@@ -1,0 +1,20 @@
+# Lintian overrides for pg-hardstorage-compat-barman.
+#
+# Format per Lintian Manual §2.4.1:
+#   <package>: <tag> [optional-args]
+
+# The compat shim binaries are symlinks (or multi-call dispatch) that
+# delegate to the main pg_hardstorage CLI.  Their behaviour is
+# documented under the parent package's manpages — wrapping each in
+# its own dedicated manpage would duplicate content the operator
+# already finds via `man pg_hardstorage-compat`.  Migration docs
+# (docs/how-to/migration/from-barman.md, shipped by pg-hardstorage-
+# common) cover the operator-facing surface.
+pg-hardstorage-compat-barman: no-manual-page [usr/bin/pg-hardstorage-barman]
+pg-hardstorage-compat-barman: no-manual-page [usr/bin/pg-hardstorage-barman-wal-archive]
+
+# Initial upload (this package has never been in Debian); the
+# changelog correctly closes no bugs because there are no bugs to
+# close yet.  The tag is informational for genuinely-Debian-tracked
+# packages; for the first release of a non-Debian package it's noise.
+pg-hardstorage-compat-barman: initial-upload-closes-no-bugs

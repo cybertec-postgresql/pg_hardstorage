@@ -1,0 +1,140 @@
+# discovery.yaml — bring up MinIO + a Crunchy PostgresCluster
+# CRD pointing at it, using the crunchy-argv-recorder image so
+# every pgbackrest invocation lands a PGHS_ARGV_FIXTURE NDJSON
+# line on stderr (kubectl logs) AND in /tmp/argv-fixture.ndjson
+# inside the pod.
+#
+# Apply with:
+#
+#   kubectl apply -f test/fixtures/operator-argv/crunchy/manifests/discovery.yaml
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: argv-discovery-crunchy
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: minio-creds
+  namespace: argv-discovery-crunchy
+type: Opaque
+stringData:
+  AWS_ACCESS_KEY_ID: minio
+  AWS_SECRET_ACCESS_KEY: minio12345
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: minio
+  namespace: argv-discovery-crunchy
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: minio }
+  template:
+    metadata:
+      labels: { app: minio }
+    spec:
+      containers:
+        - name: minio
+          image: minio/minio:RELEASE.2024-12-18T13-15-44Z
+          args: ["server", "/data", "--console-address", ":9001"]
+          env:
+            - name: MINIO_ROOT_USER
+              valueFrom: { secretKeyRef: { name: minio-creds, key: AWS_ACCESS_KEY_ID } }
+            - name: MINIO_ROOT_PASSWORD
+              valueFrom: { secretKeyRef: { name: minio-creds, key: AWS_SECRET_ACCESS_KEY } }
+          ports: [{ containerPort: 9000, name: api }]
+          volumeMounts: [{ name: data, mountPath: /data }]
+      volumes: [{ name: data, emptyDir: {} }]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: minio
+  namespace: argv-discovery-crunchy
+spec:
+  selector: { app: minio }
+  ports: [{ port: 9000, name: api }]
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: minio-mkbucket
+  namespace: argv-discovery-crunchy
+spec:
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: mc
+          image: minio/mc:RELEASE.2024-11-21T17-21-54Z
+          envFrom: [{ secretRef: { name: minio-creds } }]
+          command:
+            - sh
+            - -c
+            - |
+              set -eux
+              for i in $(seq 1 60); do
+                  if mc alias set m http://minio:9000 "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY"; then
+                      break
+                  fi
+                  sleep 2
+              done
+              mc mb -p m/crunchy-backups || true
+              mc ls m/
+---
+# pgBackRest needs S3 credentials in a specific Secret shape.
+# Crunchy reads pgbackrest.conf-shaped values from a Secret
+# referenced by spec.backups.pgbackrest.configuration.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: pgbackrest-s3-creds
+  namespace: argv-discovery-crunchy
+type: Opaque
+stringData:
+  s3.conf: |
+    [global]
+    repo1-s3-key=minio
+    repo1-s3-key-secret=minio12345
+---
+# The PostgresCluster CRD.  Uses the recorder image as the
+# postgres image; pgbackrest invocations write fixture NDJSON
+# (stderr → kubectl logs; on-disk → /tmp/argv-fixture.ndjson).
+apiVersion: postgres-operator.crunchydata.com/v1beta1
+kind: PostgresCluster
+metadata:
+  name: discovery
+  namespace: argv-discovery-crunchy
+spec:
+  postgresVersion: 17
+  image: docker.io/pg-hardstorage/crunchy-argv-recorder:17
+  imagePullPolicy: Never
+  instances:
+    - name: in
+      replicas: 1
+      dataVolumeClaimSpec:
+        accessModes: [ReadWriteOnce]
+        resources: { requests: { storage: 1Gi } }
+  backups:
+    pgbackrest:
+      # pgBackRest needs its own image (separate from the postgres
+      # one).  We reuse the recorder image because pgbackrest is
+      # the binary we want to capture argv from regardless of
+      # which container.
+      image: docker.io/pg-hardstorage/crunchy-argv-recorder:17
+      configuration:
+        - secret:
+            name: pgbackrest-s3-creds
+      global:
+        repo1-s3-uri-style: path
+        repo1-path: /pgbackrest/repo1
+      repos:
+        - name: repo1
+          s3:
+            bucket: crunchy-backups
+            endpoint: minio.argv-discovery-crunchy.svc.cluster.local:9000
+            region: us-east-1

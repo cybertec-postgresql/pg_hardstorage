@@ -1,0 +1,139 @@
+.nh
+.TH "PG_HARDSTORAGE" "1" "May 2026" "pg_hardstorage Manual" "pg_hardstorage Manual"
+
+.SH NAME
+.PP
+pg_hardstorage-repo-audit - Comprehensive read-only repository state report
+
+
+.SH SYNOPSIS
+.PP
+\fBpg_hardstorage repo audit  [flags]\fP
+
+
+.SH DESCRIPTION
+.PP
+repo audit walks every deployment + every visible manifest in the
+repo and produces a comprehensive state report covering:
+
+.RS
+.IP \(bu 2
+per-deployment lifecycle (active / tombstoned / held counts,
+oldest / newest backup, latest backup metadata, encryption
+posture, KEK refs, schema versions, PG-version spread,
+timeline spread)
+.IP \(bu 2
+fleet-wide rollups (KEK ref → manifest count, schema-version
+distribution, replica completeness)
+.IP \(bu 2
+audit-chain summary (event count, last-anchor age,
+head-pointer presence)
+.IP \(bu 2
+storage usage (objects / bytes per category — same shape as
+repo usage)
+.IP \(bu 2
+approval-request lifecycle counts
+.IP \(bu 2
+WORM mode + retention from HSREPO
+
+.RE
+
+.PP
+The report is a snapshot of FACTS, not a verdict — it surfaces
+the data an operator needs to answer "are all my fleets'
+backups encrypted under the expected KEK?", "how many manifests
+are still on the old schema?", "which deployments are missing
+replica copies?" — without prescribing what's "broken". For
+operational health checks (something is actively wrong), use
+\fBpg_hardstorage doctor\fR; for per-backup integrity, use
+\fBpg_hardstorage verify\fR\&.
+
+.PP
+Read-only by construction; safe at any cadence.
+
+.PP
+Optional opt-outs cut runtime on huge fleets:
+  --no-storage     skip the per-category storage walk
+  --no-chain       skip the audit-chain summary
+  --no-approvals   skip the approval-request lifecycle scan
+
+
+.SH OPTIONS
+.PP
+\fB--deployment\fP=""
+	restrict the per-deployment section to one deployment (fleet rollups still cover all deployments)
+
+.PP
+\fB-h\fP, \fB--help\fP[=false]
+	help for audit
+
+.PP
+\fB--no-approvals\fP[=false]
+	skip the approval-request lifecycle scan
+
+.PP
+\fB--no-chain\fP[=false]
+	skip the audit-chain summary (cheaper on long chains)
+
+.PP
+\fB--no-storage\fP[=false]
+	skip the per-category storage usage scan (cheaper on huge repos)
+
+.PP
+\fB--repo\fP=""
+	repository URL — must already exist (positional  is also accepted)
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+.PP
+\fB--airgapped\fP[=false]
+	refuse outbound endpoints (LLM providers, sinks, OTLP collectors) outside loopback / RFC1918 / explicit airgap.allowlist. Also enabled by PG_HARDSTORAGE_AIRGAPPED=1 or \fBairgapped: strict\fR in the config file.
+
+.PP
+\fB-c\fP, \fB--config\fP=""
+	path to config file (default: XDG/FHS lookup)
+
+.PP
+\fB--cpu-profile\fP=""
+	write a pprof CPU profile to this path for the duration of the command (\fBgo tool pprof <path>\fR to analyse). Off when empty.
+
+.PP
+\fB--mem-profile\fP=""
+	write a pprof heap profile to this path at command exit. Off when empty.
+
+.PP
+\fB--no-color\fP[=false]
+	disable ANSI color in text output
+
+.PP
+\fB--on-error-llm\fP[=false]
+	on a structured-error failure, drop into the matching LLM helper skill (auto_on_error trigger). Also enabled by PG_HARDSTORAGE_ON_ERROR_LLM=1.
+
+.PP
+\fB--otel-endpoint\fP=""
+	OpenTelemetry OTLP/HTTP endpoint (e.g. http://otel-collector:4318); empty disables tracing
+
+.PP
+\fB--otel-stdout\fP[=false]
+	also export OpenTelemetry traces to stderr (useful for dev)
+
+.PP
+\fB-o\fP, \fB--output\fP=""
+	output format: text|json|ndjson|yaml|template|csv|markdown|html|tap|junit|pdf (default: text on TTY, json off-TTY)
+
+.PP
+\fB--profile-port\fP=0
+	if non-zero, expose net/http/pprof on 127.0.0.1: for live profiling of long-running commands (e.g. \fBgo tool pprof http://127.0.0.1:6060/debug/pprof/profile?seconds=30\fR). Off when zero.
+
+.PP
+\fB-q\fP, \fB--quiet\fP[=false]
+	suppress non-essential output
+
+.PP
+\fB--template\fP=""
+	Go text/template applied when --output template (or implied if --template is set without --output)
+
+
+.SH SEE ALSO
+.PP
+\fBpg_hardstorage-repo(1)\fP

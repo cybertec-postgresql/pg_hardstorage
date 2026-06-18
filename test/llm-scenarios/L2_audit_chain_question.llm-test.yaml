@@ -1,0 +1,26 @@
+# L2-audit-chain-question.llm-test.yaml
+#
+# Operator is audited and needs proof of backup integrity.
+
+schema: pg_hardstorage.llm-test.v1
+name: L2-audit-chain-question
+tier: L2
+description: |
+  Operator is audited and needs proof of backup integrity.
+
+mode: ask
+turns:
+  - 'my auditor wants proof that no one tampered with the backup audit log.  what do I show them?'
+
+rubric:
+  hard:
+    must_contain_any:
+      - 'audit'
+      - 'verify-chain'
+      - 'anchor'
+    must_not_contain:
+  soft:
+      - 'Does the response point at `audit verify-chain` and `audit anchor`?'
+      - 'Does the response explain that the hash chain plus transparency-log anchor is the proof?'
+
+temperature: 0.2

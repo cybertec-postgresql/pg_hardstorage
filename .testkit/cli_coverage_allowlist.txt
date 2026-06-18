@@ -1,0 +1,50 @@
+# cli_coverage_allowlist.txt
+#
+# Leaves listed here are intentionally NOT exercised by a scenario.
+# Add a one-line comment above each entry explaining why.  Reviewed
+# any time we go to bump cobra leaves.
+#
+# Format: one leaf path per line (e.g. "wal stream").  Blank lines
+# and '#' comments are skipped.
+#
+# CI runs `pg_hardstorage_testkit coverage cli` to keep coverage
+# honest: new commands must land with a scenario OR be added here
+# with a one-line reason.
+
+# Onboarding / informational leaves added by the onboarding work.
+# These print static help/info or run a self-contained live demo;
+# there is no backup/restore/WAL data-path behaviour for a soak
+# scenario to assert. Convert to scenarios if they grow real logic.
+
+# Prints the embedded CHANGELOG; static output, nothing to assert.
+changelog
+# Spins up a throwaway PG 18 + Docker and runs a self-contained
+# backup/restore demo; not a fit for the soak scenario harness.
+demo
+# Prints conceptual explanations; static informational output.
+explain
+# Prints the terminology glossary; static informational output.
+glossary
+# Validates pg_hardstorage.yaml and exits; config-shape check with
+# no data path to exercise in a scenario.
+lint
+# Diagnostic that shells out to the configured LLM provider — the
+# documented allow-list case (cannot run a real provider in CI).
+llm doctor
+
+# Read-only / diagnostic / maintenance leaves with no backup/restore
+# data path of their own for a soak scenario to assert.
+
+# Read-only display: prints a single backup's manifest JSON. The
+# manifest itself is already written and validated by every backup
+# scenario; `show` only renders it, so there is no new data path.
+manifest show
+# Diagnostic listing: walks $HSPLUGIN_PATH and probes each plugin,
+# printing a table. Informational output, same category as the other
+# diagnostic leaves above.
+plugin list
+# Maintenance GC: sweeps approval requests past their TTL. The reaper
+# logic is already exercised via `hold purge-expired --dry-run` in
+# L1_misc_smoke; this sibling under `approval` performs the live sweep
+# with no additional data path to assert.
+approval purge-expired

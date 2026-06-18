@@ -1,0 +1,29 @@
+# L2-pg-upgrade-prep.llm-test.yaml
+#
+# Operator is preparing to pg_upgrade from PG 16 → 17.
+
+schema: pg_hardstorage.llm-test.v1
+name: L2-pg-upgrade-prep
+tier: L2
+description: |
+  Operator is preparing to pg_upgrade from PG 16 → 17.
+
+mode: ask
+turns:
+  - "I'm going to pg_upgrade my database from 16 to 17 next week.  what should I do with pg_hardstorage before / during / after?"
+
+rubric:
+  hard:
+    must_contain_any:
+      - 'backup'
+      - 'before'
+      - 'after'
+      - 'version'
+      - 'upgrade'
+    must_not_contain:
+      - 'rm -rf'
+  soft:
+      - 'Does the response recommend taking a fresh backup right before the upgrade as a rollback option?'
+      - 'Does the response acknowledge that post-upgrade restore needs the matching PG major (postverify check)?'
+
+temperature: 0.2

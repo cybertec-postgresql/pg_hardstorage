@@ -1,0 +1,131 @@
+# L8_pitr_across_timeline_branch.scenario.yaml
+#
+# Tier L8 — PITR correctness across a timeline split.  This
+# is the canonical "operators promoted a replica, then later
+# realised they needed pre-promotion data" disaster-recovery
+# story.
+#
+# Sequence:
+#   1. Backup on TLI 1.
+#   2. Capture an LSN on TLI 1 (after some load).
+#   3. Patroni failover → new leader promotes → TLI bumps
+#      to 2.
+#   4. Continue load on TLI 2 (the cluster's "main" timeline
+#      is now 2; TLI 1's tail is a forked-off history).
+#   5. Restore --to-lsn=<TLI 1 LSN>.  The restored cluster
+#      MUST replay TLI 1's history up to the captured LSN
+#      and stop, NOT TLI 2's.
+#
+# What this catches:
+#   * The restore path's timeline-history file selection.
+#     PG looks up which TLI contains the target LSN by
+#     consulting timeline-history files in the WAL store
+#     (`<TLI>.history`).  A buggy agent that uploads only
+#     the *current* timeline's history (TLI 2's, which
+#     records "branched from TLI 1 at LSN X") but not
+#     TLI 1's tail segments would silently restore the
+#     wrong history.
+#   * recovery_target_timeline = 'latest' vs explicit.  PG
+#     defaults to "latest TLI containing the target LSN".
+#     If TLI 1 LSN X is also reachable via TLI 2 (it isn't,
+#     by construction, but a buggy fork point would make it
+#     look that way), the restored cluster would have TLI 2
+#     post-fork data — a silent disaster.
+#   * `assert_restored_match` against the pre-failover
+#     checksum is the byte-equality gate: the restored row
+#     state must match what was captured *before* the
+#     failover, not after.
+#
+# Wall-clock budget: ~7 minutes (5 GB seed + 10s pre load +
+# failover + 30s post load + backup + restore + verify).
+schema: pg_hardstorage.scenario.v1
+name: L8-pitr-across-timeline-branch
+tier: L8
+description: |
+  TLI 1 backup → capture LSN → Patroni failover (→ TLI 2) →
+  load on TLI 2 → restore --to-lsn=<TLI 1 LSN>.  Restored
+  cluster must reflect TLI 1 row state at the captured LSN,
+  not TLI 2 post-fork state.
+
+topology:
+  provider: patroni-local-docker
+  pg_version: "17"
+
+load:
+  file: test/load/failover_loop.load.yaml
+
+steps:
+  - seed:
+      target_gb: 1
+
+  - wal_stream:
+      action: start
+
+  # Initial load on TLI 1.
+  - run_load:
+      duration: 10s
+
+  # Take the basebackup BEFORE capturing the PITR LSN so the
+  # captured LSN is guaranteed to be reachable from the
+  # basebackup's end-LSN.  Same ordering invariant as the
+  # L4-rapid-failover scenarios.
+  - take_backup:
+      deployment: l8-pitr-tli-branch
+
+  - capture_lsn:
+      name: pre_failover_tli1
+      checksum_query: |
+        select
+          count(*)::text || '|' ||
+          coalesce(sum(abalance)::text, '0') || '|' ||
+          coalesce(sum(hashtextextended(t::text, 0))::text, '0')
+        from pgbench_accounts t
+
+  # Seal the in-flight WAL segment so the captured LSN is
+  # reachable from streamed WAL on restore.  Without this
+  # the segment containing pre_failover_tli1 may still be
+  # in-flight on PG when the failover bumps the TLI; PG
+  # never finalises that segment and PITR aborts with
+  # "recovery ended before configured recovery target was
+  # reached".  Mirrors the same fix L4 PITR scenarios use.
+  - switch_wal: {}
+
+  # Failover — TLI bumps to 2 on the new leader.  Longer
+  # heal_window than L8_patroni_failover_during_backup
+  # because here we WANT the transition fully settled
+  # before continuing load on TLI 2.  The novelty for L8
+  # is the post-failover WAL writes that *don't* belong in
+  # the restored history.
+  - inject:
+      kind: patroni_failover
+      target: patroni
+      heal_window: 15s
+
+  # Drive TLI 2 forward.  This load's WAL must NOT appear
+  # in the restored cluster — restore-to-LSN
+  # pre_failover_tli1 stops at the pre-failover row state.
+  - run_load:
+      duration: 30s
+
+  - wal_stream:
+      action: stop
+
+  # Restore to a TLI 1 LSN.  PG must consult timeline-
+  # history files, pick TLI 1 (the timeline that contains
+  # the target LSN at this point in history), replay
+  # only up through the LSN, and stop.
+  - restore:
+      deployment: l8-pitr-tli-branch
+      name: pre_failover_tli1
+
+  # Byte-equality of the captured pre-failover row state
+  # against the restored cluster.  If the restore silently
+  # picked TLI 2 (post-failover history) the row counts /
+  # sums would diverge here.
+  - assert_restored_match:
+      name: pre_failover_tli1
+      strict: true
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

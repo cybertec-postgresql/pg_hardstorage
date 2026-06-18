@@ -1,0 +1,70 @@
+# L2_compat_walg.scenario.yaml
+#
+# Tier L2: end-to-end smoke for the pg-hardstorage-walg shim
+# against a file:// repo.  WAL-G's interface is fully env-var
+# driven (WALG_*_PREFIX, AWS_ENDPOINT, PGHOST, ...) — different
+# shape from pgbackrest (CLI flags) and barman (deployment
+# config YAML).  Same end result: a synthetic 16 MiB WAL
+# segment + matching `.backup` companion archive into the repo
+# under wal/<deployment>/00000001/.
+#
+# What this scenario protects:
+#
+#   - The shim's flags.go:loadEnv() / mapEnvToNativeArgs()
+#     pipeline reads the same env vars an operator's existing
+#     wal-g cron / archive_command line would set.
+#
+#   - The shim's deploymentName() resolution: the test sets
+#     PG_HARDSTORAGE_DEPLOYMENT explicitly so two parallel
+#     scenario runs against the same host don't collide on
+#     the PGHOST fallback.
+#
+#   - The wal-fetch (round-trip) path is symmetric and
+#     produces byte-identical output.
+#
+#   - Issue #10 aux-file path through the WAL-G shim:
+#     `wal-push some.backup` lands at the canonical
+#     wal/<deployment>/<TLI>/<basename> key.
+
+schema: pg_hardstorage.scenario.v1
+name: L2-compat-walg
+tier: L2
+description: |
+  pg-hardstorage-walg end-to-end against a file:// repo:
+  wal-push 16 MiB segment + .backup companion + history file,
+  wal-fetch round-trip.  Inside the os_image container the
+  driver picks.
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  - compat_archive:
+      shim: walg
+      deployment: compat-walg
+      fixture: segment
+
+  - compat_archive:
+      shim: walg
+      deployment: compat-walg
+      fixture: segment_plus_backup
+
+  - compat_archive:
+      shim: walg
+      deployment: compat-walg
+      fixture: history
+
+  # Idempotency — PG retries archive_command on transient
+  # errors AND on operator restart.  If the shim or native
+  # CLI ever loses the RenameIfNotExists -> success
+  # mapping, the operator's archive_command would fail
+  # forever.  Pin it.
+  - compat_archive:
+      shim: walg
+      deployment: compat-walg
+      fixture: segment_idempotent
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

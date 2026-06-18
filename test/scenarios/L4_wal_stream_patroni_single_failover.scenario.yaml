@@ -1,0 +1,118 @@
+# L4_wal_stream_patroni_single_failover.scenario.yaml
+#
+# Single Patroni leader change with the streamer running before,
+# during, and after the switchover.  Focused regression gate for
+# "WAL streaming survives a Patroni failover" — easier to debug
+# than the multi-failover L4_patroni_failover_loop scenario.
+#
+# Why a focused single-failover scenario in addition to the loop:
+# the loop scenario exercises slot-continuity AND failover-loop
+# pacing AND multi-round byte-equal correctness.  When something
+# breaks in the streaming path on Patroni, the loop scenario
+# fails for an obscure reason; this one isolates the variable to
+# "did one switchover work?".
+#
+# What gets exercised end-to-end:
+#
+#   * patroni-local-docker topology (1 etcd + 3 Spilo PG 17 nodes)
+#     with a leader-aware ConnString.
+#   * `wal_stream: { action: start }` on the initial primary.
+#   * Pre-failover load drives WAL through the slot.
+#   * `inject: { kind: patroni_failover }` triggers a controlled
+#     leader change.  Patroni promotes a replica; the old leader
+#     reattaches as a replica.
+#   * Streamer's connection to the old primary breaks; the
+#     scenario explicitly stop+start's the streamer to model a
+#     systemd-supervised restart on connection failure.  On
+#     restart, the streamer's leader-aware DSN routes to the new
+#     primary; replication.EnsureSlot finds-or-creates the slot
+#     there (RESERVE_WAL); start LSN is validated against the
+#     new slot's restart_lsn.
+#   * Post-failover load drives WAL through the new primary's
+#     slot.
+#   * Final restore + byte-equal assert proves no WAL was lost
+#     across the switchover.
+#
+# Pass criterion: byte-equal checksum match.  A regression in the
+# streamer's reconnect-via-EnsureSlot path leaves a hole spanning
+# the switchover; PITR cannot cross it.
+#
+# Wall-clock budget: ~5-6 minutes.  Cluster bring-up dominates
+# (~90s); failover settles in ~10-15s.
+schema: pg_hardstorage.scenario.v1
+name: L4-wal-stream-patroni-single-failover
+tier: L4
+description: |
+  Single Patroni switchover with the streamer running before/
+  during/after.  Streamer is restarted between primaries to
+  model systemd-supervised reconnect.  Pass criterion: PITR
+  byte-equal match across the switchover.
+topology:
+  provider: patroni-local-docker
+  pg_version: "17"
+load:
+  file: test/load/failover_loop.load.yaml
+steps:
+  - seed:
+      target_gb: 1
+
+  - wal_stream:
+      action: start
+
+  # Pre-failover workload — streamer ships WAL through the
+  # initial primary's slot.
+  - run_load:
+      duration: 15s
+
+  # Stop the streamer cleanly BEFORE the inject so we can
+  # model a deterministic restart afterwards.  In production
+  # the streamer would crash on the connection break and
+  # systemd would restart it; doing it explicitly here makes
+  # the scenario reproducible without relying on
+  # connection-break timing.
+  - wal_stream:
+      action: stop
+
+  - inject:
+      kind: patroni_failover
+      target: patroni
+      heal_window: 15s
+
+  # Re-start the streamer.  The leader-aware DSN now routes
+  # to the new primary; EnsureSlot finds-or-creates the slot
+  # on the new node (Strategy A if Patroni permanent_slots
+  # propagated it, Strategy C otherwise).  The
+  # start-LSN-vs-restart-LSN safety check refuses to stream
+  # if there's a gap.
+  - wal_stream:
+      action: start
+
+  - run_load:
+      duration: 15s
+
+  - take_backup:
+      deployment: l4-wal-stream-patroni-single-failover
+
+  - run_load:
+      duration: 10s
+
+  - capture_lsn:
+      name: post_failover
+      checksum_query: |
+        select
+          count(*)::text || '|' ||
+          coalesce(sum(abalance)::text, '0') || '|' ||
+          coalesce(sum(hashtextextended(t::text, 0))::text, '0')
+        from pgbench_accounts t
+  - switch_wal: {}
+  - wal_stream:
+      action: stop
+  - restore:
+      deployment: l4-wal-stream-patroni-single-failover
+      name: post_failover
+  - assert_restored_match:
+      name: post_failover
+      strict: true
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

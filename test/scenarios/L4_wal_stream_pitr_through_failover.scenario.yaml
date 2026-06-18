@@ -1,0 +1,136 @@
+# L4_wal_stream_pitr_through_failover.scenario.yaml
+#
+# The "PITR forward through a Patroni failover via the streamer's
+# archive" gate.  Mirrors the operator's actual question: a base
+# backup taken before lunch; a Patroni failover at 14:00; a
+# request at 15:00 to restore to a target moment AFTER the
+# failover.  Does the backup repo carry enough WAL across the
+# failover boundary to honour the request?
+#
+# Why this scenario doesn't overlap with L4_patroni_failover_loop:
+# the loop scenario takes the basebackup AFTER all switchovers,
+# so PITR replay never crosses a failover boundary.  Recovery
+# completes at end of inline WAL carried by the basebackup itself
+# (--include-wal).  This scenario takes the basebackup BEFORE the
+# failovers, so PITR has no choice but to replay through the
+# streamer's archive — the only repo source of WAL on the post-
+# failover timeline(s).
+#
+# What gets exercised end-to-end:
+#
+#   * `wal_stream: { action: start }` on the initial primary
+#     (timeline 1).
+#   * `take_backup` BEFORE any failover.  Backup-end-LSN sits on
+#     timeline 1; a post-failover restore target therefore
+#     requires WAL from backup-end-LSN forward across the
+#     timeline switch.
+#   * `wal_stream: { action: stop }` before each failover and
+#     `wal_stream: { action: start }` after — models a systemd-
+#     supervised streamer that restarts on connection break.
+#     The CLI streamer doesn't auto-reconnect today; this is the
+#     production-realistic supervised-restart pattern.
+#   * On post-failover restart, ensureSlot finds the slot on the
+#     new primary (Strategy A if Patroni permanent_slots
+#     propagated it; Strategy C recreate-with-RESERVE_WAL
+#     otherwise).  The start-LSN safety check refuses to stream
+#     if the resumed position is older than the new slot's
+#     restart_lsn (would mean WAL was lost across the failover).
+#   * The IDENTIFY_SYSTEM at start of the second streamer run
+#     surfaces the new timeline.  WAL on the new timeline lands
+#     in the repo under `wal/<deployment>/<TLI>/` so restore can
+#     stitch the timelines together.
+#
+# Pass criterion: byte-equal checksum match between live state
+# at capture_lsn and the restored cluster.  The captured LSN
+# sits on the post-failover timeline; the restore source is the
+# pre-failover backup; the only path between them is through the
+# streamer's archive across the timeline switch.
+#
+# Wall-clock budget: ~6-7 minutes.  Cluster bring-up dominates
+# (~90s); each switchover settles in ~10-15s; load windows
+# total ~50s.
+schema: pg_hardstorage.scenario.v1
+name: L4-wal-stream-pitr-through-failover
+tier: L4
+description: |
+  Base backup taken on TLI 1.  Streamer runs across the failover
+  via supervised stop+start.  PITR target sits on the post-
+  failover TLI; the only WAL source between backup-end-LSN and
+  the target is the streamer's archive.  Pass criterion: PITR
+  byte-equal match across the timeline switch.
+topology:
+  provider: patroni-local-docker
+  pg_version: "17"
+load:
+  file: test/load/failover_loop.load.yaml
+steps:
+  - wal_stream:
+      action: start
+  - seed:
+      target_gb: 1
+
+  # The anchor backup: taken on the initial primary's timeline,
+  # BEFORE any failover.  This is the restore source.  Any WAL
+  # past backup-end-LSN must come from the streamer's archive.
+  - take_backup:
+      deployment: l4-wal-stream-pitr-through-failover
+
+  # Pre-failover workload — streamer ships TLI 1 WAL through
+  # the slot.
+  - run_load:
+      duration: 15s
+
+  # Supervised-restart stop.  Modelling the production pattern:
+  # the streamer's TCP connection to the old primary will break
+  # on the failover; systemd would restart the unit.  Here we
+  # do it explicitly so the scenario is deterministic.
+  - wal_stream:
+      action: stop
+
+  - inject:
+      kind: patroni_failover
+      target: patroni
+      heal_window: 15s
+
+  # Streamer comes back on the new primary.  This is the path
+  # that:
+  #   - re-resolves the leader-aware DSN to the new primary
+  #   - runs IDENTIFY_SYSTEM on the new primary (captures TLI 2)
+  #   - runs ensureSlot (Strategy A or C — both fine)
+  #   - validates start LSN against the new slot's restart_lsn
+  - wal_stream:
+      action: start
+
+  # Post-failover workload — every byte of TLI 2 WAL produced
+  # here flows through the streamer's archive.  This is what
+  # the restore step replays forward to.
+  - run_load:
+      duration: 15s
+
+  - capture_lsn:
+      name: post_failover
+      checksum_query: |
+        select
+          count(*)::text || '|' ||
+          coalesce(sum(abalance)::text, '0') || '|' ||
+          coalesce(sum(hashtextextended(t::text, 0))::text, '0')
+        from pgbench_accounts t
+  - switch_wal: {}
+  - wal_stream:
+      action: stop
+
+  # Restore from the pre-failover backup.  PG's recovery walks
+  # the timeline-history files in the repo to stitch TLI 1 →
+  # TLI 2 and replays through to the captured LSN.  A streamer
+  # that lost any WAL across the failover boundary would leave
+  # a hole here and recovery would either abort or land at the
+  # wrong LSN; the byte-equal assert is the gate.
+  - restore:
+      deployment: l4-wal-stream-pitr-through-failover
+      name: post_failover
+  - assert_restored_match:
+      name: post_failover
+      strict: true
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

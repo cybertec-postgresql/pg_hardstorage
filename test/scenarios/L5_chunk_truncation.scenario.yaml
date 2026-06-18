@@ -1,0 +1,27 @@
+# L5_chunk_truncation.scenario.yaml
+#
+# Tier L5: truncate one CAS chunk to half its length.
+# Sibling to L4_corrupt_chunk (which flips a bit) — this
+# variant exercises the read path on a SHORT file.
+# Plaintext-hash verify must refuse before the chunk is
+# materialised into a restored datadir.
+schema: pg_hardstorage.scenario.v1
+name: L5-chunk-truncation
+tier: L5
+description: |
+  Truncate a random CAS chunk, assert scrub catches it.
+topology:
+  provider: local-docker
+  pg_version: "17"
+steps:
+  - seed:
+      target_gb: 1
+  - take_backup:
+      deployment: l5-chunk-trunc
+  - corrupt_repo_object:
+      repo_target: chunk_random
+      mutation: truncate
+      expect_error_prefix: verify.
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

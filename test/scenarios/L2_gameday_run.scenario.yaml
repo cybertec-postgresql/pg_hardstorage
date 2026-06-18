@@ -1,0 +1,93 @@
+# L2_gameday_run.scenario.yaml
+#
+# Tier L2 — gameday harness: `gameday run | report`.
+# Operators inject canned fault-recovery exercises and
+# inspect the audit trail.
+#
+# Headline property: gameday run --dry-run prints the
+# planned action without injecting the fault; report
+# walks the resulting audit events.
+#
+# Leaves covered (gate scope):
+#   * gameday run
+#   * gameday report
+#
+# Wall-clock budget: ~10s.
+
+schema: pg_hardstorage.scenario.v1
+name: L2-gameday-run
+tier: L2
+description: |
+  gameday run --dry-run for a known scenario → gameday
+  report walks the audit chain → negative report for an
+  unknown scenario filter.
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  - take_backup:
+      deployment: l2-gameday-run
+
+  # 1. List available gameday scenarios via gameday list
+  # (already covered in earlier scenarios — but here we
+  # use one of them in dry-run).
+  - cli_run:
+      args:
+        - "gameday"
+        - "list"
+        - "--output"
+        - "json"
+      expect_exit: 0
+
+  # 2. gameday run --dry-run.  The scenario name is a
+  # well-known scaffold ID; --dry-run prints the planned
+  # action without invoking the inject registry.
+  - cli_run:
+      args:
+        - "gameday"
+        - "run"
+        - "agent_kill"
+        - "--repo"
+        - "$REPO"
+        - "--deployment"
+        - "$DEPLOYMENT"
+        - "--dry-run"
+      expect_exit: 0
+
+  # 3. report — exits 0 with empty or near-empty output
+  # (no real gameday runs have happened in this scenario).
+  - cli_run:
+      args:
+        - "gameday"
+        - "report"
+        - "--repo"
+        - "$REPO"
+      expect_exit: 0
+
+  # 4. report with a scenario filter.
+  - cli_run:
+      args:
+        - "gameday"
+        - "report"
+        - "--repo"
+        - "$REPO"
+        - "--scenario"
+        - "agent_kill"
+      expect_exit: 0
+
+  # 5. Negative gameday run: unknown scenario.
+  - cli_run:
+      args:
+        - "gameday"
+        - "run"
+        - "no-such-gameday-scenario"
+        - "--repo"
+        - "$REPO"
+        - "--dry-run"
+      expect_exit: 2
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

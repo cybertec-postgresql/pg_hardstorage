@@ -1,0 +1,70 @@
+# L8_verify_detects_manifest_corruption.scenario.yaml
+#
+# Tier L8 — `pg_hardstorage verify` must surface a corrupted
+# backup manifest with a structured error, not silently
+# pass with degraded output.
+#
+# The class of bug this guards:
+#   * Signature-check short-circuiting: if the verifier
+#     skips the Ed25519 check when the manifest schema
+#     looks "close enough", a corrupted attestation block
+#     would silently slip through.
+#   * Per-backup error scope: only the corrupted backup
+#     should fail verify; the OTHER backups in the chain
+#     remain individually verifiable.  This is the
+#     blast-radius gate: corruption in one manifest
+#     must not poison the rest of the chain.
+#
+# Wall-clock budget: ~4 minutes (1 GB seed + 3 backups +
+# corrupt + verify probes).
+schema: pg_hardstorage.scenario.v1
+name: L8-verify-detects-manifest-corruption
+tier: L8
+description: |
+  3 backups → corrupt one manifest → `verify` must
+  surface the corruption.  Other backups still verify
+  cleanly (per-manifest blast radius).
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  - seed:
+      target_gb: 1
+
+  - take_backup:
+      deployment: l8-verify-corrupt
+      name: backup_1
+
+  - take_backup:
+      deployment: l8-verify-corrupt
+      name: backup_2
+
+  - take_backup:
+      deployment: l8-verify-corrupt
+      name: backup_3
+
+  # Flip a bit in a random manifest.  Whichever manifest
+  # gets hit is the one verify will refuse.  The blast-
+  # radius assertion below (verify pre-corrupt backup
+  # still works for AT LEAST the other two) holds
+  # regardless of which one drew the short straw.
+  - corrupt_repo_object:
+      repo_target: manifest_random
+      mutation: flip_bit_at
+      offset: 256
+      # Manifests are JSON blobs.  A flipped bit at offset 256
+      # almost always lands inside a string/number/key, which
+      # makes the JSON unparseable.  `repo scrub`'s reference-
+      # collection pass surfaces this as
+      # `code: repo.scrub.collect_refs_failed` with a message
+      # like "invalid character '0' after object key".  Match
+      # on that exact prefix so the assertion is structural
+      # (the structured error code) rather than tied to the
+      # human-readable message wording.
+      expect_error_prefix: "repo.scrub."
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

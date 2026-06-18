@@ -1,0 +1,148 @@
+# Documentation site CI — runs on every push and PR that
+# touches docs-related paths.
+#
+# Three gates:
+#
+#   1. docs-regen drift  — every auto-generated page (CLI
+#      reference, manpages) must match the live source of
+#      truth.  A mismatch fails the build.
+#   2. mkdocs --strict   — broken cross-link, missing nav
+#      target, or extension misconfiguration fails the
+#      build.
+#   3. Linkcheck         — every external link reachable.
+#      Soft-fail (warning) for now; will promote to
+#      hard-fail once the link inventory stabilises.
+#
+# The build artefact is the rendered ./site/ directory,
+# uploaded so PR reviewers can preview the rendered site
+# without spinning up MkDocs locally.
+
+name: docs
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docs/**"
+      - "mkdocs.yml"
+      - "cmd/docsgen/**"
+      - "internal/cli/**"
+      - "Makefile"
+      - ".github/workflows/docs.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "docs/**"
+      - "mkdocs.yml"
+      - "cmd/docsgen/**"
+      - "internal/cli/**"
+      - "Makefile"
+      - ".github/workflows/docs.yml"
+
+concurrency:
+  group: docs-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: "1.26.4"
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  regen-clean:
+    # docs-regen drift gate.  Auto-generated pages can't
+    # diverge from the source of truth — the Cobra command
+    # tree, the OpenAPI spec, the .proto files.  CI runs
+    # the generator and fails if `git diff` is non-empty.
+    name: docs-regen is clean
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - name: regenerate
+        run: make docs-regen
+      - name: assert no drift
+        # Diff with --exit-code: zero means clean, non-zero
+        # means an auto-gen page changed but wasn't
+        # committed.  The diff itself goes to the job log so
+        # reviewers see exactly what drifted.
+        run: |
+          if ! git diff --exit-code --stat docs/reference/cli/ man/; then
+            echo "::error::docs-regen produced drift — run 'make docs-regen' locally and commit"
+            git diff docs/reference/cli/ man/ | head -200
+            exit 1
+          fi
+
+  build:
+    # mkdocs --strict build.  Any broken cross-link or
+    # missing nav target fails the build.  The rendered
+    # site/ uploads as an artefact so reviewers can preview
+    # PRs.
+    name: mkdocs build (strict)
+    runs-on: ubuntu-24.04
+    needs: [regen-clean]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: install MkDocs Material + plugins
+        run: |
+          pip install --upgrade pip
+          pip install \
+            'mkdocs-material>=9.5,<10' \
+            'mkdocs-material-extensions>=1.3' \
+            'pymdown-extensions>=10.7' \
+            'mkdocs-static-i18n>=1.2'
+      - name: build
+        run: mkdocs build --strict
+      - name: upload site artefact
+        uses: actions/upload-artifact@v4
+        with:
+          name: docs-site
+          path: site/
+          retention-days: 14
+
+  linkcheck:
+    # External-link reachability gate.  Soft-fail for now
+    # (continue-on-error) — the docs project is in initial
+    # rollout and link inventory is unstable.  Promote to
+    # hard-fail once the link set stabilises.
+    name: lychee linkcheck
+    runs-on: ubuntu-24.04
+    needs: [build]
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: install MkDocs (to render before linkcheck)
+        run: |
+          pip install --upgrade pip
+          pip install \
+            'mkdocs-material>=9.5,<10' \
+            'mkdocs-material-extensions>=1.3' \
+            'pymdown-extensions>=10.7' \
+            'mkdocs-static-i18n>=1.2'
+      - name: build
+        run: mkdocs build --strict
+      - name: lychee
+        uses: lycheeverse/lychee-action@v2
+        with:
+          # `--exclude-private` skips intranet hosts a
+          # public CI runner can't reach (RFC 1918).
+          # `--cache` reuses results across runs.
+          args: >-
+            --exclude-private
+            --cache
+            --max-cache-age 7d
+            --no-progress
+            --accept 200..=299,401,403
+            './site/**/*.html'
+          fail: false

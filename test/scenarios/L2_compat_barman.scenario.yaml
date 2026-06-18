@@ -1,0 +1,88 @@
+# L2_compat_barman.scenario.yaml
+#
+# Tier L2: end-to-end smoke for the pg-hardstorage-barman
+# (and pg-hardstorage-barman-wal-archive) compat shim.
+# Drives the REAL shim binaries against a synthetic 16 MiB
+# WAL segment + a `.backup` companion, inside the OS
+# container the run_compat_testing.sh driver substitutes via
+# the os_image step parameter.
+#
+# What this scenario protects:
+#
+#   - Bug A (silent dispatch): the pre-fix Barman shim
+#     swallowed every native error because its dispatcher
+#     used cobra.ExecuteC instead of cli.Run.  An L2
+#     scenario with a real binary IS the only test that
+#     would have caught it — every existing unit test stubs
+#     the dispatcher.
+#
+#   - Bug B (no --repo wiring): pre-fix barman-wal-archive
+#     dispatched argv with no --repo, which the native CLI
+#     rejected.  The compat_archive step seeds a
+#     pg_hardstorage.yaml with the deployment's repo URL so
+#     the shim's deployment-config lookup finds it; if the
+#     shim regresses to "pass argv unchanged" the assert
+#     step fires.
+#
+#   - Issue #10 aux-file path through the Barman shim
+#     (`.backup` lands at wal/<server>/<TLI>/<basename>).
+#
+#   - The shim binary works on every distro the matrix
+#     covers — Debian / Ubuntu / Rocky / openSUSE — exposing
+#     glibc / loader incompatibilities (libfaketime preload,
+#     resolver behaviour, /etc/passwd shape) before they hit
+#     a real operator.
+#
+# Round-trip: barman-wal-archive has no archive-get verb
+# (recovery uses pg_hardstorage's own restore_command), so
+# the compat_archive step drops back to the native
+# `pg_hardstorage wal fetch` for the byte-equal check.
+
+schema: pg_hardstorage.scenario.v1
+name: L2-compat-barman
+tier: L2
+description: |
+  pg-hardstorage-barman-wal-archive end-to-end: archive
+  16 MiB segment + .backup companion via the Barman shim,
+  fetch back via native wal fetch, byte-equal cmp.  Inside
+  the os_image container the driver picks.
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  # 1. Plain segment — proves the basic shim → native dispatch
+  #    + repo lookup + archive-push flow works end-to-end.
+  - compat_archive:
+      shim: barman-wal-archive
+      deployment: compat-barman-server
+      fixture: segment
+
+  # 2. Segment + .backup companion — closes the loop on issue
+  #    #10 through the Barman shim.  Without the bug-fix this
+  #    step would fail with "wal push: --repo is required"
+  #    bubbled up via cli.Run (the post-bug-A surface).
+  - compat_archive:
+      shim: barman-wal-archive
+      deployment: compat-barman-server
+      fixture: segment_plus_backup
+
+  # 3. Timeline-history file — separate aux-file class.
+  - compat_archive:
+      shim: barman-wal-archive
+      deployment: compat-barman-server
+      fixture: history
+
+  # 4. Idempotent re-push — see L2_compat_pgbackrest's
+  #    matching step for the rationale.  Same RenameIfNotExists
+  #    contract applies; the Barman shim's deployment-config
+  #    lookup must not trip on its own re-resolution.
+  - compat_archive:
+      shim: barman-wal-archive
+      deployment: compat-barman-server
+      fixture: segment_idempotent
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

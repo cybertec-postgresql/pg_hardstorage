@@ -1,0 +1,109 @@
+# L3_wal_stream_storage_outage.scenario.yaml
+#
+# Storage backend goes briefly unreachable while the
+# streamer is shipping WAL.  The streamer must queue,
+# retry, and resume cleanly when storage comes back.
+#
+# Why this matters: every cloud-storage backend has
+# transient outages — region-level GC pauses, object-
+# store API throttling, network-storm packet drops.  The
+# streamer's job is to absorb them without dropping WAL
+# or escalating into the supervised process exiting.  A
+# regression that made the streamer give up on the first
+# Put failure would surface a daily flap in production.
+#
+# What gets exercised end-to-end:
+#
+#   * `sink: { kind: s3-minio }` brings up a real MinIO
+#     emulator that can be docker-paused mid-flight.
+#     Same surface as the L3_storage_outage scenario,
+#     but here applied DURING streaming rather than
+#     during basebackup.
+#   * `inject: { kind: docker_pause, target: sink,
+#     heal_window: 25s }` freezes the sink container.
+#     The streamer's S3 PUTs hang on the open TCP
+#     socket; the AWS SDK retry budget kicks in.  After
+#     25s the container unfreezes and queued PUTs
+#     succeed.
+#   * Workload runs through the outage window so the
+#     streamer has WAL to ship while storage is dark.
+#     The retry budget must outlast the heal_window.
+#
+# Pass criterion: byte-equal checksum match.  A
+# streamer that exited on storage error would leave a
+# hole exactly the width of the outage; PITR fails.
+#
+# Air-gap: pre-pull the MinIO image once on a connected
+# box (same procedure as L3_storage_outage):
+#   pg_hardstorage_testkit image pull-sinks --only=s3-minio
+#
+# Wall-clock budget: ~3-4 minutes (1 GB seed + 25s pause +
+# restore + verify).
+schema: pg_hardstorage.scenario.v1
+name: L3-wal-stream-storage-outage
+tier: L3
+description: |
+  S3 sink (MinIO) frozen mid-stream via docker_pause.
+  Streamer's retry budget must absorb the heal_window;
+  PITR byte-equal match proves no WAL was lost.
+topology:
+  provider: local-docker
+  pg_version: "17"
+sink:
+  kind: s3-minio
+load:
+  file: test/load/failover_loop.load.yaml
+steps:
+  - wal_stream:
+      action: start
+  - seed:
+      target_gb: 1
+
+  # Pause the sink while the streamer has live WAL to
+  # ship.  Workload runs in a brief warmup so segments
+  # are queued at the moment docker_pause lands.
+  - run_load:
+      duration: 5s
+
+  # 25-second pause.  Slightly shorter than the
+  # storage_outage scenario's 30s — the streamer commits
+  # smaller payloads more frequently than basebackup, so
+  # it hits the retry budget sooner.  If this scenario
+  # starts flaking, lengthen the heal_window or increase
+  # the streamer's retry budget.
+  - inject:
+      kind: docker_pause
+      target: sink
+      heal_window: 25s
+
+  # Post-outage workload.  Confirms the streamer is
+  # alive and shipping after the pause clears.
+  - run_load:
+      duration: 10s
+
+  - take_backup:
+      deployment: l3-wal-stream-storage-outage
+
+  - run_load:
+      duration: 10s
+
+  - capture_lsn:
+      name: post_outage
+      checksum_query: |
+        select
+          count(*)::text || '|' ||
+          coalesce(sum(abalance)::text, '0') || '|' ||
+          coalesce(sum(hashtextextended(t::text, 0))::text, '0')
+        from pgbench_accounts t
+  - switch_wal: {}
+  - wal_stream:
+      action: stop
+  - restore:
+      deployment: l3-wal-stream-storage-outage
+      name: post_outage
+  - assert_restored_match:
+      name: post_outage
+      strict: true
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

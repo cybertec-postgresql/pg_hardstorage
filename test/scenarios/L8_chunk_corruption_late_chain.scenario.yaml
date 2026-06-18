@@ -1,0 +1,96 @@
+# L8_chunk_corruption_late_chain.scenario.yaml
+#
+# Tier L8 — chunk-level bit-rot detection AFTER a long
+# backup chain has been written.  Distinct from
+# L5_chunk_overwrite_zeros which corrupts after a single
+# backup: this scenario writes 5 backups (each adding chunks
+# to the CAS layer and updating manifests) BEFORE the
+# corruption, then asserts scrub catches the drift.
+#
+# The class of bug this guards:
+#   * Scrub coverage that walks "newly written" chunks only.
+#     If the scrub sampling logic anchored on the latest
+#     manifest's chunk set, chunks first introduced by an
+#     EARLIER backup that no later manifest references
+#     would never be re-hashed and silent rot would slip
+#     through.  Hits the same surface as the
+#     restore-the-oldest gate in L8_kek_rotate_mid_chain
+#     but via a different probe (scrub, not restore).
+#   * Per-backup audit-chain integrity AFTER tampering.
+#     `audit verify-chain` must still pass on the audit log
+#     bytes (the audit is hash-linked over EVENT records,
+#     not chunk content), so the chain remains
+#     cryptographically valid while the chunk itself is
+#     corrupt — clean separation of concerns.
+#
+# Wall-clock budget: ~4 minutes (1 GB seed + 5 backups +
+# corrupt + scrub + audit verify-chain).
+schema: pg_hardstorage.scenario.v1
+name: L8-chunk-corruption-late-chain
+tier: L8
+description: |
+  5-backup chain → corrupt a random chunk → repo scrub
+  surfaces verify.checksum_mismatch.  audit verify-chain
+  remains green (audit chain is over events, not chunk
+  content).
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  - seed:
+      target_gb: 1
+
+  - take_backup:
+      deployment: l8-chunk-late
+      name: backup_1
+
+  - take_backup:
+      deployment: l8-chunk-late
+      name: backup_2
+
+  - take_backup:
+      deployment: l8-chunk-late
+      name: backup_3
+
+  - take_backup:
+      deployment: l8-chunk-late
+      name: backup_4
+
+  - take_backup:
+      deployment: l8-chunk-late
+      name: backup_5
+
+  # Pick a random chunk and flip a bit deep inside the
+  # envelope.  Expect_error_prefix wires the scrub probe
+  # in-line: corrupt → scrub → assert structured error
+  # surfaces.  See internal/testkit/runner/corrupt_repo.go
+  # for the chunk-pick logic (uniform random across the
+  # repo's chunks subtree).
+  - corrupt_repo_object:
+      repo_target: chunk_random
+      mutation: flip_bit_at
+      offset: 128
+      expect_error_prefix: verify.
+
+  # Audit chain remains valid — the audit log records
+  # EVENTS (backup_started, backup_completed, ...), each
+  # hash-linked to its predecessor.  Corrupting a chunk
+  # doesn't touch the audit log, so the chain stays
+  # cryptographically valid.  This gate confirms the
+  # separation: "corrupt repo content" is NOT the same
+  # thing as "tampered audit trail", and an operator
+  # debugging a scrub finding can still trust the audit
+  # to be intact.
+  - cli_run:
+      args:
+        - "audit"
+        - "verify-chain"
+        - "--repo"
+        - "$REPO"
+      timeout: 30s
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

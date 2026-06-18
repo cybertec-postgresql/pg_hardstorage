@@ -1,0 +1,29 @@
+# Lintian overrides for pg-hardstorage.
+#
+# Format per Lintian Manual §2.4.1:
+#   <package>: <tag> [optional-args]
+
+# Go binaries are statically linked by design — that's the whole
+# point of CGO_ENABLED=0 + -buildmode=default for a tool that ships
+# across distros without dynamic-linker drift.  The static link is
+# Go's standard build model; lintian's E:statically-linked-binary
+# treats it as a packaging error appropriate to C/C++ binaries
+# (where dynamic linkage is the norm).  Suppressing this for our
+# build is the standard practice for every Go-binary Debian
+# package (cf. golang itself, prometheus, restic, ...).
+pg-hardstorage: statically-linked-binary [usr/bin/pg_hardstorage]
+
+# postinst uses `if [ -x /bin/systemd-sysusers ]` and `if [ -x
+# /bin/systemd-tmpfiles ]` guards before invoking those helpers.
+# The absolute path is intentional: the test-existence check is
+# specifically about whether systemd's helpers are present at the
+# canonical path systemd ships them at.  PATH-search would defeat
+# the guard (an unrelated binary named systemd-sysusers in $PATH
+# would falsely pass the check).
+pg-hardstorage: command-with-path-in-maintainer-script /bin/systemd-sysusers (in test syntax) [postinst:61]
+pg-hardstorage: command-with-path-in-maintainer-script /bin/systemd-tmpfiles (in test syntax) [postinst:58]
+
+# Initial upload (this package has never been in Debian); the
+# changelog correctly closes no bugs because there are no bugs to
+# close yet.  Same rationale as the compat-* and -server overrides.
+pg-hardstorage: initial-upload-closes-no-bugs

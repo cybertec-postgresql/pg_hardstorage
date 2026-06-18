@@ -1,0 +1,116 @@
+#!/usr/bin/make -f
+#
+# debian/rules for pg-hardstorage.
+#
+# We delegate the actual build to the project Makefile so the
+# package is built with the exact same flags as a from-source
+# install. dh_auto_install is overridden to drop the systemd
+# units, completions, and manpages into per-package staging
+# trees -- dh_install picks them up from there.
+
+export DH_VERBOSE = 1
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+export GOFLAGS := -trimpath -buildvcs=false
+export CGO_ENABLED := 0
+# Pin module mode + reset GOPATH back to its default ($HOME/go) so
+# dh-golang's auto-hooks (which set GOPATH=/work/obj-<arch>/ and
+# stage source under obj-<arch>/src/<importpath>/) DON'T fool the
+# go toolchain into GOPATH-mode lookups.  Without this, the
+# override_dh_auto_build's `make build` sees `cannot find package
+# .../internal/cli in any of /usr/local/go/src/... /work/obj-...
+# /src/...` because go is searching GOPATH-style locations instead
+# of honouring our top-level go.mod.
+export GO111MODULE := on
+unexport GOPATH
+
+# Match the Makefile's stamping so `pg_hardstorage version`
+# reports the Debian package's version and Git revision. Falls
+# back gracefully when built outside a working tree.
+DEB_VERSION ?= $(shell dpkg-parsechangelog -SVersion)
+GIT_COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo none)
+BUILD_DATE ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
+
+%:
+	# Plain `dh $@` — no addons, no buildsystem.
+	#
+	#   `--with=systemd` was dropped in debhelper compat 11+; we
+	#   handle systemd units via override_dh_installsystemd below.
+	#
+	#   `--with=golang` + `--buildsystem=golang` (dh-golang) both
+	#   stage the source under obj-x86_64-linux-gnu/src/<importpath>/
+	#   and set GOPATH-mode env vars that:
+	#     1. Drop sibling //go:embed targets (schema.sql, oses.yaml,
+	#        runbooks/, builtin/*.skill.yaml) → embed patterns fail
+	#        with `no matching files found`.
+	#     2. Force GOPATH lookup that misses our go.mod, producing
+	#        `cannot find package ".../internal/cli" in any of
+	#        /usr/local/go/src/...  /work/obj-.../src/...`.
+	#   Our overrides (override_dh_auto_build / _install / _test)
+	#   own the entire build pipeline via $(MAKE), so we don't need
+	#   dh-golang's "help" — and we explicitly don't want it.
+	dh $@
+
+override_dh_auto_configure:
+	# Block dh-golang's auto-configure hook (which is registered
+	# the moment dh-golang is INSTALLED in the build image — even
+	# without `--with=golang` or `--buildsystem=golang` on the dh
+	# line) from staging the source under obj-<arch>/src/<importpath>
+	# and switching GOPATH there.  Our build is module-mode + Make-
+	# driven; no source juggling needed.
+
+override_dh_auto_build:
+	$(MAKE) build VERSION=$(DEB_VERSION) COMMIT=$(GIT_COMMIT) DATE=$(BUILD_DATE)
+	$(MAKE) build-testkit VERSION=$(DEB_VERSION) COMMIT=$(GIT_COMMIT) DATE=$(BUILD_DATE) || true
+	# v1.1+ compat shims.  The Makefile target tolerates a
+	# missing source tree per shim (we keep them in lockstep
+	# with the main binary today, but build_compat_* is
+	# defensive so a half-merge of one shim doesn't block
+	# the other).
+	$(MAKE) build-compat VERSION=$(DEB_VERSION) COMMIT=$(GIT_COMMIT) DATE=$(BUILD_DATE)
+
+override_dh_auto_test:
+	# Skip the test suite during dpkg-buildpackage.  `make test`
+	# runs `go test -race`, which needs CGO; our default build
+	# is CGO_ENABLED=0 (pure Go) and the deb-builder image
+	# doesn't carry a cgo-enabled stdlib + glibc-dev.  The test
+	# suite runs in CI; the package build's job is to produce
+	# the .deb, not to gate on test results.
+
+override_dh_auto_install:
+	install -D -m 0755 bin/pg_hardstorage debian/pg-hardstorage/usr/bin/pg_hardstorage
+	install -D -m 0644 deploy/systemd/pg_hardstorage.service \
+		debian/pg-hardstorage/lib/systemd/system/pg_hardstorage.service
+	install -D -m 0644 deploy/systemd/pg_hardstorage@.service \
+		debian/pg-hardstorage/lib/systemd/system/pg_hardstorage@.service
+	install -D -m 0644 deploy/systemd/pg-hardstorage.sysusers.conf \
+		debian/pg-hardstorage/usr/lib/sysusers.d/pg-hardstorage.conf
+	install -D -m 0644 deploy/systemd/pg-hardstorage.tmpfiles.conf \
+		debian/pg-hardstorage/usr/lib/tmpfiles.d/pg-hardstorage.conf
+	# v1.1+ compat shim binaries — installed into their own
+	# subpackage staging trees.  Each subpackage Conflicts:
+	# with the upstream package (see debian/control) so the
+	# operator picks one or the other.
+	install -D -m 0755 bin/pg-hardstorage-pgbackrest \
+		debian/pg-hardstorage-compat-pgbackrest/usr/bin/pg-hardstorage-pgbackrest
+	install -D -m 0755 bin/pg-hardstorage-barman \
+		debian/pg-hardstorage-compat-barman/usr/bin/pg-hardstorage-barman
+	install -D -m 0755 bin/pg-hardstorage-barman-wal-archive \
+		debian/pg-hardstorage-compat-barman/usr/bin/pg-hardstorage-barman-wal-archive
+	install -D -m 0755 bin/pg-hardstorage-walg \
+		debian/pg-hardstorage-compat-walg/usr/bin/pg-hardstorage-walg
+
+override_dh_auto_clean:
+	$(MAKE) clean
+
+# We ship our own systemd unit; dh_installsystemd picks it up by
+# convention from debian/pg-hardstorage.service.  `-p pg-hardstorage`
+# scopes the install to that one binary package — without it,
+# dh_installsystemd loops across every package in debian/control
+# (including pg-hardstorage-common, which has no service) and
+# aborts with "Package 'pg-hardstorage-common' does not install
+# unit 'pg_hardstorage.service'".
+override_dh_installsystemd:
+	dh_installsystemd -p pg-hardstorage --name=pg_hardstorage pg_hardstorage.service
+
+override_dh_strip:
+	dh_strip --no-automatic-dbgsym

@@ -1,0 +1,25 @@
+# L2-residency-question.llm-test.yaml
+#
+# Operator wants backups to stay in EU regions only.
+
+schema: pg_hardstorage.llm-test.v1
+name: L2-residency-question
+tier: L2
+description: |
+  Operator wants backups to stay in EU regions only.
+
+mode: ask
+turns:
+  - 'I need my backups to stay in EU regions for GDPR.  how do I enforce that?'
+
+rubric:
+  hard:
+    must_contain_any:
+      - 'residency'
+      - 'set'
+    must_not_contain:
+  soft:
+      - 'Does the response point at `pg_hardstorage residency set <dep> <regions>`?'
+      - 'Does the response mention residency check + residency report as monitoring surfaces?'
+
+temperature: 0.2

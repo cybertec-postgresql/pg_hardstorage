@@ -1,0 +1,26 @@
+# L2-monitoring-question.llm-test.yaml
+#
+# Operator wants alerts on backup failures.
+
+schema: pg_hardstorage.llm-test.v1
+name: L2-monitoring-question
+tier: L2
+description: |
+  Operator wants alerts on backup failures.
+
+mode: ask
+turns:
+  - 'how do I get alerted in Slack when a backup fails?'
+
+rubric:
+  hard:
+    must_contain_any:
+      - 'notify add'
+      - 'slack'
+      - 'webhook'
+    must_not_contain:
+  soft:
+      - 'Does the response point at `pg_hardstorage notify add slack --set webhook_url=...`?'
+      - 'Does the response mention --min-severity for filtering noise?'
+
+temperature: 0.2

@@ -1,0 +1,46 @@
+# L7_chaos_chain_then_backup.scenario.yaml
+#
+# Tier L7 resource exhaustion: stack three different
+# faults sequentially, each healed before the next, then
+# take a backup.  The backup must succeed end-to-end.
+#
+# The class of bug this guards: cumulative leftover
+# state.  A fault's Recovery callback might "look" idempotent
+# but leave behind a stale lock, a fd, an unbounded
+# tmpfile, or a cgroup-disabled write path that only
+# manifests when the NEXT fault stacks on top.  Three
+# back-to-back inject+heal cycles surface that class.
+schema: pg_hardstorage.scenario.v1
+name: L7-chaos-chain-then-backup
+tier: L7
+description: |
+  pg_kill → docker_pause → cgroup_squeeze, all healed,
+  then a backup must complete cleanly.  (Both disk_full
+  and pause_archive are agent-target faults; the
+  local-docker provider only exposes role=pg, so chaos-
+  chain coverage uses three pg-targetable axes:
+  process-kill, IO freeze, memory pressure.  cgroup_squeeze
+  has no convenience-map entry yet, so it's expressed as
+  a raw registry action.)
+topology:
+  provider: local-docker
+  pg_version: "17"
+steps:
+  - seed:
+      target_gb: 1
+  - inject:
+      kind: pg_kill
+      signal: 9
+      heal_window: 60s
+  - inject:
+      kind: docker_pause
+      target: pg
+      heal_window: 10s
+  - inject:
+      action: "cgroup_squeeze(target=pg, max_bytes=536870912)"
+      heal_window: 10s
+  - take_backup:
+      deployment: l7-chaos-chain
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

@@ -1,0 +1,178 @@
+# L4_wal_stream_full_lifecycle.scenario.yaml
+#
+# The full operator-lifecycle gate.  Two complete (a–h) cycles
+# in a single scenario:
+#
+#   Phase 1
+#     a. create instance               (patroni-local-docker bring-up)
+#     b. take_backup #1                (anchor for restore #1)
+#     c. running OLTP                  (run_load)
+#     d. streaming WAL                 (wal_stream: start)
+#     e. patroni failover under load   (inject patroni_failover)
+#     f. keep streaming                (supervised stop+start across failover)
+#     g. restore + byte-equal assert   (PITR through streamed WAL)
+#
+#   Phase 2 (proves the chain still works after a complete cycle)
+#     a-d on the live cluster (already running, post-Phase-1
+#         failover, post-Phase-1 restore)
+#     e. another patroni failover under load
+#     f. keep streaming
+#     g. take_backup #2 + restore #2 + byte-equal assert
+#
+# Why a two-phase scenario in addition to the single-phase
+# L4_wal_stream_pitr_through_failover:
+#
+#   * Single-phase scenarios prove "one full cycle works".  This
+#     scenario proves "the system stays healthy ACROSS cycles" —
+#     no state-leak between Phase-1 and Phase-2 backups; no slot
+#     drift; no repo accounting that breaks on the second
+#     take_backup; no streamer state that has to be torn down
+#     and rebuilt to remain functional.
+#
+#   * Each phase has its own anchor backup + its own restore +
+#     its own byte-equal assert.  The runner stashes only the
+#     most-recent backup_id (state.lastBackup), so each phase's
+#     restore defaults to that phase's backup.  Phase 1's
+#     backup is then GC-eligible from a retention standpoint —
+#     a follow-up scenario could exercise that, but here we
+#     only test that BOTH backups are independently restorable
+#     to their respective captured LSNs.
+#
+# What gets exercised end-to-end (in addition to the per-phase
+# bullets above):
+#
+#   * Two `take_backup` calls in one scenario, separated by load
+#     and a failover — proves the second backup doesn't see
+#     stale state from the first.
+#   * Two `restore` calls, each from its own backup — proves
+#     the runner's backup/restore wiring isn't single-use.
+#   * The streamer is stop+start'd FOUR times across the
+#     scenario (before each failover, after each failover) —
+#     stresses the slot's ensure-and-resume path far more than
+#     any single-failover scenario.
+#
+# Pass criteria: TWO byte-equal checksum matches, one per phase.
+# A regression that breaks the second cycle (e.g. slot accounting
+# drift after a restore, or take_backup state leakage) fails the
+# Phase-2 assert specifically.
+#
+# Wall-clock budget: ~10-12 minutes.  Roughly twice the single-
+# failover-with-prior-backup scenario; cluster bring-up amortises
+# across both phases.
+schema: pg_hardstorage.scenario.v1
+name: L4-wal-stream-full-lifecycle
+tier: L4
+description: |
+  Two full backup-stress-failover-restore cycles in one scenario.
+  Proves WAL streaming + slot lifecycle + backup/restore chain
+  all stay healthy across more than one cycle.  Pass criteria:
+  two independent byte-equal checksum matches.
+topology:
+  provider: patroni-local-docker
+  pg_version: "17"
+load:
+  file: test/load/failover_loop.load.yaml
+steps:
+  # ────────────────────────────── PHASE 1 ──────────────────────────────
+
+  - wal_stream:
+      action: start
+  - seed:
+      target_gb: 1
+
+  # Phase-1 anchor backup.
+  - take_backup:
+      deployment: l4-wal-stream-full-lifecycle
+
+  - run_load:
+      duration: 12s
+
+  # Supervised-restart pattern across the Phase-1 failover.
+  - wal_stream:
+      action: stop
+  - inject:
+      kind: patroni_failover
+      target: patroni
+      heal_window: 15s
+  - wal_stream:
+      action: start
+
+  - run_load:
+      duration: 12s
+
+  # Phase-1 capture + restore.
+  - capture_lsn:
+      name: phase1_post_failover
+      checksum_query: |
+        select
+          count(*)::text || '|' ||
+          coalesce(sum(abalance)::text, '0') || '|' ||
+          coalesce(sum(hashtextextended(t::text, 0))::text, '0')
+        from pgbench_accounts t
+  - switch_wal: {}
+
+  # NB: we DON'T stop the streamer between Phase 1 restore and
+  # Phase 2 — this proves the streamer keeps shipping WAL while
+  # an unrelated restore step runs in parallel against the same
+  # repo.  The restore step writes to a sandbox dir; the
+  # streamer keeps writing to wal/<deployment>/.
+  - restore:
+      deployment: l4-wal-stream-full-lifecycle
+      name: phase1_post_failover
+  - assert_restored_match:
+      name: phase1_post_failover
+      strict: true
+
+  # ────────────────────────────── PHASE 2 ──────────────────────────────
+
+  # Live cluster has now been through one full cycle.  The
+  # streamer is still running from Phase 1; the live primary
+  # has been promoted once already.  Drive a second cycle.
+
+  - run_load:
+      duration: 12s
+
+  - wal_stream:
+      action: stop
+  - inject:
+      kind: patroni_failover
+      target: patroni
+      heal_window: 15s
+  - wal_stream:
+      action: start
+
+  - run_load:
+      duration: 12s
+
+  # Phase-2 anchor backup.  Taken on a different timeline than
+  # Phase 1's backup; against a primary that has been promoted
+  # twice from the original.  Overwrites state.lastBackup so
+  # the next default-source restore resolves to this backup.
+  - take_backup:
+      deployment: l4-wal-stream-full-lifecycle
+
+  - run_load:
+      duration: 10s
+
+  - capture_lsn:
+      name: phase2_post_failover
+      checksum_query: |
+        select
+          count(*)::text || '|' ||
+          coalesce(sum(abalance)::text, '0') || '|' ||
+          coalesce(sum(hashtextextended(t::text, 0))::text, '0')
+        from pgbench_accounts t
+  - switch_wal: {}
+  - wal_stream:
+      action: stop
+
+  # Phase-2 restore from Phase-2's backup (state.lastBackup).
+  - restore:
+      deployment: l4-wal-stream-full-lifecycle
+      name: phase2_post_failover
+  - assert_restored_match:
+      name: phase2_post_failover
+      strict: true
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

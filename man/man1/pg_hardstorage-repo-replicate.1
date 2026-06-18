@@ -1,0 +1,138 @@
+.nh
+.TH "PG_HARDSTORAGE" "1" "May 2026" "pg_hardstorage Manual" "pg_hardstorage Manual"
+
+.SH NAME
+.PP
+pg_hardstorage-repo-replicate - Copy committed manifests + chunks from a source repo to a replica repo
+
+
+.SH SYNOPSIS
+.PP
+\fBpg_hardstorage repo replicate --from  --to  [flags]\fP
+
+
+.SH DESCRIPTION
+.PP
+replicate copies every committed (non-tombstoned) manifest from
+--from to --to, plus every chunk those manifests reference.
+
+.PP
+Idempotent: chunks and manifests already at --to are skipped via
+Stat / IfNotExists, so re-running the same replicate is safe and
+cheap.
+
+.PP
+The destination repo MUST already exist (use 'repo init \&' first).
+Replicate only ADDS to the destination — it never initialises one and
+never prunes (use 'repo gc' on the destination if you want to trim).
+
+.PP
+Tombstoned backups are not replicated. The replica is for surviving
+loss of the primary, not for resurrecting deleted backups.
+
+.PP
+By default WAL segment manifests (and their chunks) are NOT copied.
+Pass --include-wal for full WAL redundancy in the replica region.
+
+.PP
+Bandwidth shaping (mutually exclusive):
+  --max-mbps N         constant cap of N megabits per second
+  --schedule     time-of-day windows; e.g.
+                       "Mon-Fri,09:00-18:00=50mbps;Sat-Sun,00:00-23:59=200mbps"
+                       Times are UTC. Outside any declared window
+                       traffic is unbounded. Rates are 0/mbps/kbps.
+
+.PP
+Both forms wrap the destination's storage plugin with a token-
+bucket. The schedule is consulted per-acquire so a window
+transition takes effect mid-run.
+
+.PP
+This is the implementation: a one-shot command. Schedule it via
+pg_timetable or cron at whatever cadence matches your egress budget
+and target RPO for the replica region.
+
+
+.SH OPTIONS
+.PP
+\fB--dry-run\fP[=false]
+	Compute the work but write nothing to the destination
+
+.PP
+\fB--from\fP=""
+	Source repo URL (must already exist)
+
+.PP
+\fB-h\fP, \fB--help\fP[=false]
+	help for replicate
+
+.PP
+\fB--include-wal\fP[=false]
+	Also replicate wal/// segment manifests and their chunks
+
+.PP
+\fB--max-mbps\fP=0
+	Cap upload bandwidth to N megabits per second (default 0 = unbounded). Token-bucket shared across the run.
+
+.PP
+\fB--schedule\fP=""
+	Time-of-day windows for bandwidth shaping; e.g. "Mon-Fri,09:00-18:00=50mbps". Mutually exclusive with --max-mbps.
+
+.PP
+\fB--to\fP=""
+	Destination repo URL (must already exist; bootstrap with 'repo init')
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+.PP
+\fB--airgapped\fP[=false]
+	refuse outbound endpoints (LLM providers, sinks, OTLP collectors) outside loopback / RFC1918 / explicit airgap.allowlist. Also enabled by PG_HARDSTORAGE_AIRGAPPED=1 or \fBairgapped: strict\fR in the config file.
+
+.PP
+\fB-c\fP, \fB--config\fP=""
+	path to config file (default: XDG/FHS lookup)
+
+.PP
+\fB--cpu-profile\fP=""
+	write a pprof CPU profile to this path for the duration of the command (\fBgo tool pprof <path>\fR to analyse). Off when empty.
+
+.PP
+\fB--mem-profile\fP=""
+	write a pprof heap profile to this path at command exit. Off when empty.
+
+.PP
+\fB--no-color\fP[=false]
+	disable ANSI color in text output
+
+.PP
+\fB--on-error-llm\fP[=false]
+	on a structured-error failure, drop into the matching LLM helper skill (auto_on_error trigger). Also enabled by PG_HARDSTORAGE_ON_ERROR_LLM=1.
+
+.PP
+\fB--otel-endpoint\fP=""
+	OpenTelemetry OTLP/HTTP endpoint (e.g. http://otel-collector:4318); empty disables tracing
+
+.PP
+\fB--otel-stdout\fP[=false]
+	also export OpenTelemetry traces to stderr (useful for dev)
+
+.PP
+\fB-o\fP, \fB--output\fP=""
+	output format: text|json|ndjson|yaml|template|csv|markdown|html|tap|junit|pdf (default: text on TTY, json off-TTY)
+
+.PP
+\fB--profile-port\fP=0
+	if non-zero, expose net/http/pprof on 127.0.0.1: for live profiling of long-running commands (e.g. \fBgo tool pprof http://127.0.0.1:6060/debug/pprof/profile?seconds=30\fR). Off when zero.
+
+.PP
+\fB-q\fP, \fB--quiet\fP[=false]
+	suppress non-essential output
+
+.PP
+\fB--template\fP=""
+	Go text/template applied when --output template (or implied if --template is set without --output)
+
+
+.SH SEE ALSO
+.PP
+\fBpg_hardstorage-repo(1)\fP, \fBpg_hardstorage-repo-replicate-verify(1)\fP

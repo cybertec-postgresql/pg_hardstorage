@@ -1,0 +1,152 @@
+# discovery.yaml — bring up MinIO + a CNPG Cluster pointing at
+# it, using the argv-recorder image as the postgres container's
+# image so every barman-cloud-* invocation lands a JSON line in
+# /var/log/pg_hardstorage/argv-fixture.ndjson.
+#
+# Apply with:
+#
+#   kubectl apply -f test/fixtures/operator-argv/cnpg/manifests/discovery.yaml
+#
+# Wait for the cluster to start (a minute or two), then trigger
+# a Backup with the discovery-backup.yaml manifest.
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: argv-discovery
+---
+# Trivial MinIO — single-replica, hostpath-backed, plain-HTTP.
+# Authentic TLS comes in S2; for argv discovery the wire is
+# in-cluster only.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: minio-creds
+  namespace: argv-discovery
+type: Opaque
+stringData:
+  AWS_ACCESS_KEY_ID: minio
+  AWS_SECRET_ACCESS_KEY: minio12345
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: minio
+  namespace: argv-discovery
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: minio }
+  template:
+    metadata:
+      labels: { app: minio }
+    spec:
+      containers:
+        - name: minio
+          image: minio/minio:RELEASE.2024-12-18T13-15-44Z
+          args: ["server", "/data", "--console-address", ":9001"]
+          envFrom:
+            - secretRef: { name: minio-creds }
+          # MinIO expects MINIO_ROOT_USER / MINIO_ROOT_PASSWORD
+          # rather than AWS-style env vars; map them.
+          env:
+            - name: MINIO_ROOT_USER
+              valueFrom:
+                secretKeyRef:
+                  name: minio-creds
+                  key: AWS_ACCESS_KEY_ID
+            - name: MINIO_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: minio-creds
+                  key: AWS_SECRET_ACCESS_KEY
+          ports:
+            - { containerPort: 9000, name: api }
+          volumeMounts:
+            - { name: data, mountPath: /data }
+      volumes:
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: minio
+  namespace: argv-discovery
+spec:
+  selector: { app: minio }
+  ports:
+    - { port: 9000, name: api }
+---
+# A Job to mc-mb the bucket so CNPG's first archive doesn't
+# fail with "NoSuchBucket".  Runs once after MinIO is ready.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: minio-mkbucket
+  namespace: argv-discovery
+spec:
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: mc
+          image: minio/mc:RELEASE.2024-11-21T17-21-54Z
+          envFrom:
+            - secretRef: { name: minio-creds }
+          command:
+            - sh
+            - -c
+            - |
+              set -eux
+              # Wait for MinIO to come up.
+              for i in $(seq 1 60); do
+                  if mc alias set m http://minio:9000 "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY"; then
+                      break
+                  fi
+                  sleep 2
+              done
+              mc mb -p m/cnpg-backups || true
+              mc ls m/
+---
+# The CNPG Cluster.  Uses the argv-recorder image; barman-cloud-*
+# invocations write to /var/log/pg_hardstorage/argv-fixture.ndjson
+# and exec the upstream Python tool from <name>.real.
+#
+# barmanObjectStore points at the in-cluster MinIO over plain
+# HTTP via endpointURL — TLS is intentionally off here so we
+# don't need a CA bundle for argv discovery.
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: discovery
+  namespace: argv-discovery
+spec:
+  instances: 2
+  # CNPG validates the imageName tag against a SemVer-shaped
+  # pattern (must start with the PG major).  The "pg17" prefix
+  # we used in the docker tag is rejected; we retag plain "17".
+  imageName: docker.io/pg-hardstorage/cnpg-argv-recorder:17
+  imagePullPolicy: Never  # always use the locally-loaded image
+  storage:
+    size: 1Gi
+  bootstrap:
+    initdb:
+      database: app
+      owner: app
+  backup:
+    barmanObjectStore:
+      destinationPath: s3://cnpg-backups/discovery
+      endpointURL: http://minio.argv-discovery.svc.cluster.local:9000
+      s3Credentials:
+        accessKeyId:
+          name: minio-creds
+          key: AWS_ACCESS_KEY_ID
+        secretAccessKey:
+          name: minio-creds
+          key: AWS_SECRET_ACCESS_KEY
+      wal:
+        compression: gzip
+      data:
+        compression: gzip

@@ -1,0 +1,57 @@
+# Dockerfile.rpm-suse-builder — openSUSE Leap .rpm build env.
+#
+# Same workflow as the rpm-rhel-builder: source via bind-mount,
+# rpmbuild driven by the run_pkg_build_testing.sh script.  SUSE
+# package names differ (rpm-build → rpm-build, golang → go1.NN),
+# and the spec's `%if 0%{?suse_version}` block flips
+# BuildRequires to `go1.26` on this image.
+
+ARG OS_IMAGE=opensuse/leap:15
+FROM ${OS_IMAGE}
+
+ENV GOTOOLCHAIN=local
+
+# zypper packages.  go1.26 lives in devel:languages:go on
+# openSUSE; Leap 15.5+ has it in the default repos.  If the
+# zypper install of go1.26 fails on an older Leap variant the
+# upstream tarball install below covers it as a fallback.
+RUN zypper -n install --no-recommends \
+        ca-certificates curl gpg2 \
+        rpm-build \
+        make git tar gzip xz \
+        rsync \
+        which procps systemd-rpm-macros \
+ && zypper -n install go1.26 || true \
+ && zypper clean -a
+
+# Ensure a working `go` binary even if `zypper install go1.26`
+# wasn't available (older Leap, custom repo set).  Pull
+# upstream Go tarball as a fallback so the spec's BuildRequires
+# is satisfied either way.
+ARG GO_VERSION=1.26.0
+RUN if ! command -v go >/dev/null 2>&1; then \
+        arch="$(uname -m)"; \
+        case "$arch" in \
+            x86_64)  gotar="go${GO_VERSION}.linux-amd64.tar.gz"  ;; \
+            aarch64) gotar="go${GO_VERSION}.linux-arm64.tar.gz"  ;; \
+            *)       echo "unsupported arch: $arch" >&2; exit 1  ;; \
+        esac; \
+        curl -fsSL "https://go.dev/dl/${gotar}" -o /tmp/go.tgz; \
+        tar -C /usr/local -xzf /tmp/go.tgz; \
+        rm /tmp/go.tgz; \
+    fi
+ENV PATH=/usr/local/go/bin:/usr/lib64/go/1.26/bin:${PATH}
+ENV GOPATH=/go
+ENV GOCACHE=/go/cache
+
+# rpmdev-setuptree isn't shipped in Leap by default; create the
+# rpmbuild tree manually.  The shape mirrors what
+# rpmdev-setuptree would have made.
+RUN mkdir -p /root/rpmbuild/BUILD \
+             /root/rpmbuild/RPMS \
+             /root/rpmbuild/SOURCES \
+             /root/rpmbuild/SPECS \
+             /root/rpmbuild/SRPMS
+
+WORKDIR /src
+CMD ["bash", "-c", "echo 'rpm-suse-builder ready; driver should `docker run` with explicit cmd'"]

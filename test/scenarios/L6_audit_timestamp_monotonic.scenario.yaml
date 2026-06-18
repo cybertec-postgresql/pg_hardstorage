@@ -1,0 +1,47 @@
+# L6_audit_timestamp_monotonic.scenario.yaml
+#
+# Tier L6 clock/time: take 3 backups, run audit summary,
+# assert the operator-visible chain head grew monotonically.
+# The invariant this guards: every audit event has a
+# timestamp that's >= its predecessor's.  A non-monotonic
+# clock (NTP rewind, container clock skew, manual
+# `date -s`) would let event N+1 land BEFORE event N in
+# wall time, breaking forensic ordering.  audit
+# verify-chain is the operator-facing detector — this
+# scenario pins it on a 3-backup sequence.
+schema: pg_hardstorage.scenario.v1
+name: L6-audit-timestamp-monotonic
+tier: L6
+description: |
+  Three sequential backups; chain remains verifiable end-to-end.
+topology:
+  provider: local-docker
+  pg_version: "17"
+steps:
+  - take_backup:
+      deployment: l6-audit-monotonic
+  - take_backup:
+      deployment: l6-audit-monotonic
+  - take_backup:
+      deployment: l6-audit-monotonic
+  - cli_run:
+      args:
+        - "audit"
+        - "verify-chain"
+        - "--repo"
+        - "$REPO"
+        - "--output"
+        - "json"
+      expect_exit: 0
+  - cli_run:
+      args:
+        - "audit"
+        - "summary"
+        - "--repo"
+        - "$REPO"
+        - "--output"
+        - "json"
+      expect_exit: 0
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

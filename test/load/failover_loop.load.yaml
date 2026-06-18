@@ -1,0 +1,55 @@
+# failover_loop.load.yaml
+#
+# Load file shaped for the L4 patroni-failover-loop scenario.
+# Designed to be re-runnable: every pass appends rows without
+# tripping any uniqueness constraint, so the scenario runner's
+# `run_load { duration: ... }` step can loop the file across
+# multiple Patroni leader changes.
+#
+# Why a dedicated file vs. oltp_smoke.load.yaml:
+#   The smoke load creates a UNIQUE index on email — fine for
+#   the L1 PR-gate scenario (one-shot apply), but the deterministic
+#   email generator emits the same `user-N@example.test` sequence
+#   on every pass, so a second pass hits "duplicate key violates
+#   unique constraint".  This file uses NO unique index, so each
+#   pass just appends another batch of rows.
+#
+# Phases:
+#   bootstrap   — table DDL + first 500 rows.  CREATE TABLE
+#                 IF NOT EXISTS makes the DDL safe to re-run.
+#   write_burst — another 500 rows + a non-unique btree on
+#                 created_at to model production indexing
+#                 without blocking re-inserts.
+#
+# Each full pass inserts 1000 rows.  With a 30s run_load step
+# and ~5s per pass, expect 5-7 passes per round, ~5000-7000 rows
+# per round.
+
+schema: pg_hardstorage.testload.v1
+seed: 0xFA110_5EED
+locale: en_US.UTF-8
+timezone: UTC
+
+phases:
+  - name: bootstrap
+    operations:
+      - create_table:
+          name: users
+          schema: users_v1
+      - insert_rows:
+          table: users
+          count: 500
+          generator: faker_users
+
+  - name: write_burst
+    operations:
+      - create_index:
+          table: users
+          columns: [created_at]
+          unique: false
+      - insert_rows:
+          table: users
+          count: 500
+          generator: faker_users
+      - vacuum:
+          table: users

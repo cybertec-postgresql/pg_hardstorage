@@ -1,0 +1,26 @@
+# cnpg-cluster.yaml
+#
+# A minimal CloudNativePG cluster used by cnpg-verify.sh to prove
+# that pg_hardstorage can back up and restore a CNPG-managed
+# PostgreSQL instance.
+#
+# enableSuperuserAccess gives us the `postgres` role (REPLICATION-
+# capable) with a generated password in the `<cluster>-superuser`
+# secret. pg_hardstorage needs a REPLICATION connection because the
+# base backup is taken with the BASE_BACKUP replication command --
+# the CNPG `app` user is not replication-capable, so we use the
+# superuser here. A dedicated `REPLICATION LOGIN` role works too.
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: hs-cnpg
+spec:
+  instances: 1
+  imageName: ghcr.io/cloudnative-pg/postgresql:17
+  enableSuperuserAccess: true
+  storage:
+    size: 2Gi
+  postgresql:
+    parameters:
+      max_wal_senders: "10"
+      wal_keep_size: 256MB

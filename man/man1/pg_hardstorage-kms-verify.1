@@ -1,0 +1,137 @@
+.nh
+.TH "PG_HARDSTORAGE" "1" "May 2026" "pg_hardstorage Manual" "pg_hardstorage Manual"
+
+.SH NAME
+.PP
+pg_hardstorage-kms-verify - Verify the encryption envelope on every backup manifest in the repo
+
+
+.SH SYNOPSIS
+.PP
+\fBpg_hardstorage kms verify [flags]\fP
+
+
+.SH DESCRIPTION
+.PP
+kms verify walks every committed (non-tombstoned) backup manifest
+in the repo and asks the only question that matters for at-rest
+encryption health: "would the operator's current keyring decrypt
+this backup if we had to restore it right now?".
+
+.PP
+For each manifest, kms verify:
+
+.RS
+.IP "  1." 5
+Validates the manifest's Ed25519 signature against the local
+ public key (manifests that don't verify get the loudest
+ classification: signature_failed).
+.IP "  2." 5
+Reads the encryption block. Manifests with no encryption block
+ are counted as 'unencrypted' (NOT a failure — that's the
+ operator's policy call).
+.IP "  3." 5
+Resolves the KEK by KEKRef. By default the resolver is the
+ local keystore, which knows the "local:default" ref. With
+ --kek-ref + --kek-file the operator points at an explicit
+ KEK file for one ref (post-rotation or per-tenant audits).
+.IP "  4." 5
+Tries to unwrap the wrapped_dek with the resolved KEK. A
+ successful unwrap is "ok"; a tag-failure is "unwrap_failed".
+
+.RE
+
+.PP
+Chunks are NOT fetched, decrypted, or hashed. For per-chunk
+integrity verification of one specific backup, use
+\fBpg_hardstorage verify <deployment> [backup-id]\fR\&. The fleet-wide
+envelope check this command runs is O(manifest count); per-chunk
+verification is O(unique chunks per backup) and orders of magnitude
+more expensive.
+
+.PP
+Read-only by construction — safe to run against a read-only repo,
+a WORM-locked repo, or production at any cadence.
+
+.PP
+Exit code is 0 when every encrypted manifest unwraps cleanly (or
+every manifest is unencrypted). Exit code 9 (verify failed) is
+returned when at least one encrypted manifest can't be decrypted
+with the resolved KEK, or any manifest signature failed.
+
+
+.SH OPTIONS
+.PP
+\fB--deployment\fP=""
+	restrict the walk to one deployment (default: all deployments)
+
+.PP
+\fB-h\fP, \fB--help\fP[=false]
+	help for verify
+
+.PP
+\fB--kek-file\fP=""
+	path to KEK bytes for --kek-ref (32 bytes raw); required when --kek-ref is set, not the local-keystore ref, and the local keyring can't resolve the ref
+
+.PP
+\fB--kek-ref\fP=""
+	restrict to manifests whose KEKRef matches this string (default: all kek_refs)
+
+.PP
+\fB--repo\fP=""
+	repository URL (required)
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+.PP
+\fB--airgapped\fP[=false]
+	refuse outbound endpoints (LLM providers, sinks, OTLP collectors) outside loopback / RFC1918 / explicit airgap.allowlist. Also enabled by PG_HARDSTORAGE_AIRGAPPED=1 or \fBairgapped: strict\fR in the config file.
+
+.PP
+\fB-c\fP, \fB--config\fP=""
+	path to config file (default: XDG/FHS lookup)
+
+.PP
+\fB--cpu-profile\fP=""
+	write a pprof CPU profile to this path for the duration of the command (\fBgo tool pprof <path>\fR to analyse). Off when empty.
+
+.PP
+\fB--mem-profile\fP=""
+	write a pprof heap profile to this path at command exit. Off when empty.
+
+.PP
+\fB--no-color\fP[=false]
+	disable ANSI color in text output
+
+.PP
+\fB--on-error-llm\fP[=false]
+	on a structured-error failure, drop into the matching LLM helper skill (auto_on_error trigger). Also enabled by PG_HARDSTORAGE_ON_ERROR_LLM=1.
+
+.PP
+\fB--otel-endpoint\fP=""
+	OpenTelemetry OTLP/HTTP endpoint (e.g. http://otel-collector:4318); empty disables tracing
+
+.PP
+\fB--otel-stdout\fP[=false]
+	also export OpenTelemetry traces to stderr (useful for dev)
+
+.PP
+\fB-o\fP, \fB--output\fP=""
+	output format: text|json|ndjson|yaml|template|csv|markdown|html|tap|junit|pdf (default: text on TTY, json off-TTY)
+
+.PP
+\fB--profile-port\fP=0
+	if non-zero, expose net/http/pprof on 127.0.0.1: for live profiling of long-running commands (e.g. \fBgo tool pprof http://127.0.0.1:6060/debug/pprof/profile?seconds=30\fR). Off when zero.
+
+.PP
+\fB-q\fP, \fB--quiet\fP[=false]
+	suppress non-essential output
+
+.PP
+\fB--template\fP=""
+	Go text/template applied when --output template (or implied if --template is set without --output)
+
+
+.SH SEE ALSO
+.PP
+\fBpg_hardstorage-kms(1)\fP

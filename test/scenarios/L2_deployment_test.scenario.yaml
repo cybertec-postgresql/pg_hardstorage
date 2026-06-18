@@ -1,0 +1,99 @@
+# L2_deployment_test.scenario.yaml
+#
+# Tier L2 — `deployment test`: connect to the registered
+# deployment + run preflight + report health.  Cross-cover
+# scenario for the deployment family.
+#
+# Leaves covered (gate scope — 2nd touch for the family):
+#   * deployment test
+#   * deployment add (2nd)
+#   * deployment edit (2nd)
+#   * deployment list (2nd)
+#   * deployment remove (2nd)
+#
+# Wall-clock budget: ~15s.
+
+schema: pg_hardstorage.scenario.v1
+name: L2-deployment-test
+tier: L2
+description: |
+  Register the LIVE testbed PG as a deployment → test it
+  (real connection, must exit 0) → cover the family with
+  list/edit/remove on the same entry.
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  # 1. Register the live cell PG.  $PG_CONN resolves to the
+  # actual DSN the runner uses; --skip-probe is omitted so
+  # add itself does a connection probe — implicit "the
+  # plumbing works" gate.
+  - cli_run:
+      args:
+        - "deployment"
+        - "add"
+        - "l2-dep-live"
+        - "--repo"
+        - "$REPO"
+        - "--connection"
+        - "$PG_CONN"
+        - "--yes"
+      expect_exit: 0
+
+  # 2. test — must succeed against the live PG.
+  - cli_run:
+      args:
+        - "deployment"
+        - "test"
+        - "l2-dep-live"
+      expect_exit: 0
+
+  # 3. Negative test: deployment that doesn't exist.
+  - cli_run:
+      args:
+        - "deployment"
+        - "test"
+        - "no-such-live-deployment"
+      expect_exit: 6
+
+  # 4. list — 2nd touch.
+  - cli_run:
+      args:
+        - "deployment"
+        - "list"
+      expect_exit: 0
+
+  # 5. edit the existing entry — change schedule.
+  - cli_run:
+      args:
+        - "deployment"
+        - "edit"
+        - "l2-dep-live"
+        - "--schedule-backup"
+        - "every 2h"
+        - "--skip-probe"
+      expect_exit: 0
+
+  # 6. Re-test post-edit — must still succeed (edit didn't
+  # break the connection).
+  - cli_run:
+      args:
+        - "deployment"
+        - "test"
+        - "l2-dep-live"
+      expect_exit: 0
+
+  # 7. Remove.
+  - cli_run:
+      args:
+        - "deployment"
+        - "remove"
+        - "l2-dep-live"
+        - "--yes"
+      expect_exit: 0
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

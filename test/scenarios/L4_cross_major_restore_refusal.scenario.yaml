@@ -1,0 +1,77 @@
+# L4_cross_major_restore_refusal.scenario.yaml
+#
+# Tier L4 — backup PG 17, then attempt to restore that backup
+# into a PG 18 sandbox.  Pass condition: the restore refuses
+# CLEANLY (non-zero exit + structured error code) rather than
+# producing a corrupt cluster that PG 18 then refuses to start.
+#
+# Why this matters: PG's on-disk format changes between majors,
+# and a restore that "succeeds" but produces a datadir PG 18
+# can't open is the worst-of-both-worlds failure: the operator
+# THINKS the restore worked (exit 0, files on disk), then PG
+# 18 refuses to start with a cryptic catalog-mismatch error
+# 30 seconds later when they `systemctl start postgresql`.
+# We want the refusal at restore-time, with a clear pointer at
+# what to do (run pg_upgrade first, restore into the SAME
+# major, etc.).
+#
+# Pass condition:
+#   - The restore command exits non-zero.
+#   - stderr names the version mismatch (substrings: "version",
+#     "major", "17", "18").
+#   - The target dir, if it exists, does NOT contain a
+#     `global/pg_control` PG 18 would try to open.
+
+schema: pg_hardstorage.scenario.v1
+name: L4-cross-major-restore-refusal
+tier: L4
+description: |
+  PG 17 backup → restore-into-PG18-sandbox → assert clean refusal,
+  not a corrupt cluster.
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  # 1. Take the PG 17 backup.
+  - take_backup:
+      type: full
+      name: pg17_backup
+
+  # 2. Try to restore into a sandbox WITH AN EXPLICIT TARGET
+  #    PG VERSION mismatch.  As of 6f7287b the restore CLI
+  #    has no `--target-pg-version` flag — adding it (and the
+  #    refusal logic that compares it to the manifest's
+  #    pg_control major) is the FEATURE this scenario will
+  #    gate when it lands.  Until then the scenario can't
+  #    assert refusal because there's nothing to refuse on:
+  #    the restore happily proceeds against an unspecified
+  #    target major.
+  #
+  #    Step COMMENTED so the rest of the scenario lints +
+  #    documents the intent.  Uncomment once the feature
+  #    ships and pin --target-pg-version 18.
+  #
+  # - cli_run:
+  #     args:
+  #       - restore
+  #       - $DEPLOYMENT
+  #       - $LAST_BACKUP
+  #       - --repo
+  #       - $REPO
+  #       - --target
+  #       - $ARTEFACT_DIR/restore-pg18-sandbox
+  #       - --target-pg-version
+  #       - "18"
+  #       - -o
+  #       - json
+  #     timeout: 60s
+  #     expect_exit: 1
+  #     expect_stderr_contains: "version"
+
+  # The cross-major-refusal assertion is paired with the
+  # commented cli_run above — both unblock when the feature
+  # lands.  Until then the scenario serves as a
+  # specification-by-example: this is the failure mode the
+  # feature must prevent.

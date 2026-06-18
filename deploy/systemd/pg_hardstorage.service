@@ -1,0 +1,81 @@
+# pg_hardstorage host agent — single-instance unit.
+#
+# For a host that backs up one PostgreSQL deployment (or several
+# deployments declared in /etc/pg_hardstorage/pg_hardstorage.yaml),
+# this is the unit you enable. For multi-tenant hosts where each
+# customer or cluster needs its own state and config, use the
+# templated unit pg_hardstorage@.service instead.
+#
+# The agent is a normal long-running process. Type=simple is
+# correct today — sd_notify integration lands in v0.5 alongside
+# the control-plane API.
+
+[Unit]
+Description=pg_hardstorage host agent
+Documentation=https://github.com/cybertec-postgresql/pg_hardstorage
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pgbackup
+Group=pgbackup
+
+# Config lives in /etc/pg_hardstorage by default. The binary
+# resolves XDG/FHS paths automatically when run as the pgbackup
+# system user; we pin the config domain explicitly so an operator
+# reading `systemctl cat` knows exactly where to look.
+Environment=PG_HARDSTORAGE_CONFIG_DIR=/etc/pg_hardstorage
+Environment=PG_HARDSTORAGE_STATE_DIR=/var/lib/pg_hardstorage
+Environment=PG_HARDSTORAGE_LOGS_DIR=/var/log/pg_hardstorage
+Environment=PG_HARDSTORAGE_RUNTIME_DIR=/run/pg_hardstorage
+
+ExecStart=/usr/bin/pg_hardstorage agent
+
+WorkingDirectory=/var/lib/pg_hardstorage
+StateDirectory=pg_hardstorage
+ConfigurationDirectory=pg_hardstorage
+RuntimeDirectory=pg_hardstorage
+LogsDirectory=pg_hardstorage
+
+# Crash-only design: the scheduler keeps LastRun in memory only,
+# so restart is the recovery path. 5s avoids tight loops while
+# still being fast enough that a missed window is rare.
+Restart=always
+RestartSec=5
+
+# Generous stop timeout — an in-flight backup may need to finalize
+# manifests and flush WAL chunks before exit.
+TimeoutStopSec=120
+
+SyslogIdentifier=pg_hardstorage
+
+# --- Sandboxing ---
+# pg_hardstorage talks to PostgreSQL over the network and to a
+# small set of state/cache/log directories. Everything else is
+# locked down. Keep this list in sync with deploy/systemd/
+# pg_hardstorage@.service.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged ~@resources
+
+# Writable paths the binary actually needs. StateDirectory etc.
+# already grant access, but explicit ReadWritePaths makes the
+# permitted set obvious in `systemctl show`.
+ReadWritePaths=/var/lib/pg_hardstorage /var/log/pg_hardstorage /run/pg_hardstorage
+
+[Install]
+WantedBy=multi-user.target

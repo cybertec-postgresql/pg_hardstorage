@@ -1,0 +1,120 @@
+# L2_compat_walg_incremental.scenario.yaml
+#
+# Tier L2: WAL-G compat shim is a delta-from-latest drop-in for
+# `wal-g backup-push`.  Operators with existing cron entries like
+# `wal-g backup-push /var/lib/postgresql/15/main` keep them
+# unchanged after symlinking pg-hardstorage-walg into PATH as
+# `wal-g`; the shim translates the default delta-on-push behaviour
+# into the native `--incremental-from latest` and the underlying
+# PG 17 BASE_BACKUP INCREMENTAL fires.
+#
+# Why this scenario is necessary:
+#
+#   WAL-G's documented behaviour: `backup-push` ALWAYS takes a
+#   delta relative to the latest base unless --full is passed.
+#   The shim mirrors that contract by appending --incremental-from
+#   latest to the native CLI invocation when --full is absent.
+#   The shim's unit tests (compat/walg/verbs_test.go) verify the
+#   argv shape; they CANNOT verify the bidirectional contract that
+#   the native side honours "latest" as a resolver sentinel.
+#
+#   The L2_compat_pgbackrest_incremental scenario closed the same
+#   gap for the pgBackRest shim.  This scenario closes it for
+#   WAL-G — a symmetric proof that "latest" resolution is shim-
+#   agnostic infrastructure, not pgBackRest-only plumbing.
+#
+# What the scenario proves:
+#
+#   * `backup-push --full` produces an anchor full via the shim.
+#   * `backup-push` (no --full) produces a REAL incremental_lsn
+#     manifest, NOT a silent fallback to full.  Asserted on the
+#     backup-id substring — the type is encoded in the ID format.
+#
+# WAL-G uses standard libpq env vars for the connection (PGHOST,
+# PGPORT, PGUSER, PGDATABASE, PGPASSWORD) and its own WALG_* vars
+# for the repo and deployment.  All injected via cli_run's env:
+# field.
+#
+# Wall-clock budget: ~10s.
+
+schema: pg_hardstorage.scenario.v1
+name: L2-compat-walg-incremental
+tier: L2
+description: |
+  WAL-G shim: backup-push --full + backup-push (delta default)
+  produces incremental_lsn manifest via native --incremental-from
+  latest.
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+load:
+  file: test/load/failover_loop.load.yaml
+
+steps:
+  # 1. Confirm load landed.
+  - assert:
+      - count_exact: { table: users, value: 1000 }
+
+  # 2. Pre-create the repo via a native take_backup.  Same
+  #    rationale as L2_compat_pgbackrest_incremental:
+  #    scenario-runner steps own repo bootstrap; the shim is
+  #    exercised for its argv translation, not its repo-init
+  #    behaviour (that's covered by L2_compat_walg).
+  - take_backup:
+      deployment: l2-walg-incr
+      name: bootstrap_only
+
+  # 3. Drive churn so the shim's full has meaningful state.
+  - run_load:
+      duration: 2s
+
+  # 4. Anchor full via the shim's --full path.
+  - cli_run:
+      shim: walg
+      args: ["backup-push", "/var/lib/postgresql/data", "--full"]
+      env:
+        PGHOST: "$PG_HOST"
+        PGPORT: "$PG_PORT"
+        PGUSER: "$PG_USER"
+        PGDATABASE: "$PG_DB"
+        # libpq's standard env chain reads PGPASSWORD for the
+        # password — WAL-G doesn't have its own override.
+        PGPASSWORD: "testkit"
+        WALG_FILE_PREFIX: "$ARTEFACT_DIR/repo"
+        PG_HARDSTORAGE_DEPLOYMENT: "l2-walg-incr"
+      expect_exit: 0
+
+  # 5. Churn between full and delta.
+  - run_load:
+      duration: 2s
+
+  # 6. THE proof step: default `backup-push` (no --full).  The
+  #    shim translates this to `--incremental-from latest` and
+  #    dispatches.  The native CLI's loadIncrementalConfig MUST
+  #    resolve "latest" to the most recent live backup of
+  #    deployment "l2-walg-incr" (which is the full taken at
+  #    step 4) and produce an incremental.  A regression where
+  #    "latest" isn't recognised surfaces as exit 1 with a
+  #    notfound.backup error.
+  - cli_run:
+      shim: walg
+      args: ["backup-push", "/var/lib/postgresql/data"]
+      env:
+        PGHOST: "$PG_HOST"
+        PGPORT: "$PG_PORT"
+        PGUSER: "$PG_USER"
+        PGDATABASE: "$PG_DB"
+        PGPASSWORD: "testkit"
+        WALG_FILE_PREFIX: "$ARTEFACT_DIR/repo"
+        PG_HARDSTORAGE_DEPLOYMENT: "l2-walg-incr"
+      expect_exit: 0
+      # Backup-id substring proof: ".incremental_lsn." in the
+      # native CLI's response body confirms this is a real
+      # incremental, not a silent fallback to full.
+      expect_stdout_contains: ".incremental_lsn."
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

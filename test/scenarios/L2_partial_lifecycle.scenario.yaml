@@ -1,0 +1,102 @@
+# L2_partial_lifecycle.scenario.yaml
+#
+# Tier L2 — partial-extraction flows: `partial dump |
+# inspect | restore`.  An operator pulls a single table
+# (or set of tables) out of a backup without restoring
+# the entire datadir.
+#
+# Headline property: after a backup is committed, an
+# operator can inspect which manifest files contain a
+# specific table, dump its rows as SQL, or extract its
+# relfilenode bytes into a target dir.
+#
+# Why partly negative-path for dump/restore: a real
+# positive flow needs the tables to exist on the source
+# PG.  The testbed runs a fresh PG with only pg_catalog —
+# no pgbench tables unless a `load` block runs first.
+# We exercise:
+#
+#   * inspect (positive — well-known pg_catalog tables
+#     always exist in the manifest)
+#   * dump / restore against tables that don't exist in
+#     the manifest (negative)
+#
+# Leaves covered (gate scope):
+#   * partial dump
+#   * partial inspect
+#   * partial restore
+#
+# Wall-clock budget: ~15s.
+
+schema: pg_hardstorage.scenario.v1
+name: L2-partial-lifecycle
+tier: L2
+description: |
+  take_backup → partial inspect against pg_catalog.pg_class
+  (positive — always present) → partial dump for a
+  nonexistent user table (negative) → partial restore
+  same (negative).
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  - take_backup:
+      deployment: l2-partial-lifecycle
+
+  # 1. inspect pg_catalog.pg_class.  Every backup's manifest
+  # includes the system catalogs; this proves the inspect
+  # path can resolve a table to a manifest file ref.
+  # --pg-connection lets inspect look up relfilenodes
+  # against the live PG.
+  - cli_run:
+      args:
+        - "partial"
+        - "inspect"
+        - "$DEPLOYMENT"
+        - "--repo"
+        - "$REPO"
+        - "--tables"
+        - "pg_catalog.pg_class"
+        - "--pg-connection"
+        - "$PG_CONN"
+      expect_exit: 0
+      timeout: 60s
+
+  # 2. Negative dump: --tables references a user table
+  # that doesn't exist in this fresh-PG testbed.
+  - cli_run:
+      args:
+        - "partial"
+        - "dump"
+        - "$DEPLOYMENT"
+        - "--repo"
+        - "$REPO"
+        - "--tables"
+        - "public.no_such_user_table"
+        - "--sql-file"
+        - "$ARTEFACT_DIR/partial-dump.sql"
+      expect_exit: 4
+      timeout: 60s
+
+  # 3. Negative restore: same.
+  - cli_run:
+      args:
+        - "partial"
+        - "restore"
+        - "$DEPLOYMENT"
+        - "--repo"
+        - "$REPO"
+        - "--tables"
+        - "public.no_such_user_table"
+        - "--target"
+        - "$ARTEFACT_DIR/partial-target"
+        - "--pg-connection"
+        - "$PG_CONN"
+      expect_exit: 0
+      timeout: 60s
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

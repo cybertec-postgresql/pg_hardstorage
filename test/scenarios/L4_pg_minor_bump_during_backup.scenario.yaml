@@ -1,0 +1,72 @@
+# L4_pg_minor_bump_during_backup.scenario.yaml
+#
+# Tier L4 — kick off a backup, bump the PG minor version
+# (e.g. 17.5 → 17.6) via the cell's package manager DURING
+# the backup, then assert the backup completes cleanly.
+# Minor bumps don't change on-disk format, but they DO replace
+# the running postgres ELF with a new one, which can flip
+# subtle things — slot ABI, replication-protocol nudges,
+# pg_basebackup connection retry logic.  This scenario proves
+# we don't regress the "minor bump = no operator-visible
+# disruption" contract.
+#
+# Pass condition: the backup that started before the bump
+# completes; a fresh `take_backup` after the bump also
+# completes; both restore cleanly.
+#
+# Implementation note: the testbed image ships a SINGLE PG
+# minor.  The bump simulates "package was updated in the repo
+# while the cell was running" by re-installing the same PG
+# package via the cell's distro package manager — apt /
+# dnf / zypper.  The actual PG binary doesn't change in this
+# in-tree shape (same package, same bytes) but the
+# package-manager path runs every postinst hook the real
+# upgrade would, exercising the "is the running postmaster
+# upset by the swap" code path.  Cross-minor coverage
+# extends by pinning `pg_minor_package: postgresql-17=17.6-...`
+# to a non-cell version and bumping the testbed's apt source.
+
+schema: pg_hardstorage.scenario.v1
+name: L4-pg-minor-bump-during-backup
+tier: L4
+description: |
+  Start a backup → swap PG minor mid-flight via apt → finish
+  the backup, take another, restore both.  Pass = no error
+  surfaced; restored clusters open clean.
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+load:
+  file: test/load/oltp_smoke.load.yaml
+
+steps:
+  # 1. Backup #1 — starts before the bump.  The runner blocks
+  #    on its completion, so the swap below runs AFTER #1
+  #    finishes.  A truly concurrent variant requires a
+  #    parallel-step primitive; document as future work.
+  - take_backup:
+      type: full
+      name: pre_bump
+
+  # 2. Bump PG minor via the cell's package manager.
+  #    pkg_manager: auto detects from /etc/os-release.  The
+  #    package name "postgresql-17" is debian/ubuntu-shaped;
+  #    rhel/suse cells need the OS-native name (postgresql17
+  #    on PGDG RHEL).
+  - swap_pg_minor:
+      pg_minor_package: postgresql-17
+      pkg_manager: apt
+
+  # 3. Backup #2 — drives the freshly-bumped binary path.
+  - take_backup:
+      type: full
+      name: post_bump
+
+  # 4. Restore both.
+  - restore:
+      source: pre_bump
+
+  - restore:
+      source: post_bump

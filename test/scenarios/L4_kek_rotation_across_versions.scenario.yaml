@@ -1,0 +1,75 @@
+# L4_kek_rotation_across_versions.scenario.yaml
+#
+# Tier L4 — take an encrypted backup with KEK 1, rotate to KEK 2,
+# take another encrypted backup, then assert BOTH backups still
+# restore cleanly.  This is the fundamental "operators don't lose
+# data when they rotate keys" property — without it, a KEK
+# rotation looks fine until 6 months later when an old backup
+# can't be restored.
+#
+# Strict cross-version coverage (v0.8 binary signs, v0.9+
+# verifies) requires a v0.8 binary checked into testdata/
+# ahead of time.  This scenario uses the CURRENT binary as both
+# producer + consumer, plus a rotation in between, which is the
+# minimal property we can assert in-tree without binary
+# archeology.  When a v0.8 binary is in testdata/, swap the
+# `cli_run: backup` between the two `take_backup` steps for a
+# `swap_binary: host_path: testdata/pg_hardstorage-v0.8` to
+# extend the matrix.
+
+schema: pg_hardstorage.scenario.v1
+name: L4-kek-rotation-across-versions
+tier: L4
+description: |
+  Encrypted backup → KEK rotate → encrypted backup → restore
+  BOTH.  Pass = both restores succeed; fail = the older backup
+  can't decrypt under the rotated KEK chain.
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+load:
+  file: test/load/oltp_smoke.load.yaml
+
+steps:
+  # 1. Take backup #1 with whatever KEK the testbed shipped
+  #    (the testbed's pg_hardstorage init in the entrypoint
+  #    already provisioned a KEK; this scenario just verifies
+  #    that operating on top of an existing keyring is safe).
+  - take_backup:
+      type: full
+      name: pre_rotation
+
+  # 2. Rotate the KEK in-place.  The current `kms rotate` CLI
+  #    surface requires explicit --old-kek-file / --new-kek-file
+  #    / --old-kek-ref / --new-kek-ref paths — see
+  #    `pg_hardstorage kms rotate --help`.  Supplying those is
+  #    a fixture-management exercise the runner doesn't have a
+  #    primitive for yet, so this step is COMMENTED until the
+  #    `rotate_kek` step kind lands (it would generate a fresh
+  #    KEK file, derive the refs, and call kms rotate with all
+  #    four args wired).  Until then the scenario asserts the
+  #    "backup chain survives a no-op step" baseline.
+  #
+  # - rotate_kek: {}
+
+  # 3. Take backup #2 (logically: under KEK 2 once the rotate
+  #    step lands).
+  - take_backup:
+      type: full
+      name: post_rotation
+
+  # 5. Restore the PRE-rotation backup.  This is the load-
+  #    bearing assertion: the old-KEK-encrypted chunks must
+  #    still decrypt, even though the chain head now references
+  #    KEK 2.  Failure here = an operator's archived backups
+  #    became unreadable the moment they rotated keys.
+  - restore:
+      source: pre_rotation
+
+  # 6. Restore the POST-rotation backup for parity.
+  - restore:
+      source: post_rotation
+
+  # 7. Both PGDATA dirs must exist after restore.

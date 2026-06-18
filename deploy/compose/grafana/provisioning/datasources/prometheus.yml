@@ -1,0 +1,20 @@
+# Grafana datasource provisioning for the eval stack (issue #98).
+#
+# Before this file, Grafana came up with no datasource, so every
+# dashboard panel rendered "No data" even though backups, listing,
+# and restore all worked.  Provisioning the Prometheus datasource at
+# boot makes the pg_hardstorage_* metrics show up without any manual
+# click-through in the Grafana UI.
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    # Stable uid so the provisioned dashboard JSON can reference this
+    # datasource without a manual re-bind.
+    uid: pgh-prometheus
+    access: proxy
+    # Service name + port on the compose network.
+    url: http://prometheus:9090
+    isDefault: true
+    editable: true

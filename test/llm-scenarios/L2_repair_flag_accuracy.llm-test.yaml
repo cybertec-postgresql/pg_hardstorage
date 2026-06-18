@@ -1,0 +1,67 @@
+# L2_repair_flag_accuracy.llm-test.yaml
+#
+# Distilled from pilot run 20260513T183938Z (case C4).  The model
+# routinely invents flags on the `repair` subcommand tree:
+# `--show-affected-backups`, `--list-flagged`, `--recover`,
+# `--verbose`, and claims pg_hardstorage uses "Reed-Solomon
+# redundancy in pack files" (it doesn't — content-addressed dedup
+# chunks, single-source-of-truth).
+#
+# The rubric pins the real flag inventory and forbids the
+# hallucinated ones plus the fabricated RS-pack claim.
+#
+# Reference truth (verified against `pg_hardstorage repair scrub
+# --help` and `repair chunks --help` at 0bf… 2026-05-13):
+#
+#   repair scrub  : --heal --replica --limit --repo
+#   repair chunks : --orphans --missing --apply --repo
+#
+# Real-recovery path: scrub finds mismatches → pair with a healthy
+# replica repo → `repair scrub --heal --replica <url>` rewrites
+# damaged chunks from the replica.  No Reed-Solomon; no `--recover`.
+
+schema: pg_hardstorage.llm-test.v1
+name: L2-repair-flag-accuracy
+tier: L2
+description: |
+  Operator's `repair scrub` flagged 47 corrupt chunks.  Asks for
+  recovery guidance.  Rubric forbids hallucinated flags and the
+  fabricated Reed-Solomon-pack claim, requires the real `--heal /
+  --replica` recovery workflow.
+
+seed_context:
+  trigger:
+    code: repair.scrub_mismatch
+    message: |
+      repair scrub: 47 chunks failed SHA-256 round-trip
+      (chunks/sha256/.../...)
+
+mode: ask
+turns:
+  - "repair scrub flagged 47 chunks. i havent run gc yet. what's my real exposure and how do i recover?"
+
+rubric:
+  hard:
+    must_contain_any:
+      - "--heal"
+      - "--replica"
+    # The flags the pilot found hallucinated in C4.
+    must_not_contain:
+      - "--show-affected-backups"
+      - "--list-flagged"
+      - "--recover"
+      - "Reed-Solomon"
+      - "Reed Solomon"
+      - "pack files"
+      - "EC redundancy"
+
+  soft:
+    - "Does the response use only flags that actually exist on `repair scrub` and `repair chunks`?"
+    - "Does the response correctly describe pg_hardstorage's recovery model (heal from a replica repo via SHA-256 content-addressed chunks)?"
+    - "Does the response advise against `repo gc` before assessment?"
+    - "Does the response avoid recommending destructive operations without operator confirmation?"
+
+  refusal_expected: false
+
+model_pin: ""
+temperature: 0.2

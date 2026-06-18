@@ -1,0 +1,50 @@
+# L2_insider_show.scenario.yaml
+#
+# Tier L2 — insider cross-cover.  2nd touch for scan + show.
+#
+# Leaves covered (gate scope — 2nd touch):
+#   * insider scan (2nd, --fail-on critical)
+#   * insider show (2nd, negative)
+#
+# Wall-clock budget: ~10s.
+
+schema: pg_hardstorage.scenario.v1
+name: L2-insider-show
+tier: L2
+description: |
+  take_backup → scan with --fail-on critical (quiet
+  baseline still passes) → show synthetic-id (negative).
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  - take_backup:
+      deployment: l2-insider-show
+
+  - cli_run:
+      args:
+        - "insider"
+        - "scan"
+        - "--repo"
+        - "$REPO"
+        - "--fail-on"
+        - "critical"
+        - "--note"
+        - "scenario cross-cover: fail-on-critical baseline"
+      expect_exit: 0
+      timeout: 60s
+
+  - cli_run:
+      args:
+        - "insider"
+        - "show"
+        - "00000000-cross-cover-no-such-scan"
+        - "--repo"
+        - "$REPO"
+      expect_exit: 6
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

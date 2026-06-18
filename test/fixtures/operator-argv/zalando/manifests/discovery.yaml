@@ -1,0 +1,168 @@
+# discovery.yaml — bring up MinIO + a Zalando postgresql CRD
+# pointing at it, using the spilo-argv-recorder image so every
+# wal-g invocation lands a PGHS_ARGV_FIXTURE NDJSON line on
+# stderr (kubectl logs).
+#
+# Apply with:
+#
+#   kubectl apply -f test/fixtures/operator-argv/zalando/manifests/discovery.yaml
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: argv-discovery-zalando
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: minio-creds
+  namespace: argv-discovery-zalando
+type: Opaque
+stringData:
+  AWS_ACCESS_KEY_ID: minio
+  AWS_SECRET_ACCESS_KEY: minio12345
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: minio
+  namespace: argv-discovery-zalando
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: minio }
+  template:
+    metadata:
+      labels: { app: minio }
+    spec:
+      containers:
+        - name: minio
+          image: minio/minio:RELEASE.2024-12-18T13-15-44Z
+          args: ["server", "/data", "--console-address", ":9001"]
+          env:
+            - name: MINIO_ROOT_USER
+              valueFrom:
+                secretKeyRef: { name: minio-creds, key: AWS_ACCESS_KEY_ID }
+            - name: MINIO_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: minio-creds, key: AWS_SECRET_ACCESS_KEY }
+          ports:
+            - { containerPort: 9000, name: api }
+          volumeMounts:
+            - { name: data, mountPath: /data }
+      volumes:
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: minio
+  namespace: argv-discovery-zalando
+spec:
+  selector: { app: minio }
+  ports: [{ port: 9000, name: api }]
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: minio-mkbucket
+  namespace: argv-discovery-zalando
+spec:
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: mc
+          image: minio/mc:RELEASE.2024-11-21T17-21-54Z
+          envFrom: [{ secretRef: { name: minio-creds } }]
+          command:
+            - sh
+            - -c
+            - |
+              set -eux
+              for i in $(seq 1 60); do
+                  if mc alias set m http://minio:9000 "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY"; then
+                      break
+                  fi
+                  sleep 2
+              done
+              mc mb -p m/spilo-backups || true
+              mc ls m/
+---
+# Service account + cluster-admin for the Spilo pods (Zalando's
+# operator generates a per-cluster SA but it needs RBAC; the
+# minimal default in zalando-system isn't enough on minikube).
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: postgres-pod
+  namespace: argv-discovery-zalando
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: postgres-pod
+  namespace: argv-discovery-zalando
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: postgres-pod
+subjects:
+  - { kind: ServiceAccount, name: postgres-pod, namespace: argv-discovery-zalando }
+---
+# The Zalando postgresql CRD.  Uses the recorder image as the
+# pod's docker_image; wal-g invocations write fixture NDJSON
+# to stderr.  WAL-G credentials and S3 endpoint come from the
+# Spilo env-var convention (WAL_S3_BUCKET, AWS_ENDPOINT, ...).
+apiVersion: acid.zalan.do/v1
+kind: postgresql
+metadata:
+  name: zalando-discovery
+  namespace: argv-discovery-zalando
+spec:
+  teamId: "argvdiscovery"
+  dockerImage: "docker.io/pg-hardstorage/spilo-argv-recorder:17"
+  numberOfInstances: 1
+  postgresql:
+    version: "17"
+  volume:
+    size: 1Gi
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
+  users:
+    app: []
+  databases:
+    app: app
+  env:
+    # Spilo's wal-g uses these env vars (WAL_S3_BUCKET, AWS_*).
+    # Setting them switches Spilo into wal-g mode for archiving.
+    - name: USE_WALG_BACKUP
+      value: "true"
+    - name: USE_WALG_RESTORE
+      value: "true"
+    - name: WAL_S3_BUCKET
+      value: "spilo-backups"
+    - name: AWS_ENDPOINT
+      value: "http://minio.argv-discovery-zalando.svc.cluster.local:9000"
+    - name: AWS_REGION
+      value: "us-east-1"
+    - name: AWS_S3_FORCE_PATH_STYLE
+      value: "true"
+    - name: AWS_ACCESS_KEY_ID
+      valueFrom:
+        secretKeyRef: { name: minio-creds, key: AWS_ACCESS_KEY_ID }
+    - name: AWS_SECRET_ACCESS_KEY
+      valueFrom:
+        secretKeyRef: { name: minio-creds, key: AWS_SECRET_ACCESS_KEY }
+    # Also disable WAL-E entirely so Spilo's archive_command
+    # doesn't fall back to it when wal-g returns the recorder's
+    # exec-success.
+    - name: BACKUP_SCHEDULE
+      value: "*/3 * * * *"   # backup every 3 min — fast cycle for capture

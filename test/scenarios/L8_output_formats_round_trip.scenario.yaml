@@ -1,0 +1,73 @@
+# L8_output_formats_round_trip.scenario.yaml
+#
+# Tier L8 — every read-only command supports `-o
+# <format>` for json | text | ndjson | yaml | template |
+# csv | markdown | html | tap | junit | pdf.  Operators
+# script around these formats (e.g. `repo audit -o
+# yaml` feeding a CI config), so a regression that
+# silently broke any one format would silently break the
+# operator's downstream tooling without surfacing in the
+# happy-path scenarios.
+#
+# This scenario sweeps the four most-used formats (json,
+# text, ndjson, yaml) across three commands (repo audit,
+# repo usage, audit summary).  Twelve invocations total,
+# each must exit 0 and produce non-empty output.
+#
+# What this catches:
+#   * Format-renderer regressions: a refactor that
+#     accidentally dropped one of the formats from one
+#     of the commands.
+#   * Output-format-agnostic streaming: ndjson and
+#     yaml output must be valid for the entire stream,
+#     not just the first record.  A buggy renderer that
+#     produced valid JSON for the first event then
+#     truncated would still exit 0 and show in stdout
+#     here — we don't structurally validate the bytes
+#     in this scenario; that's the unit tests'
+#     responsibility.  The gate is "command exits 0
+#     with non-empty stdout."
+#
+# Wall-clock budget: ~3 minutes (1 GB seed + 1 backup +
+# 12 fast cli_run probes).
+schema: pg_hardstorage.scenario.v1
+name: L8-output-formats-round-trip
+tier: L8
+description: |
+  Sweep -o json / text / ndjson / yaml across repo audit,
+  repo usage, and audit summary.  All 12 invocations
+  must exit 0 with non-empty output.
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  - seed:
+      target_gb: 1
+
+  - take_backup:
+      deployment: l8-output-formats
+      name: only_backup
+
+  # repo audit
+  - cli_run: { args: ["repo", "audit", "$REPO", "-o", "json"],    timeout: 30s }
+  - cli_run: { args: ["repo", "audit", "$REPO", "-o", "text"],    timeout: 30s }
+  - cli_run: { args: ["repo", "audit", "$REPO", "-o", "ndjson"],  timeout: 30s }
+  - cli_run: { args: ["repo", "audit", "$REPO", "-o", "yaml"],    timeout: 30s }
+
+  # repo usage
+  - cli_run: { args: ["repo", "usage", "$REPO", "-o", "json"],   timeout: 30s }
+  - cli_run: { args: ["repo", "usage", "$REPO", "-o", "text"],   timeout: 30s }
+  - cli_run: { args: ["repo", "usage", "$REPO", "-o", "ndjson"], timeout: 30s }
+  - cli_run: { args: ["repo", "usage", "$REPO", "-o", "yaml"],   timeout: 30s }
+
+  # audit summary
+  - cli_run: { args: ["audit", "summary", "--repo", "$REPO", "-o", "json"],   timeout: 30s }
+  - cli_run: { args: ["audit", "summary", "--repo", "$REPO", "-o", "text"],   timeout: 30s }
+  - cli_run: { args: ["audit", "summary", "--repo", "$REPO", "-o", "ndjson"], timeout: 30s }
+  - cli_run: { args: ["audit", "summary", "--repo", "$REPO", "-o", "yaml"],   timeout: 30s }
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

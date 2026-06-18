@@ -1,0 +1,97 @@
+# L2_insider_scan.scenario.yaml
+#
+# Tier L2 — insider-anomaly scan: `insider scan | show`.
+# Walks the audit chain looking for unusual operator-activity
+# patterns (e.g. a spike in destructive ops by one principal
+# vs the baseline).
+#
+# Headline property: scan exits 0 against a quiet baseline
+# (no findings) and persists a scan record; show retrieves
+# the record by ID.
+#
+# Leaves covered (gate scope):
+#   * insider scan
+#   * insider show
+#
+# Wall-clock budget: ~10s.
+
+schema: pg_hardstorage.scenario.v1
+name: L2-insider-scan
+tier: L2
+description: |
+  take_backup (emits audit events) → insider scan (default
+  windows) → scan with --tenant filter → show against a
+  synthetic id (negative).
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  - take_backup:
+      deployment: l2-insider-scan
+
+  # 1. scan with defaults.  The audit chain has only this
+  # scenario's events; no anomaly to flag, exit 0.
+  # --fail-on=none keeps the exit code at 0 regardless of
+  # severity (otherwise scan flips to exit 9 on findings
+  # >= warning).
+  - cli_run:
+      args:
+        - "insider"
+        - "scan"
+        - "--repo"
+        - "$REPO"
+        - "--fail-on"
+        - "none"
+        - "--note"
+        - "scenario probe: quiet baseline"
+      expect_exit: 0
+      timeout: 60s
+
+  # 2. scan with --tenant filter.
+  - cli_run:
+      args:
+        - "insider"
+        - "scan"
+        - "--repo"
+        - "$REPO"
+        - "--tenant"
+        - "default"
+        - "--fail-on"
+        - "none"
+      expect_exit: 0
+      timeout: 60s
+
+  # 3. scan with --spike-factor + --target/--baseline
+  # exercises the windowing flags.
+  - cli_run:
+      args:
+        - "insider"
+        - "scan"
+        - "--repo"
+        - "$REPO"
+        - "--target"
+        - "1h"
+        - "--baseline"
+        - "24h"
+        - "--spike-factor"
+        - "10"
+        - "--fail-on"
+        - "none"
+      expect_exit: 0
+      timeout: 60s
+
+  # 4. Negative show: synthetic id.
+  - cli_run:
+      args:
+        - "insider"
+        - "show"
+        - "00000000-no-such-insider-scan"
+        - "--repo"
+        - "$REPO"
+      expect_exit: 6
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

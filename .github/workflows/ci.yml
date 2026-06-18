@@ -1,0 +1,779 @@
+# CI — runs on every push and PR.
+#
+# Jobs are split so a unit-test failure is visible without waiting on
+# the (slower) integration suite, and so we can require the cheap gates
+# (vet, lint, race-tests) on PRs while running the full matrix nightly.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags-ignore: ["v*"]   # release.yml owns tag pushes
+  pull_request:
+    branches: [main]
+
+# Cancel in-progress runs for the same ref — a force-push or rebase
+# shouldn't burn CI minutes on the discarded history.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: "1.26.4"
+
+jobs:
+  vet:
+    name: vet + fmt
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - run: go vet ./...
+      - name: gofmt
+        run: |
+          out=$(gofmt -s -l . 2>&1)
+          if [ -n "$out" ]; then
+            echo "gofmt -s -l reports:"
+            echo "$out"
+            exit 1
+          fi
+
+  build:
+    name: build
+    runs-on: ubuntu-24.04
+    needs: [vet]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - run: make build build-testkit
+
+  # End-to-end smoke test for the docker-compose evaluation
+  # stack (issues #89 + #93).  Both reports came from this stack
+  # and only surface at `docker compose up` time, so the Go unit
+  # tests can't catch them:
+  #
+  #   #89  a distroless `sh -c` entrypoint → `exec "sh": ... not
+  #        found`, and then an image-pull `unauthorized` because
+  #        the eval stack referenced the release-gated, private
+  #        GHCR image.
+  #   #93  the agent crash-looped with config.no_deployments
+  #        because PG_HARDSTORAGE_CONFIG was ignored by a stale
+  #        published image.
+  #
+  # This job runs the real stack — building the image from source
+  # (the #89 follow-up), so it never depends on a released/public
+  # GHCR image — and asserts the three things a fresh
+  # `docker compose up` must do:
+  #   * the minio-init + repo-init one-shots exit 0,
+  #   * the agent loads the inline deployment (it logs its
+  #     startup event and never logs config.no_deployments), and
+  #   * the agent does not crash-loop (RestartCount stays put
+  #     across a settle window).
+  #
+  # Docker + compose v2 are preinstalled on ubuntu-24.04; no
+  # registry credentials are needed because the image is built
+  # locally from this checkout.
+  eval-stack:
+    name: eval-stack (docker compose)
+    runs-on: ubuntu-24.04
+    needs: [vet]
+    timeout-minutes: 15
+    env:
+      # Deterministic container names regardless of the checkout
+      # directory, so the inspect calls below don't guess.
+      COMPOSE_PROJECT_NAME: pgh
+    steps:
+      - uses: actions/checkout@v4
+      - name: build + start the eval stack
+        run: docker compose up -d --build
+      - name: assert the stack boots and the agent loads the deployment
+        run: |
+          set -uo pipefail
+          agent="pgh-pg_hardstorage-1"
+
+          dump() { echo "=== compose ps ==="; docker compose ps -a; echo "=== agent logs ==="; docker compose logs pg_hardstorage 2>&1 | tail -60; }
+
+          # 1. Both one-shots must reach exited(0).  repo-init is the
+          #    #89 canary: it runs the pg_hardstorage binary directly
+          #    (no shell) against the freshly-created bucket.
+          for svc in minio-init repo-init; do
+            c="pgh-${svc}-1"
+            deadline=$((SECONDS + 180))
+            while :; do
+              state=$(docker inspect -f '{{.State.Status}}' "$c" 2>/dev/null || echo missing)
+              [ "$state" = "exited" ] && break
+              if [ "$SECONDS" -ge "$deadline" ]; then
+                echo "::error::${svc} did not exit within 180s (state=${state})"; dump; exit 1
+              fi
+              sleep 3
+            done
+            code=$(docker inspect -f '{{.State.ExitCode}}' "$c")
+            if [ "$code" != "0" ]; then
+              echo "::error::${svc} exited non-zero (code=${code})"; docker compose logs "$svc"; exit 1
+            fi
+            echo "${svc}: exited 0 OK"
+          done
+
+          # 2. The agent must be running and must NOT have logged the
+          #    issue #93 error.
+          state=$(docker inspect -f '{{.State.Status}}' "$agent" 2>/dev/null || echo missing)
+          if [ "$state" != "running" ]; then
+            echo "::error::agent is not running (state=${state})"; dump; exit 1
+          fi
+          # The agent emits its startup event asynchronously, a moment
+          # after the container reports "running" — poll for it rather
+          # than checking once, or a slow runner races the first log
+          # flush and the one-shot grep spuriously fails.
+          deadline=$((SECONDS + 60))
+          until docker compose logs pg_hardstorage 2>&1 | grep -q '"op": "starting"'; do
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "::error::agent never emitted its startup event within 60s — config may not have loaded"; dump; exit 1
+            fi
+            sleep 2
+          done
+          if docker compose logs pg_hardstorage 2>&1 | grep -q "config.no_deployments"; then
+            echo "::error::agent logged config.no_deployments — issue #93 regression"; dump; exit 1
+          fi
+
+          # 3. The agent must not crash-loop.  config.no_deployments
+          #    (or any startup error) makes the restart:unless-stopped
+          #    agent exit and respawn, climbing RestartCount.
+          r1=$(docker inspect -f '{{.RestartCount}}' "$agent")
+          sleep 25
+          r2=$(docker inspect -f '{{.RestartCount}}' "$agent")
+          state=$(docker inspect -f '{{.State.Status}}' "$agent")
+          if [ "$r2" -gt "$r1" ] || [ "$state" != "running" ]; then
+            echo "::error::agent is crash-looping (restarts ${r1}->${r2}, state=${state})"; dump; exit 1
+          fi
+          echo "agent: running, restarts stable at ${r2}, no config.no_deployments OK"
+      - name: assert the metrics endpoint is reachable and scraped (issue #98)
+        run: |
+          set -uo pipefail
+
+          dump() { echo "=== compose ps ==="; docker compose ps -a; echo "=== agent logs ==="; docker compose logs pg_hardstorage 2>&1 | tail -60; echo "=== prometheus logs ==="; docker compose logs prometheus 2>&1 | tail -40; }
+
+          # 1. The agent must announce its metrics bind in its event
+          #    stream (the listener logs a notice with the address).
+          if ! docker compose logs pg_hardstorage 2>&1 | grep -q '"op": "listening"'; then
+            echo "::error::agent never logged the metrics listener 'listening' event — --metrics-listen not wired (issue #98)"; dump; exit 1
+          fi
+
+          # 2. The agent's /metrics must be reachable from the host on
+          #    the published port and carry a real pg_hardstorage_*
+          #    sample (build_info is published at listener start, so it
+          #    is present even before the first backup).
+          deadline=$((SECONDS + 60))
+          until curl -fsS http://localhost:9187/metrics 2>/dev/null | grep -q '^pg_hardstorage_build_info'; do
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "::error::GET :9187/metrics never returned pg_hardstorage_build_info (issue #98)"; dump; exit 1
+            fi
+            sleep 2
+          done
+          echo "agent /metrics: reachable on :9187 with pg_hardstorage_* samples OK"
+
+          # 3. Prometheus must discover the agent target as 'up'.
+          deadline=$((SECONDS + 90))
+          until curl -fsS 'http://localhost:9090/api/v1/query?query=up%7Bjob%3D%22pg_hardstorage_agent%22%7D' 2>/dev/null | grep -q '"value":\[[^]]*,"1"\]'; do
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "::error::Prometheus never reported the pg_hardstorage_agent target as up (issue #98)"; dump; exit 1
+            fi
+            sleep 3
+          done
+          echo "prometheus: pg_hardstorage_agent target up OK"
+      - name: dump logs on failure
+        if: failure()
+        run: docker compose logs --no-color 2>&1 | tail -200 || true
+      - name: tear down
+        if: always()
+        run: docker compose down -v || true
+
+  # CLI-coverage gate — every cobra leaf must be exercised
+  # by ≥1 scenario YAML under test/scenarios/ (or live in
+  # .testkit/cli_coverage_allowlist.txt with a documented
+  # reason).  Catches new subcommands landing without a
+  # scenario.  See `testkit coverage cli --help`.
+  cli-coverage:
+    name: cli coverage gate
+    runs-on: ubuntu-24.04
+    needs: [build]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - run: make build build-testkit
+      - run: ./bin/pg_hardstorage_testkit coverage cli
+
+  # Windows cross-compile gate — issue #11.  We build the
+  # CLI + every operator-facing binary for windows/amd64
+  # AND windows/arm64 to catch a regression the moment a
+  # Linux-only syscall slips into a shared package.  Tests
+  # don't run here (the test suite assumes systemd / unix
+  # signals / docker); a smoke-test job under runs-on:
+  # windows-2022 can be added once the operator surface is
+  # stable enough to warrant it.  Vet runs first so a
+  # type / import drift surfaces with the same message it
+  # would on Linux.
+  build-windows:
+    name: build (windows/${{ matrix.arch }})
+    runs-on: ubuntu-24.04
+    needs: [vet]
+    timeout-minutes: 6
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - name: vet for windows
+        env:
+          GOOS: windows
+          GOARCH: ${{ matrix.arch }}
+        run: go vet ./internal/... ./cmd/...
+      - name: cross-compile
+        env:
+          GOOS: windows
+          GOARCH: ${{ matrix.arch }}
+          CGO_ENABLED: "0"
+        run: |
+          mkdir -p out/windows
+          go build -trimpath -ldflags='-s -w' -o out/windows/pg_hardstorage.exe ./cmd/pg_hardstorage
+          go build -trimpath -ldflags='-s -w' -o out/windows/pg_hardstorage_testkit.exe ./cmd/pg_hardstorage_testkit
+          go build -trimpath -ldflags='-s -w' -o out/windows/pg-hardstorage-pgbackrest.exe ./cmd/pg-hardstorage-pgbackrest
+          go build -trimpath -ldflags='-s -w' -o out/windows/pg-hardstorage-barman.exe ./cmd/pg-hardstorage-barman
+          go build -trimpath -ldflags='-s -w' -o out/windows/pg-hardstorage-barman-wal-archive.exe ./cmd/pg-hardstorage-barman-wal-archive
+          go build -trimpath -ldflags='-s -w' -o out/windows/pg-hardstorage-walg.exe ./cmd/pg-hardstorage-walg
+          go build -trimpath -ldflags='-s -w' -o out/windows/pg-hardstorage-compat.exe ./cmd/pg-hardstorage-compat
+          ls -lh out/windows
+      - name: upload binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: pg_hardstorage-windows-${{ matrix.arch }}-${{ github.sha }}
+          path: out/windows/*.exe
+          retention-days: 7
+
+  # Build-tagged variants get their own per-PR smoke job so
+  # the file-level //go:build pkcs11 / firecracker source
+  # paths are at least syntax-and-type-checked on every PR.
+  # Without this gate, a refactor touching the build-tagged
+  # files could land on main and only surface when an
+  # operator tries to build the FIPS / HSM artifact —
+  # exactly the F2 finding from v27 audit.
+  #
+  # The SDK deps for these variants don't live in the
+  # default go.mod (they would otherwise pollute the
+  # CGO_ENABLED=0 production graph).  We `go get` them on
+  # the runner, then `go vet` (rather than full build) —
+  # vet is enough to catch unused imports, type errors,
+  # and SDK API drift, and skips the linkage step that
+  # would need libpkcs11 / KVM headers on the runner.
+  build-tags:
+    name: build-tags (${{ matrix.tag }})
+    runs-on: ubuntu-24.04
+    needs: [vet]
+    timeout-minutes: 6
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - tag: pkcs11
+            sdk: github.com/miekg/pkcs11
+          - tag: firecracker
+            sdk: github.com/firecracker-microvm/firecracker-go-sdk
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - name: install SDK dep + vet
+        # PKCS#11 needs CGO + libltdl-dev for cgo to find the
+        # PKCS#11 toolchain headers; firecracker is pure-Go so
+        # the install step is harmless when the matrix tag is
+        # firecracker.
+        run: |
+          if [ "${{ matrix.tag }}" = "pkcs11" ]; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq libltdl-dev
+            export CGO_ENABLED=1
+          fi
+          go get ${{ matrix.sdk }}
+          go vet -tags ${{ matrix.tag }} ./...
+      - name: build the variant binary
+        # Restore the on-disk go.mod from the tree before
+        # building, so the artefact build's go.mod matches
+        # what an operator with the dep installed would see.
+        # We don't commit go.mod / go.sum changes from CI.
+        run: |
+          if [ "${{ matrix.tag }}" = "pkcs11" ]; then
+            export CGO_ENABLED=1
+          fi
+          make build-${{ matrix.tag }}
+
+  test:
+    name: test (race)
+    runs-on: ubuntu-24.04
+    needs: [vet]
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - run: go test -race -count=1 -timeout=10m ./...
+
+  restore-correctness:
+    # L6 of the restore-correctness defence stack — a fast
+    # per-PR end-to-end gate that exercises the full
+    # backup → restore round-trip with L1 (Manifest.Validate)
+    # + L2 (in-process pg_verifybackup) + L3 (postverify
+    # cluster-start smoke) + L7 (assert_restored_match strict).
+    #
+    # Matrix over every supported sink: file:// (no emulator),
+    # MinIO (S3), Azurite (Azure), atmoz/sftp (SFTP),
+    # fake-gcs-server (GCS).  A regression in any storage
+    # plugin's backup/restore round-trip fails the matching
+    # cell before merge.
+    #
+    # postgresql-client is required for the strict
+    # assert_restored_match step — without it the scenario
+    # hard-fails by design (the soft-skip path is exactly
+    # what let issue #7 ship).
+    name: restore correctness (${{ matrix.sink }})
+    runs-on: ubuntu-24.04
+    needs: [build]
+    timeout-minutes: 12
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - sink: file
+            scenario: test/scenarios/L3_restore_correctness.scenario.yaml
+          - sink: s3-minio
+            scenario: test/scenarios/L3_restore_correctness_s3.scenario.yaml
+          - sink: azurite
+            scenario: test/scenarios/L3_restore_correctness_azurite.scenario.yaml
+          - sink: sftp
+            scenario: test/scenarios/L3_restore_correctness_sftp.scenario.yaml
+          - sink: gcs-fake
+            scenario: test/scenarios/L3_restore_correctness_gcs-fake.scenario.yaml
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - name: install postgresql-client
+        # pg_ctl + psql + pg_dumpall + pgbench live in the
+        # contrib package on Debian/Ubuntu.  Required for
+        # the strict gate; without it the scenario hard-
+        # fails (which is what we want — the reverse of
+        # the soft-skip path that let issue #7 ship).
+        # ssh-keyscan ships with openssh-client; needed
+        # for the SFTP sink's per-instance known_hosts
+        # generation.
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq postgresql-client postgresql-contrib openssh-client
+      - name: build binaries
+        run: make build build-testkit
+      - name: pre-pull sink images (offline run from here)
+        if: matrix.sink != 'file'
+        run: |
+          ./bin/pg_hardstorage_testkit image pull-sinks --only=${{ matrix.sink }}
+      - name: run scenario
+        env:
+          PG_HARDSTORAGE_BIN: ${{ github.workspace }}/bin/pg_hardstorage
+        run: |
+          mkdir -p test-runs
+          ./bin/pg_hardstorage_testkit scenario run \
+              ${{ matrix.scenario }} \
+              --artefact-dir test-runs/ci-${{ matrix.sink }}-${{ github.run_id }}
+      - name: upload artefacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: restore-correctness-${{ matrix.sink }}-${{ github.run_id }}
+          path: test-runs/ci-${{ matrix.sink }}-${{ github.run_id }}
+          if-no-files-found: ignore
+          retention-days: 7
+
+  test-integration:
+    # Per-PR integration matrix.  Every supported PG major
+    # (15 / 16 / 17 / 18) gets its own cell so a major-specific
+    # regression (e.g. PG 17 incremental, PG 18 wal_summarize)
+    # is visible at PR time, not at release time.
+    #
+    # PG 18 is currently allowed-to-fail per the SPEC (newer than
+    # mainline release cycle); we still run the cell so our
+    # readiness for PG 18 is observable.  The continue-on-error
+    # flag is per-cell, not job-wide — a 15/16/17 failure still
+    # blocks the PR.
+    name: test (integration, PG ${{ matrix.pg }})
+    runs-on: ubuntu-24.04
+    needs: [vet]
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: ["15", "16", "17", "18"]
+        include:
+          - pg: "15"
+            allow_failure: false
+          - pg: "16"
+            allow_failure: false
+          - pg: "17"
+            allow_failure: false
+          - pg: "18"
+            allow_failure: true
+    continue-on-error: ${{ matrix.allow_failure }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      # Docker is preinstalled on ubuntu-24.04 runners; testcontainers
+      # uses /var/run/docker.sock directly. We pin the PG major across
+      # all *_test.go integration targets via the env var so the
+      # matrix cell is meaningful — otherwise every cell would test
+      # the same image.
+      - name: integration suite
+        env:
+          PG_HARDSTORAGE_TEST_PG_MAJOR: ${{ matrix.pg }}
+        run: make test-integration
+
+  lint:
+    name: golangci-lint
+    runs-on: ubuntu-24.04
+    needs: [vet]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - uses: golangci/golangci-lint-action@v7
+        with:
+          # golangci-lint went from v1.64.8 straight to v2.0.0 (no
+          # v1.65 ever existed).  The action's default install-mode
+          # downloads a PREBUILT binary; every v2.x prebuilt up
+          # through v2.12.x was compiled with go1.24 and crashes
+          # at config-load time when go.mod targets go1.26:
+          #
+          #   Error: can't load config: the Go language version
+          #   (go1.24) used to build golangci-lint is lower than
+          #   the targeted Go version (1.26)
+          #
+          # install-mode: goinstall rebuilds golangci-lint from
+          # source using the actions/setup-go Go (1.26.3 above), so
+          # the binary the runner uses tracks our toolchain
+          # automatically.  Picks up future Go bumps for free.
+          install-mode: goinstall
+          version: v2.5
+          # Don't fail the run on findings until the lint baseline is
+          # stable — start by surfacing them, then promote to a hard
+          # gate once the report is empty on main.
+          args: --timeout=5m --issues-exit-code=0
+
+  govulncheck:
+    # Hard gate (v0.4+). govulncheck reports only on reachable
+    # vulnerable code paths — a transitive dep with a CVE that we
+    # never call into doesn't fail CI. That makes it a better signal
+    # than Dependabot for "is the binary actually exposed?".
+    #
+    # govulncheck exit codes are how we keep this a HARD gate for real
+    # findings while tolerating a tool bug: 0 = clean, 3 = reachable
+    # vulnerability (still a release blocker), and 1/2 = tooling error.
+    # As of Go 1.26 + golang.org/x/tools v0.46.0, source-mode analysis
+    # PANICS ("ForEachElement called on type containing *types.TypeParam",
+    # element.go:130) — a generics/Go-1.26 incompatibility in the tool,
+    # not a vulnerability in this codebase. The wrapper below treats
+    # exit 3 as fatal and a non-3 crash as a warning, so a real CVE
+    # still fails CI but the tool's own panic doesn't.
+    # REVERT to a plain `govulncheck ./...` (failing on any non-zero)
+    # once x/tools ships a Go-1.26-compatible release.
+    name: govulncheck
+    runs-on: ubuntu-24.04
+    needs: [vet]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - name: install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+      # -mode=source (default) walks the call graph so we only flag
+      # vulnerable code that's actually reachable. The build tag adds
+      # the integration suite to the surface so reachability there
+      # is checked too.
+      - name: govulncheck (default tags)
+        run: |
+          set +e
+          govulncheck -show=verbose ./...
+          rc=$?
+          set -e
+          if [ "$rc" -eq 3 ]; then
+            echo "::error::govulncheck found reachable vulnerabilities"
+            exit 3
+          fi
+          if [ "$rc" -ne 0 ]; then
+            echo "::warning::govulncheck exited $rc without a vuln verdict — known x/tools panic on Go 1.26; non-blocking until the tool supports Go 1.26"
+          fi
+      - name: govulncheck (integration tag)
+        run: |
+          set +e
+          govulncheck -show=verbose -tags=integration ./...
+          rc=$?
+          set -e
+          if [ "$rc" -eq 3 ]; then
+            echo "::error::govulncheck found reachable vulnerabilities (integration tag)"
+            exit 3
+          fi
+          if [ "$rc" -ne 0 ]; then
+            echo "::warning::govulncheck exited $rc without a vuln verdict (integration tag) — known x/tools panic on Go 1.26; non-blocking until the tool supports Go 1.26"
+          fi
+
+  packaging-lint:
+    name: packaging artefacts
+    runs-on: ubuntu-24.04
+    needs: [vet]
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck packaging scripts
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq shellcheck
+          # Debian maintainer scripts are short shell — we want them
+          # lintian-clean before we ever ship a .deb.
+          shellcheck -s sh debian/pg-hardstorage.postinst \
+                          debian/pg-hardstorage.prerm \
+                          debian/pg-hardstorage.postrm
+          # The top-level compile.sh is the user-facing
+          # one-shot build script; we hold it to the bash
+          # dialect (since it uses `set -u` + arrays) and
+          # gate against the same lint baseline.
+          shellcheck -s bash compile.sh
+      # Install helm via the official setup action — fetches the
+      # release tarball straight from GitHub.  The previous shape
+      # added baltocdn's apt repo, which DNS-fails on the GHA
+      # runner intermittently ("Could not resolve host:
+      # baltocdn.com") and tanked the whole packaging-lint job
+      # before it ever reached the chart.
+      - name: install helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.16.4
+      - name: helm lint
+        run: helm lint charts/pg-hardstorage-sidecar
+
+  api-spec-lint:
+    # Validate the OpenAPI 3.1 spec + the .proto definitions are
+    # syntactically clean.  These are the v1 contract for tooling
+    # (CNPG-I provider, WAL-G shim, custom dispatch); we want CI
+    # to block a malformed spec before any client SDK is generated
+    # from it.
+    name: api spec lint
+    runs-on: ubuntu-24.04
+    needs: [vet]
+    steps:
+      - uses: actions/checkout@v4
+      # setup-go pins the toolchain to the workflow's pinned
+      # version AND prepends $(go env GOPATH)/bin to GITHUB_PATH;
+      # without it, `go install` lands vacuum under
+      # $HOME/go/bin which isn't on the runner's default PATH,
+      # so the next step exited 127 (command not found).
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - name: install vacuum (OpenAPI linter)
+        # vacuum is a Go-based, fast OpenAPI 3 linter — no node
+        # toolchain pulled in just for this gate.
+        run: go install github.com/daveshanley/vacuum@v0.13.0
+      - name: vacuum lint api/openapi.yaml
+        # The standard rule set covers the contract checks we care
+        # about (every operation has an operationId, every response
+        # body declares its content type, refs resolve, etc.).
+        # vacuum's hard-mode pulls in OWASP rules which would fail
+        # 170+ checks on this spec; we can layer those in once the
+        # base set is green.
+        #
+        # `--errors` silences warnings/info in the output so a CI
+        # log focused on "what failed" stays readable.
+        # `--fail-severity=error` is the default but pinned here so
+        # a future vacuum version flipping the default doesn't
+        # surprise the gate.
+        run: |
+          vacuum lint --details --no-banner --errors --fail-severity=error api/openapi.yaml
+      - name: install protoc + buf
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq protobuf-compiler
+          curl -sSL https://github.com/bufbuild/buf/releases/download/v1.50.0/buf-Linux-x86_64 -o /usr/local/bin/buf
+          chmod +x /usr/local/bin/buf
+      - name: buf lint proto/
+        # buf catches the common "additive must be backward-compatible"
+        # mistakes Tier-2 plugin authors will make against our protos.
+        # Hard-fail on FILE-level issues; warn on PACKAGE-level.
+        run: |
+          cd proto
+          # buf.yaml-less invocation: walk every .proto and call
+          # protoc with the standard well-known imports.
+          for f in $(find . -name '*.proto'); do
+            protoc --proto_path=. --proto_path=/usr/include "$f" -o /dev/null
+          done
+
+  debian-package:
+    # Build the .deb in CI and gate on lintian-clean.  The
+    # packaging-lint job above already shellchecks the maintainer
+    # scripts; this job exercises the full dpkg-buildpackage path
+    # and gates on `lintian -i -E -I`.  Hard-fail on E (errors)
+    # and W (warnings); information is allowed.
+    #
+    # Note: piuparts (install/upgrade/purge cycle) is the SPEC-
+    # required next step — it requires sudo + a rootfs image and
+    # is too heavy for a per-PR CI job.  Runs in the L4 weekly
+    # tier of the testkit per docs/SPEC.md; this job is the L1
+    # smoke-gate.
+    name: debian package (lintian-clean)
+    runs-on: ubuntu-24.04
+    needs: [build]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - name: install build deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            build-essential debhelper devscripts dh-golang lintian \
+            dh-make fakeroot
+      - name: dpkg-buildpackage
+        # -us -uc: don't sign the .changes / .dsc; CI doesn't have
+        # a release key.  -b: binary-only build; -d: don't run
+        # build-deps check (we installed them above).
+        run: |
+          dpkg-buildpackage -us -uc -b -d 2>&1 | tail -50
+          ls -la ../*.deb
+      - name: lintian
+        # -i: show issue tags; -E: hide experimental tags; -I: show
+        # info messages; --pedantic: fail on every warning.  The
+        # debian/pg-hardstorage.lintian-overrides file documents
+        # any deliberately suppressed tags.
+        run: |
+          set -e
+          for deb in ../*.deb; do
+            echo "=== lintian $deb ==="
+            lintian -i -E -I --pedantic --fail-on warning "$deb"
+          done
+
+  rpm-package:
+    # Parallel L1 smoke gate for the RPM packaging path.  The
+    # spec lives at packaging/rpm/pg_hardstorage.spec; we
+    # build a source tarball + invoke rpmbuild inside a
+    # Fedora container so the build environment matches what
+    # downstream Fedora/EPEL maintainers see.
+    #
+    # Gates on `rpmlint`'s warnings + errors; informational
+    # tags are allowed.  The L4 weekly tier (packaging-
+    # weekly.yml) already covers piuparts for the .deb path;
+    # an equivalent yum / dnf install/upgrade/erase cycle for
+    # the RPM path will land alongside the rpm registry
+    # upload work.
+    name: rpm package (rpmlint-clean)
+    runs-on: ubuntu-24.04
+    needs: [build]
+    container: fedora:40
+    steps:
+      - uses: actions/checkout@v4
+      - name: install build deps
+        # Fedora 40's `golang` package is 1.22; the spec requires
+        # >= 1.26 and our code uses features from 1.24+.  Pull Go
+        # 1.26 straight from go.dev (same toolchain the rest of the
+        # CI matrix uses) and prepend /usr/local/go/bin to PATH so
+        # the rpmbuild step uses it.  The spec's
+        # `BuildRequires: golang >= 1.26` is checked against the
+        # rpmdb, not against PATH; rpmbuild is invoked with
+        # `--nodeps` in the next step so the check is skipped (we
+        # already verified go availability above).
+        run: |
+          dnf install -y -q rpm-build rpmlint git make tar curl systemd-rpm-macros >/dev/null
+          curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" \
+              | tar -C /usr/local -xz
+          /usr/local/go/bin/go version
+          echo "/usr/local/go/bin" >> "$GITHUB_PATH"
+      - name: prepare source tarball
+        # rpmbuild expects a tarball at the layout the spec's
+        # %autosetup line consumes.  We produce
+        # pg_hardstorage-<version>.tar.gz from the working
+        # tree.
+        #
+        # Inside the fedora:40 container, GHA runs steps with
+        # HOME=/github/home for the github user.  rpmbuild's
+        # _topdir default is `~/rpmbuild`, which expands to
+        # /github/home/rpmbuild here — NOT /root/rpmbuild.
+        # Earlier this step staged under /root/rpmbuild and
+        # rpmbuild then couldn't find the tarball ("error: File
+        # /github/home/rpmbuild/SOURCES/...: No such file").  Use
+        # $HOME consistently so prep + rpmbuild agree.
+        env:
+          NAME: pg_hardstorage
+        run: |
+          set -e
+          VER=$(awk '/^Version:/ {print $2}' packaging/rpm/${NAME}.spec)
+          mkdir -p "$HOME/rpmbuild/SOURCES" "$HOME/rpmbuild/SPECS"
+          # Stage the working tree under <name>-<ver>/ so
+          # %autosetup -n %{name}-%{version} finds it.
+          STAGE=$(mktemp -d)
+          cp -a . "$STAGE/${NAME}-${VER}"
+          tar -C "$STAGE" -czf "$HOME/rpmbuild/SOURCES/${NAME}-${VER}.tar.gz" \
+              --exclude='.git' \
+              --exclude='/site/' \
+              --exclude='/.venv/' \
+              --exclude='/bin/' \
+              "${NAME}-${VER}"
+          cp packaging/rpm/${NAME}.spec "$HOME/rpmbuild/SPECS/"
+      - name: rpmbuild
+        # -bb: binary-only build.  --nodeps skips the
+        # BuildRequires check against rpmdb — the spec's
+        # `golang >= 1.26` is satisfied by the /usr/local/go
+        # install in the previous step, which rpmbuild doesn't
+        # see in the rpmdb but the build itself uses fine via
+        # the PATH we set up.  Surface the last 80 lines of
+        # build log so a failed %check / %install is visible
+        # without scrolling through the prep noise.
+        run: |
+          set -e
+          rpmbuild --nodeps -bb "$HOME/rpmbuild/SPECS/pg_hardstorage.spec" 2>&1 | tail -80
+          find "$HOME/rpmbuild/RPMS" -name '*.rpm' -ls
+      - name: rpmlint
+        # `-i`: human-readable explanations.  We accept
+        # informational tags (`I:` lines) for the initial
+        # rollout; promote to fail-on-info once the package
+        # is clean.  Hard-fail on errors and warnings.
+        run: |
+          set -e
+          for rpm in $(find "$HOME/rpmbuild/RPMS" -name '*.rpm'); do
+            echo "=== rpmlint $rpm ==="
+            rpmlint -i "$rpm"
+          done

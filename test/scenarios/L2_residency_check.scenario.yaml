@@ -1,0 +1,90 @@
+# L2_residency_check.scenario.yaml
+#
+# Tier L2 — residency cross-cover.  2nd touch for set /
+# check / clear with multi-region policies.
+#
+# Leaves covered (gate scope — 2nd touch):
+#   * residency set (2nd, 3 regions)
+#   * residency check (2nd)
+#   * residency clear (2nd)
+#
+# Wall-clock budget: ~10s.
+
+schema: pg_hardstorage.scenario.v1
+name: L2-residency-check
+tier: L2
+description: |
+  Register a deployment → set a 3-region policy → check
+  → re-set narrower policy → check → clear → re-check.
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  - cli_run:
+      args:
+        - "deployment"
+        - "add"
+        - "l2-residency-check"
+        - "--repo"
+        - "$REPO"
+        - "--connection"
+        - "$PG_CONN"
+        - "--skip-probe"
+        - "--yes"
+      expect_exit: 0
+
+  # 1. 3-region policy.
+  - cli_run:
+      args:
+        - "residency"
+        - "set"
+        - "l2-residency-check"
+        - "eu-central-1"
+        - "eu-west-1"
+        - "eu-north-1"
+      expect_exit: 0
+
+  - cli_run:
+      args:
+        - "residency"
+        - "check"
+        - "l2-residency-check"
+      expect_exit: 9
+
+  # 2. Re-set to narrower policy.
+  - cli_run:
+      args:
+        - "residency"
+        - "set"
+        - "l2-residency-check"
+        - "eu-central-1"
+      expect_exit: 0
+
+  - cli_run:
+      args:
+        - "residency"
+        - "check"
+        - "l2-residency-check"
+      expect_exit: 9
+
+  # 3. Clear.
+  - cli_run:
+      args:
+        - "residency"
+        - "clear"
+        - "l2-residency-check"
+      expect_exit: 0
+
+  - cli_run:
+      args:
+        - "deployment"
+        - "remove"
+        - "l2-residency-check"
+        - "--yes"
+      expect_exit: 0
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

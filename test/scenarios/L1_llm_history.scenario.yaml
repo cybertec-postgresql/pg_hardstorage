@@ -1,0 +1,103 @@
+# L1_llm_history.scenario.yaml
+#
+# Tier L1 — llm history + session cross-cover.  2nd touch
+# for ask / explain / export-session / history list-show-
+# shred; also covers `llm chat` in non-interactive form
+# (chat with --help so the leaf is exercised without an
+# interactive REPL).
+#
+# Why `llm chat --help`: chat is a REPL — interactive by
+# design — and the scenario runner has no way to feed
+# stdin to a child process or send EOF.  --help proves the
+# command is wired (cobra parses, RunE preflight runs)
+# without entering the REPL loop.
+#
+# Leaves covered (gate scope — 2nd touch + chat):
+#   * llm chat (--help form)
+#   * llm ask (2nd, different model)
+#   * llm explain (2nd, different command)
+#   * llm history list / show / shred (2nd)
+#   * llm export-session (2nd, negative)
+#
+# Wall-clock budget: ~10s.
+
+schema: pg_hardstorage.scenario.v1
+name: L1-llm-history
+tier: L1
+description: |
+  llm chat --help → ask / explain (2nd) → history list /
+  show / shred (2nd) → export-session (2nd, negative).
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  - cli_run:
+      args:
+        - "llm"
+        - "chat"
+        - "--help"
+      expect_exit: 0
+
+  - cli_run:
+      args:
+        - "llm"
+        - "ask"
+        - "explain WAL streaming"
+        - "--provider"
+        - "mock"
+        - "--model"
+        - "mock-fast"
+      expect_exit: 0
+
+  - cli_run:
+      args:
+        - "llm"
+        - "explain"
+        - "pg_hardstorage repo gc"
+        - "--provider"
+        - "mock"
+      expect_exit: 0
+
+  - cli_run:
+      args:
+        - "llm"
+        - "history"
+        - "list"
+        - "--principal"
+        - "scenario-probe"
+      expect_exit: 1
+
+  - cli_run:
+      args:
+        - "llm"
+        - "history"
+        - "show"
+        - "00000000-cross-cover-no-such-id"
+        - "--principal"
+        - "scenario-probe"
+      expect_exit: 1
+
+  - cli_run:
+      args:
+        - "llm"
+        - "history"
+        - "shred"
+        - "--yes"
+        - "--principal"
+        - "scenario-probe"
+      expect_exit: 1
+
+  - cli_run:
+      args:
+        - "llm"
+        - "export-session"
+        - "00000000-cross-cover-no-such-session"
+        - "--repo"
+        - "$REPO"
+      expect_exit: 6
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

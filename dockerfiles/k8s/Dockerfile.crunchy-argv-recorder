@@ -1,0 +1,43 @@
+# Dockerfile.crunchy-argv-recorder — Crunchy postgres overlay
+# that swaps pgbackrest for argv-recorder.  Same shape as the
+# CNPG and Spilo recorder images.
+#
+# Crunchy publishes images with full version tags (no rolling
+# major-only tag); the default below pins to the verified
+# ubi9-17.5-2520.  Override with --build-arg CRUNCHY_PG_IMAGE=...
+# for a different release.
+
+# Global ARGs (before any FROM) — visible to FROM lines, must
+# be redeclared inside each stage to be visible in RUN.
+ARG CRUNCHY_PG_VERSION=17
+ARG CRUNCHY_PG_IMAGE=registry.developers.crunchydata.com/crunchydata/crunchy-postgres:ubi9-${CRUNCHY_PG_VERSION}.5-2520
+
+# ---------- Stage 1: build the recorder binary ------------------
+FROM golang:1.26-alpine AS builder
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY dockerfiles/k8s/argv-recorder/ ./dockerfiles/k8s/argv-recorder/
+RUN CGO_ENABLED=0 go build \
+        -trimpath -ldflags '-s -w' \
+        -o /out/argv-recorder ./dockerfiles/k8s/argv-recorder
+
+# ---------- Stage 2: Crunchy overlay ----------------------------
+FROM ${CRUNCHY_PG_IMAGE}
+ARG CRUNCHY_PG_VERSION
+ARG CRUNCHY_PG_IMAGE
+
+USER root
+
+# Crunchy ships pgbackrest at /usr/bin/pgbackrest (verified on
+# ubi9-17.5-2520).  Move aside; drop the recorder in.
+RUN if [ -f /usr/bin/pgbackrest ]; then \
+        mv /usr/bin/pgbackrest /usr/bin/pgbackrest.real; \
+    fi
+
+COPY --from=builder --chmod=0755 /out/argv-recorder /usr/bin/pgbackrest
+
+LABEL pg_hardstorage.compat_shim="crunchy-argv-recorder" \
+      pg_hardstorage.upstream_image="${CRUNCHY_PG_IMAGE}"
+
+USER 26

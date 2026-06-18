@@ -1,0 +1,112 @@
+# Release — fires on tag push (v*).
+#
+# Builds reproducible binaries via goreleaser, generates SBOMs via syft,
+# signs everything via cosign keyless (Sigstore OIDC against the GitHub
+# Actions OIDC issuer), publishes a GitHub Release with attached
+# checksums + .deb + .rpm, and pushes container images to GHCR.
+#
+# We don't publish to package registries (distro repos,
+# Helm chart repo) from this workflow — that's a manual step gated on
+# manual review of the release notes. goreleaser's GitHub Release is
+# the authoritative artefact source.
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write       # create the GitHub Release
+  packages: write       # push images to GHCR
+  id-token: write       # cosign keyless via OIDC
+
+env:
+  GO_VERSION: "1.26.4"
+
+jobs:
+  goreleaser:
+    name: goreleaser
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0       # goreleaser needs full history for changelog
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - name: install cosign
+        uses: sigstore/cosign-installer@v3
+      - name: install syft (SBOM)
+        uses: anchore/sbom-action/download-syft@v0
+      - name: docker login (GHCR)
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: goreleaser
+        id: goreleaser
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          version: latest
+          # --skip=docker: GHCR package-write is not yet enabled on the
+          # org, so the image+manifest push fails with
+          # `denied: permission_denied: write_package` — and that
+          # failure aborts goreleaser's whole publish phase, taking the
+          # binaries/.deb/.rpm/GitHub Release down with it. Skipping
+          # docker lets the rest of the release ship; drop this flag
+          # once the org grants Actions package-write and re-tag to
+          # publish the image. (--skip=docker covers docker_manifests
+          # too; there is no separate manifest skip key.)
+          args: release --clean --skip=docker
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Capture the goreleaser-emitted artifact list as JSON so the
+      # SLSA generator can compute checksums for the binaries +
+      # archives + .deb + .rpm.  goreleaser writes this to
+      # dist/artifacts.json by default.
+      - name: collect artifact metadata
+        id: collect-artifacts
+        run: |
+          # subject-checksums maps to the SLSA generator's expected
+          # input shape: a base64-encoded text blob, one
+          # "<sha256>  <filename>" line per artifact.
+          checksums=$(cd dist && sha256sum *.tar.gz *.zip *.deb *.rpm 2>/dev/null | base64 -w0 || true)
+          if [ -z "$checksums" ]; then
+            echo "no artifacts to attest"
+            exit 0
+          fi
+          echo "subject-checksums=$checksums" >> "$GITHUB_OUTPUT"
+    outputs:
+      subject-checksums: ${{ steps.collect-artifacts.outputs.subject-checksums }}
+
+  # SLSA Level 3 build provenance.  The reusable generator is
+  # documented at https://github.com/slsa-framework/slsa-github-generator.
+  # It runs on a separate, locked-down GitHub-hosted runner that has
+  # access to OIDC but NOT the goreleaser-built artifacts directly —
+  # that's the SLSA L3 isolation invariant.  The generator signs
+  # the provenance keylessly via Sigstore + uploads the
+  # ".intoto.jsonl" attestation to the same GitHub Release.
+  #
+  # Verifying a release post-hoc:
+  #   slsa-verifier verify-artifact \
+  #       --provenance-path pg_hardstorage_<ver>_linux_amd64.intoto.jsonl \
+  #       --source-uri github.com/cybertec-postgresql/pg_hardstorage \
+  #       --source-tag v0.7.0 \
+  #       pg_hardstorage_<ver>_linux_amd64.tar.gz
+  slsa-provenance:
+    name: SLSA L3 provenance
+    needs: [goreleaser]
+    if: needs.goreleaser.outputs.subject-checksums != ''
+    permissions:
+      actions: read       # required for SLSA L3 isolation
+      id-token: write     # OIDC token for keyless signing
+      contents: write     # upload the .intoto.jsonl to the Release
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.0.0
+    with:
+      base64-subjects: "${{ needs.goreleaser.outputs.subject-checksums }}"
+      upload-assets: true
+      provenance-name: pg_hardstorage.intoto.jsonl

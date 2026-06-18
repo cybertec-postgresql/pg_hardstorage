@@ -1,0 +1,29 @@
+apiVersion: v2
+name: pg-hardstorage-sidecar
+description: |
+  pg_hardstorage host agent for Kubernetes. Deploys a single
+  StatefulSet replica that backs up an external PostgreSQL
+  cluster reachable from the cluster network. Use this chart
+  when you operate Postgres outside Kubernetes (managed RDS /
+  CloudSQL, bare metal, VMs) and want backups, WAL streaming,
+  and PITR coordinated from a Kubernetes-native workload.
+type: application
+version: 0.1.1
+appVersion: "0.1.1"
+kubeVersion: ">= 1.24.0-0"
+home: https://github.com/cybertec-postgresql/pg_hardstorage
+sources:
+  - https://github.com/cybertec-postgresql/pg_hardstorage
+maintainers:
+  - name: Hans-Jürgen Schönig
+    email: hs@cybertec.at
+keywords:
+  - postgresql
+  - postgres
+  - backup
+  - wal
+  - pitr
+  - cybertec
+icon: https://raw.githubusercontent.com/cybertec-postgresql/pg_hardstorage/main/docs/assets/logo.png
+annotations:
+  category: Database

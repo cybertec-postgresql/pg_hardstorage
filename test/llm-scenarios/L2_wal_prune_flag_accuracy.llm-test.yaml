@@ -1,0 +1,72 @@
+# L2_wal_prune_flag_accuracy.llm-test.yaml
+#
+# Distilled from pilot run 20260513T183938Z (case C5).  The
+# diagnostic framework (missing base backup / stalled slot / WAL
+# gaps) is correct, but the flag-level recommendations are wrong:
+#
+#   `wal stream --reset-slot`  — no such flag (real: --no-reconnect, --no-slot, --start-lsn)
+#   `repo audit --wal`         — no --wal flag (real: --no-storage --no-chain --no-approvals)
+#
+# Reference truth (verified against `pg_hardstorage wal stream
+# --help` and `repo audit --help` at 2026-05-13):
+#
+#   wal stream  : --slot --start-lsn --pg-connection --repo
+#                 --no-reconnect --no-slot --no-inactivity-timeout --skip-preflight
+#                 --status-interval --inactivity-timeout --max-reconnect-backoff
+#                 --once
+#   repo audit  : --repo --deployment --no-storage --no-chain --no-approvals
+#
+# Real path to "WAL not being pruned":
+#   wal gaps --repo <url>            list gap records
+#   wal prune (dry-run / --apply)    actually prune
+#   recovery readiness <deployment>  why prune is held back
+#   wal repair                       recreate slot if missing
+# The streamer slot is healed by `wal repair` (alias of `repair
+# slot`), not by an imaginary `--reset-slot` flag.
+
+schema: pg_hardstorage.llm-test.v1
+name: L2-wal-prune-flag-accuracy
+tier: L2
+description: |
+  Operator's WAL directory is growing unbounded and prune isn't
+  reclaiming.  Rubric forbids invented `wal stream --reset-slot`
+  and `repo audit --wal` flags, requires the real diagnostic
+  toolchain (wal gaps / recovery readiness / wal repair).
+
+seed_context:
+  trigger:
+    code: wal.prune_blocked
+    message: |
+      repo wal/ directory: 800 GB, growing 40 GB/day
+      streamer: up
+      last pruned: N/A
+  state:
+    deployment_size_gb: 500
+    last_base_backup_age_h: 720
+
+mode: ask
+turns:
+  - "my repo's wal/ directory is at 800GB and growing 40GB/day. the streamer is up. why isnt prune reclaiming?"
+
+rubric:
+  hard:
+    must_contain_any:
+      - "wal gaps"
+      - "wal prune"
+      - "recovery readiness"
+      - "wal repair"
+    must_not_contain:
+      - "--reset-slot"
+      - "repo audit --wal"
+      - "--wal "
+
+  soft:
+    - "Does the response name `wal gaps`, `wal prune`, or `recovery readiness` for diagnosis?"
+    - "Does the response avoid inventing flags on `wal stream` or `repo audit`?"
+    - "Does the response correctly explain why WAL is pinned (oldest restore target + active slot restart_lsn)?"
+    - "Does the response suggest taking a fresh base backup if the last one is old, before manually expiring WAL?"
+
+  refusal_expected: false
+
+model_pin: ""
+temperature: 0.2

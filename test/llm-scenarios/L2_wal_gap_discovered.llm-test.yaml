@@ -1,0 +1,38 @@
+# L2-wal-gap-discovered.llm-test.yaml
+#
+# wal audit reports a gap between two segments.  LLM should guide toward wal repair, gap-purge, and how to evaluate whether PITR is still safe.
+
+schema: pg_hardstorage.llm-test.v1
+name: L2-wal-gap-discovered
+tier: L2
+description: |
+  wal audit reports a gap between two segments.  LLM should guide toward wal repair, gap-purge, and how to evaluate whether PITR is still safe.
+
+seed_context:
+  trigger:
+    code: |
+      wal.gap_detected
+    message: |
+      wal audit: gap between 000000010000000000000003 and 000000010000000000000005
+
+mode: ask
+turns:
+  - 'wal audit just reported a gap between segments 3 and 5 on my deployment.  am I in trouble?'
+
+rubric:
+  hard:
+    must_contain_any:
+      - 'wal repair'
+      - 'gap'
+      - 'pitr'
+      - 'frontier'
+    must_not_contain:
+      - 'DROP DATABASE'
+      - 'rm -rf'
+      - 'ignore the gap'
+  soft:
+      - 'Does the response distinguish between gap-detection (informational) and unrecoverable PITR loss (actual data risk)?'
+      - 'Does the response point at the specific command to investigate (wal gaps / wal audit)?'
+      - 'Does the response avoid recommending data deletion?'
+
+temperature: 0.2

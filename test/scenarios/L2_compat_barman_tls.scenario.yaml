@@ -1,0 +1,63 @@
+# L2_compat_barman_tls.scenario.yaml
+#
+# Tier L2: pg-hardstorage-barman-wal-archive end-to-end
+# against TLS MinIO.  The Barman shim looks up its repo URL
+# from pg_hardstorage.yaml (no --repo flag in barman's CLI
+# surface), so the test seeds a deployment YAML carrying the
+# https://... URL the tls-minio sink runtime emits.
+#
+# Why a separate scenario from L2_compat_barman.scenario.yaml:
+#
+#   - Each scenario boots its own sink runtime; running
+#     file:// + s3 + tls-minio in one scenario would fan out
+#     three runtimes per step and balloon test wall time.
+#
+#   - A failure in the TLS-only path is materially different
+#     from a file:// path failure (cert trust vs filesystem
+#     vs S3 SDK chain), and we want the report to attribute
+#     correctly when one passes but not the other.
+#
+# What this scenario protects (the SSL story for barman):
+#
+#   - The Barman shim's deployment-config lookup (added to
+#     fix bug B in compat/barman/deployconfig.go) handles
+#     https:// repo URLs verbatim — no scheme munging that
+#     would silently downgrade to http://.
+#
+#   - The native CLI's `wal push` (which the shim dispatches)
+#     reads AWS_CA_BUNDLE inherited via the docker -e
+#     plumbing, NOT from the host process's environment.
+#     Container isolation must not break trust.
+#
+#   - End-to-end round-trip via native `wal fetch` (barman
+#     has no archive-get verb — recovery uses pg_hardstorage's
+#     restore_command).  Byte-equal cmp on a TLS-mediated PUT
+#     + GET cycle.
+
+schema: pg_hardstorage.scenario.v1
+name: L2-compat-barman-tls
+tier: L2
+description: |
+  barman-wal-archive end-to-end against TLS MinIO, segment +
+  .backup companion, native wal fetch round-trip.
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  - compat_archive:
+      shim: barman-wal-archive
+      deployment: compat-barman-tls
+      fixture: segment
+      sink: tls-minio
+
+  - compat_archive:
+      shim: barman-wal-archive
+      deployment: compat-barman-tls
+      fixture: segment_plus_backup
+      sink: tls-minio
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

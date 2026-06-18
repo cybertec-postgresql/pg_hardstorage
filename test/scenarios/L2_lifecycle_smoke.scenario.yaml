@@ -1,0 +1,164 @@
+# L2_lifecycle_smoke.scenario.yaml
+#
+# Tier 2 — lifecycle command smoke.  A single scenario that
+# walks every read-only-or-dry-run lifecycle CLI surface and
+# asserts they all exit cleanly against a populated repo.
+#
+# Why this matters: these commands (schedule, notify, doctor,
+# repair, gameday, runbook, rotate, repo audit) are operator
+# workflow primitives.  Unit tests prove each surface emits
+# valid output in isolation; this scenario proves they all work
+# end-to-end against a real repo with a real backup, without
+# side effects (everything here is read-only or default-dry-run).
+#
+# What gets exercised:
+#
+#   * doctor         — host/repo/PG diagnostics scorecard
+#   * repo audit     — repo-level integrity walk
+#   * schedule       — list configured per-deployment schedules
+#   * notify list    — list configured notify sinks
+#   * repair chunks  — chunk reachability scan (dry-run default)
+#   * repair index   — chunk inventory walk (read-only)
+#   * gameday list   — registered chaos scenarios
+#   * runbook list   — registered disaster runbooks
+#   * runbook generate — render a runbook to disk (one file write
+#                        under artefactDir, otherwise read-only)
+#   * rotate         — retention dry-run (no --apply)
+#
+# Pass criterion: every command exits 0 with structured JSON.
+# A regression in any one surfaces as that step's exit code.
+#
+# Wall-clock budget: ~15s.
+
+schema: pg_hardstorage.scenario.v1
+name: L2-lifecycle-smoke
+tier: L2
+description: |
+  Workflow-primitive smoke: walk every read-only / dry-run
+  lifecycle surface against a populated repo via cli_run.
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  # Setup: take a backup so commands that walk the repo
+  # (repo audit, repair index, rotate) have something
+  # non-empty to scan.
+  - take_backup:
+      deployment: l2-lifecycle-smoke
+
+  # 1. doctor — host/repo/PG scorecard.  Read-only.
+  - cli_run:
+      args: ["doctor", "$DEPLOYMENT", "--output", "json"]
+      expect_exit: 0
+      expect_stdout_contains: "schema"
+
+  # 2. repo audit — repo-level integrity walk against the
+  # populated repo.  Read-only.
+  - cli_run:
+      args:
+        - "repo"
+        - "audit"
+        - "--repo"
+        - "$REPO"
+        - "--output"
+        - "json"
+      expect_exit: 0
+
+  # 3. schedule (no args) — fleet-wide list of configured
+  # backup + rotate schedules.  Empty config is fine; the
+  # invariant is "command exits 0 with structured output".
+  - cli_run:
+      args: ["schedule", "--output", "json"]
+      expect_exit: 0
+
+  # 4. notify list — configured notification sinks.  An
+  # empty list is the expected initial state.
+  - cli_run:
+      args: ["notify", "list", "--output", "json"]
+      expect_exit: 0
+
+  # 5. repair chunks --orphans — chunk reachability scan.
+  # Reports chunks not referenced by any manifest.  Default
+  # is dry-run (no --apply); --orphans / --missing are the
+  # required mode selectors per the repair-chunks contract
+  # ("pass exactly one of --orphans or --missing").  A
+  # populated repo with one full backup whose manifest
+  # references every chunk should report zero orphans.
+  - cli_run:
+      args:
+        - "repair"
+        - "chunks"
+        - "--orphans"
+        - "--repo"
+        - "$REPO"
+        - "--output"
+        - "json"
+      expect_exit: 0
+
+  # 5b. repair chunks --missing — the inverse mode: report
+  # any manifest that references a chunk no longer on disk.
+  # Should also be zero on a freshly-taken backup.
+  - cli_run:
+      args:
+        - "repair"
+        - "chunks"
+        - "--missing"
+        - "--repo"
+        - "$REPO"
+        - "--output"
+        - "json"
+      expect_exit: 0
+
+  # 6. repair index — read-only chunk inventory walk.
+  # Counts chunks under chunks/sha256/, no mutation.
+  - cli_run:
+      args:
+        - "repair"
+        - "index"
+        - "--repo"
+        - "$REPO"
+        - "--output"
+        - "json"
+      expect_exit: 0
+
+  # 7. gameday list — registered chaos-automation scenarios.
+  # Read-only registry walk.
+  - cli_run:
+      args: ["gameday", "list", "--output", "json"]
+      expect_exit: 0
+
+  # 8. runbook list — registered disaster-runbook templates
+  # (R1-R7 in docs/SPEC.md).  Read-only.
+  - cli_run:
+      args: ["runbook", "list", "--output", "json"]
+      expect_exit: 0
+
+  # 9. runbook generate is intentionally skipped here.
+  # It requires the deployment to be defined in
+  # pg_hardstorage.yaml even when --repo overrides the
+  # repo URL (the command pulls Patroni / control-plane
+  # / sink config from the deployment block).  Adding
+  # config-file fixtures to the scenario harness is its
+  # own project — for now `runbook list` (step 8) covers
+  # the read-only-registry surface and we defer the
+  # render-with-config check to the unit-test layer.
+
+  # 10. rotate — retention dry-run.  Default GFS policy.
+  # No --apply means classify-only, no soft-deletes.
+  # With one backup the policy keeps it as the
+  # daily/weekly/monthly/yearly bucket leader.
+  - cli_run:
+      args:
+        - "rotate"
+        - "$DEPLOYMENT"
+        - "--repo"
+        - "$REPO"
+        - "--output"
+        - "json"
+      expect_exit: 0
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

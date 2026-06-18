@@ -1,0 +1,108 @@
+# L8_repo_bundle_export_smoke.scenario.yaml
+#
+# Tier L8 — `repo bundle export` produces an
+# air-gap-transportable .tar of the deployment's
+# manifests + chunks + (optionally) WAL.  Used for
+# moving backups across security boundaries (e.g. from
+# a high-side production repo into an investigator's
+# isolated environment) without needing network
+# access between the two.
+#
+# This scenario pins the export-side contract:
+#   1. After a 3-backup chain, `repo bundle export
+#      --deployment X --out <path>` produces a non-
+#      empty .tar.
+#   2. `repo bundle export --backup-id <specific>`
+#      narrows to one manifest; output is smaller.
+#   3. `--include-wal` augments the bundle with WAL
+#      segments listed in each manifest's wal_required.
+#
+# Import-side verification (round-trip into a fresh
+# repo + restore from the imported bundle) is left to
+# a future scenario — that path needs a second repo URL
+# in scenario state, which the runner doesn't expose
+# as a placeholder today.
+#
+# Wall-clock budget: ~3 minutes (1 GB seed + 3 backups +
+# 3 export probes).
+schema: pg_hardstorage.scenario.v1
+name: L8-repo-bundle-export-smoke
+tier: L8
+description: |
+  3 backups → repo bundle export (all backups) →
+  export --backup-id (specific backup) →
+  export --include-wal.  All three produce a non-empty
+  .tar.
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  - seed:
+      target_gb: 1
+
+  - take_backup:
+      deployment: l8-bundle-export
+      name: backup_1
+
+  - take_backup:
+      deployment: l8-bundle-export
+      name: backup_2
+
+  - take_backup:
+      deployment: l8-bundle-export
+      name: backup_3
+
+  # Export every live backup for the deployment.
+  - cli_run:
+      args:
+        - "repo"
+        - "bundle"
+        - "export"
+        - "--repo"
+        - "$REPO"
+        - "--deployment"
+        - "$DEPLOYMENT"
+        - "--out"
+        - "$ARTEFACT_DIR/bundle-all.tar"
+      timeout: 60s
+
+  # Export a specific backup-id.  Output is smaller
+  # than the all-backups bundle above (it's only one
+  # manifest's worth of chunks).
+  - cli_run:
+      args:
+        - "repo"
+        - "bundle"
+        - "export"
+        - "--repo"
+        - "$REPO"
+        - "--deployment"
+        - "$DEPLOYMENT"
+        - "--backup-id"
+        - "$LAST_BACKUP"
+        - "--out"
+        - "$ARTEFACT_DIR/bundle-one.tar"
+      timeout: 60s
+
+  # Export with --include-wal so the bundle is
+  # self-contained for PITR up to the latest backup's
+  # end-LSN.
+  - cli_run:
+      args:
+        - "repo"
+        - "bundle"
+        - "export"
+        - "--repo"
+        - "$REPO"
+        - "--deployment"
+        - "$DEPLOYMENT"
+        - "--include-wal"
+        - "--out"
+        - "$ARTEFACT_DIR/bundle-with-wal.tar"
+      timeout: 60s
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

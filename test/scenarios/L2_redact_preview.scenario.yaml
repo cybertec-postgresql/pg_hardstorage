@@ -1,0 +1,78 @@
+# L2_redact_preview.scenario.yaml
+#
+# Tier L2 — redact preview cross-cover.  2nd touch for
+# redact apply / preview / classify set, with different
+# inputs.
+#
+# Leaves covered (gate scope — 2nd touch):
+#   * redact preview (2nd)
+#   * redact apply (2nd, different salt)
+#   * classify set (2nd, different level)
+#
+# Wall-clock budget: ~10s.
+
+schema: pg_hardstorage.scenario.v1
+name: L2-redact-preview
+tier: L2
+description: |
+  preview rules → apply --print-sql with different salt
+  → register a deployment with a different classify level.
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  - cli_run:
+      args:
+        - "redact"
+        - "preview"
+        - "--rules"
+        - "test/scenarios/fixtures/redact_rules.yaml"
+      expect_exit: 0
+
+  # Different salt → different hashes; proves the salt
+  # plumbing reaches the SQL generator.
+  - cli_run:
+      args:
+        - "redact"
+        - "apply"
+        - "--rules"
+        - "test/scenarios/fixtures/redact_rules.yaml"
+        - "--print-sql"
+        - "--salt-hex"
+        - "deadbeefcafef00d1234567890abcdef"
+      expect_exit: 0
+
+  - cli_run:
+      args:
+        - "deployment"
+        - "add"
+        - "l2-redact-2"
+        - "--repo"
+        - "$REPO"
+        - "--connection"
+        - "$PG_CONN"
+        - "--skip-probe"
+        - "--yes"
+      expect_exit: 0
+
+  - cli_run:
+      args:
+        - "classify"
+        - "set"
+        - "l2-redact-2"
+        - "internal"
+      expect_exit: 0
+
+  - cli_run:
+      args:
+        - "deployment"
+        - "remove"
+        - "l2-redact-2"
+        - "--yes"
+      expect_exit: 0
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

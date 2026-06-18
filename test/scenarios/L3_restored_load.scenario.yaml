@@ -1,0 +1,70 @@
+# L3_restored_load.scenario.yaml
+#
+# Tier L3: the "does PG actually start and serve traffic
+# post-restore" gate.  Existing L2 scenarios prove the
+# manifest matches the bytes (pg_verifybackup) and the
+# byte-equality of the restored datadir vs a captured
+# checksum (assert_restored_match).  Neither catches:
+#
+#   - Byte-perfect datadir that PG refuses to start
+#     (postgresql.conf references a missing user,
+#     recovery.signal malformed, control file inconsistent
+#     post-promote).
+#   - PG starts but serves errors on every query (catalog
+#     corruption that survives initdb, broken statistics,
+#     missing FSM/VM files).
+#   - Material performance regression (restored bloat,
+#     empty hint-bit cache).
+#
+# This scenario does the simplest possible end-to-end
+# check: take a backup, restore it, boot the restored
+# datadir in a postgres:<version> sandbox container, run
+# pgbench against it for 30 seconds, assert no failed
+# transactions.
+
+schema: pg_hardstorage.scenario.v1
+name: L3-restored-load
+tier: L3
+description: |
+  Full backup → restore → restored_load round-trip.  The
+  restored_load step boots the restored datadir in a
+  fresh sandbox container and runs pgbench against it,
+  asserting no SQL errors.
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  # Seed via pgbench -i so the restored_load step has
+  # pgbench_accounts / pgbench_branches / pgbench_tellers
+  # tables to run the standard TPC-B-like mix against.
+  # 1 GB is small but enough to make the load test
+  # meaningful; bigger seeds slow down the L3 budget
+  # without changing what the test pins.
+  - seed:
+      target_gb: 1
+
+  # Take a full backup with WAL inline so the restore
+  # doesn't need a wal_stream sidecar — the L3 budget
+  # keeps the scenario hermetic.
+  - take_backup:
+      deployment: l3-restored-load
+
+  - restore:
+      deployment: l3-restored-load
+
+  # The actual gate: boot the restored datadir, run
+  # pgbench against it, assert clean.  30s is enough to
+  # exercise the standard TPC-B-like mix; 4 clients
+  # generates measurable load without stressing the
+  # docker host.  Pin error_tolerance: 0 — any failed
+  # transaction is a real bug worth surfacing.
+  - restored_load:
+      duration: 30s
+      pgbench_clients: 4
+      pgbench_error_tolerance: 0
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

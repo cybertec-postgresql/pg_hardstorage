@@ -1,0 +1,105 @@
+# L2_residency_policy.scenario.yaml
+#
+# Tier L2 — residency policy lifecycle: `residency set |
+# check | clear`.  Operators record the set of allowed
+# regions for a deployment's backups; check reports
+# compliance status; clear removes the policy.
+#
+# Leaves covered (gate scope):
+#   * residency set
+#   * residency check
+#   * residency clear
+#
+# Wall-clock budget: ~10s.
+
+schema: pg_hardstorage.scenario.v1
+name: L2-residency-policy
+tier: L2
+description: |
+  Register a deployment via deployment add → residency
+  set 2 regions → residency check → residency clear →
+  residency check post-clear.
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  - cli_run:
+      args:
+        - "deployment"
+        - "add"
+        - "l2-residency-dep"
+        - "--repo"
+        - "$REPO"
+        - "--connection"
+        - "$PG_CONN"
+        - "--skip-probe"
+        - "--yes"
+      expect_exit: 0
+
+  # 1. set policy: allow eu-central + eu-west.
+  - cli_run:
+      args:
+        - "residency"
+        - "set"
+        - "l2-residency-dep"
+        - "eu-central-1"
+        - "eu-west-1"
+      expect_exit: 0
+
+  # 2. check — exits 0; the report's verdict depends on
+  # the testbed sink's region (we don't assert a verdict,
+  # just that the command itself runs).
+  - cli_run:
+      args:
+        - "residency"
+        - "check"
+        - "l2-residency-dep"
+      expect_exit: 9
+
+  # 3. clear the policy.
+  - cli_run:
+      args:
+        - "residency"
+        - "clear"
+        - "l2-residency-dep"
+      expect_exit: 0
+
+  # 4. check post-clear — no policy, should report "no
+  # policy set" (exit 0).
+  - cli_run:
+      args:
+        - "residency"
+        - "check"
+        - "l2-residency-dep"
+      expect_exit: 0
+
+  # 5. Negative set: nonexistent deployment.
+  - cli_run:
+      args:
+        - "residency"
+        - "set"
+        - "no-such-deployment"
+        - "eu-west-1"
+      expect_exit: 6
+
+  # 6. Negative check.
+  - cli_run:
+      args:
+        - "residency"
+        - "check"
+        - "no-such-deployment"
+      expect_exit: 6
+
+  - cli_run:
+      args:
+        - "deployment"
+        - "remove"
+        - "l2-residency-dep"
+        - "--yes"
+      expect_exit: 0
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

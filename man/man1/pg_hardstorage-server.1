@@ -1,0 +1,142 @@
+.nh
+.TH "PG_HARDSTORAGE" "1" "May 2026" "pg_hardstorage Manual" "pg_hardstorage Manual"
+
+.SH NAME
+.PP
+pg_hardstorage-server - Run the control plane
+
+
+.SH SYNOPSIS
+.PP
+\fBpg_hardstorage server [flags]\fP
+
+
+.SH DESCRIPTION
+.PP
+Run the pg_hardstorage control plane.
+
+.PP
+v0.1 cut: HTTP/REST listener with mTLS + bearer-token auth, an
+in-memory agent registry, repo-walking handlers for deployments +
+backups. adds the PostgreSQL-backed job registry: pass
+--coord-backend pg --coord-dsn 'postgres://...' to persist dispatch
+state across restarts and to run multiple control planes against the
+same database (FOR UPDATE SKIP LOCKED gives atomic claims).
+
+.PP
+The control plane never uses an embedded database (no SQLite, no
+BoltDB). State is either in-memory (default) or in a PostgreSQL the
+operator already runs.
+
+.PP
+Endpoints (all under /v1/):
+
+.PP
+GET  /healthz                            (no auth)
+  GET  /readyz                             (no auth; per-repo reachability)
+  GET  /version
+  GET  /deployments
+  GET  /deployments//backups
+  GET  /agents [?include_inactive=true]
+  POST /agents/heartbeat
+
+.PP
+The flags below override the config file's server: block. Use
+--config to point at a YAML; flag overrides win.
+
+
+.SH OPTIONS
+.PP
+\fB--client-ca\fP=""
+	client CA bundle (enables mTLS with verify)
+
+.PP
+\fB--coord-backend\fP="memory"
+	coordination backend for jobs: memory (default, ephemeral) | pg (persistent, multi-instance HA)
+
+.PP
+\fB--coord-dsn\fP=""
+	PostgreSQL DSN when --coord-backend pg (postgres://user:pass@host/db?sslmode=...)
+
+.PP
+\fB-h\fP, \fB--help\fP[=false]
+	help for server
+
+.PP
+\fB--listen\fP="127.0.0.1:8443"
+	bind address (host:port)
+
+.PP
+\fB--max-concurrent-jobs\fP=0
+	cap on jobs running at once across the fleet (0 = unlimited; backpressure so a burst can't storm storage/PostgreSQL). For multi-control-plane HA set the same value on every instance.
+
+.PP
+\fB--repo\fP=[]
+	repository URL to index (repeatable)
+
+.PP
+\fB--tls-cert\fP=""
+	TLS server certificate (PEM)
+
+.PP
+\fB--tls-key\fP=""
+	TLS server key (PEM)
+
+.PP
+\fB--token-file\fP=""
+	file containing the bearer token (single-line)
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+.PP
+\fB--airgapped\fP[=false]
+	refuse outbound endpoints (LLM providers, sinks, OTLP collectors) outside loopback / RFC1918 / explicit airgap.allowlist. Also enabled by PG_HARDSTORAGE_AIRGAPPED=1 or \fBairgapped: strict\fR in the config file.
+
+.PP
+\fB-c\fP, \fB--config\fP=""
+	path to config file (default: XDG/FHS lookup)
+
+.PP
+\fB--cpu-profile\fP=""
+	write a pprof CPU profile to this path for the duration of the command (\fBgo tool pprof <path>\fR to analyse). Off when empty.
+
+.PP
+\fB--mem-profile\fP=""
+	write a pprof heap profile to this path at command exit. Off when empty.
+
+.PP
+\fB--no-color\fP[=false]
+	disable ANSI color in text output
+
+.PP
+\fB--on-error-llm\fP[=false]
+	on a structured-error failure, drop into the matching LLM helper skill (auto_on_error trigger). Also enabled by PG_HARDSTORAGE_ON_ERROR_LLM=1.
+
+.PP
+\fB--otel-endpoint\fP=""
+	OpenTelemetry OTLP/HTTP endpoint (e.g. http://otel-collector:4318); empty disables tracing
+
+.PP
+\fB--otel-stdout\fP[=false]
+	also export OpenTelemetry traces to stderr (useful for dev)
+
+.PP
+\fB-o\fP, \fB--output\fP=""
+	output format: text|json|ndjson|yaml|template|csv|markdown|html|tap|junit|pdf (default: text on TTY, json off-TTY)
+
+.PP
+\fB--profile-port\fP=0
+	if non-zero, expose net/http/pprof on 127.0.0.1: for live profiling of long-running commands (e.g. \fBgo tool pprof http://127.0.0.1:6060/debug/pprof/profile?seconds=30\fR). Off when zero.
+
+.PP
+\fB-q\fP, \fB--quiet\fP[=false]
+	suppress non-essential output
+
+.PP
+\fB--template\fP=""
+	Go text/template applied when --output template (or implied if --template is set without --output)
+
+
+.SH SEE ALSO
+.PP
+\fBpg_hardstorage(1)\fP

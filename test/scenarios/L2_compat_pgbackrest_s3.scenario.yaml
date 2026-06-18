@@ -1,0 +1,60 @@
+# L2_compat_pgbackrest_s3.scenario.yaml
+#
+# Tier L2: pg-hardstorage-pgbackrest end-to-end against an
+# S3-API endpoint over plain HTTP.  Boots a single-node MinIO
+# (the testkit's `s3-minio` sink runtime), points the shim at
+# it via --repo1-type=s3 / --repo1-s3-bucket / --repo1-s3-
+# endpoint, archives a synthetic 16 MiB segment + .backup
+# companion, asserts the bucket carries the manifest, then
+# round-trips with archive-get.
+#
+# What this scenario protects:
+#
+#   - The pgbackrest shim's S3 URL builder (issue: pre-fix it
+#     dropped --repo1-s3-endpoint / --repo1-s3-region from the
+#     emitted URL, so MinIO operators would silently target
+#     real AWS).  pgbackrestRepoFlags-->buildRepoURL is the
+#     loop the test exercises.
+#
+#   - The native S3 storage plugin's path-style addressing
+#     (vhost addressing fails against MinIO loopback).
+#
+#   - AWS SDK credential discovery via env (AWS_ACCESS_KEY_ID
+#     + AWS_SECRET_ACCESS_KEY) flowing from sink.EnvForAgent
+#     all the way through the shim → native CLI → SDK chain.
+#
+# Multi-distro coverage: run_compat_testing.sh substitutes
+# os_image: per cell at scenario-run time.
+
+schema: pg_hardstorage.scenario.v1
+name: L2-compat-pgbackrest-s3
+tier: L2
+description: |
+  pg-hardstorage-pgbackrest end-to-end against MinIO over HTTP:
+  archive-push 16 MiB segment + .backup companion, archive-get
+  round-trip.  Inside the os_image container the driver picks.
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  # 1. Plain segment via the shim → S3 path.
+  - compat_archive:
+      shim: pgbackrest
+      deployment: compat-pgbr-s3
+      fixture: segment
+      sink: s3-minio
+
+  # 2. Segment + .backup companion — the issue #10 aux-file
+  #    path through the S3 storage backend (object key shape
+  #    matches the file:// layout: wal/<stanza>/<TLI>/...).
+  - compat_archive:
+      shim: pgbackrest
+      deployment: compat-pgbr-s3
+      fixture: segment_plus_backup
+      sink: s3-minio
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

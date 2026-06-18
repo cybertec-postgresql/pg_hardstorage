@@ -1,0 +1,101 @@
+.nh
+.TH "PG_HARDSTORAGE" "1" "May 2026" "pg_hardstorage Manual" "pg_hardstorage Manual"
+
+.SH NAME
+.PP
+pg_hardstorage-integrity - Continuous-attestation runs: re-verify manifests + chunks, sign the report
+
+
+.SH SYNOPSIS
+.PP
+\fBpg_hardstorage integrity [flags]\fP
+
+
+.SH DESCRIPTION
+.PP
+Run periodic integrity scans of the repository.  Each run
+re-verifies every committed manifest's signature, confirms its
+referenced chunks are still present, and (optionally) re-fetches
+a sample of chunks for plaintext SHA-256 verification.  The
+result is signed with the operator's key and stored in the repo
+under integrity/runs/\&.json so an auditor can prove the repo
+was intact at any historical attest time.
+
+.PP
+Strategies (cost vs assurance):
+
+.PP
+manifests-only          fastest; just re-verify ed25519 signatures
+  presence (default)      manifests + Stat every referenced chunk
+  content-sample N        manifests + Stat all + plaintext-SHA-256 N% sample
+  content-full            manifests + Stat all + plaintext-SHA-256 every chunk
+
+.PP
+Exit codes:
+
+.PP
+0  no issues
+  9  found_issues (signature break, missing or mismatched chunks) — exit
+     code matches the "verify-failed" namespace; cron will alert.
+  6  notfound (run id or strategy target absent)
+
+
+.SH OPTIONS
+.PP
+\fB-h\fP, \fB--help\fP[=false]
+	help for integrity
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+.PP
+\fB--airgapped\fP[=false]
+	refuse outbound endpoints (LLM providers, sinks, OTLP collectors) outside loopback / RFC1918 / explicit airgap.allowlist. Also enabled by PG_HARDSTORAGE_AIRGAPPED=1 or \fBairgapped: strict\fR in the config file.
+
+.PP
+\fB-c\fP, \fB--config\fP=""
+	path to config file (default: XDG/FHS lookup)
+
+.PP
+\fB--cpu-profile\fP=""
+	write a pprof CPU profile to this path for the duration of the command (\fBgo tool pprof <path>\fR to analyse). Off when empty.
+
+.PP
+\fB--mem-profile\fP=""
+	write a pprof heap profile to this path at command exit. Off when empty.
+
+.PP
+\fB--no-color\fP[=false]
+	disable ANSI color in text output
+
+.PP
+\fB--on-error-llm\fP[=false]
+	on a structured-error failure, drop into the matching LLM helper skill (auto_on_error trigger). Also enabled by PG_HARDSTORAGE_ON_ERROR_LLM=1.
+
+.PP
+\fB--otel-endpoint\fP=""
+	OpenTelemetry OTLP/HTTP endpoint (e.g. http://otel-collector:4318); empty disables tracing
+
+.PP
+\fB--otel-stdout\fP[=false]
+	also export OpenTelemetry traces to stderr (useful for dev)
+
+.PP
+\fB-o\fP, \fB--output\fP=""
+	output format: text|json|ndjson|yaml|template|csv|markdown|html|tap|junit|pdf (default: text on TTY, json off-TTY)
+
+.PP
+\fB--profile-port\fP=0
+	if non-zero, expose net/http/pprof on 127.0.0.1: for live profiling of long-running commands (e.g. \fBgo tool pprof http://127.0.0.1:6060/debug/pprof/profile?seconds=30\fR). Off when zero.
+
+.PP
+\fB-q\fP, \fB--quiet\fP[=false]
+	suppress non-essential output
+
+.PP
+\fB--template\fP=""
+	Go text/template applied when --output template (or implied if --template is set without --output)
+
+
+.SH SEE ALSO
+.PP
+\fBpg_hardstorage(1)\fP, \fBpg_hardstorage-integrity-list(1)\fP, \fBpg_hardstorage-integrity-run(1)\fP, \fBpg_hardstorage-integrity-show(1)\fP, \fBpg_hardstorage-integrity-verify(1)\fP

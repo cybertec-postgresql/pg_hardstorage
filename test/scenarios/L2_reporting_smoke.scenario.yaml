@@ -1,0 +1,163 @@
+# L2_reporting_smoke.scenario.yaml
+#
+# Tier 3 — reporting / policy CLI smoke.  A single scenario
+# that walks the read-only reporting and policy-listing CLI
+# surfaces against a populated repo.  Everything here is
+# read-only or produces a single signed-report file under
+# artefactDir; no mutation of the deployment or repo state.
+#
+# Why this matters: these commands surface the operator's
+# at-a-glance view of the system — anomaly scores, residency
+# compliance, capacity headroom, SLO posture, dossiers.  Unit
+# tests prove each report renderer; this scenario proves the
+# report pipelines actually run end-to-end against a real repo
+# and produce structured output.
+#
+# What gets exercised:
+#
+#   * anomaly check          — score the latest backup vs priors
+#   * classify list          — fleet classification view
+#   * compliance report      — time-windowed compliance bundle
+#   * capacity report        — projected size + WAL volume
+#   * forecast               — capacity / cost projection
+#   * slo show               — configured RPO/RTO targets
+#   * residency list         — fleet residency policies
+#   * insider list           — recorded insider-threat scans
+#   * integrity list         — continuous-attestation history
+#   * dsa list               — DSA report history
+#
+# Empty initial state (zero scans / zero reports) is the
+# expected baseline for several of these — the assertion is
+# "command exits 0 with valid JSON", not "report is non-empty".
+# Pass criterion: every step exits 0.  Wall-clock budget: ~12s.
+
+schema: pg_hardstorage.scenario.v1
+name: L2-reporting-smoke
+tier: L2
+description: |
+  Read-only reporting/policy surface smoke: anomaly, classify,
+  compliance, capacity, forecast, slo, residency, insider,
+  integrity, dsa — each command exits 0 against a populated
+  repo with structured output.
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  # Setup: take a backup so anomaly scoring + capacity
+  # reporting + forecast have data to work with.
+  - take_backup:
+      deployment: l2-reporting-smoke
+
+  # 1. anomaly check — score the latest backup against priors.
+  # With one backup there are no priors; the command should
+  # still exit 0 and return a "no baseline" signal in the body.
+  - cli_run:
+      args:
+        - "anomaly"
+        - "check"
+        - "$DEPLOYMENT"
+        - "--repo"
+        - "$REPO"
+        - "--output"
+        - "json"
+      expect_exit: 0
+      expect_stdout_contains: "schema"
+
+  # 2. classify list — fleet classification.  Empty config
+  # is fine; canonical signal is the schema envelope.
+  - cli_run:
+      args: ["classify", "list", "--output", "json"]
+      expect_exit: 0
+
+  # 3. compliance report — time-windowed compliance bundle.
+  # Defaults to a sensible window; we don't pin one.
+  - cli_run:
+      args:
+        - "compliance"
+        - "report"
+        - "$REPO"
+        - "--output"
+        - "json"
+      expect_exit: 0
+
+  # 4. capacity report — projected size + WAL volume against
+  # the populated repo.
+  - cli_run:
+      args:
+        - "capacity"
+        - "report"
+        - "--repo"
+        - "$REPO"
+        - "--output"
+        - "json"
+      expect_exit: 0
+
+  # 5. forecast — capacity / cost projection.  Uses the same
+  # repo state as capacity report but adds horizon-based
+  # projections.  --no-anomalies skips the anomaly subcheck
+  # (already covered in step 1).
+  - cli_run:
+      args:
+        - "forecast"
+        - "$REPO"
+        - "--no-anomalies"
+        - "--output"
+        - "json"
+      expect_exit: 0
+
+  # 6. slo show without a deployment arg — fleet view of all
+  # configured targets.  The deployment-positional form
+  # requires the deployment to be in pg_hardstorage.yaml
+  # (config-file dependency we handle in a future fixture).
+  # The fleet form is the read-only-anywhere surface that
+  # always works.
+  - cli_run:
+      args: ["slo", "show", "--output", "json"]
+      expect_exit: 0
+
+  # 7. residency list — fleet residency policies.
+  - cli_run:
+      args: ["residency", "list", "--output", "json"]
+      expect_exit: 0
+
+  # 8. insider list — recorded insider-threat scans.  Empty
+  # before any `insider scan` has been run.
+  - cli_run:
+      args:
+        - "insider"
+        - "list"
+        - "--repo"
+        - "$REPO"
+        - "--output"
+        - "json"
+      expect_exit: 0
+
+  # 9. integrity list — continuous-attestation history.
+  # Empty before any `integrity run`.
+  - cli_run:
+      args:
+        - "integrity"
+        - "list"
+        - "--repo"
+        - "$REPO"
+        - "--output"
+        - "json"
+      expect_exit: 0
+
+  # 10. dsa list — DSA report history.  Empty before any
+  # `dsa locate`.
+  - cli_run:
+      args:
+        - "dsa"
+        - "list"
+        - "--repo"
+        - "$REPO"
+        - "--output"
+        - "json"
+      expect_exit: 0
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

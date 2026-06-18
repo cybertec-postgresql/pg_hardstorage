@@ -1,0 +1,317 @@
+# pg_hardstorage documentation site config.
+#
+# Build:    make docs-build      → site/
+# Serve:    make docs-serve      → http://localhost:8000
+# Regen:    make docs-regen      → rebuild every auto-generated page
+#
+# Hosting: this site builds as a portable static directory.
+# When we switch on a public domain, set `site_url` below to
+# the canonical URL (e.g. "https://docs.pghardstorage.org")
+# — that's the *only* required content change.  All internal
+# links are relative; all assets are repo-local.
+
+site_name: pg_hardstorage
+site_description: PostgreSQL backup, done right — agent + CLI documentation
+site_author: CYBERTEC PostgreSQL International GmbH
+# Canonical domain.  docs/CNAME carries the same hostname so
+# GitHub Pages serves the site at this address.  See issue #83
+# for the cutover details.
+site_url: "https://docs.pghardstorage.org"
+
+repo_name: cybertec-postgresql/pg_hardstorage
+repo_url: https://github.com/cybertec-postgresql/pg_hardstorage
+edit_uri: edit/main/docs/
+
+docs_dir: docs
+site_dir: site
+
+# Material is the chosen theme.  Search-first, dark-mode
+# aware, native admonitions + tabs + code-copy buttons.
+theme:
+  name: material
+  features:
+    # Single-page-app navigation: pre-fetches linked pages,
+    # cuts perceived latency.
+    - navigation.instant
+    - navigation.instant.prefetch
+    - navigation.tracking
+    # Tabs at the top reflect the Diátaxis split.
+    - navigation.tabs
+    - navigation.sections
+    - navigation.indexes
+    # Per-page TOC pinned right; "back to top" button.
+    - toc.follow
+    - navigation.top
+    # Search: live, suggestion, share-link.
+    - search.suggest
+    - search.share
+    # Code blocks: copy button + line-link anchors.
+    - content.code.copy
+    - content.code.annotate
+    - content.code.select
+    # Tab groups inside content (e.g. for one tutorial that
+    # shows the same flow in CLI vs REST vs gRPC).
+    - content.tabs.link
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  font:
+    # Self-host the fonts so the site works air-gapped /
+    # behind locked-down corporate proxies — doc readers
+    # are likely on networks where Google CDN is blocked.
+    text: false
+    code: false
+  icon:
+    repo: fontawesome/brands/github
+
+# Markdown extensions: pick the rich set Material supports.
+markdown_extensions:
+  # Admonitions: !!! note / !!! warning / !!! danger.
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  # Tabbed content blocks.
+  - pymdownx.tabbed:
+      alternate_style: true
+  # Inline code highlighting + line numbers + copy.
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets:
+      check_paths: true
+  # Footnotes for citation-style references.
+  - footnotes
+  # Definition lists for glossary-style content.
+  - def_list
+  # Task lists, smart symbols, smarty quotes.
+  - pymdownx.tasklist:
+      custom_checkbox: true
+  - pymdownx.smartsymbols
+  # Inline mark / strikethrough / etc.
+  - pymdownx.caret
+  - pymdownx.tilde
+  - pymdownx.mark
+  # Auto-link bare URLs.
+  - pymdownx.magiclink:
+      repo_url_shortener: true
+      user: cybertec-postgresql
+      repo: pg_hardstorage
+  # Better tables.
+  - tables
+  # Cross-page anchor injection.
+  - attr_list
+  - md_in_html
+  - toc:
+      permalink: true
+      permalink_title: "Permalink to this section"
+
+plugins:
+  - search:
+      separator: '[\s\-,:!=\[\]()"`/]+|\.(?!\d)|&[lg]t;|(?!\b)(?=[A-Z][a-z])'
+  # Tags surface across the site (e.g. "patroni", "kms",
+  # "k8s").  Plugin fails silently if no front-matter tags
+  # are set, so it's safe to enable from day 1.
+  - tags
+  # Versioning is provided by `mike` post-v1.0; for now we
+  # ship "latest" only.  Plugin not yet active — see
+  # DOC_PLAN.md "Open decisions".
+
+# Single-page navigation tree.  Only existing files are
+# referenced — mkdocs --strict fails on missing nav targets.
+# As phases 2-7 land, new pages get added here.
+nav:
+  - Home: index.md
+  - Tutorials:
+      - tutorials/index.md
+      - Getting started (simple): tutorials/getting-started-simple.md
+      - Getting started (full CLI): tutorials/getting-started.md
+      - First backup + restore: tutorials/first-backup-restore.md
+      - PITR tutorial: tutorials/pitr-tutorial.md
+      - Encryption walkthrough: tutorials/encryption-walkthrough.md
+      - LLM incident walkthrough: tutorials/llm-incident-walkthrough.md
+      - Patroni cluster: tutorials/patroni-cluster.md
+      - Kubernetes (CNPG): tutorials/kubernetes-cnpg.md
+      - Build a storage plugin: tutorials/build-a-storage-plugin.md
+  - How-to:
+      - how-to/index.md
+      - Adding:
+          - Deployment: how-to/adding/deployment.md
+          - "Repo: S3": how-to/adding/repository-s3.md
+          - "Repo: Azure Blob": how-to/adding/repository-azblob.md
+          - "Repo: GCS": how-to/adding/repository-gcs.md
+          - "Repo: SFTP": how-to/adding/repository-sftp.md
+          - "Repo: SCP": how-to/adding/repository-scp.md
+          - "KMS: AWS": how-to/adding/kms-aws.md
+          - "KMS: GCP": how-to/adding/kms-gcp.md
+          - "KMS: Azure": how-to/adding/kms-azure.md
+          - "KMS: Vault": how-to/adding/kms-vault.md
+          - "KMS: HSM (PKCS#11)": how-to/adding/kms-hsm-pkcs11.md
+          - "Sink: Slack": how-to/adding/sink-slack.md
+          - "Sink: Jira": how-to/adding/sink-jira.md
+          - "Sink: PagerDuty": how-to/adding/sink-pagerduty.md
+          - "Sink: webhook": how-to/adding/sink-webhook.md
+          - "Sink: syslog": how-to/adding/sink-syslog.md
+          - "Sink: other (cef/datadog/email/teams/…)": how-to/adding/sink-other.md
+      - Operating:
+          - Set retention: how-to/operating/set-retention.md
+          - Schedule backups: how-to/operating/schedule-backups.md
+          - "Verify: fast vs full": how-to/operating/verify-fast-vs-full.md
+          - Scrub and heal: how-to/operating/scrub-and-heal.md
+          - Replication-slot disk safety: how-to/operating/slot-disk-safety.md
+          - Rotate KEK: how-to/operating/rotate-kek.md
+          - Crypto-shred: how-to/operating/crypto-shred.md
+          - Legal hold: how-to/operating/legal-hold.md
+          - Data residency: how-to/operating/data-residency.md
+          - n-of-m approvals: how-to/operating/n-of-m-approvals.md
+      - Kubernetes:
+          - how-to/kubernetes/index.md
+          - CNPG-I provider: how-to/kubernetes/cnpg-i-provider.md
+          - pgBackRest shim (Crunchy): how-to/kubernetes/pgbackrest-shim.md
+          - Barman shim (in-pod): how-to/kubernetes/barman-shim.md
+          - WAL-G shim (Zalando): how-to/kubernetes/walg-shim.md
+          - "Helm: server chart": how-to/kubernetes/helm-server-chart.md
+          - "Helm: sidecar chart": how-to/kubernetes/helm-sidecar-chart.md
+      - Migration:
+          - how-to/migration/index.md
+          - From pgBackRest: how-to/migration/from-pgbackrest.md
+          - From WAL-G: how-to/migration/from-walg.md
+          - From Barman: how-to/migration/from-barman.md
+      - Packaging:
+          - how-to/packaging/index.md
+          - Build from source: how-to/packaging/build-from-source.md
+          - Debian / RPM: how-to/packaging/debian-rpm.md
+          - FIPS variant: how-to/packaging/fips-variant.md
+          - "PKCS#11 variant": how-to/packaging/pkcs11-variant.md
+          - Firecracker variant: how-to/packaging/firecracker-variant.md
+      - Air-gapped:
+          - how-to/air-gapped/index.md
+          - Enable policy: how-to/air-gapped/enable-policy.md
+          - Export bundle: how-to/air-gapped/repo-bundle-export.md
+          - Import bundle: how-to/air-gapped/transport-bundle-import.md
+      - Verify:
+          - how-to/verify/index.md
+          - Docker sandbox: how-to/verify/docker-sandbox.md
+          - Firecracker sandbox: how-to/verify/firecracker-sandbox.md
+  - Reference:
+      - reference/index.md
+      - CLI: reference/cli/index.md
+      - REST API: reference/api/index.md
+      - Plugins:
+          - reference/plugins/index.md
+          - Storage: reference/plugins/storage-contract.md
+          - Source: reference/plugins/source-contract.md
+          - Encryption (KMS): reference/plugins/encryption-contract.md
+          - Compression: reference/plugins/compression-contract.md
+          - Renderer: reference/plugins/renderer-contract.md
+          - Sink: reference/plugins/sink-contract.md
+          - LLM provider: reference/plugins/llm-provider-contract.md
+          - "Tier-2 protocol (go-plugin)": reference/plugins/tier2-go-plugin-protocol.md
+          - Tier-1 vs Tier-2: reference/plugins/tier1-vs-tier2.md
+      - Schemas and catalogues:
+          - Exit codes: reference/exit-codes.md
+          - Error codes: reference/error-codes.md
+          - KEKRef schemes: reference/kekref-schemes.md
+          - Storage URL schemes: reference/storage-url-schemes.md
+          - Build flavours: reference/build-flavours.md
+          - Manifest schema: reference/manifest-schema.md
+          - Output event schema: reference/output-event-schema.md
+          - Skill schema: reference/skill-schema.md
+          - Metric catalogue: reference/metric-catalogue.md
+      - Runbooks:
+          - reference/runbooks/index.md
+          - "R1 — Repo region gone": reference/runbooks/R1-repo-region-gone.md
+          - "R2 — KMS key destroyed": reference/runbooks/R2-kms-key-destroyed.md
+          - "R3 — Cold start from backups": reference/runbooks/R3-cold-start-from-backups.md
+          - "R4 — Repo corruption at rest": reference/runbooks/R4-repo-corruption-at-rest.md
+          - "R5 — Half-applied PITR": reference/runbooks/R5-half-applied-pitr.md
+          - "R6 — Slot dropped, gap detected": reference/runbooks/R6-slot-dropped-gap.md
+          - "R7 — Patroni split-brain": reference/runbooks/R7-patroni-split-brain.md
+          - "Control-plane setup": reference/runbooks/control-plane-setup.md
+  - Explanation:
+      - explanation/index.md
+      - Design principles: explanation/design-principles.md
+      - Architecture tour: explanation/architecture-tour.md
+      - WAL pipeline: explanation/wal-pipeline.md
+      - Patroni failover deep-dive: explanation/patroni-failover-deep-dive.md
+      - Content-addressed storage: explanation/content-addressed-storage.md
+      - Envelope encryption: explanation/envelope-encryption.md
+      - TDE awareness: explanation/tde-awareness.md
+      - Audit chain: explanation/audit-chain.md
+      - LLM safety stack: explanation/llm-safety-stack.md
+      - Threat model: explanation/threat-model.md
+      - Three execution modes: explanation/three-execution-modes.md
+      - Coordination without etcd: explanation/coordination-without-etcd.md
+      - Tier-1 vs Tier-2 plugins: explanation/tier1-vs-tier2-plugins.md
+      - Verify-sandbox tradeoffs: explanation/verify-sandbox-tradeoffs.md
+      - vs pgBackRest / WAL-G / Barman: explanation/comparison-pgbackrest-walg-barman.md
+  - Operations:
+      - operations/index.md
+      - Operator guide: operations/operator-guide.md
+      - Troubleshooting: operations/troubleshooting.md
+      - Upgrade procedures: operations/upgrade-procedures.md
+      - Monitoring: operations/monitoring.md
+      - Alerting recipes: operations/alerting-recipes.md
+      - Incident response: operations/incident-response.md
+      - Capacity planning: operations/capacity-planning.md
+      - Scaling to large fleets: operations/scaling-large-fleets.md
+      - Cost reporting: operations/cost-reporting.md
+      - SLO as code: operations/slo-as-code.md
+  - Compliance:
+      - compliance/index.md
+      - GDPR Art. 17 — crypto-shred: compliance/gdpr-art-17-crypto-shred.md
+      - Audit evidence bundles: compliance/audit-evidence-bundles.md
+      - SLSA L3 build provenance: compliance/slsa-l3-provenance.md
+      - Data residency pinning: compliance/data-residency-pinning.md
+      - SOC 2 mapping: compliance/soc2-control-mapping.md
+      - ISO 27001 mapping: compliance/iso-27001-control-mapping.md
+      - HIPAA: compliance/hipaa.md
+      - PCI DSS: compliance/pci-dss.md
+      - FedRAMP: compliance/fedramp.md
+  - LLM helper: llm-helper.md
+  - FAQ: faq.md
+  - Glossary: glossary.md
+  - Release notes:
+      - release-notes/index.md
+      - Unreleased: release-notes/unreleased.md
+      - "v1.0": release-notes/v1.0.md
+  - Support:
+      - support/index.md
+  - Changelog: changelog.md
+  - Documentation plan: DOC_PLAN.md
+  - SPEC drift (eng follow-ups): SPEC_DRIFT.md
+
+# Top-level extras: footer, social, copyright.  Designed to
+# light up cleanly when a domain lands; today they're modest
+# repo-pointer links.
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/cybertec-postgresql/pg_hardstorage
+      name: pg_hardstorage on GitHub
+
+copyright: >
+  Copyright © CYBERTEC PostgreSQL International GmbH ·
+  Licensed under Apache 2.0 ·
+  <a href="#__consent">Change cookie settings</a>
+
+# Strict mode is enabled at the CLI level (`mkdocs build
+# --strict`) by the Makefile — broken cross-link or missing
+# nav entry fails the build.

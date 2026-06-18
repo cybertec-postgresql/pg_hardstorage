@@ -1,0 +1,79 @@
+# L3_partial_dump_database_flag.scenario.yaml
+#
+# Tier L3 — issue #97 end-to-end gate.
+#
+# Issue #97: `partial dump` always connected pg_dump to `postgres`,
+# so a table living in any other database matched nothing — and
+# pg_dump's silent exit left an empty .sql file while the command
+# reported SUCCESS (exit 0).  The fix added --database AND an
+# empty-dump guard that turns "found nothing" into a structured
+# refusal instead of a silently-empty file.
+#
+# What this scenario ACTUALLY exercises (end-to-end, real cluster):
+#
+#   * take_backup of a real PG 17 cluster.
+#   * partial dump WITHOUT --database for a table that does not
+#     exist in the connected (default postgres) database → MUST
+#     refuse with exit 6 (ExitNotFound).  This is the core #97
+#     regression: pre-fix it exited 0 with an empty .sql file.
+#     The empty-dump guard now fires instead.
+#
+# NOT exercised here (known coverage gap, documented honestly):
+# the POSITIVE routing — `partial dump --database=app` recovering a
+# table that lives only in `app` and writing a non-empty .sql.
+# The scenario runner's `sql:` step runs only against the default
+# database (no per-database targeting) so a table cannot be seeded
+# inside `app`, and the partial-dump sandbox needs a host pg_dump
+# matching the backup's PG major.  Today the positive path is
+# covered only by TestPartialDump_HasDatabaseFlag (a --help
+# presence check); a real routing test awaits framework support.
+schema: pg_hardstorage.scenario.v1
+name: L3-partial-dump-database-flag
+tier: L3
+description: |
+  CREATE DATABASE app → seed a table → backup → partial dump
+  without --database refuses → partial dump --database=app
+  succeeds.  Pins issue #97's contract in the live agent.
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  # 1. Create a second database so the backed-up cluster is
+  #    realistically multi-database.  NOTE: the `sql:` step runs
+  #    against the default (postgres) connection only, so we cannot
+  #    seed a table INSIDE `app` here — that is the limitation that
+  #    keeps the positive --database routing out of this scenario
+  #    (see the header).  `app` stays empty; it exists only so the
+  #    cluster isn't single-database.
+  - sql:
+      statement: "CREATE DATABASE app"
+
+  # 2. Backup the real cluster.  The agent connects to the default
+  #    database, but the manifest's file list spans every
+  #    database's relfilenodes.
+  - take_backup:
+      deployment: l3-partial-database
+
+  # 3. Negative (the #97 core): partial dump WITHOUT --database for
+  #    a table absent from the connected (postgres) database must
+  #    REFUSE with exit 6 — not exit 0 with an empty .sql file.
+  #    The empty-dump guard is what makes "found nothing" an error.
+  - cli_run:
+      args:
+        - "partial"
+        - "dump"
+        - "$DEPLOYMENT"
+        - "--repo"
+        - "$REPO"
+        - "--tables"
+        - "public.nonexistent_in_postgres"
+        - "--out"
+        - "$ARTEFACT_DIR/partial-no-database.sql"
+      expect_exit: 6
+      timeout: 60s
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

@@ -1,0 +1,127 @@
+.nh
+.TH "PG_HARDSTORAGE" "1" "May 2026" "pg_hardstorage Manual" "pg_hardstorage Manual"
+
+.SH NAME
+.PP
+pg_hardstorage-partial-restore - Extract specific tables' files from a backup into --target
+
+
+.SH SYNOPSIS
+.PP
+\fBpg_hardstorage partial restore  [flags]\fP
+
+
+.SH DESCRIPTION
+.PP
+Selective restore: writes ONLY the heap files (plus TOAST,
+visibility-map, and segment siblings) for the requested tables into
+--target. Other relations, indexes, control files, and WAL are
+skipped.
+
+.PP
+Resolution: pass --pg-connection to query pg_class on a live source
+DB, OR --relfilenode-map  to a JSON file (the same shape
+\fBpartial inspect -o json\fR emits).
+
+.PP
+The output is a partial PGDATA layout. Run pg_dump against a
+PG instance pointed at --target (or copy files into a matching
+running cluster) to get SQL out — that automation is a
+follow-up.
+
+.PP
+Encryption: encrypted backups are not yet supported by partial
+restore. Use full \fBpg_hardstorage restore\fR + pg_dump.
+
+
+.SH OPTIONS
+.PP
+\fB--backup\fP="latest"
+	backup ID, or \fBlatest\fR for the most recent committed backup
+
+.PP
+\fB--force\fP[=false]
+	allow extracting into a non-empty --target
+
+.PP
+\fB-h\fP, \fB--help\fP[=false]
+	help for restore
+
+.PP
+\fB--kms-config\fP=[]
+	cloud KMS provider config for a cloud-KMS-encrypted backup (e.g. region=eu-central-1,endpoint=...); empty uses ambient credentials
+
+.PP
+\fB--pg-connection\fP=""
+	libpq DSN for the live source DB to look up relfilenodes
+
+.PP
+\fB--relfilenode-map\fP=""
+	path to a JSON map of qualified-name → relfilenode (alternative to --pg-connection)
+
+.PP
+\fB--repo\fP=""
+	repository URL (required)
+
+.PP
+\fB--tables\fP=""
+	comma-separated qualified tables (required, e.g. public.users,public.events)
+
+.PP
+\fB--target\fP=""
+	target directory where the selected files materialise (required)
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+.PP
+\fB--airgapped\fP[=false]
+	refuse outbound endpoints (LLM providers, sinks, OTLP collectors) outside loopback / RFC1918 / explicit airgap.allowlist. Also enabled by PG_HARDSTORAGE_AIRGAPPED=1 or \fBairgapped: strict\fR in the config file.
+
+.PP
+\fB-c\fP, \fB--config\fP=""
+	path to config file (default: XDG/FHS lookup)
+
+.PP
+\fB--cpu-profile\fP=""
+	write a pprof CPU profile to this path for the duration of the command (\fBgo tool pprof <path>\fR to analyse). Off when empty.
+
+.PP
+\fB--mem-profile\fP=""
+	write a pprof heap profile to this path at command exit. Off when empty.
+
+.PP
+\fB--no-color\fP[=false]
+	disable ANSI color in text output
+
+.PP
+\fB--on-error-llm\fP[=false]
+	on a structured-error failure, drop into the matching LLM helper skill (auto_on_error trigger). Also enabled by PG_HARDSTORAGE_ON_ERROR_LLM=1.
+
+.PP
+\fB--otel-endpoint\fP=""
+	OpenTelemetry OTLP/HTTP endpoint (e.g. http://otel-collector:4318); empty disables tracing
+
+.PP
+\fB--otel-stdout\fP[=false]
+	also export OpenTelemetry traces to stderr (useful for dev)
+
+.PP
+\fB-o\fP, \fB--output\fP=""
+	output format: text|json|ndjson|yaml|template|csv|markdown|html|tap|junit|pdf (default: text on TTY, json off-TTY)
+
+.PP
+\fB--profile-port\fP=0
+	if non-zero, expose net/http/pprof on 127.0.0.1: for live profiling of long-running commands (e.g. \fBgo tool pprof http://127.0.0.1:6060/debug/pprof/profile?seconds=30\fR). Off when zero.
+
+.PP
+\fB-q\fP, \fB--quiet\fP[=false]
+	suppress non-essential output
+
+.PP
+\fB--template\fP=""
+	Go text/template applied when --output template (or implied if --template is set without --output)
+
+
+.SH SEE ALSO
+.PP
+\fBpg_hardstorage-partial(1)\fP

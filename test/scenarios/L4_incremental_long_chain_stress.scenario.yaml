@@ -1,0 +1,202 @@
+# L4_incremental_long_chain_stress.scenario.yaml
+#
+# Tier L4: 20-link incremental chain, leaf restore, byte-equal
+# verify.  Stress-tests the parts of the incremental backup
+# pipeline that L2's 3-link smoke can't reach because they only
+# show up at scale.
+#
+# What this scenario protects:
+#
+#   * Manifest persistence across the chain.  L2's 3-link
+#     scenario proves an incremental persists its own
+#     PGBackupManifest so the NEXT incremental can chain off it.
+#     This scenario extends that proof to 20 links: every
+#     incremental beyond #2 reads a manifest that was itself
+#     written by an incremental backup.  A regression where the
+#     manifest happens to round-trip for the first few links
+#     but degrades (silent re-encoding, lost bytes, accumulated
+#     error) wouldn't fail L2 but fails here.
+#
+#   * Chain-restore iteration limits.  restoreIncrementalChain
+#     walks the chain backwards from leaf to anchor.  A 20-link
+#     walk exercises any recursion-depth assumption (Go's stack
+#     is generous, but a pathological recursive copy of manifest
+#     bytes per step would surface), any LRU cache in the agent
+#     that ages out parents mid-walk, any
+#     ErrTombstoned-on-parent edge case that doesn't fire in a
+#     3-link smoke.
+#
+#   * pg_combinebackup at depth.  PG's pg_combinebackup tool is
+#     theoretically unbounded in chain depth (each step replays
+#     the next manifest's deltas onto the working copy), but it
+#     does keep all input manifests resident.  20 manifests +
+#     20 staging directories is a meaningful workload for the
+#     subprocess; a regression where we accidentally O(N²) on
+#     re-reading manifests (e.g. reloading the chain for each
+#     step instead of caching) shows up as wall-clock blow-up
+#     here.
+#
+#   * Deployment-side WAL pressure.  20 BASE_BACKUP INCREMENTAL
+#     calls in quick succession + 19 intervening run_load passes
+#     generate WAL fast enough to stress the walsummarizer's
+#     ability to keep up.  If the summarizer falls behind, the
+#     mid-chain incrementals fail with "WAL summaries are
+#     required from X/X to X/X, but no summaries were found" —
+#     a hard precondition error that L2's 3-link scenario does
+#     not surface because the 2-3s run_load between backups is
+#     too short to outpace the summarizer.
+#
+#   * Restore-side dedup at scale.  Every chunk hash is
+#     content-addressed; a 20-link chain that hits the same
+#     pages over and over should NOT 20x the repo size.  The
+#     final assertion compares repo bytes to a generous upper
+#     bound — a regression that broke chunk dedup (silently
+#     uploading fresh chunks per backup) would blow past it.
+#
+# Wall-clock budget: ~5 minutes (20 backups × ~3s + 19 run_load
+# × 2s + restore + verify).  Fits the L4 nightly window.
+#
+# Implementation note: scenario YAML has no loop primitive, so
+# the 19 incremental-link steps are unrolled.  Verbose but the
+# verbosity is the point — every step is independently inspectable
+# in the run log; a single failing iteration's step.starting and
+# step.take_backup.completed events name the exact link that
+# tripped.
+
+schema: pg_hardstorage.scenario.v1
+name: L4-incremental-long-chain-stress
+tier: L4
+description: |
+  20-link incremental chain (full + 19 incrementals), restore
+  the leaf, assert byte-equivalent state via row-count.
+
+topology:
+  provider: local-docker
+  # PG 17+ for BASE_BACKUP INCREMENTAL.  summarize_wal=on
+  # inherited from the topology default.
+  pg_version: "17"
+
+load:
+  file: test/load/failover_loop.load.yaml
+
+steps:
+  # 1. Anchor.  All 19 incrementals chain off this one (each
+  #    references the IMMEDIATE prior via $LAST_BACKUP — see
+  #    L2_incremental_three_links for the resolution semantics).
+  - take_backup:
+      deployment: l4-longchain
+      name: anchor_full
+
+  # 2-20. Nineteen incremental backups, each anchored on the
+  #       prior backup via $LAST_BACKUP.  Each preceded by a
+  #       brief run_load so the incremental has real deltas to
+  #       capture — without churn, every incremental would be
+  #       near-empty and never exercise the dedup/restore paths
+  #       at meaningful payload size.
+
+  # Link 2 (incremental 1):
+  - run_load: { duration: 2s }
+  - take_backup: { deployment: l4-longchain, incremental_from: "$LAST_BACKUP" }
+
+  # Link 3:
+  - run_load: { duration: 2s }
+  - take_backup: { deployment: l4-longchain, incremental_from: "$LAST_BACKUP" }
+
+  # Link 4:
+  - run_load: { duration: 2s }
+  - take_backup: { deployment: l4-longchain, incremental_from: "$LAST_BACKUP" }
+
+  # Link 5:
+  - run_load: { duration: 2s }
+  - take_backup: { deployment: l4-longchain, incremental_from: "$LAST_BACKUP" }
+
+  # Link 6:
+  - run_load: { duration: 2s }
+  - take_backup: { deployment: l4-longchain, incremental_from: "$LAST_BACKUP" }
+
+  # Link 7:
+  - run_load: { duration: 2s }
+  - take_backup: { deployment: l4-longchain, incremental_from: "$LAST_BACKUP" }
+
+  # Link 8:
+  - run_load: { duration: 2s }
+  - take_backup: { deployment: l4-longchain, incremental_from: "$LAST_BACKUP" }
+
+  # Link 9:
+  - run_load: { duration: 2s }
+  - take_backup: { deployment: l4-longchain, incremental_from: "$LAST_BACKUP" }
+
+  # Link 10 (halfway marker — useful in the run log for "did we
+  # at least get this far?"):
+  - run_load: { duration: 2s }
+  - take_backup: { deployment: l4-longchain, incremental_from: "$LAST_BACKUP", name: midchain_link_10 }
+
+  # Link 11:
+  - run_load: { duration: 2s }
+  - take_backup: { deployment: l4-longchain, incremental_from: "$LAST_BACKUP" }
+
+  # Link 12:
+  - run_load: { duration: 2s }
+  - take_backup: { deployment: l4-longchain, incremental_from: "$LAST_BACKUP" }
+
+  # Link 13:
+  - run_load: { duration: 2s }
+  - take_backup: { deployment: l4-longchain, incremental_from: "$LAST_BACKUP" }
+
+  # Link 14:
+  - run_load: { duration: 2s }
+  - take_backup: { deployment: l4-longchain, incremental_from: "$LAST_BACKUP" }
+
+  # Link 15:
+  - run_load: { duration: 2s }
+  - take_backup: { deployment: l4-longchain, incremental_from: "$LAST_BACKUP" }
+
+  # Link 16:
+  - run_load: { duration: 2s }
+  - take_backup: { deployment: l4-longchain, incremental_from: "$LAST_BACKUP" }
+
+  # Link 17:
+  - run_load: { duration: 2s }
+  - take_backup: { deployment: l4-longchain, incremental_from: "$LAST_BACKUP" }
+
+  # Link 18:
+  - run_load: { duration: 2s }
+  - take_backup: { deployment: l4-longchain, incremental_from: "$LAST_BACKUP" }
+
+  # Link 19:
+  - run_load: { duration: 2s }
+  - take_backup: { deployment: l4-longchain, incremental_from: "$LAST_BACKUP" }
+
+  # Link 20 (the leaf — restore target):
+  - run_load: { duration: 2s }
+  - take_backup:
+      deployment: l4-longchain
+      incremental_from: "$LAST_BACKUP"
+      name: chain_leaf
+
+  # Restore the leaf.  Materialises all 20 links via repeated
+  # pg_combinebackup invocations (or a single multi-source
+  # invocation, depending on the restore implementation's
+  # batching strategy), pg_verifybackup gates the flattened
+  # datadir.  Any chain-walk regression in restoreIncrementalChain
+  # surfaces as a non-zero exit here.
+  - restore:
+      deployment: l4-longchain
+      source: chain_leaf
+
+asserts:
+  # Row-level correctness check.  Initial seed = 1000 (500
+  # bootstrap + 500 write_burst); each run_load pass appends
+  # 1000 more.  19 churn passes (between links 2-20) at 2s each
+  # — on a quiet machine ≥1 full pass per 2s window — gives
+  # AT LEAST 1000 + 19*1000 = 20000 rows in the leaf.  In
+  # practice the load engine is much faster than 1 pass/2s on
+  # bare metal, so the real count is in the 80k-150k range.
+  # We assert ≥20000 to verify the CHAIN replayed (rules out a
+  # regression where the restored cluster reflects only the
+  # FULL's state).
+  - count_range: { table: users, min: 20000, max: 10000000 }
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:2h"

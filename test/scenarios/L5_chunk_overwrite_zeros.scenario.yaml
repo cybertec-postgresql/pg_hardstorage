@@ -1,0 +1,27 @@
+# L5_chunk_overwrite_zeros.scenario.yaml
+#
+# Tier L5: overwrite 64 bytes of a CAS chunk with zeros.
+# Length-only integrity checks would silently pass (file
+# size unchanged).  Only the chunk's content hash detects
+# the drift — this scenario pins that verification path.
+schema: pg_hardstorage.scenario.v1
+name: L5-chunk-overwrite-zeros
+tier: L5
+description: |
+  Zero out 64 bytes inside a random CAS chunk; scrub
+  must surface a verify.* error.
+topology:
+  provider: local-docker
+  pg_version: "17"
+steps:
+  - seed:
+      target_gb: 1
+  - take_backup:
+      deployment: l5-chunk-zeros
+  - corrupt_repo_object:
+      repo_target: chunk_random
+      mutation: overwrite_zeros
+      expect_error_prefix: verify.
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

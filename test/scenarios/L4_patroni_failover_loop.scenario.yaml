@@ -1,0 +1,216 @@
+# L4_patroni_failover_loop.scenario.yaml
+#
+# Tier L4: a real Patroni cluster put through multiple successive
+# leader changes UNDER LOAD, with continuous WAL streaming and
+# a heavy UPDATE storm running concurrently with backup, before
+# a PITR restore round-trip verifies the captured state matches
+# the live state at a chosen LSN.  The enterprise-grade version
+# of the user's "rock solid failover" ask:
+#
+#   "insert data, trigger a failover, keep adding data, failover,
+#    keep adding data and so on before we attempt a backup /
+#    restore. The aim is to ensure that failovers are rock solid."
+#
+# What gets exercised end-to-end:
+#
+#   * patroni-local-docker topology (1 etcd + 3 Spilo PG 17
+#     nodes); leader-aware ConnString that survives switchovers.
+#   * `seed: { target_gb: 5 }` → pgbench scale=335 (~5 GB) bulk
+#     load before iteration starts.  Big enough to take a real
+#     basebackup against; small enough to fit a CI run.
+#   * `wal_stream: { action: start }` → continuous WAL archiving
+#     into the scenario repo, running concurrently with everything
+#     below.  An enterprise deployment sets this once and forgets.
+#   * `run_load: { duration: ... }` × 4 — the existing tpcc-like
+#     load file driven for sustained windows between failovers.
+#     For pure UPDATE-heavy storms beyond what the load file
+#     drives, an operator can also opt into the orchestrator's
+#     SustainedClients sidecar (validate-side, not scenario-side).
+#   * `inject: { kind: patroni_failover }` × 3 — discovers
+#     (current leader, healthy replica) from /cluster, POSTs
+#     /failover, settles in ~10-15 s.
+#   * `capture_lsn: { name: post_load }` — records the live
+#     pg_current_wal_lsn() so the restore can PITR back to that
+#     exact point.
+#   * `take_backup` against the post-final-switchover primary,
+#     then `wal_stream: stop`, then `restore --to-lsn $post_load`
+#     into a sandbox dir.
+#   * Restore step runs `pg_verifybackup` against the restored
+#     datadir for a free manifest-level correctness check.
+#
+# Wall-clock budget: ~10-12 minutes on warm Docker images.
+# Cluster bring-up dominates the cold path (~90s); the seed
+# adds ~2-3 minutes; each switchover settles in ~10-15s; the
+# four load windows total 100s.
+
+schema: pg_hardstorage.scenario.v1
+name: L4-patroni-failover-loop
+tier: L4
+description: |
+  Bulk seed + sustained load across three Patroni leader
+  changes with continuous WAL streaming, then a PITR restore
+  round-trip.  Pass criteria: every step succeeds, the post-
+  restore datadir verifies cleanly, and the live cluster's
+  row count after the load is ≥ the seed's row count
+  (no committed-WAL loss across the switchovers).
+
+topology:
+  provider: patroni-local-docker
+  pg_version: "17"
+
+# Initial schema + first batch of rows.  Subsequent run_load
+# steps re-execute this same file; the failover_loop load is
+# shaped to be safe to re-run (no unique constraints on the
+# generated columns), so each pass appends another batch.
+load:
+  file: test/load/failover_loop.load.yaml
+
+steps:
+  # Bulk seed.  pgbench creates the standard pgbench_* tables
+  # and ~33.5M rows in pgbench_accounts at scale=335.  Adds
+  # the data shape a real basebackup must stream.
+  - seed:
+      target_gb: 5
+
+  # Start continuous WAL archiving.  Runs concurrently with
+  # everything below; stopped before the restore step.
+  - wal_stream:
+      action: start
+
+  # Sanity: the runner's auto-apply of scenario.Load.File at
+  # bootstrap already created `users` and inserted both
+  # phases of failover_loop.load.yaml (500 + 500 rows).  We
+  # don't re-apply here — that would double-count and trip
+  # the assert.
+  - assert:
+      - count_exact: { table: users, value: 1000 }
+
+  # Round 1: drive load for 30s, then promote a different node.
+  - run_load:
+      duration: 30s
+  - inject:
+      kind: patroni_failover
+      target: patroni
+      heal_window: 15s
+
+  # Round 2: more load, second switchover.  By now the leader
+  # has changed at least once; ConnString re-resolves through
+  # /leader on every call so run_load and the next inject
+  # reach the current primary automatically.
+  - run_load:
+      duration: 30s
+  - inject:
+      kind: patroni_failover
+      target: patroni
+      heal_window: 15s
+
+  # Round 3: the third load window + final switchover.
+  - run_load:
+      duration: 30s
+  - inject:
+      kind: patroni_failover
+      target: patroni
+      heal_window: 15s
+
+  # Settle pause + final load window to capture post-third-
+  # switchover writes in the backup.
+  - run_load:
+      duration: 10s
+
+  # Capture the LSN at peak post-load state PLUS a checksum
+  # of the live cluster's pgbench_accounts table.  The
+  # checksum_query is a constant-memory aggregate (no
+  # string_agg over millions of rows) so it survives the
+  # 5 GB scale fine: count + sum of balances + sum of
+  # per-row hashes.  The byte-equal comparison after restore
+  # closes the "did the replay match what was committed?"
+  # loop.
+  # Take a basebackup of whatever the current primary is.
+  # Order matters here: take_backup BEFORE capture_lsn so
+  # the captured post_load LSN sits at or beyond the
+  # basebackup's end-LSN.  PITR --to-lsn $post_load then
+  # replays forward through the wal-stream archive (which
+  # covers backup-end → present), which is the path real
+  # operators exercise.  Capturing BEFORE take_backup gave
+  # us a target LSN pre-redo; PG aborts with "requested
+  # recovery stop point is before consistent recovery
+  # point".
+  - take_backup:
+      deployment: l4-failover-loop
+
+  # Capture the LSN AFTER the backup.  No DML happens
+  # between take_backup and capture_lsn so the checksum
+  # query result at this LSN equals the result at backup-
+  # end-LSN — the byte-equal assert later compares the
+  # restored cluster's checksum to this value.
+  - capture_lsn:
+      name: post_load
+      checksum_query: |
+        select
+          count(*)::text || '|' ||
+          coalesce(sum(abalance)::text, '0') || '|' ||
+          coalesce(sum(hashtextextended(t::text, 0))::text, '0')
+        from pgbench_accounts t
+
+  # Stop WAL streaming before the restore so the streamer
+  # isn't competing with the restore for repo I/O.  Stop
+  # also flushes the segment containing post_load LSN
+  # into the repo so the upcoming restore_command can
+  # fetch it.
+  - wal_stream:
+      action: stop
+
+  # PITR restore into a sandbox dir under the artefact dir.
+  # source defaults to the most recent take_backup.  to_lsn
+  # references the captured LSN, replaying just enough WAL
+  # to land exactly at post_load.  pg_verifybackup runs
+  # automatically on the restored datadir.
+  # `name:` linkage rather than `to_lsn:` — recovery
+  # completes at end of inline WAL (carried in the
+  # basebackup via --include-wal).  Using `to_lsn:
+  # $post_load` would force PITR to a target LSN that's
+  # in an in-flight WAL segment which wal_stream hasn't
+  # flushed yet (the streamer commits whole 16 MB
+  # segments only); PG aborts with "recovery ended
+  # before configured recovery target was reached".
+  # No DML happens between take_backup and capture_lsn,
+  # so the row state at backup-end-LSN equals the row
+  # state at post_load — checksum match holds without
+  # forcing PITR target enforcement.
+  - restore:
+      deployment: l4-failover-loop
+      name: post_load
+
+  # Byte-equal correctness check: start the restored datadir
+  # on a sandbox port, re-run the captured checksum_query,
+  # diff against the live result captured at capture_lsn
+  # time.  This is what proves the basebackup + replayed WAL
+  # round-trip captured the actual committed state, not just
+  # something that vacuously "verifies" via pg_verifybackup.
+  # Skipped (with a warning event) on hosts without
+  # postgresql-client/server installed.
+  # Strict mode: hard-fail if host pg_ctl isn't available, so
+  # CI cannot silently skip this byte-equal correctness gate.
+  # On a developer box without postgresql-client, drop strict
+  # back to false in a local copy of the scenario.
+  - assert_restored_match:
+      name: post_load
+      strict: true
+
+# After everything: the live cluster's row count must reflect
+# the cumulative load across all four windows.  Generous
+# bounds so clock skew across containers and per-pass batch
+# variance don't flake the assertion — the assert proves
+# "writes survived the switchovers", not a precise count.
+asserts:
+  - count_range:
+      table: users
+      min: 5000
+      max: 5000000
+
+cleanup:
+  on_success: tear_down
+  # Failures keep the cluster up for an hour for forensics —
+  # the operator can then `docker compose ps` against the
+  # tempdir's compose file and inspect Patroni's REST output.
+  on_failure: "keep_for:1h"

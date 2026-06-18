@@ -1,0 +1,74 @@
+# L8_recovery_readiness_smoke.scenario.yaml
+#
+# Tier L8 — `recovery readiness <deployment>` is the
+# operator's "could we restore this deployment right
+# now?" scorecard.  It checks:
+#   * Manifest signature health for the latest backup
+#   * Chunk reachability (does our keyring actually
+#     decrypt the wrapped DEK?)
+#   * WAL coverage between the latest backup and now
+#   * RPO / RTO observed-vs-target deltas
+#   * Verification freshness (when was the last
+#     end-to-end `verify --full` run?)
+#
+# After a healthy chain, readiness should exit 0 with
+# a "we could restore" verdict.  The default RPO/RTO
+# targets are operator-tunable; the test uses defaults.
+#
+# Companion: `recovery windows <deployment>` enumerates
+# every available PITR window with WAL-coverage gaps
+# called out — also exercised here.
+#
+# Wall-clock budget: ~3 minutes (1 GB seed + 2 backups +
+# 2 readiness probes).
+schema: pg_hardstorage.scenario.v1
+name: L8-recovery-readiness-smoke
+tier: L8
+description: |
+  2 backups → recovery readiness <deployment> + recovery
+  windows <deployment>.  Both must exit 0 with non-empty
+  output against a healthy chain.
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  - seed:
+      target_gb: 1
+
+  - take_backup:
+      deployment: l8-recovery-readiness
+      name: backup_1
+
+  - take_backup:
+      deployment: l8-recovery-readiness
+      name: backup_2
+
+  # Default-flags readiness probe.  Default --format is
+  # json (per the help); the operator-readable markdown
+  # variant ships under --format markdown.
+  - cli_run:
+      args:
+        - "recovery"
+        - "readiness"
+        - "$DEPLOYMENT"
+        - "--repo"
+        - "$REPO"
+      timeout: 30s
+
+  # `recovery windows` enumerates every available PITR
+  # window for the deployment.  With 2 fulls + the WAL
+  # in between, we expect a non-empty window list.
+  - cli_run:
+      args:
+        - "recovery"
+        - "windows"
+        - "$DEPLOYMENT"
+        - "--repo"
+        - "$REPO"
+      timeout: 30s
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

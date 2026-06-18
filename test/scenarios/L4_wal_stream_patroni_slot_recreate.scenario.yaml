@@ -1,0 +1,127 @@
+# L4_wal_stream_patroni_slot_recreate.scenario.yaml
+#
+# Forces the EnsureSlot Strategy-C (recreate-with-RESERVE_WAL)
+# branch by dropping the slot between two streamer runs.  In
+# production this happens when:
+#
+#   * an admin runs `SELECT pg_drop_replication_slot('...')`
+#     manually;
+#   * a Patroni failover promotes a node that doesn't carry the
+#     slot (Patroni `permanent_slots` not configured, or
+#     misconfigured);
+#   * a PG 17+ deployment hit `idle_replication_slot_timeout`
+#     while the streamer was offline.
+#
+# The streamer's response is the same in all three cases:
+# EnsureSlot probes the new leader, finds the slot absent,
+# recreates it with `CREATE_REPLICATION_SLOT ... RESERVE_WAL`,
+# and the start-LSN safety check refuses to stream if the
+# resume position sits in a segment older than the new slot's
+# pinned restart_lsn.  This scenario exercises that path
+# deterministically without needing a Patroni misconfiguration.
+#
+# What gets exercised end-to-end:
+#
+#   * `wal_stream: { action: start }` on TLI 1 — slot created
+#     with RESERVE_WAL.
+#   * `seed` + `run_load` drive WAL through the slot.
+#   * `wal_stream: { action: stop }` flushes the in-flight
+#     segment via the streamer's signal handler (pg_switch_wal
+#     + wait), so the captured-LSN segment is durable in the
+#     repo.
+#   * `inject patroni_failover` promotes a different node.
+#   * `drop_slot` removes the slot from the new leader,
+#     simulating the "Patroni didn't propagate it" case.
+#   * `wal_stream: { action: start }` triggers EnsureSlot's
+#     SlotRecreated branch.  The new slot's restart_lsn is
+#     populated immediately (RESERVE_WAL).  resolveStartLSN
+#     uses the highest committed segment in the repo from the
+#     pre-failover stream as the resume LSN, validates against
+#     the new slot's restart_lsn (segment-floor comparison;
+#     should pass because the pre-failover segment is older
+#     than the new restart_lsn → start LSN sits in a segment
+#     ≥ the new restart segment).
+#   * Post-failover `run_load` drives TLI 2 WAL through the
+#     recreated slot.
+#   * `take_backup` on TLI 2.  Restore from this backup
+#     replays through the streamed TLI 2 archive.
+#
+# Pass criterion: byte-equal checksum match.  A regression in
+# the SlotRecreated path (e.g. RESERVE_WAL not actually
+# applied; restart_lsn left empty; safety check
+# false-positive) fails the assert.
+#
+# Wall-clock budget: ~5-6 minutes.
+schema: pg_hardstorage.scenario.v1
+name: L4-wal-stream-patroni-slot-recreate
+tier: L4
+description: |
+  Forces EnsureSlot Strategy-C by dropping the slot after a
+  Patroni switchover.  Streamer reconnects, recreates the slot
+  with RESERVE_WAL, validates resume LSN, resumes streaming.
+  Pass criterion: PITR byte-equal match.
+topology:
+  provider: patroni-local-docker
+  pg_version: "17"
+load:
+  file: test/load/failover_loop.load.yaml
+steps:
+  - wal_stream:
+      action: start
+  - seed:
+      target_gb: 1
+  - run_load:
+      duration: 10s
+
+  # Graceful stop — flushes the in-flight segment via the
+  # streamer's signal handler (pg_switch_wal + wait).
+  - wal_stream:
+      action: stop
+
+  - inject:
+      kind: patroni_failover
+      target: patroni
+      heal_window: 15s
+
+  # Force the SlotRecreated branch.  The slot may or may not
+  # have been propagated by Patroni (depends on
+  # permanent_slots config); dropping it explicitly makes the
+  # scenario deterministic.
+  - drop_slot: {}
+
+  # Streamer comes back; EnsureSlot finds the slot absent on
+  # the new primary; CreatePhysicalSlotReserveWAL fires; the
+  # new slot's restart_lsn is populated; resolveStartLSN's
+  # safety check accepts the resume position.
+  - wal_stream:
+      action: start
+
+  - run_load:
+      duration: 12s
+
+  - take_backup:
+      deployment: l4-wal-stream-patroni-slot-recreate
+
+  - run_load:
+      duration: 8s
+
+  - capture_lsn:
+      name: post_recreate
+      checksum_query: |
+        select
+          count(*)::text || '|' ||
+          coalesce(sum(abalance)::text, '0') || '|' ||
+          coalesce(sum(hashtextextended(t::text, 0))::text, '0')
+        from pgbench_accounts t
+  - switch_wal: {}
+  - wal_stream:
+      action: stop
+  - restore:
+      deployment: l4-wal-stream-patroni-slot-recreate
+      name: post_recreate
+  - assert_restored_match:
+      name: post_recreate
+      strict: true
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

@@ -1,0 +1,131 @@
+# L3_wal_stream_ddl_storm.scenario.yaml
+#
+# Mixed DDL+DML coverage for the streamer.  Drives the
+# failover_loop load file in a repeating cycle while the
+# streamer is running, so every pass emits CREATE TABLE
+# (IF NOT EXISTS), INSERT, CREATE INDEX (IF NOT EXISTS),
+# and VACUUM WAL records that the streamer must carry
+# byte-for-byte.
+#
+# Why this matters: WAL records for catalog updates,
+# index builds, and VACUUM cleanup take different code
+# paths from heap-tuple INSERT/UPDATE.  A regression in
+# the streamer's segment-commit cadence is more likely to
+# surface on the rare WAL record types than the common
+# ones.  The failover_loop load file is shaped to be safe
+# to re-run, so a `run_load` step over a sustained window
+# generates many cycles of mixed DDL+DML.
+#
+# What gets exercised end-to-end:
+#
+#   * `run_load: { duration: 20s }` re-applies every phase
+#     in failover_loop.load.yaml repeatedly: bootstrap
+#     (CREATE TABLE + INSERT 500), write_burst (CREATE
+#     INDEX + INSERT 500 + VACUUM).  Each pass fires DDL
+#     WAL records that the streamer must carry mid-flight.
+#   * Two `run_load` windows: one BEFORE take_backup
+#     (rows live inside the basebackup) and one AFTER
+#     (rows only reachable via streamed WAL).  PITR forward
+#     replay through the post-backup cycles is the gate.
+#   * `assert_restored_match` checksum touches BOTH
+#     pgbench_accounts (from seed) AND `users` (from the
+#     load file).  A streamer that drops catalog WAL would
+#     leave `users` missing in the restore — the sandbox
+#     query then fails with "relation does not exist" and
+#     the strict assert hard-fails.
+#
+# Pass criterion: byte-equal checksum match across both
+# tables.  A regression in DDL replay surfaces as a clean
+# failure, not silent drift.
+#
+# Wall-clock budget: ~3-4 minutes.
+schema: pg_hardstorage.scenario.v1
+name: L3-wal-stream-ddl-storm
+tier: L3
+description: |
+  Continuous WAL streaming across a sustained DDL+DML
+  workload (failover_loop load on repeat).  PITR replay
+  must reproduce every catalog change committed after
+  the base backup.
+topology:
+  provider: local-docker
+  pg_version: "17"
+load:
+  file: test/load/failover_loop.load.yaml
+steps:
+  - wal_stream:
+      action: start
+
+  # 1 GB pgbench seed gives the streamer realistic-shape
+  # WAL volume to keep up with before the DDL cycles
+  # start.  Without this the test budget shrinks to
+  # below the streamer's per-segment commit cadence and
+  # the post-backup checksum lands inside an unflushed
+  # segment.
+  - seed:
+      target_gb: 1
+
+  # Pre-backup DDL cycles.  Each pass of failover_loop
+  # fires CREATE TABLE IF NOT EXISTS users, inserts 500
+  # rows, creates a non-unique index on created_at,
+  # inserts 500 more, then VACUUMs.  Re-runnable; ~5s
+  # per pass on a warm cluster.
+  - run_load:
+      duration: 15s
+
+  - take_backup:
+      deployment: l3-wal-stream-ddl-storm
+
+  # Post-backup DDL cycles.  These rows + WAL records
+  # are reachable ONLY through the streamed archive —
+  # the basebackup ended above this LSN.  A streamer
+  # that drops any of them fails the byte-equal checksum.
+  - run_load:
+      duration: 15s
+
+  - capture_lsn:
+      name: post_ddl_storm
+      checksum_query: |
+        select
+          (select count(*) from pgbench_accounts)::text || '|' ||
+          (select coalesce(sum(abalance)::text, '0') from pgbench_accounts) || '|' ||
+          (select count(*) from users)::text
+
+  # Brief post-capture load.  PG's recovery_target_lsn semantic
+  # requires WAL records to exist PAST the target so PG can
+  # confirm reaching it (inclusive=true: replay records UP TO
+  # AND INCLUDING the target, then stop — but PG must read at
+  # least one byte past the target's end-LSN to know there's
+  # more WAL).  Without this, the captured LSN sits at end-of-
+  # WAL and the streamer's stop seals the segment with the
+  # captured LSN as its final record; PG's recovery hits zeros,
+  # asks for the next segment which doesn't exist, and aborts
+  # with "recovery ended before configured recovery target was
+  # reached".  3s of post-capture inserts generates plenty of
+  # successor records so PITR can stop at the target cleanly.
+  # This doesn't affect the captured ChecksumLive (captured
+  # before the post-load) or the restored state (recovery
+  # stops at to_lsn), only PG's ability to confirm the target.
+  - run_load:
+      duration: 3s
+
+  - switch_wal: {}
+  - wal_stream:
+      action: stop
+  # `to_lsn: $post_ddl_storm` (not the bare `name:` linkage)
+  # because the post-backup run_load that writes 200k+ users
+  # happens AFTER take_backup; recovery must replay through the
+  # streamer's archive to reach the captured LSN.  Bare `name:`
+  # would stop at backup_end_lsn and leave the restored cluster
+  # with only the pre-backup ~50k users — surfacing as
+  # `assert_restored_match: MISMATCH 6700000|0|266000 vs
+  # 6700000|0|50000`.
+  - restore:
+      deployment: l3-wal-stream-ddl-storm
+      to_lsn: $post_ddl_storm
+  - assert_restored_match:
+      name: post_ddl_storm
+      strict: true
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

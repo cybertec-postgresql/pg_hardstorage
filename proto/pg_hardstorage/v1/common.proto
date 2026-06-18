@@ -1,0 +1,169 @@
+// Common types shared across pg_hardstorage's gRPC services.
+//
+// The REST API in api/openapi.yaml is the canonical operator-facing
+// surface; gRPC mirrors it for tooling that prefers strongly-typed
+// codegen (the CNPG-I provider, the WAL-G CLI shim, large-fleet
+// custom dispatch tooling).  When the two surfaces disagree, the
+// REST contract wins — gRPC is generated from these protos.
+//
+// We commit to 24-month backward-compatibility on every field
+// number below.  Additive changes (new field with a higher number,
+// new enum value at the end) are non-breaking.  Removed fields
+// keep their number reserved.
+
+syntax = "proto3";
+
+package pg_hardstorage.v1;
+
+option go_package = "github.com/cybertec-postgresql/pg_hardstorage/proto/pg_hardstorage/v1;pgv1";
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/struct.proto";
+
+// Suggestion is the operator-actionable remediation hint attached
+// to every Error.  The CLI surfaces .human in text mode and exposes
+// the full struct in JSON mode.
+message Suggestion {
+  string human = 1;
+  string command = 2;
+  string doc_url = 3;
+}
+
+// Error is the structured failure body.  Code is the dotted
+// namespace that drives the CLI exit-code mapping (see
+// internal/output/exitcode.go).
+message Error {
+  string code = 1;
+  string message = 2;
+  Suggestion suggestion = 3;
+}
+
+// Subject describes the cluster/deployment/backup context for an
+// error or event.  Mirrors output.Subject.
+message Subject {
+  string tenant = 1;
+  string deployment = 2;
+  string backup_id = 3;
+  string repo = 4;
+}
+
+// JobKind enumerates the operations a job represents.  Stable
+// values (do not renumber).  Add new kinds at the end.
+enum JobKind {
+  JOB_KIND_UNSPECIFIED = 0;
+  JOB_KIND_BACKUP = 1;
+  JOB_KIND_RESTORE = 2;
+  JOB_KIND_VERIFY = 3;
+  JOB_KIND_AUDIT_ANCHOR = 4;
+}
+
+// JobState enumerates the job lifecycle.
+enum JobState {
+  JOB_STATE_UNSPECIFIED = 0;
+  JOB_STATE_PENDING = 1;
+  JOB_STATE_RUNNING = 2;
+  JOB_STATE_COMPLETED = 3;
+  JOB_STATE_FAILED = 4;
+  JOB_STATE_CANCELLED = 5;
+}
+
+// BackupType mirrors backup.BackupType.
+enum BackupType {
+  BACKUP_TYPE_UNSPECIFIED = 0;
+  BACKUP_TYPE_FULL = 1;
+  BACKUP_TYPE_INCREMENTAL_LSN = 2;
+  BACKUP_TYPE_SNAPSHOT = 3;
+}
+
+// Severity mirrors output.Severity (RFC 5424).
+enum Severity {
+  SEVERITY_UNSPECIFIED = 0;
+  SEVERITY_EMERGENCY = 1;
+  SEVERITY_ALERT = 2;
+  SEVERITY_CRITICAL = 3;
+  SEVERITY_ERROR = 4;
+  SEVERITY_WARNING = 5;
+  SEVERITY_NOTICE = 6;
+  SEVERITY_INFO = 7;
+  SEVERITY_DEBUG = 8;
+}
+
+// Backup mirrors the REST /v1/deployments/<n>/backups item shape.
+message Backup {
+  string backup_id = 1;
+  string deployment = 2;
+  string tenant = 3;
+  string repo = 4;
+  BackupType type = 5;
+  string parent_backup_id = 6;
+  int32 pg_version = 7;
+  uint32 timeline = 8;
+  string start_lsn = 9;
+  string stop_lsn = 10;
+  google.protobuf.Timestamp started_at = 11;
+  google.protobuf.Timestamp stopped_at = 12;
+  bool encrypted = 13;
+  string kek_ref = 14;
+}
+
+// Job mirrors the REST job shape.  The Args + Result + Progress
+// fields use google.protobuf.Struct to preserve schema flexibility
+// — operations have varying body shapes, and Struct lets the
+// gRPC surface stay stable while individual job kinds evolve
+// their own field sets.
+message Job {
+  string id = 1;
+  JobKind kind = 2;
+  JobState state = 3;
+  string deployment = 4;
+  string repo_url = 5;
+  google.protobuf.Timestamp created_at = 6;
+  google.protobuf.Timestamp claimed_at = 7;
+  google.protobuf.Timestamp completed_at = 8;
+  string agent_id = 9;
+  google.protobuf.Struct args = 10;
+  repeated ProgressEvent progress = 11;
+  google.protobuf.Struct result = 12;
+  string failure = 13;
+}
+
+// ProgressEvent is one streaming progress entry.  Kind is a free-
+// form classification (e.g. "progress", "chunker_paused"); body
+// is the operation-specific payload.
+message ProgressEvent {
+  google.protobuf.Timestamp at = 1;
+  string kind = 2;
+  google.protobuf.Struct body = 3;
+  Severity severity = 4;
+}
+
+// Agent mirrors the REST agent registration shape.
+message Agent {
+  string id = 1;
+  string host = 2;
+  google.protobuf.Timestamp first_seen = 3;
+  google.protobuf.Timestamp last_seen = 4;
+  repeated string deployments = 5;
+  repeated JobKind kinds = 6;
+  int32 in_flight = 7;
+  string version = 8;
+}
+
+// HeartbeatRequest is the agent → control-plane heartbeat body.
+message HeartbeatRequest {
+  string agent_id = 1;
+  string host = 2;
+  repeated string deployments = 3;
+  repeated JobKind kinds = 4;
+  string version = 5;
+}
+
+// Deployment mirrors the REST /v1/deployments item shape.  This
+// is the fleet-inventory entry, not the on-disk manifest.
+message Deployment {
+  string name = 1;
+  string repo = 2;
+  int32 backup_count = 3;
+  string last_backup = 4;
+  google.protobuf.Timestamp last_at = 5;
+}

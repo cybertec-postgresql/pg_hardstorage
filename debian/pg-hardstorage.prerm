@@ -1,0 +1,28 @@
+#!/bin/sh
+# prerm for pg-hardstorage.
+#
+# Stop the agent before removal so an in-flight backup gets a
+# clean shutdown -- the runner respects SIGTERM and finalizes
+# manifests before exiting.
+
+set -e
+
+case "$1" in
+    remove|upgrade|deconfigure)
+        if [ -d /run/systemd/system ]; then
+            # Best-effort: ignore failure on hosts where the
+            # unit was never enabled.
+            deb-systemd-invoke stop pg_hardstorage.service >/dev/null 2>&1 || true
+        fi
+        ;;
+    failed-upgrade)
+        ;;
+    *)
+        echo "prerm called with unknown argument \`$1'" >&2
+        exit 1
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

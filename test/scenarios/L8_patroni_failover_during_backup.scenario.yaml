@@ -1,0 +1,115 @@
+# L8_patroni_failover_during_backup.scenario.yaml
+#
+# Tier L8 — multi-actor coordination correctness.  Trigger a
+# Patroni switchover with a short heal_window so the leader
+# transition is still IN FLIGHT when take_backup starts.  The
+# backup must EITHER complete cleanly against the new leader
+# OR fail with a recoverable structured error — never produce
+# a half-written manifest visible to dedup, never crash the
+# agent, never panic.
+#
+# This is distinct from L4_patroni_failover_loop / L4_rapid_
+# failover_x5, both of which fully heal the failover BEFORE
+# the next take_backup (heal_window=15s, take_backup runs
+# after that window).  Here the heal_window is 1s — Patroni's
+# /failover POST has been accepted but the DCS update +
+# new-leader promote + old-leader demote (~10-15s) is still
+# unfolding when the basebackup connection is established.
+#
+# What this catches:
+#   * `pg_basebackup` against the demoted-mid-stream leader:
+#     PG terminates the replication connection during
+#     promote/demote, surfacing as
+#     `ERROR: terminating connection due to administrator
+#     command` mid-stream.  A buggy agent would write the
+#     partial tar stream into the repo (poisoning dedup),
+#     mark the half-baked manifest committed, or hang.
+#   * DSN re-resolution: the agent caches a /leader lookup
+#     at session start.  Mid-failover the cached DSN points
+#     at the now-replica.  Cleanest path: agent detects
+#     read-only-transaction error, re-polls /leader,
+#     retries.  Anything else surfaces here.
+#   * Restore correctness across the racey backup: if
+#     take_backup did finalise a manifest, that manifest's
+#     bytes must produce a restorable cluster.  Asserted
+#     via restore + assert_restored_match below.
+#
+# Wall-clock budget: ~6 minutes (5 GB seed + load + failover
+# + backup attempt + restore + assert).
+schema: pg_hardstorage.scenario.v1
+name: L8-patroni-failover-during-backup
+tier: L8
+description: |
+  Trigger a Patroni switchover with heal_window=1s so the
+  transition is still in flight when take_backup starts.
+  Backup must either succeed-on-new-leader or fail with a
+  structured error — no corruption, no hang, no panic.
+
+topology:
+  provider: patroni-local-docker
+  pg_version: "17"
+
+load:
+  file: test/load/failover_loop.load.yaml
+
+steps:
+  - seed:
+      target_gb: 1
+
+  - wal_stream:
+      action: start
+
+  - run_load:
+      duration: 10s
+
+  - capture_lsn:
+      name: pre_failover
+      checksum_query: |
+        select
+          count(*)::text || '|' ||
+          coalesce(sum(abalance)::text, '0') || '|' ||
+          coalesce(sum(hashtextextended(t::text, 0))::text, '0')
+        from pgbench_accounts t
+
+  # heal_window=1s: Apply() POSTs /failover and returns; we
+  # exit the inject step ~1s later (before the actual leader
+  # transition has settled — Patroni typically takes 10-15s
+  # for DCS + promote + demote).  The take_backup that
+  # follows then runs against an in-flight transition.
+  - inject:
+      kind: patroni_failover
+      target: patroni
+      heal_window: 1s
+
+  # take_backup is the load-bearing assertion: either it
+  # succeeds (agent re-resolved /leader, retried, finalised
+  # a coherent manifest) or it returns a structured error.
+  # The runner treats a step-level error as scenario fail;
+  # if the agent surfaces e.g. `backup.source_unavailable`
+  # that propagates here and the scenario fails — which is
+  # what we want for the "MUST be a clean error, not a
+  # corruption" property.  A successful backup is also a
+  # pass: it means the agent rode the transition cleanly.
+  - take_backup:
+      deployment: l8-patroni-mid-backup
+
+  # If we got here the backup either succeeded or the
+  # runner already failed the step above.  Stop wal_stream
+  # so the LSN we just captured is committed to the repo.
+  - wal_stream:
+      action: stop
+
+  - restore:
+      deployment: l8-patroni-mid-backup
+      name: pre_failover
+
+  # Strict byte-equality of the captured row state on the
+  # restored cluster.  Sensitive to any silent corruption
+  # in the manifest produced under the racey backup.
+  - assert_restored_match:
+      name: pre_failover
+      strict: true
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

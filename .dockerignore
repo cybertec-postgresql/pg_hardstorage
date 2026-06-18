@@ -1,0 +1,14 @@
+# Keep the Docker build context small and reproducible.
+# test-runs/ alone can grow to hundreds of GB of soak artefacts and
+# must never be tarred into a build context.
+#
+# NOTE: bin/ is intentionally NOT excluded — the testbed and k8s
+# Dockerfiles COPY pre-built binaries (bin/pg_hardstorage and the
+# compat shims) straight from it.
+.git
+.github
+test-runs/
+site/
+dist/
+*.exe
+*.test

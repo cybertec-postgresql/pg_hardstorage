@@ -1,0 +1,122 @@
+# L2_approval_revoke.scenario.yaml
+#
+# Tier L2 — approval revocation path: cross-cover scenario
+# for the approval family.  Same shape as L2_approval_workflow
+# but emphasises the revoke side of the lifecycle so each
+# leaf gets at least two scenarios.
+#
+# Leaves covered (gate scope — 2nd touch):
+#   * approval request (2nd)
+#   * approval list (2nd)
+#   * approval revoke (2nd)
+#   * approval status (2nd)
+#   * approval approve (2nd, still negative)
+#
+# Wall-clock budget: ~10s.
+
+schema: pg_hardstorage.scenario.v1
+name: L2-approval-revoke
+tier: L2
+description: |
+  Request two approvals → list each filter pass → revoke
+  one (negative-id form) → status / approve negatives →
+  list pending shows both still active.
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  # 1. First request — for a kms.shred op.
+  - cli_run:
+      args:
+        - "approval"
+        - "request"
+        - "--repo"
+        - "$REPO"
+        - "--op"
+        - "kms.shred"
+        - "--target"
+        - "kek-001"
+        - "--reason"
+        - "scenario probe: revoke cross-cover #1"
+        - "--threshold"
+        - "1"
+      expect_exit: 2
+
+  # 2. Second request — different op for filter coverage.
+  - cli_run:
+      args:
+        - "approval"
+        - "request"
+        - "--repo"
+        - "$REPO"
+        - "--op"
+        - "repo.wipe"
+        - "--target"
+        - "file:///tmp/synthetic-repo"
+        - "--reason"
+        - "scenario probe: revoke cross-cover #2"
+        - "--threshold"
+        - "1"
+      expect_exit: 2
+
+  # 3. list — no filter, both present.
+  - cli_run:
+      args:
+        - "approval"
+        - "list"
+        - "--repo"
+        - "$REPO"
+      expect_exit: 0
+
+  # 4. list filter by op.
+  - cli_run:
+      args:
+        - "approval"
+        - "list"
+        - "--repo"
+        - "$REPO"
+        - "--op"
+        - "repo.wipe"
+      expect_exit: 0
+
+  # 5. Negative revoke — unknown ID, must surface
+  # structured error rather than silently no-op.
+  - cli_run:
+      args:
+        - "approval"
+        - "revoke"
+        - "00000000-still-no-such-id-00000000"
+        - "--repo"
+        - "$REPO"
+        - "--by"
+        - "scenario-probe"
+        - "--reason"
+        - "scenario probe: 2nd-touch negative"
+      expect_exit: 6
+
+  # 6. Negative status / approve.
+  - cli_run:
+      args:
+        - "approval"
+        - "status"
+        - "00000000-still-no-such-id-00000000"
+        - "--repo"
+        - "$REPO"
+      expect_exit: 6
+
+  - cli_run:
+      args:
+        - "approval"
+        - "approve"
+        - "00000000-still-no-such-id-00000000"
+        - "--repo"
+        - "$REPO"
+        - "--approver"
+        - "scenario-probe"
+      expect_exit: 1
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

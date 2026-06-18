@@ -1,0 +1,11 @@
+{
+  "bugs": "https://github.com/cybertec-postgresql/pg_hardstorage/issues",
+  "description": "PostgreSQL backup, done right. Continuous WAL streaming is the data plane.",
+  "homepage": "https://github.com/cybertec-postgresql/pg_hardstorage",
+  "license": "Apache-2.0",
+  "section": "databases",
+  "stable": true,
+  "dependencies": [
+    "postgresql@18"
+  ]
+}

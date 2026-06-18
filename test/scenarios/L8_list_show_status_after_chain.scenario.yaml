@@ -1,0 +1,97 @@
+# L8_list_show_status_after_chain.scenario.yaml
+#
+# Tier L8 — the day-one operator commands.  Every
+# operator's first interaction with pg_hardstorage runs
+# at least one of:
+#
+#   * `backup list <deployment> --repo` — enumerate the
+#     backups in chronological order.
+#   * `backup show <deployment> <id> --repo` — detail
+#     view of a single backup.
+#   * `status --repo` — fleet-wide health summary.
+#
+# These are read-only "what's in the repo" surfaces;
+# regressions would silently break the operator's
+# mental model of the repo state.
+#
+# What this catches:
+#   * `backup list` empty-chain edge case: a chain that
+#     starts empty and grows to N must surface N entries
+#     after N take_backups.  Off-by-one in the list
+#     iterator would surface here.
+#   * `backup show <id>` field completeness: a renamed
+#     or dropped field in the show output would surface
+#     when the assertion below checks for stable field
+#     names.  We don't structurally validate the schema
+#     here (that's the unit tests' responsibility); the
+#     gate is "command exits 0 with non-empty output."
+#   * `status` aggregate: must reflect the chain just
+#     written — multi-deployment correctness lives in
+#     a separate (future) scenario.
+#
+# Wall-clock budget: ~3 minutes (1 GB seed + 3 backups +
+# list + show + status).
+schema: pg_hardstorage.scenario.v1
+name: L8-list-show-status-after-chain
+tier: L8
+description: |
+  3-backup chain → backup list → backup show <id> →
+  status.  Every read-only "what's in the repo" command
+  must exit 0 with non-empty output.
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  - seed:
+      target_gb: 1
+
+  - take_backup:
+      deployment: l8-list-show
+      name: backup_1
+
+  - take_backup:
+      deployment: l8-list-show
+      name: backup_2
+
+  - take_backup:
+      deployment: l8-list-show
+      name: backup_3
+
+  # `list` is a top-level command (NOT `backup list`).
+  - cli_run:
+      args:
+        - "list"
+        - "$DEPLOYMENT"
+        - "--repo"
+        - "$REPO"
+      timeout: 30s
+
+  # Show the most recent backup by ID via the top-level
+  # `show` command.  $LAST_BACKUP is the orchestrator's
+  # reference to the take_backup step's emitted
+  # backup_id.
+  - cli_run:
+      args:
+        - "show"
+        - "$DEPLOYMENT"
+        - "$LAST_BACKUP"
+        - "--repo"
+        - "$REPO"
+      timeout: 30s
+
+  # `status` reports fleet health.  No --repo positional
+  # form expected here; uses default config or --repo
+  # if set.  Confirm the simplest invocation works
+  # against the chain we just wrote.
+  - cli_run:
+      args:
+        - "status"
+        - "--repo"
+        - "$REPO"
+      timeout: 30s
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

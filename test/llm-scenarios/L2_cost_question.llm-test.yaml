@@ -1,0 +1,25 @@
+# L2-cost-question.llm-test.yaml
+#
+# Operator wants to know how much their repo costs per month.
+
+schema: pg_hardstorage.llm-test.v1
+name: L2-cost-question
+tier: L2
+description: |
+  Operator wants to know how much their repo costs per month.
+
+mode: ask
+turns:
+  - 'how do I see how much my backup repo is costing me each month?'
+
+rubric:
+  hard:
+    must_contain_any:
+      - 'cost report'
+      - 'price-per-gb-month'
+    must_not_contain:
+  soft:
+      - 'Does the response point at `pg_hardstorage cost report --repo <url>`?'
+      - 'Does the response mention --price-per-gb-month for non-default storage pricing?'
+
+temperature: 0.2

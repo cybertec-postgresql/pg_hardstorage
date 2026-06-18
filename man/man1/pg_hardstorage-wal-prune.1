@@ -1,0 +1,110 @@
+.nh
+.TH "PG_HARDSTORAGE" "1" "May 2026" "pg_hardstorage Manual" "pg_hardstorage Manual"
+
+.SH NAME
+.PP
+pg_hardstorage-wal-prune - Delete WAL segment manifests no kept backup can use for recovery
+
+
+.SH SYNOPSIS
+.PP
+\fBpg_hardstorage wal prune  [flags]\fP
+
+
+.SH DESCRIPTION
+.PP
+Walk wal/// and delete segment manifests
+whose end_lsn is below the oldest non-tombstoned backup's
+start_lsn (the "frontier"). Segments at or after the frontier are
+needed for PITR and stay.
+
+.PP
+Default mode is --dry-run; pass --apply to actually delete.
+
+.PP
+--keep-since  adds a time-based floor: segments whose
+CreatedAt is newer than now()-keep-since are preserved even when
+their end_lsn is below the LSN frontier. Use this to enforce a
+"keep at least N days of WAL" policy on top of the LSN-based
+primary rule (the plan's keep_wal_days).
+
+.PP
+Chunks are NOT deleted by this command. Run 'pg_hardstorage repo
+gc --apply' afterwards to reclaim the now-orphan chunk bytes.
+
+
+.SH OPTIONS
+.PP
+\fB--apply\fP[=false]
+	actually delete the candidate segments (default: dry-run)
+
+.PP
+\fB-h\fP, \fB--help\fP[=false]
+	help for prune
+
+.PP
+\fB--keep-since\fP=0s
+	keep WAL segments newer than now- regardless of the LSN rule (e.g. 14d → 336h)
+
+.PP
+\fB--repo\fP=""
+	repository URL (file://, s3://, ...) — must already exist (required)
+
+.PP
+\fB--tombstone-grace\fP=24h0m0s
+	keep a just-tombstoned backup's WAL until its tombstone ages past this, so a backup undelete within the window can still recover it (matches repo gc); pass 0 to disable
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+.PP
+\fB--airgapped\fP[=false]
+	refuse outbound endpoints (LLM providers, sinks, OTLP collectors) outside loopback / RFC1918 / explicit airgap.allowlist. Also enabled by PG_HARDSTORAGE_AIRGAPPED=1 or \fBairgapped: strict\fR in the config file.
+
+.PP
+\fB-c\fP, \fB--config\fP=""
+	path to config file (default: XDG/FHS lookup)
+
+.PP
+\fB--cpu-profile\fP=""
+	write a pprof CPU profile to this path for the duration of the command (\fBgo tool pprof <path>\fR to analyse). Off when empty.
+
+.PP
+\fB--mem-profile\fP=""
+	write a pprof heap profile to this path at command exit. Off when empty.
+
+.PP
+\fB--no-color\fP[=false]
+	disable ANSI color in text output
+
+.PP
+\fB--on-error-llm\fP[=false]
+	on a structured-error failure, drop into the matching LLM helper skill (auto_on_error trigger). Also enabled by PG_HARDSTORAGE_ON_ERROR_LLM=1.
+
+.PP
+\fB--otel-endpoint\fP=""
+	OpenTelemetry OTLP/HTTP endpoint (e.g. http://otel-collector:4318); empty disables tracing
+
+.PP
+\fB--otel-stdout\fP[=false]
+	also export OpenTelemetry traces to stderr (useful for dev)
+
+.PP
+\fB-o\fP, \fB--output\fP=""
+	output format: text|json|ndjson|yaml|template|csv|markdown|html|tap|junit|pdf (default: text on TTY, json off-TTY)
+
+.PP
+\fB--profile-port\fP=0
+	if non-zero, expose net/http/pprof on 127.0.0.1: for live profiling of long-running commands (e.g. \fBgo tool pprof http://127.0.0.1:6060/debug/pprof/profile?seconds=30\fR). Off when zero.
+
+.PP
+\fB-q\fP, \fB--quiet\fP[=false]
+	suppress non-essential output
+
+.PP
+\fB--template\fP=""
+	Go text/template applied when --output template (or implied if --template is set without --output)
+
+
+.SH SEE ALSO
+.PP
+\fBpg_hardstorage-wal(1)\fP

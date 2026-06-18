@@ -1,0 +1,89 @@
+# L4_manifest_schema_migration.scenario.yaml
+#
+# Tier L4 — synthesises a v0.8-shaped manifest into a live repo,
+# then drives the current-version pg_hardstorage binary at it via
+# `audit verify-chain` (the read path that eagerly walks every
+# manifest).  Pass condition: the binary either auto-migrates the
+# old shape silently OR refuses with a structured error code that
+# names the schema mismatch — the failure mode we want to PREVENT
+# is a silent partial-read where some fields are zero-valued and
+# the audit chain reports "all good" against a corrupted manifest.
+#
+# What this scenario protects against:
+#
+#   - Adding a new required manifest field without a migration
+#     path → old manifests silently parse with zero-valued field
+#     → audit chain still reports clean.  Operators with a
+#     mid-version-bump install never know.
+#
+#   - The schema_version field being treated as advisory; the
+#     binary should refuse-with-code on mismatch, not warn-and-
+#     proceed.
+#
+# How to extend: add more synthesize_manifest steps with different
+# ManifestSchemaVersion values to cover every documented migration
+# path.
+
+schema: pg_hardstorage.scenario.v1
+name: L4-manifest-schema-migration
+tier: L4
+description: |
+  Inject a synthetic v0.8 manifest into the repo, then assert the
+  current binary's audit-chain walker either migrates it cleanly
+  or refuses with a non-zero exit + a structured-error code.
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  # 1. Take one real backup so the repo has the v1 layout in
+  #    place — we want to assert behavior of a SCHEMA-version
+  #    mismatch, not a layout mismatch on an empty repo.
+  - take_backup:
+      type: full
+
+  # 2. Drop a synthetic v0.8 manifest into manifests/ alongside
+  #    the real ones.  The synthetic file declares
+  #    schema_version: v0.8 and includes ONLY the legacy fields
+  #    a v0.8 binary would produce.
+  - synthesize_manifest:
+      manifest_schema_version: v0.8
+      manifest_rel_path: manifests/synthetic-v0_8.json
+
+  # 3. Walk the audit chain with the current binary.  The pass
+  #    condition is "exits cleanly OR exits with a structured
+  #    error" — both prove the binary noticed the schema and
+  #    decided.  We split on expect_exit + the stdout/stderr
+  #    sniffs below.
+  - cli_run:
+      args:
+        - audit
+        - verify-chain
+        - --repo
+        - $REPO
+        - -o
+        - json
+      timeout: 30s
+      # We don't pin expect_exit: the binary may legitimately
+      # auto-migrate (exit 0) OR refuse (non-zero with a clear
+      # error code).  Both pass; the failure mode we catch is
+      # a SILENT zero-valued field with exit 0 + no log line.
+      # The stdout sniff below distinguishes "noticed" from
+      # "silently mis-parsed".
+
+  # 4. Assert the manifest reader emitted EITHER a successful
+  #    migration line OR a structured-error code.  Both paths
+  #    name the synthetic manifest by relative path so we know
+  #    the walker reached it.
+  - assert:
+      asserts:
+        - kind: cli_stderr_or_stdout_contains_any
+          substrings:
+            - "synthetic-v0_8.json"
+        - kind: cli_stderr_or_stdout_contains_any
+          substrings:
+            - "schema_version"
+            - "migrated"
+            - "schema.unsupported"
+            - "manifest.format"

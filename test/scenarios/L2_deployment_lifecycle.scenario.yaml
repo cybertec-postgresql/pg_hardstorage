@@ -1,0 +1,121 @@
+# L2_deployment_lifecycle.scenario.yaml
+#
+# Tier L2 — deployment registry lifecycle: `deployment add
+# | edit | list | remove`.
+#
+# Headline property: an operator can register a deployment
+# pointer (name → libpq DSN + repo + schedules), list the
+# registry, edit a field, and remove the entry.  The
+# registry is what `pg_hardstorage backup <name>` consults
+# to resolve a deployment-name to its connection details
+# and target repo.
+#
+# Leaves covered (gate scope):
+#   * deployment add
+#   * deployment edit
+#   * deployment list
+#   * deployment remove
+#
+# Wall-clock budget: ~10s.
+
+schema: pg_hardstorage.scenario.v1
+name: L2-deployment-lifecycle
+tier: L2
+description: |
+  list empty → add (with --skip-probe so we don't need a
+  live PG at the synthetic DSN) → list shows entry → edit
+  schedule → list reflects → remove → list empty.
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  - cli_run:
+      args:
+        - "deployment"
+        - "list"
+      expect_exit: 0
+
+  # 1. Add a synthetic deployment.  --skip-probe means we
+  # don't connect to PG at registration time, so the
+  # connection string can be a placeholder.  Real
+  # operators rely on the probe; the runner uses
+  # --skip-probe to keep this scenario fast + decoupled
+  # from a specific test PG topology.
+  - cli_run:
+      args:
+        - "deployment"
+        - "add"
+        - "l2-dep-synthetic"
+        - "--repo"
+        - "$REPO"
+        - "--connection"
+        - "postgres://probe@127.0.0.1:9/synthetic"
+        - "--schedule-backup"
+        - "every 12h"
+        - "--schedule-rotate"
+        - "daily_at 03:00"
+        - "--skip-probe"
+        - "--yes"
+      expect_exit: 0
+
+  # 2. List — see the new entry.
+  - cli_run:
+      args:
+        - "deployment"
+        - "list"
+      expect_exit: 0
+      expect_stdout_contains: "l2-dep-synthetic"
+
+  # 3. Edit — change the backup schedule.
+  - cli_run:
+      args:
+        - "deployment"
+        - "edit"
+        - "l2-dep-synthetic"
+        - "--schedule-backup"
+        - "every 4h"
+        - "--skip-probe"
+      expect_exit: 0
+
+  # 4. Negative edit: unknown deployment.
+  - cli_run:
+      args:
+        - "deployment"
+        - "edit"
+        - "no-such-deployment"
+        - "--schedule-backup"
+        - "every 1h"
+        - "--skip-probe"
+      expect_exit: 6
+
+  # 5. Remove the entry.
+  - cli_run:
+      args:
+        - "deployment"
+        - "remove"
+        - "l2-dep-synthetic"
+        - "--yes"
+      expect_exit: 0
+
+  # 6. Negative remove: same name again.
+  - cli_run:
+      args:
+        - "deployment"
+        - "remove"
+        - "l2-dep-synthetic"
+        - "--yes"
+      expect_exit: 6
+
+  # 7. List — back to empty (relative to this scenario's
+  # adds; the testbed may have other deployments).
+  - cli_run:
+      args:
+        - "deployment"
+        - "list"
+      expect_exit: 0
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

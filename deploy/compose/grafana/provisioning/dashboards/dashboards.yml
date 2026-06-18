@@ -1,0 +1,19 @@
+# Grafana dashboard provider for the eval stack (issue #98).
+#
+# Loads every dashboard JSON under /var/lib/grafana/dashboards (the
+# compose file mounts deploy/compose/grafana/dashboards there) so the
+# operator lands on a working pg_hardstorage overview instead of an
+# empty Grafana.
+apiVersion: 1
+
+providers:
+  - name: pg_hardstorage
+    orgId: 1
+    folder: pg_hardstorage
+    type: file
+    disableDeletion: false
+    editable: true
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

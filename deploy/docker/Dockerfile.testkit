@@ -1,0 +1,61 @@
+# pg_hardstorage_testkit image.
+#
+# Used by CI to run integration scenarios against ephemeral
+# PostgreSQL containers. Same distroless base as the production
+# image; differs only in the binary that ships and the entrypoint.
+# Not intended for production deployments.
+
+ARG GO_VERSION=1.26
+
+FROM golang:${GO_VERSION} AS builder
+
+ARG VERSION=dev
+ARG COMMIT=none
+ARG BUILD_DATE=unknown
+ARG TARGETOS=linux
+ARG TARGETARCH=amd64
+
+WORKDIR /src
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+
+ENV CGO_ENABLED=0 \
+    GOOS=${TARGETOS} \
+    GOARCH=${TARGETARCH}
+
+RUN go build \
+      -trimpath \
+      -buildvcs=false \
+      -ldflags="-s -w \
+        -X github.com/cybertec-postgresql/pg_hardstorage/internal/version.Version=${VERSION} \
+        -X github.com/cybertec-postgresql/pg_hardstorage/internal/version.Commit=${COMMIT} \
+        -X github.com/cybertec-postgresql/pg_hardstorage/internal/version.Date=${BUILD_DATE}" \
+      -o /out/pg_hardstorage_testkit \
+      ./cmd/pg_hardstorage_testkit
+
+FROM gcr.io/distroless/static-debian12:nonroot
+
+ARG VERSION=dev
+ARG COMMIT=none
+ARG BUILD_DATE=unknown
+
+LABEL org.opencontainers.image.title="pg_hardstorage_testkit" \
+      org.opencontainers.image.description="Test harness for pg_hardstorage CI scenarios." \
+      org.opencontainers.image.source="https://github.com/cybertec-postgresql/pg_hardstorage" \
+      org.opencontainers.image.url="https://github.com/cybertec-postgresql/pg_hardstorage" \
+      org.opencontainers.image.vendor="CYBERTEC PostgreSQL International GmbH" \
+      org.opencontainers.image.licenses="Apache-2.0" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${COMMIT}" \
+      org.opencontainers.image.created="${BUILD_DATE}"
+
+COPY --from=builder /out/pg_hardstorage_testkit /usr/bin/pg_hardstorage_testkit
+
+VOLUME ["/var/lib/pg_hardstorage", "/etc/pg_hardstorage"]
+
+USER nonroot:nonroot
+
+ENTRYPOINT ["/usr/bin/pg_hardstorage_testkit"]

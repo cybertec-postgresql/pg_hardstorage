@@ -1,0 +1,29 @@
+# L2-retention-question.llm-test.yaml
+#
+# Operator asks how to keep 5 base backups and 4 months of WAL.
+
+schema: pg_hardstorage.llm-test.v1
+name: L2-retention-question
+tier: L2
+description: |
+  Operator asks how to keep 5 base backups and 4 months of WAL.
+
+mode: ask
+turns:
+  - 'I want to keep exactly 5 base backups plus 4 months of WAL.  how do I configure that in pg_hardstorage?'
+
+rubric:
+  hard:
+    must_contain_any:
+      - 'count'
+      - 'keep_fulls'
+      - 'wal prune'
+      - 'keep-since'
+    must_not_contain:
+      - 'DROP DATABASE'
+  soft:
+      - 'Does the response correctly mention `retention.policy: count` with `keep_fulls: 5`?'
+      - 'Does the response mention `wal prune --keep-since 120d` (or similar duration math) for WAL?'
+      - 'Does the response distinguish base-backup retention from WAL retention?'
+
+temperature: 0.2

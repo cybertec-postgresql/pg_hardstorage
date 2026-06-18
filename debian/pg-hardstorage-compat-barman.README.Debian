@@ -1,0 +1,70 @@
+pg-hardstorage-compat-barman for Debian
+========================================
+
+This package ships /usr/bin/pg-hardstorage-barman and
+/usr/bin/pg-hardstorage-barman-wal-archive, drop-in replacements
+for the upstream barman + barman-wal-archive binaries.  They accept
+the Barman CLI surface (7 verbs: backup, recover, list-backup,
+show-backup, check, delete, plus the dedicated barman-wal-archive
+binary) and dispatch to native pg_hardstorage commands underneath.
+
+Existing cron jobs, archive_command settings, and monitoring
+scripts run unchanged but produce native pg_hardstorage backups
+(content-addressed, signed, optionally KMS-wrapped).
+
+Activation
+----------
+
+The package does NOT auto-install /usr/bin/barman or
+/usr/bin/barman-wal-archive symlinks (they would conflict with
+operators running both tools side-by-side during a migration
+window).  Activate manually:
+
+  sudo ln -sf /usr/bin/pg-hardstorage-barman             /usr/local/bin/barman
+  sudo ln -sf /usr/bin/pg-hardstorage-barman-wal-archive /usr/local/bin/barman-wal-archive
+
+Verify the symlinks win on PATH (/usr/local/bin should precede
+/usr/bin for most distros — `which barman` is the quickest sanity
+check).
+
+One-shot config translation
+---------------------------
+
+Translate your existing /etc/barman.conf to pg_hardstorage's YAML
+form:
+
+  pg_hardstorage compat translate --from barman \
+      /etc/barman.conf \
+      --output /etc/pg_hardstorage/pg_hardstorage.yaml
+
+Multi-server barman.conf with [server] sections produces multiple
+deployment entries.  Every Barman setting that doesn't have a
+direct semantic equivalent emits as a YAML comment + a stderr
+summary so you can review before deploying.
+
+Refusal contract
+----------------
+
+15 less-common Barman verbs (`cron`, `archive-wal`, `switch-wal`,
+`diagnose`, `verify-backup`, `verify`, `keep`, `receive-wal`,
+`replication-status`, `show-server`, `list-server`,
+`lock-directory-cleanup`, `rebuild-xlogdb`, `get-wal`, `put-wal`)
+and `--target-xid` exit with code 2 and a one-line message of the
+form
+
+  pg-hardstorage-barman: <command>: not implemented in v1.1;
+  native equivalent: <suggestion>
+
+— so wrapper scripts that test for "tool exited non-zero" behave
+the same as they would against real Barman.
+
+What this is NOT
+----------------
+
+This package does NOT read existing Barman repositories.  Old
+repos remain readable only by barman itself; the dual-write +
+retention-drain migration pattern (described in the project's
+docs/how-to/migration/from-barman.md) keeps both tools running
+side-by-side until the old repo's retention window expires.
+
+ -- Hans-Jürgen Schönig <hs@cybertec.at>  Mon, 05 May 2026 09:00:00 +0000

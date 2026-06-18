@@ -1,0 +1,13 @@
+# pg_hardstorage extension control file
+#
+# Installs an in-database surface for querying pg_hardstorage's
+# state from inside the PostgreSQL cluster it backs up.  See
+# the README for installation + the SPEC for the feature
+# rationale.
+comment = 'in-database views over pg_hardstorage backup state'
+default_version = '1.0'
+module_pathname = ''
+relocatable = false
+schema = pg_hardstorage
+superuser = true
+trusted = false

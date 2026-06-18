@@ -1,0 +1,761 @@
+# pg_hardstorage REST API — v1
+#
+# This document is the canonical OpenAPI 3.1 specification of the
+# pg_hardstorage control-plane REST API.  The actual handlers live
+# in internal/server/routes.go; this spec is hand-maintained to
+# match.  Both ship in the same release; CI gates that the routes
+# enumerated here match the registered handlers.
+#
+# Audience: operators integrating with the control plane, third-
+# party tooling (pgBackRest CLI shim, Zalando WAL-G shim, the
+# CNPG-I provider), and the openapi-generator-driven SDKs.
+#
+# Authentication: bearer token (HTTP `Authorization: Bearer <token>`)
+# OR mTLS (the client cert IS the auth — no Authorization header
+# required).  /v1/healthz and /v1/readyz are exempt.
+#
+# Versioning: this is the v1 contract.  We commit to 24-month
+# backward-compatibility on every shape below.  Additive fields
+# are non-breaking; removed fields require a v2 prefix.
+
+openapi: 3.1.0
+info:
+  title: pg_hardstorage control-plane API
+  version: "1.0.0"
+  description: |
+    Control-plane REST API for pg_hardstorage.
+
+    Operationally, the API exposes:
+
+      - **Liveness / readiness probes** (`/v1/healthz`, `/v1/readyz`)
+        for Kubernetes / load-balancer health checks.
+      - **Deployment + backup inventory** for fleet-view dashboards.
+      - **Job dispatch + claim** for the agent-side worker loop.
+      - **Agent registry + heartbeat** for fleet-side observability.
+
+    Job-bearing endpoints (backup, restore, verify) accept a JSON
+    body with operation-specific fields and return a Job whose
+    `id` the client polls via `GET /v1/jobs/<id>` until terminal.
+
+    Every response is wrapped in a stable envelope: success bodies
+    sit under `result`; error bodies sit under `error` with a
+    structured `code` + `message` + optional `suggestion`.  See
+    the `Envelope` schema below.
+  contact:
+    name: pg_hardstorage
+    url: https://github.com/cybertec-postgresql/pg_hardstorage
+  license:
+    name: Apache-2.0
+    url: https://www.apache.org/licenses/LICENSE-2.0
+
+servers:
+  - url: https://control-plane.example.com
+    description: Operator-supplied control-plane endpoint
+
+security:
+  - bearerAuth: []
+  - {}    # mTLS-only deployments need no Authorization header
+
+tags:
+  - name: Probes
+    description: |
+      Liveness + readiness probes.  No authentication required.
+  - name: Inventory
+    description: |
+      Read-only fleet inventory: deployments + backups + agents.
+  - name: Jobs
+    description: |
+      Job lifecycle: enqueue (operator side) + claim / progress /
+      complete (agent side) + cancel (operator side).
+  - name: Agents
+    description: |
+      Agent registry + heartbeat.
+
+paths:
+  /v1/healthz:
+    get:
+      operationId: getHealthz
+      summary: Liveness probe
+      tags: [Probes]
+      security: []
+      description: |
+        Returns 200 OK if the listener is serving.  No state
+        consulted; no auth required.  Standard Kubernetes
+        liveness contract.
+      responses:
+        "200":
+          description: Live
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StatusEnvelope" }
+
+  /v1/readyz:
+    get:
+      operationId: getReadyz
+      summary: Readiness probe
+      tags: [Probes]
+      security: []
+      description: |
+        Returns 200 OK only when every configured repo is reachable.
+        Returns 503 Service Unavailable when ANY configured repo
+        fails to open.  Per-repo status is included in the body
+        for diagnosis.
+      responses:
+        "200":
+          description: Ready
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ReadyzEnvelope" }
+        "503":
+          description: Degraded — at least one repo is unreachable
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ReadyzEnvelope" }
+
+  /v1/version:
+    get:
+      operationId: getVersion
+      summary: Build metadata
+      tags: [Inventory]
+      description: |
+        Returns the control plane's version, commit SHA, and build
+        date.  Used for rolling-upgrade verification.
+      responses:
+        "200":
+          description: Version metadata
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/VersionEnvelope" }
+
+  /v1/deployments:
+    get:
+      operationId: listDeployments
+      summary: List deployments across every configured repo
+      tags: [Inventory]
+      description: |
+        Walks each configured repo's manifest store, collects the
+        unique set of deployment names, and reports per-deployment
+        backup count + the latest backup's metadata.
+      responses:
+        "200":
+          description: Deployment inventory
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DeploymentsEnvelope" }
+
+  /v1/deployments/{name}/backups:
+    parameters:
+      - { $ref: "#/components/parameters/DeploymentName" }
+    get:
+      operationId: listBackups
+      summary: List backups for one deployment
+      tags: [Inventory]
+      description: |
+        Returns every committed manifest for the named deployment
+        across every configured repo.  Newest-first ordering.
+      responses:
+        "200":
+          description: Backup list
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/BackupListEnvelope" }
+    post:
+      operationId: createBackup
+      summary: Enqueue a backup job
+      tags: [Jobs]
+      description: |
+        Body fields ride into Job.Args.  Optional `repo` overrides
+        the default (server.repos[0]).  Optional `type=full|incremental`
+        and `tag=<label>` are honoured by the agent-side executor.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/BackupEnqueueRequest" }
+      responses:
+        "202":
+          description: Job accepted
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/JobEnvelope" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /v1/deployments/{name}/restores:
+    parameters:
+      - { $ref: "#/components/parameters/DeploymentName" }
+    post:
+      operationId: createRestore
+      summary: Enqueue a restore job
+      tags: [Jobs]
+      description: |
+        Required body fields: `backup_id` (or "latest") + `target_dir`.
+        Optional fields: `repo`, `allow_overwrite`, `to`, `to_lsn`,
+        `verify_after`, `tablespace_mapping`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RestoreEnqueueRequest" }
+      responses:
+        "202":
+          description: Job accepted
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/JobEnvelope" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /v1/deployments/{name}/verifies:
+    parameters:
+      - { $ref: "#/components/parameters/DeploymentName" }
+    post:
+      operationId: createVerify
+      summary: Enqueue a verify job
+      tags: [Jobs]
+      description: |
+        The agent's VerifyExecutor performs the full restore-to-
+        sandbox + pg_verifybackup loop and returns a structured
+        result.  Required body fields: `backup_id` (or "latest").
+        Optional: `pg_major`, `tempdir`, `repo`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/VerifyEnqueueRequest" }
+      responses:
+        "202":
+          description: Job accepted
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/JobEnvelope" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /v1/agents:
+    get:
+      operationId: listAgents
+      summary: List registered agents
+      tags: [Agents]
+      parameters:
+        - in: query
+          name: include_inactive
+          schema: { type: boolean, default: false }
+          description: |
+            When true, surfaces agents past the heartbeat timeout.
+            Default false: only currently-healthy agents.
+      responses:
+        "200":
+          description: Agent list
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AgentsEnvelope" }
+
+  /v1/agents/heartbeat:
+    post:
+      operationId: postAgentHeartbeat
+      summary: Agent-side heartbeat
+      tags: [Agents]
+      description: |
+        Agents POST a HeartbeatRequest body every ~10s.  The
+        control plane updates the agent's LastSeen + records the
+        agent's reported state (jobs in flight, host info).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/HeartbeatRequest" }
+      responses:
+        "200":
+          description: Heartbeat acknowledged
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AgentEnvelope" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+
+  /v1/jobs:
+    get:
+      operationId: listJobs
+      summary: List jobs
+      tags: [Jobs]
+      parameters:
+        - in: query
+          name: state
+          schema: { type: string, enum: [pending, running, completed, failed, cancelled] }
+          description: Filter by terminal/non-terminal state
+        - in: query
+          name: kind
+          schema: { type: string, enum: [backup, restore, verify, audit-anchor] }
+          description: Filter by operation type
+        - in: query
+          name: deployment
+          schema: { type: string }
+          description: Filter by deployment name
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 1000 }
+          description: Cap the returned slice (default unbounded)
+      responses:
+        "200":
+          description: Job list
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/JobListEnvelope" }
+
+  /v1/jobs/claim:
+    post:
+      operationId: claimJob
+      summary: Agent-side job claim
+      tags: [Jobs]
+      description: |
+        Agent declares its identity + which deployments + kinds it
+        will run.  Returns a single eligible job.  When no jobs
+        are available, returns 404 with code `notfound.no_jobs`
+        — distinguishable from auth / parse errors.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ClaimRequest" }
+      responses:
+        "200":
+          description: Claimed job
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/JobEnvelope" }
+        "404":
+          description: No eligible jobs
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+
+  /v1/jobs/{id}:
+    parameters:
+      - { $ref: "#/components/parameters/JobID" }
+    get:
+      operationId: getJob
+      summary: Job detail
+      tags: [Jobs]
+      responses:
+        "200":
+          description: Job
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/JobEnvelope" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/jobs/{id}/progress:
+    parameters:
+      - { $ref: "#/components/parameters/JobID" }
+    post:
+      operationId: postJobProgress
+      summary: Append progress event
+      tags: [Jobs]
+      description: |
+        Agent-side endpoint.  Each call appends one ProgressEvent
+        to the job's progress stream.  The control plane fans
+        these out over the agent → operator dispatch boundary
+        for live progress in the operator's terminal.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ProgressEvent" }
+      responses:
+        "202":
+          description: Progress appended
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ProgressAcceptedEnvelope" }
+        "404":
+          description: Job not found
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+        "409":
+          description: Job no longer running
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+
+  /v1/jobs/{id}/complete:
+    parameters:
+      - { $ref: "#/components/parameters/JobID" }
+    post:
+      operationId: completeJob
+      summary: Terminal-state transition
+      tags: [Jobs]
+      description: |
+        Agent-side.  Atomically transitions the job to completed
+        or failed.  Body carries the result body (success) or
+        failure reason (failed).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CompleteRequest" }
+      responses:
+        "200":
+          description: Job completed
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/JobEnvelope" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/jobs/{id}/cancel:
+    parameters:
+      - { $ref: "#/components/parameters/JobID" }
+    post:
+      operationId: cancelJob
+      summary: Operator-initiated cancel
+      tags: [Jobs]
+      description: |
+        Marks the job as cancellation-requested.  The agent
+        observes the flag at its next progress flush and
+        terminates cooperatively.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CancelRequest" }
+      responses:
+        "200":
+          description: Cancellation requested
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/JobEnvelope" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: token
+      description: |
+        HTTP Bearer-token auth.  Token is set on the server side
+        via `pg_hardstorage server --token <token>` (or
+        environment variable).  When the server runs without a
+        configured token, no Authorization header is required —
+        the control plane is intended for behind-mTLS deployments
+        where the client cert IS the auth.
+
+  parameters:
+    DeploymentName:
+      name: name
+      in: path
+      required: true
+      schema: { type: string }
+      description: Deployment name (e.g. `db1`)
+      example: db1
+    JobID:
+      name: id
+      in: path
+      required: true
+      schema: { type: string }
+      description: Opaque job ID
+      example: job-20260502-152800-abc123
+
+  responses:
+    BadRequest:
+      description: Bad request
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+    Unauthorized:
+      description: Authentication required
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+
+  schemas:
+    # --- Envelopes -----------------------------------------------------
+    # Every response wraps the body in either `result` (success) or
+    # `error` (failure).  Schemas below define the shape inside.
+
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          description: |
+            Stable dotted-namespace error code.  First segment
+            drives the CLI exit code.  Codes follow the v1
+            contract: `auth.*`, `usage.*`, `preflight.*`,
+            `aborted.*`, `notfound.*`, `conflict.*`, `verify.*`,
+            `anomaly.*`, `doctor.*`.
+          example: usage.missing_field
+        message:
+          type: string
+          description: Human-readable error
+        suggestion:
+          type: object
+          description: Operator-actionable remediation
+          properties:
+            human:
+              type: string
+              description: Plain-English suggestion
+            command:
+              type: string
+              description: Copy-pasteable CLI command
+            doc_url:
+              type: string
+              description: Link to the relevant runbook
+
+    ErrorEnvelope:
+      type: object
+      properties:
+        error: { $ref: "#/components/schemas/Error" }
+
+    StatusEnvelope:
+      type: object
+      properties:
+        result:
+          type: object
+          properties:
+            status: { type: string, example: ok }
+
+    ReadyzEnvelope:
+      type: object
+      properties:
+        result:
+          type: object
+          properties:
+            status: { type: string, enum: [ready, degraded] }
+            repos:
+              type: array
+              items:
+                type: object
+                properties:
+                  url: { type: string }
+                  ready: { type: boolean }
+                  error: { type: string }
+
+    VersionEnvelope:
+      type: object
+      properties:
+        result:
+          type: object
+          properties:
+            version: { type: string, example: v0.7.0 }
+            commit: { type: string, example: abc1234 }
+            date: { type: string, format: date-time }
+
+    # --- Inventory -----------------------------------------------------
+    Deployment:
+      type: object
+      properties:
+        name: { type: string, example: db1 }
+        repo: { type: string, example: "s3://acme-pg-backups/" }
+        backup_count: { type: integer }
+        last_backup: { type: string, description: "Backup ID of the freshest backup" }
+        last_at: { type: string, format: date-time }
+
+    DeploymentsEnvelope:
+      type: object
+      properties:
+        result:
+          type: object
+          properties:
+            deployments:
+              type: array
+              items: { $ref: "#/components/schemas/Deployment" }
+
+    Backup:
+      type: object
+      properties:
+        backup_id: { type: string }
+        repo: { type: string }
+        type: { type: string, enum: [full, incremental_lsn, snapshot] }
+        pg_version: { type: integer, example: 17 }
+        timeline: { type: integer, example: 1 }
+        start_lsn: { type: string, example: "0/3000028" }
+        stop_lsn: { type: string, example: "0/30001A0" }
+        started_at: { type: string, format: date-time }
+        stopped_at: { type: string, format: date-time }
+
+    BackupListEnvelope:
+      type: object
+      properties:
+        result:
+          type: object
+          properties:
+            deployment: { type: string }
+            backups:
+              type: array
+              items: { $ref: "#/components/schemas/Backup" }
+
+    # --- Agents --------------------------------------------------------
+    Agent:
+      type: object
+      properties:
+        id: { type: string, description: "(host_fqdn, agent_uuid) tuple" }
+        host: { type: string }
+        first_seen: { type: string, format: date-time }
+        last_seen: { type: string, format: date-time }
+        deployments:
+          type: array
+          items: { type: string }
+          description: "Deployments this agent will service"
+        kinds:
+          type: array
+          items: { type: string, enum: [backup, restore, verify, audit-anchor] }
+        in_flight:
+          type: integer
+          description: "Jobs currently claimed by this agent"
+
+    AgentsEnvelope:
+      type: object
+      properties:
+        result:
+          type: object
+          properties:
+            agents:
+              type: array
+              items: { $ref: "#/components/schemas/Agent" }
+            heartbeat_timeout: { type: string, example: "30s" }
+
+    AgentEnvelope:
+      type: object
+      properties:
+        result: { $ref: "#/components/schemas/Agent" }
+
+    HeartbeatRequest:
+      type: object
+      required: [agent_id]
+      properties:
+        agent_id: { type: string }
+        host: { type: string }
+        deployments:
+          type: array
+          items: { type: string }
+        kinds:
+          type: array
+          items: { type: string }
+        version: { type: string }
+
+    # --- Jobs ----------------------------------------------------------
+    Job:
+      type: object
+      properties:
+        id: { type: string }
+        kind: { type: string, enum: [backup, restore, verify, audit-anchor] }
+        deployment: { type: string }
+        repo_url: { type: string }
+        state: { type: string, enum: [pending, running, completed, failed, cancelled] }
+        created_at: { type: string, format: date-time }
+        claimed_at: { type: string, format: date-time }
+        completed_at: { type: string, format: date-time }
+        agent_id: { type: string }
+        args:
+          type: object
+          additionalProperties: true
+        progress:
+          type: array
+          items: { $ref: "#/components/schemas/ProgressEvent" }
+        result:
+          type: object
+          additionalProperties: true
+        failure: { type: string }
+
+    JobEnvelope:
+      type: object
+      properties:
+        result: { $ref: "#/components/schemas/Job" }
+
+    JobListEnvelope:
+      type: object
+      properties:
+        result:
+          type: object
+          properties:
+            jobs:
+              type: array
+              items: { $ref: "#/components/schemas/Job" }
+            count: { type: integer }
+
+    BackupEnqueueRequest:
+      type: object
+      properties:
+        repo: { type: string, description: "Override the default repo" }
+        type: { type: string, enum: [full, incremental] }
+        tag: { type: string }
+        ignore_capacity: { type: boolean }
+        capacity_safety_factor: { type: number, format: float }
+
+    RestoreEnqueueRequest:
+      type: object
+      required: [backup_id, target_dir]
+      properties:
+        backup_id: { type: string, description: "Backup ID or 'latest'" }
+        target_dir: { type: string, description: "Absolute path on the agent host" }
+        repo: { type: string }
+        allow_overwrite: { type: boolean }
+        to: { type: string, description: "Natural-language PITR target ('5 minutes ago')" }
+        to_lsn: { type: string, description: "Explicit LSN PITR target" }
+        verify_after: { type: boolean }
+        tablespace_mapping:
+          type: array
+          items: { type: string, example: "/old/path=/new/path" }
+        skip_gap_check: { type: boolean }
+
+    VerifyEnqueueRequest:
+      type: object
+      required: [backup_id]
+      properties:
+        backup_id: { type: string, description: "Backup ID or 'latest'" }
+        pg_major: { type: string, example: "17" }
+        tempdir: { type: string }
+        repo: { type: string }
+        existence_only: { type: boolean }
+        sample_chunks: { type: integer, minimum: 0 }
+
+    ClaimRequest:
+      type: object
+      required: [agent_id]
+      properties:
+        agent_id: { type: string }
+        deployments:
+          type: array
+          items: { type: string }
+        kinds:
+          type: array
+          items: { type: string }
+
+    ProgressEvent:
+      type: object
+      properties:
+        at: { type: string, format: date-time }
+        kind: { type: string, description: "Event class (e.g. progress, chunker_paused)" }
+        body:
+          type: object
+          additionalProperties: true
+
+    ProgressAcceptedEnvelope:
+      type: object
+      properties:
+        result:
+          type: object
+          properties:
+            appended: { type: boolean }
+            id: { type: string }
+
+    CompleteRequest:
+      type: object
+      properties:
+        success: { type: boolean }
+        result:
+          type: object
+          additionalProperties: true
+        failure: { type: string }
+
+    CancelRequest:
+      type: object
+      properties:
+        reason: { type: string, default: operator-initiated }

@@ -1,0 +1,36 @@
+# L2-patroni-leader-switchover.llm-test.yaml
+#
+# Operator's Patroni cluster just switched leaders mid-backup.
+
+schema: pg_hardstorage.llm-test.v1
+name: L2-patroni-leader-switchover
+tier: L2
+description: |
+  Operator's Patroni cluster just switched leaders mid-backup.
+
+seed_context:
+  trigger:
+    code: |
+      wal.slot_missing_on_new_leader
+    message: |
+      wal stream: replication slot pg_hardstorage_db1 does not exist on new leader
+
+mode: ask
+turns:
+  - 'patroni just promoted a new leader and my wal stream broke with slot_missing.  what now?'
+
+rubric:
+  hard:
+    must_contain_any:
+      - 'wal repair'
+      - 'slot'
+      - 'patroni follow'
+      - 'recreate'
+    must_not_contain:
+      - 'DROP DATABASE'
+      - 'rm -rf'
+  soft:
+      - 'Does the response point at `pg_hardstorage wal repair <dep>` (or the patroni follow coordinator)?'
+      - "Does the response correctly explain that slots don't replicate by default in Patroni?"
+
+temperature: 0.2

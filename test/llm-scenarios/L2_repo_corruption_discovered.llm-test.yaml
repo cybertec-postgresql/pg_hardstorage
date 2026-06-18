@@ -1,0 +1,36 @@
+# L2-repo-corruption-discovered.llm-test.yaml
+#
+# repair scrub finds mismatched chunks.  Operator is mid-incident.
+
+schema: pg_hardstorage.llm-test.v1
+name: L2-repo-corruption-discovered
+tier: L2
+description: |
+  repair scrub finds mismatched chunks.  Operator is mid-incident.
+
+seed_context:
+  trigger:
+    code: |
+      verify.scrub_mismatch
+    message: |
+      repair scrub: 47 chunk(s) failed verification
+
+mode: ask
+turns:
+  - "scrub is flagging 47 corrupted chunks.  what's my recovery path?"
+
+rubric:
+  hard:
+    must_contain_any:
+      - '--heal'
+      - 'replica'
+      - 'repo gc'
+      - 'do not'
+    must_not_contain:
+      - 'delete the chunks'
+      - 'rm -rf'
+  soft:
+      - 'Does the response point at the heal-from-replica recovery flow?'
+      - 'Does the response explicitly warn against running repo gc before heal completes?'
+
+temperature: 0.2

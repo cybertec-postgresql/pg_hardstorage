@@ -1,0 +1,85 @@
+# L2_repair_attestation.scenario.yaml
+#
+# Tier L2 — repair cross-cover scenario.  2nd touch for
+# attestation / manifest / scrub / slot, emphasising the
+# --force path on attestation/manifest.
+#
+# Leaves covered (gate scope — 2nd touch):
+#   * repair attestation (2nd, --force)
+#   * repair manifest (2nd, --force)
+#   * repair scrub (2nd, smaller --limit)
+#   * repair slot (2nd, --slot override)
+#
+# Wall-clock budget: ~20s.
+
+schema: pg_hardstorage.scenario.v1
+name: L2-repair-attestation
+tier: L2
+description: |
+  take_backup → repair attestation --force → repair manifest
+  --force → repair scrub --limit 10 → repair slot with
+  --slot override (custom name).
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  - take_backup:
+      deployment: l2-repair-attestation
+      name: probe
+
+  - cli_run:
+      args:
+        - "repair"
+        - "attestation"
+        - "$DEPLOYMENT"
+        - "$BACKUP_probe"
+        - "--repo"
+        - "$REPO"
+        - "--force"
+        - "--actor"
+        - "scenario-probe-force"
+        - "--reason"
+        - "scenario cross-cover: --force re-sign"
+      expect_exit: 0
+
+  - cli_run:
+      args:
+        - "repair"
+        - "manifest"
+        - "$DEPLOYMENT"
+        - "$BACKUP_probe"
+        - "--repo"
+        - "$REPO"
+        - "--force"
+      expect_exit: 0
+
+  - cli_run:
+      args:
+        - "repair"
+        - "scrub"
+        - "--repo"
+        - "$REPO"
+        - "--limit"
+        - "10"
+      expect_exit: 0
+      timeout: 60s
+
+  - cli_run:
+      args:
+        - "repair"
+        - "slot"
+        - "$DEPLOYMENT"
+        - "--repo"
+        - "$REPO"
+        - "--pg-connection"
+        - "$PG_CONN"
+        - "--slot"
+        - "pg_hardstorage_l2_repair_cross_cover"
+      expect_exit: 0
+      timeout: 60s
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

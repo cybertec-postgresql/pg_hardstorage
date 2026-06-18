@@ -1,0 +1,62 @@
+# L2_compat_walg_tls.scenario.yaml
+#
+# Tier L2: pg-hardstorage-walg end-to-end against TLS MinIO
+# with a self-signed cert.  WAL-G operators using S3-compat
+# storage configure:
+#
+#   WALG_S3_PREFIX=s3://bucket/prefix
+#   AWS_ENDPOINT=https://minio.example.com:9000
+#   AWS_S3_FORCE_PATH_STYLE=true
+#   AWS_CA_BUNDLE=/etc/ssl/certs/ca.crt   (for self-signed)
+#
+# This scenario exercises every byte of that path: the shim's
+# flags.go must thread AWS_ENDPOINT into the native CLI's
+# `--repo s3://bucket?endpoint=...` URL (the analog of the
+# pgbackrest shim's pre-fix bug); the AWS SDK must trust the
+# self-signed cert via AWS_CA_BUNDLE; the round-trip via
+# wal-fetch must produce byte-identical output.
+#
+# Likely-to-surface bug: the WAL-G shim today emits AWS_ENDPOINT
+# as a warning ("verify with doctor") rather than weaving it
+# into the --repo URL.  The native CLI's S3 plugin reads
+# `endpoint=...` from URL params, NOT from AWS_ENDPOINT
+# directly.  Fail mode would be: shim writes
+# `--repo s3://bucket`, AWS SDK targets real AWS, archive
+# silently fails against an account that doesn't own the
+# bucket.
+
+schema: pg_hardstorage.scenario.v1
+name: L2-compat-walg-tls
+tier: L2
+description: |
+  pg-hardstorage-walg end-to-end against TLS MinIO via
+  WALG_S3_PREFIX + AWS_ENDPOINT + AWS_S3_FORCE_PATH_STYLE +
+  AWS_CA_BUNDLE.  wal-push segment + .backup, wal-fetch
+  round-trip — every byte traverses TLS twice.
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  - compat_archive:
+      shim: walg
+      deployment: compat-walg-tls
+      fixture: segment
+      sink: tls-minio
+
+  - compat_archive:
+      shim: walg
+      deployment: compat-walg-tls
+      fixture: segment_plus_backup
+      sink: tls-minio
+
+  - compat_archive:
+      shim: walg
+      deployment: compat-walg-tls
+      fixture: segment_idempotent
+      sink: tls-minio
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

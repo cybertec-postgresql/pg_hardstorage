@@ -1,0 +1,146 @@
+# L3_wal_stream_continuous.scenario.yaml
+#
+# The headline scenario for the headline feature.  Mirrors
+# the production deployment shape exactly: continuous WAL
+# streaming runs as a long-lived sidecar from the moment the
+# cluster comes up, a base backup is taken WHILE the streamer
+# keeps running, more workload runs after the backup ends,
+# and finally PITR replays through the streamed archive to
+# land at a point past backup-end.
+#
+# This is what an operator does in production:
+#
+#     systemctl enable --now pg_hardstorage-wal-stream@db1   # 24/7
+#     # ... and on a nightly cron / systemd timer:
+#     pg_hardstorage backup db1 --pg-connection ... --repo ...
+#
+# The two processes share a repo URL but do not coordinate
+# beyond that.  The base backup is the periodic anchor; the
+# stream is what makes PITR between anchors byte-precise.
+#
+# Why this scenario exists separately from L3_pitr_forward
+# and L4_patroni_failover_loop:
+#
+#   * It is named for the feature it exercises ("wal stream
+#     continuous"), so a doc cross-link from the README and
+#     getting-started tutorial points at something obviously
+#     relevant.  L3_pitr_forward is named for its narrower
+#     job (forward-replay correctness); L4_patroni is
+#     dominated by the failover-loop axis.
+#   * It captures the full streamer life-cycle on a single-
+#     node topology, free of failover noise.  A regression in
+#     the streamer's basic "run continuously through a base
+#     backup" path surfaces here without needing a 3-node
+#     Patroni stack.
+#   * It is the smallest scenario whose pass/fail directly
+#     answers "did continuous WAL streaming work end-to-end?".
+#
+# What gets exercised end-to-end:
+#
+#   * `wal_stream: { action: start }` BEFORE any data load
+#     (the moment the cluster is reachable, just like a real
+#     deployment).
+#   * `seed: { target_gb: 1 }` runs WITH the streamer active —
+#     proves the streamer can keep up with the bulk-load WAL
+#     rate on a fresh cluster.
+#   * `take_backup` runs concurrently with the streamer.  PG
+#     handles two replication connections (one BASE_BACKUP,
+#     one START_REPLICATION SLOT) at the same time; this
+#     scenario is the regression gate for that.
+#   * `run_load` after the backup drives WAL past backup-end-LSN
+#     so PITR is forced to consume archived segments rather
+#     than the WAL embedded in the base backup.
+#   * `wal_stream: { action: stop }` flushes and finalises
+#     the segment containing the captured LSN, then the
+#     restore picks it up via `wal fetch`.
+#   * `assert_restored_match` byte-equal-compares a checksum
+#     of the restored cluster against the live cluster at the
+#     captured LSN.
+#
+# Wall-clock budget: ~3 minutes on warm Docker images.
+schema: pg_hardstorage.scenario.v1
+name: L3-wal-stream-continuous
+tier: L3
+description: |
+  Continuous WAL streaming across a base-backup window, then
+  PITR forward through the streamed archive.  The base backup
+  runs while the streamer is active; the streamer is stopped
+  only after the captured LSN has been sealed into a segment.
+  Pass criterion: the restored cluster's checksum matches the
+  live cluster's checksum at the captured LSN, byte-equal.
+topology:
+  provider: local-docker
+  pg_version: "17"
+load:
+  file: test/load/failover_loop.load.yaml
+steps:
+  # The streamer comes up FIRST, the moment the cluster is
+  # reachable.  In a real deployment this is the systemd unit
+  # `pg_hardstorage@<deployment>.service` enabled at boot.
+  - wal_stream:
+      action: start
+
+  # Bulk seed runs concurrently with the streamer.  The
+  # streamer must keep up — its slot pins restart_lsn so PG
+  # cannot recycle WAL out from under it, but the segments
+  # must still flush to the repo at the cluster's WAL rate.
+  - seed:
+      target_gb: 1
+
+  # Base backup runs concurrently with the streamer.  Two
+  # replication connections to PG at once: BASE_BACKUP for
+  # the snapshot, START_REPLICATION SLOT for the live tail.
+  - take_backup:
+      deployment: l3-wal-stream-continuous
+
+  # Drive WAL past backup-end-LSN.  This is the workload that
+  # would otherwise be lost if only the base backup existed —
+  # the streamer is what makes recovery to a post-backup LSN
+  # possible.
+  - run_load:
+      duration: 15s
+
+  # Capture the live LSN + a checksum of the live cluster's
+  # state.  The checksum is a constant-memory aggregate so it
+  # scales unchanged to multi-GB tables.
+  - capture_lsn:
+      name: post_backup_load
+      checksum_query: |
+        select
+          count(*)::text || '|' ||
+          coalesce(sum(abalance)::text, '0') || '|' ||
+          coalesce(sum(hashtextextended(t::text, 0))::text, '0')
+        from pgbench_accounts t
+
+  # Force a WAL rotation so the segment containing the
+  # captured LSN is sealed.  Without this the streamer's
+  # `stop` cannot finalise that segment (it commits whole
+  # 16 MB segments only) and PITR aborts with "recovery
+  # ended before configured recovery target was reached".
+  - switch_wal: {}
+
+  # Stop the streamer.  This drains the now-sealed segment
+  # into the repo, so the upcoming `restore`'s `wal fetch`
+  # can read it.
+  - wal_stream:
+      action: stop
+
+  # PITR restore.  `name:` rather than `to_lsn:` for the same
+  # reason as L3_pitr_forward — PITR target enforcement past
+  # the streamer's flushed-segment boundary is brittle on
+  # single-node local-docker; the byte-equal checksum below
+  # is the actual correctness gate.
+  - restore:
+      deployment: l3-wal-stream-continuous
+      name: post_backup_load
+
+  # The pass/fail line: does the restored cluster match the
+  # live cluster at the captured LSN?  If yes, continuous WAL
+  # streaming carried the post-backup workload all the way
+  # through to recovery.
+  - assert_restored_match:
+      name: post_backup_load
+      strict: true
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

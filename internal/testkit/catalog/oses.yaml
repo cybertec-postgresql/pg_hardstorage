@@ -1,0 +1,129 @@
+# oses.yaml — the testkit's source-of-truth for supported
+# (OS × PG version × architecture) combinations.
+#
+# Every fleet entry the user adds via `pg_hardstorage_testkit
+# fleet add` must reference one of these IDs.  CI runs a
+# weekly drift check against the upstream PGDG repos so this
+# catalog stays accurate.
+#
+# Adding a new OS / PG combination?
+#   1. Add the entry below.
+#   2. Make sure dockerfiles/testbed/Dockerfile.<family> can
+#      build it (most distros need no template change; new
+#      families do).
+#   3. Run `pg_hardstorage_testkit image build --only os=<id>`
+#      to confirm the image actually builds.
+
+schema: pg_hardstorage.testkit.catalog.v1
+version: 1
+
+# Family-level defaults inherited by every entry that doesn't
+# override.  Cuts repetition; keeps the table short.
+families:
+  debian:
+    packages: pgdg-apt
+    init: systemd
+  rhel:
+    packages: pgdg-yum
+    init: systemd
+  suse:
+    packages: distro
+    init: systemd
+  arch:
+    # Arch ships PostgreSQL via pacman from the `extra` repo.
+    # PGDG does not publish for Arch, so there's no
+    # `pgdg-pacman` alternative — `distro` is the only mode.
+    packages: distro
+    init: systemd
+
+oses:
+  # ---- Debian family ----
+  - id: ubuntu:22.04
+    family: debian
+    pg_versions: [15, 16, 17, 18]
+    arches: [amd64, arm64]
+
+  - id: ubuntu:24.04
+    family: debian
+    pg_versions: [15, 16, 17, 18]
+    arches: [amd64, arm64]
+
+  - id: debian:12
+    family: debian
+    pg_versions: [15, 16, 17, 18]
+    arches: [amd64, arm64]
+
+  - id: debian:13
+    family: debian
+    packages: distro            # PGDG-apt not yet on trixie at catalog write
+    pg_versions: [15, 16, 17]
+    arches: [amd64, arm64]
+
+  # ---- RHEL family ----
+  - id: rockylinux:9
+    family: rhel
+    pg_versions: [15, 16, 17, 18]
+    arches: [amd64, arm64]
+
+  - id: almalinux:9
+    family: rhel
+    pg_versions: [15, 16, 17, 18]
+    arches: [amd64]
+
+  - id: rhel:9
+    # `rhel:9` doesn't exist on Docker Hub — RHEL itself is
+    # subscription-gated.  Use Red Hat UBI 9 (Universal Base
+    # Image), which is binary-compatible with RHEL 9 and
+    # freely redistributable.  For a true RHEL test (e.g.
+    # against subscription-only packages) override `image`
+    # to `registry.redhat.io/rhel9/rhel:latest` and `docker
+    # login` to registry.redhat.io first.
+    image: registry.access.redhat.com/ubi9/ubi:latest
+    family: rhel
+    pg_versions: [15, 16, 17, 18]
+    arches: [amd64]
+
+  - id: fedora:40
+    family: rhel
+    packages: distro            # Fedora ships PG via dnf, not PGDG
+    pg_versions: [16, 17]
+    arches: [amd64, arm64]
+
+  # Amazon Linux 2023 was removed from the catalogue: the rhel-family
+  # testbed Dockerfile fetches libfaketime from EPEL 9, but EPEL 9's
+  # release RPM requires `redhat-release >= 9`, which AL2023 (Fedora-
+  # 38-derived, not RHEL-9-derived) does not provide.  AL2023 also
+  # doesn't ship libfaketime in its own default repo.  Re-adding the
+  # OS will require a from-source libfaketime build branch in
+  # Dockerfile.rhel-family — out of scope for this fix.
+
+  # ---- Arch family ----
+  - id: archlinux:latest
+    # Arch is rolling-release; we don't snapshot to the Arch
+    # Linux Archive (ALA) since the point of an Arch testbed
+    # is to catch problems against rolling-tip glibc + tooling.
+    # The `pg_versions` list reflects what Arch's `extra` repo
+    # currently ships (PG 18 today); older majors live in the
+    # AUR which the family Dockerfile doesn't yet build from.
+    family: arch
+    pg_versions: [18]
+    arches: [amd64]
+
+  # ---- SUSE family ----
+  - id: opensuse:leap-15
+    # `opensuse:leap-15` isn't the Docker Hub library image
+    # (there's no `library/opensuse`).  The real image lives
+    # in the `opensuse` namespace as `opensuse/leap:15`.
+    image: opensuse/leap:15
+    family: suse
+    pg_versions: [15, 16]
+    arches: [amd64]
+
+# Filesystems we currently know how to provision over a
+# loopback in the testbed images.  Used by `fleet add` to
+# constrain operator choice.
+filesystems: [ext4, xfs, zfs, btrfs]
+
+# Roles a fleet entry can take.  Drives container wiring in
+# the validate driver.
+roles: [standalone, primary, replica, patroni-cluster]

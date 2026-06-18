@@ -1,0 +1,198 @@
+# pg_hardstorage.sample.yaml — annotated reference config.
+#
+# Copy to one of the standard config locations:
+#
+#   ~/.config/pg_hardstorage/pg_hardstorage.yaml   # per-user
+#   /etc/pg_hardstorage/pg_hardstorage.yaml        # system-wide
+#
+# Drop-in fragments under conf.d/*.yaml at the same parent
+# merge in lexicographic order (later wins) — same convention
+# as /etc/sysctl.d, /etc/sudoers.d.
+#
+# Every field is optional unless noted. Empty fields fall back
+# to their hardcoded defaults so a tiny config (e.g. just a
+# `deployments:` block) is valid.
+#
+# Schema commitment: the v1 schema is supported for at least
+# 24 months past any successor's introduction.
+
+schema: pg_hardstorage.config.v1
+
+# -------------------------------------------------------------------------
+# llm: assistant / explainer integration
+# -------------------------------------------------------------------------
+#
+# The LLM helper accepts any OpenAI-compatible Chat Completions
+# endpoint:
+#
+#   * api.openai.com (default)         — needs an OpenAI API key
+#   * Anthropic Claude (OpenAI-compat) — endpoint = https://api.anthropic.com/v1
+#   * Azure OpenAI                     — set api_key_header: "api-key" in extra
+#   * Ollama (local, air-gap-friendly) — endpoint = http://127.0.0.1:11434/v1
+#   * vLLM, OpenRouter, LiteLLM, ...   — same shape, just different URL
+#
+# Resolution chain for endpoint + key — later wins:
+#
+#   endpoint:
+#     1. --endpoint flag
+#     2. $PG_HARDSTORAGE_URL                 ← canonical project-branded
+#     3. $OPENAI_BASE_URL                    ← cross-tool standard
+#     4. llm.endpoint (this file)
+#     5. provider's hardcoded default
+#
+#   api_key:
+#     1. $PG_HARDSTORAGE_LLM_KEY             ← canonical project-branded
+#     2. $OPENAI_API_KEY                     ← cross-tool standard
+#     3. $PG_HARDSTORAGE_LLM_API_KEY         ← legacy spelling, still honoured
+#     4. llm.api_key_file (re-read each call so rotation
+#        doesn't need a restart)
+#     5. llm.api_key (inline; discouraged in production)
+#
+#   model:
+#     1. --model flag
+#     2. $PG_HARDSTORAGE_LLM_MODEL           ← canonical project-branded
+#     3. $OPENAI_MODEL                       ← cross-tool standard
+#     4. llm.model (this file)
+#     5. provider's hardcoded default (gpt-4o-mini for openai)
+#
+#   ⚠ When PG_HARDSTORAGE_URL points at a non-OpenAI endpoint
+#   (Anthropic, Azure, Ollama, vLLM, ...) you MUST set the
+#   model too — gpt-4o-mini won't exist there.  The upstream
+#   returns 404; pg_hardstorage's wrapped error names the env
+#   var so the operator can fix it in one step.
+#
+# When NO key is in scope anywhere the CLI falls back to the
+# `mock` provider — replies are stub echoes, not real AI. The
+# chat banner prints a loud warning so this isn't silent.
+#
+# Quick start (OpenAI):
+#   1) Put your API key in a 0600 file:
+#        umask 077 && echo "sk-proj-..." > /etc/pg_hardstorage/openai.key
+#   2) Set api_key_file below to that path.
+#   3) Verify:
+#        pg_hardstorage llm ask "ping"
+#
+# The same config also drives the LLM test harness — the
+# testkit's `llm run` shells out to `pg_hardstorage llm ask`
+# so this block is loaded the same way for both:
+#        pg_hardstorage_testkit llm run --tier L1 --provider mock test/llm-scenarios/
+#        pg_hardstorage_testkit llm run --tier L2 --skip-soft test/llm-scenarios/
+
+llm:
+  # Provider name. Today only "openai" (the OpenAI-compat
+  # client) and "mock" are registered. Future providers
+  # (Anthropic-native, AWS Bedrock, ...) accrete here.
+  provider: openai
+
+  # Endpoint URL. Most operators leave this empty (use the
+  # OpenAI default). Override for self-hosted or alternate
+  # Chat-Completions providers.
+  endpoint: https://api.openai.com
+
+  # Model id. OpenAI: gpt-4o-mini (cheap, ~$0.15/M tokens),
+  # gpt-4o (better, ~$2.50/M), gpt-4.1 (best). Anthropic via
+  # OpenAI-compat: claude-3-5-sonnet, claude-3-5-haiku.
+  # Ollama: whatever you've pulled (e.g. llama3.1:8b).
+  model: gpt-4o-mini
+
+  # API key, file form (preferred). The path is read on
+  # every CLI invocation so a key rotation is just
+  # `echo new-key > /etc/pg_hardstorage/openai.key` —
+  # no service restart.
+  api_key_file: /etc/pg_hardstorage/openai.key
+
+  # API key, inline form (discouraged — secrets in YAML
+  # leak via backups, version control, etc.). Use only
+  # for one-off configs or when the operator's secret-
+  # management story already gates this file.
+  # api_key: sk-proj-...
+
+  # Per-response token cap. Default 4096. Bigger answers
+  # cost more; smaller can truncate complex tool-use
+  # cycles. Most operators leave this at the default.
+  # max_tokens: 4096
+
+  # Privacy posture for the conversation history:
+  #   ""           — default (history kept in
+  #                   ~/.local/state/pg_hardstorage/llm-history)
+  #   "off"        — no history written
+  #   "redact"     — history kept but redactor strips
+  #                   secrets / DSNs / IPs before write
+  # privacy: redact
+
+  # Provider-specific extras. Today's known keys:
+  #   api_key_header — Azure OpenAI uses "api-key", not the
+  #                    default "Authorization: Bearer ..."
+  # extra:
+  #   api_key_header: api-key
+
+# -------------------------------------------------------------------------
+# deployments: one entry per PG cluster pg_hardstorage manages
+# -------------------------------------------------------------------------
+
+deployments:
+  prod-db:
+    pg_connection: postgres://pgrole@db.example.com:5432/postgres
+    repo: s3://acme-pg-backups/prod-db?region=us-east-1
+    tenant: prod
+    classification: confidential        # public|internal|confidential|restricted
+    schedule:
+      backup: { every: 6h }
+      rotate: { daily_at: "02:30" }
+    retention:
+      policy: gfs                       # gfs|simple|count
+      keep_daily: 14
+      keep_weekly: 8
+      keep_monthly: 24
+
+  staging-db:
+    pg_connection: postgres://pgrole@db.staging.example.com:5432/postgres
+    repo: file:///srv/pg_hardstorage/staging-db
+
+  # ---------------------------------------------------------------
+  # Example: source PG with Transparent Data Encryption (TDE)
+  # ---------------------------------------------------------------
+  #
+  # When the source PostgreSQL has TDE enabled (CYBERTEC PGEE,
+  # pg_tde, EDB TDE, ...), declare it with `tde.enabled: true`.
+  # This switches every code path that would otherwise parse PG
+  # byte layout off the source filesystem (the `wal push`
+  # archive_command shim, primarily) into "those bytes are
+  # ciphertext, don't peek" mode.  Manifests taken under TDE
+  # carry a `source_tde` block so restore-time tooling can
+  # refuse vanilla-PG targets and skip checksum gates that
+  # cannot be meaningful against ciphertext.
+  #
+  # The backup wire protocol itself does NOT change under TDE —
+  # PGEE / pg_tde decrypt at the replication boundary so
+  # BASE_BACKUP and START_REPLICATION deliver plaintext.  See
+  # docs/explanation/tde-awareness.md for the full story.
+  encrypted-pgee:
+    pg_connection: postgres://pgrole@db.pgee.example.com:5432/postgres
+    repo: s3://acme-pg-backups/pgee?region=eu-west-1
+    classification: restricted
+    tde:
+      enabled: true
+      engine: cybertec_enterprise        # free-form; informational
+      key_ref: kms-secret://prod/pgee    # operator-supplied; opaque
+    schedule:
+      backup: { every: 6h }
+
+# -------------------------------------------------------------------------
+# airgap: refuse outbound endpoints outside loopback / RFC1918
+# -------------------------------------------------------------------------
+#
+# Three modes, escalating: empty (the runtime decides),
+# "warn" (log + proceed), "strict" (refuse).
+#
+# Useful for regulated deployments where every outbound
+# connection must be on an allowlist. The LLM provider's
+# endpoint is gated through this, so an air-gapped setup
+# can use Ollama without accidentally leaking prompts to
+# api.openai.com if a config typo flips the endpoint.
+
+# airgapped: strict
+# airgap:
+#   allowlist:
+#     - http://127.0.0.1:11434       # local Ollama
+#     - https://internal-vault.corp/v1

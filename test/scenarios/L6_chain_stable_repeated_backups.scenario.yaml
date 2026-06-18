@@ -1,0 +1,40 @@
+# L6_chain_stable_repeated_backups.scenario.yaml
+#
+# Tier L6 clock/time: 5 backups in a tight loop.  Catches
+# a class of clock-related defect where audit events
+# emitted within the same wall-clock millisecond collide
+# in the hash chain (same prev_hash + same timestamp +
+# similar payload → near-duplicate canonical JSON
+# disambiguated only by a monotonic counter).  The chain
+# must verify end-to-end even under burst issuance.
+schema: pg_hardstorage.scenario.v1
+name: L6-chain-stable-repeated-backups
+tier: L6
+description: |
+  Five back-to-back backups; verify-chain must report clean.
+topology:
+  provider: local-docker
+  pg_version: "17"
+steps:
+  - take_backup:
+      deployment: l6-chain-stable
+  - take_backup:
+      deployment: l6-chain-stable
+  - take_backup:
+      deployment: l6-chain-stable
+  - take_backup:
+      deployment: l6-chain-stable
+  - take_backup:
+      deployment: l6-chain-stable
+  - cli_run:
+      args:
+        - "audit"
+        - "verify-chain"
+        - "--repo"
+        - "$REPO"
+        - "--output"
+        - "json"
+      expect_exit: 0
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

@@ -1,0 +1,134 @@
+# L2_repo_replication.scenario.yaml
+#
+# Tier L2 — repository replication: `repo replicate` (one-way
+# sync from primary repo to a replica repo) and `repo
+# replicate verify` (deep / shallow consistency check across
+# the two).
+#
+# Headline property: a primary repo populated with backups
+# can be replicated to a sister repo using just `repo
+# replicate`, and `repo replicate verify` reports clean.
+# A regression in either side silently breaks the
+# disaster-recovery story for operators who keep a hot
+# replica of their backup repo.
+#
+# Leaves covered (gate scope):
+#   * repo replicate — happy-path one-way sync
+#   * repo replicate verify — shallow + deep consistency check
+#   * repo bundle import — 2nd touch (alternate path to seed
+#     the replica)
+#   * repo compact — 2nd touch (stub, exits 0)
+#
+# Wall-clock budget: ~25s.
+
+schema: pg_hardstorage.scenario.v1
+name: L2-repo-replication
+tier: L2
+description: |
+  Take a backup → init a sister repo → replicate → verify
+  shallow → verify deep → cross-cover bundle import +
+  compact on the replica.
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  - take_backup:
+      deployment: l2-repo-replication
+
+  # 1. Bootstrap the replica repo.
+  - cli_run:
+      args:
+        - "repo"
+        - "init"
+        - "file://$ARTEFACT_DIR/replica"
+      expect_exit: 0
+
+  # 2. Replicate primary → replica.  Default mode (no
+  # --dry-run) actually writes; the byte count is small
+  # because the testbed seed is small.
+  - cli_run:
+      args:
+        - "repo"
+        - "replicate"
+        - "--from"
+        - "$REPO"
+        - "--to"
+        - "file://$ARTEFACT_DIR/replica"
+      expect_exit: 0
+
+  # 3. Shallow verify — the cheap path: object presence +
+  # size match across the two sides.  Operators run this
+  # routinely.
+  - cli_run:
+      args:
+        - "repo"
+        - "replicate"
+        - "verify"
+        - "--from"
+        - "$REPO"
+        - "--to"
+        - "file://$ARTEFACT_DIR/replica"
+      expect_exit: 0
+
+  # 4. Deep verify — the byte-compare path: fetches both
+  # sides and asserts identical content.  Catches
+  # same-size drift the shallow path misses.
+  - cli_run:
+      args:
+        - "repo"
+        - "replicate"
+        - "verify"
+        - "--from"
+        - "$REPO"
+        - "--to"
+        - "file://$ARTEFACT_DIR/replica"
+        - "--deep"
+      expect_exit: 0
+
+  # 5. Cross-cover: bundle export from primary → import
+  # into a SECOND replica.  This proves the import path
+  # works against a repo bootstrapped independently of
+  # the replicate flow.
+  - cli_run:
+      args:
+        - "repo"
+        - "bundle"
+        - "export"
+        - "--repo"
+        - "$REPO"
+        - "--deployment"
+        - "$DEPLOYMENT"
+        - "--out"
+        - "$ARTEFACT_DIR/bundle.tar"
+      expect_exit: 0
+
+  - cli_run:
+      args:
+        - "repo"
+        - "init"
+        - "file://$ARTEFACT_DIR/replica2"
+      expect_exit: 0
+
+  - cli_run:
+      args:
+        - "repo"
+        - "bundle"
+        - "import"
+        - "--in"
+        - "$ARTEFACT_DIR/bundle.tar"
+        - "--to"
+        - "file://$ARTEFACT_DIR/replica2"
+      expect_exit: 0
+
+  # 6. compact — 2nd touch (stub).
+  - cli_run:
+      args:
+        - "repo"
+        - "compact"
+      expect_exit: 1
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

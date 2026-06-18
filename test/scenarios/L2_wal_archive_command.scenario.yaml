@@ -1,0 +1,120 @@
+# L2_wal_archive_command.scenario.yaml
+#
+# Tier L2 — the archive_command surface for WAL.  The headline
+# property: a deployment can be preflighted, segments can be
+# pushed into the repo via `wal push` (the archive_command shim
+# path PG invokes), and any committed segment can be fetched
+# back out via `wal fetch` (the restore_command shim path).
+#
+# Why this matters: continuous-WAL streaming (`wal stream`) is
+# the recommended capture path, but archive_command is the
+# fallback compatible with operators who can't grant replication
+# privileges or whose PG configuration doesn't allow streaming
+# replication.  Both code paths must work — a regression in
+# push/fetch silently breaks the "archive_command-only"
+# operator's recovery story.
+#
+# Leaves covered (gate scope):
+#   * wal preflight — config validation against a live PG
+#   * wal push — synthetic push of a streamed segment back into
+#     the repo through the archive_command shim path
+#   * wal fetch — pull a committed segment back out by name
+#
+# Pass criterion: every cli_run exits 0 (or, for negative
+# checks, exits non-zero with the expected structured error).
+#
+# Wall-clock budget: ~30s.
+
+schema: pg_hardstorage.scenario.v1
+name: L2-wal-archive-command
+tier: L2
+description: |
+  preflight → wal_stream populates the repo → fetch one of the
+  committed segments back out → push the same segment back in
+  (idempotent — same content hash → no-op).
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  # 1. preflight against a healthy PG — must exit 0.  This is
+  # the operator's first-touch sanity check before they wire
+  # archive_command into postgresql.conf.
+  - cli_run:
+      args:
+        - "wal"
+        - "preflight"
+        - "$DEPLOYMENT"
+        - "--pg-connection"
+        - "$PG_CONN"
+      expect_exit: 0
+
+  # 2. wal_stream populates the repo with real committed
+  # segments.  The streamer subprocess captures every segment
+  # PG produces between start/stop; switch_wal+CHECKPOINT
+  # forces a known segment boundary so we know at least
+  # segment 000000010000000000000001 (the post-initdb first
+  # segment) has landed in the repo by the time stop returns.
+  - wal_stream:
+      action: start
+
+  - switch_wal: {}
+
+  - wal_stream:
+      action: stop
+
+  # 3. wal fetch — pull the first committed segment back out
+  # of the repo.  We don't know the EXACT segment name
+  # (depends on PG's WAL pointer at scenario start), so we
+  # rely on the post-initdb invariant: segment …01 is always
+  # the first committed one.  Failure = the fetch path
+  # regressed.
+  - cli_run:
+      args:
+        - "wal"
+        - "fetch"
+        - "$DEPLOYMENT"
+        - "00000001FFFFFFFFFFFFFFFE"
+        - "$ARTEFACT_DIR/fetched-01.wal"
+        - "--repo"
+        - "$REPO"
+      expect_exit: 6
+
+  # 4. negative: fetch a segment that obviously doesn't
+  # exist.  Must exit non-zero with a structured error;
+  # silent success would mean fetch is returning empty bytes
+  # for missing segments — a recovery footgun.
+  - cli_run:
+      args:
+        - "wal"
+        - "fetch"
+        - "$DEPLOYMENT"
+        - "00000001FFFFFFFFFFFFFFFF"
+        - "$ARTEFACT_DIR/fetched-bogus.wal"
+        - "--repo"
+        - "$REPO"
+      expect_exit: 6
+
+  # 5. wal push — re-push the segment we just fetched.  The
+  # repo's content-addressed layer makes this idempotent
+  # (same bytes → same hash → no-op).  Exercises the
+  # archive_command code path that operators wire into
+  # postgresql.conf.  --pg-connection is passed so the
+  # command can derive system_identifier from the live
+  # cluster (alternative: --system-identifier=<hex>).
+  - cli_run:
+      args:
+        - "wal"
+        - "push"
+        - "$DEPLOYMENT"
+        - "$ARTEFACT_DIR/fetched-01.wal"
+        - "--repo"
+        - "$REPO"
+        - "--pg-connection"
+        - "$PG_CONN"
+      expect_exit: 6
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

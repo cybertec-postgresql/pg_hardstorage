@@ -1,0 +1,88 @@
+# L2_db_extension.scenario.yaml
+#
+# Tier L2 — in-DB extension lifecycle: `db install-extension
+# | uninstall-extension`.  Embeds + installs the
+# pg_hardstorage in-DB extension that exposes
+# observability functions to the operator's PG.
+#
+# Headline property: install-extension --print-sql emits
+# the install SQL without a PG; uninstall-extension
+# requires --drop-data acknowledgement.
+#
+# Leaves covered (gate scope):
+#   * db install-extension
+#   * db uninstall-extension
+#
+# Wall-clock budget: ~15s.
+
+schema: pg_hardstorage.scenario.v1
+name: L2-db-extension
+tier: L2
+description: |
+  install-extension --print-sql (no PG) → install-extension
+  --dry-run against PG → uninstall without --drop-data
+  refused → uninstall with --drop-data succeeds.
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  # 1. --print-sql — no PG connection, prints the SQL.
+  - cli_run:
+      args:
+        - "db"
+        - "install-extension"
+        - "--print-sql"
+      expect_exit: 0
+
+  # 2. --dry-run against PG — validates the connection +
+  # reports what would be installed, doesn't apply.
+  - cli_run:
+      args:
+        - "db"
+        - "install-extension"
+        - "--pg-connection"
+        - "$PG_CONN"
+        - "--dry-run"
+      expect_exit: 0
+      timeout: 60s
+
+  # 3. Apply for real.
+  - cli_run:
+      args:
+        - "db"
+        - "install-extension"
+        - "--pg-connection"
+        - "$PG_CONN"
+      expect_exit: 0
+      timeout: 60s
+
+  # 4. Negative uninstall: missing --drop-data acknowledge.
+  # The flag is REQUIRED for uninstall to proceed (per the
+  # --drop-data help string).  Silent install with no
+  # gate would mean operators can drop in-DB tables by
+  # typo.
+  - cli_run:
+      args:
+        - "db"
+        - "uninstall-extension"
+        - "--pg-connection"
+        - "$PG_CONN"
+      expect_exit: 2
+      timeout: 60s
+
+  # 5. Uninstall with --drop-data.
+  - cli_run:
+      args:
+        - "db"
+        - "uninstall-extension"
+        - "--pg-connection"
+        - "$PG_CONN"
+        - "--drop-data"
+      expect_exit: 0
+      timeout: 60s
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

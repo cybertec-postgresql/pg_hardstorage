@@ -1,0 +1,47 @@
+# Dockerfile.rpm-rhel-builder — Rocky/Alma/Fedora .rpm build env.
+#
+# Used by run_pkg_build_testing.sh.  Source comes in via bind-
+# mount at /src; the driver tar's the source into the rpmbuild
+# tree, copies the spec, and runs `rpmbuild -bb`.  Output .rpm
+# files land under /root/rpmbuild/RPMS/<arch>/ and are copied
+# to /out by the driver.
+
+ARG OS_IMAGE=rockylinux:9
+FROM ${OS_IMAGE}
+
+ENV GOTOOLCHAIN=local
+
+# rpm-build + rpmdevtools cover the spec build path.  The
+# project's spec asks for golang>=1.26 which UBI 9 / Rocky 9
+# don't ship by default — install upstream Go tarball below.
+# `--allowerasing` keeps the curl-minimal vs curl conflict
+# from blowing up on UBI 9; same workaround the testbed uses.
+RUN dnf -y install --allowerasing \
+        ca-certificates curl gnupg2 \
+        rpm-build rpmdevtools \
+        systemd-rpm-macros \
+        make git tar xz \
+        rsync \
+        which procps-ng \
+ && dnf clean all
+
+ARG GO_VERSION=1.26.0
+RUN arch="$(uname -m)" \
+ && case "$arch" in \
+        x86_64)  gotar="go${GO_VERSION}.linux-amd64.tar.gz"  ;; \
+        aarch64) gotar="go${GO_VERSION}.linux-arm64.tar.gz"  ;; \
+        *)       echo "unsupported arch: $arch" >&2; exit 1  ;; \
+    esac \
+ && curl -fsSL "https://go.dev/dl/${gotar}" -o /tmp/go.tgz \
+ && tar -C /usr/local -xzf /tmp/go.tgz \
+ && rm /tmp/go.tgz
+ENV PATH=/usr/local/go/bin:${PATH}
+ENV GOPATH=/go
+ENV GOCACHE=/go/cache
+
+# Pre-create the rpmbuild tree so the driver's tar-copy works
+# without a stat race.
+RUN rpmdev-setuptree
+
+WORKDIR /src
+CMD ["bash", "-c", "echo 'rpm-rhel-builder ready; driver should `docker run` with explicit cmd'"]

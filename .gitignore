@@ -1,0 +1,84 @@
+# Build output
+/bin/
+/dist/
+/build/
+
+# MkDocs site build output + local Python venv used by `make docs-deps`.
+/site/
+/.venv/
+
+# Go binaries / test artefacts
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.prof
+*.out
+/coverage.out
+/coverage.html
+/cover.out
+/cover.html
+
+# Vendoring (we don't vendor; pin via go.sum)
+/vendor/
+
+# Editor / IDE
+/.idea/
+/.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Local development state
+/.pg_hardstorage/
+/state.sqlite*
+*.sqlite-journal
+*.sqlite-shm
+*.sqlite-wal
+
+# Crash bundles / core dumps
+/crashes/
+core
+core.*
+
+# Local config / secrets — never commit
+/.env
+/.env.*
+*.local.yaml
+/keyring/
+*.pem.local
+
+# Testkit run artefacts
+/test/_runs/
+/test/artifacts/
+/test-runs/
+*.scenario.lock
+
+# LLM pilot transcripts — keep cases.yaml / run.sh / GRADES.md
+# under version control; per-run model output stays local.
+
+# Editor / merge / agent leftovers
+*.orig
+*.rej
+.claude/
+
+# pgregory.net/rapid failure reproducer cache.  rapid writes here on
+# any test failure; mutation-test runs intentionally fail, so we
+# don't want to check those in.  Real reproducers should be pinned
+# in the test body via -rapid.seed=.
+**/testdata/rapid/
+
+# Date-stamped test-run artefact directories (docker container
+# leftovers, run output, etc.).  Anchored to repo root so it
+# only catches top-level dumps, not anything inside test/.
+/test-artefacts-*/
+
+# Stray pg_hardstorage / pg_hardstorage_testkit binaries built at
+# repo root.  The proper output path is bin/ (already ignored
+# above); anchored to root so they don't shadow the corresponding
+# cmd/* packages.
+/pg_hardstorage
+/pg_hardstorage_testkit

@@ -1,0 +1,73 @@
+# Focused 2 h soak catalogue for the ten new fault primitives
+# added in PR #54.  Drop in as the soak's faults.yaml to exercise
+# the new primitives against a real docker fleet:
+#
+#     mkdir -p test-runs/run-new-faults-2h
+#     cp test/soak/faults_new_primitives_2h.yaml \
+#        test-runs/run-new-faults-2h/faults.yaml
+#     ./run_testing.sh 4 2h --report-dir test-runs/run-new-faults-2h
+#
+# Goal: prove the new primitives' Apply + Recovery paths work
+# against real `docker exec` (the unit tests in PR #54 use
+# FakeTarget), that pg_hardstorage survives the survival faults,
+# and that it detects the corruption faults.  Total weight 65;
+# expected ~150-200 fault applications over 2 h on a 4-cell
+# fleet with the default 30-60 s heal window.
+#
+# Two primitives are deliberately excluded:
+#   - tablespace_unmount: the testbed cells don't create a
+#     tablespace today, so the fault's "absolute path required"
+#     guard would always fail.  Belongs in a future testbed
+#     scaffolding PR.
+#   - concurrent_repo_writer: needs deployment / pg_conn / repo
+#     args interpolated per cell, which the random-soak driver
+#     doesn't carry today.  Deserves a scenario-driven test.
+#
+# Pass criteria (see PR #54 description for the full table):
+#   - 0 backup_failed / setup_failed / panic / mismatch / corrupt
+#   - 0 fault_apply_failed for the SURVIVAL faults below
+#   - every inode_exhaustion application MUST fault_apply_failed
+#     with "filesystem too inode-rich" (honest-refusal invariant)
+#   - restore_failed / verify_failed events from the CORRUPTION
+#     faults are EXPECTED — the product detecting the corruption
+#     is the success signal.  A verify_ok immediately following a
+#     manifest/wal corruption hit on the same backup would mean
+#     the product MISSED the corruption (test FAIL).
+
+schema: pg_hardstorage.testkit.fault.v1
+version: 1
+faults:
+  # ---------- Survival faults (pg_hardstorage must keep working) ----------
+  # CHECKPOINT flood stresses the WAL→backup interaction window.
+  - { name: checkpoint_storm,   weight: 12, action: "checkpoint_storm(target=pg_random, count=20, sleep_ms=500)" }
+  # CREATE → INSERT → CHECKPOINT → DROP a sizeable relation while a
+  # concurrent backup is in flight; tests relfilenode-vs-catalog
+  # invariant.
+  - { name: drop_relation_mid_backup, weight: 12, action: "drop_relation_mid_backup(target=pg_random, rows=50000)" }
+  # prlimit --nofile=64 on the postmaster; subsequent opens hit EMFILE.
+  - { name: fd_exhaustion,      weight: 10, action: "fd_exhaustion(target=pg_random, role=pg, limit=64)" }
+
+  # ---------- Corruption faults (product must DETECT and refuse) ----------
+  # Low weight per fault — these accumulate damage; too many erodes
+  # the "did the product detect it" signal because every backup is
+  # corrupted before we can verify it.
+  - { name: torn_page,          weight: 3, action: "torn_page(target=pg_random, pages=1)" }
+  - { name: manifest_corruption, weight: 3, action: "manifest_targeted_corruption(target=repo, count=1)" }
+  - { name: truncated_wal,      weight: 3, action: "truncated_wal_segment(target=repo, bytes=512)" }
+  - { name: missing_wal,        weight: 3, action: "missing_wal_segment(target=repo)" }
+
+  # ---------- Honest-refusal check (every application MUST fault_apply_failed) ----------
+  # On any modern host the bind-mounted repo dir has billions of
+  # free inodes — far above max_iavail.  We expect the fault to
+  # REFUSE with a clear "filesystem too inode-rich" error rather
+  # than silently no-op.  Weight 1 → ~3 applications over 2 h;
+  # enough to verify the invariant fires without bloating the
+  # fault_apply_failed count.
+  - { name: inode_exhaustion_refusal, weight: 1, action: "inode_exhaustion(target=repo)" }
+
+  # ---------- Baseline existing-fault chaos for realistic interleave ----------
+  - { name: signal_15,    weight: 5, action: "signal(target=pg_random, sig=15)" }
+  - { name: signal_9,     weight: 5, action: "signal(target=pg_random, sig=9)" }
+  - { name: disk_full,    weight: 3, action: "disk_full(target=repo, fill=98%)" }
+  - { name: cgroup_squeeze, weight: 3, action: "cgroup_squeeze(target=pg_random, max_bytes=33554432)" }
+  - { name: docker_pause, weight: 2, action: "docker_pause(target=repo)" }

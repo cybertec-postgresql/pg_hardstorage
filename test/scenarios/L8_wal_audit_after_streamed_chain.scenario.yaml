@@ -1,0 +1,107 @@
+# L8_wal_audit_after_streamed_chain.scenario.yaml
+#
+# Tier L8 — `wal audit <deployment>` is the cron-friendly
+# WAL-gap detector.  It walks every committed WAL segment
+# for the deployment, looks for LSN holes, and surfaces
+# any found gaps as findings (cron-aware: exit non-zero
+# if any gap exists).
+#
+# On a deployment with a healthy wal_stream chain, audit
+# must surface ZERO gaps and exit 0.  Companion commands
+# also exercised:
+#
+#   * `wal list <deployment>` — enumerate every
+#     committed segment.  Must report a non-empty list
+#     after the wal_stream chain.
+#   * `wal list --gaps-only` — only the gap report
+#     (empty on a healthy chain).
+#   * `wal gaps <deployment>` — the persisted gap-record
+#     view (separate from `wal audit`'s live walk).
+#
+# Wall-clock budget: ~3 minutes (1 GB seed + wal_stream
+# start + load + backup + wal_stream stop + audit + list
+# + gaps probes).
+schema: pg_hardstorage.scenario.v1
+name: L8-wal-audit-after-streamed-chain
+tier: L8
+description: |
+  wal_stream start → load → take_backup → wal_stream stop
+  → wal audit / wal list / wal gaps must all run cleanly
+  against the streamed chain.
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+load:
+  # failover_loop.load.yaml has no UNIQUE constraint so a
+  # post-seed run_load doesn't conflict with the pgbench
+  # bootstrap (oltp_smoke would trip on the email UNIQUE
+  # index when it re-runs the bootstrap phase).
+  file: test/load/failover_loop.load.yaml
+
+steps:
+  - seed:
+      target_gb: 1
+
+  - wal_stream:
+      action: start
+
+  - run_load:
+      duration: 10s
+
+  - take_backup:
+      deployment: l8-wal-audit
+      name: only_backup
+
+  - wal_stream:
+      action: stop
+
+  # `wal audit` returns exit 0 on a clean chain (no
+  # gaps), non-zero with a structured error if any gap
+  # exists.  We assert clean here.
+  - cli_run:
+      args:
+        - "wal"
+        - "audit"
+        - "$DEPLOYMENT"
+        - "--repo"
+        - "$REPO"
+      timeout: 30s
+
+  # `wal list` must surface the streamed segments.
+  - cli_run:
+      args:
+        - "wal"
+        - "list"
+        - "$DEPLOYMENT"
+        - "--repo"
+        - "$REPO"
+      timeout: 30s
+
+  # `wal list --gaps-only` on a healthy chain — must
+  # report no gaps.
+  - cli_run:
+      args:
+        - "wal"
+        - "list"
+        - "$DEPLOYMENT"
+        - "--repo"
+        - "$REPO"
+        - "--gaps-only"
+      timeout: 30s
+
+  # `wal gaps` — the persisted gap-record query (separate
+  # store from the live walk audit performs).
+  - cli_run:
+      args:
+        - "wal"
+        - "gaps"
+        - "$DEPLOYMENT"
+        - "--repo"
+        - "$REPO"
+      timeout: 30s
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

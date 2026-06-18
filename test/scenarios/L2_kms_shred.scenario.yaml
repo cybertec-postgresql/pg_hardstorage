@@ -1,0 +1,101 @@
+# L2_kms_shred.scenario.yaml
+#
+# Tier L2 — KMS shred command surface.  The headline property:
+# `kms shred` refuses to destroy a KEK without an n-of-m
+# approval gate AND the typed-keyring-path confirmation AND
+# --yes, but `kms shred --dry-run` (no gates required) exits
+# 0 and reports the affected-backup scope.
+#
+# Why this matters: shredding a KEK is irreversible — every
+# backup encrypted under that key becomes unrecoverable
+# forever.  The four-gate posture (approval + typed-keyring +
+# --yes + non-dry-run) is the operator-safety contract; a
+# regression that lets shred fire without one of those gates
+# is a data-loss landmine.
+#
+# Leaves covered (gate scope, 2nd touch for kms rotate +
+# hsm-status):
+#   * kms shred — gate-validation + dry-run preview
+#   * kms rotate — re-exercised in a destruction-readiness
+#     workflow
+#   * kms hsm-status — re-exercised
+#
+# Wall-clock budget: ~15s.
+
+schema: pg_hardstorage.scenario.v1
+name: L2-kms-shred
+tier: L2
+description: |
+  Take an encrypted backup → kms hsm-status → kms shred
+  without gates is refused → kms shred --dry-run reports
+  scope → kms rotate validation re-runs (cross-cover).
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  - take_backup:
+      deployment: l2-kms-shred
+
+  # 1. hsm-status — sanity touch (2nd scenario; required for
+  # 2× coverage).
+  - cli_run:
+      args:
+        - "kms"
+        - "hsm-status"
+      expect_exit: 1
+
+  # 2. Negative: shred without --require-approval must be
+  # refused.  The four-gate posture would silently degrade if
+  # the missing-approval path didn't return non-zero.
+  - cli_run:
+      args:
+        - "kms"
+        - "shred"
+        - "--repo"
+        - "$REPO"
+        - "--reason"
+        - "scenario probe: missing-approval check"
+        - "--yes"
+      expect_exit: 2
+
+  # 3. Positive: shred --dry-run with --reason exits 0 and
+  # reports the affected-backup scope.  Dry-run is
+  # explicitly documented as skipping the approval /
+  # typed-keyring / --yes gates because it's a non-mutating
+  # preview — the operator's "what would I lose" surface.
+  - cli_run:
+      args:
+        - "kms"
+        - "shred"
+        - "--repo"
+        - "$REPO"
+        - "--reason"
+        - "scenario probe: dry-run preview"
+        - "--dry-run"
+      expect_exit: 0
+
+  # 4. 2nd touch on kms rotate validation — same-ref
+  # negative.  Cheap cross-coverage; the rotate command is
+  # adjacent to shred in operator mental models (both are
+  # KEK-lifecycle).
+  - cli_run:
+      args:
+        - "kms"
+        - "rotate"
+        - "--repo"
+        - "$REPO"
+        - "--old-kek-file"
+        - "/etc/pg_hardstorage/keyring/kek.bin"
+        - "--new-kek-file"
+        - "/etc/pg_hardstorage/keyring/kek.bin"
+        - "--old-kek-ref"
+        - "kek-A"
+        - "--new-kek-ref"
+        - "kek-A"
+      expect_exit: 2
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

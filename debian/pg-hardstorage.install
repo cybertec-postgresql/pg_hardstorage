@@ -1,0 +1,3 @@
+completions/bash/pg_hardstorage usr/share/bash-completion/completions/
+completions/zsh/_pg_hardstorage usr/share/zsh/vendor-completions/
+completions/fish/pg_hardstorage.fish usr/share/fish/vendor_completions.d/

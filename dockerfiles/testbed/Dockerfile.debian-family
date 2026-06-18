@@ -1,0 +1,122 @@
+# Dockerfile.debian-family — debian/ubuntu testbed image.
+#
+# Args:
+#   OS_IMAGE   — e.g. ubuntu:24.04 / debian:12 (from the catalog)
+#   PG_VERSION — major version (15 / 16 / 17 / 18-dev)
+#   PACKAGES   — pgdg-apt | distro
+#
+# Build via:
+#   pg_hardstorage_testkit image build --only-os=ubuntu:24.04 --only-pg=17
+#
+# Result: a container that runs PG + the host agent inside the
+# same OS the operator picked, ready to serve as one cell in
+# the soak-test fleet.
+
+ARG OS_IMAGE=ubuntu:24.04
+FROM ${OS_IMAGE}
+
+ARG PG_VERSION=17
+ARG PACKAGES=pgdg-apt
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Base utilities every cell uses: process supervisor, network
+# tools, fault-injection helpers (libfaketime, dmsetup,
+# toxiproxy-cli), build essentials for the agent's cgo-light
+# rebuild.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        ca-certificates curl gnupg lsb-release \
+        systemd systemd-sysv \
+        libfaketime \
+        iproute2 iptables \
+        sudo locales \
+        procps \
+ && rm -rf /var/lib/apt/lists/*
+
+# PG install path — pgdg-apt for upstream-supported distros,
+# distro repo otherwise.  Both end with a working postgresql-N
+# binary on PATH.
+#
+# `apt-get update` runs in BOTH branches: the previous RUN
+# ended with `rm -rf /var/lib/apt/lists/*` to keep the layer
+# small, so the package cache is empty here.  Without an
+# update the distro-path apt-get install fails with
+# `Unable to locate package postgresql-17` (debian:13 hits
+# this — its base image has no cached lists at all).
+#
+# postgresql-contrib-${PG_VERSION} is required: on Debian/Ubuntu
+# `pgbench` ships in the contrib package, not postgresql-client.
+# Without it the testkit's bulk-seed step (and any future scenario
+# step that drives pgbench inside the container) fails with
+# "pgbench: command not found".  RHEL/SUSE testbeds already
+# install -contrib for the same reason.
+RUN if [ "$PACKAGES" = "pgdg-apt" ]; then \
+        install -d /usr/share/postgresql-common/pgdg && \
+        curl -sSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+            https://www.postgresql.org/media/keys/ACCC4CF8.asc && \
+        echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+            > /etc/apt/sources.list.d/pgdg.list && \
+        apt-get update && \
+        apt-get install -y --no-install-recommends \
+            "postgresql-${PG_VERSION}" \
+            "postgresql-client-${PG_VERSION}" \
+            "postgresql-contrib-${PG_VERSION}"; \
+    else \
+        apt-get update && \
+        ( apt-get install -y --no-install-recommends \
+              "postgresql-${PG_VERSION}" \
+              "postgresql-client-${PG_VERSION}" \
+              "postgresql-contrib-${PG_VERSION}" \
+          || apt-get install -y --no-install-recommends \
+              postgresql postgresql-client postgresql-contrib ); \
+    fi \
+ && rm -rf /var/lib/apt/lists/*
+
+# Agent binary + entrypoint script land here at build time.
+# Build context is the repo root (so `bin/pg_hardstorage` is
+# reachable); the testkit `image build` driver passes "." as
+# the context and `-f dockerfiles/testbed/Dockerfile.debian-family`
+# as the file.  Operators using `docker build` directly should
+# match that posture.
+COPY bin/pg_hardstorage /usr/local/bin/pg_hardstorage
+RUN chmod 755 /usr/local/bin/pg_hardstorage \
+ && /usr/local/bin/pg_hardstorage version || true
+
+# Create the pgbackup system user that owns the agent's
+# config + state + keyring inside the container.  The host CLI
+# refuses to run as root (internal/cli/refuse_root.go), so the
+# testbed must exercise the same production posture — testkit
+# invokes `docker exec -u pgbackup ...` for every agent call.
+# Add pgbackup to the `postgres` group so PG's restore_command
+# (which runs as `postgres`) can read the repo files.
+#
+# /etc/pg_hardstorage as the canonical config root; the soak
+# driver mounts a deployment-specific YAML over this.
+#
+# pgbackup gets a FIXED uid/gid (2000) rather than the value
+# `useradd -r` auto-allocates — that value differs per OS family
+# (RHEL, Debian, SUSE, Arch each pick a different free system id).
+# The soak fleet bind-mounts ONE shared file:// repo into every
+# cell, and `repo init` writes HSREPO + chunks/ + manifests/ with
+# 0640/0750 (owner-rw, group-r).  With per-distro uids, every cell
+# whose pgbackup uid differs from the cell that created the repo
+# gets "HSREPO: permission denied".  Pinning the id makes the
+# shared repo readable fleet-wide and mirrors the production
+# practice of standardising the backup user across hosts.  2000 is
+# free of any base-image account on all supported distros.
+RUN groupadd -r -g 2000 pgbackup \
+ && (getent passwd postgres >/dev/null 2>&1 || useradd -r -s /usr/sbin/nologin postgres) \
+ && useradd -r -u 2000 -g pgbackup -G postgres -d /var/lib/pg_hardstorage \
+        -s /usr/sbin/nologin -c "pg_hardstorage agent" pgbackup \
+ && install -d -m 0755 -o root      -g root      /etc/pg_hardstorage \
+ && install -d -m 0750 -o pgbackup  -g pgbackup  /var/lib/pg_hardstorage \
+ && install -d -m 0700 -o pgbackup  -g pgbackup  /etc/pg_hardstorage/keyring
+
+# Default entrypoint: a tiny supervisor that boots PG, then the
+# agent, then sleeps.  Real soak runs override this with the
+# driver-prescribed command.
+COPY dockerfiles/testbed/entrypoint-pg.sh /usr/local/bin/entrypoint-pg.sh
+RUN chmod 755 /usr/local/bin/entrypoint-pg.sh
+
+EXPOSE 5432
+ENTRYPOINT ["/usr/local/bin/entrypoint-pg.sh"]

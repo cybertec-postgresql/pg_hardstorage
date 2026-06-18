@@ -1,0 +1,67 @@
+# L7_large_wal_stream_8gb.scenario.yaml
+#
+# Tier L7 (stress) — WAL streaming + 8 GB seed + basebackup
+# under a sustained post-backup workload, then a PITR restore
+# byte-verified against the streamed archive.
+#
+# The big sibling of L3_wal_stream_long_backup_window: an 8 GB
+# database means the basebackup overlaps a much longer stretch
+# of streamed WAL, stressing the async WAL pipeline's ability to
+# keep up while a multi-segment basebackup runs concurrently —
+# the exact interaction that the streamer rearchitecture was
+# built to survive. Pass criterion: PITR byte-equal match.
+#
+# target_gb: 8 → pgbench scale 536.
+#
+# Wall-clock budget: ~15-25 minutes.
+
+schema: pg_hardstorage.scenario.v1
+name: L7-large-wal-stream-8gb
+tier: L7
+description: |
+  WAL streamer + 8 GB seed + real-window basebackup + sustained
+  post-backup workload; PITR byte-equal verification through the
+  streamed archive. Large-database WAL-pipeline resilience.
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+load:
+  file: test/load/failover_loop.load.yaml
+
+steps:
+  - wal_stream:
+      action: start
+  - seed:
+      target_gb: 8
+  - run_load:
+      duration: 20s
+  - take_backup:
+      deployment: l7-large-wal-stream-8gb
+  - run_load:
+      duration: 30s
+  - capture_lsn:
+      name: post_large_window
+      checksum_query: |
+        select
+          count(*)::text || '|' ||
+          coalesce(sum(abalance)::text, '0') || '|' ||
+          coalesce(sum(hashtextextended(t::text, 0))::text, '0')
+        from pgbench_accounts t
+  - switch_wal: {}
+  - wait_wal_archived:
+      to_lsn: $post_large_window
+  - wal_stream:
+      action: stop
+  - restore:
+      deployment: l7-large-wal-stream-8gb
+      name: post_large_window
+  - assert_restored_match:
+      name: post_large_window
+      strict: true
+      ready_timeout: 30m
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

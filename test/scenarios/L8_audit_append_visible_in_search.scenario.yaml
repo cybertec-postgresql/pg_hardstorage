@@ -1,0 +1,94 @@
+# L8_audit_append_visible_in_search.scenario.yaml
+#
+# Tier L8 — `audit append` is the operator's emergency
+# "record an event manually" surface: legal-hold review
+# decisions, manual incident notes, anything that needs
+# to live in the hash-linked audit chain alongside the
+# system-emitted events.  Once appended, the event must
+# be:
+#
+#   1. Discoverable via `audit search` (filter by actor,
+#      deployment, or substring) — operators rely on
+#      this for forensic reconstruction.
+#   2. Hash-linked into the chain — `audit verify-chain`
+#      must remain green after the append.
+#   3. Visible in `audit summary` aggregates.
+#
+# Without this gate, a regression that landed a manual
+# event but skipped the PrevHash anchor would break
+# verify-chain on the NEXT system event (its PrevHash
+# would point at the system-emitted predecessor, not the
+# manually-appended one), surfacing as a chain integrity
+# failure for operators who run `audit verify-chain` in
+# cron.
+#
+# Wall-clock budget: ~2 minutes (1 GB seed + 1 backup +
+# audit append + 3 audit probes).
+schema: pg_hardstorage.scenario.v1
+name: L8-audit-append-visible-in-search
+tier: L8
+description: |
+  Take backup → audit append manual event → audit search
+  surfaces it → audit verify-chain remains green.
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  - seed:
+      target_gb: 1
+
+  - take_backup:
+      deployment: l8-audit-append
+      name: only_backup
+
+  # `audit append <action>` — action is a positional
+  # arg.  We use `manual.note` as the action namespace
+  # for human-emitted entries; an operator script would
+  # typically pick `manual.review-cleared`,
+  # `manual.incident-note`, etc.
+  - cli_run:
+      args:
+        - "audit"
+        - "append"
+        - "manual.note"
+        - "--repo"
+        - "$REPO"
+        - "--actor"
+        - "testkit-scenario-L8-audit-append"
+        - "--deployment"
+        - "l8-audit-append"
+        - "--reason"
+        - "L8 audit-append-visible-in-search invariant"
+      timeout: 30s
+
+  # Search for the manual event by its distinctive actor
+  # principal.  Must surface at least one row; we assert
+  # via the actor substring being present in stdout.
+  - cli_run:
+      args:
+        - "audit"
+        - "search"
+        - "--repo"
+        - "$REPO"
+        - "--actor-contains"
+        - "testkit-scenario-L8-audit-append"
+      timeout: 30s
+      expect_stdout_contains: "testkit-scenario-L8-audit-append"
+
+  # Verify-chain must remain green AFTER the manual
+  # append.  This is the critical assertion: a regression
+  # that bypassed PrevHash on the append path would
+  # break this step.
+  - cli_run:
+      args:
+        - "audit"
+        - "verify-chain"
+        - "--repo"
+        - "$REPO"
+      timeout: 30s
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

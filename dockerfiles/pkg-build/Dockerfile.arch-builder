@@ -1,0 +1,35 @@
+# Dockerfile.arch-builder — Arch Linux PKGBUILD build env.
+#
+# Used by run_pkg_build_testing.sh.  makepkg refuses to run as
+# root, so this image creates a `builder` user; the driver
+# `docker run`s with the source bind-mounted at /src and
+# invokes `makepkg -fs --noconfirm` as that user.
+
+ARG OS_IMAGE=archlinux:latest
+FROM ${OS_IMAGE}
+
+# Refresh keys + install build toolchain.  base-devel pulls
+# makepkg, fakeroot, gcc, etc.; go is the toolchain the
+# PKGBUILD's `build()` reaches for.
+RUN pacman-key --init \
+ && pacman-key --populate archlinux \
+ && pacman -Syu --noconfirm --needed \
+        base-devel \
+        ca-certificates curl git \
+        go \
+        sudo rsync \
+        which \
+ && pacman -Scc --noconfirm
+
+# makepkg refuses root.  Create a builder user with passwordless
+# sudo (some helpers shell out to `sudo pacman -S` for missing
+# deps; harmless since we install everything up front).
+RUN useradd -m -G wheel -s /bin/bash builder \
+ && echo 'builder ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/builder \
+ && chmod 0440 /etc/sudoers.d/builder
+
+USER builder
+ENV HOME=/home/builder
+WORKDIR /src
+
+CMD ["bash", "-c", "echo 'arch-builder ready; driver should `docker run` with explicit cmd'"]

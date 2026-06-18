@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "pg-hardstorage-sidecar.fullname" . }}-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "pg-hardstorage-sidecar.labels" . | nindent 4 }}
+data:
+  pg_hardstorage.yaml: |
+{{- if .Values.config }}
+{{ .Values.config | indent 4 }}
+{{- else }}
+    # Empty config -- override .Values.config in your values file.
+    # See docs/SPEC.md for the schema and docs/runbooks for
+    # worked examples.
+{{- end }}

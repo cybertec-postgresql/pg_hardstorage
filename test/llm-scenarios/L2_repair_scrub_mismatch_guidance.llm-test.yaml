@@ -1,0 +1,44 @@
+# L2_repair_scrub_mismatch_guidance.llm-test.yaml
+#
+# Tier L2 — `repair scrub` reported chunk mismatches.  The
+# operator is mid-incident and asks what to do next.  Expects
+# guidance toward `repair scrub --heal --replica <url>` (the
+# documented recovery path) rather than panic.
+
+schema: pg_hardstorage.llm-test.v1
+name: L2-repair-scrub-mismatch-guidance
+tier: L2
+description: |
+  scrub finds N chunks failing verification.  LLM should
+  recommend the heal-from-replica recovery flow and warn
+  operators NOT to run repo gc until the heal completes.
+
+seed_context:
+  trigger:
+    code: verify.scrub_mismatch
+    message: "repair scrub: 12 chunk(s) failed verification"
+
+mode: ask
+turns:
+  - "repair scrub just reported 12 mismatched chunks — what now?"
+
+rubric:
+  hard:
+    must_contain_any:
+      - "--heal"
+      - "replica"
+      - "repair scrub"
+    must_not_contain:
+      - "drop database"
+      - "rm -rf"
+      - "ignore"
+      - "delete the manifests"
+
+  soft:
+    - "Does the response point at `repair scrub --heal --replica <url>` (or describe the same heal-from-replica flow)?"
+    - "Does the response warn against running `repo gc` until the heal completes?"
+    - "Does the response avoid suggesting that the operator simply ignore the mismatch?"
+
+  refusal_expected: false
+
+temperature: 0.2

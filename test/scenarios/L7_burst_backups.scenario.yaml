@@ -1,0 +1,38 @@
+# L7_burst_backups.scenario.yaml
+#
+# Tier L7 resource exhaustion: take 5 backups back-to-back
+# with no spacing.  Catches sandbox-fd leaks, repo-lock
+# contention, and PG WAL-pressure failures that only
+# show up when backup N+1 starts before backup N's
+# cleanup paths have settled.
+schema: pg_hardstorage.scenario.v1
+name: L7-burst-backups
+tier: L7
+description: |
+  Five back-to-back backups; each must complete + scrub clean.
+topology:
+  provider: local-docker
+  pg_version: "17"
+steps:
+  - take_backup:
+      deployment: l7-burst
+  - take_backup:
+      deployment: l7-burst
+  - take_backup:
+      deployment: l7-burst
+  - take_backup:
+      deployment: l7-burst
+  - take_backup:
+      deployment: l7-burst
+  - cli_run:
+      args:
+        - "repo"
+        - "scrub"
+        - "$REPO"
+        - "--full"
+        - "--output"
+        - "json"
+      expect_exit: 0
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

@@ -1,0 +1,143 @@
+Source: pg-hardstorage
+Section: database
+Priority: optional
+Maintainer: Hans-Jürgen Schönig <hs@cybertec.at>
+Build-Depends:
+ debhelper-compat (= 13),
+ git
+# dh-golang + golang-go intentionally NOT listed here.  Why:
+# dh-golang auto-registers a configure hook that stages source
+# under obj-<triplet>/src/<importpath>/ and sets GOPATH= to the
+# obj-... root — regardless of `--with=golang` / `--buildsystem=
+# golang` on the dh line.  The configure-staging then drops
+# //go:embed sibling files (schema.sql, oses.yaml, runbooks/,
+# builtin/*.skill.yaml) and switches go into GOPATH mode, which
+# can't resolve our module-mode imports ("cannot find package
+# .../internal/cli in any of /work/obj-.../src/...").  Our
+# `override_dh_auto_build: $(MAKE) build` already drives Go via
+# the project Makefile (CGO_ENABLED=0, -trimpath, the works);
+# we don't need dh-golang at all, and removing it from
+# Build-Depends keeps it from auto-attaching.  golang-go also
+# removed: the deb-builder image installs Go 1.26 manually from
+# go.dev/dl/ (Debian 12 ships 1.21 max) and apt's golang-go
+# would shadow that on PATH.  See run_pkg_build_testing.sh
+# already passing `-d` to dpkg-buildpackage to skip
+# Build-Depends checking — same rationale.
+Standards-Version: 4.7.0
+Homepage: https://github.com/cybertec-postgresql/pg_hardstorage
+Vcs-Browser: https://github.com/cybertec-postgresql/pg_hardstorage
+Vcs-Git: https://github.com/cybertec-postgresql/pg_hardstorage.git
+Rules-Requires-Root: no
+XS-Go-Import-Path: github.com/cybertec-postgresql/pg_hardstorage
+
+Package: pg-hardstorage
+Architecture: any
+Depends:
+ ${misc:Depends},
+ ${shlibs:Depends},
+ pg-hardstorage-common (= ${source:Version}),
+ adduser
+Recommends:
+ postgresql-client (>= 13)
+Suggests:
+ pg-hardstorage-server,
+ systemd
+Description: PostgreSQL backup, done right -- agent and CLI
+ pg_hardstorage performs incremental, content-addressed backups of
+ PostgreSQL clusters with WAL archiving and point-in-time recovery.
+ It is a single static Go binary that doubles as a long-running
+ host agent and as an interactive CLI.
+ .
+ This package ships the pg_hardstorage binary, shell completions,
+ manpages, and a systemd unit suitable for single- or multi-tenant
+ hosts.
+
+Package: pg-hardstorage-common
+Architecture: all
+Multi-Arch: foreign
+Depends:
+ ${misc:Depends}
+Description: PostgreSQL backup, done right -- shared data
+ Architecture-independent assets shared by every pg-hardstorage
+ binary package: runbooks, OpenAPI documents, and the v1 JSON
+ schema files that govern manifests and audit records.
+ .
+ Install pg-hardstorage to get the agent and CLI.
+
+Package: pg-hardstorage-server
+Architecture: any
+Depends:
+ ${misc:Depends},
+ ${shlibs:Depends},
+ pg-hardstorage (= ${binary:Version})
+Description: PostgreSQL backup, done right -- control-plane server
+ Stub package for the v0.5 control-plane server. Installing this
+ package today is a no-op other than registering the dependency on
+ pg-hardstorage; the server binary lands with v0.5 and unlocks the
+ multi-host orchestration API plus the centralised retention engine.
+
+Package: pg-hardstorage-compat-pgbackrest
+Architecture: any
+Depends:
+ ${misc:Depends},
+ ${shlibs:Depends},
+ pg-hardstorage (= ${binary:Version})
+Conflicts: pgbackrest
+Description: pg_hardstorage drop-in shim for pgBackRest
+ Drop-in replacement binary that mimics the pgBackRest CLI surface
+ (8 verbs: stanza-create, backup, restore, archive-push, archive-get,
+ info, check, verify) so existing cron jobs, archive_command lines,
+ and monitoring scripts keep working but produce native pg_hardstorage
+ backups.
+ .
+ Installs the pg-hardstorage-pgbackrest binary at /usr/bin and offers
+ a Conflicts with the upstream pgbackrest package so the operator
+ picks one or the other. Symlink /usr/local/bin/pgbackrest to this
+ binary for true PATH-level drop-in.
+ .
+ See /usr/share/doc/pg-hardstorage-compat-pgbackrest/migration.md
+ for the cutover playbook.
+
+Package: pg-hardstorage-compat-barman
+Architecture: any
+Depends:
+ ${misc:Depends},
+ ${shlibs:Depends},
+ pg-hardstorage (= ${binary:Version})
+Conflicts: barman, barman-cli
+Description: pg_hardstorage drop-in shim for Barman
+ Drop-in replacement binaries that mimic the Barman CLI surface
+ (7 verbs: backup, recover, list-backup, show-backup, check, delete,
+ plus a separate barman-wal-archive binary for archive_command use).
+ .
+ Installs pg-hardstorage-barman and pg-hardstorage-barman-wal-archive
+ at /usr/bin and offers a Conflicts with the upstream barman + barman-cli
+ packages so the operator picks one or the other. Symlink
+ /usr/local/bin/{barman,barman-wal-archive} to these binaries for true
+ PATH-level drop-in.
+ .
+ See /usr/share/doc/pg-hardstorage-compat-barman/migration.md
+ for the cutover playbook.
+
+Package: pg-hardstorage-compat-walg
+Architecture: any
+Depends:
+ ${misc:Depends},
+ ${shlibs:Depends},
+ pg-hardstorage (= ${binary:Version})
+Conflicts: wal-g
+Description: pg_hardstorage drop-in shim for WAL-G
+ Drop-in replacement binary that mimics the WAL-G CLI surface
+ (5 verbs: backup-push, backup-fetch, backup-list, wal-push,
+ wal-fetch) so existing cron jobs, archive_command lines, and
+ monitoring scripts keep working but produce native pg_hardstorage
+ backups.
+ .
+ Configuration follows WAL-G's env-var convention (WALG_S3_PREFIX,
+ PGHOST, ...).  Installs pg-hardstorage-walg at /usr/bin and offers
+ a Conflicts with the upstream wal-g package so the operator picks
+ one or the other.  Symlink /usr/local/bin/wal-g to this binary for
+ true PATH-level drop-in.
+ .
+ See /usr/share/doc/pg-hardstorage-compat-walg/migration.md
+ for the cutover playbook.

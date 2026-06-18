@@ -1,0 +1,157 @@
+.nh
+.TH "PG_HARDSTORAGE" "1" "May 2026" "pg_hardstorage Manual" "pg_hardstorage Manual"
+
+.SH NAME
+.PP
+pg_hardstorage-timetable-emit - Print (or directly install) pg_timetable SQL for the cron-friendly housekeeping commands
+
+
+.SH SYNOPSIS
+.PP
+\fBpg_hardstorage timetable emit [flags]\fP
+
+
+.SH DESCRIPTION
+.PP
+Emit a SELECT timetable.add_job(...) block per scheduled
+operation. Two modes:
+
+.PP
+Print to stdout (default):
+    pg_hardstorage timetable emit --repo s3://acme/backups --deployment db1 \\
+        | psql -d timetable_admin
+
+.PP
+Apply directly to a pg_timetable database:
+    pg_hardstorage timetable emit --repo s3://acme/backups --deployment db1 \\
+        --apply --pg-connection "postgres://timetable@host/timetable"
+
+.PP
+Each job uses pg_timetable's PROGRAM kind with a JSONB argv (no
+shell escaping hazards). The default cadence matches what the
+project's CHANGELOG documents for each command:
+
+.EX
+repo scrub --sample-percent 1   hourly
+wal audit                       hourly
+anomaly check                   daily
+wal prune --apply               daily
+repo gc --apply                 weekly
+repo scrub --full               quarterly
+gameday report                  quarterly
+.EE
+
+.PP
+Use --include / --exclude to subset; --prefix to namespace the job
+names (default: pg\fIhardstorage\fP).
+
+.PP
+When --apply is set, the command:
+  1. Connects to --pg-connection and pre-flights the timetable schema.
+  2. Wraps everything in a single Go-managed transaction.
+  3. (Default) DELETEs existing jobs whose chain_name starts with
+     --prefix, so re-applies are idempotent. Pass --replace=false
+     to fail-on-duplicate instead.
+  4. Calls timetable.add_job for each job with parameter binding
+     (no SQL string interpolation of operator-supplied values).
+
+.PP
+Targets pg_timetable v5; for other versions, the printed SQL is a
+starting point operators adapt.
+
+
+.SH OPTIONS
+.PP
+\fB--apply\fP[=false]
+	actually install the jobs into pg_timetable (requires --pg-connection)
+
+.PP
+\fB--binary\fP="pg_hardstorage"
+	path to the pg_hardstorage binary the scheduled jobs invoke
+
+.PP
+\fB--deployment\fP=""
+	deployment name (required for per-deployment jobs: wal audit, wal prune, anomaly check)
+
+.PP
+\fB--exclude\fP=""
+	comma-separated job names (without prefix) to exclude
+
+.PP
+\fB-h\fP, \fB--help\fP[=false]
+	help for emit
+
+.PP
+\fB--include\fP=""
+	comma-separated job names (without prefix) to include; empty = all
+
+.PP
+\fB--pg-connection\fP=""
+	libpq DSN for the pg_timetable installation (required with --apply)
+
+.PP
+\fB--prefix\fP="pg\fIhardstorage\fP"
+	job-name prefix for namespacing in pg_timetable
+
+.PP
+\fB--replace\fP[=true]
+	with --apply: DELETE existing chains whose name starts with --prefix before adding (default true)
+
+.PP
+\fB--repo\fP=""
+	repository URL (required; substituted into every job's argv)
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+.PP
+\fB--airgapped\fP[=false]
+	refuse outbound endpoints (LLM providers, sinks, OTLP collectors) outside loopback / RFC1918 / explicit airgap.allowlist. Also enabled by PG_HARDSTORAGE_AIRGAPPED=1 or \fBairgapped: strict\fR in the config file.
+
+.PP
+\fB-c\fP, \fB--config\fP=""
+	path to config file (default: XDG/FHS lookup)
+
+.PP
+\fB--cpu-profile\fP=""
+	write a pprof CPU profile to this path for the duration of the command (\fBgo tool pprof <path>\fR to analyse). Off when empty.
+
+.PP
+\fB--mem-profile\fP=""
+	write a pprof heap profile to this path at command exit. Off when empty.
+
+.PP
+\fB--no-color\fP[=false]
+	disable ANSI color in text output
+
+.PP
+\fB--on-error-llm\fP[=false]
+	on a structured-error failure, drop into the matching LLM helper skill (auto_on_error trigger). Also enabled by PG_HARDSTORAGE_ON_ERROR_LLM=1.
+
+.PP
+\fB--otel-endpoint\fP=""
+	OpenTelemetry OTLP/HTTP endpoint (e.g. http://otel-collector:4318); empty disables tracing
+
+.PP
+\fB--otel-stdout\fP[=false]
+	also export OpenTelemetry traces to stderr (useful for dev)
+
+.PP
+\fB-o\fP, \fB--output\fP=""
+	output format: text|json|ndjson|yaml|template|csv|markdown|html|tap|junit|pdf (default: text on TTY, json off-TTY)
+
+.PP
+\fB--profile-port\fP=0
+	if non-zero, expose net/http/pprof on 127.0.0.1: for live profiling of long-running commands (e.g. \fBgo tool pprof http://127.0.0.1:6060/debug/pprof/profile?seconds=30\fR). Off when zero.
+
+.PP
+\fB-q\fP, \fB--quiet\fP[=false]
+	suppress non-essential output
+
+.PP
+\fB--template\fP=""
+	Go text/template applied when --output template (or implied if --template is set without --output)
+
+
+.SH SEE ALSO
+.PP
+\fBpg_hardstorage-timetable(1)\fP

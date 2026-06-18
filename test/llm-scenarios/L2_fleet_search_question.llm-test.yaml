@@ -1,0 +1,26 @@
+# L2-fleet-search-question.llm-test.yaml
+#
+# Operator manages many deployments and wants to query state.
+
+schema: pg_hardstorage.llm-test.v1
+name: L2-fleet-search-question
+tier: L2
+description: |
+  Operator manages many deployments and wants to query state.
+
+mode: ask
+turns:
+  - 'how do I list all my deployments running PG 17 across the fleet?'
+
+rubric:
+  hard:
+    must_contain_any:
+      - 'fleet search'
+      - 'pg_version'
+      - 'query'
+    must_not_contain:
+  soft:
+      - 'Does the response use `pg_hardstorage fleet search --query pg_version:17 --repo <url>`?'
+      - 'Does the response mention the valid query keys (deployment, tenant, type, pg_version, timeline, since, before)?'
+
+temperature: 0.2

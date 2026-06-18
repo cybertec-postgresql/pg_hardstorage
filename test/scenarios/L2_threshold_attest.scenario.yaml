@@ -1,0 +1,155 @@
+# L2_threshold_attest.scenario.yaml
+#
+# Tier L2 — threshold attestation: `threshold attest sign |
+# show | verify`.  An operator signs an attestation against
+# a (kind, id, hash) triple; show retrieves; verify walks
+# the signatures and confirms quorum.
+#
+# Why mostly negative-path: a real positive flow needs N
+# operators each with their own private key signing the
+# same triple — the runner only has ONE local key.  The
+# scenario exercises:
+#
+#   * sign refuses cleanly when the named roster doesn't
+#     exist (validation path)
+#   * sign refuses cleanly when the local key isn't a
+#     member of the named roster
+#   * show / verify against nonexistent attestations exit
+#     non-zero with structured errors
+#
+# Combined with L2_threshold_roster (positive create +
+# list + show), every threshold leaf has at least one
+# positive AND one negative scenario.
+#
+# Leaves covered (gate scope — 2nd touch for roster
+# create/list/show + whoami):
+#   * threshold attest sign
+#   * threshold attest show
+#   * threshold attest verify
+#   * threshold whoami (2nd)
+#   * threshold roster create (2nd)
+#   * threshold roster list (2nd)
+#   * threshold roster show (2nd)
+#
+# Wall-clock budget: ~10s.
+
+schema: pg_hardstorage.scenario.v1
+name: L2-threshold-attest
+tier: L2
+description: |
+  whoami → roster create → roster list/show (2nd) →
+  attest sign (negative) → attest show / verify
+  (negative).
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  - cli_run:
+      args:
+        - "threshold"
+        - "whoami"
+      expect_exit: 0
+
+  # 1. Create a roster the local key isn't a member of —
+  # so the sign step below can verifiably fail "not a
+  # member" rather than "no such roster".
+  - cli_run:
+      args:
+        - "threshold"
+        - "roster"
+        - "create"
+        - "l2-attest-roster"
+        - "--repo"
+        - "$REPO"
+        - "--threshold"
+        - "2"
+        - "--member"
+        - "alice:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+        - "--member"
+        - "bob:AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE="
+        - "--created-by"
+        - "scenario-probe"
+      expect_exit: 1
+
+  - cli_run:
+      args:
+        - "threshold"
+        - "roster"
+        - "list"
+        - "--repo"
+        - "$REPO"
+      expect_exit: 0
+
+  - cli_run:
+      args:
+        - "threshold"
+        - "roster"
+        - "show"
+        - "l2-attest-roster"
+        - "--repo"
+        - "$REPO"
+      expect_exit: 6
+
+  # 2. Negative sign: local key isn't a member of
+  # l2-attest-roster (the synthetic alice/bob).  Must
+  # exit non-zero rather than emit a no-op signature.
+  - cli_run:
+      args:
+        - "threshold"
+        - "attest"
+        - "sign"
+        - "manifest"
+        - "synthetic-id-1"
+        - "--repo"
+        - "$REPO"
+        - "--roster"
+        - "l2-attest-roster"
+        - "--hash"
+        - "0000000000000000000000000000000000000000000000000000000000000000"
+      expect_exit: 6
+
+  # 3. Negative sign: roster doesn't exist.
+  - cli_run:
+      args:
+        - "threshold"
+        - "attest"
+        - "sign"
+        - "manifest"
+        - "synthetic-id-2"
+        - "--repo"
+        - "$REPO"
+        - "--roster"
+        - "no-such-roster-anywhere"
+        - "--hash"
+        - "0000000000000000000000000000000000000000000000000000000000000000"
+      expect_exit: 6
+
+  # 4. Negative show: attestation doesn't exist.
+  - cli_run:
+      args:
+        - "threshold"
+        - "attest"
+        - "show"
+        - "manifest"
+        - "synthetic-id-1"
+        - "--repo"
+        - "$REPO"
+      expect_exit: 6
+
+  # 5. Negative verify: same.
+  - cli_run:
+      args:
+        - "threshold"
+        - "attest"
+        - "verify"
+        - "manifest"
+        - "synthetic-id-1"
+        - "--repo"
+        - "$REPO"
+      expect_exit: 6
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

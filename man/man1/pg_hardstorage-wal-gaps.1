@@ -1,0 +1,115 @@
+.nh
+.TH "PG_HARDSTORAGE" "1" "May 2026" "pg_hardstorage Manual" "pg_hardstorage Manual"
+
+.SH NAME
+.PP
+pg_hardstorage-wal-gaps - List persisted WAL-gap records (Patroni-failover diagnostics)
+
+
+.SH SYNOPSIS
+.PP
+\fBpg_hardstorage wal gaps  [flags]\fP
+
+
+.SH DESCRIPTION
+.PP
+Lists the WAL-gap records the leader-follow coordinator
+persisted when it detected a Patroni-failover gap (the new
+leader's slot advanced past the agent's last confirmed LSN, so
+PITR within the gap range is impossible from this repo).
+
+.PP
+Records are written to \fBwal/<deployment>/gaps/<tli>-<ns>.json\fR —
+one per detection, append-only, so the forensic trail survives
+agent restarts. Use this command to:
+
+.RS
+.IP \(bu 2
+confirm whether a gap is outstanding (\fBpg_hardstorage doctor\fR
+raises a structured wal.gap_persistent issue when one exists)
+.IP \(bu 2
+inspect the LSN range PITR cannot bridge
+.IP \(bu 2
+verify which slot + role triggered each detection
+
+.RE
+
+.PP
+Filters:
+
+.PP
+--timeline N    only records on TLI N
+  --limit   N    return at most N records (newest-first)
+
+
+.SH OPTIONS
+.PP
+\fB-h\fP, \fB--help\fP[=false]
+	help for gaps
+
+.PP
+\fB--limit\fP=0
+	return at most this many records (0 = unbounded)
+
+.PP
+\fB--repo\fP=""
+	repository URL (required)
+
+.PP
+\fB--timeline\fP=0
+	filter to records on this timeline only (0 = all)
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+.PP
+\fB--airgapped\fP[=false]
+	refuse outbound endpoints (LLM providers, sinks, OTLP collectors) outside loopback / RFC1918 / explicit airgap.allowlist. Also enabled by PG_HARDSTORAGE_AIRGAPPED=1 or \fBairgapped: strict\fR in the config file.
+
+.PP
+\fB-c\fP, \fB--config\fP=""
+	path to config file (default: XDG/FHS lookup)
+
+.PP
+\fB--cpu-profile\fP=""
+	write a pprof CPU profile to this path for the duration of the command (\fBgo tool pprof <path>\fR to analyse). Off when empty.
+
+.PP
+\fB--mem-profile\fP=""
+	write a pprof heap profile to this path at command exit. Off when empty.
+
+.PP
+\fB--no-color\fP[=false]
+	disable ANSI color in text output
+
+.PP
+\fB--on-error-llm\fP[=false]
+	on a structured-error failure, drop into the matching LLM helper skill (auto_on_error trigger). Also enabled by PG_HARDSTORAGE_ON_ERROR_LLM=1.
+
+.PP
+\fB--otel-endpoint\fP=""
+	OpenTelemetry OTLP/HTTP endpoint (e.g. http://otel-collector:4318); empty disables tracing
+
+.PP
+\fB--otel-stdout\fP[=false]
+	also export OpenTelemetry traces to stderr (useful for dev)
+
+.PP
+\fB-o\fP, \fB--output\fP=""
+	output format: text|json|ndjson|yaml|template|csv|markdown|html|tap|junit|pdf (default: text on TTY, json off-TTY)
+
+.PP
+\fB--profile-port\fP=0
+	if non-zero, expose net/http/pprof on 127.0.0.1: for live profiling of long-running commands (e.g. \fBgo tool pprof http://127.0.0.1:6060/debug/pprof/profile?seconds=30\fR). Off when zero.
+
+.PP
+\fB-q\fP, \fB--quiet\fP[=false]
+	suppress non-essential output
+
+.PP
+\fB--template\fP=""
+	Go text/template applied when --output template (or implied if --template is set without --output)
+
+
+.SH SEE ALSO
+.PP
+\fBpg_hardstorage-wal(1)\fP

@@ -1,0 +1,76 @@
+# L2_integrity_verify.scenario.yaml
+#
+# Tier L2 — integrity cross-cover.  2nd touch for run /
+# show / verify with different strategy/sample inputs.
+#
+# Leaves covered (gate scope — 2nd touch):
+#   * integrity run (2nd, --count + --seed)
+#   * integrity show (2nd, negative)
+#   * integrity verify (2nd, negative)
+#
+# Wall-clock budget: ~15s.
+
+schema: pg_hardstorage.scenario.v1
+name: L2-integrity-verify
+tier: L2
+description: |
+  take_backup → integrity run with --count + --seed →
+  another run with default strategy → negatives.
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  - take_backup:
+      deployment: l2-integrity-verify
+
+  # 1. run with --seed for deterministic sampling.
+  - cli_run:
+      args:
+        - "integrity"
+        - "run"
+        - "--repo"
+        - "$REPO"
+        - "--seed"
+        - "42"
+        - "--skip-sign"
+        - "--note"
+        - "scenario cross-cover: deterministic seed"
+      expect_exit: 0
+      timeout: 60s
+
+  # 2. run scoped to deployment (cross-cover).
+  - cli_run:
+      args:
+        - "integrity"
+        - "run"
+        - "--repo"
+        - "$REPO"
+        - "--deployment"
+        - "$DEPLOYMENT"
+        - "--skip-sign"
+      expect_exit: 0
+      timeout: 60s
+
+  - cli_run:
+      args:
+        - "integrity"
+        - "show"
+        - "00000000-cross-cover-no-such-run"
+        - "--repo"
+        - "$REPO"
+      expect_exit: 6
+
+  - cli_run:
+      args:
+        - "integrity"
+        - "verify"
+        - "00000000-cross-cover-no-such-run"
+        - "--repo"
+        - "$REPO"
+      expect_exit: 6
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

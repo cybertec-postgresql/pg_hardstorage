@@ -1,0 +1,123 @@
+.nh
+.TH "PG_HARDSTORAGE" "1" "May 2026" "pg_hardstorage Manual" "pg_hardstorage Manual"
+
+.SH NAME
+.PP
+pg_hardstorage-repo-gc - Reclaim space — sweep chunks no manifest references
+
+
+.SH SYNOPSIS
+.PP
+\fBpg_hardstorage repo gc  [flags]\fP
+
+
+.SH DESCRIPTION
+.PP
+gc walks every committed manifest, builds the set of referenced
+chunk hashes, and lists chunks under chunks/sha256/... that aren't
+in that set. Without --apply, the operation is a dry-run and reports
+how much space WOULD be freed. With --apply, the orphans are
+deleted via the CAS.
+
+.PP
+Tombstoned manifests (soft-deleted by retention) are excluded from
+the reference walk ONCE they age past --tombstone-grace.  Default
+grace is 24h: an operator who soft-deletes a backup, notices the
+mistake, and runs \fBbackup undelete\fR within 24h gets a
+fully-restorable backup back even if --apply ran in between.
+Operators willing to accept the audit-flagged race (v23 #3) can
+pass --tombstone-grace 0 to restore the historical immediate-
+collection behaviour.
+
+.PP
+Either pass  as a positional, or via --repo. The latter form
+keeps the command shape consistent with other subcommands (rotate,
+list, etc.) for scripting.
+
+.PP
+--require-approval : gate --apply on an existing n-of-m
+approval request. The approval's Op must be \fBrepo.gc\fR and its
+Target must be the URL being GC'd; otherwise --apply is refused at
+the gate. Dry-runs (no --apply) don't need an approval — they read
+only. See \fBpg_hardstorage approval\fR\&.
+
+
+.SH OPTIONS
+.PP
+\fB--apply\fP[=false]
+	actually delete the orphan chunks (default: dry-run)
+
+.PP
+\fB-h\fP, \fB--help\fP[=false]
+	help for gc
+
+.PP
+\fB--min-chunk-age\fP=24h0m0s
+	minimum age an unreferenced chunk (and stale staging file) must reach before --apply reaps it; defends an in-flight backup whose manifest hasn't committed yet (pass 0 to disable)
+
+.PP
+\fB--repo\fP=""
+	repository URL — must already exist (positional  is also accepted)
+
+.PP
+\fB--require-approval\fP=""
+	approval request ID that must be in approved state for repo.gc + this URL (n-of-m gate; --apply only)
+
+.PP
+\fB--tombstone-grace\fP=24h0m0s
+	minimum tombstone age before the manifest's chunks become GC candidates (defends Undelete-after-delete; pass 0 to disable)
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+.PP
+\fB--airgapped\fP[=false]
+	refuse outbound endpoints (LLM providers, sinks, OTLP collectors) outside loopback / RFC1918 / explicit airgap.allowlist. Also enabled by PG_HARDSTORAGE_AIRGAPPED=1 or \fBairgapped: strict\fR in the config file.
+
+.PP
+\fB-c\fP, \fB--config\fP=""
+	path to config file (default: XDG/FHS lookup)
+
+.PP
+\fB--cpu-profile\fP=""
+	write a pprof CPU profile to this path for the duration of the command (\fBgo tool pprof <path>\fR to analyse). Off when empty.
+
+.PP
+\fB--mem-profile\fP=""
+	write a pprof heap profile to this path at command exit. Off when empty.
+
+.PP
+\fB--no-color\fP[=false]
+	disable ANSI color in text output
+
+.PP
+\fB--on-error-llm\fP[=false]
+	on a structured-error failure, drop into the matching LLM helper skill (auto_on_error trigger). Also enabled by PG_HARDSTORAGE_ON_ERROR_LLM=1.
+
+.PP
+\fB--otel-endpoint\fP=""
+	OpenTelemetry OTLP/HTTP endpoint (e.g. http://otel-collector:4318); empty disables tracing
+
+.PP
+\fB--otel-stdout\fP[=false]
+	also export OpenTelemetry traces to stderr (useful for dev)
+
+.PP
+\fB-o\fP, \fB--output\fP=""
+	output format: text|json|ndjson|yaml|template|csv|markdown|html|tap|junit|pdf (default: text on TTY, json off-TTY)
+
+.PP
+\fB--profile-port\fP=0
+	if non-zero, expose net/http/pprof on 127.0.0.1: for live profiling of long-running commands (e.g. \fBgo tool pprof http://127.0.0.1:6060/debug/pprof/profile?seconds=30\fR). Off when zero.
+
+.PP
+\fB-q\fP, \fB--quiet\fP[=false]
+	suppress non-essential output
+
+.PP
+\fB--template\fP=""
+	Go text/template applied when --output template (or implied if --template is set without --output)
+
+
+.SH SEE ALSO
+.PP
+\fBpg_hardstorage-repo(1)\fP

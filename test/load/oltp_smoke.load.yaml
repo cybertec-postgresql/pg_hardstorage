@@ -1,0 +1,45 @@
+# oltp_smoke.load.yaml
+#
+# The L1 smoke load. Tiny, deterministic, runs in seconds — the
+# scenario it backs is the "fresh PG accepts the load and asserts
+# pass" gate that runs on every PR.
+#
+# Phases:
+#   bootstrap     — DDL + first 1000 rows
+#   small_writes  — another 1000 rows + an index
+#
+# Same seed on every CI run = same row content = same digest, today
+# and three years from now.
+schema: pg_hardstorage.testload.v1
+seed: 0xC0FFEEBEAD42
+locale: en_US.UTF-8
+timezone: UTC
+
+phases:
+  - name: bootstrap
+    operations:
+      - create_table:
+          name: users
+          schema: users_v1
+      - insert_rows:
+          table: users
+          count: 1000
+          generator: faker_users
+
+  - name: small_writes
+    operations:
+      - create_index:
+          table: users
+          columns: [email]
+          unique: true
+      # start_offset: 1000 advances the deterministic generator's
+      # row-number axis past the bootstrap phase's 0..999 range.
+      # Without this, faker_users re-emits user-0@... which trips
+      # the unique-email index just created above (SQLSTATE 23505).
+      - insert_rows:
+          table: users
+          count: 1000
+          start_offset: 1000
+          generator: faker_users
+      - vacuum:
+          table: users

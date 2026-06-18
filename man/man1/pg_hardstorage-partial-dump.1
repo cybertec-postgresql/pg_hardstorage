@@ -1,0 +1,139 @@
+.nh
+.TH "PG_HARDSTORAGE" "1" "May 2026" "pg_hardstorage Manual" "pg_hardstorage Manual"
+
+.SH NAME
+.PP
+pg_hardstorage-partial-dump - Restore + start sandbox PG + pg_dump SQL for selected tables
+
+
+.SH SYNOPSIS
+.PP
+\fBpg_hardstorage partial dump  [flags]\fP
+
+
+.SH DESCRIPTION
+.PP
+Run a full pipeline:
+  1. Restore the backup into a temp directory.
+  2. Start a local sandbox PG instance against that data dir
+     (unix socket only — no TCP, no port collisions).
+  3. Run pg_dump for the requested tables.
+  4. Stop PG and remove the temp dir.
+
+.PP
+The SQL is written to --sql-file (or stdout if --sql-file is empty).
+Operator-friendly redirection: pipe stdout into a file or psql
+directly. (--sql-file avoids shadowing the global -o/--output JSON
+output flag; the SQL stream is logically separate from the
+structured Result envelope which still rides on stderr/stdout per
+-o.)
+
+.PP
+--data-only emits only INSERT/COPY statements (no DDL).
+
+.PP
+Requires pg_ctl and pg_dump on PATH (use --staging-dir to choose
+where the temporary restore lives — default is system temp).
+
+.PP
+This is the SQL-emitting half of partial restore the plan
+documented as deferred. It pairs with \fBpartial restore\fR
+(file-extraction half) — operators who want SQL run dump; those
+who want a PGDATA tree run restore.
+
+
+.SH OPTIONS
+.PP
+\fB--backup\fP="latest"
+	backup ID, or \fBlatest\fR
+
+.PP
+\fB--data-only\fP[=false]
+	pass --data-only to pg_dump (no DDL, just INSERT/COPY)
+
+.PP
+\fB--database\fP="postgres"
+	database containing the requested tables; pg_dump connects to exactly one database, so a table in another database needs its name here (issue #97)
+
+.PP
+\fB-h\fP, \fB--help\fP[=false]
+	help for dump
+
+.PP
+\fB--kms-config\fP=[]
+	cloud KMS provider config for a cloud-KMS-encrypted backup (e.g. region=eu-central-1,endpoint=...); empty uses ambient credentials
+
+.PP
+\fB--repo\fP=""
+	repository URL (required)
+
+.PP
+\fB--skip-version-check\fP[=false]
+	bypass the data-dir vs pg_ctl major-version pre-flight (only for operators running heterogeneous fleets where compatibility was validated some other way)
+
+.PP
+\fB--sql-file\fP=""
+	write the dumped SQL here; empty streams to stdout (named --sql-file to avoid shadowing the global --output flag)
+
+.PP
+\fB--staging-dir\fP=""
+	directory the temporary restore lives under (default: system temp)
+
+.PP
+\fB--tables\fP=""
+	comma-separated qualified tables (required, e.g. public.users,public.events)
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+.PP
+\fB--airgapped\fP[=false]
+	refuse outbound endpoints (LLM providers, sinks, OTLP collectors) outside loopback / RFC1918 / explicit airgap.allowlist. Also enabled by PG_HARDSTORAGE_AIRGAPPED=1 or \fBairgapped: strict\fR in the config file.
+
+.PP
+\fB-c\fP, \fB--config\fP=""
+	path to config file (default: XDG/FHS lookup)
+
+.PP
+\fB--cpu-profile\fP=""
+	write a pprof CPU profile to this path for the duration of the command (\fBgo tool pprof <path>\fR to analyse). Off when empty.
+
+.PP
+\fB--mem-profile\fP=""
+	write a pprof heap profile to this path at command exit. Off when empty.
+
+.PP
+\fB--no-color\fP[=false]
+	disable ANSI color in text output
+
+.PP
+\fB--on-error-llm\fP[=false]
+	on a structured-error failure, drop into the matching LLM helper skill (auto_on_error trigger). Also enabled by PG_HARDSTORAGE_ON_ERROR_LLM=1.
+
+.PP
+\fB--otel-endpoint\fP=""
+	OpenTelemetry OTLP/HTTP endpoint (e.g. http://otel-collector:4318); empty disables tracing
+
+.PP
+\fB--otel-stdout\fP[=false]
+	also export OpenTelemetry traces to stderr (useful for dev)
+
+.PP
+\fB-o\fP, \fB--output\fP=""
+	output format: text|json|ndjson|yaml|template|csv|markdown|html|tap|junit|pdf (default: text on TTY, json off-TTY)
+
+.PP
+\fB--profile-port\fP=0
+	if non-zero, expose net/http/pprof on 127.0.0.1: for live profiling of long-running commands (e.g. \fBgo tool pprof http://127.0.0.1:6060/debug/pprof/profile?seconds=30\fR). Off when zero.
+
+.PP
+\fB-q\fP, \fB--quiet\fP[=false]
+	suppress non-essential output
+
+.PP
+\fB--template\fP=""
+	Go text/template applied when --output template (or implied if --template is set without --output)
+
+
+.SH SEE ALSO
+.PP
+\fBpg_hardstorage-partial(1)\fP

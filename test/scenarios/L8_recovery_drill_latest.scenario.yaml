@@ -1,0 +1,68 @@
+# L8_recovery_drill_latest.scenario.yaml
+#
+# Tier L8 — `recovery drill <deployment> [<backup-id>]`
+# is the operator's "did our backups actually work?"
+# real-world probe: pick a backup, restore into a temp
+# target, run pg_verifybackup, tear down.  Reports
+# RTO-actual and verify outcome.
+#
+# Drill semantics:
+#   * empty / "latest" backup-id → most recent committed
+#     manifest
+#   * <explicit-id>            → that exact manifest
+#   * --pg-major NN            → override the sandbox
+#                                image (defaults to the
+#                                manifest's PG version)
+#
+# This scenario hits the empty-backup-id branch
+# (defaults to latest) for the common operator workflow.
+#
+# What this catches:
+#   * Backup selection: a regression that picked an
+#     OLDER backup when "latest" was requested would
+#     surface here only if the manifest store's
+#     ordering broke — not directly asserted at the
+#     scenario level (the drill prints which backup it
+#     picked; we accept any so long as it completes).
+#   * Restore-and-verify wiring: the drill is what
+#     operators run on a cadence to confirm backups are
+#     restorable.  A regression in the
+#     restore-into-sandbox path would surface here
+#     before the next production incident.
+#
+# Wall-clock budget: ~3 minutes (1 GB seed + 1 backup +
+# drill).
+schema: pg_hardstorage.scenario.v1
+name: L8-recovery-drill-latest
+tier: L8
+description: |
+  Take backup → recovery drill (latest) → must exit 0
+  with non-empty output reporting RTO + verify outcome.
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  - seed:
+      target_gb: 1
+
+  - take_backup:
+      deployment: l8-recovery-drill
+      name: only_backup
+
+  # `recovery drill` against the latest backup.  No
+  # backup-id positional ⇒ defaults to latest.  --repo
+  # is the only required flag.
+  - cli_run:
+      args:
+        - "recovery"
+        - "drill"
+        - "$DEPLOYMENT"
+        - "--repo"
+        - "$REPO"
+      timeout: 120s
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

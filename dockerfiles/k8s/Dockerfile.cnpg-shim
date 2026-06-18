@@ -1,0 +1,66 @@
+# Dockerfile.cnpg-shim — CloudNativePG image overlay that
+# swaps the four barman-cloud-* binaries for our compat shim
+# (pg-hardstorage-barman + pg-hardstorage-barman-wal-archive).
+#
+# Build context is the project root; the bin/* binaries land
+# in the build context via `make build build-compat` before
+# `docker build` is invoked.
+#
+# OpenShift / restricted-v2 PSA compliance:
+#   - Original CNPG image already runs as a non-root user
+#     (postgres, UID 26) via its own Dockerfile.  We don't
+#     change USER — the operator's own container security
+#     context wins anyway.  We DO need world-readable +x on
+#     the swapped binaries because OpenShift assigns an
+#     arbitrary UID from the namespace's range; group-readable
+#     + sticky-group works because the operator pod runs with
+#     a supplementary group of root (gid 0).
+
+ARG CNPG_PG_VERSION=17
+ARG CNPG_PG_IMAGE=ghcr.io/cloudnative-pg/postgresql:${CNPG_PG_VERSION}
+FROM ${CNPG_PG_IMAGE}
+
+USER root
+
+# Move the originals aside — argv-recorder execs <name>.real
+# after writing its fixture.  In the v1 swap we use
+# pg-hardstorage-barman directly (NOT through argv-recorder)
+# because the shim's argv contract IS what we want to test —
+# argv-recorder is for one-off discovery captures and gets
+# wired in via the dedicated argv-recorder Dockerfile, not
+# this drop-in.
+#
+# `|| true` swallows the absence of restore + wal-restore on
+# slimmer base images that ship only a subset of the
+# barman-cloud-* set; the shim handles whichever set is
+# present.
+RUN for tool in barman-cloud-backup barman-cloud-restore \
+                 barman-cloud-wal-archive barman-cloud-wal-restore; do \
+        if [ -f "/usr/local/bin/${tool}" ]; then \
+            mv "/usr/local/bin/${tool}" "/usr/local/bin/${tool}.upstream"; \
+        fi; \
+    done
+
+# Drop the shim binaries in.  The COPY targets are
+# barman-cloud-backup, etc., NOT pg-hardstorage-barman, so
+# CNPG's reconciler finds the same names on PATH it expects.
+# Drop the four barman-cloud-* shims in.  Each is a symlink
+# in bin/ to pg-hardstorage-compat; Docker dereferences the
+# symlink and copies the real binary content.  The compat
+# multi-call dispatcher routes by argv[0], so each binary
+# does the right thing for its name.
+COPY --chmod=0755 bin/pg-hardstorage-barman-cloud-backup       /usr/local/bin/barman-cloud-backup
+COPY --chmod=0755 bin/pg-hardstorage-barman-cloud-restore      /usr/local/bin/barman-cloud-restore
+COPY --chmod=0755 bin/pg-hardstorage-barman-cloud-wal-archive  /usr/local/bin/barman-cloud-wal-archive
+COPY --chmod=0755 bin/pg-hardstorage-barman-cloud-wal-restore  /usr/local/bin/barman-cloud-wal-restore
+
+# A persistent label that lets `kubectl describe pod` operators
+# tell at a glance whether a cluster is running the shimmed
+# image or stock CNPG — useful in test forensics.
+LABEL pg_hardstorage.compat_shim="cnpg-barman-cloud" \
+      pg_hardstorage.upstream_image="${CNPG_PG_IMAGE}"
+
+# CNPG's own ENTRYPOINT does the work — we restore USER to
+# whatever the upstream image defaults to (postgres / 26) so
+# operator pod startup works identically.
+USER 26

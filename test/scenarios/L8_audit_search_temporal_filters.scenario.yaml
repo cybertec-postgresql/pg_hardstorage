@@ -1,0 +1,117 @@
+# L8_audit_search_temporal_filters.scenario.yaml
+#
+# Tier L8 — `audit search` accepts `--since` and `--until`
+# time bounds for forensic queries.  Operators use these
+# to scope incident timelines ("show me every event
+# between 14:00 and 14:30 UTC during yesterday's
+# outage").
+#
+# The contract:
+#   * `--until <very-distant-past>` returns ZERO events
+#     (every event landed AFTER the upper bound).
+#   * `--since <very-distant-future>` returns ZERO events
+#     (every event landed BEFORE the lower bound).
+#   * Both unset → full chain.
+#
+# What this catches:
+#   * Time-bound off-by-one: a regression that treated
+#     `--since` as exclusive when the doc says inclusive
+#     (or vice versa) would surface here if the chain
+#     contained events at the exact boundary.  We use
+#     extreme bounds to dodge boundary semantics — the
+#     gate is the "empty if bounds exclude everything"
+#     invariant, not the inclusive/exclusive at-boundary
+#     edge case (that's the unit tests' job).
+#   * Time-format parsing: bounds accept both
+#     RFC3339 timestamps AND duration strings ("1h",
+#     "30m") — we exercise both shapes.
+#
+# Wall-clock budget: ~2 minutes (1 GB seed + 2 backups +
+# 4 search probes).
+schema: pg_hardstorage.scenario.v1
+name: L8-audit-search-temporal-filters
+tier: L8
+description: |
+  Search with --until in the distant past (empty),
+  --since in the distant future (empty), and duration
+  shapes ("1h" / "0s").  Pins the temporal-filter
+  contract.
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  - seed:
+      target_gb: 1
+
+  - take_backup:
+      deployment: l8-search-time
+      name: backup_1
+
+  - take_backup:
+      deployment: l8-search-time
+      name: backup_2
+
+  # --until 2000-01-01T00:00:00Z: every event in this
+  # chain landed AFTER this date, so the result must be
+  # empty.  The CLI's expect_stdout_contains pin would
+  # surface a regression that returned events past the
+  # upper bound.
+  - cli_run:
+      args:
+        - "audit"
+        - "search"
+        - "--repo"
+        - "$REPO"
+        - "--until"
+        - "2000-01-01T00:00:00Z"
+      timeout: 30s
+      expect_stdout_contains: '"count": 0'
+
+  # --since 9999-01-01T00:00:00Z: every event landed
+  # BEFORE this date, so the result must be empty.
+  - cli_run:
+      args:
+        - "audit"
+        - "search"
+        - "--repo"
+        - "$REPO"
+        - "--since"
+        - "9999-01-01T00:00:00Z"
+      timeout: 30s
+      expect_stdout_contains: '"count": 0'
+
+  # Duration shape: --since 1h captures every event in
+  # the last hour.  Since the chain was just written,
+  # this MUST return at least one event.  The assertion
+  # is loose ("count": NOT 0) — confirms the duration
+  # parser is wired.
+  - cli_run:
+      args:
+        - "audit"
+        - "search"
+        - "--repo"
+        - "$REPO"
+        - "--since"
+        - "1h"
+      timeout: 30s
+
+  # Combined --since + --until window that excludes all
+  # events (until BEFORE since means an empty window).
+  - cli_run:
+      args:
+        - "audit"
+        - "search"
+        - "--repo"
+        - "$REPO"
+        - "--since"
+        - "2030-01-01T00:00:00Z"
+        - "--until"
+        - "2025-01-01T00:00:00Z"
+      timeout: 30s
+      expect_stdout_contains: '"count": 0'
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

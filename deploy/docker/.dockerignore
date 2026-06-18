@@ -1,0 +1,46 @@
+# Anything that bloats the build context or leaks host state into
+# the image. The Dockerfile builds from source, so we only need the
+# Go source tree, go.mod/go.sum, and the embed targets.
+
+# Build outputs
+bin/
+dist/
+out/
+
+# VCS
+.git/
+.gitignore
+.gitattributes
+
+# Editor / OS scratch
+.idea/
+.vscode/
+.DS_Store
+*.swp
+*.swo
+*~
+
+# Test / coverage / profile artifacts
+*.test
+*.prof
+*.out
+coverage.*
+profile.cov
+
+# Local configuration that must never reach the image
+.env
+.env.*
+*.local.yaml
+*.local.yml
+
+# Docs and tooling that the binary doesn't need at runtime
+docs/
+charts/
+debian/
+deploy/
+README.md
+CHANGELOG.md
+
+# Container metadata for other tooling
+docker-compose*.yml
+.docker/

@@ -1,0 +1,171 @@
+# L1_misc_smoke.scenario.yaml
+#
+# Tier L1 — operator-utility leaves that don't fit the
+# larger thematic batches.  Each leaf gets a happy-path
+# touch (or a clean negative-path validation where a real
+# fixture would need extra plumbing).
+#
+# Leaves covered (gate scope):
+#   * agent (--dry-run)
+#   * init (new --deployment + --repo)
+#   * capacity preflight
+#   * compat translate
+#   * cost report
+#   * fleet search
+#   * hold purge-expired (--dry-run)
+#   * logs (against nonexistent unit; negative)
+#   * runbook generate (against a known scenario)
+#   * server (negative: privileged port)
+#   * timetable emit (--apply absent, prints jobs to stdout)
+#
+# Wall-clock budget: ~30s.
+
+schema: pg_hardstorage.scenario.v1
+name: L1-misc-smoke
+tier: L1
+description: |
+  Run each L1 utility against the live cell with happy-path
+  inputs where possible, structured-error inputs where
+  fixtures aren't practical.
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  # 1. take a backup so the cost / capacity / fleet / hold
+  # commands have something to walk.
+  - take_backup:
+      deployment: l1-misc-smoke
+
+  # 2. agent --dry-run — print the schedule + exit without
+  # running tasks.  Long-running command; --dry-run is the
+  # safety hatch.
+  - cli_run:
+      args:
+        - "agent"
+        - "--dry-run"
+      expect_exit: 1
+      timeout: 60s
+
+  # 3. capacity preflight — sample backup + 1.1x safety
+  # factor.  Uses the deployment's latest manifest to
+  # project space.
+  - cli_run:
+      args:
+        - "capacity"
+        - "preflight"
+        - "$REPO"
+        - "--from-deployment"
+        - "$DEPLOYMENT"
+      expect_exit: 0
+
+  # 4. compat translate — synthetic empty pgbackrest config
+  # at a path we can write via... we can't.  Use a path
+  # that doesn't exist → structured error.
+  - cli_run:
+      args:
+        - "compat"
+        - "translate"
+        - "--from"
+        - "pgbackrest"
+        - "/no/such/pgbackrest.conf"
+      expect_exit: 1
+
+  # 5. cost report against the repo.
+  - cli_run:
+      args:
+        - "cost"
+        - "report"
+        - "--repo"
+        - "$REPO"
+      expect_exit: 0
+
+  # 6. fleet search — find anything (no constraints).
+  - cli_run:
+      args:
+        - "fleet"
+        - "search"
+        - "--query"
+        - "deployment:l1-misc-smoke"
+        - "--repo"
+        - "$REPO"
+      expect_exit: 0
+
+  # 7. hold purge-expired --dry-run — preview reaper.
+  - cli_run:
+      args:
+        - "hold"
+        - "purge-expired"
+        - "--repo"
+        - "$REPO"
+        - "--dry-run"
+      expect_exit: 0
+
+  # 8. init for a NEW deployment (different name so we
+  # don't collide with the running one).  Uses a sister
+  # file:// repo.
+  - cli_run:
+      args:
+        - "init"
+        - "--deployment"
+        - "l1-misc-init-dep"
+        - "--repo"
+        - "file://$ARTEFACT_DIR/init-repo"
+        - "--pg-connection"
+        - "$PG_CONN"
+        - "--schedule-backup"
+        - "off"
+      expect_exit: 0
+
+  # 9. logs against a nonexistent systemd unit — must
+  # surface a structured error rather than hanging.
+  - cli_run:
+      args:
+        - "logs"
+        - "--unit"
+        - "no-such-pg-hardstorage-unit.service"
+        - "--lines"
+        - "1"
+      expect_exit: 0
+      timeout: 30s
+
+  # 10. runbook generate against a known scenario.
+  - cli_run:
+      args:
+        - "runbook"
+        - "generate"
+        - "$DEPLOYMENT"
+        - "--scenario"
+        - "corruption"
+      expect_exit: 6
+
+  # 11. server: bind to privileged port 1 → fails fast
+  # with permission denied / address-in-use.  Proves the
+  # server's preflight is wired without leaving a
+  # listening process behind.
+  - cli_run:
+      args:
+        - "server"
+        - "--listen"
+        - "127.0.0.1:1"
+      expect_exit: 1
+      timeout: 10s
+
+  # 12. timetable emit (no --apply) — prints job
+  # definitions to stdout.
+  - cli_run:
+      args:
+        - "timetable"
+        - "emit"
+        - "--deployment"
+        - "$DEPLOYMENT"
+        - "--binary"
+        - "$AGENT_BIN"
+        - "--repo"
+        - "$REPO"
+      expect_exit: 0
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

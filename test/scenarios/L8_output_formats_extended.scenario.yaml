@@ -1,0 +1,68 @@
+# L8_output_formats_extended.scenario.yaml
+#
+# Tier L8 — companion to L8_output_formats_round_trip,
+# which sweeps the four most-used formats (json, text,
+# ndjson, yaml).  This scenario covers the LESSER-used
+# formats: csv, markdown, html, template, tap, junit.
+# Each is registered as a format option in the CLI's
+# `-o` flag, so any of them silently breaking would be
+# a CLI-contract regression.
+#
+# Why split: the popular four are exercised on three
+# commands (repo audit, repo usage, audit summary) for
+# wide command coverage.  The lesser-used formats are
+# narrower — they're typically only meaningful for
+# certain output shapes — so we focus on the commands
+# where they make the most sense.
+#
+# CSV / markdown / html are tabular renderers; we
+# target the audit summary (a clean per-action count
+# table).  TAP / JUnit are CI-output formats; we
+# target `repo check` which has the right structured
+# pass/fail shape for them.  Template is the
+# operator's escape hatch; we exercise with a trivial
+# template against `repo usage`.
+#
+# Wall-clock budget: ~2 minutes (1 GB seed + 1 backup +
+# 7 fast cli_run probes).
+schema: pg_hardstorage.scenario.v1
+name: L8-output-formats-extended
+tier: L8
+description: |
+  Sweep -o csv / markdown / html / tap / junit / template
+  across the commands where each format is meaningful.
+  Every invocation must exit 0 with non-empty output.
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  - seed:
+      target_gb: 1
+
+  - take_backup:
+      deployment: l8-output-extended
+      name: only_backup
+
+  # Tabular formats: audit summary's per-action counts
+  # render cleanly as CSV / markdown / HTML.
+  - cli_run: { args: ["audit", "summary", "--repo", "$REPO", "-o", "csv"],      timeout: 30s }
+  - cli_run: { args: ["audit", "summary", "--repo", "$REPO", "-o", "markdown"], timeout: 30s }
+  - cli_run: { args: ["audit", "summary", "--repo", "$REPO", "-o", "html"],     timeout: 30s }
+
+  # CI-output formats: `repo check` has the structured
+  # pass/fail shape these renderers expect.
+  - cli_run: { args: ["repo", "check", "$REPO", "-o", "tap"],   timeout: 30s }
+  - cli_run: { args: ["repo", "check", "$REPO", "-o", "junit"], timeout: 30s }
+
+  # Template: render the URL field of a `repo usage`
+  # response.  Trivial template confirms the renderer
+  # path is wired without depending on schema specifics.
+  - cli_run:
+      args: ["repo", "usage", "$REPO", "-o", "template", "--template", "{{.url}}"]
+      timeout: 30s
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

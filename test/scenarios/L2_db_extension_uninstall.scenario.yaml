@@ -1,0 +1,76 @@
+# L2_db_extension_uninstall.scenario.yaml
+#
+# Tier L2 — db extension cross-cover.  2nd touch for
+# install-extension + uninstall-extension.
+#
+# Leaves covered (gate scope — 2nd touch):
+#   * db install-extension (2nd, --print-sql alternate)
+#   * db uninstall-extension (2nd, full round-trip)
+#
+# Wall-clock budget: ~15s.
+
+schema: pg_hardstorage.scenario.v1
+name: L2-db-extension-uninstall
+tier: L2
+description: |
+  install-extension --print-sql → install for real →
+  uninstall for real → re-install → uninstall again
+  (idempotent round-trip).
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  - cli_run:
+      args:
+        - "db"
+        - "install-extension"
+        - "--print-sql"
+      expect_exit: 0
+
+  - cli_run:
+      args:
+        - "db"
+        - "install-extension"
+        - "--pg-connection"
+        - "$PG_CONN"
+      expect_exit: 0
+      timeout: 60s
+
+  - cli_run:
+      args:
+        - "db"
+        - "uninstall-extension"
+        - "--pg-connection"
+        - "$PG_CONN"
+        - "--drop-data"
+      expect_exit: 0
+      timeout: 60s
+
+  # Re-install + re-uninstall: proves the round-trip is
+  # idempotent — operators can install, uninstall,
+  # reinstall without leftover state breaking the next
+  # cycle.
+  - cli_run:
+      args:
+        - "db"
+        - "install-extension"
+        - "--pg-connection"
+        - "$PG_CONN"
+      expect_exit: 0
+      timeout: 60s
+
+  - cli_run:
+      args:
+        - "db"
+        - "uninstall-extension"
+        - "--pg-connection"
+        - "$PG_CONN"
+        - "--drop-data"
+      expect_exit: 0
+      timeout: 60s
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

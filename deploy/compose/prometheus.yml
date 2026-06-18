@@ -1,0 +1,30 @@
+# Prometheus scrape config for the pg_hardstorage evaluation stack.
+#
+# Scrapes the agent's opt-in /metrics endpoint (issue #98).  The
+# agent is started with `--metrics-listen 0.0.0.0:9187` in
+# docker-compose.yml, so the `pg_hardstorage_*` data-plane families
+# (backup, WAL-archive, verify, build_info, …) are reachable on the
+# compose network at pg_hardstorage:9187.
+#
+# A short scrape interval is fine here — this is a single-node eval
+# stack, not production.  Production scrape guidance (30s, both the
+# control-plane and per-agent jobs) lives in
+# docs/operations/monitoring.md.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: pg_hardstorage_agent
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["pg_hardstorage:9187"]
+        labels:
+          stack: eval
+
+  # Prometheus scrapes itself so the stack has at least one always-up
+  # target even before the agent's first backup populates the
+  # data-plane families.
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]

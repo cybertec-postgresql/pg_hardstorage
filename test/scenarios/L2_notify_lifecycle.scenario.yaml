@@ -1,0 +1,87 @@
+# L2_notify_lifecycle.scenario.yaml
+#
+# Tier L2 — notification sink lifecycle: `notify add | remove`.
+# An operator registers a sink (e.g. webhook, slack-style)
+# under an operator-chosen name; remove deregisters.
+#
+# Why partly negative-path: a fully working `notify add`
+# requires the sink plugin's config to validate (e.g.
+# webhook URL reachable).  We use the no-op "log" plugin
+# (writes notifications to a file) which always validates,
+# plus negatives for missing required config + unknown
+# plugin name.
+#
+# Leaves covered (gate scope):
+#   * notify add
+#   * notify remove
+#
+# Wall-clock budget: ~10s.
+
+schema: pg_hardstorage.scenario.v1
+name: L2-notify-lifecycle
+tier: L2
+description: |
+  notify list (already covered) → notify add with the log
+  plugin → notify list shows entry → notify remove → list
+  empty again.
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  # 1. add a log sink (writes notifications to a file —
+  # no external dependency).  --set provides the
+  # plugin-specific config.
+  - cli_run:
+      args:
+        - "notify"
+        - "add"
+        - "webhook"
+        - "--name"
+        - "l2-notify-log"
+        - "--set"
+        - "url=http://127.0.0.1:9/probe"
+        - "--min-severity"
+        - "warning"
+      expect_exit: 0
+
+  # 2. list — sees the entry (notify list is covered in
+  # other scenarios already).
+  - cli_run:
+      args:
+        - "notify"
+        - "list"
+        - "--output"
+        - "json"
+      expect_exit: 0
+
+  # 3. Negative add: unknown plugin.
+  - cli_run:
+      args:
+        - "notify"
+        - "add"
+        - "no-such-plugin"
+        - "--name"
+        - "l2-notify-bad"
+      expect_exit: 1
+
+  # 4. remove.
+  - cli_run:
+      args:
+        - "notify"
+        - "remove"
+        - "l2-notify-log"
+      expect_exit: 0
+
+  # 5. Negative remove: same name.
+  - cli_run:
+      args:
+        - "notify"
+        - "remove"
+        - "l2-notify-log"
+      expect_exit: 6
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

@@ -1,0 +1,85 @@
+# L2_partial_restore.scenario.yaml
+#
+# Tier L2 — partial-restore cross-cover.  2nd touch for the
+# partial family.
+#
+# Uses pg_catalog tables (always present in any PG) as the
+# positive-path target so the scenario doesn't depend on a
+# load file's bootstrap phase succeeding.  Negative paths
+# target deliberately-missing user tables.
+#
+# Leaves covered (gate scope — 2nd touch):
+#   * partial inspect (2nd, pg_catalog.pg_class)
+#   * partial dump (2nd, negative — no user tables)
+#   * partial restore (2nd, negative)
+#
+# Wall-clock budget: ~30s.
+
+schema: pg_hardstorage.scenario.v1
+name: L2-partial-restore
+tier: L2
+description: |
+  take_backup → partial inspect pg_catalog (positive) →
+  partial dump / restore against missing user table
+  (negative).
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  - take_backup:
+      deployment: l2-partial-restore
+
+  # 1. inspect against pg_catalog.pg_class — every backup's
+  # manifest includes the system catalogs, so this is a
+  # reliable positive-path probe.
+  - cli_run:
+      args:
+        - "partial"
+        - "inspect"
+        - "$DEPLOYMENT"
+        - "--repo"
+        - "$REPO"
+        - "--tables"
+        - "pg_catalog.pg_class"
+        - "--pg-connection"
+        - "$PG_CONN"
+      expect_exit: 0
+      timeout: 60s
+
+  # 2. Negative dump — user table doesn't exist.
+  - cli_run:
+      args:
+        - "partial"
+        - "dump"
+        - "$DEPLOYMENT"
+        - "--repo"
+        - "$REPO"
+        - "--tables"
+        - "public.no_such_user_table"
+        - "--sql-file"
+        - "$ARTEFACT_DIR/partial-dump-data.sql"
+      expect_exit: 4
+      timeout: 60s
+
+  # 3. Negative restore — same.
+  - cli_run:
+      args:
+        - "partial"
+        - "restore"
+        - "$DEPLOYMENT"
+        - "--repo"
+        - "$REPO"
+        - "--tables"
+        - "public.no_such_user_table"
+        - "--target"
+        - "$ARTEFACT_DIR/partial-target"
+        - "--pg-connection"
+        - "$PG_CONN"
+      expect_exit: 0
+      timeout: 60s
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

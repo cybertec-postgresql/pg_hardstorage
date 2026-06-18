@@ -1,0 +1,60 @@
+# L1_cli_run_smoke.scenario.yaml
+#
+# Smoke test for the cli_run step primitive.  Confirms the runner
+# can shell out to pg_hardstorage with literal argv, parse the
+# exit code, and assert on stdout/stderr substrings.
+#
+# Why this matters: the cli_run step is the primitive every
+# Tier-1 / Tier-2 scenario builds on (hold lifecycle, kms rotate,
+# audit anchor, recovery drill, etc.).  A regression here would
+# silently break every scenario that uses it.  The L1 tier means
+# this runs first in CI and fails fast.
+#
+# Wall-clock budget: <2s.  No PG, no docker — just exec the binary.
+
+schema: pg_hardstorage.scenario.v1
+name: L1-cli-run-smoke
+tier: L1
+description: |
+  cli_run primitive smoke: `pg_hardstorage version` exits 0 and
+  prints the canonical "pg_hardstorage <version>" banner; an
+  intentionally bogus subcommand exits non-zero with a hint.
+
+# topology=local-docker is the lightest provider but still spins
+# a PG container — overkill for "just exec the binary" smoke.
+# Future: a `provider: none` topology would skip Up/Down entirely.
+# For now we accept the ~3s container boot cost as the price of
+# the existing scenario harness.
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  # Happy path: `pg_hardstorage version` exits 0 and prints
+  # something that contains the literal string "pg_hardstorage".
+  - cli_run:
+      args: ["version"]
+      expect_exit: 0
+      expect_stdout_contains: "pg_hardstorage"
+
+  # Negative path: a bogus subcommand exits non-zero.  Cobra's
+  # default is exit 1 and a "unknown command" line on stderr.
+  # We don't pin the exact text — that's a Cobra-internal contract
+  # we don't want to brittle-test.
+  - cli_run:
+      args: ["this-subcommand-does-not-exist"]
+      expect_exit: 1
+
+  # Placeholder substitution: $REPO resolves to the scenario's
+  # repo URL (file:// fallback under artefactDir/repo since this
+  # scenario has no sink).  `pg_hardstorage repo init` is
+  # idempotent against an empty file:// path so this exercises
+  # both the substitution AND a real repo command end-to-end.
+  - cli_run:
+      args: ["repo", "init", "$REPO", "--output", "json"]
+      expect_exit: 0
+      expect_stdout_contains: "schema"
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

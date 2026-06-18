@@ -1,0 +1,118 @@
+# L8_admin_cli_smoke_after_chain.scenario.yaml
+#
+# Tier L8 — sweep the read-only admin CLI surfaces against
+# a non-trivial backup chain.  Each command is what an
+# operator reaches for during a routine health check:
+#
+#   * `repo check`    — signature + reference integrity
+#                       (manifests parse cleanly, every
+#                       referenced chunk exists)
+#   * `repo usage`    — disk/repo footprint by category
+#                       (manifests, chunks, audit, WAL)
+#   * `repo audit`    — comprehensive read-only state
+#                       report (typed entries + counts)
+#   * `audit summary` — per-action event aggregates
+#   * `audit verify-chain` — hash-chain integrity over
+#                            every emitted event
+#
+# Without an end-to-end gate against a non-empty chain, a
+# regression in any of these surfaces would still pass L1
+# (empty-repo smoke) and L2 (single-backup smoke).  This
+# scenario exercises every command against a 5-backup
+# chain so any "the surface broke on a populated repo"
+# regression surfaces here, not in production.
+#
+# Wall-clock budget: ~4 minutes (1 GB seed + 5 backups +
+# 5 CLI probes).
+schema: pg_hardstorage.scenario.v1
+name: L8-admin-cli-smoke-after-chain
+tier: L8
+description: |
+  5-backup chain → repo check + repo usage + repo audit +
+  audit summary + audit verify-chain.  Every CLI surface
+  must exit 0 and produce non-empty output.
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  - seed:
+      target_gb: 1
+
+  - take_backup:
+      deployment: l8-admin-cli
+      name: backup_1
+
+  - take_backup:
+      deployment: l8-admin-cli
+      name: backup_2
+
+  - take_backup:
+      deployment: l8-admin-cli
+      name: backup_3
+
+  - take_backup:
+      deployment: l8-admin-cli
+      name: backup_4
+
+  - take_backup:
+      deployment: l8-admin-cli
+      name: backup_5
+
+  # `repo check` walks every manifest, validates the
+  # Ed25519 signature, and confirms every referenced
+  # chunk exists.  Cheaper than `repo scrub` (no
+  # SHA round-trip) but catches the same class of
+  # "manifest references a missing object" bug.
+  - cli_run:
+      args:
+        - "repo"
+        - "check"
+        - "$REPO"
+      timeout: 60s
+
+  # `repo usage` — operator-facing footprint report.
+  - cli_run:
+      args:
+        - "repo"
+        - "usage"
+        - "$REPO"
+      timeout: 30s
+
+  # `repo audit` — comprehensive state dump.  No assert
+  # on shape (it's a read-only report and the schema
+  # evolves); the gate is exit 0 with parseable output.
+  - cli_run:
+      args:
+        - "repo"
+        - "audit"
+        - "$REPO"
+      timeout: 30s
+
+  # `audit summary` aggregates the audit-log events
+  # (backup_started / backup_completed / repo_init / ...)
+  # by action.  With 5 backups + 1 repo init we expect
+  # at least 6 event categories represented.
+  - cli_run:
+      args:
+        - "audit"
+        - "summary"
+        - "--repo"
+        - "$REPO"
+      timeout: 30s
+
+  # `audit verify-chain` is the hash-chain integrity
+  # gate; mirrors the audit/repo check above but on the
+  # audit log specifically.
+  - cli_run:
+      args:
+        - "audit"
+        - "verify-chain"
+        - "--repo"
+        - "$REPO"
+      timeout: 30s
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

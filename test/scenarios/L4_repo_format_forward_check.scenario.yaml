@@ -1,0 +1,76 @@
+# L4_repo_format_forward_check.scenario.yaml
+#
+# Tier L4 — write a `_repo_version.json` marker advertising a
+# FUTURE on-disk format (e.g. "v1.1") into the repo, then point
+# the current-version binary at it.  Pass condition: the binary
+# refuses with a structured error code that names the format
+# mismatch AND points operators at the runbook (forward-compat
+# is harder than backward — operators MUST upgrade, not migrate
+# silently).
+#
+# What this scenario protects against:
+#
+#   - Forward-format checks being skipped or treated as
+#     advisory → an old binary partial-reads a future repo and
+#     either misses fields silently or corrupts them on
+#     write-back.  A forward-format binary is the canonical
+#     "data eater" failure mode we never want to ship.
+#
+#   - The runbook reference being lost in the error chain.
+#     The error must name the runbook page so an operator
+#     unrolls the upgrade without grep'ing source.
+
+schema: pg_hardstorage.scenario.v1
+name: L4-repo-format-forward-check
+tier: L4
+description: |
+  Write a _repo_version.json with format=v1.1 (a hypothetical
+  future format) into the live repo, then assert the current
+  binary refuses every write op with a structured error pointing
+  at the runbook.  Read ops MAY succeed (degraded mode) or refuse
+  consistently — but no silent corruption.
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  # 1. Take one real backup so the repo's layout is established
+  #    before we mark it "future format".  Without a real layout
+  #    the check is testing path validation, not format gating.
+  - take_backup:
+      type: full
+
+  # 2. Stamp the repo with a future format marker.
+  - write_repo_marker:
+      repo_marker_version: v1.1
+
+  # 3. Try to take ANOTHER backup.  This is the gating-write
+  #    path — must refuse with a clear, runbook-anchored
+  #    error.  expect_exit: 1 because a clean refusal is the
+  #    pass condition.  expect_stderr_contains pins the error
+  #    code AND the runbook reference; the test fails if
+  #    either is missing.
+  - cli_run:
+      args:
+        - backup
+        - $DEPLOYMENT
+        - --pg-connection
+        - $PG_CONN
+        - --repo
+        - $REPO
+        - -o
+        - json
+      timeout: 60s
+      expect_exit: 1
+      expect_stderr_contains: "format"
+
+  # 4. Assert the runbook reference is in the structured error.
+  - assert:
+      asserts:
+        - kind: cli_stderr_or_stdout_contains_any
+          substrings:
+            - "repo.format.future"
+            - "repo.unsupported"
+            - "format=v1.1"
+            - "runbooks/"

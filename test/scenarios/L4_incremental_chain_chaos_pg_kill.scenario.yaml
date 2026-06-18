@@ -1,0 +1,137 @@
+# L4_incremental_chain_chaos_pg_kill.scenario.yaml
+#
+# Tier L4: build an incremental chain, kill -9 the PG server
+# between links, prove the chain extends cleanly across the
+# crash + auto-restart cycle.
+#
+# Scope and rename:
+#
+#   The plan called this "2h soak — kill -9 mid-incremental".
+#   The scenario runner is linear (no async background-step
+#   primitive), so a literal "kill the in-flight BASE_BACKUP
+#   process at exactly 50% progress" is not expressible as a
+#   YAML scenario today.  The chaos-soak harness
+#   (cmd/pg_hardstorage_testkit chaos) can loop this scenario
+#   for 2 hours to satisfy the soak dimension.  What this
+#   scenario provides:
+#
+#     - The IN-LOOP unit of the 2-hour soak: a single kill+
+#       recover+next-backup cycle, complete in ~30s.  Run
+#       repeatedly by the soak harness it accumulates to the
+#       2-hour budget; run once by the L4 nightly tier it
+#       catches the same regressions a 2-hour run would
+#       catch, just with less coverage of statistically rare
+#       races (which is exactly the resolution L4 vs soak
+#       expresses).
+#
+# What this scenario protects against:
+#
+#   * Chain integrity across a PG crash + auto-restart.
+#     Before the crash there's a 3-link chain.  After PG
+#     reboots, the agent reconnects and the NEXT incremental
+#     MUST chain off the pre-crash leaf cleanly — proves PG's
+#     walsummarizer recovers its state across SIGKILL, the
+#     prior incremental's PGBackupManifest is still readable
+#     post-restart, and BASE_BACKUP INCREMENTAL accepts the
+#     parent reference.
+#
+#   * No orphaned in-flight markers.  If a prior backup was
+#     mid-flight when the kill landed (which can happen in
+#     soak when the kill timing crosses a backup boundary),
+#     the next backup MUST NOT see a stuck lock.  We don't
+#     literally trigger this in a single-shot run, but the
+#     soak harness's randomised kill timing exercises it
+#     over enough iterations.
+#
+#   * Restore against the post-chaos chain.  pg_combinebackup
+#     over a chain whose middle links straddle a PG crash
+#     should still produce a verifybackup-clean datadir —
+#     proves WAL summarizer state didn't drift in a way
+#     that would silently corrupt a future incremental's
+#     deltas.
+#
+# Wall-clock budget: ~45s per single-shot iteration.  The
+# soak harness multiplies by iteration count.
+
+schema: pg_hardstorage.scenario.v1
+name: L4-incremental-chain-chaos-pg-kill
+tier: L4
+description: |
+  3-link chain + SIGKILL PG between links + recovery + 4th
+  incremental + leaf restore.  In-loop unit of the kill-9
+  incremental soak.
+
+topology:
+  provider: local-docker
+  # PG 17+ for BASE_BACKUP INCREMENTAL.
+  pg_version: "17"
+
+load:
+  file: test/load/failover_loop.load.yaml
+
+steps:
+  # 1. Pre-crash chain construction.
+  - assert:
+      - count_exact: { table: users, value: 1000 }
+
+  - take_backup:
+      deployment: l4-chaos
+      name: anchor_full
+
+  - run_load: { duration: 2s }
+
+  - take_backup:
+      deployment: l4-chaos
+      incremental_from: "$LAST_BACKUP"
+      name: pre_crash_incr_1
+
+  - run_load: { duration: 2s }
+
+  - take_backup:
+      deployment: l4-chaos
+      incremental_from: "$LAST_BACKUP"
+      name: pre_crash_leaf
+
+  # 2. THE crash.  pg_kill with sig=9 sends SIGKILL to the PG
+  #    container's main process.  heal_window: 30s gives the
+  #    docker restart-on-failure policy time to re-launch PG,
+  #    PG to do crash recovery, and the walsummarizer to spin
+  #    back up.  The unless-stopped restart policy in the
+  #    local-docker topology (steps in startContainer) is
+  #    what makes this recoverable without scenario-level
+  #    intervention.
+  - inject:
+      kind: pg_kill
+      signal: 9
+      heal_window: 30s
+
+  # 3. Post-crash sanity: live load still works.  If PG didn't
+  #    come back, this step fails fast and the rest of the
+  #    scenario is short-circuited — which is what we want for
+  #    diagnosability.
+  - run_load: { duration: 2s }
+
+  # 4. THE proof step: next incremental chains off the pre-
+  #    crash leaf.  PG's walsummarizer state and our manifest
+  #    state must reconcile cleanly — otherwise BASE_BACKUP
+  #    INCREMENTAL refuses with "WAL summaries are required
+  #    from X/X to X/X, but no summaries were found" or
+  #    similar.
+  - take_backup:
+      deployment: l4-chaos
+      incremental_from: pre_crash_leaf
+      name: post_crash_incr
+
+  # 5. Restore the post-crash leaf.  Materialises a chain
+  #    whose middle straddles the crash boundary; pg_verifybackup
+  #    on the flattened datadir is the byte-level proof that
+  #    nothing drifted.
+  - restore:
+      deployment: l4-chaos
+      source: post_crash_incr
+
+cleanup:
+  on_success: tear_down
+  # 2h soak runs benefit from a longer keep-window on failure
+  # so the operator can inspect every iteration's artefacts.
+  on_failure: "keep_for:2h"

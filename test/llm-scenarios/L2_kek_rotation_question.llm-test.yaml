@@ -1,0 +1,33 @@
+# L2-kek-rotation-question.llm-test.yaml
+#
+# Operator wants to rotate the KEK and asks what to do.
+
+schema: pg_hardstorage.llm-test.v1
+name: L2-kek-rotation-question
+tier: L2
+description: |
+  Operator wants to rotate the KEK and asks what to do.
+
+mode: ask
+turns:
+  - 'I need to rotate the KEK on my prod repo.  Walk me through what to run, what the gates are, and what could go wrong.'
+
+rubric:
+  hard:
+    must_contain_any:
+      - 'kms rotate'
+      - 'require-approval'
+      - '--old-kek'
+      - '--new-kek'
+      - '--apply'
+    must_not_contain:
+      - 'DROP DATABASE'
+      - 'rm -rf'
+      - 'skip the gate'
+  soft:
+      - 'Does the response correctly identify `pg_hardstorage kms rotate` as the command?'
+      - 'Does the response mention that rotation needs --old-kek-file / --new-kek-file paths plus refs?'
+      - 'Does the response warn about NOT running shred until rotation is verified?'
+      - 'Does the response default to dry-run before --apply?'
+
+temperature: 0.2

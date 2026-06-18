@@ -1,0 +1,112 @@
+# L2_verify_invariant.scenario.yaml
+#
+# E2E coverage for `pg_hardstorage verify` — the per-backup
+# integrity-without-restore command.  Verify reads a manifest,
+# validates its signature, and SHA-256-round-trips every chunk
+# through the CAS read path.  No PG sandbox, no WAL replay.
+#
+# Why this matters: verify is the cheapest signal an operator
+# has for "is this backup still good?".  If verify silently
+# passes on a corrupted chunk, an operator who relies on it
+# learns about the corruption only at restore time — too late.
+# Unit tests prove the verify path's pieces work; this scenario
+# proves the wired-up command does what its docstring claims.
+#
+# What gets exercised:
+#
+#   * verify <deployment> <backup-id> — full chunk-fetch path
+#   * verify --existence-only — lighter Stat-only pre-flight
+#   * verify against a non-existent backup — must fail
+#
+# Pass criterion: full verify exits 0; existence-only exits 0;
+# the bogus-backup probe exits non-zero with a useful error.
+#
+# Wall-clock budget: ~15s (small backup, no streaming).
+
+schema: pg_hardstorage.scenario.v1
+name: L2-verify-invariant
+tier: L2
+description: |
+  Per-backup verify: chunk SHA-256 round-trip, existence-only
+  pre-flight, and the negative-path "backup not in repo" probe.
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+load:
+  file: test/load/oltp_smoke.load.yaml
+
+steps:
+  # 1. Take a backup to verify against.  The smoke load gives
+  # us non-trivial chunk count without inflating wall-clock.
+  - take_backup:
+      deployment: l2-verify-invariant
+
+  # 2. Full verify — reads + SHA-256s every chunk.  This is the
+  # canonical signal "the bytes on disk match what the manifest
+  # promised".  No --full flag (that path requires Docker for
+  # a sandbox PG; we already have one via topology, but the
+  # CLI's --full path spawns its own).
+  - cli_run:
+      args:
+        - "verify"
+        - "$DEPLOYMENT"
+        - "$LAST_BACKUP"
+        - "--repo"
+        - "$REPO"
+        - "--output"
+        - "json"
+      expect_exit: 0
+      expect_stdout_contains: "schema"
+
+  # 3. existence-only — Stats every unique chunk instead of
+  # fetching it.  100x cheaper; canonical pre-flight before
+  # `backup undelete` (where missing chunks mean GC reclaimed
+  # them and undelete is impossible).
+  - cli_run:
+      args:
+        - "verify"
+        - "$DEPLOYMENT"
+        - "$LAST_BACKUP"
+        - "--repo"
+        - "$REPO"
+        - "--existence-only"
+        - "--output"
+        - "json"
+      expect_exit: 0
+
+  # 4. NEGATIVE PATH: verify against a backup ID that doesn't
+  # exist.  Must exit with structured-error code for
+  # `notfound.backup` (exit 6 in the current taxonomy) and
+  # mention the missing manifest in stderr.  Pinning the
+  # specific exit code rather than "any non-zero" catches a
+  # regression where verify started returning a different
+  # structured-error class for the same input.
+  - cli_run:
+      args:
+        - "verify"
+        - "$DEPLOYMENT"
+        - "no-such-backup-id-deadbeef"
+        - "--repo"
+        - "$REPO"
+      expect_exit: 6
+      expect_stderr_contains: "notfound.backup"
+
+  # 5. Default-arg form: omitting backup-id (or passing
+  # "latest") resolves to the most recent backup.  Same
+  # backup we just verified, so it must still pass.
+  - cli_run:
+      args:
+        - "verify"
+        - "$DEPLOYMENT"
+        - "latest"
+        - "--repo"
+        - "$REPO"
+        - "--output"
+        - "json"
+      expect_exit: 0
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

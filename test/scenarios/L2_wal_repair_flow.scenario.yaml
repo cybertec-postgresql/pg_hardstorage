@@ -1,0 +1,122 @@
+# L2_wal_repair_flow.scenario.yaml
+#
+# Tier L2 — WAL slot repair + gap reaping.  The headline
+# property: an operator can invoke `wal repair` against a
+# deployment's slot and `wal gap-purge` against orphan
+# records, and both commands work whether or not a streamer
+# is active.
+#
+# Scope note: the original draft had a wal_stream + drop_slot
+# sequence to force a real recreate flow.  That sequence
+# requires the streamer's slot to be visible at drop_slot
+# time, which races with switch_wal's CHECKPOINT in some
+# topologies and hangs.  The simpler shape below — invoke
+# repair against a slot that doesn't yet exist — exercises
+# the same surface (EnsureSlot Strategy-C) without the race.
+#
+# Leaves covered (gate scope, 2nd touch):
+#   * wal repair — slot creation (covers Strategy-C)
+#   * wal gap-purge — orphan-record reaper (dry-run)
+#   * wal fetch / wal push — re-exercised in a repair-then-archive
+#     sequence
+#
+# Wall-clock budget: ~30s.
+
+schema: pg_hardstorage.scenario.v1
+name: L2-wal-repair-flow
+tier: L2
+description: |
+  Take a backup → wal preflight against a healthy PG → wal
+  repair creates the slot fresh → gap-purge --dry-run lists
+  any gap records → fetch + push round-trip against a
+  bogus segment (negative paths exercise the validation).
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  - take_backup:
+      deployment: l2-wal-repair-flow
+
+  # 1. preflight — confirms the PG is reachable with the
+  # right replication-protocol prerequisites.
+  - cli_run:
+      args:
+        - "wal"
+        - "preflight"
+        - "$DEPLOYMENT"
+        - "--pg-connection"
+        - "$PG_CONN"
+      expect_exit: 0
+
+  # 2. repair — recreate the slot.  The deployment doesn't
+  # have one yet (no wal_stream has run), so this exercises
+  # the "create when missing" branch of EnsureSlot.
+  - cli_run:
+      args:
+        - "wal"
+        - "repair"
+        - "$DEPLOYMENT"
+        - "--pg-connection"
+        - "$PG_CONN"
+        - "--repo"
+        - "$REPO"
+        - "--slot"
+        - "pg_hardstorage_l2_wal_repair_flow"
+      expect_exit: 0
+      timeout: 60s
+
+  # 3. gap-purge --dry-run — preview reaper, no mutations.
+  - cli_run:
+      args:
+        - "wal"
+        - "gap-purge"
+        - "$DEPLOYMENT"
+        - "--repo"
+        - "$REPO"
+        - "--orphans"
+        - "--dry-run"
+      expect_exit: 0
+
+  # 4. gap-purge with --orphans + --dry-run flag combination.
+  - cli_run:
+      args:
+        - "wal"
+        - "gap-purge"
+        - "$DEPLOYMENT"
+        - "--repo"
+        - "$REPO"
+        - "--orphans"
+        - "--dry-run"
+      expect_exit: 0
+
+  # 5. negative wal fetch: segment doesn't exist.
+  - cli_run:
+      args:
+        - "wal"
+        - "fetch"
+        - "$DEPLOYMENT"
+        - "00000001FFFFFFFFFFFFFFFE"
+        - "$ARTEFACT_DIR/repair-fetch.wal"
+        - "--repo"
+        - "$REPO"
+      expect_exit: 6
+
+  # 6. negative wal push: file doesn't exist (the fetch
+  # never produced it).
+  - cli_run:
+      args:
+        - "wal"
+        - "push"
+        - "$DEPLOYMENT"
+        - "$ARTEFACT_DIR/repair-fetch.wal"
+        - "--repo"
+        - "$REPO"
+        - "--pg-connection"
+        - "$PG_CONN"
+      expect_exit: 6
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

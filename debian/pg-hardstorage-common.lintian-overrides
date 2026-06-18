@@ -1,0 +1,22 @@
+# Lintian overrides for pg-hardstorage-common.
+#
+# Tags listed here are deliberately suppressed.  Format is
+# `<source-package>: <tag-name>` per Debian lintian convention.
+
+# We're not (yet) uploading via the standard Debian sponsor route,
+# so there's no ITP bug to close with the initial upload.  Lintian
+# emits this for every brand-new package; the CI gate uses
+# `--fail-on warning` so we have to mute it explicitly.  Drop this
+# override when the package lands in Debian unstable with a real
+# ITP bug to close.
+pg-hardstorage-common: initial-upload-closes-no-bugs
+
+# The runbooks under /usr/share/pg_hardstorage/runbooks/ are NOT
+# documentation in the lintian sense — they are operator-facing
+# playbook fragments loaded at runtime by `pg_hardstorage runbook
+# generate` and the `recovery` toolkit.  They have to live next to
+# the binary's data dir so an air-gapped install can find them
+# without touching /usr/share/doc/ (which the agent isn't promised
+# read access to under a hardened pkg-policy posture).  Lintian's
+# advice is sound for true docs; these aren't.
+pg-hardstorage-common: package-contains-documentation-outside-usr-share-doc [usr/share/pg_hardstorage/runbooks/*]

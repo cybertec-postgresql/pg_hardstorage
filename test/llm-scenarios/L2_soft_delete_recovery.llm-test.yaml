@@ -1,0 +1,28 @@
+# L2-soft-delete-recovery.llm-test.yaml
+#
+# Operator accidentally rotated retention more aggressively than intended; wants the old backup back.
+
+schema: pg_hardstorage.llm-test.v1
+name: L2-soft-delete-recovery
+tier: L2
+description: |
+  Operator accidentally rotated retention more aggressively than intended; wants the old backup back.
+
+mode: ask
+turns:
+  - 'I accidentally ran rotate with --keep-fulls 1 and now most of my backups are tombstoned.  how do I get them back?'
+
+rubric:
+  hard:
+    must_contain_any:
+      - 'undelete'
+      - 'backup undelete'
+      - 'tombstone'
+    must_not_contain:
+      - 'rm -rf'
+      - 'DROP'
+  soft:
+      - 'Does the response correctly point at `pg_hardstorage backup undelete`?'
+      - 'Does the response warn about the deadline (repo gc reaps after the tombstone grace window)?'
+
+temperature: 0.2

@@ -1,0 +1,55 @@
+# L4_corrupt_chunk.scenario.yaml
+#
+# Tier L4: adversarial corruption test.  Take a backup,
+# surgically mutate one chunk's envelope on disk, run
+# `repo check`, assert the corruption surfaces as a
+# structured error with a verify.* code prefix.
+#
+# The bug class this guards: a stored chunk whose bytes
+# are mutated post-commit (bit-flip on disk, malicious
+# tampering, buggy out-of-band tool that touched the
+# CAS).  Read-side hash verification in
+# CAS.GetChunkBytes catches the content drift after
+# envelope decode.  This scenario pins that the
+# operator-facing diagnostic surface (`repo check`)
+# reports it cleanly rather than silently materialising
+# wrong bytes during a restore.
+#
+# Three sub-classes exist; this scenario covers the
+# random-chunk class.  Sibling scenarios for
+# manifest_random and hsrepo follow the same shape.
+
+schema: pg_hardstorage.scenario.v1
+name: L4-corrupt-chunk
+tier: L4
+description: |
+  Take a backup; flip a bit in one CAS chunk; assert
+  `repo check` reports the corruption with a verify.*
+  code prefix.
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  # Seed via pgbench so the backup has real data; the
+  # repo's CAS chunks are what we're going to mutate.
+  - seed:
+      target_gb: 1
+
+  - take_backup:
+      deployment: l4-corrupt
+
+  # Mutate one randomly-picked chunk under chunks/sha256/.
+  # ExpectErrorPrefix `verify.` matches any of the
+  # CAS read-side codes (verify.chunk_hash_mismatch,
+  # verify.chunk_envelope_*, ...) — the specific code
+  # depends on what the mutation hit.
+  - corrupt_repo_object:
+      repo_target: chunk_random
+      mutation: flip_bit_at
+      expect_error_prefix: verify.
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

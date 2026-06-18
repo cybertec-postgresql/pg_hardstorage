@@ -1,0 +1,132 @@
+# L3_restore_to_lsn_unreachable.scenario.yaml
+#
+# Tier L3: PITR reachability gate — issue #99.
+#
+# Issue #99 shipped a real PG bug: `restore --preview --to-lsn X`
+# silently dropped the flag.  Worse: a real restore with --to-lsn
+# pointing BEFORE the backup's stop_lsn ran to end-of-WAL because
+# PG can only replay forward.  The operator's database came up at
+# a wrong-but-plausible point in time with no error in sight.
+#
+# This scenario exercises the post-fix behaviour against a REAL
+# PG cluster (not just an in-process fixture):
+#
+#   * take_backup against PG 17 (real BASE_BACKUP, real
+#     pg_basebackup-format manifest, real backup_label).  After
+#     the fix, the planted manifest carries a real stop_lsn we
+#     can compare against.
+#
+#   * restore --preview --to-lsn 0/1 — way below any real
+#     stop_lsn — must refuse with exit code 7 (ExitConflict) and
+#     emit error code restore.target_unreachable.  Pre-#99-fix
+#     this would have exited 0 and printed the same body the
+#     no-flag preview prints, masking the bug.
+#
+#   * restore (non-preview) --to-lsn 0/1 — same posture.  The
+#     gate runs in BOTH Preview and Restore so a preview-skipper
+#     still hits it.
+#
+#   * restore --preview --to-lsn FFFF/FFFFFFFF (way past any real
+#     stop_lsn, default inclusive) — the happy path: must NOT
+#     refuse (exit 0).  Without it the negative cases above could
+#     pass trivially by always refusing.
+#
+# NOT exercised here: the exclusive-equality boundary
+# (--to-lsn <stop_lsn> --to-exclusive must refuse).  It needs the
+# backup's exact stop_lsn, which the scenario runner does not expose
+# as a placeholder ($LAST_BACKUP gives the ID, not the stop_lsn).
+# That boundary is pinned by the unit test
+# TestCheckTargetReachable_LSN_EqualsStop_Exclusive_Refuses and
+# guarded against regression by the mutation
+# mutation_target_reachable_off_by_one.
+#
+# Wall-clock budget: ~30s (one real BASE_BACKUP, two refusal +
+# one acceptance preview/restore round-trips, no restored datadir).
+schema: pg_hardstorage.scenario.v1
+name: L3-restore-to-lsn-unreachable
+tier: L3
+description: |
+  take_backup → `restore --to-lsn 0/1` (below stop_lsn) must
+  refuse with exit 7 + restore.target_unreachable in preview AND
+  non-preview modes.  Pins the issue #99 gate against a real PG
+  cluster end-to-end.
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  # 1. Anchor backup — produces a real manifest with a real
+  #    stop_lsn we'll then try to target.
+  - take_backup:
+      deployment: l3-pitr-unreach
+
+  # 2. Negative preview: --to-lsn 0/1 is way below any plausible
+  #    stop_lsn.  Pre-#99-fix this would have exited 0 and
+  #    printed a body indistinguishable from the no-flag case.
+  #    Post-fix: ExitConflict (7), code restore.target_unreachable.
+  - cli_run:
+      args:
+        - "restore"
+        - "$DEPLOYMENT"
+        - "$LAST_BACKUP"
+        - "--repo"
+        - "$REPO"
+        - "--target"
+        - "$ARTEFACT_DIR/restore-unreach-preview"
+        - "--to-lsn"
+        - "0/1"
+        - "--preview"
+        - "-o"
+        - "json"
+      expect_exit: 7
+      timeout: 60s
+
+  # 3. Same posture for the non-preview path.  An operator who
+  #    skipped preview must still hit the same gate.  We give a
+  #    separate target so step 2 + 3 don't conflict on filesystem
+  #    state.
+  - cli_run:
+      args:
+        - "restore"
+        - "$DEPLOYMENT"
+        - "$LAST_BACKUP"
+        - "--repo"
+        - "$REPO"
+        - "--target"
+        - "$ARTEFACT_DIR/restore-unreach-real"
+        - "--to-lsn"
+        - "0/1"
+        - "-o"
+        - "json"
+      expect_exit: 7
+      timeout: 60s
+
+  # 4. Happy path: --to-lsn equal to (or past) stop_lsn with the
+  #    DEFAULT inclusive=true must NOT refuse.  Without this case
+  #    the negative tests above could pass trivially by always
+  #    refusing.  We pick a LSN safely past any plausible stop
+  #    (FFFF/FFFFFFFF — segment 65535's max offset, past any
+  #    real backup) so this isn't sensitive to the exact stop_lsn
+  #    the backup produced.  --preview only reads, no datadir
+  #    written.
+  - cli_run:
+      args:
+        - "restore"
+        - "$DEPLOYMENT"
+        - "$LAST_BACKUP"
+        - "--repo"
+        - "$REPO"
+        - "--target"
+        - "$ARTEFACT_DIR/restore-reachable-preview"
+        - "--to-lsn"
+        - "FFFF/FFFFFFFF"
+        - "--preview"
+        - "-o"
+        - "json"
+      expect_exit: 0
+      timeout: 60s
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

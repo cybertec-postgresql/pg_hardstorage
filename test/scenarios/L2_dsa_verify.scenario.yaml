@@ -1,0 +1,84 @@
+# L2_dsa_verify.scenario.yaml
+#
+# Tier L2 — DSA cross-cover scenario.  2nd touch for the
+# dsa family (locate / show / verify).
+#
+# Leaves covered (gate scope — 2nd touch):
+#   * dsa locate (2nd)
+#   * dsa show (2nd, negative)
+#   * dsa verify (2nd, negative)
+#
+# Wall-clock budget: ~10s.
+
+schema: pg_hardstorage.scenario.v1
+name: L2-dsa-verify
+tier: L2
+description: |
+  Run two locates across different deployment scopes →
+  show/verify negatives on different synthetic IDs.
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  - take_backup:
+      deployment: l2-dsa-verify
+
+  # 1. locate scoped to one deployment.
+  - cli_run:
+      args:
+        - "dsa"
+        - "locate"
+        - "--repo"
+        - "$REPO"
+        - "--subject-id"
+        - "scenario-cross-cover-subject"
+        - "--tenant"
+        - "tenant-b"
+        - "--deployment"
+        - "$DEPLOYMENT"
+        - "--article"
+        - "art_17_erasure"
+        - "--note"
+        - "scenario cross-cover: scoped"
+        - "--skip-sign"
+      expect_exit: 0
+
+  # 2. locate across all deployments.
+  - cli_run:
+      args:
+        - "dsa"
+        - "locate"
+        - "--repo"
+        - "$REPO"
+        - "--subject-id"
+        - "scenario-cross-cover-subject-2"
+        - "--tenant"
+        - "tenant-c"
+        - "--article"
+        - "other"
+        - "--skip-sign"
+      expect_exit: 0
+
+  - cli_run:
+      args:
+        - "dsa"
+        - "show"
+        - "00000000-cross-cover-no-such-id"
+        - "--repo"
+        - "$REPO"
+      expect_exit: 6
+
+  - cli_run:
+      args:
+        - "dsa"
+        - "verify"
+        - "00000000-cross-cover-no-such-id"
+        - "--repo"
+        - "$REPO"
+      expect_exit: 6
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

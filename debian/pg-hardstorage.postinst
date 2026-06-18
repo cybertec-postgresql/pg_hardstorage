@@ -1,0 +1,75 @@
+#!/bin/sh
+# postinst for pg-hardstorage.
+#
+# Creates the pgbackup system user (idempotent), seeds the state
+# tree the agent will write to, and refreshes systemd. The unit
+# is NOT started here -- enabling and starting is a deliberate
+# operator decision after the YAML config is in place.
+
+set -e
+
+PG_HS_USER=pgbackup
+PG_HS_GROUP=pgbackup
+PG_HS_HOME=/var/lib/pg_hardstorage
+
+case "$1" in
+    configure)
+        # systemd-sysusers will create the account from the
+        # shipped sysusers.d fragment when it runs, but plenty
+        # of hosts still bake-in adduser. Do both: idempotent
+        # by construction.
+        if ! getent group "$PG_HS_GROUP" >/dev/null 2>&1; then
+            addgroup --system "$PG_HS_GROUP"
+        fi
+        if ! getent passwd "$PG_HS_USER" >/dev/null 2>&1; then
+            adduser --system \
+                    --ingroup "$PG_HS_GROUP" \
+                    --home "$PG_HS_HOME" \
+                    --no-create-home \
+                    --shell /usr/sbin/nologin \
+                    --gecos "pg_hardstorage" \
+                    "$PG_HS_USER"
+        fi
+
+        # State + log + runtime directories. tmpfiles.d will
+        # also create these on every boot; we materialize them
+        # here so the agent can be started immediately after
+        # `dpkg -i` without waiting for systemd-tmpfiles-setup.
+        for d in \
+            /var/lib/pg_hardstorage \
+            /var/lib/pg_hardstorage/inflight \
+            /var/lib/pg_hardstorage/crashes \
+            /var/cache/pg_hardstorage \
+            /var/log/pg_hardstorage \
+            /run/pg_hardstorage \
+            /etc/pg_hardstorage/keyring
+        do
+            if [ ! -d "$d" ]; then
+                mkdir -p "$d"
+            fi
+            chown "$PG_HS_USER:$PG_HS_GROUP" "$d"
+            chmod 0750 "$d"
+        done
+        # The keyring directory must be 0700.
+        chmod 0700 /etc/pg_hardstorage/keyring 2>/dev/null || true
+
+        # Apply tmpfiles + sysusers eagerly so the post-install
+        # state matches what a reboot would produce.
+        if [ -x /bin/systemd-tmpfiles ] || [ -x /usr/bin/systemd-tmpfiles ]; then
+            systemd-tmpfiles --create /usr/lib/tmpfiles.d/pg-hardstorage.conf || true
+        fi
+        if [ -x /bin/systemd-sysusers ] || [ -x /usr/bin/systemd-sysusers ]; then
+            systemd-sysusers /usr/lib/sysusers.d/pg-hardstorage.conf || true
+        fi
+        ;;
+    abort-upgrade|abort-remove|abort-deconfigure)
+        ;;
+    *)
+        echo "postinst called with unknown argument \`$1'" >&2
+        exit 1
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

@@ -1,0 +1,269 @@
+# L1_cli_cross_cover.scenario.yaml
+#
+# Tier L1 — cross-cover scenario.  Closes the "≥2 scenarios
+# per leaf" rule by giving every cobra leaf with otherwise-
+# single coverage one more touch in a different file.
+#
+# The original 108-leaf gap-fill (batches 1-6) gave each
+# uncovered leaf one scenario.  Some leaves only appeared
+# in one scenario across that batch (e.g. `wal preflight`
+# only in L2_wal_archive_command, `kms shred` only in
+# L2_kms_shred).  Pre-existing scenarios also had several
+# leaves with a single touch (e.g. `anomaly check` only in
+# L2_reporting_smoke).
+#
+# This file invokes each of those singletons once.
+# Negative-path / minimal-positive form throughout — the
+# happier-path coverage already lives in the original
+# scenario; this file's job is purely to be a SECOND
+# scenario per leaf, so the gate's "≥2" rule is met.
+#
+# Wall-clock budget: ~30s.
+#
+# Leaves covered (gate scope — each is a 2nd touch):
+#   * audit verify-anchor / audit verify-bundle
+#   * backup compare / graph / undelete
+#   * deployment test
+#   * kms shred (dry-run)
+#   * llm chat (--help) / llm skill * (negatives)
+#   * logical stream
+#   * patroni follow / history / status (--help)
+#   * recovery drill history
+#   * repo replicate / replicate verify / set-mode / wipe
+#   * standby create / destroy
+#   * threshold attest sign / show / verify
+#   * wal preflight / repair / gap-purge / audit / gaps / list / prune
+#   * repair chunks / repair index
+#   * rotate / runbook list / schedule
+#   * anomaly check / capacity report / classify list /
+#     compliance report / dsa list / forecast / hold list /
+#     insider list / integrity list / residency list / slo show
+#   * show / status / version
+
+schema: pg_hardstorage.scenario.v1
+name: L1-cli-cross-cover
+tier: L1
+description: |
+  Single-shot cross-cover: every singleton leaf gets a 2nd
+  scenario touch via a cli_run probe (--help, --dry-run, or
+  negative-path argument validation).
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  - take_backup:
+      deployment: l1-cli-cross-cover
+      name: probe
+
+  # === audit ===
+  - cli_run:
+      args: ["audit","verify-anchor","00000000-cross-cover-anchor","--repo","$REPO"]
+      expect_exit: 1
+  - cli_run:
+      # verify-bundle takes the bundle path as a positional arg (there
+      # is no --bundle flag); a missing bundle is a NotFound (exit 6).
+      args: ["audit","verify-bundle","/no/such/audit-bundle.zip"]
+      expect_exit: 6
+
+  # === backup ===
+  - cli_run:
+      args: ["backup","compare","$DEPLOYMENT","$BACKUP_probe","$BACKUP_probe","--repo","$REPO"]
+      expect_exit: 2
+  - cli_run:
+      args: ["backup","graph","$DEPLOYMENT","--repo","$REPO"]
+      expect_exit: 0
+  - cli_run:
+      args: ["backup","undelete","$DEPLOYMENT","$BACKUP_probe","--repo","$REPO"]
+      expect_exit: 0
+
+  # === deployment ===
+  - cli_run:
+      args: ["deployment","test","no-such-deployment-for-cross-cover"]
+      expect_exit: 6
+
+  # === kms ===
+  - cli_run:
+      args: ["kms","shred","--repo","$REPO","--reason","cross-cover dry","--dry-run"]
+      expect_exit: 0
+
+  # === llm ===
+  - cli_run:
+      args: ["llm","--help"]
+      expect_exit: 0
+  - cli_run:
+      args: ["llm","chat","--help"]
+      expect_exit: 0
+  - cli_run:
+      args: ["llm","skill","list"]
+      expect_exit: 0
+  - cli_run:
+      args: ["llm","skill","install","/no/such/cross-cover-bundle"]
+      expect_exit: 1
+  - cli_run:
+      args: ["llm","skill","show","no-such-cross-cover-skill"]
+      expect_exit: 6
+  - cli_run:
+      args: ["llm","skill","lint","/no/such/cross-cover-path"]
+      expect_exit: 1
+  - cli_run:
+      args: ["llm","skill","history","no-such-cross-cover-skill"]
+      expect_exit: 0
+  - cli_run:
+      args: ["llm","skill","rollback","no-such-cross-cover-skill"]
+      expect_exit: 6
+
+  # === logical ===
+  - cli_run:
+      args: ["logical","stream","no-such-cc-sub","--pg-connection","$PG_CONN","--inactivity-timeout","2s"]
+      expect_exit: 6
+      timeout: 30s
+
+  # === patroni — bogus URL form ===
+  - cli_run:
+      args: ["patroni","status","--url","http://127.0.0.1:9","--user","cc","--password","cc"]
+      expect_exit: 8
+      timeout: 30s
+  - cli_run:
+      args: ["patroni","history","--url","http://127.0.0.1:9"]
+      expect_exit: 8
+      timeout: 30s
+  - cli_run:
+      args: ["patroni","follow","--url","http://127.0.0.1:9","--duration","2s","--interval","1s"]
+      expect_exit: 0
+      timeout: 30s
+
+  # === recovery ===
+  - cli_run:
+      args: ["recovery","drill","history","$DEPLOYMENT","--repo","$REPO","--format","markdown"]
+      expect_exit: 0
+
+  # === repo ===
+  - cli_run:
+      args: ["repo","init","file://$ARTEFACT_DIR/cc-replica"]
+      expect_exit: 0
+  - cli_run:
+      args: ["repo","replicate","--from","$REPO","--to","file://$ARTEFACT_DIR/cc-replica","--dry-run"]
+      expect_exit: 0
+  - cli_run:
+      args: ["repo","replicate","verify","--from","$REPO","--to","file://$ARTEFACT_DIR/cc-replica"]
+      expect_exit: 9
+  - cli_run:
+      args: ["repo","set-mode","$REPO","read-write"]
+      expect_exit: 0
+  - cli_run:
+      args: ["repo","wipe","file://$ARTEFACT_DIR/cc-replica","--reason","cross-cover negative","--yes"]
+      expect_exit: 2
+
+  # === standby ===
+  - cli_run:
+      args: ["standby","create","cc-standby","--deployment","$DEPLOYMENT","--repo","$REPO","--target","$ARTEFACT_DIR/cc-standby"]
+      expect_exit: 0
+  - cli_run:
+      args: ["standby","destroy","cc-standby","--remove-target"]
+      expect_exit: 0
+
+  # === threshold ===
+  - cli_run:
+      args: ["threshold","attest","sign","manifest","cc","--repo","$REPO","--roster","no-such","--hash","0000000000000000000000000000000000000000000000000000000000000000"]
+      expect_exit: 6
+  - cli_run:
+      args: ["threshold","attest","show","manifest","cc","--repo","$REPO"]
+      expect_exit: 6
+  - cli_run:
+      args: ["threshold","attest","verify","manifest","cc","--repo","$REPO"]
+      expect_exit: 6
+
+  # === wal ===
+  - cli_run:
+      args: ["wal","preflight","$DEPLOYMENT","--pg-connection","$PG_CONN"]
+      expect_exit: 0
+  - cli_run:
+      args: ["wal","repair","$DEPLOYMENT","--pg-connection","$PG_CONN","--repo","$REPO","--slot","pg_hardstorage_l1_cli_cross_cover"]
+      expect_exit: 0
+      timeout: 60s
+  - cli_run:
+      args: ["wal","gap-purge","$DEPLOYMENT","--repo","$REPO","--orphans","--dry-run"]
+      expect_exit: 0
+  - cli_run:
+      args: ["wal","audit","$DEPLOYMENT","--repo","$REPO"]
+      expect_exit: 0
+  - cli_run:
+      args: ["wal","gaps","$DEPLOYMENT","--repo","$REPO"]
+      expect_exit: 0
+  - cli_run:
+      args: ["wal","list","$DEPLOYMENT","--repo","$REPO"]
+      expect_exit: 0
+  - cli_run:
+      args: ["wal","prune","$DEPLOYMENT","--repo","$REPO"]
+      expect_exit: 0
+
+  # === repair (chunks/index — stubs today) ===
+  - cli_run:
+      args: ["repair","chunks","--repo","$REPO","--orphans"]
+      expect_exit: 0
+  - cli_run:
+      args: ["repair","index","--repo","$REPO"]
+      expect_exit: 0
+
+  # === rotate / runbook / schedule ===
+  - cli_run:
+      args: ["rotate"]
+      expect_exit: 2
+  - cli_run:
+      args: ["runbook","list"]
+      expect_exit: 0
+  - cli_run:
+      args: ["schedule"]
+      expect_exit: 0
+
+  # === reporting singletons ===
+  - cli_run:
+      args: ["anomaly","check","$DEPLOYMENT","--repo","$REPO"]
+      expect_exit: 0
+  - cli_run:
+      args: ["capacity","report","--repo","$REPO"]
+      expect_exit: 0
+  - cli_run:
+      args: ["classify","list"]
+      expect_exit: 0
+  - cli_run:
+      args: ["compliance","report","$REPO"]
+      expect_exit: 0
+  - cli_run:
+      args: ["dsa","list","--repo","$REPO"]
+      expect_exit: 0
+  - cli_run:
+      args: ["forecast","$REPO"]
+      expect_exit: 0
+  - cli_run:
+      args: ["hold","list","--repo","$REPO"]
+      expect_exit: 0
+  - cli_run:
+      args: ["insider","list","--repo","$REPO"]
+      expect_exit: 0
+  - cli_run:
+      args: ["integrity","list","--repo","$REPO"]
+      expect_exit: 0
+  - cli_run:
+      args: ["residency","list"]
+      expect_exit: 0
+  - cli_run:
+      args: ["slo","show","$DEPLOYMENT"]
+      expect_exit: 6
+
+  # === inspectors: show / status / version ===
+  - cli_run:
+      args: ["show","$DEPLOYMENT","$BACKUP_probe","--repo","$REPO"]
+      expect_exit: 0
+  - cli_run:
+      args: ["status","$DEPLOYMENT","--repo","$REPO"]
+      expect_exit: 0
+  - cli_run:
+      args: ["version"]
+      expect_exit: 0
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

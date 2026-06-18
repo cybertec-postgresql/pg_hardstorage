@@ -1,0 +1,124 @@
+.nh
+.TH "PG_HARDSTORAGE" "1" "May 2026" "pg_hardstorage Manual" "pg_hardstorage Manual"
+
+.SH NAME
+.PP
+pg_hardstorage-repo-wipe - Permanently delete every object in the repo (n-of-m approval, or --force for non-WORM repos)
+
+
+.SH SYNOPSIS
+.PP
+\fBpg_hardstorage repo wipe  [flags]\fP
+
+
+.SH DESCRIPTION
+.PP
+Permanently delete every object in the named repository — every
+backup, every audit event, every approval, every chunk, plus the
+HSREPO marker. After this completes, the URL is back to whatever
+state the storage backend has for an empty location.
+
+.PP
+Two ways to authorise the wipe:
+
+.PP
+• n-of-m approval (--require-approval ): the approval's Op
+    must be \fBrepo.wipe\fR and its Target must be the repo URL.
+    This is the strict, cross-org-coordinated path and the ONLY
+    path accepted for a WORM/compliance repo.
+
+.PP
+• --force: a single-operator escape hatch for ORDINARY (non-WORM)
+    repos — no approval required. Refused on WORM/compliance repos,
+    where the n-of-m gate is mandatory by design.
+
+.PP
+\fB--yes\fR is required either way — typed confirmation that the op
+is irreversible is the always-on second gate.
+
+.PP
+Audit emission lands BEFORE the wipe runs (a record of intent),
+because the wipe also clears the audit chain that would have held
+the post-wipe entry. The CLI's Result body is the operator-side
+witness once the audit chain is gone.
+
+
+.SH OPTIONS
+.PP
+\fB--force\fP[=false]
+	skip the n-of-m approval on an ordinary (non-WORM) repo; still requires --yes
+
+.PP
+\fB-h\fP, \fB--help\fP[=false]
+	help for wipe
+
+.PP
+\fB--reason\fP=""
+	free-form reason captured in the audit chain pre-wipe
+
+.PP
+\fB--repo\fP=""
+	repository URL — must already exist (positional  is also accepted)
+
+.PP
+\fB--require-approval\fP=""
+	approval request ID for the strict n-of-m gate (mandatory for WORM/compliance repos)
+
+.PP
+\fB--yes\fP[=false]
+	acknowledge that this op is irreversible (always required)
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+.PP
+\fB--airgapped\fP[=false]
+	refuse outbound endpoints (LLM providers, sinks, OTLP collectors) outside loopback / RFC1918 / explicit airgap.allowlist. Also enabled by PG_HARDSTORAGE_AIRGAPPED=1 or \fBairgapped: strict\fR in the config file.
+
+.PP
+\fB-c\fP, \fB--config\fP=""
+	path to config file (default: XDG/FHS lookup)
+
+.PP
+\fB--cpu-profile\fP=""
+	write a pprof CPU profile to this path for the duration of the command (\fBgo tool pprof <path>\fR to analyse). Off when empty.
+
+.PP
+\fB--mem-profile\fP=""
+	write a pprof heap profile to this path at command exit. Off when empty.
+
+.PP
+\fB--no-color\fP[=false]
+	disable ANSI color in text output
+
+.PP
+\fB--on-error-llm\fP[=false]
+	on a structured-error failure, drop into the matching LLM helper skill (auto_on_error trigger). Also enabled by PG_HARDSTORAGE_ON_ERROR_LLM=1.
+
+.PP
+\fB--otel-endpoint\fP=""
+	OpenTelemetry OTLP/HTTP endpoint (e.g. http://otel-collector:4318); empty disables tracing
+
+.PP
+\fB--otel-stdout\fP[=false]
+	also export OpenTelemetry traces to stderr (useful for dev)
+
+.PP
+\fB-o\fP, \fB--output\fP=""
+	output format: text|json|ndjson|yaml|template|csv|markdown|html|tap|junit|pdf (default: text on TTY, json off-TTY)
+
+.PP
+\fB--profile-port\fP=0
+	if non-zero, expose net/http/pprof on 127.0.0.1: for live profiling of long-running commands (e.g. \fBgo tool pprof http://127.0.0.1:6060/debug/pprof/profile?seconds=30\fR). Off when zero.
+
+.PP
+\fB-q\fP, \fB--quiet\fP[=false]
+	suppress non-essential output
+
+.PP
+\fB--template\fP=""
+	Go text/template applied when --output template (or implied if --template is set without --output)
+
+
+.SH SEE ALSO
+.PP
+\fBpg_hardstorage-repo(1)\fP

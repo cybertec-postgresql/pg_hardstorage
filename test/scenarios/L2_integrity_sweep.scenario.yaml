@@ -1,0 +1,84 @@
+# L2_integrity_sweep.scenario.yaml
+#
+# Tier L2 — repo integrity sweep: `integrity run | show |
+# verify`.  Periodic chunk-content sampling that an
+# operator runs to catch silent storage corruption.
+#
+# Headline property: an operator runs an integrity sweep
+# against the repo, the run is recorded with an ID, and
+# the run can be retrieved + verified by ID.
+#
+# Leaves covered (gate scope):
+#   * integrity run
+#   * integrity show
+#   * integrity verify
+#
+# Wall-clock budget: ~15s.
+
+schema: pg_hardstorage.scenario.v1
+name: L2-integrity-sweep
+tier: L2
+description: |
+  take_backup → integrity run (signed) → run (skip-sign)
+  → show / verify synthetic-id negatives.
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  - take_backup:
+      deployment: l2-integrity-sweep
+
+  # 1. Run signed sweep across all deployments.
+  - cli_run:
+      args:
+        - "integrity"
+        - "run"
+        - "--repo"
+        - "$REPO"
+        - "--note"
+        - "scenario probe: integrity sweep"
+      expect_exit: 0
+      timeout: 60s
+
+  # 2. Run scoped to deployment + sample percent.
+  - cli_run:
+      args:
+        - "integrity"
+        - "run"
+        - "--repo"
+        - "$REPO"
+        - "--deployment"
+        - "$DEPLOYMENT"
+        - "--percent"
+        - "100"
+        - "--skip-sign"
+        - "--note"
+        - "scenario probe: percent-scoped"
+      expect_exit: 0
+      timeout: 60s
+
+  # 3. Negative show.
+  - cli_run:
+      args:
+        - "integrity"
+        - "show"
+        - "00000000-no-such-integrity-run"
+        - "--repo"
+        - "$REPO"
+      expect_exit: 6
+
+  # 4. Negative verify.
+  - cli_run:
+      args:
+        - "integrity"
+        - "verify"
+        - "00000000-no-such-integrity-run"
+        - "--repo"
+        - "$REPO"
+      expect_exit: 6
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

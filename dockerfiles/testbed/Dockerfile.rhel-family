@@ -1,0 +1,128 @@
+# Dockerfile.rhel-family — RHEL / Rocky / Alma / Fedora /
+# Amazon Linux testbed image.
+#
+# Args mirror the debian-family Dockerfile so the testkit's
+# image-build driver can dispatch to either by family.
+
+ARG OS_IMAGE=rockylinux:9
+FROM ${OS_IMAGE}
+
+ARG PG_VERSION=17
+ARG PACKAGES=pgdg-yum
+
+# Base utilities every cell uses: process supervisor, network
+# tools, fault-injection helpers, build essentials.
+#
+# `--allowerasing` because modern Rocky / Alma / UBI 9 base
+# images ship with `curl-minimal` pre-installed, and our
+# explicit `curl` request triggers a file-conflict
+#
+#   package curl-minimal-X conflicts with curl provided by
+#   curl-X from baseos
+#
+# (introduced when Red Hat split curl into minimal/full in
+# RHEL 9.4-ish).  --allowerasing tells dnf to swap
+# curl-minimal for the full curl package.  Harmless on Fedora
+# / Amazon Linux / older RHEL where no conflict exists.
+RUN dnf -y install --allowerasing \
+        ca-certificates curl gnupg2 \
+        systemd \
+        iproute iptables \
+        sudo glibc-langpack-en \
+        procps-ng \
+        which \
+ && dnf clean all
+
+# libfaketime is needed by the libfaketime fault primitive.
+# Only Fedora ships it in its main repo; Rocky / Alma / RHEL
+# (UBI) / Amazon Linux 2023 require EPEL 9.  Try the main
+# repo first; on miss, pull the EPEL bootstrap RPM and
+# retry.  --nogpgcheck on the bootstrap RPM avoids plumbing
+# the EPEL signing key into every image variant for a
+# pinned-URL upstream package; the subsequent libfaketime
+# install uses signed metadata.  Fail-loud on the second
+# attempt so a soak that depends on libfaketime can't run
+# on an image where it silently went missing.
+RUN set -e; \
+    if ! dnf -y install libfaketime; then \
+        dnf -y install --nogpgcheck \
+            https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm; \
+        dnf -y install libfaketime; \
+    fi; \
+    dnf clean all
+
+# PG install path.  pgdg-yum for upstream-supported distros,
+# distro repo for Fedora.
+#
+# `dnf module disable postgresql` is defensive on Rocky / Alma /
+# full RHEL — the AppStream postgresql module would otherwise
+# shadow the PGDG package set.  On UBI 9 (which we use as the
+# rhel:9 stand-in because the real RHEL image is subscription-
+# gated) the module simply doesn't exist:
+#   Error: missing groups or modules: postgresql
+# `|| true` swallows that — a missing module is the success
+# state for our purposes.  A real PGDG conflict, if it ever
+# arose, would still fail at the install step below.
+#
+# `repo_gpgcheck=0` AND `gpgcheck=0` on the freshly-installed
+# pgdg-*.repo files: this is a testbed image, NEVER shipped to
+# operators.  Two PGDG signing-drift modes bite us, both noisy
+# during fresh-image builds:
+#
+#  1. `repo_gpgcheck`: pgdg-common's repomd.xml.asc is at times
+#     signed with a key that hasn't yet propagated into
+#     /etc/pki/rpm-gpg/PGDG-RPM-GPG-KEY-RHEL, and dnf aborts at
+#     makecache with "repomd.xml GPG signature verification
+#     error" — original fix for issue #13.
+#  2. `gpgcheck` (per-package): on arm64 the postgresql17-*.
+#     aarch64.rpm files report "Import of key(s) didn't help,
+#     wrong key(s)?" even after the bundled
+#     PGDG-RPM-GPG-KEY-RHEL imports successfully — issue #14.
+#     PGDG ships aarch64 packages signed with a different
+#     fingerprint than the x86_64 key that the
+#     `pgdg-redhat-repo-latest` package installs, and the
+#     correct aarch64 key isn't reliably present in the bundled
+#     keyring directory.
+#
+# Disabling both gpgcheck modes is testbed-scoped: these images
+# are throwaway test infrastructure rebuilt from this Dockerfile
+# every time the testkit's image-build driver runs, no operator
+# trust chain depends on them.  The end-user packaging surface
+# (run_pkg_build_testing.sh + dockerfiles/pkg-build/...) is
+# unaffected — it still verifies signatures end-to-end.
+RUN if [ "$PACKAGES" = "pgdg-yum" ]; then \
+        rpm -Uvh https://download.postgresql.org/pub/repos/yum/reporpms/EL-9-x86_64/pgdg-redhat-repo-latest.noarch.rpm && \
+        sed -i -e 's/^repo_gpgcheck *=.*/repo_gpgcheck=0/' \
+               -e 's/^gpgcheck *=.*/gpgcheck=0/' \
+               /etc/yum.repos.d/pgdg-*.repo && \
+        ( dnf -qy module disable postgresql || true ) && \
+        dnf -y install "postgresql${PG_VERSION}-server" "postgresql${PG_VERSION}-contrib"; \
+    else \
+        dnf -y install postgresql-server postgresql-contrib; \
+    fi \
+ && dnf clean all
+
+# Agent binary + entrypoint, baked in at build time.  Build
+# context is the repo root (matches Dockerfile.debian-family).
+COPY bin/pg_hardstorage /usr/local/bin/pg_hardstorage
+RUN chmod 755 /usr/local/bin/pg_hardstorage \
+ && /usr/local/bin/pg_hardstorage version || true
+
+# Create pgbackup (see Dockerfile.debian-family for rationale —
+# the host CLI refuses euid 0 so the testbed must mirror
+# production posture).  RHEL family uses /sbin/nologin (not
+# /usr/sbin/nologin).  The uid/gid is pinned to 2000 so the
+# shared file:// repo is readable across every OS family.
+RUN groupadd -r -g 2000 pgbackup \
+ && (getent passwd postgres >/dev/null 2>&1 || useradd -r -s /sbin/nologin postgres) \
+ && useradd -r -u 2000 -g pgbackup -G postgres -d /var/lib/pg_hardstorage \
+        -s /sbin/nologin -c "pg_hardstorage agent" pgbackup \
+ && install -d -m 0755 -o root     -g root     /etc/pg_hardstorage \
+ && install -d -m 0750 -o pgbackup -g pgbackup /var/lib/pg_hardstorage \
+ && install -d -m 0700 -o pgbackup -g pgbackup /etc/pg_hardstorage/keyring
+
+COPY dockerfiles/testbed/entrypoint-pg.sh /usr/local/bin/entrypoint-pg.sh
+RUN chmod 755 /usr/local/bin/entrypoint-pg.sh
+
+EXPOSE 5432
+ENTRYPOINT ["/usr/local/bin/entrypoint-pg.sh"]

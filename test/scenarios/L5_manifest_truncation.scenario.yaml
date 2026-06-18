@@ -1,0 +1,35 @@
+# L5_manifest_truncation.scenario.yaml
+#
+# Tier L5: truncate a random manifest at its midpoint.
+# Failure mode this guards: a torn write during manifest
+# fsync leaves the file at non-zero length but parseable
+# only up to the cut.  Read-side must detect the
+# truncation (signature won't verify; length-only checks
+# would silently pass).
+schema: pg_hardstorage.scenario.v1
+name: L5-manifest-truncation
+tier: L5
+description: |
+  Truncate a random manifest at half its length, assert
+  scrub reports a verify.* error.
+topology:
+  provider: local-docker
+  pg_version: "17"
+steps:
+  - seed:
+      target_gb: 1
+  - take_backup:
+      deployment: l5-manifest-trunc
+  # Truncating a manifest leaves a parse-time error: scrub's
+  # collect-references walk hits "unexpected end of JSON input"
+  # well before any chunk-content verification.  That's the
+  # operator-visible refusal we pin here.  Bit-flipping a
+  # manifest mid-body parses cleanly and is NOT caught by
+  # scrub today (real product gap; tracked separately).
+  - corrupt_repo_object:
+      repo_target: manifest_random
+      mutation: truncate
+      expect_error_prefix: repo.scrub.collect_refs_failed
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

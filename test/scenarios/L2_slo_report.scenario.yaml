@@ -1,0 +1,128 @@
+# L2_slo_report.scenario.yaml
+#
+# Tier L2 — SLO cross-cover.  2nd touch for slo set /
+# report / clear with different RPO/RTO inputs and the
+# fleet-wide report path.
+#
+# Leaves covered (gate scope — 2nd touch):
+#   * slo set (2nd)
+#   * slo report (2nd, fleet-wide form)
+#   * slo clear (2nd)
+#
+# Wall-clock budget: ~10s.
+
+schema: pg_hardstorage.scenario.v1
+name: L2-slo-report
+tier: L2
+description: |
+  Register two deployments → set differing SLO targets →
+  fleet-wide report → per-deployment report → clear both.
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  - cli_run:
+      args:
+        - "deployment"
+        - "add"
+        - "l2-slo-a"
+        - "--repo"
+        - "$REPO"
+        - "--connection"
+        - "$PG_CONN"
+        - "--skip-probe"
+        - "--yes"
+      expect_exit: 0
+
+  - cli_run:
+      args:
+        - "deployment"
+        - "add"
+        - "l2-slo-b"
+        - "--repo"
+        - "$REPO"
+        - "--connection"
+        - "$PG_CONN"
+        - "--skip-probe"
+        - "--yes"
+      expect_exit: 0
+
+  - cli_run:
+      args:
+        - "slo"
+        - "set"
+        - "l2-slo-a"
+        - "--rpo"
+        - "30m"
+      expect_exit: 0
+
+  - cli_run:
+      args:
+        - "slo"
+        - "set"
+        - "l2-slo-b"
+        - "--rto"
+        - "5m"
+      expect_exit: 0
+
+  # Fleet-wide report (no positional).
+  - cli_run:
+      args:
+        - "slo"
+        - "report"
+      expect_exit: 0
+
+  # Per-deployment reports.
+  - cli_run:
+      args:
+        - "slo"
+        - "report"
+        - "l2-slo-a"
+        - "--repo"
+        - "$REPO"
+      expect_exit: 0
+
+  - cli_run:
+      args:
+        - "slo"
+        - "report"
+        - "l2-slo-b"
+        - "--repo"
+        - "$REPO"
+      expect_exit: 0
+
+  - cli_run:
+      args:
+        - "slo"
+        - "clear"
+        - "l2-slo-a"
+      expect_exit: 0
+
+  - cli_run:
+      args:
+        - "slo"
+        - "clear"
+        - "l2-slo-b"
+      expect_exit: 0
+
+  - cli_run:
+      args:
+        - "deployment"
+        - "remove"
+        - "l2-slo-a"
+        - "--yes"
+      expect_exit: 0
+
+  - cli_run:
+      args:
+        - "deployment"
+        - "remove"
+        - "l2-slo-b"
+        - "--yes"
+      expect_exit: 0
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

@@ -1,0 +1,109 @@
+.nh
+.TH "PG_HARDSTORAGE" "1" "May 2026" "pg_hardstorage Manual" "pg_hardstorage Manual"
+
+.SH NAME
+.PP
+pg_hardstorage-approval-request - Create a new n-of-m approval request
+
+
+.SH SYNOPSIS
+.PP
+\fBpg_hardstorage approval request [flags]\fP
+
+
+.SH DESCRIPTION
+.PP
+Create a new n-of-m approval request
+
+
+.SH OPTIONS
+.PP
+\fB--approver-key\fP=[]
+	path to an approver's ed25519 public-key PEM (repeatable; need at least --threshold)
+
+.PP
+\fB-h\fP, \fB--help\fP[=false]
+	help for request
+
+.PP
+\fB--op\fP=""
+	namespaced op being approved (e.g. backup.delete, kms.shred) (required)
+
+.PP
+\fB--reason\fP=""
+	free-form reason for the destructive op
+
+.PP
+\fB--repo\fP=""
+	repository URL (required)
+
+.PP
+\fB--target\fP=""
+	target identifier (e.g. a backup ID)
+
+.PP
+\fB--tenant\fP=""
+	tenant scope
+
+.PP
+\fB--threshold\fP=2
+	number of distinct approvals required (≥ 1)
+
+.PP
+\fB--ttl\fP=24h0m0s
+	how long this request stays approvable
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+.PP
+\fB--airgapped\fP[=false]
+	refuse outbound endpoints (LLM providers, sinks, OTLP collectors) outside loopback / RFC1918 / explicit airgap.allowlist. Also enabled by PG_HARDSTORAGE_AIRGAPPED=1 or \fBairgapped: strict\fR in the config file.
+
+.PP
+\fB-c\fP, \fB--config\fP=""
+	path to config file (default: XDG/FHS lookup)
+
+.PP
+\fB--cpu-profile\fP=""
+	write a pprof CPU profile to this path for the duration of the command (\fBgo tool pprof <path>\fR to analyse). Off when empty.
+
+.PP
+\fB--mem-profile\fP=""
+	write a pprof heap profile to this path at command exit. Off when empty.
+
+.PP
+\fB--no-color\fP[=false]
+	disable ANSI color in text output
+
+.PP
+\fB--on-error-llm\fP[=false]
+	on a structured-error failure, drop into the matching LLM helper skill (auto_on_error trigger). Also enabled by PG_HARDSTORAGE_ON_ERROR_LLM=1.
+
+.PP
+\fB--otel-endpoint\fP=""
+	OpenTelemetry OTLP/HTTP endpoint (e.g. http://otel-collector:4318); empty disables tracing
+
+.PP
+\fB--otel-stdout\fP[=false]
+	also export OpenTelemetry traces to stderr (useful for dev)
+
+.PP
+\fB-o\fP, \fB--output\fP=""
+	output format: text|json|ndjson|yaml|template|csv|markdown|html|tap|junit|pdf (default: text on TTY, json off-TTY)
+
+.PP
+\fB--profile-port\fP=0
+	if non-zero, expose net/http/pprof on 127.0.0.1: for live profiling of long-running commands (e.g. \fBgo tool pprof http://127.0.0.1:6060/debug/pprof/profile?seconds=30\fR). Off when zero.
+
+.PP
+\fB-q\fP, \fB--quiet\fP[=false]
+	suppress non-essential output
+
+.PP
+\fB--template\fP=""
+	Go text/template applied when --output template (or implied if --template is set without --output)
+
+
+.SH SEE ALSO
+.PP
+\fBpg_hardstorage-approval(1)\fP

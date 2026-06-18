@@ -1,0 +1,2 @@
+bin/pg-hardstorage-barman usr/bin/
+bin/pg-hardstorage-barman-wal-archive usr/bin/

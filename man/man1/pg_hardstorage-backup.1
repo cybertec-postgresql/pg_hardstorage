@@ -1,0 +1,180 @@
+.nh
+.TH "PG_HARDSTORAGE" "1" "May 2026" "pg_hardstorage Manual" "pg_hardstorage Manual"
+
+.SH NAME
+.PP
+pg_hardstorage-backup - Take a backup of a deployment
+
+
+.SH SYNOPSIS
+.PP
+\fBpg_hardstorage backup  [flags]\fP
+
+
+.SH DESCRIPTION
+.PP
+Run a full base backup of a PostgreSQL deployment.
+
+.PP
+The signing keypair is loaded (or generated on first run) from the
+resolved keyring directory; see \fBpg_hardstorage doctor\fR for the path.
+
+.PP
+Encryption is chosen automatically: if a KEK file (kek.bin) exists
+in the keyring directory, every chunk is AES-256-GCM-encrypted and
+the wrapped DEK lands in the manifest. Pass --no-encrypt to force
+an unencrypted backup even when a KEK is present (escape hatch for
+operators with mixed posture); pass --encrypt to require encryption
+and error when no KEK is found.
+
+.PP
+The repository must already exist — create it with \fBpg_hardstorage repo init\fR\&.
+
+
+.SH OPTIONS
+.PP
+\fB--allow-concurrent\fP[=false]
+	skip the per-deployment backup lease and allow a second backup of the same deployment to run concurrently (doubles load on the source)
+
+.PP
+\fB--capacity-safety-factor\fP=1.1
+	safety multiplier for the capacity pre-flight (default 1.1 = 110% of projected); ignored under --ignore-capacity
+
+.PP
+\fB--control-plane\fP=""
+	control-plane base URL — when set, the command is dispatched there instead of running locally
+
+.PP
+\fB--control-plane-ca\fP=""
+	PEM file pinning the control plane's TLS server certificate
+
+.PP
+\fB--control-plane-client-cert\fP=""
+	client certificate for mTLS to the control plane
+
+.PP
+\fB--control-plane-client-key\fP=""
+	client key for mTLS to the control plane
+
+.PP
+\fB--control-plane-poll-secs\fP=1
+	poll cadence (seconds) for /v1/jobs/
+
+.PP
+\fB--control-plane-token-file\fP=""
+	file containing the bearer token for the control plane
+
+.PP
+\fB--encrypt\fP[=false]
+	require encryption (errors if no KEK file is present)
+
+.PP
+\fB--fast\fP[=false]
+	force an immediate CHECKPOINT (faster start, brief I/O burst)
+
+.PP
+\fB-h\fP, \fB--help\fP[=false]
+	help for backup
+
+.PP
+\fB--ignore-capacity\fP[=false]
+	skip the capacity pre-flight (refuse-on-low-free-space gate); use only when the projection is misleading
+
+.PP
+\fB--include-wal\fP[=false]
+	embed every WAL segment needed for recovery into the basebackup tar stream (equivalent to pg_basebackup -X stream).  Default off — production deployments use \fBwal stream\fR for continuous archiving.  Set this for self-contained correctness scenarios where no separate WAL archiver is running.
+
+.PP
+\fB--incremental-from\fP=""
+	take a PG 17+ incremental backup against this parent backup ID; requires summarize_wal=on on the source DB
+
+.PP
+\fB--kek\fP=""
+	KEK reference (default: local:default if a kek.bin is present). Cloud-KMS schemes: aws-kms://\&. The runner opens the matching kms.Provider and asks it to wrap the per-backup DEK; the manifest stamps the KEKRef so restore can pick the right unwrap path.
+
+.PP
+\fB--kms-config\fP=[]
+	per-call config for the cloud-KMS provider (e.g. region=us-east-1,use_fips_endpoint=true). Only consulted when --kek is a cloud scheme.
+
+.PP
+\fB--label\fP=""
+	backup label for backup_label (default: derived from backup ID)
+
+.PP
+\fB--no-encrypt\fP[=false]
+	force unencrypted backup even when a KEK file is present
+
+.PP
+\fB--pg-connection\fP=""
+	libpq connection string for the source PostgreSQL (required)
+
+.PP
+\fB--repo\fP=""
+	repository URL (file://, s3://, ...) — must already exist (required)
+
+.PP
+\fB--stall-timeout\fP=0s
+	abort with backup.io_starved if no progress event for this long (0 = disabled; soak drivers pin 5m)
+
+.PP
+\fB--tenant\fP="default"
+	tenant scope for the backup
+
+.PP
+\fB-v\fP, \fB--verbose\fP[=false]
+	emit one line per regular file as it commits to the CAS — file path, logical size, chunk count, deduped chunks, and bytes the CAS actually had to store after dedup.  Useful for live progress on large backups; suppressed under --output json (JSON consumers see file events as backup.file_archived structured events instead).
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+.PP
+\fB--airgapped\fP[=false]
+	refuse outbound endpoints (LLM providers, sinks, OTLP collectors) outside loopback / RFC1918 / explicit airgap.allowlist. Also enabled by PG_HARDSTORAGE_AIRGAPPED=1 or \fBairgapped: strict\fR in the config file.
+
+.PP
+\fB-c\fP, \fB--config\fP=""
+	path to config file (default: XDG/FHS lookup)
+
+.PP
+\fB--cpu-profile\fP=""
+	write a pprof CPU profile to this path for the duration of the command (\fBgo tool pprof <path>\fR to analyse). Off when empty.
+
+.PP
+\fB--mem-profile\fP=""
+	write a pprof heap profile to this path at command exit. Off when empty.
+
+.PP
+\fB--no-color\fP[=false]
+	disable ANSI color in text output
+
+.PP
+\fB--on-error-llm\fP[=false]
+	on a structured-error failure, drop into the matching LLM helper skill (auto_on_error trigger). Also enabled by PG_HARDSTORAGE_ON_ERROR_LLM=1.
+
+.PP
+\fB--otel-endpoint\fP=""
+	OpenTelemetry OTLP/HTTP endpoint (e.g. http://otel-collector:4318); empty disables tracing
+
+.PP
+\fB--otel-stdout\fP[=false]
+	also export OpenTelemetry traces to stderr (useful for dev)
+
+.PP
+\fB-o\fP, \fB--output\fP=""
+	output format: text|json|ndjson|yaml|template|csv|markdown|html|tap|junit|pdf (default: text on TTY, json off-TTY)
+
+.PP
+\fB--profile-port\fP=0
+	if non-zero, expose net/http/pprof on 127.0.0.1: for live profiling of long-running commands (e.g. \fBgo tool pprof http://127.0.0.1:6060/debug/pprof/profile?seconds=30\fR). Off when zero.
+
+.PP
+\fB-q\fP, \fB--quiet\fP[=false]
+	suppress non-essential output
+
+.PP
+\fB--template\fP=""
+	Go text/template applied when --output template (or implied if --template is set without --output)
+
+
+.SH SEE ALSO
+.PP
+\fBpg_hardstorage(1)\fP, \fBpg_hardstorage-backup-compare(1)\fP, \fBpg_hardstorage-backup-delete(1)\fP, \fBpg_hardstorage-backup-graph(1)\fP, \fBpg_hardstorage-backup-undelete(1)\fP

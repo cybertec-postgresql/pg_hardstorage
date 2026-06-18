@@ -1,0 +1,154 @@
+.nh
+.TH "PG_HARDSTORAGE" "1" "May 2026" "pg_hardstorage Manual" "pg_hardstorage Manual"
+
+.SH NAME
+.PP
+pg_hardstorage-wal-push - Archive one segment via archive_command (PG-invoked)
+
+
+.SH SYNOPSIS
+.PP
+\fBpg_hardstorage wal push   [flags]\fP
+
+
+.SH DESCRIPTION
+.PP
+Push one PostgreSQL WAL segment file into the repository.
+
+.PP
+PG invokes this command from archive_command during normal operation:
+
+.PP
+archive_command = 'pg_hardstorage wal push db1 %p --repo \&'
+
+.PP
+The %p substitution is a path on the PG host; we read the file, chunk
+it through the CAS, and commit a segment manifest atomically. Re-pushes
+of an already-committed segment are no-ops.
+
+.PP
+system_identifier — stamped on every segment manifest so cross-cluster
+repo contamination is detectable — is derived in this order:
+
+.RS
+.IP "  1." 5
+--system-identifier  if supplied (zero-cost path).
+ This is the unsigned-decimal value pg_control_system() reports
+ (SELECT system_identifier FROM pg_control_system()) — the SAME
+ form rule 2 derives from the segment header. Passing it in any
+ other base would mismatch header-derived pushes and trip a
+ spurious splitbrain.system_identifier_mismatch.
+.IP "  2." 5
+Otherwise read directly from the segment file's first-page
+ XLogLongPageHeader.xlp_sysid — every WAL segment PG writes
+ carries it.  No libpq round-trip per call.
+.IP "  3." 5
+Otherwise --pg-connection  if supplied (legacy path).
+
+.RE
+
+.PP
+The default canonical archive_command shape — repo only, no extra
+flags — works because of (2).
+
+.PP
+Transparent Data Encryption (TDE):
+
+.PP
+Pass --tde when the source PostgreSQL has TDE enabled (CYBERTEC
+  PGEE, pg_tde, EDB TDE).  Under TDE the segment file on disk is
+  ciphertext, so the on-segment header read (precedence rule 2
+  above) is meaningless — it would either fail outright OR return
+  bogus bytes that happen to look header-shaped.  --tde skips
+  rule 2 unconditionally; you MUST supply --system-identifier or
+  --pg-connection.
+
+.PP
+Exit codes:
+  0  - segment archived (or already present)
+  >0 - error; PG will retry per archive_timeout
+
+
+.SH OPTIONS
+.PP
+\fB-h\fP, \fB--help\fP[=false]
+	help for push
+
+.PP
+\fB--kek\fP=""
+	KEK reference for WAL encryption under a cloud KMS (e.g. aws-kms://...); MUST match the deployment's base-backup KEKRef. Local-KEK encryption is automatic when a keyring kek.bin is present.
+
+.PP
+\fB--kms-config\fP=[]
+	cloud KMS provider config (region/endpoint/credentials); only consulted when --kek is a cloud scheme — the same values base backups use.
+
+.PP
+\fB--pg-connection\fP=""
+	libpq connection string — used once to fetch the system_identifier
+
+.PP
+\fB--repo\fP=""
+	repository URL (file://, s3://, ...) — must already exist (required)
+
+.PP
+\fB--system-identifier\fP=""
+	explicit pg_control system_identifier (skip libpq round-trip)
+
+.PP
+\fB--tde\fP[=false]
+	the source PG has Transparent Data Encryption enabled; skip on-segment header parsing (requires --system-identifier or --pg-connection). See docs/explanation/tde-awareness.md.
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+.PP
+\fB--airgapped\fP[=false]
+	refuse outbound endpoints (LLM providers, sinks, OTLP collectors) outside loopback / RFC1918 / explicit airgap.allowlist. Also enabled by PG_HARDSTORAGE_AIRGAPPED=1 or \fBairgapped: strict\fR in the config file.
+
+.PP
+\fB-c\fP, \fB--config\fP=""
+	path to config file (default: XDG/FHS lookup)
+
+.PP
+\fB--cpu-profile\fP=""
+	write a pprof CPU profile to this path for the duration of the command (\fBgo tool pprof <path>\fR to analyse). Off when empty.
+
+.PP
+\fB--mem-profile\fP=""
+	write a pprof heap profile to this path at command exit. Off when empty.
+
+.PP
+\fB--no-color\fP[=false]
+	disable ANSI color in text output
+
+.PP
+\fB--on-error-llm\fP[=false]
+	on a structured-error failure, drop into the matching LLM helper skill (auto_on_error trigger). Also enabled by PG_HARDSTORAGE_ON_ERROR_LLM=1.
+
+.PP
+\fB--otel-endpoint\fP=""
+	OpenTelemetry OTLP/HTTP endpoint (e.g. http://otel-collector:4318); empty disables tracing
+
+.PP
+\fB--otel-stdout\fP[=false]
+	also export OpenTelemetry traces to stderr (useful for dev)
+
+.PP
+\fB-o\fP, \fB--output\fP=""
+	output format: text|json|ndjson|yaml|template|csv|markdown|html|tap|junit|pdf (default: text on TTY, json off-TTY)
+
+.PP
+\fB--profile-port\fP=0
+	if non-zero, expose net/http/pprof on 127.0.0.1: for live profiling of long-running commands (e.g. \fBgo tool pprof http://127.0.0.1:6060/debug/pprof/profile?seconds=30\fR). Off when zero.
+
+.PP
+\fB-q\fP, \fB--quiet\fP[=false]
+	suppress non-essential output
+
+.PP
+\fB--template\fP=""
+	Go text/template applied when --output template (or implied if --template is set without --output)
+
+
+.SH SEE ALSO
+.PP
+\fBpg_hardstorage-wal(1)\fP

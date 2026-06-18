@@ -1,0 +1,10 @@
+pg-hardstorage (0.1.1-1) unstable; urgency=medium
+
+  * Initial Debian packaging for the v0.1.1 cheap-closure release.
+  * Three binary packages: pg-hardstorage (agent + CLI),
+    pg-hardstorage-common (shared data), pg-hardstorage-server
+    (stub for the v0.5 control plane).
+  * Ships systemd units, sysusers / tmpfiles fragments, bash
+    completion, and manpages.
+
+ -- Hans-Jürgen Schönig <hs@cybertec.at>  Wed, 29 Apr 2026 12:00:00 +0000

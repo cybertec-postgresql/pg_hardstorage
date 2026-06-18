@@ -1,0 +1,131 @@
+# L3_wal_stream_pg_restart.scenario.yaml
+#
+# PG bounces while the streamer is connected.  The
+# streamer must reconnect through the slot and resume
+# without WAL loss.
+#
+# Why this matters: a PG primary restart is the most
+# common operational fault a long-running streamer will
+# see — minor-version upgrades, OS patching, OOM kills,
+# crash recovery.  An operator's expectation is that the
+# streamer reconnects automatically and PITR continues
+# to work across the restart boundary.  A regression
+# here would force a manual streamer restart on every
+# PG bounce, which is exactly the operator burden this
+# tool is designed to remove.
+#
+# What gets exercised end-to-end:
+#
+#   * `inject: { kind: pg_kill, target: pg, signal: 9 }`
+#     sends SIGKILL — immediate-shutdown / OOM-kill.
+#     Container exits; runInject `docker start`s it (docker
+#     treats `docker kill` as user-stop so --restart=always
+#     doesn't kick in) and polls pg_isready against the
+#     topology's live DSN until PG accepts connections.
+#     Crash recovery from the basebackup's IncludeWAL pass
+#     finishes before the heal_window expires.  Streamer's
+#     auto-reconnect handles the bounce transparently —
+#     that's what this scenario validates.
+#   * The streamer must notice the broken connection,
+#     reconnect, and resume from its slot's restart_lsn.
+#     Whatever WAL PG wrote during the down/recovering
+#     window must land in the repo by the time we hit
+#     `take_backup`.
+#   * Subsequent `take_backup` runs against the
+#     re-started PG and produces a fresh manifest.  PITR
+#     replays the streamed WAL from BOTH the pre-bounce
+#     window and the post-bounce window.
+#
+# Pass criterion: byte-equal checksum match.  A streamer
+# that failed to reconnect would leave a hole spanning
+# the bounce; PITR can't cross it.
+#
+# Wall-clock budget: ~3-4 minutes.
+schema: pg_hardstorage.scenario.v1
+name: L3-wal-stream-pg-restart
+tier: L3
+description: |
+  PG bounce mid-stream.  Streamer must reconnect through
+  the slot and ship WAL written during the recovering
+  window.  Pass criterion: PITR byte-equal match across
+  the bounce.
+topology:
+  provider: local-docker
+  pg_version: "17"
+load:
+  file: test/load/failover_loop.load.yaml
+steps:
+  - wal_stream:
+      action: start
+  - seed:
+      target_gb: 1
+
+  # Workload before the bounce — exercises the streamer
+  # under steady-state.
+  - run_load:
+      duration: 10s
+
+  # SIGTERM PG.  Container restart policy brings it back
+  # automatically; heal_window=20s is enough for PG to
+  # finish crash recovery and accept connections again
+  # against a 1 GB cluster on warm Docker.
+  - inject:
+      kind: pg_kill
+      target: pg
+      # SIGKILL (sig=9) — immediate-shutdown / OOM-kill
+      # equivalent.  Why not SIGINT (fast-shutdown) here?
+      # The wal_stream sidecar maintains a walsender
+      # connection AND auto-reconnects when its conn breaks.
+      # Fast-shutdown waits for all backends including
+      # walsenders to exit, but the streamer's reconnect
+      # cadence keeps spawning fresh walsenders before PG
+      # finishes draining — empirically PG stayed in
+      # SQLSTATE 57P03 ("shutting down") for >60s with no
+      # signs of progress.  SIGKILL skips drain entirely:
+      # PG dies, container exits, runInject's docker-start
+      # brings it back into crash recovery (matching the
+      # scenario header's "OOM kill / crash recovery"
+      # narrative).  The streamer then reconnects through
+      # the slot's restart_lsn — exactly what this scenario
+      # is designed to test.
+      signal: 9
+      # heal_window is the max-budget for pg_isready, not a
+      # fixed sleep.  Crash recovery from a 1 GB pgbench
+      # cluster runs <10s on a quiet host; 30s gives 3×
+      # margin.
+      heal_window: 30s
+
+  # Post-bounce workload.  Drives WAL after PG comes back.
+  # The streamer's reconnect-and-resume happens
+  # transparently in the background; if it didn't
+  # reconnect, this WAL never lands in the repo and the
+  # final byte-equal match fails.
+  - run_load:
+      duration: 15s
+
+  - take_backup:
+      deployment: l3-wal-stream-pg-restart
+
+  - run_load:
+      duration: 10s
+
+  - capture_lsn:
+      name: post_pg_restart
+      checksum_query: |
+        select
+          count(*)::text || '|' ||
+          coalesce(sum(abalance)::text, '0') || '|' ||
+          coalesce(sum(hashtextextended(t::text, 0))::text, '0')
+        from pgbench_accounts t
+  - switch_wal: {}
+  - wal_stream:
+      action: stop
+  - restore:
+      deployment: l3-wal-stream-pg-restart
+      name: post_pg_restart
+  - assert_restored_match:
+      name: post_pg_restart
+      strict: true
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

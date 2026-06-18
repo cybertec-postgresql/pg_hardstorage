@@ -1,0 +1,97 @@
+# L3_wal_stream_restart.scenario.yaml
+#
+# Slot-resume regression gate.  Stops the streamer cleanly,
+# generates WAL on the live cluster while the streamer is
+# absent, then starts the streamer again and proves recovery
+# through the captured LSN succeeds.
+#
+# Why this matters: the headline value of `pg_hardstorage wal
+# stream` over `archive_command` is that PG retains every WAL
+# segment until the slot ACKs.  An operator who restarts the
+# streamer (systemd reload, host reboot, agent upgrade) MUST
+# get gap-free coverage on resume.  A regression here would
+# silently drop WAL after a restart and only surface as a
+# failed PITR weeks later.
+#
+# What gets exercised end-to-end:
+#
+#   * Two `wal_stream: { action: start }` calls separated by a
+#     `wal_stream: { action: stop }`.  The runner shells out to
+#     `pg_hardstorage wal stream` twice; the second invocation
+#     resolves its start LSN from the existing slot's
+#     restart_lsn rather than from "current cluster head".
+#   * `run_load` between stop and re-start drives WAL with no
+#     streamer active.  PG must retain every byte (slot pinned
+#     restart_lsn).  When the streamer comes back, those bytes
+#     must land in the repo.
+#   * `take_backup` runs after re-start, so backup-end-LSN
+#     sits in WAL the second streamer instance shipped.
+#   * Final restore + byte-equal assert_restored_match.
+#
+# Pass criterion: byte-equal checksum match.  Any WAL gap
+# across the stop/start window would corrupt the restored
+# state and fail the assert.
+#
+# Wall-clock budget: ~3 minutes.
+schema: pg_hardstorage.scenario.v1
+name: L3-wal-stream-restart
+tier: L3
+description: |
+  Streamer stop → generate WAL with no streamer → streamer
+  start → backup → PITR.  Proves slot-based resume covers
+  the no-streamer window with no gaps.
+topology:
+  provider: local-docker
+  pg_version: "17"
+load:
+  file: test/load/failover_loop.load.yaml
+steps:
+  - wal_stream:
+      action: start
+  - seed:
+      target_gb: 1
+
+  # Graceful stop — the streamer commits whatever segment it
+  # was on and releases the connection.  PG keeps the slot.
+  - wal_stream:
+      action: stop
+
+  # WAL generated here has NO streamer to receive it.  PG's
+  # slot retention is what makes this safe; if the slot were
+  # absent, PG would recycle these segments before the
+  # streamer comes back.
+  - run_load:
+      duration: 10s
+  - switch_wal: {}
+
+  # Re-start.  The agent re-opens the slot and resumes from
+  # restart_lsn — every byte generated above must now flow
+  # into the repo.
+  - wal_stream:
+      action: start
+
+  - take_backup:
+      deployment: l3-wal-stream-restart
+
+  - run_load:
+      duration: 10s
+  - capture_lsn:
+      name: post_restart
+      checksum_query: |
+        select
+          count(*)::text || '|' ||
+          coalesce(sum(abalance)::text, '0') || '|' ||
+          coalesce(sum(hashtextextended(t::text, 0))::text, '0')
+        from pgbench_accounts t
+  - switch_wal: {}
+  - wal_stream:
+      action: stop
+  - restore:
+      deployment: l3-wal-stream-restart
+      name: post_restart
+  - assert_restored_match:
+      name: post_restart
+      strict: true
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

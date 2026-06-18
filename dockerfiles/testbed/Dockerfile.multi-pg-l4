@@ -1,0 +1,64 @@
+# Dockerfile.multi-pg-l4 — single-purpose testbed for the L4
+# pg_upgrade cross-major scenario.
+#
+# Why we can't just use postgres:16 from Docker Hub:
+#   - The official postgres image runs `postgres` as PID 1.
+#   - The L4 pg_upgrade scenario runs `pg_ctl stop` on the
+#     source cluster as part of the upgrade sequence.  Stopping
+#     PID 1 terminates the container; the in-progress
+#     `docker exec pg_upgrade` gets SIGKILL'd at that point.
+#
+# This image fixes that by:
+#   1. Installing both PG 16 and PG 17 from the PGDG apt repo
+#      (Debian's postgresql-NN packages are designed to coexist
+#      under /usr/lib/postgresql/<NN>/bin).
+#   2. Replacing the official entrypoint with a wrapper that
+#      starts PG 16 in the BACKGROUND, waits for it to accept
+#      connections, then `exec sleep infinity` so PID 1 is the
+#      `sleep` and stays alive across `pg_ctl stop`.
+#
+# The image is intentionally narrow-scope — used by exactly one
+# scenario (test/scenarios/L4_pg_upgrade_cross_major.scenario.yaml)
+# and built by the scenario runner via the topology image override.
+# When the testbed-image catalog grows a "multi-major" tuple,
+# delete this file in favour of the catalog entry.
+
+FROM debian:12
+
+# Install PG 16 + PG 17 side-by-side from PGDG.  The PGDG repo
+# ships postgresql-N for every supported major; both land
+# under /usr/lib/postgresql/<N>/bin.  No service is started by
+# the apt postinst because we override the entrypoint below.
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        ca-certificates curl gnupg lsb-release \
+        postgresql-common \
+        sudo locales \
+ && install -d /usr/share/postgresql-common/pgdg \
+ && curl -sSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+        https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+ && echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+        > /etc/apt/sources.list.d/pgdg.list \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends \
+        postgresql-16 postgresql-contrib-16 \
+        postgresql-17 postgresql-contrib-17 \
+ && rm -rf /var/lib/apt/lists/*
+
+# Match the official postgres image's user / data dir layout so
+# scenarios that bind-mount or expect /var/lib/postgresql/data
+# semantics behave identically.  postgresql-common ALREADY
+# creates the postgres user (uid 109 on Debian 12) and the
+# /var/lib/postgresql tree.
+ENV PGDATA=/var/lib/postgresql/data
+ENV PATH=/usr/lib/postgresql/16/bin:${PATH}
+
+# The wait-strategy testcontainers-go uses (BasicWaitStrategies)
+# probes 5432.  Expose it.
+EXPOSE 5432
+
+COPY dockerfiles/testbed/entrypoint-multi-pg.sh /usr/local/bin/entrypoint-multi-pg.sh
+RUN chmod 0755 /usr/local/bin/entrypoint-multi-pg.sh
+
+ENTRYPOINT ["/usr/local/bin/entrypoint-multi-pg.sh"]

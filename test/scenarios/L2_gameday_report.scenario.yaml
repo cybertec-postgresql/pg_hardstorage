@@ -1,0 +1,79 @@
+# L2_gameday_report.scenario.yaml
+#
+# Tier L2 — gameday cross-cover.  2nd touch for gameday
+# run + report, exercising the filter flags.
+#
+# Leaves covered (gate scope — 2nd touch):
+#   * gameday run (2nd, with --fault-duration / --recover-within)
+#   * gameday report (2nd, --since / --limit)
+#
+# Wall-clock budget: ~10s.
+
+schema: pg_hardstorage.scenario.v1
+name: L2-gameday-report
+tier: L2
+description: |
+  gameday run --dry-run with explicit timing flags →
+  gameday report with --since / --limit filters.
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  - take_backup:
+      deployment: l2-gameday-report
+
+  # 1. gameday run --dry-run with explicit timing flags.
+  - cli_run:
+      args:
+        - "gameday"
+        - "run"
+        - "agent_kill"
+        - "--repo"
+        - "$REPO"
+        - "--deployment"
+        - "$DEPLOYMENT"
+        - "--dry-run"
+        - "--fault-duration"
+        - "30s"
+        - "--recover-within"
+        - "120s"
+      expect_exit: 0
+
+  # 2. report --since 1h (recent window).
+  - cli_run:
+      args:
+        - "gameday"
+        - "report"
+        - "--repo"
+        - "$REPO"
+        - "--since"
+        - "1h"
+      expect_exit: 0
+
+  # 3. report --since 0 (unbounded).
+  - cli_run:
+      args:
+        - "gameday"
+        - "report"
+        - "--repo"
+        - "$REPO"
+        - "--since"
+        - "0"
+      expect_exit: 0
+
+  # 4. report --limit 10.
+  - cli_run:
+      args:
+        - "gameday"
+        - "report"
+        - "--repo"
+        - "$REPO"
+        - "--limit"
+        - "10"
+      expect_exit: 0
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

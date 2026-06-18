@@ -1,0 +1,94 @@
+# L5_k8s_sidecar_daily_full_6h_incremental_soak.scenario.yaml
+#
+# Tier L5: pg-hardstorage-sidecar Helm chart deployment running
+# alongside a Postgres pod, taking a daily full + every-6-hours
+# incremental.  Soak-mode budget = 24 hours; the scenario runner
+# loops this YAML to satisfy the soak dimension.  The single-shot
+# invariant is identical: daily full + 4 incrementals per day
+# produces a restorable chain; sidecar restart preserves repo
+# state; chunk dedup across full→incr→incr→incr→incr→full keeps
+# repo growth bounded.
+#
+# Why this scenario is K8s-specific:
+#
+#   * The pg-hardstorage-sidecar chart's pod-sharing model
+#     (one PG container + one agent container in the same pod,
+#     same network namespace, talking over the in-pod
+#     loopback) is K8s-native.  A docker-compose proxy doesn't
+#     exercise the kubelet's pod-restart semantics, the
+#     PodDisruptionBudget interaction with backup-in-flight,
+#     or the readinessProbe → backup-trigger handshake.
+#
+#   * The "agent recovers if PG pod restarts" path is exercised
+#     when kubelet kills the PG container (resource pressure,
+#     image update, evicted-by-NodePressure) and the sidecar's
+#     restartPolicy=Always re-spawns it alongside a fresh PG —
+#     this is operationally distinct from the local-docker
+#     SIGKILL+auto-restart that L4_incremental_chain_chaos_pg_kill
+#     already covers.  A regression where the agent didn't notice
+#     the PG container restart (and tried to keep streaming
+#     against a stale FD) would surface here.
+#
+# What this scenario would assert when kind topology lands:
+#
+#   * Helm install of pg-hardstorage-sidecar against a CNPG/Zalando/
+#     bare-PG StatefulSet succeeds.
+#   * Within 5s of the first PG ready-probe pass, an HSBackup CR
+#     for the first full is committed.
+#   * A subsequent HSSchedule with `every: 6h type: incremental`
+#     produces 4 incrementals over 24h.
+#   * pg_verifybackup passes against the 4th incremental's
+#     pg_combinebackup-flattened datadir.
+#
+# The chaos-soak harness (cmd/pg_hardstorage_testkit chaos) runs
+# this scenario in 24h loops to exercise statistically rare
+# timing races (pod-restart mid-backup, PV reconnect mid-fetch).
+# Single-shot in CI hits the deterministic invariants; soak hits
+# the long tail.
+
+schema: pg_hardstorage.scenario.v1
+name: L5-k8s-sidecar-daily-full-6h-incremental-soak
+tier: L5
+description: |
+  pg-hardstorage-sidecar Helm chart: daily full + every-6h
+  incremental against a K8s-managed PG pod; 24h soak budget;
+  leaf restore + pg_verifybackup gate.  Requires the kind
+  topology provider (stub today).
+
+topology:
+  provider: kind
+  cluster_name: testkit-sidecar-soak
+  pg_version: "17"
+  replicas: 1
+  # Sidecar chart shape — implied by the pg-hardstorage-sidecar
+  # helm release name; the kind topology provider's bring-up will
+  # parse this section when it lands.
+
+load:
+  file: test/load/failover_loop.load.yaml
+
+steps:
+  # Refuses at topology.Up because `kind` is a stub.  See
+  # L5_k8s_cronjob_incremental_cnpg.scenario.yaml for the
+  # rationale; the steps below land alongside the kind provider.
+  #
+  # Future steps (sketch):
+  #
+  #   - cli_run:
+  #       args: ["helm", "install", "pg-hardstorage-sidecar",
+  #              "charts/pg-hardstorage-sidecar",
+  #              "--set", "deployment.name=sidecar-soak",
+  #              "--set", "schedule.full=daily",
+  #              "--set", "schedule.incremental=every-6h"]
+  #   - wait_for_resource: { kind: Pod, name: pg-sidecar-soak-0, condition: Ready }
+  #   - wait_for_first_backup: { deployment: sidecar-soak, within: 60s }
+  #   - simulate_time: { advance: 24h }   # libfaketime-style
+  #   - assert_chain_length: { deployment: sidecar-soak, count: 5 } # 1 full + 4 incr
+  #   - restore: { deployment: sidecar-soak, source: latest }
+  #   - assert_restored_match: { name: sidecar-soak-end }
+  - assert:
+      - count_exact: { table: users, value: 1000 }
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:24h"

@@ -1,0 +1,38 @@
+# Dockerfile.spilo-argv-recorder — Zalando Spilo overlay that
+# swaps wal-g for argv-recorder.  Same shape as the CNPG
+# argv-recorder Dockerfile: capture Spilo's actual wal-g
+# invocations as PGHS_ARGV_FIXTURE NDJSON lines on stderr,
+# which kubectl logs picks up.
+#
+# After running this against a real Zalando cluster, extract
+# fixtures with:
+#
+#   kubectl logs <pod> | grep PGHS_ARGV_FIXTURE \
+#       > test/fixtures/operator-argv/zalando/argv-fixtures.ndjson
+
+ARG SPILO_PG_VERSION=17
+
+# ---------- Stage 1: build the recorder binary ------------------
+FROM golang:1.26-alpine AS builder
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY dockerfiles/k8s/argv-recorder/ ./dockerfiles/k8s/argv-recorder/
+RUN CGO_ENABLED=0 go build \
+        -trimpath -ldflags '-s -w' \
+        -o /out/argv-recorder ./dockerfiles/k8s/argv-recorder
+
+# ---------- Stage 2: Spilo overlay ------------------------------
+FROM ghcr.io/zalando/spilo-${SPILO_PG_VERSION}:4.0-p1
+ARG SPILO_PG_VERSION
+
+# Spilo runs as root by default; no USER swap needed.
+# Move wal-g aside; drop the recorder in.
+RUN if [ -f /usr/local/bin/wal-g ]; then \
+        mv /usr/local/bin/wal-g /usr/local/bin/wal-g.real; \
+    fi
+
+COPY --from=builder --chmod=0755 /out/argv-recorder /usr/local/bin/wal-g
+
+LABEL pg_hardstorage.compat_shim="spilo-argv-recorder" \
+      pg_hardstorage.upstream_image="ghcr.io/zalando/spilo-${SPILO_PG_VERSION}:4.0-p1"

@@ -1,0 +1,35 @@
+# L2-restore-to-point-in-time.llm-test.yaml
+#
+# Operator wants to restore to a specific point in time.
+
+schema: pg_hardstorage.llm-test.v1
+name: L2-restore-to-point-in-time
+tier: L2
+description: |
+  Operator wants to restore to a specific point in time.
+
+mode: ask
+turns:
+  - 'I need to restore my database to exactly 2:30 UTC yesterday.  walk me through the command.'
+
+rubric:
+  hard:
+    must_contain_any:
+      - 'restore'
+      - '--to'
+      - 'lsn'
+      - 'time'
+      - 'target'
+    # Tightened: forbid only dangerous unbounded forms.  `rm -rf
+    # "$TARGET"` in a cleanup context (post-restore tear-down) is
+    # legitimate ops and surfaced naturally by the model.
+    must_not_contain:
+      - 'rm -rf /'
+      - 'rm -rf $HOME'
+      - 'rm -rf $PGDATA'
+  soft:
+      - 'Does the response correctly use `pg_hardstorage restore <dep> <backup-id|latest> --target <dir>` shape?'
+      - 'Does the response mention PITR target flags (--to / --to-lsn / --to-time)?'
+      - 'Does the response warn about needing the WAL chain from start_lsn to target?'
+
+temperature: 0.2

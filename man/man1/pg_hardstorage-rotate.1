@@ -1,0 +1,143 @@
+.nh
+.TH "PG_HARDSTORAGE" "1" "May 2026" "pg_hardstorage Manual" "pg_hardstorage Manual"
+
+.SH NAME
+.PP
+pg_hardstorage-rotate - Apply retention policy to a deployment (or all)
+
+
+.SH SYNOPSIS
+.PP
+\fBpg_hardstorage rotate [] [flags]\fP
+
+
+.SH DESCRIPTION
+.PP
+Classify each backup as kept or to-be-soft-deleted per the chosen
+retention policy, then optionally apply the decision.
+
+.PP
+Three policies ship today:
+
+.PP
+gfs (default): grandfather-father-son.
+    --keep-daily 7      keep one backup per UTC calendar day, last 7
+    --keep-weekly 4     keep one backup per ISO calendar week, last 4
+    --keep-monthly 12   keep one backup per UTC calendar month, last 12
+    --keep-yearly 5     keep one backup per UTC calendar year, last 5
+
+.PP
+simple:
+    --keep-for 30d      keep every backup younger than this duration
+
+.PP
+count:
+    --keep-fulls 14     keep the most recent N full backups
+
+.PP
+The newest backup is ALWAYS kept regardless of policy output —
+operators must never end up with zero backups because of a misset
+flag. This is hardcoded; --keep-* lower bounds don't override it.
+
+.PP
+Default mode is --dry-run; pass --apply to actually mark manifests.
+Soft-deleted manifests get a tombstone marker beside them; the
+manifest body and its chunks are NOT removed in this slice (the
+chunk-GC pass that reaps unreferenced bytes lands).
+
+
+.SH OPTIONS
+.PP
+\fB--apply\fP[=false]
+	actually soft-delete (default: dry-run)
+
+.PP
+\fB-h\fP, \fB--help\fP[=false]
+	help for rotate
+
+.PP
+\fB--keep-daily\fP=7
+	GFS: backups kept per UTC day
+
+.PP
+\fB--keep-for\fP=720h0m0s
+	simple: keep every backup younger than this
+
+.PP
+\fB--keep-fulls\fP=14
+	count: keep the N most recent fulls
+
+.PP
+\fB--keep-monthly\fP=12
+	GFS: backups kept per UTC month
+
+.PP
+\fB--keep-weekly\fP=4
+	GFS: backups kept per ISO week
+
+.PP
+\fB--keep-yearly\fP=5
+	GFS: backups kept per UTC year
+
+.PP
+\fB--policy\fP="gfs"
+	retention policy: gfs|simple|count
+
+.PP
+\fB--repo\fP=""
+	repository URL (file://, s3://, ...) — must already exist (required)
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+.PP
+\fB--airgapped\fP[=false]
+	refuse outbound endpoints (LLM providers, sinks, OTLP collectors) outside loopback / RFC1918 / explicit airgap.allowlist. Also enabled by PG_HARDSTORAGE_AIRGAPPED=1 or \fBairgapped: strict\fR in the config file.
+
+.PP
+\fB-c\fP, \fB--config\fP=""
+	path to config file (default: XDG/FHS lookup)
+
+.PP
+\fB--cpu-profile\fP=""
+	write a pprof CPU profile to this path for the duration of the command (\fBgo tool pprof <path>\fR to analyse). Off when empty.
+
+.PP
+\fB--mem-profile\fP=""
+	write a pprof heap profile to this path at command exit. Off when empty.
+
+.PP
+\fB--no-color\fP[=false]
+	disable ANSI color in text output
+
+.PP
+\fB--on-error-llm\fP[=false]
+	on a structured-error failure, drop into the matching LLM helper skill (auto_on_error trigger). Also enabled by PG_HARDSTORAGE_ON_ERROR_LLM=1.
+
+.PP
+\fB--otel-endpoint\fP=""
+	OpenTelemetry OTLP/HTTP endpoint (e.g. http://otel-collector:4318); empty disables tracing
+
+.PP
+\fB--otel-stdout\fP[=false]
+	also export OpenTelemetry traces to stderr (useful for dev)
+
+.PP
+\fB-o\fP, \fB--output\fP=""
+	output format: text|json|ndjson|yaml|template|csv|markdown|html|tap|junit|pdf (default: text on TTY, json off-TTY)
+
+.PP
+\fB--profile-port\fP=0
+	if non-zero, expose net/http/pprof on 127.0.0.1: for live profiling of long-running commands (e.g. \fBgo tool pprof http://127.0.0.1:6060/debug/pprof/profile?seconds=30\fR). Off when zero.
+
+.PP
+\fB-q\fP, \fB--quiet\fP[=false]
+	suppress non-essential output
+
+.PP
+\fB--template\fP=""
+	Go text/template applied when --output template (or implied if --template is set without --output)
+
+
+.SH SEE ALSO
+.PP
+\fBpg_hardstorage(1)\fP

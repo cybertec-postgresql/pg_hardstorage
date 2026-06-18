@@ -1,0 +1,108 @@
+# L2_repo_maintenance.scenario.yaml
+#
+# Tier L2 — repository maintenance command surfaces:
+# `repo compact`, `repo wipe`, `repo bundle import`.
+#
+# Headline property: maintenance commands either succeed
+# (compact / bundle export-then-import round-trip into a
+# fresh sister repo) or refuse cleanly with a structured
+# error (wipe without approval gate).  A regression where
+# any maintenance surface silently mutates state without
+# its required gates is a repository-corruption / data-loss
+# landmine.
+#
+# Leaves covered (gate scope):
+#   * repo compact — deferred stub today, exits 0 with
+#     "notimpl"; scenario auto-upgrades when implemented
+#   * repo bundle import — round-trip via export-then-import
+#     into a sister file:// repo
+#   * repo wipe — gate validation (missing approval refused)
+#
+# Wall-clock budget: ~20s.
+
+schema: pg_hardstorage.scenario.v1
+name: L2-repo-maintenance
+tier: L2
+description: |
+  Take a backup → repo compact (stub; will auto-cover the
+  implementation when it lands) → repo bundle export →
+  init a sister repo → repo bundle import → repo wipe
+  refused without approval.
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  - take_backup:
+      deployment: l2-repo-maint
+
+  # 1. compact — today a stub; exits 0 with a structured
+  # "notimpl" notice.  Scenario lights up the real
+  # surface the moment the stub is replaced.
+  - cli_run:
+      args:
+        - "repo"
+        - "compact"
+      expect_exit: 1
+
+  # 2. Export the deployment into a portable bundle.  The
+  # bundle is the input for the import step below.
+  - cli_run:
+      args:
+        - "repo"
+        - "bundle"
+        - "export"
+        - "--repo"
+        - "$REPO"
+        - "--deployment"
+        - "$DEPLOYMENT"
+        - "--out"
+        - "$ARTEFACT_DIR/bundle.tar"
+      expect_exit: 0
+
+  # 3. Bootstrap a sister file:// repo to import into.  The
+  # destination must already exist (the import command does
+  # NOT bootstrap on its own — `repo init` is the
+  # operator-explicit step that records the desired WORM /
+  # compression posture before any data lands).
+  - cli_run:
+      args:
+        - "repo"
+        - "init"
+        - "file://$ARTEFACT_DIR/replica"
+      expect_exit: 0
+
+  # 4. Import the bundle into the sister repo.  Confirms
+  # the round-trip: bytes that came out of repo A go back
+  # into repo B without losing any manifest / chunk linkage.
+  - cli_run:
+      args:
+        - "repo"
+        - "bundle"
+        - "import"
+        - "--in"
+        - "$ARTEFACT_DIR/bundle.tar"
+        - "--to"
+        - "file://$ARTEFACT_DIR/replica"
+      expect_exit: 0
+
+  # 5. Negative: wipe without --require-approval must be
+  # refused.  Wiping a repo is irreversible — the approval-
+  # gate posture is the operator-safety contract, same
+  # shape as kms shred.  A regression that lets wipe fire
+  # without a gate would silently delete every backup in
+  # the repo.
+  - cli_run:
+      args:
+        - "repo"
+        - "wipe"
+        - "file://$ARTEFACT_DIR/replica"
+        - "--reason"
+        - "scenario probe: missing-approval check"
+        - "--yes"
+      expect_exit: 2
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

@@ -1,0 +1,150 @@
+.nh
+.TH "PG_HARDSTORAGE" "1" "May 2026" "pg_hardstorage Manual" "pg_hardstorage Manual"
+
+.SH NAME
+.PP
+pg_hardstorage-verify - Verify a backup's signature and chunks (no restore required)
+
+
+.SH SYNOPSIS
+.PP
+\fBpg_hardstorage verify  [latest|] [flags]\fP
+
+
+.SH DESCRIPTION
+.PP
+verify reads the named backup's manifest, validates its
+signature with the local public key, then SHA-256-round-trips every
+referenced chunk via the CAS read path. Encrypted backups are
+decrypted in-process using the local KEK; nothing is restored to
+disk and no WAL is replayed.
+
+.PP
+For the full restore-and-pg_verifybackup verification path, pass
+\fB--full\fR (requires Docker locally) or \fB--control-plane <url>\fR to
+dispatch a sandbox verify to an agent (Docker on the agent host,
+not yours). \fB--control-plane\fR always implies \fB--full\fR semantics —
+fast verify doesn't need network round-trips.
+
+.PP
+For a much faster pre-flight ("are the chunks still here?"
+without the bytes-and-checksums round-trip), pass
+\fB--existence-only\fR\&. This Stats every unique chunk instead of
+fetching it; useful before \fBbackup undelete\fR (to confirm
+chunk-GC hasn't reclaimed the body) or as a 100x-cheaper
+sanity check on cold archives. Mismatch on bytes is NOT
+detected in this mode — only absence.
+
+.PP
+Backup ID:
+  - omitted or "latest" → the most recent (by stop time) backup
+  - ""        → that exact backup
+
+
+.SH OPTIONS
+.PP
+\fB--control-plane\fP=""
+	control-plane base URL — when set, the command is dispatched there instead of running locally
+
+.PP
+\fB--control-plane-ca\fP=""
+	PEM file pinning the control plane's TLS server certificate
+
+.PP
+\fB--control-plane-client-cert\fP=""
+	client certificate for mTLS to the control plane
+
+.PP
+\fB--control-plane-client-key\fP=""
+	client key for mTLS to the control plane
+
+.PP
+\fB--control-plane-poll-secs\fP=1
+	poll cadence (seconds) for /v1/jobs/
+
+.PP
+\fB--control-plane-token-file\fP=""
+	file containing the bearer token for the control plane
+
+.PP
+\fB--existence-only\fP[=false]
+	only check that each chunk EXISTS (Stat) — skip fetch+decrypt+SHA verification (much faster; useful pre-flight before \fBbackup undelete\fR)
+
+.PP
+\fB--full\fP[=false]
+	perform a full restore into a Docker sandbox and run pg_verifybackup against it
+
+.PP
+\fB-h\fP, \fB--help\fP[=false]
+	help for verify
+
+.PP
+\fB--kms-config\fP=[]
+	cloud KMS provider config for verifying a cloud-KMS-encrypted backup (e.g. region=eu-central-1,endpoint=...); empty uses ambient credentials
+
+.PP
+\fB--pg-major\fP=""
+	PG major version for the sandbox image (default: derived from the backup's pg_version)
+
+.PP
+\fB--repo\fP=""
+	repository URL (file://, s3://, ...) — must already exist (required)
+
+.PP
+\fB--sample\fP=0
+	verify only the first N chunks in hash-sorted order (0 = every referenced chunk)
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+.PP
+\fB--airgapped\fP[=false]
+	refuse outbound endpoints (LLM providers, sinks, OTLP collectors) outside loopback / RFC1918 / explicit airgap.allowlist. Also enabled by PG_HARDSTORAGE_AIRGAPPED=1 or \fBairgapped: strict\fR in the config file.
+
+.PP
+\fB-c\fP, \fB--config\fP=""
+	path to config file (default: XDG/FHS lookup)
+
+.PP
+\fB--cpu-profile\fP=""
+	write a pprof CPU profile to this path for the duration of the command (\fBgo tool pprof <path>\fR to analyse). Off when empty.
+
+.PP
+\fB--mem-profile\fP=""
+	write a pprof heap profile to this path at command exit. Off when empty.
+
+.PP
+\fB--no-color\fP[=false]
+	disable ANSI color in text output
+
+.PP
+\fB--on-error-llm\fP[=false]
+	on a structured-error failure, drop into the matching LLM helper skill (auto_on_error trigger). Also enabled by PG_HARDSTORAGE_ON_ERROR_LLM=1.
+
+.PP
+\fB--otel-endpoint\fP=""
+	OpenTelemetry OTLP/HTTP endpoint (e.g. http://otel-collector:4318); empty disables tracing
+
+.PP
+\fB--otel-stdout\fP[=false]
+	also export OpenTelemetry traces to stderr (useful for dev)
+
+.PP
+\fB-o\fP, \fB--output\fP=""
+	output format: text|json|ndjson|yaml|template|csv|markdown|html|tap|junit|pdf (default: text on TTY, json off-TTY)
+
+.PP
+\fB--profile-port\fP=0
+	if non-zero, expose net/http/pprof on 127.0.0.1: for live profiling of long-running commands (e.g. \fBgo tool pprof http://127.0.0.1:6060/debug/pprof/profile?seconds=30\fR). Off when zero.
+
+.PP
+\fB-q\fP, \fB--quiet\fP[=false]
+	suppress non-essential output
+
+.PP
+\fB--template\fP=""
+	Go text/template applied when --output template (or implied if --template is set without --output)
+
+
+.SH SEE ALSO
+.PP
+\fBpg_hardstorage(1)\fP

@@ -1,0 +1,78 @@
+# L8_doctor_smoke_after_chain.scenario.yaml
+#
+# Tier L8 — `pg_hardstorage doctor` is the operator's
+# go-to "is anything obviously broken" command.  It
+# reports:
+#   * Resolved filesystem paths (config dir, keyring,
+#     repo defaults)
+#   * Configuration status (which config file got
+#     loaded, what overrides apply)
+#   * Health checks (keyring readable, signing key
+#     valid, etc.)
+#
+# The command's contract is "exits 0 on a healthy
+# install, non-zero with structured error otherwise."
+# After a non-trivial backup chain, doctor must remain
+# green — a regression that mis-counted backups,
+# mis-read the keyring, or surfaced a phantom warning
+# would break operator confidence in the command.
+#
+# What this catches:
+#   * Path-resolver regressions: doctor reports the
+#     resolved paths it picked.  A refactor that picked
+#     the wrong path under a particular config combo
+#     would surface here (and via the existing
+#     internal/cli/doctor_*_test.go suite at the unit
+#     level — this scenario is the end-to-end
+#     companion).
+#   * Output-format stability: tested with both text
+#     and json output to confirm both renderers wire
+#     correctly through the doctor's structured-data
+#     body.
+#
+# Wall-clock budget: ~3 minutes (1 GB seed + 2 backups +
+# doctor probes).
+schema: pg_hardstorage.scenario.v1
+name: L8-doctor-smoke-after-chain
+tier: L8
+description: |
+  2-backup chain → `doctor` (text) → `doctor` (json) →
+  `doctor <deployment>` (deployment-scoped).  All three
+  must exit 0 with non-empty output.
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  - seed:
+      target_gb: 1
+
+  - take_backup:
+      deployment: l8-doctor
+      name: backup_1
+
+  - take_backup:
+      deployment: l8-doctor
+      name: backup_2
+
+  # Fleet-wide doctor in default (text) output.
+  - cli_run:
+      args: ["doctor"]
+      timeout: 30s
+
+  # Same in JSON for script-friendly consumption.
+  - cli_run:
+      args: ["doctor", "-o", "json"]
+      timeout: 30s
+
+  # Deployment-scoped variant.  The CLI's doctor takes
+  # an optional positional deployment name; when
+  # present, the output narrows to that deployment.
+  - cli_run:
+      args: ["doctor", "$DEPLOYMENT"]
+      timeout: 30s
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

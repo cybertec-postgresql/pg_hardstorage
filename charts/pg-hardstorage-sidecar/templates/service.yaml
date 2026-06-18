@@ -1,0 +1,25 @@
+{{- if .Values.service.enabled -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "pg-hardstorage-sidecar.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "pg-hardstorage-sidecar.labels" . | nindent 4 }}
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  # ClusterIP=None would give per-pod DNS but we only ever run
+  # one replica; a regular ClusterIP keeps Prometheus scrape
+  # config simple.
+  ports:
+    - port: {{ .Values.service.port }}
+      targetPort: metrics
+      protocol: TCP
+      name: metrics
+  selector:
+    {{- include "pg-hardstorage-sidecar.selectorLabels" . | nindent 4 }}
+{{- end }}

@@ -1,0 +1,66 @@
+# pg_hardstorage host agent — templated multi-instance unit.
+#
+# One systemd instance per logical deployment. The instance name
+# %i selects the config under /etc/pg_hardstorage/deployments/
+# and produces an isolated state directory. Use this when several
+# tenants share a host and must not share keyrings, audit logs,
+# or backup runs.
+#
+# Enable with:
+#   systemctl enable --now pg_hardstorage@<deployment>.service
+
+[Unit]
+Description=pg_hardstorage host agent (%i)
+Documentation=https://github.com/cybertec-postgresql/pg_hardstorage
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pgbackup
+Group=pgbackup
+
+# Per-instance config and state. Each instance has its own
+# /var/lib/pg_hardstorage/<deployment> tree so manifests, audit
+# log, and inflight markers never collide.
+Environment=PG_HARDSTORAGE_CONFIG_DIR=/etc/pg_hardstorage
+Environment=PG_HARDSTORAGE_STATE_DIR=/var/lib/pg_hardstorage/%i
+Environment=PG_HARDSTORAGE_LOGS_DIR=/var/log/pg_hardstorage
+Environment=PG_HARDSTORAGE_RUNTIME_DIR=/run/pg_hardstorage
+
+ExecStart=/usr/bin/pg_hardstorage agent
+
+WorkingDirectory=/var/lib/pg_hardstorage/%i
+StateDirectory=pg_hardstorage/%i
+ConfigurationDirectory=pg_hardstorage
+RuntimeDirectory=pg_hardstorage
+LogsDirectory=pg_hardstorage
+
+Restart=always
+RestartSec=5
+TimeoutStopSec=120
+
+SyslogIdentifier=pg_hardstorage@%i
+
+# --- Sandboxing --- (mirror of pg_hardstorage.service)
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged ~@resources
+
+ReadWritePaths=/var/lib/pg_hardstorage /var/log/pg_hardstorage /run/pg_hardstorage
+
+[Install]
+WantedBy=multi-user.target

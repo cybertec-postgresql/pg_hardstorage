@@ -1,0 +1,91 @@
+# L8_repo_flag_vs_positional_equivalence.scenario.yaml
+#
+# Tier L8 — several repo-level commands accept the repo
+# URL either as a positional argument OR via the
+# `--repo` flag (e.g. `repo check <url>` ≡
+# `repo check --repo <url>`).  This is a documented
+# operator convenience, but a regression in either
+# branch of the parser would silently break scripts
+# that prefer one form.
+#
+# Without this gate, a future refactor that "tightened"
+# the CLI to require ONE form (or that made the two
+# forms diverge in behaviour) would silently break
+# operator tooling.
+#
+# What this catches:
+#   * Asymmetric implementation: a buggy command that
+#     accepts `--repo` but not the positional form (or
+#     vice versa) would surface here as one branch
+#     failing.
+#   * Conflicting-sources rejection: when BOTH forms
+#     are passed simultaneously, the CLI must refuse
+#     (otherwise a user could silently pass two
+#     different URLs and not know which one was used).
+#     L1 covers this for `repo check` specifically; we
+#     extend coverage to additional commands here.
+#
+# Wall-clock budget: ~2 minutes (1 GB seed + 1 backup +
+# parallel-form probes).
+schema: pg_hardstorage.scenario.v1
+name: L8-repo-flag-vs-positional-equivalence
+tier: L8
+description: |
+  For each command that accepts both `<url>` positional
+  and `--repo <url>`, both forms must exit 0.  Passing
+  BOTH simultaneously must exit 2 (ExitMisuse).
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  - seed:
+      target_gb: 1
+
+  - take_backup:
+      deployment: l8-flag-positional
+      name: only_backup
+
+  # `repo check` — positional form
+  - cli_run:
+      args: ["repo", "check", "$REPO"]
+      timeout: 30s
+
+  # `repo check` — flag form
+  - cli_run:
+      args: ["repo", "check", "--repo", "$REPO"]
+      timeout: 30s
+
+  # Both forms simultaneously with the SAME URL is
+  # tolerated — the CLI's parser only refuses when the
+  # positional and the flag DISAGREE (see
+  # TestRepoCheck_RejectsConflictingRepoSources for the
+  # canonical contract).  An operator who hand-wrote
+  # `--repo $REPO $REPO` should NOT get a misuse error;
+  # the values agree, so the command proceeds.
+  - cli_run:
+      args: ["repo", "check", "$REPO", "--repo", "$REPO"]
+      timeout: 30s
+
+  # Disagreeing positional + flag values must refuse.
+  # We pass two distinctly different file:// URLs; the
+  # CLI's resolver sees the conflict and exits 2
+  # (ExitMisuse) before even probing either URL.
+  - cli_run:
+      args: ["repo", "check", "file:///nonexistent-positional", "--repo", "file:///nonexistent-flag"]
+      expect_exit: 2
+      timeout: 10s
+
+  # `repo gc` — positional + flag both accepted per --help
+  - cli_run:
+      args: ["repo", "gc", "$REPO"]
+      timeout: 30s
+
+  - cli_run:
+      args: ["repo", "gc", "--repo", "$REPO"]
+      timeout: 30s
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

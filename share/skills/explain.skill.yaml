@@ -1,0 +1,37 @@
+schema: pg_hardstorage.skill.v1
+name: explain
+display_name: Explain Command
+version: 0.1.0
+description: |
+  Given a CLI invocation, produce a plain-English explanation: what
+  the command does, what flags mean, what side effects to expect.
+  Cheap; no tool calls.
+
+trigger:
+  manual:
+    - pg_hardstorage llm explain
+
+permissions:
+  read_only: true
+
+context:
+  available_tools: []
+
+guardrails:
+  - max_token_budget_per_session: 4000
+  - mandatory_disclaimer: "AI assistant — explanations are best-effort; the SPEC is authoritative."
+
+prompt_template: |
+  You are the `explain` skill for pg_hardstorage. The user gives you
+  a CLI invocation (e.g. `pg_hardstorage restore db1 --to "5 minutes
+  ago"`); you explain in plain English:
+
+   1. What the command does end-to-end.
+   2. What each flag means.
+   3. What state mutates (or "this is read-only").
+   4. The exit code surface (0=ok, 1=generic, 2=usage, 3=auth,
+      4=preflight, 5=aborted, 6=notfound, 7=conflict, 8=storage,
+      9=verify, 10=health-issues).
+   5. One sentence about gotchas if any apply.
+
+  Be terse. The reader is a tired DBA at 3am — clarity beats prose.

@@ -1,0 +1,119 @@
+# L2_redact_flow.scenario.yaml
+#
+# Tier L2 — redaction flow: `redact apply | preview` +
+# `classify set`.
+#
+# Headline property: an operator describes redactions in a
+# YAML rules file, previews the plan, and applies it via
+# generated SQL.  --print-sql mode emits the SQL without
+# touching a PG, useful for review + dry-run.
+#
+# Leaves covered (gate scope):
+#   * redact preview
+#   * redact apply
+#   * classify set
+#
+# Wall-clock budget: ~10s.
+
+schema: pg_hardstorage.scenario.v1
+name: L2-redact-flow
+tier: L2
+description: |
+  preview the rules → apply --print-sql → apply --dry-run
+  → classify set on a deployment.
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  # 1. preview — parses + validates the rules, prints the
+  # plan.  No PG needed.
+  - cli_run:
+      args:
+        - "redact"
+        - "preview"
+        - "--rules"
+        - "test/scenarios/fixtures/redact_rules.yaml"
+      expect_exit: 0
+
+  # 2. apply --print-sql — generates the SQL without a PG
+  # connection.  --salt-hex pinned so the same fixture
+  # always produces the same hashes (testability +
+  # reproducibility).
+  - cli_run:
+      args:
+        - "redact"
+        - "apply"
+        - "--rules"
+        - "test/scenarios/fixtures/redact_rules.yaml"
+        - "--print-sql"
+        - "--salt-hex"
+        - "deadbeefcafef00d1234567890abcdef"
+      expect_exit: 0
+
+  # 3. apply --dry-run against a real PG connection: the
+  # plan is validated against the live schema (pgbench
+  # tables exist due to the load below; the public.users
+  # table the fixture references does NOT exist on this
+  # fresh PG, so the dry-run reports a missing-table
+  # validation finding).  --dry-run still exits 0 because
+  # the operator's intent is "show me what would happen,
+  # including problems".  An exit-non-zero here would
+  # mean dry-run can't tolerate planning-stage
+  # validation findings, which is the wrong behaviour.
+  - cli_run:
+      args:
+        - "redact"
+        - "apply"
+        - "--rules"
+        - "test/scenarios/fixtures/redact_rules.yaml"
+        - "--pg-connection"
+        - "$PG_CONN"
+        - "--dry-run"
+      expect_exit: 0
+      timeout: 60s
+
+  # 4. Negative preview: missing rules file.
+  - cli_run:
+      args:
+        - "redact"
+        - "preview"
+        - "--rules"
+        - "/no/such/path/redact_rules.yaml"
+      expect_exit: 1
+
+  # 5. classify set — register a sensitivity level for
+  # the deployment.
+  - cli_run:
+      args:
+        - "deployment"
+        - "add"
+        - "l2-redact-dep"
+        - "--repo"
+        - "$REPO"
+        - "--connection"
+        - "$PG_CONN"
+        - "--skip-probe"
+        - "--yes"
+      expect_exit: 0
+
+  - cli_run:
+      args:
+        - "classify"
+        - "set"
+        - "l2-redact-dep"
+        - "confidential"
+      expect_exit: 0
+
+  - cli_run:
+      args:
+        - "deployment"
+        - "remove"
+        - "l2-redact-dep"
+        - "--yes"
+      expect_exit: 0
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

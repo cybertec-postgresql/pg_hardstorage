@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security report
+    url: https://github.com/cybertec-postgresql/pg_hardstorage/security/advisories
+    about: Report security issues privately via the GitHub Security Advisories.
+  - name: Documentation
+    url: https://github.com/cybertec-postgresql/pg_hardstorage/tree/main/docs
+    about: Operator guide, runbooks, troubleshooting, and the SPEC.

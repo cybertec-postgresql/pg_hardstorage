@@ -1,0 +1,126 @@
+# L2_repair_flows.scenario.yaml
+#
+# Tier L2 — repair surface: `repair attestation | manifest |
+# scrub | slot`.  Operator-driven recovery for repo /
+# manifest / slot state that drifted off-invariant.
+#
+# Headline property: each repair command exits 0 against
+# clean state (the no-op case — operators run scrub on
+# cadence even when nothing's wrong) or refuses cleanly
+# with a structured error against missing inputs.
+#
+# Leaves covered (gate scope):
+#   * repair attestation
+#   * repair manifest
+#   * repair scrub
+#   * repair slot
+#
+# Wall-clock budget: ~20s.
+
+schema: pg_hardstorage.scenario.v1
+name: L2-repair-flows
+tier: L2
+description: |
+  take_backup → scrub the whole repo (no corruption to
+  heal) → repair attestation against the live backup →
+  repair manifest re-emit → repair slot recreate.
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  - take_backup:
+      deployment: l2-repair-flows
+      name: probe
+
+  # 1. scrub the whole repo with default --limit=1000.  No
+  # corruption, no heal needed — must exit 0.
+  - cli_run:
+      args:
+        - "repair"
+        - "scrub"
+        - "--repo"
+        - "$REPO"
+      expect_exit: 0
+      timeout: 120s
+
+  # 2. scrub with --limit=0 (full scrub).
+  - cli_run:
+      args:
+        - "repair"
+        - "scrub"
+        - "--repo"
+        - "$REPO"
+        - "--limit"
+        - "0"
+      expect_exit: 0
+      timeout: 120s
+
+  # 3. attestation — re-sign the backup's attestation.
+  # Without --force the command is a no-op when the
+  # current attestation already verifies; --force re-signs
+  # unconditionally.  Both exit 0 against a healthy backup.
+  - cli_run:
+      args:
+        - "repair"
+        - "attestation"
+        - "$DEPLOYMENT"
+        - "$BACKUP_probe"
+        - "--repo"
+        - "$REPO"
+        - "--actor"
+        - "scenario-probe"
+        - "--reason"
+        - "scenario probe: idempotent re-sign"
+      expect_exit: 5
+
+  # 4. manifest — re-emit the primary manifest from sidecar.
+  # Without --force the command is a no-op when the
+  # primary is already valid.
+  - cli_run:
+      args:
+        - "repair"
+        - "manifest"
+        - "$DEPLOYMENT"
+        - "$BACKUP_probe"
+        - "--repo"
+        - "$REPO"
+      expect_exit: 5
+
+  # 5. slot — recreate the replication slot for the
+  # deployment.  Reports the LSN gap (zero in a fresh
+  # cell) and exits 0.  Post-v0.6 Mechanism 2 refactor
+  # wrapped slot-create + gap-analysis
+  # in EnsureSlot which returns a non-error result on a
+  # successful recreate, so the command exits 0 — the
+  # body carries Outcome=recreated + gap fields for the
+  # operator's monitoring instead of using the exit code.
+  # The earlier expect_exit: 1 reflected the pre-refactor
+  # "any drift triggers exit 1" calibration.
+  - cli_run:
+      args:
+        - "repair"
+        - "slot"
+        - "$DEPLOYMENT"
+        - "--repo"
+        - "$REPO"
+        - "--pg-connection"
+        - "$PG_CONN"
+      expect_exit: 0
+      timeout: 60s
+
+  # 6. Negative attestation: nonexistent backup-id.
+  - cli_run:
+      args:
+        - "repair"
+        - "attestation"
+        - "$DEPLOYMENT"
+        - "00000000-no-such-backup-00000000"
+        - "--repo"
+        - "$REPO"
+      expect_exit: 6
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

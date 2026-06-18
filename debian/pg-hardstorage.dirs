@@ -1,0 +1,9 @@
+var/lib/pg_hardstorage
+var/lib/pg_hardstorage/inflight
+var/lib/pg_hardstorage/crashes
+var/cache/pg_hardstorage
+var/log/pg_hardstorage
+etc/pg_hardstorage
+etc/pg_hardstorage/deployments
+etc/pg_hardstorage/conf.d
+etc/pg_hardstorage/keyring

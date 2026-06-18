@@ -1,0 +1,102 @@
+# L2_slo_lifecycle.scenario.yaml
+#
+# Tier L2 — SLO target lifecycle: `slo set | report | clear`.
+# Operators record RPO (max acceptable backup lag) and RTO
+# (max acceptable restore time) targets per deployment;
+# report compares actual vs target.
+#
+# Leaves covered (gate scope):
+#   * slo set
+#   * slo report
+#   * slo clear
+#
+# Wall-clock budget: ~10s.
+
+schema: pg_hardstorage.scenario.v1
+name: L2-slo-lifecycle
+tier: L2
+description: |
+  Register a deployment → slo set RPO 1h RTO 10m → slo
+  report → slo clear → slo report post-clear.
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  - cli_run:
+      args:
+        - "deployment"
+        - "add"
+        - "l2-slo-dep"
+        - "--repo"
+        - "$REPO"
+        - "--connection"
+        - "$PG_CONN"
+        - "--skip-probe"
+        - "--yes"
+      expect_exit: 0
+
+  - cli_run:
+      args:
+        - "slo"
+        - "set"
+        - "l2-slo-dep"
+        - "--rpo"
+        - "1h"
+        - "--rto"
+        - "10m"
+      expect_exit: 0
+
+  - cli_run:
+      args:
+        - "slo"
+        - "report"
+        - "l2-slo-dep"
+        - "--repo"
+        - "$REPO"
+      expect_exit: 0
+
+  - cli_run:
+      args:
+        - "slo"
+        - "report"
+      expect_exit: 0
+
+  - cli_run:
+      args:
+        - "slo"
+        - "clear"
+        - "l2-slo-dep"
+      expect_exit: 0
+
+  - cli_run:
+      args:
+        - "slo"
+        - "report"
+        - "l2-slo-dep"
+        - "--repo"
+        - "$REPO"
+      expect_exit: 0
+
+  # Negative cases.
+  - cli_run:
+      args:
+        - "slo"
+        - "set"
+        - "no-such-deployment-for-slo"
+        - "--rpo"
+        - "1h"
+      expect_exit: 6
+
+  - cli_run:
+      args:
+        - "deployment"
+        - "remove"
+        - "l2-slo-dep"
+        - "--yes"
+      expect_exit: 0
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

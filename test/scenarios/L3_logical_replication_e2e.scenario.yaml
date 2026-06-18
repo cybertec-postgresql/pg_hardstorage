@@ -1,0 +1,104 @@
+# L3_logical_replication_e2e.scenario.yaml
+#
+# Tier L3 — REAL end-to-end logical replication happy path.
+#
+# The other two logical scenarios (L3_logical_stream,
+# L3_logical_lifecycle) are negative-path only: their comments
+# explain that a happy-path test needs a CREATE PUBLICATION on the
+# source, which was impossible before the `sql:` scenario step
+# landed. The `sql:` step exists now, so this scenario exercises the
+# full pipeline:
+#
+#   1. sql — CREATE TABLE + CREATE PUBLICATION on the source.
+#   2. sql — pre-create the logical slot under the exact name
+#      `logical add` defaults to (`pg_hardstorage_logical_<name>`).
+#      `logical stream` would create the slot itself, but a slot
+#      only decodes changes made AFTER it exists — pre-creating it
+#      means the rows inserted in step 4 are inside its window.
+#   3. logical add — register the stream against the publication.
+#   4. sql — INSERT 500 rows; all captured by the slot from step 2.
+#   5. logical stream — consume the slot through the chunked sink
+#      into $REPO, bounded by --inactivity-timeout. Once the 500-row
+#      backlog drains and PG goes quiet, the inactivity timeout
+#      fires; runLogicalStream maps that to a `logical.stream_error`
+#      (exit 1) because only context-cancel counts as a clean stop.
+#      Reaching that exit proves the whole path ran: repo opened,
+#      slot streamed, pgoutput decoded, chunked sink written +
+#      flushed.
+#   6. logical status — post-stream registry/slot read still works.
+#
+# Wall-clock budget: ~25s.
+
+schema: pg_hardstorage.scenario.v1
+name: L3-logical-replication-e2e
+tier: L3
+description: |
+  Full logical-replication happy path — publication + slot +
+  500-row decoded Insert flow through the chunked sink into the
+  repo, then a post-stream status read.
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  # 1. Source schema.
+  - sql:
+      statement: "CREATE TABLE lr_demo (id int PRIMARY KEY, v text)"
+
+  # 2. Publication over the table.
+  - sql:
+      statement: "CREATE PUBLICATION lr_demo_pub FOR TABLE lr_demo"
+
+  # 3. Pre-create the logical slot under `logical add`'s default
+  #    name so the step-4 inserts are within its decode window.
+  - sql:
+      statement: "SELECT pg_create_logical_replication_slot('pg_hardstorage_logical_e2esub', 'pgoutput')"
+
+  # 4. Register the stream. --slot omitted → defaults to
+  #    pg_hardstorage_logical_e2esub, matching step 3.
+  - cli_run:
+      args:
+        - "logical"
+        - "add"
+        - "e2esub"
+        - "--deployment"
+        - "$DEPLOYMENT"
+        - "--repo"
+        - "$REPO"
+        - "--publication"
+        - "lr_demo_pub"
+      expect_exit: 0
+
+  # 5. Generate the change stream — 500 rows, all decoded by the slot.
+  - sql:
+      statement: "INSERT INTO lr_demo SELECT g, 'val-' || g FROM generate_series(1, 500) g"
+
+  # 6. Consume the slot. Drains the 500-row backlog into the chunked
+  #    sink, then exits 1 when the inactivity timeout fires on the
+  #    now-quiet slot. timeout: caps the step if the timeout path
+  #    itself were buggy.
+  - cli_run:
+      args:
+        - "logical"
+        - "stream"
+        - "e2esub"
+        - "--pg-connection"
+        - "$PG_CONN"
+        - "--inactivity-timeout"
+        - "8s"
+      expect_exit: 1
+      timeout: 90s
+
+  # 7. Post-stream status read — registry + slot introspection must
+  #    still succeed after a real streaming session.
+  - cli_run:
+      args:
+        - "logical"
+        - "status"
+        - "e2esub"
+      expect_exit: 0
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

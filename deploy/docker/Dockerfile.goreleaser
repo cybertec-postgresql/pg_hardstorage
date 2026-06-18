@@ -1,0 +1,25 @@
+# Dockerfile used by goreleaser. goreleaser builds the binary itself
+# (single source of truth for ldflags), then invokes this Dockerfile
+# with the pre-built binary in the build context. So unlike
+# Dockerfile (multi-stage, builds from source), this one is COPY-only.
+#
+# Distroless static base — no shell, no package manager, smallest
+# attack surface compatible with our CGO_ENABLED=0 build.
+
+FROM gcr.io/distroless/static-debian12:nonroot
+
+LABEL org.opencontainers.image.source="https://github.com/cybertec-postgresql/pg_hardstorage" \
+      org.opencontainers.image.vendor="CYBERTEC PostgreSQL International GmbH" \
+      org.opencontainers.image.licenses="Apache-2.0" \
+      org.opencontainers.image.title="pg_hardstorage" \
+      org.opencontainers.image.description="PostgreSQL backup, done right."
+
+# goreleaser places the binary at the build context root.
+COPY pg_hardstorage /usr/bin/pg_hardstorage
+
+USER nonroot:nonroot
+
+VOLUME ["/var/lib/pg_hardstorage", "/etc/pg_hardstorage"]
+
+ENTRYPOINT ["/usr/bin/pg_hardstorage"]
+CMD ["--help"]

@@ -1,0 +1,64 @@
+# operators.yaml — supported PostgreSQL-on-Kubernetes operators
+# for the run_k8s_testing.sh drop-in shim coverage.
+#
+# We test pg_hardstorage's compat shims against operator-managed
+# clusters by rebuilding each operator's PG image with the
+# original backup tool's binary swapped for our shim:
+#
+#   CNPG    — barman-cloud-* binaries → pg-hardstorage-barman + -wal-archive
+#   Crunchy — pgbackrest binary       → pg-hardstorage-pgbackrest
+#   Zalando — wal-g binary            → pg-hardstorage-walg
+#
+# The operator's own backup CRD fires the backup; the operator
+# does not know it's not talking to barman-cloud / pgBackRest /
+# WAL-G.  That's the drop-in-replacement claim, tested honestly.
+
+schema: pg_hardstorage.testkit.operators.v1
+version: 1
+
+operators:
+  cnpg:
+    display_name: CloudNativePG
+    install: helm
+    helm:
+      chart: cnpg/cloudnative-pg
+      repo:  https://cloudnative-pg.github.io/charts
+      release: cnpg
+      namespace: cnpg-system
+    versions: ["1.24.1", "1.23.5"]
+    cluster_crd: cluster.postgresql.cnpg.io/v1
+    pg_image_repo: ghcr.io/cloudnative-pg/postgresql
+    backup_tool: barman-cloud
+    # Paths inside the upstream image where the original
+    # barman-cloud-* binaries live; the shim Dockerfile COPYs
+    # over each of them.  Resolved by `which barman-cloud-backup`
+    # in a 1.24.1 spin-up: /usr/bin.
+    binary_paths:
+      barman_cloud_backup:      /usr/bin/barman-cloud-backup
+      barman_cloud_restore:     /usr/bin/barman-cloud-restore
+      barman_cloud_wal_archive: /usr/bin/barman-cloud-wal-archive
+      barman_cloud_wal_restore: /usr/bin/barman-cloud-wal-restore
+
+  crunchy:
+    display_name: Crunchy Postgres Operator (PGO v5)
+    install: kubectl
+    manifests:
+      base: dockerfiles/k8s/operators/crunchy/install.yaml
+    versions: ["5.7.0"]
+    cluster_crd: postgrescluster.postgres-operator.crunchydata.com/v1beta1
+    pg_image_repo: registry.developers.crunchydata.com/crunchydata/crunchy-postgres
+    backup_tool: pgbackrest
+    binary_paths:
+      pgbackrest: /usr/bin/pgbackrest
+
+  zalando:
+    display_name: Zalando postgres-operator (Spilo)
+    install: kubectl
+    manifests:
+      base: dockerfiles/k8s/operators/zalando/manifests.yaml
+    versions: ["1.13.0"]
+    cluster_crd: postgresql.acid.zalan.do/v1
+    pg_image_repo: ghcr.io/zalando/spilo-17
+    backup_tool: wal-g
+    binary_paths:
+      wal_g: /usr/local/bin/wal-g

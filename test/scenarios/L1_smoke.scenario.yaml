@@ -1,0 +1,42 @@
+# L1_smoke.scenario.yaml
+#
+# Tier L1: runs on every PR. Brings up a single PG via testcontainers,
+# applies the smoke load, asserts the row counts match what the
+# deterministic generator was asked to produce.
+#
+# Goal: prove the testkit's load engine + assertion DSL + topology
+# round-trip on every PR, in under five minutes wall clock.
+
+schema: pg_hardstorage.scenario.v1
+name: L1-smoke-load-and-assert
+tier: L1
+description: |
+  Single-PG smoke test. Runs the OLTP smoke load and asserts that the
+  table counts match the generator's request. Catches:
+   - testcontainers / Docker breakage on the runner
+   - load engine regressions (UnmarshalYAML, op dispatch)
+   - assertion DSL regressions (count_exact, lsn_at_least)
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+load:
+  file: test/load/oltp_smoke.load.yaml
+
+steps:
+  - assert:
+    - count_exact:   { table: users, value: 2000 }
+    - lsn_at_least:  "0/1000000"
+    - sql:
+        query: "SELECT count(*) FROM users WHERE email LIKE 'user-%@example.test'"
+        expected:
+          rows:
+            - [2000]
+
+asserts:
+  - count_range:   { table: users, min: 1999, max: 2001 }
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

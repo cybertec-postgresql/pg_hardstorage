@@ -1,0 +1,72 @@
+# L4_doppelganger.scenario.yaml
+#
+# Tier L4: split-brain archive collision.
+#
+# Two clusters that share a system_identifier + timeline (the
+# operator-cloned-the-datadir-with-cp-a-and-forgot-pg_resetwal
+# scenario) will both call archive_command on the same segment
+# number with DIFFERENT content.  Without explicit verification
+# in walsink's commit-manifest path, the second push hits an
+# existing manifest, gets ErrAlreadyExists from
+# RenameIfNotExists, and is silently treated as idempotent
+# success — even though the archived bytes belong to the OTHER
+# cluster.  archive_command exits 0, PG advances
+# confirmed_flush_lsn, the slot recycles the segment off disk,
+# the operator believes their archive worked.  PITR a year
+# later restores the wrong cluster's data.
+#
+# This scenario reproduces the race directly:
+#
+#   1. Push segment A (default content, valid xlp_sysid).
+#   2. Push segment A' — same segment name, same xlp_sysid,
+#      different body bytes (every byte from offset 32 XORed
+#      with 0x5a instead of 0xa5; the FastCDC chunker
+#      produces a wholly different chunk-hash list, so the
+#      manifests diverge in their Chunks slices).
+#   3. Assert the second push errored with `splitbrain.*`.
+#
+# Pre-fix: step fails with "doppelgänger push silently
+# succeeded (split-brain undetected)" — the bug we're pinning.
+# Post-fix: step passes with "split-brain detected".
+#
+# We run this against the file:// path (simplest) and the
+# tls-minio sink path (covers the fix in the S3 storage
+# backend's GET-existing-manifest path too).
+
+schema: pg_hardstorage.scenario.v1
+name: L4-doppelganger
+tier: L4
+description: |
+  Two clusters with cloned system_identifier both archive the
+  same segment number with different content; the second push
+  must surface splitbrain.content_mismatch.
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  # 1. Native CLI against file:// — simplest surface, the
+  #    archive_command path most operators run.
+  - compat_doppelganger:
+      shim: native
+      deployment: doppelganger-fs
+
+  # 2. Same race against TLS MinIO — proves the fix lands in
+  #    the S3 storage backend's existing-manifest read, not
+  #    just in the local-fs path.
+  - compat_doppelganger:
+      shim: native
+      deployment: doppelganger-s3
+      sink: tls-minio
+
+  # 3. The operator-facing surface: the pgbackrest shim's
+  #    archive-push.  Same race, but the error has to bubble
+  #    through cli.Run → shim → archive_command exit code.
+  - compat_doppelganger:
+      shim: pgbackrest
+      deployment: doppelganger-pgbr
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

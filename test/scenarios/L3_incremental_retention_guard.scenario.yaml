@@ -1,0 +1,152 @@
+# L3_incremental_retention_guard.scenario.yaml
+#
+# Tier L3: prove the chain-anchor rule in retention through the
+# `pg_hardstorage rotate` CLI end-to-end.  A retention policy that
+# would otherwise expire a parent full MUST keep it as long as a
+# live incremental child references it, otherwise the child becomes
+# unrestorable.
+#
+# What this catches that the unit tests do not:
+#
+#   * The full path: manifest store list → retention decision →
+#     CLI output → tombstone marker write.  The unit tests
+#     (internal/backup/retention/chain_test.go) cover only the
+#     decision function; this scenario validates that the rotate
+#     command actually surfaces the chain-anchor reason in the
+#     CLI body and refuses to soft-delete the guarded full.
+#   * Reversibility: after soft-deleting the child, the next
+#     rotate pass MUST see the anchor as unreferenced and mark
+#     it for delete.  A bug that "sticky-kept" anchors after
+#     their children went away would let a deployment hoard old
+#     fulls indefinitely.
+#   * Interaction with the always-keep-newest safety-net rule —
+#     anchor_full is older than the policy window AND not the
+#     newest backup, so chain-anchor is the ONLY thing keeping
+#     it.  A regression that conflated newest-rule and chain-
+#     anchor-rule (or doubled-up the keep set) would surface
+#     here.
+#
+# How the timeline is constructed:
+#
+#   t = 0s:  take_backup anchor_full   (full)
+#   t = 0–13s: run_load to age anchor_full past the 10s simple
+#             retention threshold
+#   t = 13s: take_backup leaf_incr     (incremental from anchor_full)
+#   t = 13–14s: brief run_load so the next full has fresh WAL
+#   t = 14s: take_backup newer_full    (full)
+#   t = 14s: rotate --policy simple --keep-for 10s --dry-run
+#
+#   At t=14s the sorted list is [newer_full, leaf_incr, anchor_full]:
+#     - newer_full (0s old)   → kept by simple (within-10s)
+#     - leaf_incr   (1s old)   → kept by simple (within-10s)
+#     - anchor_full (14s old) → BEYOND cutoff; would expire
+#                              under simple alone, but leaf_incr's
+#                              ParentBackupID = anchor_full triggers
+#                              chain-anchor promotion.
+#
+#   After backup delete leaf_incr, sorted=[newer_full, anchor_full]:
+#     - newer_full → kept (within-10s + newest)
+#     - anchor_full → still 14s+ old, no children left → DELETE.
+#
+# Wall-clock budget: ~30s.
+
+schema: pg_hardstorage.scenario.v1
+name: L3-incremental-retention-guard
+tier: L3
+description: |
+  Chain-anchor rule end-to-end: a full with a live incremental
+  child is kept by `rotate` even when the simple policy's age
+  window would expire it; soft-deleting the child makes the
+  full eligible again.
+
+topology:
+  provider: local-docker
+  # PG 17+ required for BASE_BACKUP INCREMENTAL.
+  pg_version: "17"
+
+load:
+  file: test/load/failover_loop.load.yaml
+
+steps:
+  # 1. Seed and confirm the load landed.
+  - assert:
+      - count_exact: { table: users, value: 1000 }
+
+  # 2. The full we want to guard — taken first so it ages out
+  #    while we wait.
+  - take_backup:
+      deployment: l3-retention
+      name: anchor_full
+
+  # 3. Age the anchor past the 10s retention window we'll use
+  #    below.  run_load is the available "do work for N seconds"
+  #    primitive; it idempotently re-runs the load file, which
+  #    has the side-effect of pushing the anchor's StoppedAt
+  #    further into the past.  13s is safely > 10s + take_backup
+  #    overhead.
+  - run_load:
+      duration: 13s
+
+  # 4. The incremental child.  Establishes the chain-anchor
+  #    relationship that protects anchor_full from expiry.
+  - take_backup:
+      deployment: l3-retention
+      incremental_from: anchor_full
+      name: leaf_incr
+
+  # 5. Brief settle then a second full — needed so that after
+  #    we soft-delete leaf_incr later, anchor_full is no longer
+  #    the newest manifest (which would otherwise save it via
+  #    the always-keep-newest safety-net rule).
+  - run_load:
+      duration: 1s
+  - take_backup:
+      deployment: l3-retention
+      name: newer_full
+
+  # 6. Dry-run rotation.  With simple/10s policy:
+  #      newer_full → keep (within-10s, newest)
+  #      leaf_incr  → keep (within-10s)
+  #      anchor_full → keep (chain-anchor for leaf_incr — the
+  #                    proof we're after)
+  - cli_run:
+      args: ["rotate", "l3-retention", "--repo", "$REPO",
+             "--policy", "simple", "--keep-for", "10s"]
+      expect_exit: 0
+      expect_stdout_contains: "chain-anchor"
+
+  # 7. Same dry-run; assert the chain-anchor reason was attached
+  #    to the RIGHT backup (anchor_full's auto-generated ID).
+  #    Without this check, the previous step could pass on a
+  #    chain-anchor reason recorded against the wrong manifest.
+  - cli_run:
+      args: ["rotate", "l3-retention", "--repo", "$REPO",
+             "--policy", "simple", "--keep-for", "10s"]
+      expect_exit: 0
+      expect_stdout_contains: "$BACKUP_anchor_full"
+
+  # 8. Soft-delete the child.  Once the chain relationship is
+  #    severed, anchor_full has no live children, the chain-
+  #    anchor reason no longer applies, and the simple-policy
+  #    age window can take effect.
+  - cli_run:
+      args: ["backup", "delete", "l3-retention", "$BACKUP_leaf_incr",
+             "--repo", "$REPO",
+             "--reason", "L3-incremental-retention-guard: sever chain to test reversibility"]
+      expect_exit: 0
+
+  # 9. Same dry-run again, JSON output for unambiguous assertion.
+  #    anchor_full should now be in the DELETE bucket — proves
+  #    the guard releases as soon as the chain is gone.
+  - cli_run:
+      args: ["rotate", "l3-retention", "--repo", "$REPO",
+             "--policy", "simple", "--keep-for", "10s",
+             "--output", "json"]
+      expect_exit: 0
+      # encoding/json MarshalIndent emits `"action": "delete"`
+      # with a space after the colon — match the indented form.
+      expect_stdout_contains: "\"action\": \"delete\""
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

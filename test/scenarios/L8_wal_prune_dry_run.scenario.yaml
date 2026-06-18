@@ -1,0 +1,87 @@
+# L8_wal_prune_dry_run.scenario.yaml
+#
+# Tier L8 — `wal prune <deployment>` deletes WAL segment
+# manifests no kept backup can use for recovery.  It's
+# the operator's space-reclamation knob for WAL after
+# old backups are pruned.
+#
+# The default is DRY-RUN (--apply makes it real); the
+# scenario exercises the dry-run path so no actual WAL
+# is deleted.  --keep-since lets operators add a
+# soft floor (e.g. "always keep the last 14 days
+# regardless of LSN reachability").
+#
+# What this catches:
+#   * WAL retention rule correctness: the dry-run report
+#     must surface the segments that WOULD be deleted.
+#     A bug that selected reachable segments for
+#     deletion would surface here as a non-empty dry-run
+#     report against a chain where every segment is
+#     still referenced by the only backup.
+#   * --keep-since respected: with --keep-since 365d on
+#     a chain whose segments are all younger than a
+#     year, the report must propose zero deletions.
+#
+# Wall-clock budget: ~3 minutes (1 GB seed + wal_stream
+# start + load + backup + wal_stream stop + prune dry
+# runs).
+schema: pg_hardstorage.scenario.v1
+name: L8-wal-prune-dry-run
+tier: L8
+description: |
+  wal_stream + take_backup → wal prune (dry-run) + wal
+  prune --keep-since 365d (must keep everything).
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+load:
+  # No UNIQUE constraint so re-runs don't trip seed
+  # bootstrap; see L8_wal_audit's load comment.
+  file: test/load/failover_loop.load.yaml
+
+steps:
+  - seed:
+      target_gb: 1
+
+  - wal_stream:
+      action: start
+
+  - run_load:
+      duration: 10s
+
+  - take_backup:
+      deployment: l8-wal-prune
+      name: only_backup
+
+  - wal_stream:
+      action: stop
+
+  # Bare dry-run.
+  - cli_run:
+      args:
+        - "wal"
+        - "prune"
+        - "$DEPLOYMENT"
+        - "--repo"
+        - "$REPO"
+      timeout: 30s
+
+  # --keep-since 365d soft floor.  Every segment in the
+  # chain is way younger than a year, so the report
+  # MUST propose zero deletions.
+  - cli_run:
+      args:
+        - "wal"
+        - "prune"
+        - "$DEPLOYMENT"
+        - "--repo"
+        - "$REPO"
+        - "--keep-since"
+        - "8760h"
+      timeout: 30s
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

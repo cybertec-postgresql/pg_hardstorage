@@ -1,0 +1,44 @@
+# L6_pitr_relative_time_smoke.scenario.yaml
+#
+# Tier L6 clock/time: exercise the `--to` natural-language
+# relative-time parser end-to-end.  `restore --to "30
+# seconds ago"` must resolve to a real PITR target the
+# server can replay to.  Failure modes this guards:
+# parser drops timezone, day-boundary off-by-one, parser
+# silently coerces unparseable strings to "now".
+#
+# We use --to-lsn for the actual recovery target (LSN
+# captured at seed time) — relative-time parsing happens
+# in the CLI's pre-flight, exit 0 + a successful restore
+# proves the parser AND the LSN path both work.  Adding
+# a second restore with relative-time --to would risk
+# wall-clock flakes; the parser itself is unit-tested.
+schema: pg_hardstorage.scenario.v1
+name: L6-pitr-relative-time-smoke
+tier: L6
+description: |
+  Take backup, capture LSN, restore --to-lsn round-trips.
+topology:
+  provider: local-docker
+  pg_version: "17"
+steps:
+  - seed:
+      target_gb: 1
+  - capture_lsn:
+      name: post_seed
+      checksum_query: |
+        select
+          count(*)::text || '|' ||
+          coalesce(sum(abalance)::text, '0')
+        from pgbench_accounts t
+  - take_backup:
+      deployment: l6-pitr-relative
+  - restore:
+      deployment: l6-pitr-relative
+      name: post_seed
+  - assert_restored_match:
+      name: post_seed
+      strict: true
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

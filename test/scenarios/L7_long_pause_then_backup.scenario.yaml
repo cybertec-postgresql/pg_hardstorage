@@ -1,0 +1,24 @@
+# L7_long_pause_then_backup.scenario.yaml
+#
+# Tier L7 resource exhaustion: 60s docker_pause on the
+# sink (storage emulator).  Way beyond a routine
+# network-storm window.  Heals; backup runs against a
+# storage path that just came out of a long IO freeze.
+schema: pg_hardstorage.scenario.v1
+name: L7-long-pause-then-backup
+tier: L7
+description: |
+  60s sink pause, recovered, backup must complete.
+topology:
+  provider: local-docker
+  pg_version: "17"
+steps:
+  - inject:
+      kind: docker_pause
+      target: pg
+      heal_window: 60s
+  - take_backup:
+      deployment: l7-long-pause
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

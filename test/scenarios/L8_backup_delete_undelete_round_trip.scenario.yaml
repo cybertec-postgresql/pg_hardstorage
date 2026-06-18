@@ -1,0 +1,110 @@
+# L8_backup_delete_undelete_round_trip.scenario.yaml
+#
+# Tier L8 — `backup delete` is a SOFT delete by design:
+# it lands a tombstone marker; the chunks are reclaimed
+# only on the next `repo gc`.  That gives operators a
+# bounded recovery window — `backup undelete` can lift
+# the tombstone as long as gc hasn't run.
+#
+# This scenario pins the round-trip:
+#   1. Take backup → it shows up in `list` (LIVE).
+#   2. `backup delete` → tombstoned; default `list`
+#      filters it out.
+#   3. `list --only-deleted` confirms the tombstone is
+#      visible to operators searching for undelete
+#      candidates.
+#   4. `backup undelete` → tombstone gone.
+#   5. `list` shows the backup again (back to LIVE).
+#
+# What this catches:
+#   * Tombstone-filter correctness: a regression that
+#     made `list` show tombstoned backups by default
+#     (or filtered them from `--only-deleted`) would
+#     surface here.
+#   * Undelete-after-delete completeness: the tombstone
+#     marker must be fully removable.  Any state the
+#     delete path leaves behind (cached entries, audit
+#     marker that the undelete missed) would surface.
+#
+# Wall-clock budget: ~3 minutes (1 GB seed + 1 backup +
+# list + delete + list-deleted + undelete + list-live).
+schema: pg_hardstorage.scenario.v1
+name: L8-backup-delete-undelete-round-trip
+tier: L8
+description: |
+  Take backup → list LIVE → delete → list --only-deleted
+  → undelete → list LIVE again.  Pins the soft-delete
+  recovery window.
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  - seed:
+      target_gb: 1
+
+  - take_backup:
+      deployment: l8-delete-undelete
+      name: only_backup
+
+  # Confirm the backup appears in `list` (default = LIVE
+  # only) before any delete operation.
+  - cli_run:
+      args:
+        - "list"
+        - "$DEPLOYMENT"
+        - "--repo"
+        - "$REPO"
+      timeout: 30s
+      expect_stdout_contains: "$LAST_BACKUP"
+
+  # Soft-delete the backup.
+  - cli_run:
+      args:
+        - "backup"
+        - "delete"
+        - "$DEPLOYMENT"
+        - "$LAST_BACKUP"
+        - "--repo"
+        - "$REPO"
+        - "--reason"
+        - "L8 delete-undelete round-trip"
+      timeout: 30s
+
+  # `list --only-deleted` must surface the tombstone so
+  # operators can find undelete candidates.
+  - cli_run:
+      args:
+        - "list"
+        - "$DEPLOYMENT"
+        - "--repo"
+        - "$REPO"
+        - "--only-deleted"
+      timeout: 30s
+      expect_stdout_contains: "$LAST_BACKUP"
+
+  # Lift the tombstone.
+  - cli_run:
+      args:
+        - "backup"
+        - "undelete"
+        - "$DEPLOYMENT"
+        - "$LAST_BACKUP"
+        - "--repo"
+        - "$REPO"
+      timeout: 30s
+
+  # Confirm the backup is back in the LIVE list.
+  - cli_run:
+      args:
+        - "list"
+        - "$DEPLOYMENT"
+        - "--repo"
+        - "$REPO"
+      timeout: 30s
+      expect_stdout_contains: "$LAST_BACKUP"
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

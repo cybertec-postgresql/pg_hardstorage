@@ -1,0 +1,77 @@
+# L2_dsa_partial_flag_accuracy.llm-test.yaml
+#
+# Distilled from pilot run 20260513T183938Z (case D2).  GDPR
+# Article 17 prompt produced a workflow shape that's correct
+# (locate → inspect → restore-to-sandbox → re-backup) but the
+# specific invocations hallucinated flags:
+#
+#   `dsa locate --subject-id ... --tenant ...`         missing required --repo
+#   `partial inspect --backup-id X --subject-id Y ...` no such flag; real is --backup, --tables
+#   `partial restore --table Y --where "..."`          no --where; partial restore is file-level, not SQL
+#
+# Reference truth (verified against `pg_hardstorage dsa locate
+# --help` and `partial inspect/restore --help` at 2026-05-13):
+#
+#   dsa locate       : --repo --subject-id --tenant (--article --window-from --window-to --note --skip-sign --deployment)
+#   partial inspect  : --repo --backup --tables (--pg-connection)
+#   partial restore  : --repo --backup --tables --target (--pg-connection --relfilenode-map --force)
+#
+# Critically: pg_hardstorage's partial restore is file-level (data
+# files for selected tables, materialised into a sandbox).  It does
+# NOT take a WHERE predicate.  Row-level redaction is a separate
+# step performed on the sandbox DB (e.g. via `redact`).
+
+schema: pg_hardstorage.llm-test.v1
+name: L2-dsa-partial-flag-accuracy
+tier: L2
+description: |
+  Operator asks how to fulfill a GDPR Article 17 erasure request.
+  Rubric forbids invented flags and the false claim that partial
+  restore accepts a SQL WHERE clause, requires the real
+  --repo/--backup/--tables flag set.
+
+seed_context:
+  trigger:
+    code: governance.gdpr_art17
+    message: |
+      subject_id: 8c2d
+      article: art_17_erasure
+      tenant: acme-prod
+      window: last 18 months
+
+mode: ask
+turns:
+  - "we got a gdpr article 17 erasure request for subject_id 8c2d. how do i locate and prove the deletion across backups?"
+
+rubric:
+  hard:
+    must_contain_any:
+      - "dsa locate"
+      - "dsa export"
+      - "dsa show"
+    must_contain_all:
+      - "--repo"
+    # Flags found hallucinated in D2.  We do NOT forbid bare
+    # "--where" because the model legitimately educates ("partial
+    # restore does NOT accept --where") which lifts the F-axis
+    # score but trips a substring rubric.  Forbidden forms are
+    # only the executable / recommendation forms.
+    must_not_contain:
+      - "--subject-id 8c2d --tenant"
+      - "--backup-id"
+      - "partial restore --where"
+      - "partial inspect --where"
+      - "partial restore --table "
+      - "partial inspect --table "
+
+  soft:
+    - "Does the response use only flags that actually exist on `dsa locate`, `partial inspect`, and `partial restore`?"
+    - "Does the response include the required `--repo` flag wherever needed?"
+    - "Does the response correctly state that partial restore is file-level, not SQL-level (no WHERE clause)?"
+    - "Does the response cover the audit-chain proof (audit search --action dsa.*) for compliance posture?"
+    - "Does the response avoid claiming pg_hardstorage can rewrite individual rows inside an existing backup?"
+
+  refusal_expected: false
+
+model_pin: ""
+temperature: 0.2

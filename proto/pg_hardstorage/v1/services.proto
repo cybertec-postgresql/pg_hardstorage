@@ -1,0 +1,226 @@
+// gRPC service definitions for pg_hardstorage's control plane.
+//
+// One service per resource group; the REST routes in
+// internal/server/routes.go map 1:1 to the RPCs below.  Streaming
+// RPCs (BackupService.Run, RestoreService.Run, VerifyService.Run)
+// expose live progress via gRPC server-side streaming, replacing
+// the operator-side polling loop the REST surface needs.
+//
+// Authentication: bearer token in the gRPC metadata
+// (`authorization: Bearer <token>`) OR mTLS.  Unary methods that
+// don't need auth (HealthService.Check) are noted explicitly.
+
+syntax = "proto3";
+
+package pg_hardstorage.v1;
+
+option go_package = "github.com/cybertec-postgresql/pg_hardstorage/proto/pg_hardstorage/v1;pgv1";
+
+import "google/protobuf/empty.proto";
+import "google/protobuf/struct.proto";
+import "pg_hardstorage/v1/common.proto";
+
+// HealthService maps to /v1/healthz + /v1/readyz.  No auth.
+service HealthService {
+  // Check is the liveness probe.  Returns OK as long as the
+  // listener is serving.  No state consulted.
+  rpc Check(google.protobuf.Empty) returns (HealthCheckResponse);
+
+  // Ready is the readiness probe.  Returns the per-repo
+  // reachability picture.  When any repo is unreachable, the
+  // status field reflects that (and gRPC clients can map to
+  // their own readiness contract).
+  rpc Ready(google.protobuf.Empty) returns (ReadyResponse);
+
+  // Version returns the build metadata of the control plane
+  // process.  Authenticated.
+  rpc Version(google.protobuf.Empty) returns (VersionResponse);
+}
+
+message HealthCheckResponse {
+  string status = 1;
+}
+
+message ReadyResponse {
+  string status = 1;
+  repeated RepoReady repos = 2;
+}
+
+message RepoReady {
+  string url = 1;
+  bool ready = 2;
+  string error = 3;
+}
+
+message VersionResponse {
+  string version = 1;
+  string commit = 2;
+  string date = 3;
+}
+
+// DeploymentService maps to /v1/deployments + /v1/deployments/{n}/backups.
+service DeploymentService {
+  rpc List(google.protobuf.Empty) returns (ListDeploymentsResponse);
+  rpc ListBackups(ListBackupsRequest) returns (ListBackupsResponse);
+}
+
+message ListDeploymentsResponse {
+  repeated Deployment deployments = 1;
+}
+
+message ListBackupsRequest {
+  string deployment = 1;
+}
+
+message ListBackupsResponse {
+  string deployment = 1;
+  repeated Backup backups = 2;
+}
+
+// BackupService dispatches backup jobs.  EnqueueBackup mirrors the
+// REST POST /v1/deployments/{n}/backups; Run is the streaming
+// variant that delivers progress events live (used by `backup`
+// CLI when the operator passes --control-plane).
+service BackupService {
+  // EnqueueBackup creates a job in the pending state and returns
+  // its descriptor.  The agent's BackupExecutor claims + runs it.
+  rpc EnqueueBackup(EnqueueBackupRequest) returns (Job);
+
+  // Run is the streaming variant.  The control plane enqueues +
+  // (optionally) waits for the agent to claim + streams every
+  // ProgressEvent until terminal.  Final state = Job's terminal
+  // record.
+  rpc Run(EnqueueBackupRequest) returns (stream RunProgress);
+}
+
+message EnqueueBackupRequest {
+  string deployment = 1;
+  string repo_url = 2;
+  string type = 3;
+  string tag = 4;
+  bool ignore_capacity = 5;
+  float capacity_safety_factor = 6;
+  google.protobuf.Struct extra_args = 99;
+}
+
+// RunProgress is the streaming-RPC frame.  Either Event or
+// Terminal is set.
+message RunProgress {
+  ProgressEvent event = 1;
+  Job terminal = 2;
+}
+
+// RestoreService dispatches restore jobs.
+service RestoreService {
+  rpc EnqueueRestore(EnqueueRestoreRequest) returns (Job);
+  rpc Run(EnqueueRestoreRequest) returns (stream RunProgress);
+}
+
+message EnqueueRestoreRequest {
+  string deployment = 1;
+  string backup_id = 2;
+  string target_dir = 3;
+  string repo_url = 4;
+  bool allow_overwrite = 5;
+  string to = 6;
+  string to_lsn = 7;
+  bool verify_after = 8;
+  repeated string tablespace_mapping = 9;
+  bool skip_gap_check = 10;
+  google.protobuf.Struct extra_args = 99;
+}
+
+// VerifyService dispatches verify jobs.  Mirrors REST
+// POST /v1/deployments/{n}/verifies.
+service VerifyService {
+  rpc EnqueueVerify(EnqueueVerifyRequest) returns (Job);
+  rpc Run(EnqueueVerifyRequest) returns (stream RunProgress);
+}
+
+message EnqueueVerifyRequest {
+  string deployment = 1;
+  string backup_id = 2;
+  string pg_major = 3;
+  string tempdir = 4;
+  string repo_url = 5;
+  bool existence_only = 6;
+  int32 sample_chunks = 7;
+  google.protobuf.Struct extra_args = 99;
+}
+
+// JobsService is the agent-side worker-loop surface + operator
+// inspection surface.
+service JobsService {
+  rpc List(ListJobsRequest) returns (ListJobsResponse);
+  rpc Get(JobIDRequest) returns (Job);
+
+  // Claim is the agent-side endpoint.  Returns one eligible job;
+  // when no jobs are available, the RPC fails with NOT_FOUND.
+  rpc Claim(ClaimRequest) returns (Job);
+
+  // AppendProgress + Complete + Cancel are atomic state
+  // transitions.  AppendProgress is OK-while-running; Complete /
+  // Cancel are terminal.
+  rpc AppendProgress(AppendProgressRequest) returns (AppendProgressResponse);
+  rpc Complete(CompleteRequest) returns (Job);
+  rpc Cancel(CancelRequest) returns (Job);
+}
+
+message ListJobsRequest {
+  string state = 1;
+  string kind = 2;
+  string deployment = 3;
+  int32 limit = 4;
+}
+
+message ListJobsResponse {
+  repeated Job jobs = 1;
+  int32 count = 2;
+}
+
+message JobIDRequest {
+  string id = 1;
+}
+
+message ClaimRequest {
+  string agent_id = 1;
+  repeated string deployments = 2;
+  repeated JobKind kinds = 3;
+}
+
+message AppendProgressRequest {
+  string id = 1;
+  ProgressEvent event = 2;
+}
+
+message AppendProgressResponse {
+  bool appended = 1;
+  string id = 2;
+}
+
+message CompleteRequest {
+  string id = 1;
+  bool success = 2;
+  google.protobuf.Struct result = 3;
+  string failure = 4;
+}
+
+message CancelRequest {
+  string id = 1;
+  string reason = 2;
+}
+
+// AgentService is the agent registry + heartbeat surface.
+service AgentService {
+  rpc List(ListAgentsRequest) returns (ListAgentsResponse);
+  rpc Heartbeat(HeartbeatRequest) returns (Agent);
+}
+
+message ListAgentsRequest {
+  bool include_inactive = 1;
+}
+
+message ListAgentsResponse {
+  repeated Agent agents = 1;
+  string heartbeat_timeout = 2;
+}

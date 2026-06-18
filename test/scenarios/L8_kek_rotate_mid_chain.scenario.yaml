@@ -1,0 +1,135 @@
+# L8_kek_rotate_mid_chain.scenario.yaml
+#
+# Tier L8 — long-chain encryption-envelope stability.  The
+# headline property: after N encrypted backups (with load
+# between each) the entire chain remains verifiable end-to-
+# end (kms verify + audit verify-chain) AND restorable
+# (restore + byte-equality of captured row state on the
+# OLDEST backup).  This is the canonical "did anything in
+# the encryption code regress in a way that breaks an old
+# backup nobody restored yet" gate.
+#
+# What this catches that L2_kms_envelope and L4_kek_rotation
+# don't:
+#   * Cross-backup chain drift: every backup re-derives
+#     per-chunk keys via HKDF from the same BDEK, but the
+#     manifest's wrapped DEK can differ across backups.
+#     A regression that changes how DEKs are derived or
+#     wrapped between backups would surface here as the
+#     oldest backup failing to decrypt under the keyring
+#     state that was healthy at the time of the newest
+#     backup.
+#   * Long-chain audit integrity: 5 hash-linked backup
+#     events plus interspersed load events.  Any code path
+#     that emits an audit event without re-anchoring
+#     PrevHash breaks the chain — surfaces in step 11.
+#   * Restore-the-oldest invariant: the first backup's
+#     manifest must still unwrap + decrypt + restore even
+#     after four newer backups have run against the same
+#     repo.  Catches GC-style regressions that aggressively
+#     reclaim chunks "no longer referenced" but miss the
+#     reference from an older manifest.
+#
+# What this scenario *cannot* exercise today: actual KEK
+# rotation between backups.  `kms rotate` needs explicit
+# --old-kek-file / --new-kek-file paths; the scenario
+# runner has no host-side primitive for writing files
+# inside the testbed (the cli_run step kind only invokes
+# `pg_hardstorage` subcommands, not arbitrary shell).
+# Add a `rotate_kek` step kind that generates a fresh
+# 32-byte KEK file inside the cell, derives the refs, and
+# calls `kms rotate --apply` between any two backups
+# below — same shape L4_kek_rotation_across_versions
+# documents.  Until then this scenario asserts the
+# baseline long-chain stability that the rotation case
+# builds on top of.
+#
+# Wall-clock budget: ~5 minutes (1 GB seed + 5 backups +
+# kms verify + audit verify-chain + restore + assert).
+
+schema: pg_hardstorage.scenario.v1
+name: L8-kek-rotate-mid-chain
+tier: L8
+description: |
+  5 encrypted backups → kms verify (every envelope unwrappable
+  by the current keyring) → audit verify-chain (hash-linked
+  end-to-end) → restore the OLDEST backup → byte-equality
+  of pre-load row state.
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  - seed:
+      target_gb: 1
+
+  - capture_lsn:
+      name: post_seed_oldest
+      checksum_query: |
+        select
+          count(*)::text || '|' ||
+          coalesce(sum(abalance)::text, '0') || '|' ||
+          coalesce(sum(hashtextextended(t::text, 0))::text, '0')
+        from pgbench_accounts t
+
+  - take_backup:
+      deployment: l8-kek-chain
+      name: backup_1
+
+  - take_backup:
+      deployment: l8-kek-chain
+      name: backup_2
+
+  - take_backup:
+      deployment: l8-kek-chain
+      name: backup_3
+
+  - take_backup:
+      deployment: l8-kek-chain
+      name: backup_4
+
+  - take_backup:
+      deployment: l8-kek-chain
+      name: backup_5
+
+  # Headline encryption gate: every manifest's wrapped DEK
+  # must unwrap under the current keyring.  Failure here
+  # would mean an older manifest's encryption block became
+  # unreadable somewhere along the chain.
+  - cli_run:
+      args:
+        - "kms"
+        - "verify"
+        - "--repo"
+        - "$REPO"
+      timeout: 30s
+
+  # Audit chain integrity across the 5 backup events +
+  # any interleaved repo events (init, audit anchoring).
+  - cli_run:
+      args:
+        - "audit"
+        - "verify-chain"
+        - "--repo"
+        - "$REPO"
+      timeout: 30s
+
+  # Restore the OLDEST backup (backup_1).  The load-bearing
+  # assertion: backup_1's manifest must still decrypt AND
+  # its referenced chunks must still be present in the
+  # repo even after 4 newer backups ran against the same
+  # repo.  A GC bug that reclaimed chunks "only referenced
+  # by an older manifest" would fail here.
+  - restore:
+      source: backup_1
+      deployment: l8-kek-chain
+      name: post_seed_oldest
+
+  - assert_restored_match:
+      name: post_seed_oldest
+      strict: true
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

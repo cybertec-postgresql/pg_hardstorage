@@ -1,0 +1,14 @@
+---
+# Trigger a one-shot backup against the discovery cluster.
+# CNPG's controller invokes barman-cloud-backup; the recorder
+# image captures the argv to stderr (PGHS_ARGV_FIXTURE prefix
+# in the pod logs).
+apiVersion: postgresql.cnpg.io/v1
+kind: Backup
+metadata:
+  name: discovery-backup
+  namespace: argv-discovery
+spec:
+  cluster:
+    name: discovery
+  method: barmanObjectStore

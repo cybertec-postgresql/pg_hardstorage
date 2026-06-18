@@ -1,0 +1,105 @@
+# L3_standby_lifecycle.scenario.yaml
+#
+# Tier L3 — `standby create | list | destroy` lifecycle.
+# Headline property: an operator can restore a backup INTO a
+# named standby (a temporary PG data directory that gets
+# tracked by the agent's standby registry), list registered
+# standbys, and destroy one cleanly.
+#
+# Why this matters: `standby create` is the recommended path
+# for spinning up a hot replica from a backup without manually
+# wiring `restore` + `pg_ctl` + recovery.conf.  A regression
+# silently breaks the operator's "stand up a read replica
+# from yesterday's backup" workflow.
+#
+# Leaves covered (gate scope):
+#   * standby create
+#   * standby list
+#   * standby destroy
+#
+# Wall-clock budget: ~30s.
+
+schema: pg_hardstorage.scenario.v1
+name: L3-standby-lifecycle
+tier: L3
+description: |
+  Take backup → standby create from latest → standby list
+  (sees the new entry) → standby destroy --remove-target →
+  standby list (empty).
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  - take_backup:
+      deployment: l3-standby-lifecycle
+
+  # 1. List before — proves the registry was empty pre-create.
+  - cli_run:
+      args:
+        - "standby"
+        - "list"
+      expect_exit: 0
+
+  # 2. Create a standby from the most-recent backup.  --target
+  # points at a clean dir under the artefact base; --backup
+  # defaults to "latest" which resolves to $LAST_BACKUP.
+  - cli_run:
+      args:
+        - "standby"
+        - "create"
+        - "l3-standby-1"
+        - "--deployment"
+        - "$DEPLOYMENT"
+        - "--repo"
+        - "$REPO"
+        - "--target"
+        - "$ARTEFACT_DIR/standby-1"
+        - "--backup"
+        - "latest"
+      expect_exit: 0
+      timeout: 180s
+
+  # 3. List after — must show the new standby.  The exact JSON
+  # shape is intentionally not asserted; the smoke goal is
+  # "command sees the registry update".
+  - cli_run:
+      args:
+        - "standby"
+        - "list"
+      expect_exit: 0
+      expect_stdout_contains: "l3-standby-1"
+
+  # 4. Destroy + remove the data dir.  Without --remove-target
+  # the data dir lingers, which is intentional (operators may
+  # want to inspect a failing standby's WAL); --remove-target
+  # is the "fully clean up" mode.
+  - cli_run:
+      args:
+        - "standby"
+        - "destroy"
+        - "l3-standby-1"
+        - "--remove-target"
+      expect_exit: 0
+
+  # 5. List after destroy — registry must be empty again.
+  - cli_run:
+      args:
+        - "standby"
+        - "list"
+      expect_exit: 0
+
+  # 6. Negative: destroy a name that doesn't exist.  Must
+  # exit non-zero — silent success would mean the operator
+  # can't tell when a destroy targeted the wrong standby.
+  - cli_run:
+      args:
+        - "standby"
+        - "destroy"
+        - "no-such-standby"
+      expect_exit: 6
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

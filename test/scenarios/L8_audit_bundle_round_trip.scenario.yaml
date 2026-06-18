@@ -1,0 +1,85 @@
+# L8_audit_bundle_round_trip.scenario.yaml
+#
+# Tier L8 — `audit export-bundle` + `audit verify-bundle`
+# is the canonical "evidence package" workflow: export a
+# signed, hash-chained bundle of audit events
+# (compliance / forensics handover), then verify that
+# bundle round-trips correctly through verify-bundle.
+#
+# The contract:
+#   1. `audit export-bundle --repo --out <path>` produces
+#      a self-contained .tar.gz of audit events + the
+#      signing material needed to re-verify them
+#      offline.
+#   2. `audit verify-bundle <path>` reads the bundle and
+#      asserts every event's hash links + signature is
+#      intact AGAINST the bundle alone — no repo
+#      lookups, no network.
+#   3. The verify exit code is 0 iff every signature
+#      validates and the chain is unbroken.
+#
+# Without this gate, a regression in either path —
+# truncated export (missing the tail of the chain),
+# wrong serialisation (bundle bytes don't reproduce the
+# canonical form the signer used), broken
+# Ed25519-from-bundle wiring — would silently break the
+# compliance handover for operators who only test the
+# happy path in CI.
+#
+# Wall-clock budget: ~3 minutes (1 GB seed + 3 backups +
+# export-bundle + verify-bundle).
+schema: pg_hardstorage.scenario.v1
+name: L8-audit-bundle-round-trip
+tier: L8
+description: |
+  3 backups → audit export-bundle → audit verify-bundle
+  must succeed against the exported file (offline).
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  - seed:
+      target_gb: 1
+
+  - take_backup:
+      deployment: l8-audit-bundle
+      name: backup_1
+
+  - take_backup:
+      deployment: l8-audit-bundle
+      name: backup_2
+
+  - take_backup:
+      deployment: l8-audit-bundle
+      name: backup_3
+
+  # Export the audit bundle.  --out lands under the
+  # scenario's artefact dir so the next step picks it up
+  # by absolute path.
+  - cli_run:
+      args:
+        - "audit"
+        - "export-bundle"
+        - "--repo"
+        - "$REPO"
+        - "--out"
+        - "$ARTEFACT_DIR/audit-bundle.tar.gz"
+        - "--operator"
+        - "testkit-scenario"
+      timeout: 60s
+
+  # Verify the bundle OFFLINE (no --repo).  Pass the
+  # exported file path as the positional argument.  Must
+  # exit 0 and surface success in stdout.
+  - cli_run:
+      args:
+        - "audit"
+        - "verify-bundle"
+        - "$ARTEFACT_DIR/audit-bundle.tar.gz"
+      timeout: 30s
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

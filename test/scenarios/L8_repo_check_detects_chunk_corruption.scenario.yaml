@@ -1,0 +1,80 @@
+# L8_repo_check_detects_chunk_corruption.scenario.yaml
+#
+# Tier L8 — `repo check` and `repo scrub` cover related but
+# DISTINCT integrity surfaces:
+#
+#   * `repo scrub` re-hashes chunks against their content-
+#     addressed key — the bit-rot probe.
+#   * `repo check` validates manifest signatures and
+#     chunk-reference completeness — but does NOT re-hash
+#     chunk content.
+#
+# This scenario pins the boundary: after a bit-flip in a
+# chunk's envelope, `repo scrub` MUST surface a verify.*
+# error (L8_chunk_corruption_late_chain already gates
+# this); `repo check` MAY pass (the chunk's existence and
+# its manifest's signature are unchanged) — but if the
+# corruption is in a MANIFEST, `repo check` MUST surface
+# it via the signature path.  We exercise both paths so a
+# future refactor that confuses the two scopes (e.g. has
+# `repo check` silently start re-hashing chunks, or has
+# `repo scrub` stop validating manifest signatures along
+# the way) is caught.
+#
+# Wall-clock budget: ~3 minutes (1 GB seed + 2 backups +
+# corrupt manifest + 2 CLI probes).
+schema: pg_hardstorage.scenario.v1
+name: L8-repo-check-detects-manifest-corruption
+tier: L8
+description: |
+  2 backups → corrupt a random manifest → `repo check`
+  must surface the corruption (signature/reference path).
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  - seed:
+      target_gb: 1
+
+  - take_backup:
+      deployment: l8-repo-check-corrupt
+      name: backup_1
+
+  - take_backup:
+      deployment: l8-repo-check-corrupt
+      name: backup_2
+
+  - corrupt_repo_object:
+      repo_target: manifest_random
+      mutation: flip_bit_at
+      offset: 192
+
+  # `repo check` walks every manifest.  A bit-flipped
+  # manifest will either fail to parse (JSON syntax
+  # error) or fail the Ed25519 signature check —
+  # either way the command must exit non-zero with a
+  # structured error.  We assert via expect_exit: a
+  # successful exit here means `repo check` silently
+  # ignored the corruption, which is the regression
+  # this scenario guards against.
+  - cli_run:
+      args:
+        - "repo"
+        - "check"
+        - "$REPO"
+      # Exit 9 = ExitVerifyFailed (see internal/output/exitcode.go).
+      # `repo check` routes verify.* error codes to this exit
+      # code so an operator's cron job that gates on
+      # `exit == ExitVerifyFailed` reacts uniformly across
+      # repo check / repo scrub / verify failures.  This
+      # exit was the load-bearing fix: pre-fix, `repo check`
+      # reported `signature_failures: 1` in the body but
+      # exited 0, and operators in cron never noticed.
+      expect_exit: 9
+      timeout: 60s
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

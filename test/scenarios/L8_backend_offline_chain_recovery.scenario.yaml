@@ -1,0 +1,135 @@
+# L8_backend_offline_chain_recovery.scenario.yaml
+#
+# Tier L8 — chain-integrity correctness across a hard
+# backend outage between backups.  Distinct from
+# L3_storage_outage (which exercises a backup AROUND a sink
+# pause but doesn't follow up with deep chain verification).
+# This scenario adds two new gates that L3 doesn't:
+#
+#   * `repo scrub --sample-percent 100` after the chain is
+#     complete — re-hashes every chunk against its content-
+#     addressed key.  Catches the "outage window left half-
+#     written chunks visible to dedup" class of bug: a buggy
+#     backend that creates the final object path before
+#     fsync would let the second backup reference an object
+#     whose name says hash X but bytes hash to Y.  Only the
+#     scrub surfaces that drift.
+#
+#   * `audit verify-chain` over [backup #1, outage events,
+#     backup #2] — confirms the audit chain is hash-linked
+#     across the outage window's events (pause + unpause)
+#     and the two backup events.  A regression that emits
+#     an audit event without re-anchoring PrevHash would
+#     surface here.
+#
+# What L8 *can't* exercise yet (deferred to a future
+# parallel-step primitive): a backup IN FLIGHT during the
+# sink outage.  The scenario runner serialises steps, so
+# the inject step's recovery (sink unpause) fires before
+# the next step starts.  Today's surface is the cleanest
+# next-best: backup → outage → backup → deep verify.
+#
+# Wall-clock budget: ~3 minutes (1 GB seed + backup #1 +
+# 30s sink pause + backup #2 + restore + audit + scrub).
+schema: pg_hardstorage.scenario.v1
+name: L8-backend-offline-chain-recovery
+tier: L8
+description: |
+  Backup → sink offline → backup → restore + audit
+  verify-chain + 100% repo scrub.  Pins the cross-outage
+  chain integrity + dedup-debris invariants.
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+# MinIO is the canonical sink with the most aggressive
+# retry config; docker_pause produces the cleanest
+# "sink unreachable mid-flight" surface (held-open TCP
+# sockets, no RST).
+sink:
+  kind: s3-minio
+
+steps:
+  - seed:
+      target_gb: 1
+
+  - capture_lsn:
+      name: post_seed
+      checksum_query: |
+        select
+          count(*)::text || '|' ||
+          coalesce(sum(abalance)::text, '0') || '|' ||
+          coalesce(sum(hashtextextended(t::text, 0))::text, '0')
+        from pgbench_accounts t
+
+  # Backup #1 — baseline healthy backup against MinIO.
+  - take_backup:
+      deployment: l8-backend-offline
+      name: pre_outage
+
+  # Pause the sink for 30 s.  The runner's inject step
+  # blocks the goroutine until heal_window elapses and
+  # recovery (unpause) returns, so the NEXT step runs
+  # against an already-unpaused sink.  This catches:
+  #   * Lingering connection state in the MinIO client
+  #     after a brief outage (a buggy retry-budget might
+  #     resurrect a cached dead socket).
+  #   * Sink-side dedup-index corruption — if MinIO
+  #     replayed any partial PUTs visible during the
+  #     pause, backup #2 might find a half-written
+  #     object under a known chunk hash.
+  - inject:
+      kind: docker_pause
+      target: sink
+      heal_window: 30s
+
+  # Backup #2 — post-outage.  Must succeed AND must not
+  # observe any debris from backup #1's interaction with
+  # the (now-healed) sink.  Dedup makes this load-bearing:
+  # backup #2 will probe for existing chunks before
+  # uploading new ones; a debris-poisoned dedup index
+  # would surface as restore corruption later.
+  - take_backup:
+      deployment: l8-backend-offline
+      name: post_outage
+
+  - restore:
+      source: post_outage
+      deployment: l8-backend-offline
+      name: post_seed
+
+  - assert_restored_match:
+      name: post_seed
+      strict: true
+
+  # Audit chain across [backup #1 success, sink pause +
+  # unpause events, backup #2 success] must be hash-
+  # linked.  audit verify-chain is the operator-facing
+  # detector for chain breaks.
+  - cli_run:
+      args:
+        - "audit"
+        - "verify-chain"
+        - "--repo"
+        - "$REPO"
+      timeout: 30s
+
+  # 100% scrub: re-hash every chunk.  The deep gate that
+  # catches the "outage window left half-written chunks
+  # visible to dedup" bug class — a chunk whose name
+  # says hash X but bytes hash to Y only surfaces here
+  # (restore wouldn't notice the wrong-content chunk if
+  # the bytes parse as a valid envelope).
+  - cli_run:
+      args:
+        - "repo"
+        - "scrub"
+        - "$REPO"
+        - "--sample-percent"
+        - "100"
+      timeout: 60s
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

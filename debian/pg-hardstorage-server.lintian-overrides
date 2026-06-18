@@ -1,0 +1,15 @@
+# Lintian overrides for pg-hardstorage-server.
+#
+# The server package is a deliberate forward-compatibility stub: it
+# carries no files today but registers the dependency-on-pg-hardstorage
+# linkage so operators who follow the "control-plane setup" runbook
+# can run `apt install pg-hardstorage-server` from v0.1 onwards.  The
+# actual server binary lands with v0.5 and at that point this package
+# will start carrying files; the empty-binary-package warning is
+# expected until then.
+pg-hardstorage-server: empty-binary-package
+
+# Initial upload (this package has never been in Debian); the
+# changelog correctly closes no bugs because there are no bugs to
+# close yet.
+pg-hardstorage-server: initial-upload-closes-no-bugs

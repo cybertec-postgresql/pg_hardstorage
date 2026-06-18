@@ -1,0 +1,26 @@
+# L2-timetravel-question.llm-test.yaml
+#
+# Operator wants to time-travel a query.
+
+schema: pg_hardstorage.llm-test.v1
+name: L2-timetravel-question
+tier: L2
+description: |
+  Operator wants to time-travel a query.
+
+mode: ask
+turns:
+  - "I need to look at how the users table looked 3 hours ago.  what's the simplest way using pg_hardstorage?"
+
+rubric:
+  hard:
+    must_contain_any:
+      - 'timetravel'
+      - 'create'
+      - '--at'
+    must_not_contain:
+  soft:
+      - 'Does the response point at `pg_hardstorage timetravel create`?'
+      - 'Does the response mention that timetravel sessions are TTL-bound?'
+
+temperature: 0.2

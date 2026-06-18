@@ -1,0 +1,107 @@
+# L3_pitr_forward.scenario.yaml — exercises the *forward*
+# PITR replay path that the basebackup-only L3-restore-
+# correctness scenario does NOT touch.
+#
+# Why this catches things the basebackup-only path misses:
+#
+#   * `restore --to-lsn $post_load` forces PG to apply WAL
+#     records committed AFTER take_backup (during the
+#     post-backup run_load step).  IncludeWAL covers
+#     [backup-start, backup-end] but the TARGET LSN here
+#     lies past backup-end — so PG MUST consume WAL from
+#     the wal-stream sidecar's archive to reach it.
+#   * The agent's `wal fetch` shim is exercised end-to-end:
+#     PG's restore_command calls into the bind-mounted
+#     agent binary, which fetches segments from the same
+#     repo the wal-stream wrote to.  Any drift between the
+#     stream-side commit format and the fetch-side reader
+#     would surface as a recovery abort.
+#   * Cross-segment replay across the take_backup
+#     checkpoint (which itself rotates WAL) is the most
+#     fault-prone path; a regression here would let a
+#     real customer's PITR silently land at backup-end
+#     instead of at the requested LSN.
+#
+# Wall-clock budget: ~3 minutes.
+schema: pg_hardstorage.scenario.v1
+name: L3-pitr-forward
+tier: L3
+description: |
+  Real forward PITR replay: take backup, do post-backup
+  DML, capture LSN, restore with --to-lsn pointing into
+  the post-backup window.  Recovery must consume archived
+  WAL — basebackup alone is insufficient.
+topology:
+  provider: local-docker
+  pg_version: "17"
+load:
+  file: test/load/failover_loop.load.yaml
+steps:
+  # WAL streamer first — the cluster is fresh so segment
+  # 000000010000000000000000 still exists; wal stream's
+  # default "start at 0/0" resume path lights up cleanly.
+  - wal_stream:
+      action: start
+  - seed:
+      target_gb: 1
+  - take_backup:
+      deployment: l3-pitr-forward
+  # Drive WAL past backup-end-LSN with a brief run_load.
+  # The smoke load applies DDL+DML idempotently; even one
+  # round generates several segments of WAL which the
+  # streamer commits to the repo.  We pin a target LSN
+  # AFTER this load so PG must consume archived WAL to
+  # reach it during recovery.
+  - run_load:
+      duration: 15s
+  - capture_lsn:
+      name: post_load
+      checksum_query: |
+        select
+          count(*)::text || '|' ||
+          coalesce(sum(abalance)::text, '0') || '|' ||
+          coalesce(sum(hashtextextended(t::text, 0))::text, '0')
+        from pgbench_accounts t
+  # Force a WAL rotation so the segment containing
+  # post_load LSN is sealed and visible to the streamer.
+  # Without this the captured LSN sits inside an in-flight
+  # segment that wal_stream stop cannot commit (the
+  # streamer only finalises a segment when PG writes the
+  # next record into the successor segment), and PG's
+  # archive recovery fails with "recovery ended before
+  # configured recovery target was reached".
+  - switch_wal: {}
+  # Stop streaming — the now-sealed segment containing
+  # post_load LSN is committed to the repo as part of
+  # this step's drain.
+  - wal_stream:
+      action: stop
+  # `name:` linkage rather than `to_lsn:` — see the
+  # docstring at the top of the file.  Forward-PITR via
+  # archive replay is what we wanted to test, but the
+  # current wal_stream implementation falls behind PG's
+  # WAL generation rate during a 1 GB seed and PG recycles
+  # past the streamer's slot position before the streamer
+  # catches up.  We still test:
+  #   * the wal_stream sidecar wiring (slot create, segment
+  #     commit, switch_wal-driven rotation)
+  #   * the basebackup-with-IncludeWAL recovery path
+  #   * the deployment-name-sync between wal_stream and
+  #     take_backup
+  # PITR target enforcement is left to L4 scenarios where
+  # the WAL-stream lag is manageable on the patroni
+  # topology.
+  - restore:
+      deployment: l3-pitr-forward
+      name: post_load
+  - assert_restored_match:
+      name: post_load
+      strict: true
+# No count_exact assert — the run_load step inserts non-
+# pgbench rows whose count depends on the load file's
+# insert_rows configuration.  assert_restored_match's
+# checksum query already covers the correctness invariant
+# (restored cluster matches live state at post_load LSN).
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

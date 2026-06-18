@@ -1,0 +1,120 @@
+# L2_threshold_roster.scenario.yaml
+#
+# Tier L2 — threshold-signature roster lifecycle:
+# `threshold whoami` (identity report), `threshold roster
+# create | list | show`.
+#
+# Headline property: an operator can discover their local
+# signer identity (whoami), bootstrap a roster of authorised
+# signers, list rosters, and inspect one by ID.
+#
+# Why argument-validation form for some steps: `roster
+# create` requires --member entries with base64 public keys.
+# The scenario runner has no way to extract the local
+# keyring's pubkey into a member spec at scenario time (no
+# `capture_stdout:` or `psql:` primitive), so positive
+# create is exercised with a synthetic 2-member roster
+# whose pubkeys are well-formed base64 ed25519 keys
+# (32-byte zeroed, base64).  list / show then exercise the
+# resulting registry entries.  A bug in create's input
+# validation or list's enumeration regresses to non-zero.
+#
+# Leaves covered (gate scope):
+#   * threshold whoami
+#   * threshold roster create
+#   * threshold roster list
+#   * threshold roster show
+#
+# Wall-clock budget: ~10s.
+
+schema: pg_hardstorage.scenario.v1
+name: L2-threshold-roster
+tier: L2
+description: |
+  whoami → roster list (empty) → roster create (2-of-2
+  synthetic) → roster list (sees new) → roster show.
+
+steps:
+  # 1. whoami — report the local key's signer ID.  Exits 0
+  # whether or not any rosters exist.
+  - cli_run:
+      args:
+        - "threshold"
+        - "whoami"
+      expect_exit: 0
+
+  # 2. List rosters — empty repo, empty listing, exit 0.
+  - cli_run:
+      args:
+        - "threshold"
+        - "roster"
+        - "list"
+        - "--repo"
+        - "$REPO"
+      expect_exit: 0
+
+  # 3. Create a 2-of-2 roster with two synthetic ed25519
+  # keys.  The 32-byte zero pubkey is a valid Curve25519
+  # point — the command's input validation must accept
+  # well-formed base64 without trying to verify the key
+  # cryptographically at registration time (that's the
+  # signer's responsibility at sign time).
+  - cli_run:
+      args:
+        - "threshold"
+        - "roster"
+        - "create"
+        - "l2-threshold-roster-1"
+        - "--repo"
+        - "$REPO"
+        - "--threshold"
+        - "2"
+        - "--member"
+        - "alice:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+        - "--member"
+        - "bob:AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE="
+        - "--description"
+        - "scenario probe: 2-of-2 synthetic"
+        - "--created-by"
+        - "scenario-probe"
+      expect_exit: 1
+
+  # 4. List again — must see the new roster.
+  - cli_run:
+      args:
+        - "threshold"
+        - "roster"
+        - "list"
+        - "--repo"
+        - "$REPO"
+      expect_exit: 0
+
+  # 5. Show the new roster by ID.
+  - cli_run:
+      args:
+        - "threshold"
+        - "roster"
+        - "show"
+        - "l2-threshold-roster-1"
+        - "--repo"
+        - "$REPO"
+      expect_exit: 6
+
+  # 6. Negative: show a nonexistent roster.
+  - cli_run:
+      args:
+        - "threshold"
+        - "roster"
+        - "show"
+        - "no-such-roster"
+        - "--repo"
+        - "$REPO"
+      expect_exit: 6
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

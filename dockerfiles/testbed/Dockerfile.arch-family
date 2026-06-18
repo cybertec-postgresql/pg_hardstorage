@@ -1,0 +1,78 @@
+# Dockerfile.arch-family — Arch Linux testbed image.
+#
+# Args mirror the debian/rhel/suse-family Dockerfiles so the
+# testkit's image-build driver can dispatch by family.  Arch
+# is rolling-release; PGDG does not ship for it (Arch users
+# get PostgreSQL via pacman from the `extra` repo), so
+# PACKAGES is always `distro` — there's no `pgdg-pacman`
+# alternative.
+
+ARG OS_IMAGE=archlinux:latest
+FROM ${OS_IMAGE}
+
+ARG PG_VERSION=17
+ARG PACKAGES=distro
+
+# Refresh package databases.  Arch ships with empty pacman
+# caches in the official image; `pacman -Sy` populates them.
+# We don't snapshot to the Arch Linux Archive (ALA) — the
+# point of an Arch testbed is to catch problems against
+# rolling-tip glibc + tooling, not to reproduce some pinned
+# state.
+#
+# `pacman-key --init && --populate archlinux` is required on
+# a fresh rootfs — keys aren't pre-imported in the base
+# image.  `--noconfirm --needed` keeps the layer reproducible-
+# ish (won't redownload packages that are already at the
+# requested version when the layer cache hits).
+RUN pacman-key --init \
+ && pacman-key --populate archlinux \
+ && pacman -Syu --noconfirm --needed \
+        ca-certificates curl gnupg \
+        systemd \
+        iproute2 iptables-nft \
+        sudo glibc \
+        procps-ng \
+        which \
+        libfaketime \
+ && pacman -Scc --noconfirm
+
+# PG install.  Arch's `postgresql` package is the current
+# major only (today's Arch ships PG 18 in `extra`); PG_VERSION
+# is informational here.  Older majors ship in the AUR
+# (`postgresql-15`, `postgresql-16`, `postgresql-17`), but
+# pulling AUR requires makepkg + a non-root user, which
+# clashes with the build-as-root posture of the other family
+# Dockerfiles.  For now: the testbed builds against Arch's
+# tip-major and the matrix labels carry the major Arch is
+# currently shipping.  Multi-major coverage on Arch comes via
+# AUR in a follow-up; the family Dockerfile is the load-bearing
+# piece.
+RUN pacman -Sy --noconfirm --needed postgresql postgresql-libs \
+ && pacman -Scc --noconfirm
+
+# Agent binary + entrypoint, baked in at build time.  Build
+# context is the repo root (matches the other family
+# Dockerfiles).
+COPY bin/pg_hardstorage /usr/local/bin/pg_hardstorage
+RUN chmod 755 /usr/local/bin/pg_hardstorage \
+ && /usr/local/bin/pg_hardstorage version || true
+
+# pgbackup system user — agent runs as this inside the testbed
+# to mirror production (CLI refuses euid 0).  See
+# Dockerfile.debian-family for the full rationale.  The uid/gid
+# is pinned to 2000 so the shared file:// repo is readable
+# across every OS family.
+RUN groupadd -r -g 2000 pgbackup \
+ && (getent passwd postgres >/dev/null 2>&1 || useradd -r -s /usr/bin/nologin postgres) \
+ && useradd -r -u 2000 -g pgbackup -G postgres -d /var/lib/pg_hardstorage \
+        -s /usr/bin/nologin -c "pg_hardstorage agent" pgbackup \
+ && install -d -m 0755 -o root     -g root     /etc/pg_hardstorage \
+ && install -d -m 0750 -o pgbackup -g pgbackup /var/lib/pg_hardstorage \
+ && install -d -m 0700 -o pgbackup -g pgbackup /etc/pg_hardstorage/keyring
+
+COPY dockerfiles/testbed/entrypoint-pg.sh /usr/local/bin/entrypoint-pg.sh
+RUN chmod 755 /usr/local/bin/entrypoint-pg.sh
+
+EXPOSE 5432
+ENTRYPOINT ["/usr/local/bin/entrypoint-pg.sh"]

@@ -1,0 +1,56 @@
+# L7_large_seed_10gb.scenario.yaml
+#
+# Tier L7 (stress) — backup → restore round-trip on a 10 GB
+# pgbench seed. The big sibling of L3_large_seed_3gb: a larger
+# database surfaces resilience bugs that only appear at scale —
+# multi-segment basebackup tar boundaries, manifest CRC
+# accumulation across many chunks, restore-replay memory growth,
+# and chunker checksum-window spanning over a much longer byte
+# stream.
+#
+# target_gb: 10 → pgbench scale 670 → pgbench_accounts has
+# 670 * 100_000 = 67_000_000 rows.
+#
+# Wall-clock budget: ~15-25 minutes (seed + backup + restore).
+
+schema: pg_hardstorage.scenario.v1
+name: L7-large-seed-10gb
+tier: L7
+description: |
+  Backup → restore round-trip on a 10 GB pgbench seed —
+  large-database resilience: multi-segment basebackup,
+  manifest CRC accumulation, restore-replay at scale.
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  - seed:
+      target_gb: 10
+  - capture_lsn:
+      name: post_seed
+      checksum_query: |
+        select
+          count(*)::text || '|' ||
+          coalesce(sum(abalance)::text, '0') || '|' ||
+          coalesce(sum(hashtextextended(t::text, 0))::text, '0')
+        from pgbench_accounts t
+  - take_backup:
+      deployment: l7-large-seed-10gb
+  - restore:
+      deployment: l7-large-seed-10gb
+      name: post_seed
+  - assert_restored_match:
+      name: post_seed
+      strict: true
+      ready_timeout: 30m
+
+asserts:
+  - count_exact:
+      table: pgbench_accounts
+      value: 67000000  # scale=670 → 670 × 100k
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

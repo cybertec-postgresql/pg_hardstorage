@@ -1,0 +1,35 @@
+# L7_repeated_pg_kills_then_backup.scenario.yaml
+#
+# Tier L7 resource exhaustion: kill PG three times in
+# quick succession (SIGTERM, with PG-ready poll between),
+# then take a backup.  Catches a class where libpq /
+# WAL-stream connections accumulate stale state across
+# rapid restarts that only surfaces on the 3rd cycle.
+schema: pg_hardstorage.scenario.v1
+name: L7-repeated-pg-kills-then-backup
+tier: L7
+description: |
+  Three sequential pg_kills with PG-ready polling, then backup.
+topology:
+  provider: local-docker
+  pg_version: "17"
+steps:
+  - seed:
+      target_gb: 1
+  - inject:
+      kind: pg_kill
+      signal: 9
+      heal_window: 60s
+  - inject:
+      kind: pg_kill
+      signal: 9
+      heal_window: 60s
+  - inject:
+      kind: pg_kill
+      signal: 9
+      heal_window: 60s
+  - take_backup:
+      deployment: l7-repeated-kills
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

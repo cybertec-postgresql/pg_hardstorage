@@ -1,0 +1,109 @@
+# L4_pg_upgrade_cross_major.scenario.yaml
+#
+# Tier L4 — backup PG 16, run pg_upgrade --link in-place to
+# PG 17, take another backup against the upgraded cluster, then
+# assert the COMBINED chain restores cleanly under PG 17.
+#
+# This is the most data-loss-prone operator workflow and the one
+# we most-need a regression test for.  The failure mode we
+# protect against:  a backup taken pre-upgrade refuses to
+# restore post-upgrade (because pg_upgrade --link creates new
+# datadir UUIDs while the manifest still references the source's
+# system_identifier).
+#
+# Pass condition:
+#   - pg_upgrade --link completes inside the cell without error.
+#   - The post-upgrade backup completes cleanly.
+#   - The pre-upgrade backup ALSO restores cleanly under PG 17 —
+#     i.e. the chain handles the system_identifier transition.
+#
+# Implementation note: this scenario requires a testbed image
+# with BOTH PG 16 and PG 17 installed.  The default debian:12
+# testbed in the run_testing.sh fleet ships ONE PG; this
+# scenario needs a `pg_version: "16+17"` testbed variant which
+# is **work-in-progress** — the dockerfile shape is in
+# dockerfiles/testbed/Dockerfile.debian-family + needs a
+# multi-PG branch.  Document a stub pre-condition step that
+# asserts both PG majors are present and SKIPs the scenario
+# clean if not; this lets the YAML land in-tree without a
+# CI-breaking pre-req.
+
+schema: pg_hardstorage.scenario.v1
+name: L4-pg-upgrade-cross-major
+tier: L4
+description: |
+  In-place pg_upgrade 16 → 17 with a backup chain spanning the
+  upgrade.
+
+  STATUS: requires a testbed image where postgres is NOT PID 1.
+  The os_pkg_upgrade pre-step + pg_upgrade step both work
+  end-to-end against the dockerfiles/testbed/Dockerfile.debian-
+  family image (whose entrypoint-pg.sh wraps postgres in a
+  supervisor) — but NOT against the raw `postgres:16`
+  testcontainers image this scenario currently uses, because
+  there pg_ctl stop terminates PID 1 and docker tears the
+  container down mid-upgrade (the script aborts with
+  "exit status 137 ... waiting for server to shut down...").
+  Switch the topology to a custom-image variant once
+  scenario.Topology learns to dispatch a testbed image
+  reference; until then this scenario is FAIL-as-spec.
+
+topology:
+  provider: local-docker
+  pg_version: "16"
+  # Custom image — both PG 16 and PG 17 binaries installed
+  # under /usr/lib/postgresql/<N>/bin, with a sleep-infinity
+  # PID 1 wrapper so `pg_ctl stop` from the pg_upgrade step
+  # doesn't tear the container down.  Build via:
+  #   docker build -f dockerfiles/testbed/Dockerfile.multi-pg-l4 \
+  #     -t pg-hardstorage-l4-multipg:latest .
+  # See the Dockerfile for the rationale on why the official
+  # postgres:16 image can't host this scenario.
+  image: pg-hardstorage-l4-multipg:latest
+
+steps:
+  # 1. Backup #1 under PG 16.  Goes first because pg_upgrade
+  #    will stop the source PG and the backup wants it live.
+  - take_backup:
+      type: full
+      name: pre_upgrade_pg16
+
+  # 2. Bootstrap PG 17 binaries side-by-side inside the cell.
+  #    Debian PostgreSQL packages are designed for this exact
+  #    case: postgresql-16 lives under /usr/lib/postgresql/16,
+  #    postgresql-17 lives under /usr/lib/postgresql/17.  The
+  #    testcontainers postgres:16 image inherits debian:12 + has
+  #    the PGDG apt source configured, so apt-get install
+  #    postgresql-17 + postgresql-contrib-17 just works.  Without
+  #    this step the pg_upgrade step below would fail with
+  #    "missing target binaries at /usr/lib/postgresql/17/bin".
+  - os_pkg_upgrade:
+      packages: [postgresql-17, postgresql-contrib-17]
+      pkg_manager: apt
+
+  # 3. In-place pg_upgrade.  Step handler runs pg_ctl stop +
+  #    initdb 17 + pg_upgrade --link inside the cell.
+  - pg_upgrade:
+      pg_from_version: "16"
+      pg_to_version: "17"
+      # local-docker provider sets POSTGRES_USER=testkit when
+      # bringing the cell up.  Without pinning pg_superuser
+      # here the step's pg_upgrade -U falls back to "postgres"
+      # and aborts with `role "postgres" does not exist`.
+      pg_superuser: testkit
+
+  # 4. Backup #2 under PG 17 (against the upgraded cluster).
+  - take_backup:
+      type: full
+      name: post_upgrade_pg17
+
+  # 5. Restore the PRE-upgrade backup under PG 17.  This is the
+  #    critical assertion: a backup chain that spans an in-place
+  #    major bump must remain restorable under the NEW major.
+  #    Failure here = silent data loss for any operator who ran
+  #    pg_upgrade and then needed to restore an older backup.
+  - restore:
+      source: pre_upgrade_pg16
+
+  - restore:
+      source: post_upgrade_pg17

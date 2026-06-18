@@ -1,0 +1,142 @@
+.nh
+.TH "PG_HARDSTORAGE" "1" "May 2026" "pg_hardstorage Manual" "pg_hardstorage Manual"
+
+.SH NAME
+.PP
+pg_hardstorage-kms-rotate - Re-wrap every encrypted backup's DEK with a new KEK
+
+
+.SH SYNOPSIS
+.PP
+\fBpg_hardstorage kms rotate [flags]\fP
+
+
+.SH DESCRIPTION
+.PP
+Walk every committed (non-tombstoned) backup manifest in the
+repo. For each manifest wrapped with --old-kek-ref:
+
+.RS
+.IP "  1." 5
+Decrypt the wrapped DEK using the bytes at --old-kek-file.
+.IP "  2." 5
+Re-wrap the DEK using the bytes at --new-kek-file.
+.IP "  3." 5
+Mutate the manifest's encryption block to record --new-kek-ref
+ and the new wrapped_dek; everything else stays bit-identical.
+.IP "  4." 5
+Re-sign the manifest (the operator's signing keypair is
+ unchanged).
+.IP "  5." 5
+Atomically rewrite the manifest at its repo key (and the
+ replica copy if present).
+
+.RE
+
+.PP
+Chunks are NOT re-encrypted. Per-chunk keys are derived via HKDF
+from the (unchanged) BDEK; rewrapping the DEK leaves every chunk's
+bytes untouched. KEK rotation is O(manifest count), not O(chunk
+count).
+
+.PP
+Multi-tenant safety: only manifests with --old-kek-ref are touched.
+Manifests wrapped under different KEK refs (other tenants) are
+skipped, not failed. Operators rotating per-tenant KEKs run this
+command once per tenant.
+
+.PP
+Resumability: a rotation interrupted partway through is safely
+re-runnable with the same args. Manifests that were already
+rotated (their KEKRef == --new-kek-ref) are counted as
+\&'already_rotated' and skipped.
+
+.PP
+Default mode is dry-run; pass --apply to actually rewrite. With
+--apply, one kms.rotate audit event is emitted per rotated
+manifest.
+
+
+.SH OPTIONS
+.PP
+\fB--apply\fP[=false]
+	actually rewrite the manifests (default: dry-run)
+
+.PP
+\fB-h\fP, \fB--help\fP[=false]
+	help for rotate
+
+.PP
+\fB--new-kek-file\fP=""
+	path to the NEW KEK bytes (32 bytes raw); required
+
+.PP
+\fB--new-kek-ref\fP=""
+	the kek_ref to record on rotated manifests (required)
+
+.PP
+\fB--old-kek-file\fP=""
+	path to the OLD KEK bytes (32 bytes raw); required
+
+.PP
+\fB--old-kek-ref\fP=""
+	the kek_ref currently on the manifests to rotate (required)
+
+.PP
+\fB--repo\fP=""
+	repository URL (required)
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+.PP
+\fB--airgapped\fP[=false]
+	refuse outbound endpoints (LLM providers, sinks, OTLP collectors) outside loopback / RFC1918 / explicit airgap.allowlist. Also enabled by PG_HARDSTORAGE_AIRGAPPED=1 or \fBairgapped: strict\fR in the config file.
+
+.PP
+\fB-c\fP, \fB--config\fP=""
+	path to config file (default: XDG/FHS lookup)
+
+.PP
+\fB--cpu-profile\fP=""
+	write a pprof CPU profile to this path for the duration of the command (\fBgo tool pprof <path>\fR to analyse). Off when empty.
+
+.PP
+\fB--mem-profile\fP=""
+	write a pprof heap profile to this path at command exit. Off when empty.
+
+.PP
+\fB--no-color\fP[=false]
+	disable ANSI color in text output
+
+.PP
+\fB--on-error-llm\fP[=false]
+	on a structured-error failure, drop into the matching LLM helper skill (auto_on_error trigger). Also enabled by PG_HARDSTORAGE_ON_ERROR_LLM=1.
+
+.PP
+\fB--otel-endpoint\fP=""
+	OpenTelemetry OTLP/HTTP endpoint (e.g. http://otel-collector:4318); empty disables tracing
+
+.PP
+\fB--otel-stdout\fP[=false]
+	also export OpenTelemetry traces to stderr (useful for dev)
+
+.PP
+\fB-o\fP, \fB--output\fP=""
+	output format: text|json|ndjson|yaml|template|csv|markdown|html|tap|junit|pdf (default: text on TTY, json off-TTY)
+
+.PP
+\fB--profile-port\fP=0
+	if non-zero, expose net/http/pprof on 127.0.0.1: for live profiling of long-running commands (e.g. \fBgo tool pprof http://127.0.0.1:6060/debug/pprof/profile?seconds=30\fR). Off when zero.
+
+.PP
+\fB-q\fP, \fB--quiet\fP[=false]
+	suppress non-essential output
+
+.PP
+\fB--template\fP=""
+	Go text/template applied when --output template (or implied if --template is set without --output)
+
+
+.SH SEE ALSO
+.PP
+\fBpg_hardstorage-kms(1)\fP

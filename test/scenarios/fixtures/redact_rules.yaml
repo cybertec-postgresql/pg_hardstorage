@@ -1,0 +1,14 @@
+# Redaction rules fixture for L2_redact_flow / L2_redact_preview
+# scenarios.  Targets pgbench_accounts (seeded by run_load) +
+# a synthetic users table to exercise multiple strategies.
+schema: pg_hardstorage.redact.v1
+tables:
+  public.pgbench_accounts:
+    columns:
+      filler: nullify
+  public.users:
+    columns:
+      email: hash_keep_domain
+      ssn: replace_with_xxx
+      phone: "regex:[0-9]:0"
+      bio: "constant:[REDACTED]"

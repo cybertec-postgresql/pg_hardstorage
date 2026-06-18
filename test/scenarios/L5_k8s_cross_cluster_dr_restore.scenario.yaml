@@ -1,0 +1,102 @@
+# L5_k8s_cross_cluster_dr_restore.scenario.yaml
+#
+# Tier L5: cross-cluster disaster-recovery restore.  Take a chain
+# in cluster A; the cluster goes down (Helm uninstall / namespace
+# delete / region outage); restore the chain into cluster B in a
+# different namespace (or different kind cluster, when the
+# topology supports it).  This is the K8s expression of the
+# fundamental "the backup is the source of truth, not the source
+# cluster" property.
+#
+# Why this scenario is K8s-specific:
+#
+#   * StatefulSet PV reattachment.  When cluster B's PG pod
+#     starts against a restored PVC, the kubelet may need to
+#     reformat or wait for PV-attach.  The sidecar/operator must
+#     handle the "PG ready" signal differently from a local-
+#     docker container start.
+#
+#   * RBAC + ServiceAccount mapping.  Cluster B's
+#     pg-hardstorage agent ServiceAccount has DIFFERENT secrets
+#     than cluster A's; the KMS-key reference embedded in the
+#     manifest must be resolvable in B's cluster without
+#     hardcoding A's secret paths.
+#
+#   * Image-pull from cluster B's registry.  If cluster A used a
+#     private registry that B can't reach, the restore-time
+#     wal-fetch helper would fail.  The DR scenario forces this
+#     to be discovered before the customer needs it.
+#
+# What this scenario would assert when kind topology lands:
+#
+#   * Two kind clusters provisioned (cluster_a, cluster_b).
+#   * Build a 3-link incremental chain on cluster_a, repo on an
+#     external object store (MinIO sidecar) so both clusters
+#     reach the same bytes.
+#   * `kind delete cluster cluster_a` — full cluster wipe.
+#   * Helm install pg-hardstorage-server in cluster_b; create an
+#     HSRestore CR pointing at the chain leaf.
+#   * Within 5 minutes, the restored PG cluster in B is ready
+#     and pg_verifybackup passes against its data dir.
+#   * Smoke SQL against B's restored cluster returns the same
+#     row count we recorded on cluster_a before the wipe.
+#
+# Until the kind topology lands, this YAML serves as the
+# canonical specification of the cross-cluster DR contract.  The
+# operationally-equivalent "restore to a fresh PG instance"
+# property is already exercised by the assert_restored_match
+# step in our L2/L3 scenarios — the sandbox PG container that
+# step boots IS a "different cluster" by every meaningful
+# definition (different docker image instance, different
+# network namespace, different PGDATA, different
+# postgresql.auto.conf).  The L3/L5 split here is about K8s-
+# native vs. simulated.
+
+schema: pg_hardstorage.scenario.v1
+name: L5-k8s-cross-cluster-dr-restore
+tier: L5
+description: |
+  Build chain on kind cluster A; wipe cluster A; restore chain
+  leaf into kind cluster B; pg_verifybackup + smoke SQL prove
+  byte-identical recovery.  Requires the kind topology provider
+  AND multi-cluster support (stubs today).
+
+topology:
+  provider: kind
+  # Multi-cluster mode would extend the topology config to
+  # declare additional clusters by name; the kind provider's
+  # bring-up parses this section when it lands.
+  cluster_name: testkit-dr-source
+
+load:
+  file: test/load/failover_loop.load.yaml
+
+steps:
+  # Refuses at topology.Up because `kind` is a stub.  See
+  # L5_k8s_cronjob_incremental_cnpg.scenario.yaml for the
+  # rationale; the steps below land alongside the kind provider.
+  #
+  # Future steps (sketch):
+  #
+  #   - cli_run: ["kind", "create", "cluster", "--name", "dr-source"]
+  #   - cli_run: ["kind", "create", "cluster", "--name", "dr-target"]
+  #   - helm_install: { release: pg, namespace: src, values: ... }
+  #   - take_backup: { deployment: dr, name: anchor_full }
+  #   - run_load: { duration: 5s }
+  #   - take_backup: { deployment: dr, incremental_from: "$LAST_BACKUP" }
+  #   - run_load: { duration: 5s }
+  #   - take_backup: { deployment: dr, incremental_from: "$LAST_BACKUP", name: chain_leaf }
+  #   - cli_run: ["kind", "delete", "cluster", "--name", "dr-source"]
+  #   - switch_cluster: { name: dr-target }
+  #   - helm_install: { release: pg-hardstorage-server, namespace: dr-restore }
+  #   - apply_cr: { kind: HSRestore, source: chain_leaf, target_namespace: dr-restore }
+  #   - wait_for_resource: { kind: Pod, name: dr-restored-0, condition: Ready, within: 5m }
+  #   - assert_smoke_sql:
+  #       sql: "select count(*) from users"
+  #       expected: { rows: [[ 1000 ]] }
+  - assert:
+      - count_exact: { table: users, value: 1000 }
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:2h"

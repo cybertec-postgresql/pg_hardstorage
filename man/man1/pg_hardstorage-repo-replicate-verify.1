@@ -1,0 +1,130 @@
+.nh
+.TH "PG_HARDSTORAGE" "1" "May 2026" "pg_hardstorage Manual" "pg_hardstorage Manual"
+
+.SH NAME
+.PP
+pg_hardstorage-repo-replicate-verify - Verify a replica repo is consistent with its source
+
+
+.SH SYNOPSIS
+.PP
+\fBpg_hardstorage repo replicate verify --from  --to  [flags]\fP
+
+
+.SH DESCRIPTION
+.PP
+repo replicate verify walks the source repository's manifests +
+chunks and asserts each is present at the replica with matching
+content.  The output is one of three verdicts:
+
+.PP
+consistent  — replica matches primary
+  drifted     — present-but-mismatched content (re-replicate)
+  broken      — missing keys (re-replicate AND investigate)
+
+.PP
+Default is Stat-only: O(N keys) Stat calls; detects "missing"
++ size-mismatch.  \fB--deep\fR adds a body-fetch + byte-compare
+pass on every considered key, catching same-size-different-bytes
+drift.  Slow; suitable for periodic deep scrub, not per-PR.
+
+.PP
+Read-only against both repos.  Both \fB--from\fR and \fB--to\fR MUST
+already exist.
+
+.PP
+Output formats:
+  --format json     (default) — JSON body, the v1 contract.
+  --format markdown — forensics-grade GFM rendering.
+
+.PP
+Exit-code mapping:
+  0  — verdict=consistent
+  9  — verdict=drifted OR broken (verify-failed namespace).
+       The body still renders to stdout for diagnosis; the
+       error summary on stderr names the verdict.
+
+
+.SH OPTIONS
+.PP
+\fB--deep\fP[=false]
+	fetch + byte-compare both sides (catches same-size drift; slow)
+
+.PP
+\fB--deployment\fP=""
+	restrict the walk to one deployment (default: all)
+
+.PP
+\fB--format\fP="json"
+	output format: json | markdown
+
+.PP
+\fB--from\fP=""
+	primary (source) repository URL (required)
+
+.PP
+\fB-h\fP, \fB--help\fP[=false]
+	help for verify
+
+.PP
+\fB--include-wal\fP[=false]
+	also verify wal//... segment manifests
+
+.PP
+\fB--to\fP=""
+	replica (destination) repository URL (required)
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+.PP
+\fB--airgapped\fP[=false]
+	refuse outbound endpoints (LLM providers, sinks, OTLP collectors) outside loopback / RFC1918 / explicit airgap.allowlist. Also enabled by PG_HARDSTORAGE_AIRGAPPED=1 or \fBairgapped: strict\fR in the config file.
+
+.PP
+\fB-c\fP, \fB--config\fP=""
+	path to config file (default: XDG/FHS lookup)
+
+.PP
+\fB--cpu-profile\fP=""
+	write a pprof CPU profile to this path for the duration of the command (\fBgo tool pprof <path>\fR to analyse). Off when empty.
+
+.PP
+\fB--mem-profile\fP=""
+	write a pprof heap profile to this path at command exit. Off when empty.
+
+.PP
+\fB--no-color\fP[=false]
+	disable ANSI color in text output
+
+.PP
+\fB--on-error-llm\fP[=false]
+	on a structured-error failure, drop into the matching LLM helper skill (auto_on_error trigger). Also enabled by PG_HARDSTORAGE_ON_ERROR_LLM=1.
+
+.PP
+\fB--otel-endpoint\fP=""
+	OpenTelemetry OTLP/HTTP endpoint (e.g. http://otel-collector:4318); empty disables tracing
+
+.PP
+\fB--otel-stdout\fP[=false]
+	also export OpenTelemetry traces to stderr (useful for dev)
+
+.PP
+\fB-o\fP, \fB--output\fP=""
+	output format: text|json|ndjson|yaml|template|csv|markdown|html|tap|junit|pdf (default: text on TTY, json off-TTY)
+
+.PP
+\fB--profile-port\fP=0
+	if non-zero, expose net/http/pprof on 127.0.0.1: for live profiling of long-running commands (e.g. \fBgo tool pprof http://127.0.0.1:6060/debug/pprof/profile?seconds=30\fR). Off when zero.
+
+.PP
+\fB-q\fP, \fB--quiet\fP[=false]
+	suppress non-essential output
+
+.PP
+\fB--template\fP=""
+	Go text/template applied when --output template (or implied if --template is set without --output)
+
+
+.SH SEE ALSO
+.PP
+\fBpg_hardstorage-repo-replicate(1)\fP

@@ -1,0 +1,114 @@
+.nh
+.TH "PG_HARDSTORAGE" "1" "May 2026" "pg_hardstorage Manual" "pg_hardstorage Manual"
+
+.SH NAME
+.PP
+pg_hardstorage-backup-delete - Soft-delete a specific backup (chunks reclaimed by next repo gc)
+
+
+.SH SYNOPSIS
+.PP
+\fBpg_hardstorage backup delete   [flags]\fP
+
+
+.SH DESCRIPTION
+.PP
+delete tombstones the named backup. The manifest body and
+chunks remain on disk until the next \fBrepo gc --apply\fR cycle
+clears unreferenced chunks; this split is deliberate so an operator
+who deletes the wrong backup has time to recover.
+
+.PP
+If the backup has live incremental descendants the delete refuses
+(chain-protection: tombstoning an anchor would leave its children
+un-restorable). Pass --cascade to drain the entire chain leaf-first
+in one operation; every tombstoned manifest is recorded in the
+audit chain, and the same approval (--require-approval) gates the
+whole cascade rather than each step.
+
+.PP
+The destructive op gate (--require-approval) is strongly recommended
+for operator-initiated deletes outside of retention. Approval Op
+must be \fBbackup.delete\fR and Target must be the backup ID.
+
+.PP
+For automated deletion driven by retention policy, use
+\fBpg_hardstorage rotate\fR instead — it derives a structured
+soft-delete plan from the configured policy.
+
+
+.SH OPTIONS
+.PP
+\fB--cascade\fP[=false]
+	also delete every incremental descendant of this backup, leaf-first
+
+.PP
+\fB-h\fP, \fB--help\fP[=false]
+	help for delete
+
+.PP
+\fB--reason\fP=""
+	free-form reason captured in the tombstone + audit chain
+
+.PP
+\fB--repo\fP=""
+	repository URL (required)
+
+.PP
+\fB--require-approval\fP=""
+	approval request ID that must be in approved state for backup.delete + this backup ID (n-of-m gate; strongly recommended)
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+.PP
+\fB--airgapped\fP[=false]
+	refuse outbound endpoints (LLM providers, sinks, OTLP collectors) outside loopback / RFC1918 / explicit airgap.allowlist. Also enabled by PG_HARDSTORAGE_AIRGAPPED=1 or \fBairgapped: strict\fR in the config file.
+
+.PP
+\fB-c\fP, \fB--config\fP=""
+	path to config file (default: XDG/FHS lookup)
+
+.PP
+\fB--cpu-profile\fP=""
+	write a pprof CPU profile to this path for the duration of the command (\fBgo tool pprof <path>\fR to analyse). Off when empty.
+
+.PP
+\fB--mem-profile\fP=""
+	write a pprof heap profile to this path at command exit. Off when empty.
+
+.PP
+\fB--no-color\fP[=false]
+	disable ANSI color in text output
+
+.PP
+\fB--on-error-llm\fP[=false]
+	on a structured-error failure, drop into the matching LLM helper skill (auto_on_error trigger). Also enabled by PG_HARDSTORAGE_ON_ERROR_LLM=1.
+
+.PP
+\fB--otel-endpoint\fP=""
+	OpenTelemetry OTLP/HTTP endpoint (e.g. http://otel-collector:4318); empty disables tracing
+
+.PP
+\fB--otel-stdout\fP[=false]
+	also export OpenTelemetry traces to stderr (useful for dev)
+
+.PP
+\fB-o\fP, \fB--output\fP=""
+	output format: text|json|ndjson|yaml|template|csv|markdown|html|tap|junit|pdf (default: text on TTY, json off-TTY)
+
+.PP
+\fB--profile-port\fP=0
+	if non-zero, expose net/http/pprof on 127.0.0.1: for live profiling of long-running commands (e.g. \fBgo tool pprof http://127.0.0.1:6060/debug/pprof/profile?seconds=30\fR). Off when zero.
+
+.PP
+\fB-q\fP, \fB--quiet\fP[=false]
+	suppress non-essential output
+
+.PP
+\fB--template\fP=""
+	Go text/template applied when --output template (or implied if --template is set without --output)
+
+
+.SH SEE ALSO
+.PP
+\fBpg_hardstorage-backup(1)\fP

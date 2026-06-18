@@ -1,0 +1,42 @@
+# L1_plumbing_ask_smoke.llm-test.yaml
+#
+# Tier L1 — plumbing smoke for `pg_hardstorage llm ask`.  Runs
+# against the built-in `mock` provider so the test is fully
+# deterministic and runnable in CI without a real API key.
+# Asserts the wiring:
+#
+#   - `llm ask` reaches the provider,
+#   - the response carries a non-empty body,
+#   - the structured-output JSON shape is intact (we extract the
+#     `result.answer` / `result.response` / `result.text` /
+#     `result.explanation` / `result.content` key — at least one
+#     must contain the word "mock" since the mock provider always
+#     echoes a recognisable token).
+#
+# This is the test that fails if a future refactor renames the
+# response field, drops the provider registration, or wires the
+# `--provider` flag to a non-existent provider.
+
+schema: pg_hardstorage.llm-test.v1
+name: L1-plumbing-ask-smoke
+tier: L1
+description: |
+  llm ask against the mock provider produces a non-empty response
+  carrying the mock provider's recognisable token.  Pure plumbing
+  check — fully deterministic, no external dependency.
+
+# Pin the mock provider regardless of the operator's normal
+# config — L1 plumbing rubrics assume the mock's canned-response
+# token and would false-fail against a real provider.
+provider: mock
+mode: ask
+turns:
+  - "what does pg_hardstorage do?"
+
+rubric:
+  hard:
+    must_contain_any:
+      - "mock"
+    must_not_contain:
+      - "error"
+      - "panic"

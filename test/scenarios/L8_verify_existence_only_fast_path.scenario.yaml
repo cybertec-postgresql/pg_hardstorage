@@ -1,0 +1,80 @@
+# L8_verify_existence_only_fast_path.scenario.yaml
+#
+# Tier L8 — `pg_hardstorage verify <id> --existence-only` is
+# the operator's fast pre-flight before
+# `backup undelete` / restore: it Stat()s every referenced
+# chunk to confirm "the bytes are still in the repo" without
+# the (much more expensive) fetch + decrypt + SHA round-trip.
+# Without this gate, the existence-only path could rot
+# silently — a regression that made --existence-only silently
+# fetch+verify anyway would still pass an operator's `verify`
+# call but would burn ~100x the IO budget; operators with
+# tight TTL backup checks would notice cost regressions but
+# not correctness ones.
+#
+# What this catches:
+#   * --existence-only short-circuit: must exit 0 and not
+#     decrypt anything.  A subtle regression that bypassed
+#     the short-circuit would still pass the L1 verify smoke
+#     test but would dominate the runtime here.
+#   * Manifest reference completeness: every chunk listed in
+#     the manifest must Stat-resolve.  If the manifest's
+#     chunk_list and the on-disk chunks/ subtree disagree
+#     (e.g. an unreferenced chunk got GC'd but the manifest
+#     still names it), --existence-only is the operator's
+#     canary for that drift.
+#
+# Wall-clock budget: ~2 minutes (1 GB seed + 1 backup + 2
+# verifies — full + existence-only — paired against the same
+# backup for a direct apples-to-apples on the surfaces).
+schema: pg_hardstorage.scenario.v1
+name: L8-verify-existence-only-fast-path
+tier: L8
+description: |
+  Take backup → `verify <id> --existence-only` (fast Stat
+  pre-flight) AND `verify <id>` (full SHA round-trip) both
+  must succeed.  Pins the dual-mode verify contract.
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  - seed:
+      target_gb: 1
+
+  - take_backup:
+      deployment: l8-verify-fastpath
+      name: only_backup
+
+  # Fast pre-flight: existence-only.  Stat the chunks, do
+  # not fetch.  This must complete in well under a second
+  # on a 1 GB seed.  Any regression that silently fetches +
+  # decrypts would still exit 0 but the timeout below
+  # would catch a massive regression in runtime.
+  - cli_run:
+      args:
+        - "verify"
+        - "$DEPLOYMENT"
+        - "$LAST_BACKUP"
+        - "--repo"
+        - "$REPO"
+        - "--existence-only"
+      timeout: 30s
+
+  # Full verify: fetch + decrypt + SHA-256 round-trip every
+  # chunk.  The 2 minute budget is generous for a 1 GB
+  # backup (~few hundred chunks); 30 s is a more realistic
+  # cap for the existence-only path.
+  - cli_run:
+      args:
+        - "verify"
+        - "$DEPLOYMENT"
+        - "$LAST_BACKUP"
+        - "--repo"
+        - "$REPO"
+      timeout: 120s
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

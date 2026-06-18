@@ -1,0 +1,84 @@
+# L3_wal_stream_s3.scenario.yaml
+#
+# Continuous streaming against an S3-compatible repo
+# (MinIO emulator).  Mirrors L3_wal_stream_continuous in
+# every step except the sink — exists to gate the S3
+# upload path on every test run, since S3 is the
+# canonical production backend.
+#
+# Why a sink-specific copy: the streamer's segment-commit
+# path goes through walsink → CAS → storage plugin.  The
+# S3 plugin uses the AWS SDK v2 with multi-part upload,
+# while the file:// plugin is a plain rename.  Either
+# can regress independently; the file:// continuous
+# scenario doesn't catch S3 SDK changes, and the per-sink
+# correctness scenarios (L3_restore_correctness_s3) don't
+# stream.  This scenario fills the gap.
+#
+# What gets exercised end-to-end:
+#
+#   * `sink: { kind: s3-minio }` — the orchestrator
+#     brings up a MinIO container, the streamer points
+#     at an `s3://...` repo URL, and every WAL segment
+#     commit becomes an S3 PutObject.
+#   * Same continuous-stream pattern as the file://
+#     baseline: streamer running before/during/after the
+#     base backup, post-backup load reachable only via
+#     the streamed archive.
+#   * `assert_restored_match` strict — byte-equal
+#     checksum match through the S3 round-trip.
+#
+# Pass criterion: byte-equal checksum match.  Any S3-
+# specific regression (multipart-upload boundary bug,
+# region-config drift, signature-v4 churn) surfaces here
+# and not in the file:// baseline.
+#
+# Air-gap: pre-pull the MinIO image once on a connected
+# box:
+#   pg_hardstorage_testkit image pull-sinks --only=s3-minio
+#
+# Wall-clock budget: ~3-4 minutes.
+schema: pg_hardstorage.scenario.v1
+name: L3-wal-stream-s3
+tier: L3
+description: |
+  Continuous WAL streaming against an S3 (MinIO) repo,
+  with a base backup running concurrently.  Pass
+  criterion: PITR byte-equal match through the S3
+  upload + download round-trip.
+topology:
+  provider: local-docker
+  pg_version: "17"
+sink:
+  kind: s3-minio
+load:
+  file: test/load/failover_loop.load.yaml
+steps:
+  - wal_stream:
+      action: start
+  - seed:
+      target_gb: 1
+  - take_backup:
+      deployment: l3-wal-stream-s3
+  - run_load:
+      duration: 15s
+  - capture_lsn:
+      name: post_s3_load
+      checksum_query: |
+        select
+          count(*)::text || '|' ||
+          coalesce(sum(abalance)::text, '0') || '|' ||
+          coalesce(sum(hashtextextended(t::text, 0))::text, '0')
+        from pgbench_accounts t
+  - switch_wal: {}
+  - wal_stream:
+      action: stop
+  - restore:
+      deployment: l3-wal-stream-s3
+      name: post_s3_load
+  - assert_restored_match:
+      name: post_s3_load
+      strict: true
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

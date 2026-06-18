@@ -1,0 +1,93 @@
+# L2_compat_pgbackrest.scenario.yaml
+#
+# Tier L2: end-to-end smoke for the pg-hardstorage-pgbackrest
+# compat shim.  Drives the REAL shim binary against a
+# synthetic 16 MiB WAL segment + a `.backup` companion file,
+# inside the OS container the run_compat_testing.sh driver
+# substitutes via the os_image step parameter (or on the host
+# when the scenario runs stand-alone).
+#
+# What this scenario protects:
+#
+#   - The shim binary exits cleanly on archive-push of a real
+#     16 MiB segment (regression of any future translate-table
+#     break).
+#
+#   - The shim's archive-push routes a `.backup` companion
+#     through the issue #10 aux-file path (bytes land at the
+#     canonical wal/<stanza>/<TLI>/<basename> key — the same
+#     layout the native CLI produces).
+#
+#   - The shim's archive-get returns the segment byte-for-byte
+#     (so `restore_command = pgbackrest archive-get` would
+#     work end-to-end during real recovery).
+#
+#   - The translate.go flag-mapping (--repo1-path → --repo,
+#     --stanza → deployment) hasn't drifted from the native
+#     CLI's contract.
+#
+# Multi-OS coverage: run_compat_testing.sh runs this scenario
+# once per (os_image × pg_version) cell.  The PG version
+# doesn't actually matter here — the step doesn't bring up
+# PG; it drives the shim binary against a synthetic segment.
+# The os_image is the meaningful axis (glibc vs musl, distro
+# package surface, Cobra/Go runtime under each kernel).
+
+schema: pg_hardstorage.scenario.v1
+name: L2-compat-pgbackrest
+tier: L2
+description: |
+  pg-hardstorage-pgbackrest end-to-end: archive-push 16 MiB
+  segment + .backup companion + archive-get round-trip,
+  inside the os_image container the driver script picks.
+
+# topology.pg_version is unused by the compat_archive step
+# (no PG bring-up needed) but the runner requires a topology
+# block.  The local-docker provider boots a transient PG
+# container we never query, so the smallest supported PG
+# version keeps the bring-up cheap.
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  # 1. Plain segment — proves the basic archive-push flow.
+  - compat_archive:
+      shim: pgbackrest
+      deployment: compat-pgbr-stanza
+      fixture: segment
+
+  # 2. Segment + .backup companion — proves issue #10's
+  #    aux-file path is reachable through the shim, not just
+  #    through the native CLI.
+  - compat_archive:
+      shim: pgbackrest
+      deployment: compat-pgbr-stanza
+      fixture: segment_plus_backup
+
+  # 3. Timeline-history file — separate aux-file class with
+  #    its own canonical key (wal/<stanza>/history/<basename>).
+  #    Caught a bug in the layout helper during dev;
+  #    keep it pinned.
+  - compat_archive:
+      shim: pgbackrest
+      deployment: compat-pgbr-stanza
+      fixture: history
+
+  # 4. Idempotent re-push.  PG retries archive_command on
+  #    transient errors (network blip, repo briefly
+  #    unreachable) AND on operator restart.  Re-pushing the
+  #    same segment must be a no-op success — without this
+  #    the operator's archive_command would fail every
+  #    restart, silently (PG eats archive_command stdout).
+  #    The native CLI gets this right via
+  #    RenameIfNotExists / ErrAlreadyExists; the shim must
+  #    not break the chain.
+  - compat_archive:
+      shim: pgbackrest
+      deployment: compat-pgbr-stanza
+      fixture: segment_idempotent
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

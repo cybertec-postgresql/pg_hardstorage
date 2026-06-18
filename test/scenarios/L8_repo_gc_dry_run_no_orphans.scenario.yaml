@@ -1,0 +1,71 @@
+# L8_repo_gc_dry_run_no_orphans.scenario.yaml
+#
+# Tier L8 — `repo gc` (dry-run, default) on a clean chain
+# must report ZERO orphan chunks.  Every chunk in the repo
+# is referenced by at least one manifest in the chain by
+# construction (no manifest deletes happened).
+#
+# What this catches:
+#   * GC false positives: a regression that mis-walks the
+#     manifest reference graph (e.g. only looking at the
+#     LATEST manifest, missing chunks referenced only by
+#     earlier ones) would mark earlier-only chunks as
+#     orphans here.  An operator who then ran with
+#     --apply would silently lose data for the older
+#     backup.  This dry-run gate is the canary.
+#   * Tombstone-grace default behaviour: with no
+#     tombstoned manifests in the chain, the grace
+#     window doesn't apply; gc must still walk cleanly.
+#
+# Pairs with L8_long_chain_restore_all: that scenario
+# pins "older backups remain restorable"; this one pins
+# "GC doesn't think older-backup-only chunks are
+# eligible for reclaim."
+#
+# Wall-clock budget: ~3 minutes (1 GB seed + 3 backups +
+# gc dry-run).
+schema: pg_hardstorage.scenario.v1
+name: L8-repo-gc-dry-run-no-orphans
+tier: L8
+description: |
+  3-backup chain → `repo gc` (dry-run) must surface
+  zero orphan chunks.
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  - seed:
+      target_gb: 1
+
+  - take_backup:
+      deployment: l8-repo-gc
+      name: backup_1
+
+  - take_backup:
+      deployment: l8-repo-gc
+      name: backup_2
+
+  - take_backup:
+      deployment: l8-repo-gc
+      name: backup_3
+
+  # Dry-run gc: command must exit 0 and report orphan
+  # candidates (or zero, on a clean chain).  We don't
+  # pass --apply — this is a no-op probe.  The JSON
+  # output includes an orphan-count field that's expected
+  # to be 0, but we don't structurally assert that here
+  # (the output schema isn't pinned in v1 scenario
+  # surface); the gate is "command runs cleanly on a
+  # populated repo."
+  - cli_run:
+      args:
+        - "repo"
+        - "gc"
+        - "$REPO"
+      timeout: 60s
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

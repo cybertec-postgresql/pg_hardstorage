@@ -1,0 +1,106 @@
+# L3_wal_stream_long_backup_window.scenario.yaml
+#
+# Models the production "daily base backup, continuous
+# stream" pattern most operators run:
+#
+#     systemctl enable --now pg_hardstorage-wal-stream@db1
+#     # ... and every night:
+#     pg_hardstorage backup db1 --pg-connection ... --repo ...
+#
+# A real daily backup against a non-trivial cluster runs for
+# minutes-to-hours.  The streamer must keep up with the
+# write workload that lands during that window — its job is
+# precisely to cover the gap between successive base
+# backups.  This scenario shrinks the daily-window pattern
+# down to a 3 GB seed (so take_backup spans a real window of
+# wall-clock time) but keeps the qualitative shape intact:
+# streamer running before the backup begins, running
+# concurrently throughout, running afterwards too.
+#
+# What gets exercised end-to-end:
+#
+#   * `seed: { target_gb: 3 }` produces ~3 GB of pgbench
+#     data — enough that the subsequent take_backup spans
+#     a meaningful window (1-2 minutes on warm Docker, 10+
+#     minutes on cold disk).  The streamer must NOT fall
+#     behind PG's WAL generation rate during this seed
+#     phase.
+#   * `take_backup` runs while the streamer is active.  PG
+#     handles two replication connections at once
+#     (BASE_BACKUP + START_REPLICATION SLOT); the streamer
+#     shares I/O bandwidth with the base-backup tar stream
+#     yet still flushes segments at PG's pace.
+#   * Post-backup `run_load` produces WAL the basebackup
+#     doesn't carry — ONLY the streamer covers it.  PITR
+#     forward replay through that streamed window is the
+#     correctness gate.
+#
+# Pass criterion: byte-equal checksum match.  A streamer
+# that fell behind during the long backup window would
+# leave a hole between backup-end-LSN and the captured LSN
+# that PITR cannot fill.
+#
+# Wall-clock budget: ~6-8 minutes (3 GB seed dominates).
+schema: pg_hardstorage.scenario.v1
+name: L3-wal-stream-long-backup-window
+tier: L3
+description: |
+  Streamer + 3 GB seed + real-window basebackup + post-
+  backup workload.  Mirrors the canonical daily-backup
+  production deployment shape.  Pass criterion: PITR
+  byte-equal match through the streamed archive.
+topology:
+  provider: local-docker
+  pg_version: "17"
+load:
+  file: test/load/failover_loop.load.yaml
+steps:
+  - wal_stream:
+      action: start
+
+  # 3 GB pgbench seed.  Streamer keeps up with the bulk-
+  # load WAL rate; if it doesn't, the post-seed segment
+  # commit lag pushes captured-LSN flush past the test
+  # budget and the scenario fails on segment finalisation.
+  - seed:
+      target_gb: 3
+
+  # Brief warmup so the cluster reaches a steady-state
+  # checkpoint cadence before take_backup.  Not strictly
+  # required, but matches real-world conditions where the
+  # nightly backup runs against a warm primary, not a
+  # just-loaded one.
+  - run_load:
+      duration: 10s
+
+  # The base backup itself.  Against a 3 GB cluster on a
+  # warm laptop, this runs for ~1-2 minutes — long enough
+  # to be a real "window" the streamer must cover.
+  - take_backup:
+      deployment: l3-wal-stream-long-backup-window
+
+  # Post-backup workload.  Every byte of WAL produced here
+  # is reachable only via the streamed archive.
+  - run_load:
+      duration: 15s
+
+  - capture_lsn:
+      name: post_long_backup
+      checksum_query: |
+        select
+          count(*)::text || '|' ||
+          coalesce(sum(abalance)::text, '0') || '|' ||
+          coalesce(sum(hashtextextended(t::text, 0))::text, '0')
+        from pgbench_accounts t
+  - switch_wal: {}
+  - wal_stream:
+      action: stop
+  - restore:
+      deployment: l3-wal-stream-long-backup-window
+      name: post_long_backup
+  - assert_restored_match:
+      name: post_long_backup
+      strict: true
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

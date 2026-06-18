@@ -1,0 +1,127 @@
+# Default values for the pg-hardstorage-sidecar chart.
+#
+# This chart deploys a single agent replica as a StatefulSet so
+# the state PVC and pod identity stay stable across restarts.
+# The "sidecar" naming is historic -- the v0.1 chart packages a
+# standalone agent. True per-pod sidecar injection lands with
+# the v0.5 operator.
+
+image:
+  repository: ghcr.io/cybertec-postgresql/pg_hardstorage
+  # Pin to a digest in production. The default tag tracks the
+  # chart's appVersion.
+  tag: ""
+  pullPolicy: IfNotPresent
+  pullSecrets: []
+
+# Number of agent replicas. Always 1 in v0.1 -- the agent
+# coordinates state via filesystem locks and does not yet
+# support active/active. Setting this higher will produce
+# duplicate backups and audit-log churn.
+replicaCount: 1
+
+# The pg_hardstorage.yaml that the agent reads. Rendered into a
+# ConfigMap and mounted at /etc/pg_hardstorage/pg_hardstorage.yaml.
+# Override in your values file -- the default is intentionally
+# empty so a `helm install` without overrides fails fast.
+config: ""
+
+# Extra environment variables passed straight through to the
+# agent container. Common case: pointers at the keyring secret
+# or a passphrase fetched via secretKeyRef.
+env: []
+# - name: PG_HARDSTORAGE_KEYRING_PASSPHRASE
+#   valueFrom:
+#     secretKeyRef:
+#       name: pg-hardstorage-keyring
+#       key: passphrase
+
+# Resource budget. The defaults assume a small cluster
+# (single deployment, modest WAL volume). Tune up for busy
+# clusters.
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+# Persistence for /var/lib/pg_hardstorage. Required: the
+# inflight markers, audit log, and local manifest cache live
+# here. Disabling persistence is supported for ephemeral lab
+# work but will produce a warning in `pg_hardstorage doctor`.
+persistence:
+  enabled: true
+  size: 10Gi
+  storageClass: ""
+  accessModes:
+    - ReadWriteOnce
+  annotations: {}
+
+# Pod scheduling controls.
+nodeSelector: {}
+tolerations: []
+affinity: {}
+topologySpreadConstraints: []
+priorityClassName: ""
+
+# The distroless :nonroot variant runs as 65532. Keep these
+# aligned with the image's USER directive.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+rbac:
+  # The standalone agent does not talk to the Kubernetes API.
+  # Set to true if you wire a future controller integration in
+  # via env vars.
+  create: false
+
+# Service exposing /metrics and /healthz.
+service:
+  enabled: true
+  type: ClusterIP
+  port: 9090
+  annotations: {}
+
+# Liveness / readiness against the agent's healthz endpoint.
+# The endpoint lands with v0.2; until then the chart points
+# at /metrics, which the agent serves once it is up.
+probes:
+  liveness:
+    enabled: true
+    path: /metrics
+    initialDelaySeconds: 10
+    periodSeconds: 30
+  readiness:
+    enabled: true
+    path: /metrics
+    initialDelaySeconds: 5
+    periodSeconds: 10
+
+# Pod-level annotations and labels (e.g. for Prometheus scrape
+# config or service-mesh sidecars).
+podAnnotations: {}
+podLabels: {}
+
+# Optional CLI args appended to the entrypoint. The chart hard-
+# codes `agent` as the subcommand; everything in `args` flows
+# in after that.
+args: []

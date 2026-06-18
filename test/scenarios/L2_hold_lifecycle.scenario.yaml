@@ -1,0 +1,144 @@
+# L2_hold_lifecycle.scenario.yaml
+#
+# E2E coverage for the legal-hold protection invariant.  A backup
+# under hold MUST refuse `backup delete`; releasing the hold MUST
+# re-enable delete.  The whole cycle is recorded in the audit
+# chain (proven elsewhere in L2_audit_chain).
+#
+# Why this matters: legal hold is the regulatory-compliance kill
+# switch — if `hold add` doesn't actually block delete, an operator
+# can erase evidence under subpoena.  Unit tests prove the CLI
+# surfaces work in isolation; this scenario proves they work
+# end-to-end against a real PG, real repo, real audit chain.
+#
+# What gets exercised:
+#
+#   * hold add — places a marker file in the repo
+#   * hold list — sees the marker
+#   * backup delete WITHOUT --cascade — must fail when held
+#   * hold remove — clears the marker
+#   * hold list — empty after removal
+#   * backup delete — succeeds after release
+#
+# Pass criterion: every step exits with the asserted code.  A
+# regression in the hold→delete protection surfaces as the
+# "must-fail" delete unexpectedly succeeding (expect_exit: 1
+# but cmd returned 0).
+#
+# Wall-clock budget: ~10s (no chaos, no streaming).
+
+schema: pg_hardstorage.scenario.v1
+name: L2-hold-lifecycle
+tier: L2
+description: |
+  Legal-hold round-trip: add hold, prove delete refuses, remove
+  hold, prove delete proceeds.  Drives the hold + backup CLI
+  surfaces end-to-end via cli_run.
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  # 1. Take a backup so we have something to hold.
+  - take_backup:
+      deployment: l2-hold-lifecycle
+
+  # 2. Confirm an empty hold list before we add one — guards
+  # against earlier scenarios (or stale state) leaking holds
+  # into this run.  No structural assertion on the body shape
+  # beyond "command succeeded with JSON output".
+  - cli_run:
+      args: ["hold", "list", "--repo", "$REPO", "--output", "json"]
+      expect_exit: 0
+      expect_stdout_contains: "schema"
+
+  # 3. Place the hold.  --reason / --holder are free-form audit
+  # metadata; the marker file's presence is what protects the
+  # backup, not the metadata.
+  - cli_run:
+      args:
+        - "hold"
+        - "add"
+        - "$DEPLOYMENT"
+        - "$LAST_BACKUP"
+        - "--repo"
+        - "$REPO"
+        - "--reason"
+        - "L2_hold_lifecycle scenario"
+        - "--holder"
+        - "testkit"
+        - "--output"
+        - "json"
+      expect_exit: 0
+
+  # 4. hold list now reports the marker.  We assert the backup ID
+  # appears in stdout — that's the canonical signal the marker
+  # is registered against the right backup.
+  - cli_run:
+      args: ["hold", "list", "--repo", "$REPO", "--output", "json"]
+      expect_exit: 0
+      expect_stdout_contains: "$LAST_BACKUP"
+
+  # 5. ATTEMPT TO DELETE under hold — MUST FAIL.  This is the
+  # invariant the whole feature exists to guarantee.
+  #
+  # Structured exit code 7 maps to `conflict.manifest_held`.
+  # Pinning the specific code (rather than "any non-zero")
+  # catches a regression where backup delete starts returning
+  # a different error class for the same input — silently
+  # changing the operator-visible signal even if the protect
+  # behavior still works.
+  - cli_run:
+      args:
+        - "backup"
+        - "delete"
+        - "$DEPLOYMENT"
+        - "$LAST_BACKUP"
+        - "--repo"
+        - "$REPO"
+        - "--reason"
+        - "scenario probe — should fail because of hold"
+      expect_exit: 7
+      expect_stderr_contains: "conflict.manifest_held"
+
+  # 6. Release the hold.  --yes is required (auditable
+  # confirmation flag — releasing a hold is the kind of
+  # mutation that should never happen by accident).
+  - cli_run:
+      args:
+        - "hold"
+        - "remove"
+        - "$DEPLOYMENT"
+        - "$LAST_BACKUP"
+        - "--repo"
+        - "$REPO"
+        - "--yes"
+        - "--output"
+        - "json"
+      expect_exit: 0
+
+  # 7. hold list reports an empty (or at least no-marker-for-this-
+  # backup) state.  We don't assert "empty" textually because the
+  # JSON envelope includes scaffolding ("schema", "command", ...);
+  # asserting the BACKUP ID is NOT present would require negation
+  # which cli_run doesn't model.  Instead: the next step (delete)
+  # succeeding is the canonical proof the hold is gone.
+
+  # 8. Delete now succeeds.  This is the post-condition proving
+  # the hold->release cycle was honoured end-to-end.
+  - cli_run:
+      args:
+        - "backup"
+        - "delete"
+        - "$DEPLOYMENT"
+        - "$LAST_BACKUP"
+        - "--repo"
+        - "$REPO"
+        - "--reason"
+        - "scenario teardown"
+      expect_exit: 0
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

@@ -1,0 +1,34 @@
+# L7_docker_pause_then_cgroup_recovery.scenario.yaml
+#
+# Tier L7 resource exhaustion: interleaved IO + memory
+# pressure on the same primary.  docker_pause freezes
+# the PG container's processes (IO/CPU starvation
+# proxy), recover; cgroup_squeeze on PG (memory
+# pressure), recover; then backup.  Two recovery cycles
+# stacked on the same target surface a different
+# cumulative-state class than the chaos chain.
+# cgroup_squeeze has no convenience-map entry yet, so
+# it's expressed as a raw registry action.
+schema: pg_hardstorage.scenario.v1
+name: L7-docker-pause-then-cgroup-recovery
+tier: L7
+description: |
+  docker_pause + cgroup_squeeze, each healed, then backup.
+topology:
+  provider: local-docker
+  pg_version: "17"
+steps:
+  - seed:
+      target_gb: 1
+  - inject:
+      kind: docker_pause
+      target: pg
+      heal_window: 15s
+  - inject:
+      action: "cgroup_squeeze(target=pg, max_bytes=536870912)"
+      heal_window: 15s
+  - take_backup:
+      deployment: l7-pause-cgroup
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

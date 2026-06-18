@@ -1,0 +1,45 @@
+#!/bin/sh
+# postrm for pg-hardstorage.
+#
+# `remove` keeps state on disk -- a reinstall must be able to
+# resume against existing manifests. `purge` is the explicit
+# "I want this gone" path: it drops the system user and the
+# state/cache/log trees. Config is left in place because it may
+# contain operator secrets the user wants to recover manually.
+
+set -e
+
+PG_HS_USER=pgbackup
+PG_HS_GROUP=pgbackup
+
+case "$1" in
+    purge)
+        for d in \
+            /var/lib/pg_hardstorage \
+            /var/cache/pg_hardstorage \
+            /var/log/pg_hardstorage \
+            /run/pg_hardstorage
+        do
+            if [ -d "$d" ]; then
+                rm -rf "$d"
+            fi
+        done
+
+        if getent passwd "$PG_HS_USER" >/dev/null 2>&1; then
+            deluser --system "$PG_HS_USER" >/dev/null 2>&1 || true
+        fi
+        if getent group "$PG_HS_GROUP" >/dev/null 2>&1; then
+            delgroup --system "$PG_HS_GROUP" >/dev/null 2>&1 || true
+        fi
+        ;;
+    remove|upgrade|failed-upgrade|abort-install|abort-upgrade|disappear)
+        ;;
+    *)
+        echo "postrm called with unknown argument \`$1'" >&2
+        exit 1
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

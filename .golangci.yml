@@ -1,0 +1,66 @@
+# golangci-lint configuration. We ship this in repo so contributor
+# `golangci-lint run` produces the same findings as CI.
+#
+# Posture: the strict-but-realistic baseline. Findings are surfaced
+# but don't fail PRs yet (CI uses --issues-exit-code=0); once the
+# main-branch report is empty for two weeks we promote to a hard gate.
+
+version: "2"
+
+run:
+  timeout: 5m
+  tests: true
+  build-tags:
+    - integration
+
+linters:
+  default: standard
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - bodyclose
+    - errorlint
+    - gocritic
+    - misspell
+    - prealloc
+    - revive
+    - unconvert
+    - unparam
+    - usestdlibvars
+    - whitespace
+
+  settings:
+    revive:
+      rules:
+        - name: unused-parameter
+          disabled: true   # cobra RunE / iterator yields legitimately ignore params
+    gocritic:
+      disabled-checks:
+        - ifElseChain
+        - paramTypeCombine
+
+  exclusions:
+    paths:
+      - bin/
+      - dist/
+    rules:
+      # Test files routinely exercise error paths via t.Fatal — let
+      # them ignore Close() returns from helpers.
+      - path: _test\.go
+        linters: [errcheck, bodyclose]
+      # Generated CLI completion / etc. is exempt from staticcheck's
+      # API recommendations.
+      - path: completion\.go
+        linters: [staticcheck, revive]
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/cybertec-postgresql/pg_hardstorage

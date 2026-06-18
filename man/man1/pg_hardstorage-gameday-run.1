@@ -1,0 +1,111 @@
+.nh
+.TH "PG_HARDSTORAGE" "1" "May 2026" "pg_hardstorage Manual" "pg_hardstorage Manual"
+
+.SH NAME
+.PP
+pg_hardstorage-gameday-run - Run one chaos scenario, return structured Pass/Fail
+
+
+.SH SYNOPSIS
+.PP
+\fBpg_hardstorage gameday run  [flags]\fP
+
+
+.SH DESCRIPTION
+.PP
+Run one chaos scenario from the registry.
+
+.PP
+v0.1 scenarios document the invariant they assert and (when run with
+--dry-run) the planned fault injection; runtime drive of the kill
+signal / 503-storm / Patroni switchover lands alongside the
+supervisor's child-control surface and the storage plugin's
+fault-injection middleware.
+
+.PP
+The CLI shape is locked: an operator wiring 'gameday run agent_kill'
+into a quarterly cron today gets the same invocation when lands.
+
+.PP
+Use 'gameday list' to see registered scenarios.
+
+
+.SH OPTIONS
+.PP
+\fB--deployment\fP=""
+	deployment to target (scenario-dependent)
+
+.PP
+\fB--dry-run\fP[=false]
+	print the planned action; don't inject the fault
+
+.PP
+\fB--fault-duration\fP=0s
+	how long the fault is held active (scenario default applies if 0)
+
+.PP
+\fB-h\fP, \fB--help\fP[=false]
+	help for run
+
+.PP
+\fB--recover-within\fP=0s
+	upper bound for recovery (scenario default applies if 0)
+
+.PP
+\fB--repo\fP=""
+	repository URL (scenario-dependent)
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+.PP
+\fB--airgapped\fP[=false]
+	refuse outbound endpoints (LLM providers, sinks, OTLP collectors) outside loopback / RFC1918 / explicit airgap.allowlist. Also enabled by PG_HARDSTORAGE_AIRGAPPED=1 or \fBairgapped: strict\fR in the config file.
+
+.PP
+\fB-c\fP, \fB--config\fP=""
+	path to config file (default: XDG/FHS lookup)
+
+.PP
+\fB--cpu-profile\fP=""
+	write a pprof CPU profile to this path for the duration of the command (\fBgo tool pprof <path>\fR to analyse). Off when empty.
+
+.PP
+\fB--mem-profile\fP=""
+	write a pprof heap profile to this path at command exit. Off when empty.
+
+.PP
+\fB--no-color\fP[=false]
+	disable ANSI color in text output
+
+.PP
+\fB--on-error-llm\fP[=false]
+	on a structured-error failure, drop into the matching LLM helper skill (auto_on_error trigger). Also enabled by PG_HARDSTORAGE_ON_ERROR_LLM=1.
+
+.PP
+\fB--otel-endpoint\fP=""
+	OpenTelemetry OTLP/HTTP endpoint (e.g. http://otel-collector:4318); empty disables tracing
+
+.PP
+\fB--otel-stdout\fP[=false]
+	also export OpenTelemetry traces to stderr (useful for dev)
+
+.PP
+\fB-o\fP, \fB--output\fP=""
+	output format: text|json|ndjson|yaml|template|csv|markdown|html|tap|junit|pdf (default: text on TTY, json off-TTY)
+
+.PP
+\fB--profile-port\fP=0
+	if non-zero, expose net/http/pprof on 127.0.0.1: for live profiling of long-running commands (e.g. \fBgo tool pprof http://127.0.0.1:6060/debug/pprof/profile?seconds=30\fR). Off when zero.
+
+.PP
+\fB-q\fP, \fB--quiet\fP[=false]
+	suppress non-essential output
+
+.PP
+\fB--template\fP=""
+	Go text/template applied when --output template (or implied if --template is set without --output)
+
+
+.SH SEE ALSO
+.PP
+\fBpg_hardstorage-gameday(1)\fP

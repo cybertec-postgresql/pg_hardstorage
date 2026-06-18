@@ -1,0 +1,129 @@
+# L3_recovery_drill_history.scenario.yaml
+#
+# Tier L3 — `recovery drill history`: walks the recovery/
+# drills/ records the agent auto-persists each time
+# `recovery drill` runs.  Compliance auditors use this to
+# answer "show me every drill run for this deployment in
+# the last 90 days and the verdict each time".
+#
+# Headline property: an empty repo returns an empty
+# history (exit 0, empty slice); after `recovery drill`
+# runs, the history surfaces that drill's entry.  Filter
+# flags (--verdict, --since, --until, --limit, --reverse)
+# parse correctly.
+#
+# Leaves covered (gate scope):
+#   * recovery drill history
+#
+# Wall-clock budget: ~3 minutes (drill restores into a
+# postgres:17 sandbox).
+#
+# NOTE: this scenario INTENTIONALLY duplicates the drill
+# from L8_recovery_drill_latest — we need the drill side
+# effect (a history entry) but don't want to depend on
+# L8 having run, so each scenario is independent.
+
+schema: pg_hardstorage.scenario.v1
+name: L3-recovery-drill-history
+tier: L3
+description: |
+  Take backup → drill (records a history entry) → history
+  walk shows the entry → filter / format / limit flags
+  parse cleanly.
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  - take_backup:
+      deployment: l3-recovery-drill-history
+
+  # 1. Empty history pre-drill — exits 0, empty slice.
+  - cli_run:
+      args:
+        - "recovery"
+        - "drill"
+        - "history"
+        - "$DEPLOYMENT"
+        - "--repo"
+        - "$REPO"
+      expect_exit: 0
+
+  # 2. Run a drill.  --skip-verify keeps the scenario
+  # fast — the drill records its history entry whether
+  # or not pg_verifybackup ran.  L8_recovery_drill_latest
+  # covers the verify path; this scenario's job is to
+  # exercise the history walker, not the drill engine.
+  - cli_run:
+      args:
+        - "recovery"
+        - "drill"
+        - "$DEPLOYMENT"
+        - "--repo"
+        - "$REPO"
+        - "--skip-verify"
+        - "--operator"
+        - "scenario:l3-recovery-drill-history"
+      expect_exit: 0
+      timeout: 5m
+
+  # 3. History walk — must see the drill entry.  Exact
+  # JSON shape is intentionally not asserted (changes
+  # across versions); the smoke is that the command
+  # surfaces non-empty output.
+  - cli_run:
+      args:
+        - "recovery"
+        - "drill"
+        - "history"
+        - "$DEPLOYMENT"
+        - "--repo"
+        - "$REPO"
+      expect_exit: 0
+      expect_stdout_contains: "scenario:l3-recovery-drill-history"
+
+  # 4. --format=markdown — proves the alternate renderer
+  # is wired.
+  - cli_run:
+      args:
+        - "recovery"
+        - "drill"
+        - "history"
+        - "$DEPLOYMENT"
+        - "--repo"
+        - "$REPO"
+        - "--format"
+        - "markdown"
+      expect_exit: 0
+
+  # 5. --summarize — proves the rollup path is wired.
+  - cli_run:
+      args:
+        - "recovery"
+        - "drill"
+        - "history"
+        - "$DEPLOYMENT"
+        - "--repo"
+        - "$REPO"
+        - "--summarize"
+      expect_exit: 0
+
+  # 6. --limit=0 (all) + --reverse=false — exercise the
+  # remaining flag combinations.
+  - cli_run:
+      args:
+        - "recovery"
+        - "drill"
+        - "history"
+        - "$DEPLOYMENT"
+        - "--repo"
+        - "$REPO"
+        - "--limit"
+        - "0"
+        - "--reverse=false"
+      expect_exit: 0
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

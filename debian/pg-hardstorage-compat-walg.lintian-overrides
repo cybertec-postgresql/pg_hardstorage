@@ -1,0 +1,13 @@
+# Lintian overrides for pg-hardstorage-compat-walg.
+#
+# Same rationale as the compat-barman override file: the shim binary
+# delegates to pg_hardstorage's main CLI; its behaviour is documented
+# in the parent package's manpages and in
+# docs/how-to/migration/from-walg.md (shipped by
+# pg-hardstorage-common).
+pg-hardstorage-compat-walg: no-manual-page [usr/bin/pg-hardstorage-walg]
+
+# Initial upload (this package has never been in Debian); the
+# changelog correctly closes no bugs because there are no bugs to
+# close yet.
+pg-hardstorage-compat-walg: initial-upload-closes-no-bugs

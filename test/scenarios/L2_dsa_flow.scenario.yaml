@@ -1,0 +1,102 @@
+# L2_dsa_flow.scenario.yaml
+#
+# Tier L2 — Data Subject Access (DSA) workflow: `dsa locate
+# | show | verify`.  GDPR Art. 15 (access) / Art. 17
+# (erasure) operator surfaces.
+#
+# Headline property: an operator can issue a DSA-locate
+# report for a subject across the deployment, retrieve the
+# signed report by ID, and verify its signature.
+#
+# locate's --skip-sign mode produces a report without
+# persisting it (testing path); locate's full mode signs +
+# persists.  We exercise both.
+#
+# Leaves covered (gate scope):
+#   * dsa locate
+#   * dsa show
+#   * dsa verify
+#
+# Wall-clock budget: ~15s.
+
+schema: pg_hardstorage.scenario.v1
+name: L2-dsa-flow
+tier: L2
+description: |
+  take_backup → dsa locate (signed) → dsa locate
+  (--skip-sign cross-cover) → dsa show / verify against
+  a synthetic id (negative — runner has no stdout-into-
+  state capture for the locate report-id).
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  - take_backup:
+      deployment: l2-dsa-flow
+
+  # 1. locate signed.  Subject ID is hashed before
+  # recording; we use a synthetic value.
+  - cli_run:
+      args:
+        - "dsa"
+        - "locate"
+        - "--repo"
+        - "$REPO"
+        - "--subject-id"
+        - "scenario-probe-subject-1"
+        - "--tenant"
+        - "scenario-tenant"
+        - "--article"
+        - "art_15_access"
+        - "--note"
+        - "scenario probe: signed locate"
+      expect_exit: 0
+
+  # 2. locate --skip-sign — produces the report but does
+  # not persist.  Useful for operators who want a preview
+  # before committing audit-bound bytes.
+  - cli_run:
+      args:
+        - "dsa"
+        - "locate"
+        - "--repo"
+        - "$REPO"
+        - "--subject-id"
+        - "scenario-probe-subject-2"
+        - "--tenant"
+        - "scenario-tenant"
+        - "--article"
+        - "art_17_erasure"
+        - "--skip-sign"
+        - "--note"
+        - "scenario probe: skip-sign preview"
+      expect_exit: 0
+
+  # 3. Negative show: synthetic report-id.  The runner has
+  # no way to capture locate's stdout into a placeholder,
+  # so we can't show the just-emitted report by ID; the
+  # negative case still proves show validates inputs.
+  - cli_run:
+      args:
+        - "dsa"
+        - "show"
+        - "00000000-no-such-dsa-report-00000000"
+        - "--repo"
+        - "$REPO"
+      expect_exit: 6
+
+  # 4. Negative verify: same.
+  - cli_run:
+      args:
+        - "dsa"
+        - "verify"
+        - "00000000-no-such-dsa-report-00000000"
+        - "--repo"
+        - "$REPO"
+      expect_exit: 6
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

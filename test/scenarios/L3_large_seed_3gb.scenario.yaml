@@ -1,0 +1,43 @@
+# L3_large_seed_3gb.scenario.yaml — same shape as L3_restore_
+# correctness, but 3× the seed.  Catches correctness
+# regressions that only manifest on multi-segment basebackups
+# (e.g. tar boundary off-by-one, manifest CRC32C accumulating
+# bug, chunker spanning multiple checksum windows).
+#
+# Wall-clock budget: ~5-6 minutes.
+schema: pg_hardstorage.scenario.v1
+name: L3-large-seed-3gb
+tier: L3
+description: |
+  Backup → restore round-trip on a 3 GB pgbench seed.
+  Same defence stack as L3-restore-correctness; bigger
+  data surfaces tar-boundary / multi-segment regressions.
+topology:
+  provider: local-docker
+  pg_version: "17"
+steps:
+  - seed:
+      target_gb: 3
+  - capture_lsn:
+      name: post_seed
+      checksum_query: |
+        select
+          count(*)::text || '|' ||
+          coalesce(sum(abalance)::text, '0') || '|' ||
+          coalesce(sum(hashtextextended(t::text, 0))::text, '0')
+        from pgbench_accounts t
+  - take_backup:
+      deployment: l3-large-seed-3gb
+  - restore:
+      deployment: l3-large-seed-3gb
+      name: post_seed
+  - assert_restored_match:
+      name: post_seed
+      strict: true
+asserts:
+  - count_exact:
+      table: pgbench_accounts
+      value: 20100000  # scale=201 → 6.7M × 3
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

@@ -1,0 +1,76 @@
+# L2_notify_remove.scenario.yaml
+#
+# Tier L2 — notify cross-cover.  2nd touch for add + remove
+# with multiple sinks.
+#
+# Leaves covered (gate scope — 2nd touch):
+#   * notify add (2nd, --yes replace path)
+#   * notify remove (2nd, multiple)
+#
+# Wall-clock budget: ~10s.
+
+schema: pg_hardstorage.scenario.v1
+name: L2-notify-remove
+tier: L2
+description: |
+  add two sinks → replace one with --yes → remove both.
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  - cli_run:
+      args:
+        - "notify"
+        - "add"
+        - "webhook"
+        - "--name"
+        - "l2-notify-a"
+        - "--set"
+        - "url=http://127.0.0.1:9/probe"
+      expect_exit: 0
+
+  - cli_run:
+      args:
+        - "notify"
+        - "add"
+        - "webhook"
+        - "--name"
+        - "l2-notify-b"
+        - "--set"
+        - "url=http://127.0.0.1:9/probe"
+        - "--min-severity"
+        - "critical"
+      expect_exit: 0
+
+  # Replace l2-notify-a with --yes (new config).
+  - cli_run:
+      args:
+        - "notify"
+        - "add"
+        - "webhook"
+        - "--name"
+        - "l2-notify-a"
+        - "--set"
+        - "url=http://127.0.0.1:9/probe"
+        - "--yes"
+      expect_exit: 0
+
+  - cli_run:
+      args:
+        - "notify"
+        - "remove"
+        - "l2-notify-a"
+      expect_exit: 0
+
+  - cli_run:
+      args:
+        - "notify"
+        - "remove"
+        - "l2-notify-b"
+      expect_exit: 0
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

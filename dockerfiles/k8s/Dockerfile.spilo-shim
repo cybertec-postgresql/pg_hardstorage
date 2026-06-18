@@ -1,0 +1,39 @@
+# Dockerfile.spilo-shim — Zalando Spilo image overlay that
+# swaps the wal-g binary for our compat shim
+# (pg-hardstorage-walg).
+#
+# Spilo is the Postgres image Zalando's postgres-operator
+# deploys.  The image bakes in patroni + WAL-G + WAL-E +
+# pgbackrest + a kitchen-sink scripts dir; Zalando's
+# reconciler renders environment variables (SPILO_CONFIGURATION,
+# WALG_S3_PREFIX, AWS_REGION, ...) and the in-image entrypoint
+# scripts call wal-g for archiving and restore.
+#
+# Build context is the project root.
+
+ARG SPILO_PG_VERSION=17
+ARG SPILO_IMAGE=ghcr.io/zalando/spilo-${SPILO_PG_VERSION}:4.0-p1
+FROM ${SPILO_IMAGE}
+
+USER root
+
+# Spilo's wal-g lives at /usr/local/bin/wal-g.  Move aside;
+# drop the shim in.  Some Spilo variants ship multiple
+# wal-g-like binaries (wal-e too) — we only swap wal-g
+# because the operator's PG configuration generation
+# (`postgres.yml`) selects wal-g via `WAL_E_S3_PREFIX` env
+# being unset.
+RUN if [ -f /usr/local/bin/wal-g ]; then \
+        mv /usr/local/bin/wal-g /usr/local/bin/wal-g.upstream; \
+    fi
+
+COPY --chmod=0755 bin/pg-hardstorage-walg /usr/local/bin/wal-g
+
+LABEL pg_hardstorage.compat_shim="spilo-walg" \
+      pg_hardstorage.upstream_image="${SPILO_IMAGE}"
+
+# Spilo's stock image runs as root (uid 0) — its own runit-
+# style boot scripts drop privileges later.  We don't override
+# USER, just leave it as the upstream's default.  OpenShift
+# admission will swap UID at runtime via the namespace's
+# OpenShift Range UID anyway.

@@ -1,0 +1,163 @@
+.nh
+.TH "PG_HARDSTORAGE" "1" "May 2026" "pg_hardstorage Manual" "pg_hardstorage Manual"
+
+.SH NAME
+.PP
+pg_hardstorage-recovery-drill - Run a full restore-and-verify drill against a real backup
+
+
+.SH SYNOPSIS
+.PP
+\fBpg_hardstorage recovery drill  [flags]\fP
+
+
+.SH DESCRIPTION
+.PP
+Pick a backup, restore into a temporary target dir, run
+pg_verifybackup against the restored data dir, and tear down.
+Reports RTO actual + verify outcome.
+
+.PP
+The drill exercises the full critical path that a real recovery
+would take.  Read-only against the source repo; writes only to a
+temporary target dir which is removed on completion (unless
+--keep is set).
+
+.PP
+Backup selection:
+   | latest    pick the freshest committed backup
+            pick the named manifest (must be visible)
+
+.PP
+Verify control:
+  --pg-major NN         override the sandbox image (default: derive from manifest)
+  --image IMG           override 'postgres:\&' (air-gapped registries)
+  --allow-skip-verify   accept a Partial verdict when pg_verifybackup
+                        skips (e.g. older manifest with no on-disk
+                        backup_manifest)
+  --skip-verify         strongest opt-out — don't even try to spin up
+                        the sandbox.  Returns Partial verdict with
+                        the restore-only result.
+
+.PP
+Output formats:
+  --format json     (default) — JSON body, the v1 contract.
+  --format markdown — forensics-grade GFM rendering.
+
+.PP
+The drill requires Docker on the operator host (for the sandbox).
+For Docker-free runs, pass --skip-verify; the report's RTO actual
++ restore-phase detail are still useful for capacity planning.
+
+
+.SH OPTIONS
+.PP
+\fB--allow-skip-verify\fP[=false]
+	accept a Partial verdict when pg_verifybackup skips
+
+.PP
+\fB--backup-id\fP=""
+	explicit backup ID to drill against (default: latest)
+
+.PP
+\fB--format\fP="json"
+	output format: json | markdown
+
+.PP
+\fB-h\fP, \fB--help\fP[=false]
+	help for drill
+
+.PP
+\fB--image\fP=""
+	override 'postgres:\&' sandbox image (air-gapped)
+
+.PP
+\fB--keep\fP[=false]
+	keep the temporary target dir after the drill (for inspection)
+
+.PP
+\fB--no-encryption\fP[=false]
+	don't wire the local-keystore KEK resolver (drill an unencrypted backup or one whose KEK lives elsewhere)
+
+.PP
+\fB--no-history\fP[=false]
+	suppress the auto-persist of a slim drill history entry into recovery/drills/
+
+.PP
+\fB--operator\fP=""
+	record the operator identity in the history entry (free-form; cron jobs typically pass scheduler:)
+
+.PP
+\fB--pg-major\fP=""
+	override sandbox PG major version (default: derive from manifest)
+
+.PP
+\fB--repo\fP=""
+	repository URL (required)
+
+.PP
+\fB--rto-seconds\fP=0
+	RTO target in seconds for actual-vs-target comparison
+
+.PP
+\fB--skip-verify\fP[=false]
+	don't run the sandbox verify at all (Docker-free run)
+
+.PP
+\fB--temp-base\fP=""
+	parent directory for the temporary target dir (default: $TMPDIR)
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+.PP
+\fB--airgapped\fP[=false]
+	refuse outbound endpoints (LLM providers, sinks, OTLP collectors) outside loopback / RFC1918 / explicit airgap.allowlist. Also enabled by PG_HARDSTORAGE_AIRGAPPED=1 or \fBairgapped: strict\fR in the config file.
+
+.PP
+\fB-c\fP, \fB--config\fP=""
+	path to config file (default: XDG/FHS lookup)
+
+.PP
+\fB--cpu-profile\fP=""
+	write a pprof CPU profile to this path for the duration of the command (\fBgo tool pprof <path>\fR to analyse). Off when empty.
+
+.PP
+\fB--mem-profile\fP=""
+	write a pprof heap profile to this path at command exit. Off when empty.
+
+.PP
+\fB--no-color\fP[=false]
+	disable ANSI color in text output
+
+.PP
+\fB--on-error-llm\fP[=false]
+	on a structured-error failure, drop into the matching LLM helper skill (auto_on_error trigger). Also enabled by PG_HARDSTORAGE_ON_ERROR_LLM=1.
+
+.PP
+\fB--otel-endpoint\fP=""
+	OpenTelemetry OTLP/HTTP endpoint (e.g. http://otel-collector:4318); empty disables tracing
+
+.PP
+\fB--otel-stdout\fP[=false]
+	also export OpenTelemetry traces to stderr (useful for dev)
+
+.PP
+\fB-o\fP, \fB--output\fP=""
+	output format: text|json|ndjson|yaml|template|csv|markdown|html|tap|junit|pdf (default: text on TTY, json off-TTY)
+
+.PP
+\fB--profile-port\fP=0
+	if non-zero, expose net/http/pprof on 127.0.0.1: for live profiling of long-running commands (e.g. \fBgo tool pprof http://127.0.0.1:6060/debug/pprof/profile?seconds=30\fR). Off when zero.
+
+.PP
+\fB-q\fP, \fB--quiet\fP[=false]
+	suppress non-essential output
+
+.PP
+\fB--template\fP=""
+	Go text/template applied when --output template (or implied if --template is set without --output)
+
+
+.SH SEE ALSO
+.PP
+\fBpg_hardstorage-recovery(1)\fP, \fBpg_hardstorage-recovery-drill-history(1)\fP

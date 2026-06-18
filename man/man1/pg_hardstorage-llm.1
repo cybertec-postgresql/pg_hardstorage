@@ -1,0 +1,150 @@
+.nh
+.TH "PG_HARDSTORAGE" "1" "May 2026" "pg_hardstorage Manual" "pg_hardstorage Manual"
+
+.SH NAME
+.PP
+pg_hardstorage-llm - LLM helper — grounded assistant with skill files, mandatory preview, full audit
+
+
+.SH SYNOPSIS
+.PP
+\fBpg_hardstorage llm [chat|ask|explain|skill] [flags]\fP
+
+
+.SH DESCRIPTION
+.PP
+LLM helper.  Drops into an interactive chat session when run
+with no subcommand; one-shot Q&A via 'llm ask'; CLI-explanation
+via 'llm explain'; skill management via 'llm skill ...'.
+
+.PP
+Configuration — env vars override the YAML, flags override env:
+
+.PP
+endpoint:
+    --endpoint 
+    PG_HARDSTORAGE_URL          (canonical, project-branded)
+    OPENAI_BASE_URL             (cross-tool standard, accepted)
+    llm.endpoint in pg_hardstorage.yaml
+
+.PP
+api key:
+    PG_HARDSTORAGE_LLM_KEY      (canonical, project-branded)
+    OPENAI_API_KEY              (cross-tool standard, accepted)
+    PG_HARDSTORAGE_LLM_API_KEY  (legacy spelling, still honoured)
+    llm.api_key_file in pg_hardstorage.yaml (re-read on every
+                                              call — rotation
+                                              survives without
+                                              restart)
+    llm.api_key in pg_hardstorage.yaml (inline; discouraged)
+
+.PP
+model:
+    --model 
+    PG_HARDSTORAGE_LLM_MODEL    (canonical, project-branded)
+    OPENAI_MODEL                (cross-tool standard, accepted)
+    llm.model in pg_hardstorage.yaml
+    provider default (gpt-4o-mini for openai)
+
+.PP
+When pointing PG_HARDSTORAGE_URL at a non-OpenAI endpoint
+  (Anthropic, Azure, Ollama, vLLM, ...) you MUST set the model
+  too — gpt-4o-mini won't exist there.  A 404 from the upstream
+  is returned with an actionable hint naming the env var.
+
+.PP
+When NO key resolves anywhere, the CLI falls back to the 'mock'
+provider — replies are stub echoes, not real AI.  The chat
+banner is loud about this so it isn't silent.
+
+.PP
+Point 'endpoint:' at any OpenAI-compatible service:
+  - api.openai.com (default)
+  - https://api.anthropic.com/v1 (Anthropic via OpenAI-compat)
+  - http://127.0.0.1:11434/v1    (local Ollama)
+  - Azure OpenAI / vLLM / OpenRouter / LiteLLM, ...
+
+.PP
+See share/pg_hardstorage.sample.yaml for a fully annotated
+config.
+
+
+.SH OPTIONS
+.PP
+\fB--endpoint\fP=""
+	provider endpoint override
+
+.PP
+\fB-h\fP, \fB--help\fP[=false]
+	help for llm
+
+.PP
+\fB--mcp-server\fP[=false]
+	run as a Model Context Protocol stdio server (for Claude Desktop / Cursor / Zed / Goose / Cline integration)
+
+.PP
+\fB--model\fP=""
+	model id override
+
+.PP
+\fB--provider\fP=""
+	LLM provider override (default: env / config / 'openai' if key in scope, else 'mock')
+
+.PP
+\fB--skill\fP="ask"
+	skill to use (ask, explain, restore, incident)
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+.PP
+\fB--airgapped\fP[=false]
+	refuse outbound endpoints (LLM providers, sinks, OTLP collectors) outside loopback / RFC1918 / explicit airgap.allowlist. Also enabled by PG_HARDSTORAGE_AIRGAPPED=1 or \fBairgapped: strict\fR in the config file.
+
+.PP
+\fB-c\fP, \fB--config\fP=""
+	path to config file (default: XDG/FHS lookup)
+
+.PP
+\fB--cpu-profile\fP=""
+	write a pprof CPU profile to this path for the duration of the command (\fBgo tool pprof <path>\fR to analyse). Off when empty.
+
+.PP
+\fB--mem-profile\fP=""
+	write a pprof heap profile to this path at command exit. Off when empty.
+
+.PP
+\fB--no-color\fP[=false]
+	disable ANSI color in text output
+
+.PP
+\fB--on-error-llm\fP[=false]
+	on a structured-error failure, drop into the matching LLM helper skill (auto_on_error trigger). Also enabled by PG_HARDSTORAGE_ON_ERROR_LLM=1.
+
+.PP
+\fB--otel-endpoint\fP=""
+	OpenTelemetry OTLP/HTTP endpoint (e.g. http://otel-collector:4318); empty disables tracing
+
+.PP
+\fB--otel-stdout\fP[=false]
+	also export OpenTelemetry traces to stderr (useful for dev)
+
+.PP
+\fB-o\fP, \fB--output\fP=""
+	output format: text|json|ndjson|yaml|template|csv|markdown|html|tap|junit|pdf (default: text on TTY, json off-TTY)
+
+.PP
+\fB--profile-port\fP=0
+	if non-zero, expose net/http/pprof on 127.0.0.1: for live profiling of long-running commands (e.g. \fBgo tool pprof http://127.0.0.1:6060/debug/pprof/profile?seconds=30\fR). Off when zero.
+
+.PP
+\fB-q\fP, \fB--quiet\fP[=false]
+	suppress non-essential output
+
+.PP
+\fB--template\fP=""
+	Go text/template applied when --output template (or implied if --template is set without --output)
+
+
+.SH SEE ALSO
+.PP
+\fBpg_hardstorage(1)\fP, \fBpg_hardstorage-llm-ask(1)\fP, \fBpg_hardstorage-llm-chat(1)\fP, \fBpg_hardstorage-llm-doctor(1)\fP, \fBpg_hardstorage-llm-explain(1)\fP, \fBpg_hardstorage-llm-export-session(1)\fP, \fBpg_hardstorage-llm-history(1)\fP, \fBpg_hardstorage-llm-skill(1)\fP

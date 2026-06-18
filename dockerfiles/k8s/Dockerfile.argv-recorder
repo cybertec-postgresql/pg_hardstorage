@@ -1,0 +1,64 @@
+# Dockerfile.argv-recorder — multi-stage build that produces a
+# single static `argv-recorder` binary, plus a CNPG-flavoured
+# overlay that wires it in PLACE OF the real barman-cloud
+# tools (with the originals moved to .real for exec).
+#
+# This image is used by the discovery pass — bring up CNPG
+# with this image instead of the regular shim image, run a
+# backup once, copy /var/log/pg_hardstorage/argv-fixture.ndjson
+# out of the pod, commit it under test/fixtures/operator-argv/
+# as the canonical record of what CNPG actually invokes.
+#
+# A weekly CI job rebuilds + reruns this and opens a PR if the
+# recorded argv changes — drift detection for free.
+
+# Global ARG (before any FROM): visible to FROM lines, NOT
+# inside any stage's RUN/COPY/etc. unless redeclared after
+# FROM in that stage.  This is BuildKit's documented scope rule.
+ARG CNPG_PG_VERSION=17
+
+# ---------- Stage 1: build the recorder binary ------------------
+# Build from the project root's go.mod (the recorder is part of
+# the project module — keeping it inside the same module means
+# `go test ./...` from the repo root discovers its tests).  The
+# COPY brings in the WHOLE module surface; -trimpath + -tags
+# none pull only what main.go needs.
+FROM golang:1.26-alpine AS builder
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY dockerfiles/k8s/argv-recorder/ ./dockerfiles/k8s/argv-recorder/
+RUN CGO_ENABLED=0 go build \
+        -trimpath -ldflags '-s -w' \
+        -o /out/argv-recorder ./dockerfiles/k8s/argv-recorder
+
+# ---------- Stage 2: CNPG overlay ------------------------------
+FROM ghcr.io/cloudnative-pg/postgresql:${CNPG_PG_VERSION}
+ARG CNPG_PG_VERSION
+ARG CNPG_PG_IMAGE=ghcr.io/cloudnative-pg/postgresql:${CNPG_PG_VERSION}
+
+USER root
+
+# Move every barman-cloud-* binary aside, then drop the
+# recorder in its place.  The recorder writes one fixture
+# line then exec's <basename>.real.
+# CNPG ships barman-cloud-* under /usr/local/bin (verified by
+# `which barman-cloud-backup` against ghcr.io/cloudnative-pg/postgresql:17).
+RUN for tool in barman-cloud-backup barman-cloud-restore \
+                 barman-cloud-wal-archive barman-cloud-wal-restore; do \
+        if [ -f "/usr/local/bin/${tool}" ]; then \
+            mv "/usr/local/bin/${tool}" "/usr/local/bin/${tool}.real"; \
+        fi; \
+    done \
+ && install -d -m 0755 /var/log/pg_hardstorage \
+ && chown 26:26 /var/log/pg_hardstorage
+
+COPY --from=builder --chmod=0755 /out/argv-recorder /usr/local/bin/barman-cloud-backup
+COPY --from=builder --chmod=0755 /out/argv-recorder /usr/local/bin/barman-cloud-restore
+COPY --from=builder --chmod=0755 /out/argv-recorder /usr/local/bin/barman-cloud-wal-archive
+COPY --from=builder --chmod=0755 /out/argv-recorder /usr/local/bin/barman-cloud-wal-restore
+
+LABEL pg_hardstorage.compat_shim="cnpg-argv-recorder" \
+      pg_hardstorage.upstream_image="${CNPG_PG_IMAGE}"
+
+USER 26

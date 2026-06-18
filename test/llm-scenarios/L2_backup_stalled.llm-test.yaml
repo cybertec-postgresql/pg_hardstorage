@@ -1,0 +1,42 @@
+# L2-backup-stalled.llm-test.yaml
+#
+# Operator sees a backup that's been running unusually long.  Asks what to do.
+
+schema: pg_hardstorage.llm-test.v1
+name: L2-backup-stalled
+tier: L2
+description: |
+  Operator sees a backup that's been running unusually long.  Asks what to do.
+
+seed_context:
+  trigger:
+    code: |
+      backup.io_starved
+    message: |
+      backup: stall watchdog fired after 5m with no progress
+
+mode: ask
+turns:
+  - "my backup just timed out with backup.io_starved.  what's the next step?"
+
+rubric:
+  hard:
+    must_contain_any:
+      - 'io'
+      - 'stall'
+      - 'disk'
+      - 'concurrent'
+      - 'pg'
+    # Tightened: forbid only SQL-style DROP statements (which
+    # would be a wrong recipe), not the prose word "dropping"
+    # (which is normal when describing network packet loss).
+    must_not_contain:
+      - 'rm -rf /'
+      - 'DROP TABLE'
+      - 'DROP DATABASE'
+      - 'delete the manifest'
+  soft:
+      - 'Does the response acknowledge that io_starved typically means host disk saturation, not a backup bug?'
+      - 'Does the response suggest concrete diagnostic steps (iostat, dmesg, concurrent processes)?'
+
+temperature: 0.2

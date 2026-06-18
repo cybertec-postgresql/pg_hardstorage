@@ -1,0 +1,170 @@
+.nh
+.TH "PG_HARDSTORAGE" "1" "May 2026" "pg_hardstorage Manual" "pg_hardstorage Manual"
+
+.SH NAME
+.PP
+pg_hardstorage-wal-stream - Continuously stream WAL into the repository
+
+
+.SH SYNOPSIS
+.PP
+\fBpg_hardstorage wal stream  [flags]\fP
+
+
+.SH DESCRIPTION
+.PP
+Stream PostgreSQL's WAL into the configured repository.
+
+.PP
+The agent connects via the replication protocol on a libpq
+connection, ensures the persistent physical replication slot exists
+(creating it if absent), and runs an indefinite receive loop.
+
+.PP
+Each completed 16 MiB segment is content-addressed through the CAS
+and committed atomically. The slot's confirmed_flush_lsn is advanced
+only after a segment commits — a crash between commits causes
+PostgreSQL to resend the segment's bytes on the next start, so the
+pipeline is gap-free and idempotent across restarts.
+
+.PP
+Send SIGINT or SIGTERM (Ctrl-C in an interactive shell) to stop
+streaming cleanly. Any partially-buffered segment is discarded; the
+slot retains the bytes for the next run.
+
+.PP
+Resume LSN is determined automatically:
+  * If --start-lsn is given, it is used verbatim (must be segment-aligned).
+  * Otherwise the highest already-committed segment in the repository
+    is used (resume-where-we-left-off).
+  * On a fresh deployment with no committed segments, LSN 0/0 is
+    passed and PostgreSQL starts from the slot's restart_lsn.
+
+
+.SH OPTIONS
+.PP
+\fB--allow-system-identifier-change\fP[=false]
+	proceed even when the cluster's pg_control system identifier differs from the deployment's already-archived WAL (the pg_upgrade / clone / restore signature). By default this is refused to stop two clusters' WAL being interleaved under one lineage; set it only when deliberately continuing the deployment onto a new cluster
+
+.PP
+\fB--durability\fP="per-segment"
+	WAL durability: per-segment (one syncfs per 16 MiB segment, the fast default) | per-chunk (fsync every chunk — slower, the 'fsync every object' opt-in)
+
+.PP
+\fB-h\fP, \fB--help\fP[=false]
+	help for stream
+
+.PP
+\fB--inactivity-timeout\fP=0s
+	abort the stream if no message arrives in this duration (0 = streaming default of 5 minutes; default tolerates the default PG wal_sender_timeout=60s with a 10× margin)
+
+.PP
+\fB--kek\fP=""
+	KEK reference for WAL encryption under a cloud KMS (e.g. aws-kms://...); MUST match the deployment's base-backup KEKRef. Local-KEK encryption is automatic when a keyring kek.bin is present.
+
+.PP
+\fB--kms-config\fP=[]
+	cloud KMS provider config (region/endpoint/credentials); only consulted when --kek is a cloud scheme — the same values base backups use.
+
+.PP
+\fB--max-reconnect-backoff\fP=30s
+	upper bound on the auto-reconnect backoff (initial 1s, doubles on each failure)
+
+.PP
+\fB--no-inactivity-timeout\fP[=false]
+	disable the client-side inactivity watchdog entirely; required when the source PG has wal_sender_timeout=0 (PG never sends keepalives, so the client's read deadline is the wrong place to detect hangs — issue #12)
+
+.PP
+\fB--no-reconnect\fP[=false]
+	exit on stream connection break instead of reconnecting; default behaviour reconnects with exponential backoff (1s → 30s) using EnsureSlot resume — survives Patroni failovers and PG bounces transparently
+
+.PP
+\fB--no-slot\fP[=false]
+	stream without a replication slot (UNSAFE — PG can recycle WAL out from under the streamer; use only for archive-only setups that retain WAL another way)
+
+.PP
+\fB--once\fP[=false]
+	exit after the first segment commits (useful for testing)
+
+.PP
+\fB--pg-connection\fP=""
+	libpq connection string for the source PostgreSQL (required)
+
+.PP
+\fB--repo\fP=""
+	repository URL (file://, s3://, ...) — must already exist (required)
+
+.PP
+\fB--skip-preflight\fP[=false]
+	skip the PG-configuration preflight (catches wal_level / max_wal_senders / role.replication issues before opening the stream)
+
+.PP
+\fB--slot\fP=""
+	replication slot name (default: pg\fIhardstorage\fP)
+
+.PP
+\fB--start-lsn\fP=""
+	explicit start LSN (e.g. 0/3000000); overrides resume-from-repo logic
+
+.PP
+\fB--status-interval\fP=10s
+	how often to send Standby Status Updates to PostgreSQL
+
+.PP
+\fB-v\fP, \fB--verbose\fP[=false]
+	emit one wal.stream.progress event per --status-interval covering the segment just committed, the partial PG is currently writing, and the interval throughput.  Off by default (the streamer's existing output is a single starting event + the eventual stopped event); set this for an interactive view of a long-running stream.  Suppressed under --output json — JSON consumers should read the structured stream's other events instead.
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+.PP
+\fB--airgapped\fP[=false]
+	refuse outbound endpoints (LLM providers, sinks, OTLP collectors) outside loopback / RFC1918 / explicit airgap.allowlist. Also enabled by PG_HARDSTORAGE_AIRGAPPED=1 or \fBairgapped: strict\fR in the config file.
+
+.PP
+\fB-c\fP, \fB--config\fP=""
+	path to config file (default: XDG/FHS lookup)
+
+.PP
+\fB--cpu-profile\fP=""
+	write a pprof CPU profile to this path for the duration of the command (\fBgo tool pprof <path>\fR to analyse). Off when empty.
+
+.PP
+\fB--mem-profile\fP=""
+	write a pprof heap profile to this path at command exit. Off when empty.
+
+.PP
+\fB--no-color\fP[=false]
+	disable ANSI color in text output
+
+.PP
+\fB--on-error-llm\fP[=false]
+	on a structured-error failure, drop into the matching LLM helper skill (auto_on_error trigger). Also enabled by PG_HARDSTORAGE_ON_ERROR_LLM=1.
+
+.PP
+\fB--otel-endpoint\fP=""
+	OpenTelemetry OTLP/HTTP endpoint (e.g. http://otel-collector:4318); empty disables tracing
+
+.PP
+\fB--otel-stdout\fP[=false]
+	also export OpenTelemetry traces to stderr (useful for dev)
+
+.PP
+\fB-o\fP, \fB--output\fP=""
+	output format: text|json|ndjson|yaml|template|csv|markdown|html|tap|junit|pdf (default: text on TTY, json off-TTY)
+
+.PP
+\fB--profile-port\fP=0
+	if non-zero, expose net/http/pprof on 127.0.0.1: for live profiling of long-running commands (e.g. \fBgo tool pprof http://127.0.0.1:6060/debug/pprof/profile?seconds=30\fR). Off when zero.
+
+.PP
+\fB-q\fP, \fB--quiet\fP[=false]
+	suppress non-essential output
+
+.PP
+\fB--template\fP=""
+	Go text/template applied when --output template (or implied if --template is set without --output)
+
+
+.SH SEE ALSO
+.PP
+\fBpg_hardstorage-wal(1)\fP

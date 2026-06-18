@@ -1,0 +1,247 @@
+# goreleaser configuration for pg_hardstorage.
+#
+# Builds two binaries (pg_hardstorage + pg_hardstorage_testkit) for
+# linux/{amd64,arm64} and darwin/arm64. Windows isn't on the roadmap
+# (the agent assumes systemd / FHS); we publish a windows/amd64 of the
+# CLI only so dev workstations on Windows can still talk to a remote
+# control plane.
+#
+# Reproducibility:
+#   - -trimpath strips local paths
+#   - -buildvcs=false drops the git revision from the runtime info
+#   - LDFLAGS pin Version/Commit/Date — the Makefile uses the same
+#     vars so `make build` and goreleaser produce equivalent binaries
+#
+# Signing: cosign keyless (Sigstore + GitHub Actions OIDC) signs every
+# tarball, .deb, .rpm, and container image. The signatures land
+# alongside the artefacts on the GitHub Release.
+
+version: 2
+
+project_name: pg_hardstorage
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: pg_hardstorage
+    binary: pg_hardstorage
+    main: ./cmd/pg_hardstorage
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+      - -buildvcs=false
+    ldflags:
+      - -s -w
+      - -X github.com/cybertec-postgresql/pg_hardstorage/internal/version.Version={{.Version}}
+      - -X github.com/cybertec-postgresql/pg_hardstorage/internal/version.Commit={{.ShortCommit}}
+      - -X github.com/cybertec-postgresql/pg_hardstorage/internal/version.Date={{.Date}}
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64]
+    ignore:
+      # darwin/amd64 is dropping off our support matrix; arm64-only
+      # for macOS reduces the artefact count without leaving anyone
+      # important behind.
+      - goos: darwin
+        goarch: amd64
+      # windows/arm64 is rare enough we don't ship it.
+      - goos: windows
+        goarch: arm64
+
+  - id: pg_hardstorage_testkit
+    binary: pg_hardstorage_testkit
+    main: ./cmd/pg_hardstorage_testkit
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+      - -buildvcs=false
+    ldflags:
+      - -s -w
+      - -X github.com/cybertec-postgresql/pg_hardstorage/internal/version.Version={{.Version}}
+      - -X github.com/cybertec-postgresql/pg_hardstorage/internal/version.Commit={{.ShortCommit}}
+      - -X github.com/cybertec-postgresql/pg_hardstorage/internal/version.Date={{.Date}}
+    goos: [linux, darwin]
+    goarch: [amd64, arm64]
+    ignore:
+      - goos: darwin
+        goarch: amd64
+
+archives:
+  - id: pg_hardstorage
+    ids: [pg_hardstorage]
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    files:
+      - LICENSE
+      - README.md
+      - CHANGELOG.md
+      - docs/**/*
+
+  - id: pg_hardstorage_testkit
+    ids: [pg_hardstorage_testkit]
+    name_template: >-
+      pg_hardstorage_testkit_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    formats: [tar.gz]
+    files:
+      - LICENSE
+      - README.md
+
+checksum:
+  name_template: "checksums.txt"
+  algorithm: sha256
+
+source:
+  enabled: true
+  name_template: "{{ .ProjectName }}-{{ .Version }}-source"
+  format: tar.gz
+
+sboms:
+  - artifacts: archive
+    documents:
+      - "${artifact}.spdx.sbom.json"
+
+signs:
+  # Keyless cosign signing of every release artefact + checksums file.
+  # The .pem and .sig land on the GitHub Release alongside the artefact.
+  - id: cosign-keyless
+    cmd: cosign
+    certificate: "${artifact}.pem"
+    args:
+      - sign-blob
+      - "--yes"
+      - "--output-certificate=${certificate}"
+      - "--output-signature=${signature}"
+      - "${artifact}"
+    artifacts: all
+    output: true
+
+snapshot:
+  version_template: "{{ .Tag }}-SNAPSHOT-{{ .ShortCommit }}"
+
+changelog:
+  use: github
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - "Merge pull request"
+      - "Merge branch"
+
+# Linux distro packages — we ship .deb and .rpm so admins on
+# managed-server fleets don't have to wrap the tarball in their own
+# packaging. Both consume the systemd units in deploy/systemd/ via
+# overrides_include hooks (added when we wire native debian/ + .spec).
+nfpms:
+  - id: pg_hardstorage-deb-rpm
+    package_name: pg-hardstorage
+    file_name_template: "{{ .ConventionalFileName }}"
+    ids: [pg_hardstorage]
+    vendor: "CYBERTEC PostgreSQL International GmbH"
+    homepage: https://github.com/cybertec-postgresql/pg_hardstorage
+    maintainer: "Hans-Jürgen Schönig <hs@cybertec.at>"
+    description: |
+      pg_hardstorage — PostgreSQL backup, done right.
+      WAL streaming over the replication protocol; content-addressed
+      chunked dedup; cosign-signed manifests; built-in retention,
+      verification, scheduling.
+    license: Apache-2.0
+    section: database
+    priority: optional
+    formats: [deb, rpm]
+    bindir: /usr/bin
+    contents:
+      - src: deploy/systemd/pg_hardstorage.service
+        dst: /usr/lib/systemd/system/pg_hardstorage.service
+      - src: deploy/systemd/pg_hardstorage@.service
+        dst: /usr/lib/systemd/system/pg_hardstorage@.service
+      - src: deploy/systemd/pg-hardstorage.sysusers.conf
+        dst: /usr/lib/sysusers.d/pg-hardstorage.conf
+      - src: deploy/systemd/pg-hardstorage.tmpfiles.conf
+        dst: /usr/lib/tmpfiles.d/pg-hardstorage.conf
+      - src: LICENSE
+        dst: /usr/share/doc/pg-hardstorage/LICENSE
+      - src: README.md
+        dst: /usr/share/doc/pg-hardstorage/README.md
+      - src: docs/reference/runbooks
+        dst: /usr/share/pg-hardstorage/runbooks
+        type: tree
+    overrides:
+      deb:
+        recommends: [postgresql-client]
+      rpm:
+        recommends: [postgresql]
+
+# Container images — distroless, multi-arch via buildx.
+dockers:
+  - id: pg_hardstorage-amd64
+    ids: [pg_hardstorage]
+    image_templates:
+      - "ghcr.io/cybertec-postgresql/pg_hardstorage:{{ .Version }}-amd64"
+      - "ghcr.io/cybertec-postgresql/pg_hardstorage:latest-amd64"
+    dockerfile: deploy/docker/Dockerfile.goreleaser
+    use: buildx
+    goos: linux
+    goarch: amd64
+    build_flag_templates:
+      - "--platform=linux/amd64"
+      - "--label=org.opencontainers.image.source=https://github.com/cybertec-postgresql/pg_hardstorage"
+      - "--label=org.opencontainers.image.version={{.Version}}"
+      - "--label=org.opencontainers.image.licenses=Apache-2.0"
+      - "--label=org.opencontainers.image.vendor=CYBERTEC PostgreSQL International GmbH"
+
+  - id: pg_hardstorage-arm64
+    ids: [pg_hardstorage]
+    image_templates:
+      - "ghcr.io/cybertec-postgresql/pg_hardstorage:{{ .Version }}-arm64"
+      - "ghcr.io/cybertec-postgresql/pg_hardstorage:latest-arm64"
+    dockerfile: deploy/docker/Dockerfile.goreleaser
+    use: buildx
+    goos: linux
+    goarch: arm64
+    build_flag_templates:
+      - "--platform=linux/arm64"
+      - "--label=org.opencontainers.image.source=https://github.com/cybertec-postgresql/pg_hardstorage"
+      - "--label=org.opencontainers.image.version={{.Version}}"
+      - "--label=org.opencontainers.image.licenses=Apache-2.0"
+      - "--label=org.opencontainers.image.vendor=CYBERTEC PostgreSQL International GmbH"
+
+docker_manifests:
+  - name_template: "ghcr.io/cybertec-postgresql/pg_hardstorage:{{ .Version }}"
+    image_templates:
+      - "ghcr.io/cybertec-postgresql/pg_hardstorage:{{ .Version }}-amd64"
+      - "ghcr.io/cybertec-postgresql/pg_hardstorage:{{ .Version }}-arm64"
+  - name_template: "ghcr.io/cybertec-postgresql/pg_hardstorage:latest"
+    image_templates:
+      - "ghcr.io/cybertec-postgresql/pg_hardstorage:latest-amd64"
+      - "ghcr.io/cybertec-postgresql/pg_hardstorage:latest-arm64"
+
+release:
+  github:
+    owner: cybertec-postgresql
+    name: pg_hardstorage
+  draft: false
+  prerelease: auto
+  name_template: "v{{ .Version }}"
+  header: |
+    ## pg_hardstorage v{{ .Version }}
+
+    See CHANGELOG.md for the full release notes.
+  footer: |
+    All artefacts are cosign-signed (keyless / Sigstore). Verify with:
+
+    ```
+    cosign verify-blob \
+      --certificate-identity-regexp 'https://github.com/cybertec-postgresql/pg_hardstorage' \
+      --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+      --certificate <artefact>.pem --signature <artefact>.sig \
+      <artefact>
+    ```

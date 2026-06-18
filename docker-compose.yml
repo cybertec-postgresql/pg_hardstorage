@@ -1,0 +1,258 @@
+# pg_hardstorage evaluation stack.
+#
+# Stands up PostgreSQL + MinIO + pg_hardstorage in a single compose
+# project for local evaluation.  Boot-up runs three one-shots
+# before the agent so the operator gets a working repo on first
+# `docker compose up`:
+#
+#   1. `minio-init` creates the demo bucket (minio/mc image).
+#   2. `repo-init` runs `pg_hardstorage repo init` against the
+#      bucket (pg_hardstorage image, distroless — no shell).
+#   3. `pg_hardstorage` runs the agent against PG_HARDSTORAGE_CONFIG.
+#
+# Why the split (issue #89): the pg_hardstorage image is
+# distroless; `sh -c "mc mb ... && pg_hardstorage repo init ..."`
+# fails with `exec "sh": executable file not found in $PATH`.
+# Each one-shot does one job in an image that has the tool it
+# needs.
+#
+# Why build, not pull (issue #89 follow-up): the two services that
+# run the pg_hardstorage binary build the image from this
+# checkout (deploy/docker/Dockerfile) instead of pulling
+# ghcr.io/cybertec-postgresql/pg_hardstorage:latest.  That
+# published image only exists after a `v*` release tag and the
+# GHCR package is not anonymously pullable, so a fresh
+# `git pull && docker compose up` failed with an image-pull
+# `unauthorized` error — the eval stack never came up.  Building
+# from source makes the stack self-contained (works offline and
+# before any release) and guarantees the image matches this
+# checkout.
+#
+# Issue #87: PG_HARDSTORAGE_CONFIG didn't reach the agent on older
+# builds because the env-var inline-YAML path wasn't wired up.
+# The fix landed in internal/config; this compose file is the
+# evaluation contract that path supports.
+
+# Shared build for every service that runs the pg_hardstorage
+# binary.  Same context + image tag → compose builds it once and
+# both services reuse it.
+x-pg-hardstorage-image: &pg-hardstorage-image
+  build:
+    context: .
+    dockerfile: deploy/docker/Dockerfile
+  image: pg_hardstorage:eval
+
+services:
+  pg:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_DB: demo
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: demo
+      # PG 18-alpine changed its default PGDATA from
+      # /var/lib/postgresql/data to /var/lib/postgresql/18/docker
+      # for pg_ctlcluster compatibility (issue #88).  Pin PGDATA
+      # to the legacy path so the named volume mounted below
+      # actually contains the data directory — without this
+      # override, the container exits with
+      #   "Error: in 18+, these Docker images are configured to
+      #    store database data in a format which is compatible
+      #    with pg_ctlcluster.  Counter to that, there appears
+      #    to be PostgreSQL data in /var/lib/postgresql/data
+      #    (unused mount/volume)"
+      PGDATA: /var/lib/postgresql/data
+      # `replication=database`-style URIs require a replication-
+      # capable role; the bootstrap PG user is already superuser
+      # so no extra GRANT is needed.
+    command:
+      - "-c"
+      - "wal_level=replica"
+      - "-c"
+      - "max_wal_senders=10"
+      - "-c"
+      - "max_replication_slots=10"
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d demo"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - miniodata:/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9000/minio/health/live || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # bootstrap creates the demo bucket and initializes the repo so
+  # the agent has somewhere to write.  Runs once and exits 0.
+  # minio-init creates the demo bucket.  The pg_hardstorage image
+  # is distroless (no `sh`, no `mc`), so bucket creation cannot
+  # happen in-process there — issue #89.  We use minio/mc for the
+  # bucket-mb step; the next service handles repo init.
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint:
+      - "sh"
+      - "-c"
+      - |
+        set -e
+        mc alias set local http://minio:9000 minioadmin minioadmin
+        mc mb --ignore-existing local/pg-hardstorage-demo
+    restart: "no"
+
+  # repo-init runs `pg_hardstorage repo init` once against the
+  # newly-created MinIO bucket.  Idempotent — succeeds on a fresh
+  # bucket and is a no-op on an already-initialized repo.  No
+  # shell wrapper: the pg_hardstorage image's ENTRYPOINT is the
+  # binary, `command:` supplies its args directly.
+  repo-init:
+    <<: *pg-hardstorage-image
+    depends_on:
+      pg:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_REGION: us-east-1
+    command:
+      - "repo"
+      - "init"
+      - "s3://pg-hardstorage-demo/?endpoint=http://minio:9000&region=us-east-1&path_style=true"
+    restart: "no"
+
+  # keyring-init prepares the persistent keyring volume so the agent's
+  # manifest-signing key SURVIVES a container restart/recreate (issue
+  # #103).  Without a persistent keyring the signing key is regenerated
+  # on every restart (keystore.LoadOrGenerate generates a fresh keypair
+  # when the keyring dir is empty), orphaning every backup signed with
+  # the previous key — restore then fails with
+  #   "manifest: embedded public key does not match verifier"
+  # even though `doctor` still reports the (newly generated) key exists.
+  #
+  # The pg_hardstorage image is distroless (no shell) and runs as nonroot
+  # (uid 65532), but a fresh named volume mounts root-owned, so the
+  # nonroot agent can't write into it.  This busybox one-shot chowns the
+  # volume to the nonroot uid and sets the 0700 the keyring expects.
+  keyring-init:
+    image: busybox:latest
+    volumes:
+      - keyring:/keyring
+    command: ["sh", "-c", "chown 65532:65532 /keyring && chmod 700 /keyring"]
+    restart: "no"
+
+  pg_hardstorage:
+    <<: *pg-hardstorage-image
+    # Issue #98: the agent's Prometheus /metrics endpoint is opt-in
+    # (empty --metrics-listen disables it), so the eval stack used to
+    # come up with NO reachable metrics surface — `curl .../metrics`
+    # failed and Grafana showed nothing.  Turn it on and bind on all
+    # interfaces (0.0.0.0) so Prometheus and the host can reach it
+    # across the compose network; the default loopback bind would only
+    # be reachable from inside this container.  9187 is the
+    # documented agent metrics port (docs/operations/monitoring.md).
+    command: ["agent", "--metrics-listen", "0.0.0.0:9187"]
+    ports:
+      - "9187:9187"
+    depends_on:
+      pg:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      repo-init:
+        condition: service_completed_successfully
+      keyring-init:
+        condition: service_completed_successfully
+    environment:
+      # Persist the manifest-signing keyring on a named volume so the
+      # signing key is stable across restarts/recreates (issue #103).
+      # The SAME keyring is used by the agent (signing each backup) and by
+      # operator `restore` / `list` / `repo check` run via `docker exec`
+      # into this container (verifying) — docker exec inherits this env —
+      # so both sides agree on the key and signatures verify.
+      PG_HARDSTORAGE_KEYRING_DIR: /keyring
+      # Inline YAML configuration (issue #87 contract).  The agent
+      # parses this body identically to a pg_hardstorage.yaml on
+      # disk; field shapes follow internal/config.Config.
+      PG_HARDSTORAGE_CONFIG: |
+        deployments:
+          demo:
+            pg_connection: "postgres://postgres:demo@pg:5432/demo?sslmode=disable"
+            repo: "s3://pg-hardstorage-demo/?endpoint=http://minio:9000&region=us-east-1&path_style=true"
+            schedule:
+              backup:
+                every: "6h"
+              rotate:
+                daily_at: "04:00"
+      # S3 credentials are picked up by the AWS SDK from the
+      # standard env vars.  Bucket-level config (endpoint, region,
+      # path_style) lives in the repo URL above so it survives a
+      # re-create without env churn.
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_REGION: us-east-1
+    volumes:
+      - keyring:/keyring
+    restart: unless-stopped
+
+  # Prometheus scrapes the agent's /metrics endpoint (issue #98).
+  # Without it, Grafana had no datasource to query, so even a working
+  # /metrics surface produced empty dashboards.  Config lives in
+  # deploy/compose/prometheus.yml (mounted read-only).
+  prometheus:
+    image: prom/prometheus:latest
+    depends_on:
+      pg_hardstorage:
+        condition: service_started
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./deploy/compose/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheusdata:/prometheus
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:latest
+    depends_on:
+      prometheus:
+        condition: service_started
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    volumes:
+      - grafanadata:/var/lib/grafana
+      # Issue #98: provision the Prometheus datasource + a
+      # pg_hardstorage overview dashboard at boot so the operator sees
+      # backup/WAL metrics without any manual click-through.
+      - ./deploy/compose/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/compose/grafana/dashboards:/var/lib/grafana/dashboards:ro
+
+volumes:
+  pgdata:
+  miniodata:
+  grafanadata:
+  prometheusdata:
+  # Persists the agent's manifest-signing keyring across restarts (issue
+  # #103) so backups stay verifiable / restorable.
+  keyring:

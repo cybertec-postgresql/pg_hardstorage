@@ -1,0 +1,89 @@
+pg-hardstorage-compat-walg for Debian
+======================================
+
+This package ships /usr/bin/pg-hardstorage-walg, a drop-in
+replacement for the upstream wal-g binary.  It accepts the
+WAL-G CLI surface (5 verbs: backup-push, backup-fetch,
+backup-list, wal-push, wal-fetch) and dispatches to native
+pg_hardstorage commands underneath.
+
+Existing cron jobs, archive_command settings, and monitoring
+scripts run unchanged but produce native pg_hardstorage backups
+(content-addressed, signed, optionally KMS-wrapped).
+
+Configuration model
+-------------------
+
+WAL-G is configured through environment variables.  The shim
+honours the most-cited ones unchanged:
+
+  WALG_S3_PREFIX       → --repo s3://...
+  WALG_GS_PREFIX       → --repo gs://...
+  WALG_AZURE_PREFIX    → --repo azure://...
+  WALG_FILE_PREFIX     → --repo file:///...
+  WALG_SSH_PREFIX      → --repo sftp://...
+
+  PGHOST / PGPORT / PGUSER / PGDATABASE → --pg-connection postgres://...
+
+  PG_HARDSTORAGE_DEPLOYMENT (optional) → explicit deployment
+                                          name; otherwise PGHOST or
+                                          "default" is used.
+
+Activation
+----------
+
+The package does NOT auto-install a /usr/bin/wal-g symlink
+(that would conflict with operators running both tools side-by-
+side during a migration window).  Activate manually:
+
+  sudo ln -sf /usr/bin/pg-hardstorage-walg /usr/local/bin/wal-g
+
+Verify the symlink wins on PATH (/usr/local/bin should precede
+/usr/bin in $PATH for most distros — `which wal-g` is the
+quickest sanity check).
+
+One-shot config translation
+---------------------------
+
+Translate your existing /etc/default/wal-g (or whatever env
+file your systemd unit sources) to pg_hardstorage's YAML form:
+
+  pg_hardstorage compat translate --from walg \
+      /etc/default/wal-g \
+      --output /etc/pg_hardstorage/pg_hardstorage.yaml
+
+Every WAL-G env var that doesn't have a direct semantic
+equivalent emits as a YAML comment + a stderr summary so you
+can review before deploying.
+
+Refusal contract
+----------------
+
+WAL-G's libsodium / GPG / PGP envelopes are NOT silently
+re-encrypted — the algorithms differ.  If your env file sets
+WALG_LIBSODIUM_KEY, WALG_GPG_KEY_ID, or WALG_PGP_KEY[_PATH]
+the shim refuses with a remediation pointing at
+encryption.kek_ref in pg_hardstorage.yaml.
+
+11 less-common WAL-G verbs (`delete`, `backup-mark`,
+`catchup-push`, `catchup-fetch`, `wal-receive`, `wal-verify`,
+`wal-show`, `st`, `copy`, `daemon`, `backup-show`) and
+`--permanent` exit with code 2 and a one-line message of the
+form
+
+  pg-hardstorage-walg: <command>: not implemented in v1.1;
+  native equivalent: <suggestion>
+
+— so wrapper scripts that test for "tool exited non-zero" behave
+the same as they would against real WAL-G.
+
+What this is NOT
+----------------
+
+This package does NOT read existing WAL-G repositories.  Old
+repos remain readable only by wal-g itself; the dual-write +
+retention-drain migration pattern (described in the project's
+docs/how-to/migration/from-walg.md) keeps both tools running
+side-by-side until the old repo's retention window expires.
+
+ -- Hans-Jürgen Schönig <hs@cybertec.at>  Tue, 05 May 2026 09:00:00 +0000

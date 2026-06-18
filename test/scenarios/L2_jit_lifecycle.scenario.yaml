@@ -1,0 +1,142 @@
+# L2_jit_lifecycle.scenario.yaml
+#
+# Tier L2 — JIT (just-in-time) credential lifecycle: `jit
+# issue | list | show | verify | revoke`.
+#
+# Headline property: an operator issues a scoped, TTL-bound
+# token for a principal, lists active tokens, inspects one
+# by ID, verifies the token authorises a specific operation,
+# and revokes it.
+#
+# Why partly negative-path: show / verify / revoke need a
+# real token ID, and the runner doesn't capture stdout into
+# state.  We exercise:
+#
+#   * issue (positive)
+#   * list (positive — sees the issued token)
+#   * show / verify / revoke against synthetic IDs
+#     (negative — proves validation path is wired)
+#
+# Leaves covered (gate scope):
+#   * jit issue
+#   * jit list
+#   * jit show
+#   * jit verify
+#   * jit revoke
+#
+# Wall-clock budget: ~10s.
+
+schema: pg_hardstorage.scenario.v1
+name: L2-jit-lifecycle
+tier: L2
+description: |
+  list empty → issue a 1h-TTL token for principal=alice
+  → list shows it → show / verify / revoke synthetic-id
+  negatives → list filter by principal.
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  - cli_run:
+      args:
+        - "jit"
+        - "list"
+        - "--repo"
+        - "$REPO"
+      expect_exit: 0
+
+  # 1. Issue a scoped token.
+  - cli_run:
+      args:
+        - "jit"
+        - "issue"
+        - "alice"
+        - "--repo"
+        - "$REPO"
+        - "--scope"
+        - "kms.shred"
+        - "--scope"
+        - "backup.delete"
+        - "--duration"
+        - "1h"
+        - "--reason"
+        - "scenario probe: lifecycle issue"
+        - "--issued-by"
+        - "scenario-probe"
+      expect_exit: 0
+
+  # 2. List — must include alice's token.
+  - cli_run:
+      args:
+        - "jit"
+        - "list"
+        - "--repo"
+        - "$REPO"
+      expect_exit: 0
+      expect_stdout_contains: "alice"
+
+  # 3. List filter by principal.
+  - cli_run:
+      args:
+        - "jit"
+        - "list"
+        - "--repo"
+        - "$REPO"
+        - "--principal"
+        - "alice"
+      expect_exit: 0
+      expect_stdout_contains: "alice"
+
+  # 4. List filter by status.
+  - cli_run:
+      args:
+        - "jit"
+        - "list"
+        - "--repo"
+        - "$REPO"
+        - "--status"
+        - "active"
+      expect_exit: 0
+
+  # 5. Negative show: unknown token-id.
+  - cli_run:
+      args:
+        - "jit"
+        - "show"
+        - "00000000-no-such-token-00000000"
+        - "--repo"
+        - "$REPO"
+      expect_exit: 6
+
+  # 6. Negative verify: synthetic token bytes.
+  - cli_run:
+      args:
+        - "jit"
+        - "verify"
+        - "--repo"
+        - "$REPO"
+        - "--token"
+        - "AAAAAAAAAAAAAAAAAAAAAAAA"
+        - "--operation"
+        - "kms.shred"
+      expect_exit: 2
+
+  # 7. Negative revoke: unknown id.
+  - cli_run:
+      args:
+        - "jit"
+        - "revoke"
+        - "00000000-no-such-token-00000000"
+        - "--repo"
+        - "$REPO"
+        - "--by"
+        - "scenario-probe"
+        - "--reason"
+        - "scenario probe: negative revoke"
+      expect_exit: 6
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

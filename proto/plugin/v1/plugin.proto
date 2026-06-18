@@ -1,0 +1,278 @@
+// Tier-2 plugin gRPC interface for pg_hardstorage.
+//
+// Tier-1 plugins (S3, FS, Azure, GCS, AWS KMS, GCP KMS, AESGCM,
+// Slack, syslog, etc.) are statically linked into the binary —
+// see internal/plugin/{storage,encryption,sink,renderer,...}/.
+//
+// Tier-2 plugins ship as separate binaries discovered on
+// $HSPLUGIN_PATH and invoked via hashicorp/go-plugin's gRPC
+// transport.  They get crash isolation (a panicking plugin can't
+// take down the agent), schema-versioning isolation (each plugin
+// declares the protocol version it speaks), and language
+// independence (any language with gRPC support).
+//
+// This file defines the protocol contract.  Tier-2 plugin
+// authors generate stubs from these protos in their language of
+// choice and implement the server side; pg_hardstorage runs the
+// client side.
+
+syntax = "proto3";
+
+package pg_hardstorage.plugin.v1;
+
+option go_package = "github.com/cybertec-postgresql/pg_hardstorage/proto/plugin/v1;pluginv1";
+
+import "google/protobuf/struct.proto";
+import "google/protobuf/timestamp.proto";
+
+// PluginInfo is what every plugin reports at handshake time.
+message PluginInfo {
+  // Name uniquely identifies the plugin within its tier.
+  string name = 1;
+
+  // Tier is the plugin tier this binary implements.  Currently
+  // STORAGE / ENCRYPTION / SINK / RENDERER / SOURCE.  Reserved
+  // values for future tiers.
+  PluginTier tier = 2;
+
+  // Version is the plugin's own SemVer.  Reported in audit
+  // events and surfaced in `pg_hardstorage doctor` so the
+  // operator can correlate plugin behaviour to the binary.
+  string version = 3;
+
+  // ProtocolVersion is the version of THIS proto contract the
+  // plugin speaks.  pg_hardstorage validates compatibility at
+  // handshake; mismatches surface as a clean refusal rather
+  // than a wire-protocol corruption.
+  uint32 protocol_version = 4;
+}
+
+// PluginTier enumerates the plugin tiers Tier-2 supports.
+enum PluginTier {
+  PLUGIN_TIER_UNSPECIFIED = 0;
+  PLUGIN_TIER_STORAGE = 1;
+  PLUGIN_TIER_ENCRYPTION = 2;
+  PLUGIN_TIER_SINK = 3;
+  PLUGIN_TIER_RENDERER = 4;
+  PLUGIN_TIER_SOURCE = 5;
+  PLUGIN_TIER_LLM_PROVIDER = 6;
+  PLUGIN_TIER_COMPRESSION = 7;
+}
+
+// Capabilities are advertised at handshake; pg_hardstorage uses
+// the bitset to decide which optional methods to call.
+message Capabilities {
+  // IfNotExists: plugin honours conditional puts.
+  bool if_not_exists = 1;
+  // Rename: plugin supports atomic Rename (manifest commits).
+  bool rename = 2;
+  // SetRetention: plugin honours WORM retention.
+  bool set_retention = 3;
+  // FreeSpace: plugin reports available capacity (storage tier).
+  bool free_space = 4;
+  // RegionAware: plugin is aware of its serving region.
+  bool region_aware = 5;
+}
+
+// HandshakeRequest is the first frame.  pg_hardstorage sends its
+// own protocol version + a ConfigJSON the plugin can interpret.
+message HandshakeRequest {
+  uint32 protocol_version = 1;
+  google.protobuf.Struct config = 2;
+}
+
+// HandshakeResponse is the plugin's reply.  Refuses with a
+// non-empty reject_reason when the protocol versions disagree
+// or the config is unparseable.
+message HandshakeResponse {
+  PluginInfo info = 1;
+  Capabilities capabilities = 2;
+  string reject_reason = 3;
+}
+
+// ----------------------------------------------------------------
+// Storage plugin
+// ----------------------------------------------------------------
+
+service StoragePlugin {
+  rpc Handshake(HandshakeRequest) returns (HandshakeResponse);
+
+  rpc Put(PutRequest) returns (PutResponse);
+  rpc Get(GetRequest) returns (stream GetChunk);
+  rpc Stat(StatRequest) returns (ObjectInfo);
+  rpc List(ListRequest) returns (stream ObjectInfo);
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
+  rpc Rename(RenameRequest) returns (RenameResponse);
+  rpc SetRetention(SetRetentionRequest) returns (SetRetentionResponse);
+  rpc FreeSpace(FreeSpaceRequest) returns (FreeSpaceResponse);
+  rpc Close(CloseRequest) returns (CloseResponse);
+}
+
+message PutRequest {
+  string key = 1;
+  bytes data = 2;
+  bool if_not_exists = 3;
+  google.protobuf.Timestamp retention_until = 4;
+  string retention_mode = 5;
+  string content_sha256 = 6;
+}
+
+message PutResponse {
+  string etag = 1;
+  bool already_existed = 2;
+}
+
+message GetRequest {
+  string key = 1;
+}
+
+message GetChunk {
+  bytes data = 1;
+}
+
+message StatRequest {
+  string key = 1;
+}
+
+message ObjectInfo {
+  string key = 1;
+  int64 size = 2;
+  google.protobuf.Timestamp mod_time = 3;
+  string etag = 4;
+  google.protobuf.Timestamp retention_until = 5;
+  string retention_mode = 6;
+}
+
+message ListRequest {
+  string prefix = 1;
+}
+
+message DeleteRequest {
+  string key = 1;
+}
+
+message DeleteResponse {
+  bool deleted = 1;
+}
+
+message RenameRequest {
+  string src = 1;
+  string dst = 2;
+  bool if_not_exists = 3;
+}
+
+message RenameResponse {
+  bool renamed = 1;
+}
+
+message SetRetentionRequest {
+  string key = 1;
+  google.protobuf.Timestamp until = 2;
+  string mode = 3;
+}
+
+message SetRetentionResponse {}
+
+message FreeSpaceRequest {}
+
+message FreeSpaceResponse {
+  int64 total_bytes = 1;
+  int64 available_bytes = 2;
+  bool unsupported = 3;
+}
+
+message CloseRequest {}
+message CloseResponse {}
+
+// ----------------------------------------------------------------
+// Sink plugin (notification fan-out)
+// ----------------------------------------------------------------
+
+service SinkPlugin {
+  rpc Handshake(HandshakeRequest) returns (HandshakeResponse);
+  rpc Open(OpenSinkRequest) returns (OpenSinkResponse);
+  rpc Emit(EmitRequest) returns (EmitResponse);
+  rpc CloseSink(CloseSinkRequest) returns (CloseSinkResponse);
+}
+
+message OpenSinkRequest {
+  google.protobuf.Struct config = 1;
+}
+
+message OpenSinkResponse {
+  string sink_id = 1;
+}
+
+message EmitRequest {
+  string sink_id = 1;
+  Event event = 2;
+}
+
+message EmitResponse {}
+
+message CloseSinkRequest {
+  string sink_id = 1;
+}
+
+message CloseSinkResponse {}
+
+// Event mirrors output.Event.  Body is opaque (Struct) so future
+// event payloads don't require a proto bump.
+message Event {
+  string schema = 1;
+  uint32 severity = 2;
+  string severity_name = 3;
+  string component = 4;
+  string op = 5;
+  google.protobuf.Struct subject = 6;
+  google.protobuf.Struct body = 7;
+  google.protobuf.Struct suggestion = 8;
+  google.protobuf.Timestamp generated_at = 9;
+}
+
+// ----------------------------------------------------------------
+// Encryption plugin
+// ----------------------------------------------------------------
+
+service EncryptionPlugin {
+  rpc Handshake(HandshakeRequest) returns (HandshakeResponse);
+  rpc GenerateDEK(GenerateDEKRequest) returns (GenerateDEKResponse);
+  rpc UnwrapDEK(UnwrapDEKRequest) returns (UnwrapDEKResponse);
+  rpc RotateKEK(RotateKEKRequest) returns (RotateKEKResponse);
+  rpc Shred(ShredRequest) returns (ShredResponse);
+}
+
+message GenerateDEKRequest {
+  string tenant = 1;
+}
+
+message GenerateDEKResponse {
+  bytes dek = 1;
+  bytes wrapped_dek = 2;
+  string kek_ref = 3;
+}
+
+message UnwrapDEKRequest {
+  string tenant = 1;
+  bytes wrapped_dek = 2;
+  string kek_ref = 3;
+}
+
+message UnwrapDEKResponse {
+  bytes dek = 1;
+}
+
+message RotateKEKRequest {
+  string tenant = 1;
+  string old_kek_ref = 2;
+  string new_kek_ref = 3;
+}
+
+message RotateKEKResponse {}
+
+message ShredRequest {
+  string tenant = 1;
+  string reason = 2;
+}
+
+message ShredResponse {}

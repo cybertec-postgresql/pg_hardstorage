@@ -1,0 +1,83 @@
+# L3_restore_correctness_s3.scenario.yaml
+#
+# Tier L3 — same defence-stack exercise as
+# L3_restore_correctness.scenario.yaml, but with the repo
+# living in a fake-gcs-server sink instead of file://.
+# Catches:
+#   * S3 plugin regressions (URL parsing, path-style addressing,
+#     credential resolution from env vars)
+#   * Bucket / prefix layout regressions
+#   * Anything in the L1+L2+L7 stack that's storage-backend-
+#     sensitive (e.g., the manifest's PGBackupManifest blob is
+#     a base64 field that round-trips through S3 differently
+#     than through the local filesystem)
+#
+# Wall-clock budget: ~2 minutes (MinIO container ~3 s startup;
+# the rest of the stack mirrors the file:// scenario).
+#
+# Air-gap: pre-pull the MinIO image once on a connected box:
+#   pg_hardstorage_testkit image pull-sinks --only=gcs-fake
+# Then runs go offline:
+#   pg_hardstorage_testkit scenario run \
+#       test/scenarios/L3_restore_correctness_s3.scenario.yaml \
+#       --airgap
+
+schema: pg_hardstorage.scenario.v1
+name: L3-restore-correctness-gcs-fake
+tier: L3
+description: |
+  Backup → restore round-trip through a fake-gcs-server
+  repo, with the full L1-L4+L7 defence stack engaged.
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+# Bring up MinIO as the storage backend.  The runner pre-
+# creates the `testkit` bucket via filesystem layout (MinIO
+# treats top-level dirs under /data as buckets), so no
+# bucket-create step is needed.
+sink:
+  kind: gcs-fake
+
+steps:
+  # 1 GB pgbench seed, in-container via docker exec on the
+  # local-docker PG cell.  Identical to the file:// scenario
+  # except the repo URL the agent writes to is now s3://...
+  # under the hood.
+  - seed:
+      target_gb: 1
+
+  - capture_lsn:
+      name: post_seed
+      checksum_query: |
+        select
+          count(*)::text || '|' ||
+          coalesce(sum(abalance)::text, '0') || '|' ||
+          coalesce(sum(hashtextextended(t::text, 0))::text, '0')
+        from pgbench_accounts t
+
+  - take_backup:
+      deployment: l3-restore-correctness-gcs-fake
+
+  - restore:
+      deployment: l3-restore-correctness-gcs-fake
+      name: post_seed
+
+  # Strict byte-equal check.  Hard-fails if host pg_ctl is
+  # missing — CI runners that pull this scenario MUST have
+  # postgresql-client installed (same posture as the file://
+  # variant; the gate is what actually catches issue-#7-class
+  # regressions).
+  - assert_restored_match:
+      name: post_seed
+      strict: true
+
+asserts:
+  - count_exact:
+      table: pgbench_accounts
+      value: 6700000
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

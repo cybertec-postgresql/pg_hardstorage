@@ -1,0 +1,98 @@
+# L3_wal_stream_double_backup.scenario.yaml
+#
+# Two base backups inside a single streaming session.
+# Mirrors the production rotation pattern where the
+# streamer runs continuously and a scheduled `backup`
+# fires nightly.  By the end of week one, the streamer
+# has spanned seven base backups without restarting.
+#
+# Why a dedicated scenario: a regression that surfaced
+# only on the SECOND base backup (e.g. slot conflict, lock
+# leak, replication-protocol state confusion across two
+# concurrent BASE_BACKUP commands plus the streaming slot)
+# would not surface in any single-backup scenario.  Two
+# is the smallest count that proves N is allowed.
+#
+# What gets exercised end-to-end:
+#
+#   * Two `take_backup` steps, separated by a `run_load`
+#     window.  Both run concurrently with the streamer.
+#   * The captured LSN sits AFTER the second backup, so
+#     restore from the second backup replays a short tail
+#     of streamed WAL to land at the captured state.
+#   * `restore` with no `source:` defaults to the most
+#     recent take_backup — the runner stashes the second
+#     backup_id; the first becomes a retention test for a
+#     follow-up scenario.
+#
+# Pass criterion: byte-equal checksum match.  Any
+# regression in the streamer's two-backup-window handling
+# breaks the captured-LSN-to-restored-state alignment.
+#
+# Wall-clock budget: ~3-4 minutes.
+schema: pg_hardstorage.scenario.v1
+name: L3-wal-stream-double-backup
+tier: L3
+description: |
+  Two base backups inside one streaming session, then
+  PITR through the streamed WAL after the second backup.
+  Proves the streamer survives a multi-backup rotation
+  without state drift.
+topology:
+  provider: local-docker
+  pg_version: "17"
+load:
+  file: test/load/failover_loop.load.yaml
+steps:
+  - wal_stream:
+      action: start
+  - seed:
+      target_gb: 1
+
+  # Backup #1.  Streamer keeps running; PG handles a
+  # second concurrent BASE_BACKUP without disturbing the
+  # streaming slot.
+  - take_backup:
+      deployment: l3-wal-stream-double-backup-1
+
+  # Workload between backups.  Every byte of WAL here
+  # is in the streamed archive (and in basebackup #2's
+  # bundled WAL, since #2 covers from its own start LSN).
+  - run_load:
+      duration: 10s
+
+  # Backup #2.  Same deployment; the runner generates a
+  # fresh backup ID per take_backup so this doesn't
+  # collide.  The streaming slot sits underneath both.
+  - take_backup:
+      deployment: l3-wal-stream-double-backup-2
+
+  # Post-#2 workload.  Reachable only via the stream.
+  - run_load:
+      duration: 10s
+
+  - capture_lsn:
+      name: post_double_backup
+      checksum_query: |
+        select
+          count(*)::text || '|' ||
+          coalesce(sum(abalance)::text, '0') || '|' ||
+          coalesce(sum(hashtextextended(t::text, 0))::text, '0')
+        from pgbench_accounts t
+  - switch_wal: {}
+  - wal_stream:
+      action: stop
+
+  # Default `source:` selects the most recent take_backup
+  # (deployment l3-wal-stream-double-backup-2).  PITR
+  # replays the post-#2 stream window to reach the
+  # captured LSN.
+  - restore:
+      deployment: l3-wal-stream-double-backup-2
+      name: post_double_backup
+  - assert_restored_match:
+      name: post_double_backup
+      strict: true
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

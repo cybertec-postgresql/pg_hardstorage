@@ -1,0 +1,85 @@
+# L4_patroni_rolling_upgrade.scenario.yaml
+#
+# Tier L4 — node-by-node rolling upgrade of a 3-node Patroni
+# cluster, with a pg_hardstorage agent on every node, asserting
+# continuous backup succession across the rolling window.
+#
+# This scenario REQUIRES the patroni topology provider — the
+# default local-docker provider boots a single-node PG, which
+# can't exercise a multi-node rolling upgrade.  At the time of
+# writing the patroni topology shape exists in
+# internal/testkit/topology/ but the rolling-upgrade hook
+# (`patroni_rolling_upgrade` step or per-node binary swap) is
+# not yet wired.  The YAML lives in-tree as a
+# specification-by-example so the patroni provider PR can be
+# tested against a concrete acceptance scenario.
+#
+# Pass condition (when the provider lands):
+#   - Backup #1 succeeds before the rolling upgrade starts.
+#   - Per-node binary swap completes for nodes 0, 1, 2.
+#   - During the rolling window, at least one backup completes
+#     successfully (i.e. patroni-aware leader-discovery in the
+#     pg_hardstorage agent successfully tracks the failover).
+#   - Backup #N+1 succeeds after the rolling upgrade completes.
+#   - All backups taken before, during, and after the upgrade
+#     restore cleanly.
+
+schema: pg_hardstorage.scenario.v1
+name: L4-patroni-rolling-upgrade
+tier: L4
+description: |
+  3-node Patroni rolling upgrade with continuous backup.
+  REQUIRES the patroni topology provider; SKIP otherwise.
+
+topology:
+  provider: patroni-local-docker
+  pg_version: "17"
+  replicas: 3
+
+load:
+  file: test/load/oltp_smoke.load.yaml
+
+steps:
+  - take_backup:
+      type: full
+      name: pre_rolling
+
+  # Roll node 0.  swap_binary targets the explicit container
+  # name; the patroni topology provider exposes per-node
+  # container names like patroni-pg17-c0-node{0,1,2}.
+  - swap_binary:
+      host_path: bin/pg_hardstorage
+      cell_path: /usr/local/bin/pg_hardstorage
+      container: node:0
+
+  - take_backup:
+      type: full
+      name: rolling_after_node0
+
+  - swap_binary:
+      host_path: bin/pg_hardstorage
+      cell_path: /usr/local/bin/pg_hardstorage
+      container: node:1
+
+  - take_backup:
+      type: full
+      name: rolling_after_node1
+
+  - swap_binary:
+      host_path: bin/pg_hardstorage
+      cell_path: /usr/local/bin/pg_hardstorage
+      container: node:2
+
+  - take_backup:
+      type: full
+      name: post_rolling
+
+  # Restore one of each: pre, mid, post.
+  - restore:
+      source: pre_rolling
+
+  - restore:
+      source: rolling_after_node1
+
+  - restore:
+      source: post_rolling

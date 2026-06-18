@@ -1,0 +1,101 @@
+# L2_recovery_diagnostics.scenario.yaml
+#
+# E2E coverage for the recovery-readiness diagnostic surface.
+# `recovery readiness` and `recovery windows` are read-only
+# operator queries — they answer "could we restore right now?"
+# and "what PITR windows are available?".
+#
+# Why this matters: an operator's first move during an incident
+# is "tell me what I can restore."  If readiness misreports a
+# missing manifest as healthy, or windows hides a WAL gap, the
+# operator picks a target that doesn't actually work.  Unit
+# tests prove the formatting; this scenario proves the queries
+# return correct + non-empty answers against a populated repo.
+#
+# What gets exercised:
+#
+#   * recovery readiness <deployment> — single-screen scorecard
+#   * recovery windows <deployment> — every available PITR window
+#
+# `recovery drill` lives in a separate L3 scenario — a real drill
+# spawns a sandbox PG and is heavier-weight.
+#
+# Pass criterion: both commands exit 0 with non-empty JSON.
+# Wall-clock budget: ~8s.
+
+schema: pg_hardstorage.scenario.v1
+name: L2-recovery-diagnostics
+tier: L2
+description: |
+  Read-only recovery diagnostics: readiness scorecard and PITR
+  window listing against a populated repo.
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  # Take a backup so the readiness scorecard has something to
+  # score against.  An empty repo would return "nothing to
+  # restore" which is a different code path than "here's what
+  # you have".
+  - take_backup:
+      deployment: l2-recovery-diagnostics
+
+  # 1. readiness — the scorecard answers "could we restore this
+  # deployment right now?".  Must exit 0 with structured JSON
+  # naming the deployment.  We require the deployment name in
+  # stdout as the canonical signal the scorecard targeted the
+  # right deployment.
+  - cli_run:
+      args:
+        - "recovery"
+        - "readiness"
+        - "$DEPLOYMENT"
+        - "--repo"
+        - "$REPO"
+        - "--output"
+        - "json"
+      expect_exit: 0
+      expect_stdout_contains: "$DEPLOYMENT"
+
+  # 2. windows — every PITR window with WAL-coverage gaps
+  # called out.  Without WAL streaming this scenario only has
+  # the basebackup window (no continuous WAL).  Future:
+  # extend with a wal_stream sidecar and assert >1 window.
+  - cli_run:
+      args:
+        - "recovery"
+        - "windows"
+        - "$DEPLOYMENT"
+        - "--repo"
+        - "$REPO"
+        - "--output"
+        - "json"
+      expect_exit: 0
+      expect_stdout_contains: "schema"
+
+  # 3. UNKNOWN-DEPLOYMENT shape: readiness exits 0 even for a
+  # deployment with no backups — the scorecard is a *diagnostic*,
+  # not a query that errors on cache miss.  The body-shape signal
+  # for "deployment unknown" is in the JSON result, not the exit
+  # code.  We assert the command still exits 0 (read-only-diagnostic
+  # contract) and the deployment name appears verbatim in the
+  # output.  This catches a regression where readiness errored
+  # on a missing deployment instead of returning an empty
+  # scorecard.
+  - cli_run:
+      args:
+        - "recovery"
+        - "readiness"
+        - "no-such-deployment-deadbeef"
+        - "--repo"
+        - "$REPO"
+        - "--output"
+        - "json"
+      expect_exit: 0
+      expect_stdout_contains: "no-such-deployment-deadbeef"
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

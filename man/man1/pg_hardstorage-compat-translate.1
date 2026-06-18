@@ -1,0 +1,90 @@
+.nh
+.TH "PG_HARDSTORAGE" "1" "May 2026" "pg_hardstorage Manual" "pg_hardstorage Manual"
+
+.SH NAME
+.PP
+pg_hardstorage-compat-translate - Convert a legacy config to pg_hardstorage.yaml
+
+
+.SH SYNOPSIS
+.PP
+\fBpg_hardstorage compat translate --from   [flags]\fP
+
+
+.SH DESCRIPTION
+.PP
+translate reads a legacy backup-tool config file (today:
+pgBackRest's pgbackrest.conf, Barman's barman.conf, or a
+WAL-G env file) and writes the equivalent pg_hardstorage.yaml.
+Every setting that doesn't have a direct semantic equivalent
+is emitted as a YAML comment with a stderr summary so the
+operator can review.
+
+
+.SH OPTIONS
+.PP
+\fB--force\fP[=false]
+	overwrite an existing output file
+
+.PP
+\fB--from\fP=""
+	source tool: pgbackrest|barman|walg (required)
+
+.PP
+\fB-h\fP, \fB--help\fP[=false]
+	help for translate
+
+.PP
+\fB--output\fP=""
+	output file path (default: stdout)
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+.PP
+\fB--airgapped\fP[=false]
+	refuse outbound endpoints (LLM providers, sinks, OTLP collectors) outside loopback / RFC1918 / explicit airgap.allowlist. Also enabled by PG_HARDSTORAGE_AIRGAPPED=1 or \fBairgapped: strict\fR in the config file.
+
+.PP
+\fB-c\fP, \fB--config\fP=""
+	path to config file (default: XDG/FHS lookup)
+
+.PP
+\fB--cpu-profile\fP=""
+	write a pprof CPU profile to this path for the duration of the command (\fBgo tool pprof <path>\fR to analyse). Off when empty.
+
+.PP
+\fB--mem-profile\fP=""
+	write a pprof heap profile to this path at command exit. Off when empty.
+
+.PP
+\fB--no-color\fP[=false]
+	disable ANSI color in text output
+
+.PP
+\fB--on-error-llm\fP[=false]
+	on a structured-error failure, drop into the matching LLM helper skill (auto_on_error trigger). Also enabled by PG_HARDSTORAGE_ON_ERROR_LLM=1.
+
+.PP
+\fB--otel-endpoint\fP=""
+	OpenTelemetry OTLP/HTTP endpoint (e.g. http://otel-collector:4318); empty disables tracing
+
+.PP
+\fB--otel-stdout\fP[=false]
+	also export OpenTelemetry traces to stderr (useful for dev)
+
+.PP
+\fB--profile-port\fP=0
+	if non-zero, expose net/http/pprof on 127.0.0.1: for live profiling of long-running commands (e.g. \fBgo tool pprof http://127.0.0.1:6060/debug/pprof/profile?seconds=30\fR). Off when zero.
+
+.PP
+\fB-q\fP, \fB--quiet\fP[=false]
+	suppress non-essential output
+
+.PP
+\fB--template\fP=""
+	Go text/template applied when --output template (or implied if --template is set without --output)
+
+
+.SH SEE ALSO
+.PP
+\fBpg_hardstorage-compat(1)\fP

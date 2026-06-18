@@ -1,0 +1,162 @@
+# L3_incremental_pitr_midchain.scenario.yaml
+#
+# Tier L3: PITR replay that lands MID-CHAIN — recovery target
+# LSN sits between an intermediate incremental's stop_lsn and
+# the leaf's stop_lsn.  The restore explicitly selects the
+# intermediate (NOT the leaf) as its source backup, proving:
+#
+#   * pg_combinebackup over a NON-LEAF incremental's manifest
+#     produces a working datadir (regression guard: a bug class
+#     where chain-restore only worked for the most recent link
+#     would pass the L2 smoke and fail here).
+#   * PG's recovery loop can pick up the WAL-stream-archived
+#     post-backup WAL and roll forward FROM a chain-flattened
+#     datadir's stop_lsn to the captured midchain LSN.  This
+#     pairs the chain-restore code path with the
+#     archive-recovery code path; either alone would let a
+#     subtle interaction bug ship.
+#   * The intermediate's PGBackupManifest is intact enough for
+#     pg_combinebackup to consume — same regression class as
+#     L2 (incrementals must persist their own PG manifest),
+#     but exercised through the restore side of the contract
+#     instead of the second-incremental side.
+#   * assert_restored_match's checksum_query (count + sum of
+#     hashtextextended(email) over `users`) MUST match the
+#     captured live-cluster checksum at the midchain LSN —
+#     proves not just "recovery completed" but "recovery
+#     landed at exactly the right LSN with the right data".
+#
+# What "midchain" means precisely:
+#
+#     full @ L0   incr_1 @ L1   incr_leaf @ L2
+#     ─────●──────────●──────────●───────────────►  LSN
+#                    ╲│
+#                     ●  midchain_target ∈ (L1, L2)
+#
+# The captured LSN $midchain_target sits strictly between
+# incr_1.stop_lsn and incr_leaf.stop_lsn.  Restore picks
+# source: incr_1 (chain = [full, incr_1]); WAL replay rolls
+# forward from incr_1.stop_lsn through archived WAL until it
+# reaches $midchain_target, then promotes.
+#
+# Wall-clock budget: ~60s.
+schema: pg_hardstorage.scenario.v1
+name: L3-incremental-pitr-midchain
+tier: L3
+description: |
+  full → incr_1 → incr_leaf chain, capture LSN between incr_1
+  and incr_leaf, restore source=incr_1 to_lsn=$midchain.  Asserts
+  byte-equal restored state at the midchain LSN.
+
+topology:
+  provider: local-docker
+  # PG 17+ required for BASE_BACKUP INCREMENTAL.  Inherits
+  # `summarize_wal=on` from the local-docker topology's PG-17+
+  # auto-config (see internal/testkit/topology/local_docker.go).
+  pg_version: "17"
+
+load:
+  # failover_loop is re-runnable (no UNIQUE on generator output),
+  # so run_load between backups drives real churn without
+  # tripping duplicate-key.
+  file: test/load/failover_loop.load.yaml
+
+steps:
+  # 1. Start WAL streaming BEFORE the first backup so post-backup
+  #    WAL lands in the repo and PG's restore_command can fetch
+  #    it during recovery.  The wal_stream sidecar drains its
+  #    replication slot on `action: stop`, sealing the in-flight
+  #    segment containing $midchain_target.
+  - wal_stream:
+      action: start
+
+  # 2. Confirm the load landed.  failover_loop seeds 1000 rows
+  #    into `users` (500 bootstrap + 500 write_burst).
+  - assert:
+      - count_exact: { table: users, value: 1000 }
+
+  # 3. FULL anchor.
+  - take_backup:
+      deployment: l3-pitr-mid
+      name: anchor_full
+
+  # 4. Churn between full and incr_1 so the first incremental
+  #    has meaningful deltas (and so the LSN gap to capture
+  #    between incr_1 and incr_leaf is non-trivial).
+  - run_load:
+      duration: 3s
+
+  # 5. First incremental — the one we'll restore FROM.
+  - take_backup:
+      deployment: l3-pitr-mid
+      incremental_from: "$LAST_BACKUP"
+      name: incr_1
+
+  # 6. Churn that lands AFTER incr_1.stop_lsn — every row
+  #    inserted here is reachable only via post-backup WAL
+  #    replay, which is the exact code path we're exercising.
+  - run_load:
+      duration: 3s
+
+  # 7. The midchain marker.  $midchain_target.lsn > incr_1.stop_lsn,
+  #    and the checksum_query captures the live-cluster state we
+  #    expect to see in the restored cluster after WAL replay
+  #    stops at this LSN.
+  - capture_lsn:
+      name: midchain_target
+      checksum_query: |
+        select
+          count(*)::text || '|' ||
+          coalesce(sum(hashtextextended(email, 0))::text, '0')
+        from users
+
+  # 8. Seal the segment containing $midchain_target so wal_stream
+  #    can commit it.  Without this, the captured LSN sits in an
+  #    in-flight segment that the streamer cannot finalise, and
+  #    PG's archive recovery aborts with "recovery ended before
+  #    configured recovery target was reached".
+  - switch_wal: {}
+
+  # 9. More churn between $midchain_target and incr_leaf, so
+  #    incr_leaf.stop_lsn is strictly past the PITR target —
+  #    that's what makes this a "midchain" target.
+  - run_load:
+      duration: 3s
+
+  # 10. Leaf incremental.  Exists to prove the chain extends
+  #     past $midchain_target; we never restore from it.
+  - take_backup:
+      deployment: l3-pitr-mid
+      incremental_from: incr_1
+      name: incr_leaf
+
+  # 11. Drain the streamer so every segment up to and including
+  #     the one containing $midchain_target is committed to the
+  #     repo and visible to restore_command's wal-fetch shim.
+  - switch_wal: {}
+  - wal_stream:
+      action: stop
+
+  # 12. The actual midchain restore.  source: incr_1 (NOT
+  #     incr_leaf!) restricts the materialised chain to
+  #     [full, incr_1]; to_lsn: $midchain_target makes PG
+  #     replay archived WAL forward from incr_1.stop_lsn until
+  #     it reaches the captured LSN, then promote.
+  - restore:
+      deployment: l3-pitr-mid
+      source: incr_1
+      to_lsn: "$midchain_target"
+
+  # 13. The correctness gate.  Boots the restored datadir in a
+  #     sandbox PG container, re-runs the checksum_query, and
+  #     asserts byte-equal against the live-cluster checksum we
+  #     captured at $midchain_target.  Strict=true: scenario hard-
+  #     fails if pg_ctl can't be located, rather than soft-
+  #     skipping (which is the gap that let issue #7 ship).
+  - assert_restored_match:
+      name: midchain_target
+      strict: true
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

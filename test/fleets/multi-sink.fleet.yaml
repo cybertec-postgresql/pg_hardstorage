@@ -1,0 +1,88 @@
+schema: pg_hardstorage.testkit.fleet.v1
+version: 1
+
+# multi-sink.fleet.yaml — five cells, each pinned to a
+# different storage backend.  Exercises concurrent sink
+# coverage during a soak run: every cell brings up its
+# own emulator (s3-minio, azurite, sftp, gcs-fake), or
+# falls through to file:// when `sink:` is absent.
+#
+# Use as the input to a soak run:
+#
+#   pg_hardstorage_testkit compose generate \
+#       --fleet test/fleets/multi-sink.fleet.yaml \
+#       --out test-runs/multi-sink/docker-compose.yaml
+#   docker compose -p multi-sink-soak \
+#       -f test-runs/multi-sink/docker-compose.yaml up -d
+#   pg_hardstorage_testkit validate \
+#       --fleet test/fleets/multi-sink.fleet.yaml \
+#       --duration 30m \
+#       --report-dir test-runs/multi-sink
+#
+# Five cells × four sink emulators is heavy on a small
+# laptop (each emulator is ~few hundred MB RAM).  A 16 GB
+# host is comfortable; below that, drop the cells you
+# don't need or run the variants serially.
+#
+# What this catches that the L3 per-sink scenarios don't:
+#   * Concurrent multi-tenant pressure on emulators —
+#     fake-gcs-server and azurite both have known
+#     single-process bottlenecks; running them in parallel
+#     against four other cells under load surfaces lock /
+#     contention regressions the per-sink scenarios miss.
+#   * Repo-state isolation across cells using different
+#     sink technologies — a deduper that incorrectly
+#     keys on filename without backend qualifier could
+#     bleed state between cells.  A multi-sink fleet
+#     proves the fix-time invariant by construction.
+#   * WAL stream lag (N7's WALRepoLagBytes) collected
+#     across heterogeneous sink response profiles.
+
+fleet:
+    # Baseline: no sink → file:// repo.  Without this
+    # cell a regression specific to the sink path could
+    # be misread as a backup-tool bug; the file:// cell
+    # is the control surface.
+    - name: ubuntu-2404-pg17-file
+      os: ubuntu:24.04
+      pg: "17"
+      arch: amd64
+      count: 1
+      filesystem: ext4
+      storage_gb: 10
+
+    - name: ubuntu-2404-pg17-s3
+      os: ubuntu:24.04
+      pg: "17"
+      arch: amd64
+      count: 1
+      filesystem: ext4
+      storage_gb: 10
+      sink: s3-minio
+
+    - name: almalinux-9-pg16-azurite
+      os: almalinux:9
+      pg: "16"
+      arch: amd64
+      count: 1
+      filesystem: xfs
+      storage_gb: 10
+      sink: azurite
+
+    - name: debian-12-pg15-sftp
+      os: debian:12
+      pg: "15"
+      arch: amd64
+      count: 1
+      filesystem: ext4
+      storage_gb: 10
+      sink: sftp
+
+    - name: opensuse-leap-15-pg16-gcs
+      os: opensuse:leap-15
+      pg: "16"
+      arch: amd64
+      count: 1
+      filesystem: btrfs
+      storage_gb: 10
+      sink: gcs-fake

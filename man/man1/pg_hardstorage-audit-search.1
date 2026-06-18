@@ -1,0 +1,157 @@
+.nh
+.TH "PG_HARDSTORAGE" "1" "May 2026" "pg_hardstorage Manual" "pg_hardstorage Manual"
+
+.SH NAME
+.PP
+pg_hardstorage-audit-search - Query audit events with filters
+
+
+.SH SYNOPSIS
+.PP
+\fBpg_hardstorage audit search [flags]\fP
+
+
+.SH DESCRIPTION
+.PP
+search walks the audit chain and returns events matching
+the supplied filters. Filters AND-combine: an event must match
+every non-zero criterion to be included.
+
+.PP
+Common forensic queries:
+
+.PP
+# Everything in the last 24h, newest first
+  audit search --repo  --since 24h --reverse
+
+.PP
+# Every backup-namespace action against db1
+  audit search --repo  --deployment db1 --action-prefix backup.
+
+.PP
+# Just the deletes of one specific backup
+  audit search --repo  --backup-id db1.full.20260501T0900Z
+
+.PP
+# Anything done by an operator whose email contains "ops@"
+  audit search --repo  --actor-contains ops@
+
+.PP
+--action vs --action-prefix: the former is the strict match
+("backup.delete" only); the latter is the namespace-loose match
+("backup." captures backup.create, backup.delete, backup.undelete).
+Pass both for the strictest possible match (the strict --action
+must share the loose --action-prefix or no events match).
+
+.PP
+--reverse + --limit returns the N most-recent matching events,
+which is the natural "what happened recently?" pagination.
+
+
+.SH OPTIONS
+.PP
+\fB--action\fP=""
+	filter on exact action match (e.g. 'backup.create')
+
+.PP
+\fB--action-prefix\fP=""
+	filter on action namespace prefix (e.g. 'backup.' captures backup.*)
+
+.PP
+\fB--actor\fP=""
+	filter on exact actor match
+
+.PP
+\fB--actor-contains\fP=""
+	filter on substring match against actor (partial-principal lookup)
+
+.PP
+\fB--backup-id\fP=""
+	filter on exact backup-id match against the event Subject
+
+.PP
+\fB--deployment\fP=""
+	filter on exact deployment match against the event Subject
+
+.PP
+\fB-h\fP, \fB--help\fP[=false]
+	help for search
+
+.PP
+\fB--limit\fP=0
+	cap the number of returned events (0 = no cap); combine with --reverse for the N most-recent
+
+.PP
+\fB--repo\fP=""
+	repository URL (required)
+
+.PP
+\fB--reverse\fP[=false]
+	yield newest-first (commit order otherwise)
+
+.PP
+\fB--since\fP=""
+	include events at or after this time (RFC3339 absolute or duration like 24h, 7d)
+
+.PP
+\fB--tenant\fP=""
+	filter on exact tenant match
+
+.PP
+\fB--until\fP=""
+	include events strictly before this time (same format as --since)
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+.PP
+\fB--airgapped\fP[=false]
+	refuse outbound endpoints (LLM providers, sinks, OTLP collectors) outside loopback / RFC1918 / explicit airgap.allowlist. Also enabled by PG_HARDSTORAGE_AIRGAPPED=1 or \fBairgapped: strict\fR in the config file.
+
+.PP
+\fB-c\fP, \fB--config\fP=""
+	path to config file (default: XDG/FHS lookup)
+
+.PP
+\fB--cpu-profile\fP=""
+	write a pprof CPU profile to this path for the duration of the command (\fBgo tool pprof <path>\fR to analyse). Off when empty.
+
+.PP
+\fB--mem-profile\fP=""
+	write a pprof heap profile to this path at command exit. Off when empty.
+
+.PP
+\fB--no-color\fP[=false]
+	disable ANSI color in text output
+
+.PP
+\fB--on-error-llm\fP[=false]
+	on a structured-error failure, drop into the matching LLM helper skill (auto_on_error trigger). Also enabled by PG_HARDSTORAGE_ON_ERROR_LLM=1.
+
+.PP
+\fB--otel-endpoint\fP=""
+	OpenTelemetry OTLP/HTTP endpoint (e.g. http://otel-collector:4318); empty disables tracing
+
+.PP
+\fB--otel-stdout\fP[=false]
+	also export OpenTelemetry traces to stderr (useful for dev)
+
+.PP
+\fB-o\fP, \fB--output\fP=""
+	output format: text|json|ndjson|yaml|template|csv|markdown|html|tap|junit|pdf (default: text on TTY, json off-TTY)
+
+.PP
+\fB--profile-port\fP=0
+	if non-zero, expose net/http/pprof on 127.0.0.1: for live profiling of long-running commands (e.g. \fBgo tool pprof http://127.0.0.1:6060/debug/pprof/profile?seconds=30\fR). Off when zero.
+
+.PP
+\fB-q\fP, \fB--quiet\fP[=false]
+	suppress non-essential output
+
+.PP
+\fB--template\fP=""
+	Go text/template applied when --output template (or implied if --template is set without --output)
+
+
+.SH SEE ALSO
+.PP
+\fBpg_hardstorage-audit(1)\fP

@@ -1,0 +1,69 @@
+# L2_timetravel_cleanup.scenario.yaml
+#
+# Tier L2 — timetravel cleanup focus.  Cross-cover scenario
+# for the timetravel family, emphasising the reaper path.
+#
+# Leaves covered (gate scope — 2nd touch):
+#   * timetravel cleanup (2nd, with --remove-targets)
+#   * timetravel list (2nd)
+#   * timetravel create (2nd, negative)
+#   * timetravel destroy (2nd, negative)
+#
+# Wall-clock budget: ~10s.
+
+schema: pg_hardstorage.scenario.v1
+name: L2-timetravel-cleanup
+tier: L2
+description: |
+  Exercise cleanup --remove-targets path + cross-cover
+  list/create/destroy with different inputs.
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  - cli_run:
+      args:
+        - "timetravel"
+        - "list"
+      expect_exit: 0
+
+  # 1. cleanup with --remove-targets — no expired sessions,
+  # but the flag-parsing path must accept it.
+  - cli_run:
+      args:
+        - "timetravel"
+        - "cleanup"
+        - "--remove-targets"
+      expect_exit: 0
+
+  # 2. Negative create with a malformed --at value.
+  - cli_run:
+      args:
+        - "timetravel"
+        - "create"
+        - "l2-tt-cleanup-1"
+        - "--deployment"
+        - "$DEPLOYMENT"
+        - "--repo"
+        - "$REPO"
+        - "--at"
+        - "not-a-valid-time-or-lsn"
+        - "--target"
+        - "$ARTEFACT_DIR/tt-cleanup-target"
+      expect_exit: 1
+
+  # 3. Negative destroy with --remove-target on a name
+  # that doesn't exist.
+  - cli_run:
+      args:
+        - "timetravel"
+        - "destroy"
+        - "still-no-such-session"
+        - "--remove-target"
+      expect_exit: 6
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

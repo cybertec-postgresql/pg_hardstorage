@@ -1,0 +1,142 @@
+# L4_rapid_failover_x5.scenario.yaml — five quick
+# Patroni switchovers in succession.  More leader
+# churn than the standard L4 (3 switchovers) — catches:
+#
+#   * Replication-slot reuse hazards across rapid leader
+#     changes (the agent's wal-stream slot must follow the
+#     new leader without losing committed segments).
+#   * Patroni REST consistency under back-to-back
+#     /failover POSTs (the API rate limits or queues).
+#   * The runner's connString re-resolution under churn —
+#     a stale leader DSN cached for any reason would fail
+#     the next run_load step.
+#
+# Wall-clock budget: ~10 minutes (5 GB seed + 5
+# switchovers + backup + restore + assert).
+schema: pg_hardstorage.scenario.v1
+name: L4-rapid-failover-x5
+tier: L4
+description: |
+  Five Patroni switchovers under sustained load.  Catches
+  slot-reuse / leader-discovery regressions that the
+  3-switchover L4 baseline can miss because each round
+  has more time to settle.
+topology:
+  provider: patroni-local-docker
+  pg_version: "17"
+load:
+  file: test/load/failover_loop.load.yaml
+steps:
+  - seed:
+      target_gb: 5
+  - wal_stream:
+      action: start
+  - run_load:
+      duration: 20s
+  - inject:
+      kind: patroni_failover
+      target: patroni
+      # heal_window: patroni_switchover's Apply returns once the
+      # /failover POST is accepted; the actual leader transition
+      # (DCS update + new-leader promote + old-leader demote)
+      # takes ~10-15s.  Without this delay the next run_load
+      # races the transition and connects to the now-replica
+      # before /leader updates, surfacing as
+      # `ERROR: cannot execute CREATE TABLE in a read-only
+      # transaction (SQLSTATE 25006)`.  Mirrors the same value
+      # L4_patroni_failover_loop already pins.
+      heal_window: 15s
+  - run_load:
+      duration: 20s
+  - inject:
+      kind: patroni_failover
+      target: patroni
+      # heal_window: patroni_switchover's Apply returns once the
+      # /failover POST is accepted; the actual leader transition
+      # (DCS update + new-leader promote + old-leader demote)
+      # takes ~10-15s.  Without this delay the next run_load
+      # races the transition and connects to the now-replica
+      # before /leader updates, surfacing as
+      # `ERROR: cannot execute CREATE TABLE in a read-only
+      # transaction (SQLSTATE 25006)`.  Mirrors the same value
+      # L4_patroni_failover_loop already pins.
+      heal_window: 15s
+  - run_load:
+      duration: 20s
+  - inject:
+      kind: patroni_failover
+      target: patroni
+      # heal_window: patroni_switchover's Apply returns once the
+      # /failover POST is accepted; the actual leader transition
+      # (DCS update + new-leader promote + old-leader demote)
+      # takes ~10-15s.  Without this delay the next run_load
+      # races the transition and connects to the now-replica
+      # before /leader updates, surfacing as
+      # `ERROR: cannot execute CREATE TABLE in a read-only
+      # transaction (SQLSTATE 25006)`.  Mirrors the same value
+      # L4_patroni_failover_loop already pins.
+      heal_window: 15s
+  - run_load:
+      duration: 20s
+  - inject:
+      kind: patroni_failover
+      target: patroni
+      # heal_window: patroni_switchover's Apply returns once the
+      # /failover POST is accepted; the actual leader transition
+      # (DCS update + new-leader promote + old-leader demote)
+      # takes ~10-15s.  Without this delay the next run_load
+      # races the transition and connects to the now-replica
+      # before /leader updates, surfacing as
+      # `ERROR: cannot execute CREATE TABLE in a read-only
+      # transaction (SQLSTATE 25006)`.  Mirrors the same value
+      # L4_patroni_failover_loop already pins.
+      heal_window: 15s
+  - run_load:
+      duration: 20s
+  - inject:
+      kind: patroni_failover
+      target: patroni
+      # heal_window: patroni_switchover's Apply returns once the
+      # /failover POST is accepted; the actual leader transition
+      # (DCS update + new-leader promote + old-leader demote)
+      # takes ~10-15s.  Without this delay the next run_load
+      # races the transition and connects to the now-replica
+      # before /leader updates, surfacing as
+      # `ERROR: cannot execute CREATE TABLE in a read-only
+      # transaction (SQLSTATE 25006)`.  Mirrors the same value
+      # L4_patroni_failover_loop already pins.
+      heal_window: 15s
+  - run_load:
+      duration: 10s
+  # take_backup BEFORE capture_lsn so the captured post_churn
+  # LSN sits at or beyond the basebackup's end-LSN — same
+  # ordering invariant as L4-patroni-failover-loop.
+  - take_backup:
+      deployment: l4-rapid-failover-x5
+  - capture_lsn:
+      name: post_churn
+      checksum_query: |
+        select
+          count(*)::text || '|' ||
+          coalesce(sum(abalance)::text, '0') || '|' ||
+          coalesce(sum(hashtextextended(t::text, 0))::text, '0')
+        from pgbench_accounts t
+  - wal_stream:
+      action: stop
+  # `name:` linkage — same rationale as L4-patroni-
+  # failover-loop: wal_stream only flushes whole 16 MB
+  # segments, so a captured LSN inside an in-flight
+  # segment is unreachable via PITR.  Recovery from
+  # inline WAL (--include-wal=true on the basebackup)
+  # is enough to reach the row state captured at
+  # post_churn, since no DML happens between take_backup
+  # and capture_lsn.
+  - restore:
+      deployment: l4-rapid-failover-x5
+      name: post_churn
+  - assert_restored_match:
+      name: post_churn
+      strict: true
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

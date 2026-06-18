@@ -1,0 +1,103 @@
+# L8_long_chain_restore_all.scenario.yaml
+#
+# Tier L8 — every backup in a long chain remains
+# restorable.  Stronger gate than L8_kek_rotate_mid_chain
+# (which only restores the oldest): here EVERY backup is
+# restored in order, asserting "no later backup breaks any
+# earlier backup's restorability".
+#
+# The class of bug this guards:
+#   * Dedup-driven GC bugs: any logic that "reclaims chunks
+#     no longer referenced by the latest manifest" would
+#     silently break backup_1's restorability.  This gate
+#     is the operator-facing canary for that class.
+#   * Manifest-format drift: if the agent's manifest writer
+#     evolved between backup_1 and backup_5 (e.g. a new
+#     required field added), older manifests should still
+#     deserialise via the version-tolerant reader.  Restore
+#     surfaces any read-side regression.
+#   * Cumulative state leaks: anything in the agent's
+#     backup path that accumulates state per-backup (open
+#     fds, repo-side temp prefixes, lock files) would
+#     manifest as later backups silently differing in shape
+#     from earlier ones.  Restoring every backup checks
+#     all 5 land consistent on disk.
+#
+# Wall-clock budget: ~5 minutes (1 GB seed + 5 backups +
+# 5 restores).
+schema: pg_hardstorage.scenario.v1
+name: L8-long-chain-restore-all
+tier: L8
+description: |
+  5-backup chain → restore each backup individually.
+  Every restore must succeed end-to-end (manifest decode,
+  chunk fetch, postverify pg_ctl start).
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  - seed:
+      target_gb: 1
+
+  - take_backup:
+      deployment: l8-long-chain
+      name: backup_1
+
+  - take_backup:
+      deployment: l8-long-chain
+      name: backup_2
+
+  - take_backup:
+      deployment: l8-long-chain
+      name: backup_3
+
+  - take_backup:
+      deployment: l8-long-chain
+      name: backup_4
+
+  - take_backup:
+      deployment: l8-long-chain
+      name: backup_5
+
+  # Restore each backup in order.  Restores 2-5 implicitly
+  # share most chunks with their predecessors (dedup), but
+  # restore_1 is the load-bearing assertion: nothing the
+  # newer backups did should have invalidated its
+  # decode/decrypt/serve path.
+  - restore:
+      source: backup_1
+      deployment: l8-long-chain
+
+  - restore:
+      source: backup_2
+      deployment: l8-long-chain
+
+  - restore:
+      source: backup_3
+      deployment: l8-long-chain
+
+  - restore:
+      source: backup_4
+      deployment: l8-long-chain
+
+  - restore:
+      source: backup_5
+      deployment: l8-long-chain
+
+  # Audit chain end-to-end across all 5 backups + their
+  # restore events.  9-event chain (5 take_backup_completed
+  # + 4 restore_completed, plus repo init bookend) — any
+  # PrevHash regression in the audit emitter would surface.
+  - cli_run:
+      args:
+        - "audit"
+        - "verify-chain"
+        - "--repo"
+        - "$REPO"
+      timeout: 30s
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

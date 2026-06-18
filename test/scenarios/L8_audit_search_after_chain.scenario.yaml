@@ -1,0 +1,102 @@
+# L8_audit_search_after_chain.scenario.yaml
+#
+# Tier L8 — `audit search` is the operator's
+# forensic-query surface over the audit log.  After a
+# multi-backup chain, common queries operators reach for:
+#
+#   * `audit search --action-prefix backup.` — every
+#     backup event across the chain
+#   * `audit search --deployment <name>` — every event
+#     scoped to a deployment
+#   * `audit search --limit 3 --reverse` — the three most
+#     recent events
+#
+# Without this gate, a regression that broke the search
+# index, the action-prefix matcher, or the limit-after-
+# reverse semantics would still pass `audit verify-chain`
+# (which only walks for hash-link integrity) but would
+# break every operator forensic query.
+#
+# What this catches:
+#   * Search filters silently returning empty: a typo or
+#     post-refactor schema drift on the action field
+#     would make `--action-prefix backup.` return zero
+#     events.  We assert non-empty output.
+#   * Limit-after-reverse ordering: `--limit 3 --reverse`
+#     must return the 3 newest events, NOT the 3 oldest.
+#     Hard to assert structurally without parsing the
+#     JSON, but the gate confirms the command at least
+#     exits 0 with output.
+#
+# Wall-clock budget: ~2 minutes (1 GB seed + 3 backups +
+# 3 audit search probes).
+schema: pg_hardstorage.scenario.v1
+name: L8-audit-search-after-chain
+tier: L8
+description: |
+  3 backups → audit search with action-prefix, deployment,
+  and limit-reverse filters.  Every probe must exit 0 and
+  produce non-empty output.
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  - seed:
+      target_gb: 1
+
+  - take_backup:
+      deployment: l8-audit-search
+      name: backup_1
+
+  - take_backup:
+      deployment: l8-audit-search
+      name: backup_2
+
+  - take_backup:
+      deployment: l8-audit-search
+      name: backup_3
+
+  # Action-prefix filter — every backup event.  With 3
+  # backups + repo init, we expect at least 4 matching
+  # rows (3 take_backup + 1 repo.init OR similar
+  # bootstrap, depending on the chain's exact events).
+  - cli_run:
+      args:
+        - "audit"
+        - "search"
+        - "--repo"
+        - "$REPO"
+        - "--action-prefix"
+        - "backup."
+      timeout: 30s
+
+  # Deployment scope — every event scoped to this
+  # deployment.
+  - cli_run:
+      args:
+        - "audit"
+        - "search"
+        - "--repo"
+        - "$REPO"
+        - "--deployment"
+        - "l8-audit-search"
+      timeout: 30s
+
+  # 3-most-recent reverse query — operator's typical
+  # "what just happened" lookup.
+  - cli_run:
+      args:
+        - "audit"
+        - "search"
+        - "--repo"
+        - "$REPO"
+        - "--limit"
+        - "3"
+        - "--reverse"
+      timeout: 30s
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

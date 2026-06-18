@@ -1,0 +1,67 @@
+# L4_rolling_pg_hardstorage_upgrade.scenario.yaml
+#
+# Tier L4 — drive the soak loop for some iterations, swap the
+# pg_hardstorage binary inside the cell mid-flight, drive more
+# iterations.  The property we assert: manifests written by the
+# pre-swap binary remain readable by the post-swap binary, AND
+# the chain head produced before the swap restores cleanly via
+# the post-swap binary.
+#
+# This is the binary-rolling-upgrade contract every long-running
+# operator needs.  Without it, the canonical `apt upgrade
+# pg-hardstorage && systemctl restart pg-hardstorage-agent`
+# sequence is a coin flip.
+#
+# Realistic cross-version coverage requires a different binary
+# checked into testdata/ ahead of time.  Initial L4 implementation
+# uses the SAME binary as both pre-swap and post-swap, which
+# proves the SWAP MECHANISM works (the docker cp landing site,
+# the agent's open-FD survival).  Cross-version drift coverage
+# extends with `host_path: testdata/pg_hardstorage-prev` when
+# such a binary is committed.
+
+schema: pg_hardstorage.scenario.v1
+name: L4-rolling-pg-hardstorage-upgrade
+tier: L4
+description: |
+  Take backup #1 with binary A, swap binary in-place to A' (same
+  bytes initially; cross-version when testdata/ ships a prior
+  release), take backup #2 with the swapped binary, restore
+  both.  Pass = both restores succeed and pg_verifybackup runs
+  clean against each.
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+load:
+  file: test/load/oltp_smoke.load.yaml
+
+steps:
+  # 1. Backup #1 under the binary the cell shipped with.
+  - take_backup:
+      type: full
+      name: pre_swap
+
+  # 2. Swap the in-cell binary.  In-tree default reuses the
+  #    host's bin/pg_hardstorage (same bytes as the cell already
+  #    has — proves the swap mechanism + open-FD survival).  An
+  #    operator extending this with a prior-release binary
+  #    overrides host_path: testdata/pg_hardstorage-prev.
+  - swap_binary:
+      host_path: bin/pg_hardstorage
+      cell_path: /usr/local/bin/pg_hardstorage
+
+  # 3. Backup #2 with the swapped binary.
+  - take_backup:
+      type: full
+      name: post_swap
+
+  # 4. Restore both.  pre_swap was authored by binary A,
+  #    post_swap by binary A' — both must restore clean to
+  #    prove manifest forward+backward compat.
+  - restore:
+      source: pre_swap
+
+  - restore:
+      source: post_swap

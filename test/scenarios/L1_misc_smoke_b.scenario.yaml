@@ -1,0 +1,158 @@
+# L1_misc_smoke_b.scenario.yaml
+#
+# Tier L1 — 2nd touch for L1_misc_smoke's leaves with
+# different inputs / flag combinations so every leaf
+# appears in ≥2 scenarios.
+#
+# Leaves covered (gate scope — 2nd touch):
+#   * agent (2nd)
+#   * init (2nd, different deployment + --encrypt=false)
+#   * capacity preflight (2nd, explicit --projected-bytes)
+#   * compat translate (2nd, --from barman)
+#   * cost report (2nd, custom --price-per-gb-month)
+#   * fleet search (2nd, different query + --limit)
+#   * hold purge-expired (2nd)
+#   * logs (2nd, --since)
+#   * runbook generate (2nd, different scenario)
+#   * server (2nd, port 2)
+#   * timetable emit (2nd, --include filter)
+#
+# Wall-clock budget: ~30s.
+
+schema: pg_hardstorage.scenario.v1
+name: L1-misc-smoke-b
+tier: L1
+description: |
+  Cross-cover scenario — every L1 utility leaf gets a
+  second touch with a different flag mix.
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  - take_backup:
+      deployment: l1-misc-smoke-b
+
+  - cli_run:
+      args:
+        - "agent"
+        - "--dry-run"
+        - "--agent-id"
+        - "scenario-probe"
+      expect_exit: 1
+      timeout: 60s
+
+  - cli_run:
+      args:
+        - "capacity"
+        - "preflight"
+        - "$REPO"
+        - "--projected-bytes"
+        - "1073741824"
+        - "--safety-factor"
+        - "1.5"
+      expect_exit: 0
+
+  - cli_run:
+      args:
+        - "compat"
+        - "translate"
+        - "--from"
+        - "barman"
+        - "/no/such/barman.conf"
+      expect_exit: 1
+
+  - cli_run:
+      args:
+        - "cost"
+        - "report"
+        - "--repo"
+        - "$REPO"
+        - "--price-per-gb-month"
+        - "0.025"
+      expect_exit: 0
+
+  - cli_run:
+      args:
+        - "fleet"
+        - "search"
+        - "--query"
+        - "deployment:l1-misc-smoke-b"
+        - "--repo"
+        - "$REPO"
+        - "--limit"
+        - "10"
+      expect_exit: 0
+
+  - cli_run:
+      args:
+        - "hold"
+        - "purge-expired"
+        - "--repo"
+        - "$REPO"
+        - "--dry-run"
+      expect_exit: 0
+
+  - cli_run:
+      args:
+        - "init"
+        - "--deployment"
+        - "l1-misc-init-dep-2"
+        - "--repo"
+        - "file://$ARTEFACT_DIR/init-repo-2"
+        - "--pg-connection"
+        - "$PG_CONN"
+        - "--encrypt=false"
+        - "--schedule-backup"
+        - "off"
+      expect_exit: 0
+
+  - cli_run:
+      args:
+        - "logs"
+        - "--unit"
+        - "no-such-other-unit.service"
+        - "--since"
+        - "24h"
+        - "--lines"
+        - "5"
+      expect_exit: 6
+      timeout: 30s
+
+  - cli_run:
+      args:
+        - "runbook"
+        - "generate"
+        - "$DEPLOYMENT"
+        - "--scenario"
+        - "corruption"
+        - "--repo"
+        - "$REPO"
+      expect_exit: 6
+
+  - cli_run:
+      args:
+        - "server"
+        - "--listen"
+        - "127.0.0.1:2"
+      expect_exit: 1
+      timeout: 10s
+
+  - cli_run:
+      args:
+        - "timetable"
+        - "emit"
+        - "--deployment"
+        - "$DEPLOYMENT"
+        - "--include"
+        - "wal_audit"
+        - "--binary"
+        - "$AGENT_BIN"
+        - "--repo"
+        - "$REPO"
+      expect_exit: 0
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

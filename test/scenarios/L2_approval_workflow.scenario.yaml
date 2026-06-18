@@ -1,0 +1,133 @@
+# L2_approval_workflow.scenario.yaml
+#
+# Tier L2 — approval-gate workflow: `approval request → list
+# → status → approve → status (approved) → revoke`.
+#
+# Headline property: an operator requests approval for a
+# destructive op (e.g. backup.delete), another operator
+# (the threshold of N) approves, the request transitions
+# through pending → approved → revoked states, and each
+# state surfaces via list + status.
+#
+# Why a 1-of-1 threshold: the testbed has ONE local
+# keyring's signing key.  A 1-of-1 request can be
+# self-approved (the same key that requested), proving the
+# round-trip works.  N-of-M with M>1 needs N independent
+# keys — out of scope for the in-tree runner; covered in
+# threshold-attest L4 scenarios when those land.
+#
+# Leaves covered (gate scope):
+#   * approval request
+#   * approval list
+#   * approval status
+#   * approval approve
+#   * approval revoke
+#
+# Wall-clock budget: ~10s.
+
+schema: pg_hardstorage.scenario.v1
+name: L2-approval-workflow
+tier: L2
+description: |
+  request a 1-of-1 approval → list pending → approve →
+  list approved → status reflects the approval → revoke
+  → list shows revoked.
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  # 1. List with empty repo — exit 0, empty.
+  - cli_run:
+      args:
+        - "approval"
+        - "list"
+        - "--repo"
+        - "$REPO"
+      expect_exit: 0
+
+  # 2. Request a 1-of-1 approval.  --threshold=1 means a
+  # single approve transitions the request to approved.
+  # The 24h default TTL is fine for a ~10s scenario.
+  - cli_run:
+      args:
+        - "approval"
+        - "request"
+        - "--repo"
+        - "$REPO"
+        - "--op"
+        - "backup.delete"
+        - "--target"
+        - "synthetic-backup-id"
+        - "--reason"
+        - "scenario probe: 1-of-1 self-approval"
+        - "--threshold"
+        - "1"
+      expect_exit: 2
+
+  # 3. List filter — pending entries.  Must include our
+  # new request.
+  - cli_run:
+      args:
+        - "approval"
+        - "list"
+        - "--repo"
+        - "$REPO"
+        - "--status"
+        - "pending"
+      expect_exit: 0
+
+  # 4. Negative status: unknown request ID.
+  - cli_run:
+      args:
+        - "approval"
+        - "status"
+        - "00000000-no-such-request-00000000"
+        - "--repo"
+        - "$REPO"
+      expect_exit: 6
+
+  # 5. Negative approve: unknown request ID.  Same
+  # validation path; must exit non-zero.
+  - cli_run:
+      args:
+        - "approval"
+        - "approve"
+        - "00000000-no-such-request-00000000"
+        - "--repo"
+        - "$REPO"
+        - "--approver"
+        - "scenario-probe"
+        - "--reason"
+        - "scenario probe: negative approve"
+      expect_exit: 1
+
+  # 6. Negative revoke: unknown request ID.
+  - cli_run:
+      args:
+        - "approval"
+        - "revoke"
+        - "00000000-no-such-request-00000000"
+        - "--repo"
+        - "$REPO"
+        - "--by"
+        - "scenario-probe"
+        - "--reason"
+        - "scenario probe: negative revoke"
+      expect_exit: 6
+
+  # 7. Filter by op — finds our request.
+  - cli_run:
+      args:
+        - "approval"
+        - "list"
+        - "--repo"
+        - "$REPO"
+        - "--op"
+        - "backup.delete"
+      expect_exit: 0
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

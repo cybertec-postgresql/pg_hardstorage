@@ -1,0 +1,61 @@
+# L3_double_backup.scenario.yaml — two full backups in
+# sequence, restore the second.  Catches:
+#
+#   * Repo-level state confusion between sequential backups
+#     (chunk reuse / dedup hits, manifest indexing).
+#   * `latest` resolution at restore time when multiple full
+#     backups exist (the agent must pick the correct one).
+#   * Audit / bookkeeping double-write hazards.
+#
+# Wall-clock budget: ~4 minutes.
+schema: pg_hardstorage.scenario.v1
+name: L3-double-backup
+tier: L3
+description: |
+  Two consecutive full backups against the same repo,
+  restore the second.  Tests sequential backup state
+  isolation and `source: latest` resolution.
+topology:
+  provider: local-docker
+  pg_version: "17"
+load:
+  file: test/load/failover_loop.load.yaml
+steps:
+  - seed:
+      target_gb: 1
+  # First backup — establishes baseline state in the repo.
+  # We deliberately don't link this one to a capture_lsn;
+  # the restored target we test below is the SECOND backup.
+  - take_backup:
+      deployment: l3-double-backup
+  # Light load between backups to make their tar streams
+  # different.  10 s of run_load advances LSN measurably
+  # without taking long enough to dominate the scenario's
+  # wall-clock budget.
+  - run_load:
+      duration: 10s
+  - capture_lsn:
+      name: post_first
+      checksum_query: |
+        select
+          count(*)::text || '|' ||
+          coalesce(sum(abalance)::text, '0') || '|' ||
+          coalesce(sum(hashtextextended(t::text, 0))::text, '0')
+        from pgbench_accounts t
+  # Second backup — this is the one we restore.  The
+  # runner's lastBackup state advances to this backup_id
+  # automatically; the restore step below picks it up.
+  - take_backup:
+      deployment: l3-double-backup
+  - restore:
+      deployment: l3-double-backup
+      name: post_first
+  - assert_restored_match:
+      name: post_first
+      strict: true
+# No count_exact assert — run_load mutates row counts in
+# non-pgbench tables.  assert_restored_match's checksum
+# query covers the correctness invariant.
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

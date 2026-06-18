@@ -1,0 +1,61 @@
+# L4_os_pkg_upgrade_under_agent.scenario.yaml
+#
+# Tier L4 — bump glibc / openssl / systemd inside the cell
+# while the pg_hardstorage agent has open file handles, then
+# assert the agent is still alive AND a fresh backup completes.
+# This is the "rolling distro upgrade" scenario the compat
+# matrix doesn't currently exercise: it bakes a single image
+# and runs once; nothing tests "upgrade the rootfs while the
+# agent is mid-stream."
+#
+# Pass condition:
+#   - The agent process still exists in the cell after the
+#     package upgrade.
+#   - A fresh backup taken AFTER the upgrade completes cleanly.
+#   - The restored data dir opens (not the upgrade's job to
+#     verify byte-equality, just process survival).
+#
+# Failure modes this guards against:
+#   - glibc bump crashes the agent because of an ABI nudge.
+#   - openssl bump invalidates a cached TLS context (TLS sinks
+#     stop working without a process restart).
+#   - systemd bump kicks the agent's cgroup or notify socket
+#     state.
+
+schema: pg_hardstorage.scenario.v1
+name: L4-os-pkg-upgrade-under-agent
+tier: L4
+description: |
+  Bump glibc + openssl + systemd inside the running cell, then
+  take a fresh backup.  Pass = the agent survives + the post-
+  upgrade backup completes + restored cluster opens.
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+load:
+  file: test/load/oltp_smoke.load.yaml
+
+steps:
+  # 1. Backup #1 — establishes the pre-upgrade chain head.
+  - take_backup:
+      type: full
+      name: pre_upgrade
+
+  # 2. Upgrade the canonical rootfs-fragility set.
+  #    pkg_manager: auto detects via /etc/os-release.  Default
+  #    package list (libc6 + libssl3 + systemd) is mapped per
+  #    distro family by the step handler.
+  - os_pkg_upgrade:
+      packages: [libc6, libssl3, systemd]
+
+  # 3. Backup #2 — must complete despite the rootfs swap that
+  #    happened underneath the agent's open FDs.  This is the
+  #    load-bearing assertion.
+  - take_backup:
+      type: full
+      name: post_upgrade
+
+  - restore:
+      source: post_upgrade

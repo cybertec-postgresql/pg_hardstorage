@@ -1,0 +1,107 @@
+# L1_llm_skill.scenario.yaml
+#
+# Tier L1 — llm skill lifecycle: install / list / show /
+# lint / history / rollback.  Skills are operator-installable
+# response templates the LLM helper invokes for specific
+# error patterns (e.g. "fix kek mismatch", "explain backup
+# graph node N").
+#
+# Why negative-path for install: skill install needs a
+# real path to a skill bundle.  The scenario can't easily
+# synthesise one without a `write_file:` step kind.  We
+# exercise install with a nonexistent path (validation
+# refused), list / show / lint / rollback / history
+# against the empty skill registry.
+#
+# Leaves covered (gate scope):
+#   * llm skill install (negative)
+#   * llm skill list (positive, empty)
+#   * llm skill show (negative)
+#   * llm skill lint (negative)
+#   * llm skill history (negative)
+#   * llm skill rollback (negative)
+#
+# Wall-clock budget: ~10s.
+
+schema: pg_hardstorage.scenario.v1
+name: L1-llm-skill
+tier: L1
+description: |
+  list empty → install nonexistent path refused → show /
+  lint / history / rollback against unknown name refused.
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  # 1. list empty.
+  - cli_run:
+      args:
+        - "llm"
+        - "skill"
+        - "list"
+      expect_exit: 0
+
+  # 2. Negative install: bundle path doesn't exist.
+  - cli_run:
+      args:
+        - "llm"
+        - "skill"
+        - "install"
+        - "/no/such/skill/bundle.tar"
+        - "--dir"
+        - "$ARTEFACT_DIR/skills"
+      expect_exit: 1
+
+  # 3. Negative show.
+  - cli_run:
+      args:
+        - "llm"
+        - "skill"
+        - "show"
+        - "no-such-skill"
+      expect_exit: 6
+
+  # 4. Negative lint: path doesn't exist.
+  - cli_run:
+      args:
+        - "llm"
+        - "skill"
+        - "lint"
+        - "/no/such/skill"
+      expect_exit: 1
+
+  # 5. Negative history.
+  - cli_run:
+      args:
+        - "llm"
+        - "skill"
+        - "history"
+        - "no-such-skill"
+        - "--dir"
+        - "$ARTEFACT_DIR/skills"
+      expect_exit: 0
+
+  # 6. Negative rollback.
+  - cli_run:
+      args:
+        - "llm"
+        - "skill"
+        - "rollback"
+        - "no-such-skill"
+        - "--dir"
+        - "$ARTEFACT_DIR/skills"
+      expect_exit: 6
+
+  # 7. list 2nd touch (cross-cover with the smoke scenario).
+  - cli_run:
+      args:
+        - "llm"
+        - "skill"
+        - "list"
+      expect_exit: 0
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

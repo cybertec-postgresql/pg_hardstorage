@@ -1,0 +1,106 @@
+# L8_repo_read_only_blocks_backup.scenario.yaml
+#
+# Tier L8 — `repo set-mode read-only` is the operator's
+# emergency "freeze this repo, no more writes" switch:
+# used for forensics during an active incident, while a
+# parallel investigation is in flight, or to enforce a
+# read-only window before a destructive migration.
+#
+# The contract:
+#   1. `repo set-mode <url> read-only` records the new
+#      mode in HSREPO.
+#   2. EVERY mutating operation that lands AFTER the
+#      flip must refuse with a structured error citing
+#      the read-only mode — backup, wal push, kms rotate,
+#      repo gc, etc.
+#   3. Read operations remain available — verify,
+#      restore, list, repo usage, audit search.
+#   4. `repo set-mode <url> read-write` flips it back.
+#
+# Without this gate, a regression that bypassed the
+# read-only check in the backup path would let an
+# operator silently take a backup against a "frozen"
+# repo during the incident window, defeating the whole
+# point of the freeze.
+#
+# Wall-clock budget: ~3 minutes (1 GB seed + 1 backup +
+# set-mode + blocked-backup-attempt + verify-still-works
+# + set-mode-back + final-backup-succeeds).
+schema: pg_hardstorage.scenario.v1
+name: L8-repo-read-only-blocks-backup
+tier: L8
+description: |
+  Take backup → set repo read-only → backup MUST refuse →
+  verify (read) still works → set repo read-write →
+  backup must succeed again.
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  - seed:
+      target_gb: 1
+
+  # Baseline backup against a read-write repo.
+  - take_backup:
+      deployment: l8-readonly
+      name: pre_readonly
+
+  - cli_run:
+      args:
+        - "repo"
+        - "set-mode"
+        - "$REPO"
+        - "read-only"
+      timeout: 30s
+
+  # NOTE: the load-bearing assertion would be "a
+  # backup attempt against a read-only repo MUST refuse
+  # with a non-zero exit citing the repo state."  The
+  # runner doesn't expose a $PG_DSN placeholder, so a
+  # cli_run-driven backup invocation can't authenticate
+  # against the containerised PG (host=localhost path
+  # surfaces auth.denied before the read-only check
+  # runs).  Pinning that assertion requires either a new
+  # $PG_DSN placeholder in cli_run (small runner change)
+  # or a dedicated "expect_backup_refused" step.  Until
+  # one of those lands, this scenario asserts the
+  # adjacent invariants: read-mode flip works, READS
+  # still work under read-only, and the flip-back path
+  # restores write capability.
+  #
+  # Verify (a READ op) must still work while the repo is
+  # read-only.  This is the canary for the "freezing too
+  # aggressively" failure mode: a buggy implementation
+  # that refuses ALL operations (not just mutating ones)
+  # would surface here as a verify failure.
+  - cli_run:
+      args:
+        - "verify"
+        - "$DEPLOYMENT"
+        - "$LAST_BACKUP"
+        - "--repo"
+        - "$REPO"
+        - "--existence-only"
+      timeout: 30s
+
+  # Flip back to read-write so the cleanup tear_down +
+  # any post-scenario `repo audit` operations work.
+  - cli_run:
+      args:
+        - "repo"
+        - "set-mode"
+        - "$REPO"
+        - "read-write"
+      timeout: 30s
+
+  # A backup against the now-read-write repo must succeed
+  # again.
+  - take_backup:
+      deployment: l8-readonly
+      name: post_readwrite
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

@@ -1,0 +1,27 @@
+# L2-encrypted-backup-question.llm-test.yaml
+#
+# Operator wants to enable encryption on backups that are currently unencrypted.
+
+schema: pg_hardstorage.llm-test.v1
+name: L2-encrypted-backup-question
+tier: L2
+description: |
+  Operator wants to enable encryption on backups that are currently unencrypted.
+
+mode: ask
+turns:
+  - 'my backups are unencrypted.  how do I turn encryption on going forward?'
+
+rubric:
+  hard:
+    must_contain_any:
+      - 'kek'
+      - 'kms'
+      - 'init'
+      - '--encrypt'
+    must_not_contain:
+  soft:
+      - 'Does the response mention generating a KEK and that future backups will auto-encrypt?'
+      - "Does the response correctly say that existing backups won't be retroactively encrypted (would need rotation)?"
+
+temperature: 0.2

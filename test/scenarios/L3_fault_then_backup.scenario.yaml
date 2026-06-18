@@ -1,0 +1,67 @@
+# L3_fault_then_backup.scenario.yaml — freeze PG with
+# docker pause for a heal window, then take a backup
+# against the unfrozen cluster.  Catches:
+#
+#   * Backup runner's resilience to a primary that just
+#     came out of a SIGSTOP-equivalent (no I/O, no
+#     transactions) — pg_basebackup's CHECKPOINT 'fast'
+#     must complete against a cluster that was queueing
+#     up backlog while paused.
+#   * The runner's connString re-resolution after a
+#     pause window (libpq connections may have closed).
+#
+# We use docker_pause / unpause rather than SIGTERM here
+# because the testcontainers postgres image's entrypoint
+# does NOT auto-restart on signal — a kill leaves the
+# cluster down for the rest of the scenario.  Pause is
+# reversible and lets us prove backup-after-pause works
+# end-to-end on the same cell.
+#
+# Wall-clock budget: ~3 minutes.
+schema: pg_hardstorage.scenario.v1
+name: L3-fault-then-backup
+tier: L3
+description: |
+  Pause PG via docker pause for 15 s, then back up the
+  unfrozen cluster.  Verifies post-pause backup
+  resilience.
+topology:
+  provider: local-docker
+  pg_version: "17"
+steps:
+  - seed:
+      target_gb: 1
+  - capture_lsn:
+      name: post_seed
+      checksum_query: |
+        select
+          count(*)::text || '|' ||
+          coalesce(sum(abalance)::text, '0') || '|' ||
+          coalesce(sum(hashtextextended(t::text, 0))::text, '0')
+        from pgbench_accounts t
+  # docker pause freezes the container's processes (PG
+  # postmaster + workers) without killing them.  The
+  # heal_window unpauses them after 15 s.  The runner's
+  # next step (take_backup) sees a cluster that just
+  # came out of an I/O-suspension window — same logical
+  # surface as a recently-crashed-then-restarted primary
+  # without depending on a restart-on-exit entrypoint.
+  - inject:
+      kind: docker_pause
+      target: pg
+      heal_window: 15s
+  - take_backup:
+      deployment: l3-fault-then-backup
+  - restore:
+      deployment: l3-fault-then-backup
+      name: post_seed
+  - assert_restored_match:
+      name: post_seed
+      strict: true
+asserts:
+  - count_exact:
+      table: pgbench_accounts
+      value: 6700000
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

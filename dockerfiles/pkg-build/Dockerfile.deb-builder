@@ -1,0 +1,55 @@
+# Dockerfile.deb-builder — Debian/Ubuntu .deb package build env.
+#
+# Used by run_pkg_build_testing.sh.  The image picks up the
+# project source from a bind-mount and runs `dpkg-buildpackage`
+# inside; the resulting .deb is dropped into /out which is also
+# bind-mounted back to the host.
+#
+# Args:
+#   OS_IMAGE — base image (debian:12, ubuntu:24.04, ...)
+
+ARG OS_IMAGE=debian:12
+FROM ${OS_IMAGE}
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV GOTOOLCHAIN=local
+
+# Build-time deps for the .deb: dh-golang for the Go build
+# system, debhelper-compat 13 for the rules format, devscripts
+# for dpkg-buildpackage and debchange.  golang-go from the
+# distro is older than what the Makefile requires; we install
+# the upstream Go tarball below to get a current toolchain.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        ca-certificates curl gnupg \
+        build-essential \
+        debhelper-compat dh-golang devscripts dpkg-dev \
+        fakeroot lintian \
+        git make tar xz-utils \
+        rsync \
+ && rm -rf /var/lib/apt/lists/*
+
+# Pin Go from upstream — Debian 12 ships golang-1.21 at most,
+# which is < 1.26 the package requires.  Pull the latest stable
+# tarball from go.dev/dl and put `go` on PATH.  Same approach
+# the project's CI uses; keeps the build env reproducible.
+ARG GO_VERSION=1.26.0
+RUN arch="$(dpkg --print-architecture)" \
+ && case "$arch" in \
+        amd64)   gotar="go${GO_VERSION}.linux-amd64.tar.gz"  ;; \
+        arm64)   gotar="go${GO_VERSION}.linux-arm64.tar.gz"  ;; \
+        *)       echo "unsupported arch: $arch" >&2; exit 1  ;; \
+    esac \
+ && curl -fsSL "https://go.dev/dl/${gotar}" -o /tmp/go.tgz \
+ && tar -C /usr/local -xzf /tmp/go.tgz \
+ && rm /tmp/go.tgz
+ENV PATH=/usr/local/go/bin:${PATH}
+ENV GOPATH=/go
+ENV GOCACHE=/go/cache
+
+WORKDIR /src
+# Source comes in via bind-mount at /src; outputs land in /out.
+# The driver script invokes `dpkg-buildpackage -us -uc -b`
+# explicitly — keeps the Dockerfile a thin environment, all
+# build-shape decisions live in one shell place.
+CMD ["bash", "-c", "echo 'deb-builder ready; driver should `docker run` with explicit cmd'"]

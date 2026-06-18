@@ -1,0 +1,4 @@
+docs/reference/runbooks/*.md usr/share/pg_hardstorage/runbooks/
+api/openapi.yaml usr/share/pg_hardstorage/openapi/
+share/pg_hardstorage.sample.yaml usr/share/pg_hardstorage/
+SPEC.md usr/share/doc/pg-hardstorage-common/

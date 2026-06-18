@@ -1,0 +1,39 @@
+# Dockerfile.crunchy-shim — Crunchy PGO image overlay that
+# swaps the pgbackrest binary for our compat shim
+# (pg-hardstorage-pgbackrest).
+#
+# Build context is the project root.
+
+# NOTE: Crunchy publishes images with full version tags
+# (e.g. crunchy-postgres:ubi9-17.5-2520) rather than rolling
+# major-only tags.  The exact tag must be passed via
+# --build-arg CRUNCHY_PG_IMAGE=...  The driver script looks
+# this up from internal/testkit/catalog/operators.yaml; for
+# manual builds, see Crunchy's release notes:
+# https://access.crunchydata.com/documentation/crunchy-postgres-for-kubernetes/.
+ARG CRUNCHY_PG_VERSION=17
+ARG CRUNCHY_PG_IMAGE=registry.developers.crunchydata.com/crunchydata/crunchy-postgres:ubi9-${CRUNCHY_PG_VERSION}.5-2520
+FROM ${CRUNCHY_PG_IMAGE}
+
+USER root
+
+# Crunchy's image ships pgbackrest at /usr/bin/pgbackrest.
+# Move it aside; drop the shim in.  Crunchy uses pgbackrest
+# from inside its own pgbackrest sidecar container too — the
+# overlay applies only to the postgres container; the
+# sidecar uses the same image, so the swap is consistent.
+RUN if [ -f /usr/bin/pgbackrest ]; then \
+        mv /usr/bin/pgbackrest /usr/bin/pgbackrest.upstream; \
+    fi
+
+COPY --chmod=0755 bin/pg-hardstorage-pgbackrest /usr/bin/pgbackrest
+
+LABEL pg_hardstorage.compat_shim="crunchy-pgbackrest" \
+      pg_hardstorage.upstream_image="${CRUNCHY_PG_IMAGE}"
+
+# Crunchy's image runs as postgres (UID 26 on UBI 9).  Restore
+# USER so operator pod startup works identically.  OpenShift's
+# restricted-v2 SCC will reassign the UID to a namespace-range
+# value at admission time — both Crunchy's reconciler and our
+# shim are UID-agnostic, so that's fine.
+USER 26

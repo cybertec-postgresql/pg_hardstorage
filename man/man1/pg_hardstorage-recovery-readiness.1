@@ -1,0 +1,142 @@
+.nh
+.TH "PG_HARDSTORAGE" "1" "May 2026" "pg_hardstorage Manual" "pg_hardstorage Manual"
+
+.SH NAME
+.PP
+pg_hardstorage-recovery-readiness - Single-screen recovery-readiness scorecard for one deployment
+
+
+.SH SYNOPSIS
+.PP
+\fBpg_hardstorage recovery readiness  [flags]\fP
+
+
+.SH DESCRIPTION
+.PP
+recovery readiness aggregates many signals (latest backup age,
+RTO estimate, verification freshness, KEK reachability, WAL
+coverage) into one structured report with a traffic-light verdict
+(ready / ready_with_warnings / not_ready / no_backups).
+
+.PP
+Tunable thresholds:
+  --rpo-seconds N     RPO target; observed-vs-target comparison.
+                      Default: read from the deployment's SLO
+                      config when present.
+  --rto-seconds N     RTO target.  Default: same.
+  --assumed-throughput  Bytes/sec used for the RTO estimate
+                      (e.g. "160MiB", "1GiB", "100MB"); default
+                      160 MiB/s.
+  --staleness 7d      Verification record older than this is "stale".
+
+.PP
+Skip flags suppress optional sections:
+  --no-verification    skip the verification.json freshness check
+  --no-encryption      skip the KEK-reachability check (e.g. when
+                       the operator runs offline without the keyring)
+  --no-wal             skip the WAL-coverage walk
+
+.PP
+Output formats:
+  --format json     (default) — JSON body, the v1 contract.
+  --format markdown — forensics-grade GFM Markdown rendering.
+
+.PP
+Read-only; safe at any cadence.
+
+
+.SH OPTIONS
+.PP
+\fB--assumed-throughput\fP=""
+	bytes/sec for the RTO estimate (e.g. 160MiB, 1GiB); default 160 MiB/s
+
+.PP
+\fB--format\fP="json"
+	output format for the report body: json | markdown
+
+.PP
+\fB-h\fP, \fB--help\fP[=false]
+	help for readiness
+
+.PP
+\fB--no-encryption\fP[=false]
+	skip the KEK reachability check
+
+.PP
+\fB--no-verification\fP[=false]
+	skip the verification freshness check
+
+.PP
+\fB--no-wal\fP[=false]
+	skip the WAL coverage check
+
+.PP
+\fB--repo\fP=""
+	repository URL (required)
+
+.PP
+\fB--rpo-seconds\fP=0
+	RPO target in seconds (0 = no target check)
+
+.PP
+\fB--rto-seconds\fP=0
+	RTO target in seconds (0 = no target check)
+
+.PP
+\fB--staleness\fP=""
+	verification staleness window (e.g. 7d, 24h); default 7d
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+.PP
+\fB--airgapped\fP[=false]
+	refuse outbound endpoints (LLM providers, sinks, OTLP collectors) outside loopback / RFC1918 / explicit airgap.allowlist. Also enabled by PG_HARDSTORAGE_AIRGAPPED=1 or \fBairgapped: strict\fR in the config file.
+
+.PP
+\fB-c\fP, \fB--config\fP=""
+	path to config file (default: XDG/FHS lookup)
+
+.PP
+\fB--cpu-profile\fP=""
+	write a pprof CPU profile to this path for the duration of the command (\fBgo tool pprof <path>\fR to analyse). Off when empty.
+
+.PP
+\fB--mem-profile\fP=""
+	write a pprof heap profile to this path at command exit. Off when empty.
+
+.PP
+\fB--no-color\fP[=false]
+	disable ANSI color in text output
+
+.PP
+\fB--on-error-llm\fP[=false]
+	on a structured-error failure, drop into the matching LLM helper skill (auto_on_error trigger). Also enabled by PG_HARDSTORAGE_ON_ERROR_LLM=1.
+
+.PP
+\fB--otel-endpoint\fP=""
+	OpenTelemetry OTLP/HTTP endpoint (e.g. http://otel-collector:4318); empty disables tracing
+
+.PP
+\fB--otel-stdout\fP[=false]
+	also export OpenTelemetry traces to stderr (useful for dev)
+
+.PP
+\fB-o\fP, \fB--output\fP=""
+	output format: text|json|ndjson|yaml|template|csv|markdown|html|tap|junit|pdf (default: text on TTY, json off-TTY)
+
+.PP
+\fB--profile-port\fP=0
+	if non-zero, expose net/http/pprof on 127.0.0.1: for live profiling of long-running commands (e.g. \fBgo tool pprof http://127.0.0.1:6060/debug/pprof/profile?seconds=30\fR). Off when zero.
+
+.PP
+\fB-q\fP, \fB--quiet\fP[=false]
+	suppress non-essential output
+
+.PP
+\fB--template\fP=""
+	Go text/template applied when --output template (or implied if --template is set without --output)
+
+
+.SH SEE ALSO
+.PP
+\fBpg_hardstorage-recovery(1)\fP

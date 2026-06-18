@@ -1,0 +1,26 @@
+# L2-partial-restore-question.llm-test.yaml
+#
+# Operator wants to restore just one table.
+
+schema: pg_hardstorage.llm-test.v1
+name: L2-partial-restore-question
+tier: L2
+description: |
+  Operator wants to restore just one table.
+
+mode: ask
+turns:
+  - 'someone dropped a single table.  can I restore just that one table without rolling back everything?'
+
+rubric:
+  hard:
+    must_contain_any:
+      - 'partial'
+      - '--tables'
+    must_not_contain:
+      - 'rm -rf'
+  soft:
+      - 'Does the response point at `pg_hardstorage partial restore --tables <list>`?'
+      - 'Does the response mention that the operator can `partial inspect` first to confirm the table is in the manifest?'
+
+temperature: 0.2

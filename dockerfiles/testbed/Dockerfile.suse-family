@@ -1,0 +1,49 @@
+# Dockerfile.suse-family — openSUSE / SLES testbed image.
+#
+# Args mirror the debian/rhel-family Dockerfiles.  The SUSE
+# family currently uses the distro PG package; PGDG SLES repos
+# exist but require an SDK subscription, so the testkit sticks
+# to the in-distro PG for now.
+
+ARG OS_IMAGE=opensuse:leap-15
+FROM ${OS_IMAGE}
+
+ARG PG_VERSION=16
+ARG PACKAGES=distro
+
+RUN zypper -n install \
+        ca-certificates curl \
+        systemd \
+        iproute2 iptables \
+        sudo glibc-locale \
+        procps \
+        which \
+        libfaketime \
+ && zypper clean -a
+
+RUN zypper -n install "postgresql${PG_VERSION}-server" "postgresql${PG_VERSION}-contrib" \
+ || zypper -n install postgresql-server postgresql-contrib \
+ ; zypper clean -a
+
+COPY bin/pg_hardstorage /usr/local/bin/pg_hardstorage
+RUN chmod 755 /usr/local/bin/pg_hardstorage \
+ && /usr/local/bin/pg_hardstorage version || true
+
+# pgbackup system user — agent runs as this inside the testbed
+# to mirror production (CLI refuses euid 0).  See
+# Dockerfile.debian-family for the full rationale.  The uid/gid
+# is pinned to 2000 so the shared file:// repo is readable
+# across every OS family.
+RUN groupadd -r -g 2000 pgbackup \
+ && (getent passwd postgres >/dev/null 2>&1 || useradd -r -s /sbin/nologin postgres) \
+ && useradd -r -u 2000 -g pgbackup -G postgres -d /var/lib/pg_hardstorage \
+        -s /sbin/nologin -c "pg_hardstorage agent" pgbackup \
+ && install -d -m 0755 -o root     -g root     /etc/pg_hardstorage \
+ && install -d -m 0750 -o pgbackup -g pgbackup /var/lib/pg_hardstorage \
+ && install -d -m 0700 -o pgbackup -g pgbackup /etc/pg_hardstorage/keyring
+
+COPY dockerfiles/testbed/entrypoint-pg.sh /usr/local/bin/entrypoint-pg.sh
+RUN chmod 755 /usr/local/bin/entrypoint-pg.sh
+
+EXPOSE 5432
+ENTRYPOINT ["/usr/local/bin/entrypoint-pg.sh"]

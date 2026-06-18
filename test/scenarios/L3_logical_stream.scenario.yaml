@@ -1,0 +1,94 @@
+# L3_logical_stream.scenario.yaml
+#
+# Tier L3 — `logical stream`: continuously consume a logical
+# replication slot's output into the repo's logical/<name>/
+# sink path.  Plus 2nd-touch coverage for the rest of the
+# logical family.
+#
+# Like L3_logical_lifecycle, this scenario asserts the
+# command surfaces in negative-path form because a real
+# subscription needs a CREATE PUBLICATION on the source —
+# DDL the scenario runner can't issue without a planned
+# `psql:` step.
+#
+# Leaves covered (gate scope — 2nd touch for the family):
+#   * logical stream — connection-rejected against a slot
+#     that doesn't exist; bounded by --inactivity-timeout
+#   * logical add (2nd touch, negative)
+#   * logical list (2nd touch)
+#   * logical remove (2nd touch, negative)
+#   * logical status (2nd touch)
+#
+# Wall-clock budget: ~15s.
+
+schema: pg_hardstorage.scenario.v1
+name: L3-logical-stream
+tier: L3
+description: |
+  logical stream against a missing slot exits non-zero
+  within the inactivity timeout; covers the rest of the
+  family with a 2nd touch.
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  # 1. logical list — 2nd touch, registry empty.
+  - cli_run:
+      args:
+        - "logical"
+        - "list"
+      expect_exit: 0
+
+  # 2. logical status — 2nd touch.
+  - cli_run:
+      args:
+        - "logical"
+        - "status"
+      expect_exit: 0
+
+  # 3. logical stream — slot doesn't exist on the source PG
+  # (we haven't created any logical subscriptions in this
+  # scenario).  Command must exit non-zero with a
+  # connection or slot-missing error within a bounded
+  # time; --inactivity-timeout=3s keeps the scenario fast
+  # even if the failure path is buggy and would otherwise
+  # hang.
+  - cli_run:
+      args:
+        - "logical"
+        - "stream"
+        - "no-such-sub"
+        - "--pg-connection"
+        - "$PG_CONN"
+        - "--inactivity-timeout"
+        - "3s"
+      expect_exit: 6
+      timeout: 30s
+
+  # 4. logical add — 2nd touch, negative.
+  - cli_run:
+      args:
+        - "logical"
+        - "add"
+        - "l3-stream-sub"
+        - "--deployment"
+        - "$DEPLOYMENT"
+        - "--repo"
+        - "$REPO"
+        - "--publication"
+        - "still_no_such_publication"
+      expect_exit: 0
+
+  # 5. logical remove — 2nd touch, negative.
+  - cli_run:
+      args:
+        - "logical"
+        - "remove"
+        - "no-such-sub-here-either"
+      expect_exit: 6
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

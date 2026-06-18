@@ -1,0 +1,142 @@
+# L3_incremental_tablespace_chain.scenario.yaml
+#
+# Tier L3: prove that an incremental chain restore correctly carries
+# non-default tablespace data, and that --tablespace-mapping on the
+# restore CLI plumbs into the chain-restore code path (not just the
+# single-backup path the unit test covers).
+#
+# Why this scenario exists:
+#
+#   internal/cli/restore_tablespace_test.go already covers the
+#   single-backup tablespace-mapping CLI happy path at unit-test
+#   level.  What it cannot cover: the interaction between the
+#   chain-walk in restoreIncrementalChain and the per-link
+#   tablespace_map files emitted by each incremental's BASE_BACKUP.
+#   PG 17's pg_combinebackup MUST be invoked with --tablespace-mapping
+#   pointing at the SAME target paths for every chain link, or the
+#   merged datadir ends up with mismatched symlinks under pg_tblspc/.
+#   A regression where the mapping was applied to the LEAF backup
+#   only (or worse, to the FULL only) would let pg_combinebackup
+#   silently mix tablespace contents from different on-disk
+#   locations, producing a datadir that pg_verifybackup rejects.
+#
+# What the assertions guard:
+#
+#   * The chain restore succeeds at all when tablespace data is
+#     present at every link.  Without correct tablespace_map
+#     handling per link, pg_combinebackup exits non-zero
+#     ("tablespace mapping not found" or similar).
+#
+#   * pg_verifybackup passes against the flattened datadir.  The
+#     manifest's tablespace-checksums must reconcile against the
+#     materialised + remapped files; a mismatch surfaces as a
+#     checksum failure (a strict superset of "did the bytes
+#     arrive").
+#
+# Out of scope (deferred to later scenarios / unit tests):
+#
+#   * Booting the restored cluster against the remapped paths.
+#     The testkit's assert_restored_match sandbox bind-mounts
+#     only the data dir, not arbitrary tablespace targets; a
+#     full boot of a tablespace-using restored cluster requires
+#     extending startRestoredSandbox to mount the mapped paths,
+#     which is its own follow-up.  The verifybackup gate already
+#     proves the bytes are byte-identical to what the manifest
+#     declared — sandbox boot would only add an integration-test
+#     dimension already covered by single-backup
+#     restore_tablespace_test.go.
+#
+# Wall-clock budget: ~45s.
+
+schema: pg_hardstorage.scenario.v1
+name: L3-incremental-tablespace-chain
+tier: L3
+description: |
+  Create a non-default tablespace, build a 3-link incremental
+  chain whose data lives in that tablespace, restore the leaf
+  with --tablespace-mapping, assert chain-aware tablespace
+  remap survives pg_combinebackup + pg_verifybackup.
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+load:
+  file: test/load/failover_loop.load.yaml
+
+steps:
+  # 1. Bootstrap the non-default tablespace.
+  #
+  #    PG requires the LOCATION directory to exist + be empty +
+  #    be owned by the postgres OS user before CREATE TABLESPACE
+  #    will accept it.  We use COPY TO PROGRAM (superuser-gated;
+  #    the testkit role is a superuser) to mkdir the path inside
+  #    the PG container.  /tmp is writable by the postgres user
+  #    in the official image and outside PGDATA — both PG
+  #    requirements.
+  - sql:
+      statement: "COPY (SELECT 1) TO PROGRAM 'mkdir -p /tmp/ts_fast && chmod 700 /tmp/ts_fast'"
+
+  - sql:
+      statement: "CREATE TABLESPACE ts_fast LOCATION '/tmp/ts_fast'"
+
+  # 2. Create a table IN the new tablespace and seed it.  Using a
+  #    table separate from the load file's `users` ensures the
+  #    tablespace really is exercised — without this, the chain
+  #    would carry zero blocks in pg_tblspc/<oid>/ and the test
+  #    would degenerate to a "tablespace exists but contains
+  #    nothing" smoke.
+  - sql:
+      statement: "CREATE TABLE ts_data (id bigserial PRIMARY KEY, payload text) TABLESPACE ts_fast"
+
+  - sql:
+      statement: "INSERT INTO ts_data (payload) SELECT 'row-' || g FROM generate_series(1, 1000) g"
+
+  # 3. FULL anchor — captures the tablespace at first checkpoint.
+  - take_backup:
+      deployment: l3-ts-chain
+      name: anchor_full
+
+  # 4. Churn the tablespace table — adds dirty blocks under
+  #    pg_tblspc/<oid>/ that the next incremental MUST capture.
+  - sql:
+      statement: "INSERT INTO ts_data (payload) SELECT 'churn1-' || g FROM generate_series(1, 1000) g"
+
+  # 5. First incremental.
+  - take_backup:
+      deployment: l3-ts-chain
+      incremental_from: "$LAST_BACKUP"
+      name: incr_1
+
+  # 6. More tablespace churn.
+  - sql:
+      statement: "INSERT INTO ts_data (payload) SELECT 'churn2-' || g FROM generate_series(1, 1000) g"
+
+  # 7. Leaf incremental.
+  - take_backup:
+      deployment: l3-ts-chain
+      incremental_from: incr_1
+      name: chain_leaf
+
+  # 8. Restore with --tablespace-mapping pointing at a host-
+  #    visible path under $ARTEFACT_DIR.  The agent's restore
+  #    must:
+  #      - Materialise every link's chunks into staging dirs.
+  #      - Run pg_combinebackup with --tablespace-mapping for
+  #        EACH chain link, redirecting the in-container
+  #        /tmp/ts_fast to the host-visible mapped path.
+  #      - Produce a tablespace_map in the target datadir that
+  #        reflects the NEW path.
+  #      - Pass pg_verifybackup against the flattened datadir.
+  #
+  #    The restore step's built-in pg_verifybackup gate covers
+  #    that final check.
+  - restore:
+      deployment: l3-ts-chain
+      source: chain_leaf
+      tablespace_mappings:
+        - "/tmp/ts_fast=$ARTEFACT_DIR/restored_ts_fast"
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

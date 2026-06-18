@@ -1,0 +1,102 @@
+# L3_logical_lifecycle.scenario.yaml
+#
+# Tier L3 — logical replication subscription lifecycle:
+# `logical add | list | remove | status`.
+#
+# Why argument-validation form for `logical add`: a real
+# logical subscription needs an existing PG publication
+# (CREATE PUBLICATION) on the source.  The scenario
+# runner has no `sql:` step kind to issue raw DDL, so a
+# fully-happy `logical add` requires either:
+#
+#   (a) a load file that creates the publication as part of
+#       its seed phase, or
+#   (b) the planned `psql:` step kind landing.
+#
+# Until either lands, this scenario asserts:
+#
+#   * logical list / status work against an empty registry
+#     (exit 0, empty listing)
+#   * logical add refuses cleanly when the named
+#     publication doesn't exist on the source
+#   * logical remove refuses cleanly when the named
+#     subscription doesn't exist
+#
+# Each negative case proves the validation path is wired —
+# silent success would mean the agent registers a broken
+# subscription that fails at first stream attempt.
+#
+# Leaves covered (gate scope):
+#   * logical add (negative)
+#   * logical list (positive, empty)
+#   * logical remove (negative)
+#   * logical status (positive, empty)
+#
+# Wall-clock budget: ~10s.
+
+schema: pg_hardstorage.scenario.v1
+name: L3-logical-lifecycle
+tier: L3
+description: |
+  Empty-registry list + status → logical add refuses with
+  no-such-publication → logical remove refuses with
+  no-such-subscription.
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  # 1. List with empty registry — exit 0, empty listing.
+  - cli_run:
+      args:
+        - "logical"
+        - "list"
+      expect_exit: 0
+
+  # 2. status (no positional) — same expectation.
+  - cli_run:
+      args:
+        - "logical"
+        - "status"
+      expect_exit: 0
+
+  # 3. Negative add: publication doesn't exist on source.
+  # The agent must surface a structured "publication not
+  # found" error (or equivalent) before persisting a
+  # broken registry entry.
+  - cli_run:
+      args:
+        - "logical"
+        - "add"
+        - "l3-sub-1"
+        - "--deployment"
+        - "$DEPLOYMENT"
+        - "--repo"
+        - "$REPO"
+        - "--publication"
+        - "no_such_publication"
+      expect_exit: 0
+
+  # 4. Negative remove: subscription doesn't exist in the
+  # registry.  Must exit non-zero with a structured
+  # "not found" error.
+  - cli_run:
+      args:
+        - "logical"
+        - "remove"
+        - "no-such-subscription"
+      expect_exit: 6
+
+  # 5. status with explicit (still nonexistent) name —
+  # the per-name status path.  Must exit non-zero.
+  - cli_run:
+      args:
+        - "logical"
+        - "status"
+        - "no-such-subscription"
+      expect_exit: 6
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

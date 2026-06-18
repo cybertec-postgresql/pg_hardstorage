@@ -1,0 +1,132 @@
+.nh
+.TH "PG_HARDSTORAGE" "1" "May 2026" "pg_hardstorage Manual" "pg_hardstorage Manual"
+
+.SH NAME
+.PP
+pg_hardstorage-backup-undelete - Resurrect one or more soft-deleted backups (removes tombstone marker)
+
+
+.SH SYNOPSIS
+.PP
+\fBpg_hardstorage backup undelete   [\&...] [flags]\fP
+
+
+.SH DESCRIPTION
+.PP
+undelete removes the tombstone marker for the named backup(s),
+making them visible again to \fBbackup list\fR and \fBrestore\fR\&.
+
+.PP
+Use this to recover from an over-aggressive delete or cascade
+before chunk-GC runs. The window is bounded: once
+\fBrepo gc --apply\fR has reclaimed the chunks the manifest
+references, undelete will succeed but the resulting backup will
+fail to restore. Run \fBbackup undelete\fR BEFORE the next
+GC cycle.
+
+.PP
+Idempotent. An undelete of a manifest that's already live is a
+no-op; no error, no audit entry. Multiple IDs may be passed —
+the operation walks them in argv order and reports each one's
+outcome.
+
+.PP
+Pairs with \fBbackup delete --cascade\fR: the cascade response's
+\fBcascade_deleted\fR slice (or the equivalent audit body
+field) is exactly what you pass back to \fBundelete\fR to
+unwind a wrong cascade.
+
+.PP
+Restorability pre-flight (--check-chunks):
+  --check-chunks  Stat every chunk referenced by each manifest
+                  BEFORE removing its tombstone. Refuses with
+                  conflict.chunks_missing if any required chunk
+                  is absent — telling you the manifest can't be
+                  meaningfully restored even if you resurrect it.
+                  Same primitive that backs verify --existence-only.
+  --skip-missing  When --check-chunks fires on multi-ID input,
+                  skip the manifests with missing chunks and
+                  undelete the rest. Without --skip-missing, the
+                  whole operation refuses up-front (atomic
+                  semantics — same posture as cascade delete).
+
+
+.SH OPTIONS
+.PP
+\fB--check-chunks\fP[=false]
+	refuse to undelete a manifest whose chunks have been GC'd (Stat-only pre-flight; same primitive as \fBverify --existence-only\fR)
+
+.PP
+\fB--force\fP[=false]
+	resurrect even when chunks are gone — recover the metadata of an un-restorable backup (skips the restorability pre-flight; forensic use)
+
+.PP
+\fB-h\fP, \fB--help\fP[=false]
+	help for undelete
+
+.PP
+\fB--reason\fP=""
+	free-form reason captured in the audit chain (recommended for forensics)
+
+.PP
+\fB--repo\fP=""
+	repository URL (required)
+
+.PP
+\fB--skip-missing\fP[=false]
+	when --check-chunks fails on some IDs, undelete the rest (default: refuse the whole batch)
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+.PP
+\fB--airgapped\fP[=false]
+	refuse outbound endpoints (LLM providers, sinks, OTLP collectors) outside loopback / RFC1918 / explicit airgap.allowlist. Also enabled by PG_HARDSTORAGE_AIRGAPPED=1 or \fBairgapped: strict\fR in the config file.
+
+.PP
+\fB-c\fP, \fB--config\fP=""
+	path to config file (default: XDG/FHS lookup)
+
+.PP
+\fB--cpu-profile\fP=""
+	write a pprof CPU profile to this path for the duration of the command (\fBgo tool pprof <path>\fR to analyse). Off when empty.
+
+.PP
+\fB--mem-profile\fP=""
+	write a pprof heap profile to this path at command exit. Off when empty.
+
+.PP
+\fB--no-color\fP[=false]
+	disable ANSI color in text output
+
+.PP
+\fB--on-error-llm\fP[=false]
+	on a structured-error failure, drop into the matching LLM helper skill (auto_on_error trigger). Also enabled by PG_HARDSTORAGE_ON_ERROR_LLM=1.
+
+.PP
+\fB--otel-endpoint\fP=""
+	OpenTelemetry OTLP/HTTP endpoint (e.g. http://otel-collector:4318); empty disables tracing
+
+.PP
+\fB--otel-stdout\fP[=false]
+	also export OpenTelemetry traces to stderr (useful for dev)
+
+.PP
+\fB-o\fP, \fB--output\fP=""
+	output format: text|json|ndjson|yaml|template|csv|markdown|html|tap|junit|pdf (default: text on TTY, json off-TTY)
+
+.PP
+\fB--profile-port\fP=0
+	if non-zero, expose net/http/pprof on 127.0.0.1: for live profiling of long-running commands (e.g. \fBgo tool pprof http://127.0.0.1:6060/debug/pprof/profile?seconds=30\fR). Off when zero.
+
+.PP
+\fB-q\fP, \fB--quiet\fP[=false]
+	suppress non-essential output
+
+.PP
+\fB--template\fP=""
+	Go text/template applied when --output template (or implied if --template is set without --output)
+
+
+.SH SEE ALSO
+.PP
+\fBpg_hardstorage-backup(1)\fP

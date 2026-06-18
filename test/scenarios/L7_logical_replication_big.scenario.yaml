@@ -1,0 +1,79 @@
+# L7_logical_replication_big.scenario.yaml
+#
+# Tier L7 (stress) — logical replication under a large change volume.
+#
+# Where L3_logical_replication_e2e proves the happy path with 500
+# rows, this scenario pushes 200k rows (~25 MB of decoded pgoutput)
+# through the slot in a single transaction so the whole batch lands
+# on the chunked sink at COMMIT. It stresses:
+#
+#   - the chunked sink's batching + CAS chunking on a large payload;
+#   - the receive loop holding a big in-flight transaction;
+#   - manifest LSN bookkeeping for a multi-chunk logical segment.
+#
+# Same pre-created-slot pattern as the e2e scenario: the slot must
+# exist before the INSERT so the rows are inside its decode window.
+#
+# Wall-clock budget: ~60s.
+
+schema: pg_hardstorage.scenario.v1
+name: L7-logical-replication-big
+tier: L7
+description: |
+  200k-row single-transaction change stream consumed through the
+  chunked logical sink — big-database logical-replication stress.
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  - sql:
+      statement: "CREATE TABLE big_lr (id bigint PRIMARY KEY, payload text)"
+
+  - sql:
+      statement: "CREATE PUBLICATION big_lr_pub FOR TABLE big_lr"
+
+  - sql:
+      statement: "SELECT pg_create_logical_replication_slot('pg_hardstorage_logical_bigsub', 'pgoutput')"
+
+  - cli_run:
+      args:
+        - "logical"
+        - "add"
+        - "bigsub"
+        - "--deployment"
+        - "$DEPLOYMENT"
+        - "--repo"
+        - "$REPO"
+        - "--publication"
+        - "big_lr_pub"
+      expect_exit: 0
+
+  # 200k rows in one transaction — the entire change set decodes at
+  # COMMIT, so the sink sees one large burst.
+  - sql:
+      statement: "INSERT INTO big_lr SELECT g, md5(g::text) || md5((g + 1)::text) FROM generate_series(1, 200000) g"
+
+  - cli_run:
+      args:
+        - "logical"
+        - "stream"
+        - "bigsub"
+        - "--pg-connection"
+        - "$PG_CONN"
+        - "--inactivity-timeout"
+        - "12s"
+      expect_exit: 1
+      timeout: 180s
+
+  - cli_run:
+      args:
+        - "logical"
+        - "status"
+        - "bigsub"
+      expect_exit: 0
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

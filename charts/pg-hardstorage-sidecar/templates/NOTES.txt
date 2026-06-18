@@ -1,0 +1,35 @@
+pg-hardstorage-sidecar {{ .Chart.AppVersion }} installed.
+
+Release    : {{ .Release.Name }}
+Namespace  : {{ .Release.Namespace }}
+Image      : {{ include "pg-hardstorage-sidecar.image" . }}
+
+1. Watch the pod come up:
+
+     kubectl --namespace {{ .Release.Namespace }} \
+       rollout status statefulset/{{ include "pg-hardstorage-sidecar.fullname" . }}
+
+2. Inspect the agent's view of the world. `doctor` validates
+   config + connectivity end-to-end:
+
+     kubectl --namespace {{ .Release.Namespace }} \
+       exec -it {{ include "pg-hardstorage-sidecar.fullname" . }}-0 -- \
+       pg_hardstorage doctor --output text
+
+3. Tail the audit stream while the agent runs:
+
+     kubectl --namespace {{ .Release.Namespace }} \
+       exec -it {{ include "pg-hardstorage-sidecar.fullname" . }}-0 -- \
+       pg_hardstorage audit tail
+
+{{- if not .Values.config }}
+
+WARNING: .Values.config is empty. The agent will start but
+report config.no_deployments until you supply a configuration
+in your values file. See docs/SPEC.md for the schema.
+{{- end }}
+
+{{- if .Values.service.enabled }}
+
+Metrics service: {{ include "pg-hardstorage-sidecar.fullname" . }}.{{ .Release.Namespace }}:{{ .Values.service.port }}
+{{- end }}

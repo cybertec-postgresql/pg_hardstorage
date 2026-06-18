@@ -1,0 +1,115 @@
+# L3_incremental_summarize_wal_flip.scenario.yaml
+#
+# Tier L3: prove that PG 17 incremental backups fail with a clean,
+# operator-actionable error when `summarize_wal=off` at the time of
+# BASE_BACKUP — and that flipping the GUC back on (via the only
+# mechanism that can: a postmaster restart, since `-c` overrides
+# `ALTER SYSTEM`) restores incremental capability.
+#
+# Why this matters in production:
+#
+#   The walsummarizer GUC controls the entire incremental pipeline.
+#   A misconfigured deploy, a postgresql.conf rollback, a Patroni
+#   bootstrap with the wrong config — any of these can land the
+#   server with summarize_wal=off, and the next scheduled
+#   incremental MUST fail loudly with a message naming the GUC, not
+#   after a 30-minute BASE_BACKUP attempt, not with a manifest that
+#   quietly degrades to a full, not with a chain that looks complete
+#   but is missing deltas.
+#
+# What this scenario guards against:
+#
+#   * Silent fallback: a regression where the agent caught the
+#     server's 55000 error and proceeded with a full backup
+#     anyway (turning a customer's "incremental every 6h" policy
+#     into 6h of un-backed-up writes).
+#   * Wrong error class: the agent should propagate the PG 55000
+#     error with its original text intact, NOT wrap it as a
+#     generic "backup failed" — operators need to see the literal
+#     "WAL summarization is enabled" phrase to diagnose without
+#     opening Source.
+#
+# How we achieve the bad-config posture:
+#
+#   The testkit's local-docker topology pins
+#   `-c summarize_wal=on` for PG 17+ by default so every other
+#   incremental scenario inherits the precondition.  PG's GUC
+#   precedence says PGC_S_ARGV (command-line `-c`) wins over
+#   PGC_S_FILE (postgresql.{conf,auto.conf}), which means
+#   `ALTER SYSTEM SET summarize_wal = off` cannot override the
+#   default.  We instead use the scenario-level `extra_gucs`
+#   override (added alongside this scenario) — later `-c` flags
+#   on the same argv beat earlier ones, so
+#   `extra_gucs: { summarize_wal: "off" }` cleanly flips the
+#   effective value to off.
+#
+# Wall-clock budget: ~30s.
+
+schema: pg_hardstorage.scenario.v1
+name: L3-incremental-summarize-wal-flip
+tier: L3
+description: |
+  Boot PG 17 with summarize_wal=off (via extra_gucs override of
+  the topology default); take a FULL backup successfully; assert
+  that the next incremental_from $LAST_BACKUP fails with the PG
+  55000 "WAL summarization is enabled" error.
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+  # Force summarize_wal off at postmaster start.  See the
+  # scenario header for why this works.
+  extra_gucs:
+    summarize_wal: "off"
+
+load:
+  file: test/load/failover_loop.load.yaml
+
+steps:
+  # 1. Sanity check: confirm the override took effect.  Without
+  #    this, a regression where ExtraGUCs silently dropped (yaml
+  #    schema mismatch, topology forgetting to apply) would
+  #    surface as the wrong scenario failure — backup succeeds
+  #    because the GUC was actually still on, masking the
+  #    precondition bug.
+  - sql:
+      statement: "DO $$ BEGIN IF current_setting('summarize_wal') <> 'off' THEN RAISE EXCEPTION 'summarize_wal=%, expected off (extra_gucs override did not take effect)', current_setting('summarize_wal'); END IF; END $$"
+
+  # 2. Confirm the load landed.
+  - assert:
+      - count_exact: { table: users, value: 1000 }
+
+  # 3. FULL anchor.  Always works regardless of summarize_wal
+  #    (the GUC only gates incremental BASE_BACKUP, not full).
+  #    The full's success is part of the negative-control: it
+  #    proves the agent CAN reach this PG and write to the repo;
+  #    the next-step incremental failure is therefore solely
+  #    about the GUC, not connectivity or auth.
+  - take_backup:
+      deployment: l3-sumwal-off
+      name: anchor_full
+
+  # 4. The forbidden incremental.  cli_run rather than
+  #    take_backup so we can assert on exit-1 + the literal
+  #    PG 55000 message text.
+  #
+  #    expect_exit: 1 — `pg_hardstorage backup` exits 1 on
+  #                     structured-error failure (the v1 exit-
+  #                     code contract).
+  #    expect_stderr_contains: the PG error text.  If a
+  #                     regression turns this into a generic
+  #                     "backup failed" or routes the error
+  #                     through a wrapping layer that strips
+  #                     the original phrase, this fires.
+  - cli_run:
+      args: ["backup", "l3-sumwal-off",
+             "--pg-connection", "$PG_CONN",
+             "--repo", "$REPO",
+             "--include-wal",
+             "--incremental-from", "$BACKUP_anchor_full"]
+      expect_exit: 1
+      expect_stderr_contains: "WAL summarization is enabled"
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

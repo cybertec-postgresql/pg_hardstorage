@@ -1,0 +1,97 @@
+# L2_audit_anchor_verify.scenario.yaml
+#
+# Tier L2 — audit anchoring + anchor verification.  The
+# headline property: after the chain has at least one event,
+# `audit anchor` records the current chain head into a
+# transparency-log entry, and `audit verify-anchor <log-id>`
+# confirms that the recorded head matches the live chain.
+#
+# Why this matters: the anchor is the "I can prove later
+# that this chain was THIS at THIS time" surface for
+# compliance + tamper detection.  Without it, an attacker
+# who compromised the operator's box could rewrite history
+# and re-emit a clean verify-chain.  The anchor + later
+# verify-anchor pin the chain to a point in time independent
+# of the live store.
+#
+# Leaves covered (gate scope, 2nd-touch for anchor):
+#   * audit anchor — re-exercised after a different event mix
+#   * audit verify-anchor — the missing surface from
+#     L2_audit_chain (deferred there pending stdout-capture
+#     plumbing)
+#
+# The verify-anchor step uses a NEGATIVE assertion: it
+# passes a known-bad log-id and asserts non-zero exit +
+# structured "not found" error.  A POSITIVE round-trip
+# (anchor → capture stdout → verify-anchor with the real
+# id) needs the stdout-into-state plumbing the runner
+# doesn't have yet; the negative assertion still proves
+# the command is wired and validates inputs correctly.
+#
+# Wall-clock budget: ~10s.
+
+schema: pg_hardstorage.scenario.v1
+name: L2-audit-anchor-verify
+tier: L2
+description: |
+  Take a backup → audit anchor → audit verify-anchor with
+  a bogus log-id (negative) → audit anchor again (a 2nd
+  anchor against the new chain head).
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  - take_backup:
+      deployment: l2-audit-anchor
+
+  # 1. Anchor #1 — publishes the current chain head into
+  # the transparency-log file under $REPO.
+  - cli_run:
+      args:
+        - "audit"
+        - "anchor"
+        - "--repo"
+        - "$REPO"
+        - "--publisher"
+        - "l2-audit-anchor.scenario"
+      expect_exit: 0
+
+  # 2. verify-anchor with a deliberately wrong log-id.
+  # Must exit non-zero — silent success would mean
+  # verify-anchor accepts any string, defeating the
+  # tamper-detection point.
+  - cli_run:
+      args:
+        - "audit"
+        - "verify-anchor"
+        - "00000000-bogus-log-id-00000000"
+        - "--repo"
+        - "$REPO"
+      expect_exit: 1
+
+  # 3. Add more events to the chain by taking a second
+  # backup, then re-anchor.  A regression where anchor
+  # double-emits the SAME log-id (rather than recording
+  # the NEW chain head) would surface as the 2nd anchor's
+  # output being identical to the 1st — caught by anchor
+  # observers in a future scenario; here we just assert
+  # the command exits 0.
+  - take_backup:
+      deployment: l2-audit-anchor
+      name: post_event
+
+  - cli_run:
+      args:
+        - "audit"
+        - "anchor"
+        - "--repo"
+        - "$REPO"
+        - "--publisher"
+        - "l2-audit-anchor.scenario.second"
+      expect_exit: 0
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

@@ -1,0 +1,112 @@
+# L2_incremental_three_links.scenario.yaml
+#
+# Tier L2: end-to-end smoke for the PG 17+ incremental-backup
+# lifecycle, driven through the scenario runner.  Builds a 3-link
+# chain (full → incr → incr), restores the leaf, asserts the
+# restored cluster matches the post-chain state row-for-row.
+#
+# What this scenario protects:
+#   - `incremental_from:` step field resolves $LAST_BACKUP AND a
+#     named parent (the second incremental references an explicit
+#     name to lock both resolution paths).
+#   - Every incremental's manifest carries its OWN PGBackupManifest
+#     so a hypothetical grandchild could chain off it (regression
+#     for the "PG manifest only persisted on fulls" bug class —
+#     break that and #2's 20-link stress test fails fast).
+#   - restore.Restore dispatches to the chain-restore path when
+#     the leaf is an incremental, materialises every link, and
+#     runs pg_combinebackup to flatten into target.
+#   - assert_restored_match boots the combined datadir and proves
+#     row-level correctness (count_exact via SQL query) — the
+#     only signal that catches "pg_combinebackup exited 0 but
+#     produced subtly-wrong output" failure modes.
+#
+# Wall-clock budget: ~30s.
+
+schema: pg_hardstorage.scenario.v1
+name: L2-incremental-three-links
+tier: L2
+description: |
+  full → incr → incr → restore leaf; assert row-count round-trips.
+  Pattern-setter for every PG-17-incremental scenario that follows.
+
+topology:
+  provider: local-docker
+  # PG 17+ is REQUIRED for BASE_BACKUP INCREMENTAL.  The testkit's
+  # writeReplicationConf turns on summarize_wal automatically when
+  # ExpectedPGMajorInt() >= 17, so the precondition is met by
+  # construction.
+  pg_version: "17"
+
+load:
+  # failover_loop is re-runnable (no UNIQUE constraints on
+  # generator output, append-only inserts), so run_load steps
+  # between incrementals can drive real churn without
+  # duplicate-key failures.  oltp_smoke would trip the
+  # idx_users_email unique constraint on the second pass.
+  file: test/load/failover_loop.load.yaml
+
+steps:
+  # 1. Confirm the load landed.  failover_loop seeds 500 rows
+  #    in its bootstrap phase + 500 in write_burst = 1000 total
+  #    into the `users` table.
+  - assert:
+      - count_exact: { table: users, value: 1000 }
+
+  # 2. FULL anchor.  Named so we can prove name-resolution works
+  #    on the second incremental below.
+  - take_backup:
+      deployment: l2-incr
+      name: anchor_full
+
+  # 3. Drive some churn so the first incremental has meaningful
+  #    deltas to capture.  Re-applies the oltp_smoke load file's
+  #    re-runnable phases.  Without this, both incrementals would
+  #    be near-empty and never exercise the dedup path.
+  - run_load:
+      duration: 3s
+
+  # 4. First incremental anchored on the FULL via $LAST_BACKUP
+  #    (the implicit "most recent take_backup" resolution).
+  - take_backup:
+      deployment: l2-incr
+      incremental_from: "$LAST_BACKUP"
+      name: incr_1
+
+  # 5. More churn.
+  - run_load:
+      duration: 3s
+
+  # 6. Second incremental anchored on the FIRST INCREMENTAL via
+  #    its explicit `name`.  Exercises both the named-backup
+  #    resolution path AND the property that an incremental can
+  #    serve as a parent (only possible if PGBackupManifest got
+  #    persisted on it — the regression guard).
+  - take_backup:
+      deployment: l2-incr
+      incremental_from: incr_1
+      name: incr_leaf
+
+  # 7. Restore the leaf.  source: leaf locks the chain-restore
+  #    dispatch — restore.Restore detects Type=incremental_lsn,
+  #    routes to restoreIncrementalChain, materialises full +
+  #    incr_1 + incr_leaf into staging, runs pg_combinebackup
+  #    to flatten into target.
+  - restore:
+      deployment: l2-incr
+      source: incr_leaf
+
+asserts:
+  # Row-level correctness: failover_loop is re-applied between
+  # backups, and each pass appends 1000 rows.  After the initial
+  # 1000-row seed plus ≥1 churn pass in each 3s run_load step,
+  # the leaf backup necessarily captured ≥2000 rows (initial seed
+  # + at least one churn pass).  Upper bound is generous because
+  # the load engine runs many passes per 3s window on a quiet
+  # laptop; we care about "restore captured the churn", not the
+  # exact pass count.
+  - count_range: { table: users, min: 2000, max: 10000000 }
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

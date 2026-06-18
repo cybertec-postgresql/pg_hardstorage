@@ -1,0 +1,81 @@
+# L8_cli_required_flag_misuse.scenario.yaml
+#
+# Tier L8 — operator scripts gate on `pg_hardstorage`'s
+# misuse exit code (ExitMisuse = 2) so they can
+# distinguish "I forgot a flag" from "the operation
+# failed against a healthy repo."  Pinning this exit
+# code across multiple commands prevents a regression
+# that demoted ExitMisuse to ExitGenericError (1) and
+# made it indistinguishable from real failures.
+#
+# Each step invokes a command with a deliberately
+# missing required flag and asserts:
+#   1. Exit code is 2 (ExitMisuse).
+#   2. Stderr mentions the missing flag by name (so the
+#      operator can grep for the fix).
+#
+# What this catches:
+#   * Required-flag-validation drift: cobra's
+#     MarkFlagRequired enforcement breaks silently if a
+#     command is refactored to remove the marker.  A
+#     regression that demoted "required" to "optional"
+#     would surface here as exit 0 instead of 2.
+#   * Error-message stability: operators grep stderr
+#     for the flag name.  A rename like "--repo" to
+#     "--url" would surface here.
+#
+# Wall-clock budget: ~10 seconds (no PG, just CLI probes
+# — but the runner spins up a topology by default so
+# the wall-clock is dominated by setup/teardown).
+schema: pg_hardstorage.scenario.v1
+name: L8-cli-required-flag-misuse
+tier: L8
+description: |
+  audit search / kms verify / repo gc / audit append
+  invoked without their required --repo flag — each must
+  exit 2 (ExitMisuse) and surface "--repo" in stderr.
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  # No backups, no seed — the misuse path doesn't need
+  # any prior state, and skipping seed shaves ~5 s off
+  # the wall-clock.  The runner still brings up a PG
+  # container per topology contract, but no operations
+  # touch it.
+
+  - cli_run:
+      args: ["audit", "search"]
+      expect_exit: 2
+      expect_stderr_contains: "--repo"
+      timeout: 10s
+
+  - cli_run:
+      args: ["kms", "verify"]
+      expect_exit: 2
+      expect_stderr_contains: "--repo"
+      timeout: 10s
+
+  - cli_run:
+      args: ["audit", "summary"]
+      expect_exit: 2
+      expect_stderr_contains: "--repo"
+      timeout: 10s
+
+  - cli_run:
+      args: ["audit", "verify-chain"]
+      expect_exit: 2
+      expect_stderr_contains: "--repo"
+      timeout: 10s
+
+  - cli_run:
+      args: ["audit", "append", "manual.note"]
+      expect_exit: 2
+      expect_stderr_contains: "--repo"
+      timeout: 10s
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

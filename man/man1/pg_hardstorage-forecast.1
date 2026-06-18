@@ -1,0 +1,159 @@
+.nh
+.TH "PG_HARDSTORAGE" "1" "May 2026" "pg_hardstorage Manual" "pg_hardstorage Manual"
+
+.SH NAME
+.PP
+pg_hardstorage-forecast - Capacity-planning + cost-projection report
+
+
+.SH SYNOPSIS
+.PP
+\fBpg_hardstorage forecast  [flags]\fP
+
+
+.SH DESCRIPTION
+.PP
+forecast walks the repository's manifest history, fits an
+ordinary-least-squares linear regression to the per-day
+cumulative-bytes series for each deployment, and projects forward
+to the configured horizons (defaults: 30d / 90d / 365d).  The
+report includes per-deployment forecasts, a fleet-wide rollup, an
+optional cost projection, and growth-anomaly detection.
+
+.PP
+Window:
+  --baseline-window DURATION  default 90d.  Backups stopped before
+                              this window don't influence the
+                              regression but still count toward
+                              the manifest total.
+  --horizon DURATION          repeatable; defaults to 30d, 90d, 365d.
+
+.PP
+Cost projection (opt-in):
+  --price-per-gb-month F      monthly $/GiB rate.  We multiply the
+                              fleet projection by this; cloud
+                              tariffs include request fees + egress
+                              + lifecycle classes that the
+                              operator's billing system handles.
+  --currency LABEL            default USD.
+  --pricing-model LABEL       free-form ("s3-standard",
+                              "s3-ia", "gcs-coldline"); recorded
+                              in the report for transparency.
+
+.PP
+Output formats:
+  --format json     (default) — JSON body, the v1 contract.
+  --format markdown — forensics-grade GFM Markdown rendering.
+                      Same shape as compliance report.
+
+.PP
+Skip flags:
+  --no-fleet        suppress the fleet rollup
+  --no-anomalies    suppress the anomaly-detection pass
+
+.PP
+The forecast is a planning tool, not a guarantee.  Confidence per
+deployment is reported (high/medium/low/insufficient) so the
+operator can apply their own quality threshold.  Read-only; safe
+at any cadence.
+
+
+.SH OPTIONS
+.PP
+\fB--baseline-window\fP=""
+	baseline window duration (e.g. 90d, 30d, 168h); default 90d
+
+.PP
+\fB--currency\fP="USD"
+	currency label for the cost section
+
+.PP
+\fB--deployment\fP=""
+	restrict the forecast to one deployment (fleet rollup still covers all)
+
+.PP
+\fB--format\fP="json"
+	output format for the report body: json | markdown
+
+.PP
+\fB-h\fP, \fB--help\fP[=false]
+	help for forecast
+
+.PP
+\fB--horizon\fP=[]
+	projection horizon (repeatable, e.g. --horizon 30d --horizon 365d); default: 30d, 90d, 365d
+
+.PP
+\fB--no-anomalies\fP[=false]
+	skip anomaly detection
+
+.PP
+\fB--no-fleet\fP[=false]
+	skip the fleet rollup
+
+.PP
+\fB--price-per-gb-month\fP=0
+	monthly $/GiB rate for the cost projection (opt-in; 0 = no cost section)
+
+.PP
+\fB--pricing-model\fP=""
+	free-form pricing-model label (e.g. s3-standard) recorded in the cost section
+
+.PP
+\fB--repo\fP=""
+	repository URL (positional  also accepted)
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+.PP
+\fB--airgapped\fP[=false]
+	refuse outbound endpoints (LLM providers, sinks, OTLP collectors) outside loopback / RFC1918 / explicit airgap.allowlist. Also enabled by PG_HARDSTORAGE_AIRGAPPED=1 or \fBairgapped: strict\fR in the config file.
+
+.PP
+\fB-c\fP, \fB--config\fP=""
+	path to config file (default: XDG/FHS lookup)
+
+.PP
+\fB--cpu-profile\fP=""
+	write a pprof CPU profile to this path for the duration of the command (\fBgo tool pprof <path>\fR to analyse). Off when empty.
+
+.PP
+\fB--mem-profile\fP=""
+	write a pprof heap profile to this path at command exit. Off when empty.
+
+.PP
+\fB--no-color\fP[=false]
+	disable ANSI color in text output
+
+.PP
+\fB--on-error-llm\fP[=false]
+	on a structured-error failure, drop into the matching LLM helper skill (auto_on_error trigger). Also enabled by PG_HARDSTORAGE_ON_ERROR_LLM=1.
+
+.PP
+\fB--otel-endpoint\fP=""
+	OpenTelemetry OTLP/HTTP endpoint (e.g. http://otel-collector:4318); empty disables tracing
+
+.PP
+\fB--otel-stdout\fP[=false]
+	also export OpenTelemetry traces to stderr (useful for dev)
+
+.PP
+\fB-o\fP, \fB--output\fP=""
+	output format: text|json|ndjson|yaml|template|csv|markdown|html|tap|junit|pdf (default: text on TTY, json off-TTY)
+
+.PP
+\fB--profile-port\fP=0
+	if non-zero, expose net/http/pprof on 127.0.0.1: for live profiling of long-running commands (e.g. \fBgo tool pprof http://127.0.0.1:6060/debug/pprof/profile?seconds=30\fR). Off when zero.
+
+.PP
+\fB-q\fP, \fB--quiet\fP[=false]
+	suppress non-essential output
+
+.PP
+\fB--template\fP=""
+	Go text/template applied when --output template (or implied if --template is set without --output)
+
+
+.SH SEE ALSO
+.PP
+\fBpg_hardstorage(1)\fP

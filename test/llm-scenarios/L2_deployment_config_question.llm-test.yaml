@@ -1,0 +1,28 @@
+# L2-deployment-config-question.llm-test.yaml
+#
+# Operator needs help registering a new deployment.
+
+schema: pg_hardstorage.llm-test.v1
+name: L2-deployment-config-question
+tier: L2
+description: |
+  Operator needs help registering a new deployment.
+
+mode: ask
+turns:
+  - 'I have a new PG cluster at db.staging.example.com.  how do I get pg_hardstorage to back it up?'
+
+rubric:
+  hard:
+    must_contain_any:
+      - 'deployment add'
+      - 'schedule'
+      - 'backup'
+      - 'repo'
+    must_not_contain:
+      - 'rm -rf'
+  soft:
+      - 'Does the response use the correct CLI shape `pg_hardstorage deployment add <name> --repo <url> --connection <dsn>`?'
+      - 'Does the response mention --schedule-backup and --schedule-rotate?'
+
+temperature: 0.2

@@ -1,0 +1,10 @@
+pg_hardstorage performs incremental, content-addressed backups
+of PostgreSQL clusters with WAL archiving and point-in-time
+recovery.  It is a single static Go binary that doubles as a
+long-running host agent and as an interactive CLI.
+
+This port ships the pg_hardstorage binary, the example config,
+and (optionally) the drop-in compatibility shims that mimic the
+pgBackRest / Barman / WAL-G CLI surfaces so existing cron jobs,
+archive_command lines, and monitoring scripts keep working but
+produce native pg_hardstorage backups.

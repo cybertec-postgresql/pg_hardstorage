@@ -1,0 +1,107 @@
+# L5_k8s_cronjob_incremental_cnpg.scenario.yaml
+#
+# Tier L5: K8s CronJob driving PG 17 incremental backups against
+# a CloudNativePG-managed cluster.  This scenario exercises the
+# K8s-operator integration the plan calls for; the parallel
+# L3_incremental_scheduled.scenario.yaml exercises the
+# `pg_hardstorage schedule` invariant against local-docker so
+# the time-driven cadence is verified in CI without a K8s cluster.
+#
+# Why two scenarios for the same intent:
+#
+#   K8s-native CronJob behaviour (RBAC, ServiceAccount, image-
+#   pull, container restart semantics, CNPG WAL routing) can ONLY
+#   be tested against a real K8s cluster.  The `kind` topology
+#   provider is currently a stub (internal/testkit/topology/topology.go);
+#   running this scenario without the provider landed surfaces a
+#   clean stub error from runner.Up — same posture every L5
+#   scenario has when its provider is unimplemented.
+#
+#   The OPERATIONAL invariant the K8s scenario protects (an
+#   incremental backup fires on schedule, chain extends correctly,
+#   leaf restore works) is independent of K8s — it's the same
+#   invariant the `pg_hardstorage schedule` CLI provides on bare-
+#   metal.  L3_incremental_scheduled.scenario.yaml exercises that
+#   end-to-end against local-docker.  When the kind topology
+#   lands, this L5 scenario picks up where the L3 leaves off —
+#   stacking K8s-specific concerns (operator reconciliation,
+#   PostgresClusterDB CRD wiring, CNPG WAL archive mode) on the
+#   already-validated baseline.
+#
+# What this scenario would assert when kind topology lands:
+#
+#   * CloudNativePG operator + a PostgresCluster CR are running
+#     in the kind cluster; one primary + one replica.
+#   * A pg-hardstorage HSDeployment CR pointed at the CNPG
+#     Cluster service triggers the operator's reconcile loop.
+#   * An HSSchedule CR with `every: 30s incremental: true`
+#     creates a CronJob that runs `pg_hardstorage backup
+#     <deployment> --incremental-from latest` every 30s.
+#   * After 3 CronJob firings (90s wall clock), the repo has a
+#     full + 3 incrementals; the last one is restorable to a
+#     fresh datadir; pg_verifybackup passes against the
+#     flattened result.
+#
+# Until the kind topology lands, this scenario serves as the
+# canonical specification of the K8s integration contract; the
+# scenario runner refuses to execute it with a clear
+# topology.unimplemented error, which is exactly the gate we
+# want — operators/CI can't accidentally claim "K8s incremental
+# tested" when no K8s cluster is in scope.
+
+schema: pg_hardstorage.scenario.v1
+name: L5-k8s-cronjob-incremental-cnpg
+tier: L5
+description: |
+  K8s CronJob drives `pg_hardstorage backup --incremental-from
+  latest` against a CNPG cluster every 30s; 3 firings build a
+  chain; leaf restore passes pg_verifybackup.  Requires the
+  kind topology provider (stub today).
+
+topology:
+  provider: kind
+  cluster_name: testkit-incremental-cnpg
+  operator: cnpg
+  pg_version: "17"
+  replicas: 1
+
+load:
+  file: test/load/failover_loop.load.yaml
+
+steps:
+  # The runner refuses at topology.Up because `kind` is a stub.
+  # The fail-fast error message is the test for now:
+  #
+  #   "kind topology lands; v0.1 ships local-docker /
+  #    testcontainers / patroni-local-docker"
+  #
+  # Once the kind topology lands, replace this comment block
+  # with the concrete steps:
+  #
+  #   - cli_run:
+  #       args: ["kubectl", "apply", "-f", "test/manifests/hsdeployment-cnpg.yaml"]
+  #   - wait_for_resource:
+  #       kind: HSDeployment
+  #       name: incremental-cnpg
+  #       condition: Ready
+  #   - cli_run:
+  #       args: ["kubectl", "apply", "-f", "test/manifests/hsschedule-incremental-30s.yaml"]
+  #   - assert_cronjob_fired_n_times:
+  #       cronjob: incremental-cnpg
+  #       count: 3
+  #       within: 120s
+  #   - cli_run:
+  #       args: ["kubectl", "exec", "...", "--", "pg_hardstorage", "list", "incremental-cnpg"]
+  #       expect_stdout_contains: "incremental_lsn"
+  #       expect_stdout_contains_count: 3
+  #   - restore: { deployment: incremental-cnpg, source: latest }
+  #
+  # The wait_for_resource + assert_cronjob_fired_n_times steps
+  # are themselves not implemented yet — they land alongside the
+  # kind topology provider as the K8s-native step kinds.
+  - assert:
+      - count_exact: { table: users, value: 1000 }
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:2h"

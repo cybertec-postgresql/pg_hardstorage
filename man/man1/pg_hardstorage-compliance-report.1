@@ -1,0 +1,186 @@
+.nh
+.TH "PG_HARDSTORAGE" "1" "May 2026" "pg_hardstorage Manual" "pg_hardstorage Manual"
+
+.SH NAME
+.PP
+pg_hardstorage-compliance-report - Generate a time-windowed compliance report
+
+
+.SH SYNOPSIS
+.PP
+\fBpg_hardstorage compliance report  [flags]\fP
+
+
+.SH DESCRIPTION
+.PP
+Walks the repository over the named time window and produces a
+structured report covering:
+
+.RS
+.IP \(bu 2
+Backup activity (per-deployment + per-type counts; window-edge
+timestamps).
+.IP \(bu 2
+Encryption coverage (% of in-window backups encrypted; KEK ref
+breakdown; schemes used).
+.IP \(bu 2
+Verification coverage (verify.* audit events; per-deployment
+runs, oldest/last).
+.IP \(bu 2
+KEK lifecycle (kms.rotate / kms.shred events with actor / refs
+/ tenant / timestamp).
+.IP \(bu 2
+Approval workflow (requests created; destructive ops executed
+in window).
+.IP \(bu 2
+Holds (hold.add / hold.remove / hold.expire counts).
+.IP \(bu 2
+Replica completeness (windowed primaries vs windowed replica
+copies; unreplicated count).
+.IP \(bu 2
+Audit chain (events in window; anchor count + last-anchor age;
+full chain-integrity verification result).
+.IP \(bu 2
+WORM mode + retention from HSREPO.
+
+.RE
+
+.PP
+Window:
+  --since   duration ("30d", "90d", "168h") OR RFC3339 timestamp.
+            Default: now - 30 days.
+  --until   same form. Default: now.
+
+.PP
+Format:
+  --format json     (default) — JSON body, the v1 contract.
+  --format markdown — forensics-grade Markdown, GFM tables, with
+                      compliance-control hints next to each section
+                      (e.g. SOC 2 CC6.7, ISO 27001 A.8.13). The text
+                      renderer is the same when --output is text.
+
+.PP
+Sections are independently optional via --no-* flags so a fast
+dashboard run skips the expensive walks. Read-only by construction;
+safe at any cadence.
+
+
+.SH OPTIONS
+.PP
+\fB--deployment\fP=""
+	restrict windowed sections to one deployment (repo-wide sections still cover everything)
+
+.PP
+\fB--format\fP="json"
+	output format for the report body: json | markdown
+
+.PP
+\fB-h\fP, \fB--help\fP[=false]
+	help for report
+
+.PP
+\fB--no-approvals\fP[=false]
+	skip the approval-workflow section
+
+.PP
+\fB--no-backups\fP[=false]
+	skip the backup-activity section
+
+.PP
+\fB--no-chain\fP[=false]
+	skip the audit-chain section
+
+.PP
+\fB--no-chain-verify\fP[=false]
+	keep the chain section's event/anchor counts but skip the (potentially expensive) full VerifyChain pass
+
+.PP
+\fB--no-encryption\fP[=false]
+	skip the encryption-coverage section
+
+.PP
+\fB--no-holds\fP[=false]
+	skip the holds section
+
+.PP
+\fB--no-kek-lifecycle\fP[=false]
+	skip the KEK-lifecycle section
+
+.PP
+\fB--no-replicas\fP[=false]
+	skip the replica-completeness section
+
+.PP
+\fB--no-verification\fP[=false]
+	skip the verification-coverage section
+
+.PP
+\fB--no-worm\fP[=false]
+	skip the WORM section
+
+.PP
+\fB--repo\fP=""
+	repository URL (positional  also accepted)
+
+.PP
+\fB--since\fP=""
+	window start: duration (24h, 30d) or RFC3339 timestamp; default = now - 30d
+
+.PP
+\fB--until\fP=""
+	window end: duration or RFC3339 timestamp; default = now
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+.PP
+\fB--airgapped\fP[=false]
+	refuse outbound endpoints (LLM providers, sinks, OTLP collectors) outside loopback / RFC1918 / explicit airgap.allowlist. Also enabled by PG_HARDSTORAGE_AIRGAPPED=1 or \fBairgapped: strict\fR in the config file.
+
+.PP
+\fB-c\fP, \fB--config\fP=""
+	path to config file (default: XDG/FHS lookup)
+
+.PP
+\fB--cpu-profile\fP=""
+	write a pprof CPU profile to this path for the duration of the command (\fBgo tool pprof <path>\fR to analyse). Off when empty.
+
+.PP
+\fB--mem-profile\fP=""
+	write a pprof heap profile to this path at command exit. Off when empty.
+
+.PP
+\fB--no-color\fP[=false]
+	disable ANSI color in text output
+
+.PP
+\fB--on-error-llm\fP[=false]
+	on a structured-error failure, drop into the matching LLM helper skill (auto_on_error trigger). Also enabled by PG_HARDSTORAGE_ON_ERROR_LLM=1.
+
+.PP
+\fB--otel-endpoint\fP=""
+	OpenTelemetry OTLP/HTTP endpoint (e.g. http://otel-collector:4318); empty disables tracing
+
+.PP
+\fB--otel-stdout\fP[=false]
+	also export OpenTelemetry traces to stderr (useful for dev)
+
+.PP
+\fB-o\fP, \fB--output\fP=""
+	output format: text|json|ndjson|yaml|template|csv|markdown|html|tap|junit|pdf (default: text on TTY, json off-TTY)
+
+.PP
+\fB--profile-port\fP=0
+	if non-zero, expose net/http/pprof on 127.0.0.1: for live profiling of long-running commands (e.g. \fBgo tool pprof http://127.0.0.1:6060/debug/pprof/profile?seconds=30\fR). Off when zero.
+
+.PP
+\fB-q\fP, \fB--quiet\fP[=false]
+	suppress non-essential output
+
+.PP
+\fB--template\fP=""
+	Go text/template applied when --output template (or implied if --template is set without --output)
+
+
+.SH SEE ALSO
+.PP
+\fBpg_hardstorage-compliance(1)\fP

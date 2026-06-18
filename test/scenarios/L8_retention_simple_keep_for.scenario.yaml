@@ -1,0 +1,122 @@
+# L8_retention_simple_keep_for.scenario.yaml
+#
+# Tier L8 — simple time-based retention.  The headline
+# property: `rotate --policy simple --keep-for <dur>` keeps
+# every backup younger than the duration and tombstones
+# everything older.  Mirrors L8_retention_count_5_backups
+# in shape but exercises the SimplePolicy code path instead.
+#
+# Time-travel limitation: real scenarios produce all backups
+# within ~5 seconds of each other, so `--keep-for 1ns`
+# (everything is "old") and `--keep-for 24h` (everything is
+# "young") are the two assertable extremes.  A more realistic
+# "keep 7 days, age 4 backups past that threshold" scenario
+# would need a clock-skew primitive in the runner (deferred);
+# we exercise the boundary instead.
+#
+# Leaves covered (gate scope):
+#   * rotate (--policy simple, --keep-for; 2nd touch)
+#
+# Wall-clock budget: ~3 minutes.
+
+schema: pg_hardstorage.scenario.v1
+name: L8-retention-simple-keep-for
+tier: L8
+description: |
+  5 backups → rotate --policy simple --keep-for 24h --apply
+  (everything within window, nothing tombstoned) → rotate
+  --policy simple --keep-for 1ns --apply (everything ages
+  out except newest-safety-net) → list.
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  - take_backup: { deployment: l8-retention-simple, name: bk1 }
+  - take_backup: { deployment: l8-retention-simple, name: bk2 }
+  - take_backup: { deployment: l8-retention-simple, name: bk3 }
+  - take_backup: { deployment: l8-retention-simple, name: bk4 }
+  - take_backup: { deployment: l8-retention-simple, name: bk5 }
+
+  # 1. dry-run with a generous window — everything is within
+  # 24h of now (the backups were taken seconds ago), so all 5
+  # are kept, 0 tombstoned.
+  - cli_run:
+      args:
+        - "rotate"
+        - "$DEPLOYMENT"
+        - "--repo"
+        - "$REPO"
+        - "--policy"
+        - "simple"
+        - "--keep-for"
+        - "24h"
+      expect_exit: 0
+
+  # 2. dry-run with --keep-for 1ns — everything is "older" than
+  # the window EXCEPT the newest-safety-net.  Decision should
+  # mark 4 for delete, keep 1 (newest).
+  - cli_run:
+      args:
+        - "rotate"
+        - "$DEPLOYMENT"
+        - "--repo"
+        - "$REPO"
+        - "--policy"
+        - "simple"
+        - "--keep-for"
+        - "1ns"
+      expect_exit: 0
+
+  # 3. Apply the aggressive sweep.
+  - cli_run:
+      args:
+        - "rotate"
+        - "$DEPLOYMENT"
+        - "--repo"
+        - "$REPO"
+        - "--policy"
+        - "simple"
+        - "--keep-for"
+        - "1ns"
+        - "--apply"
+      expect_exit: 0
+
+  # 4. list — 4 tombstoned, 1 live.
+  - cli_run:
+      args:
+        - "list"
+        - "$DEPLOYMENT"
+        - "--repo"
+        - "$REPO"
+      expect_exit: 0
+
+  # 5. Re-apply with the same flags — idempotent; 0 NEW
+  # tombstones produced (the 4 are already marked).
+  - cli_run:
+      args:
+        - "rotate"
+        - "$DEPLOYMENT"
+        - "--repo"
+        - "$REPO"
+        - "--policy"
+        - "simple"
+        - "--keep-for"
+        - "1ns"
+        - "--apply"
+      expect_exit: 0
+
+  # 6. Cross-cover: rotate with the DEFAULT GFS policy on the
+  # same repo — also idempotent given the same backups.
+  - cli_run:
+      args:
+        - "rotate"
+        - "$DEPLOYMENT"
+        - "--repo"
+        - "$REPO"
+      expect_exit: 0
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

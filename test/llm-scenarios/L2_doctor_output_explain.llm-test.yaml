@@ -1,0 +1,36 @@
+# L2-doctor-output-explain.llm-test.yaml
+#
+# Operator runs `pg_hardstorage doctor` and gets a critical finding.  Wants help.
+
+schema: pg_hardstorage.llm-test.v1
+name: L2-doctor-output-explain
+tier: L2
+description: |
+  Operator runs `pg_hardstorage doctor` and gets a critical finding.  Wants help.
+
+seed_context:
+  trigger:
+    code: |
+      doctor.repo_unreachable
+    message: |
+      doctor: cannot connect to repo file:///srv/repo
+
+mode: ask
+turns:
+  - "doctor is reporting doctor.repo_unreachable.  what's wrong and how do I fix it?"
+
+rubric:
+  hard:
+    must_contain_any:
+      - 'permission'
+      - 'mount'
+      - 'path'
+      - 'exist'
+      - 'check'
+    must_not_contain:
+      - 'rm -rf'
+  soft:
+      - 'Does the response suggest checking the path exists + has the right permissions?'
+      - 'Does the response suggest running `pg_hardstorage doctor --output json` for the full structured finding?'
+
+temperature: 0.2

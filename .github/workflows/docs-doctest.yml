@@ -1,0 +1,153 @@
+# Documentation doctest — runs every `# RUNNABLE` code
+# block from the tutorials against a real `pg_hardstorage`
+# binary + a real PostgreSQL service container.  Catches
+# tutorial bit-rot the second a CLI flag is renamed.
+#
+# Triggers on doc-relevant paths only.  Per-PR runs are
+# kept under 5 min by skipping blocks that need external
+# services (Patroni cluster, K8s, AWS KMS) — those blocks
+# carry a `skip-in-ci="..."` directive in the markdown and
+# the runner honours `PG_HARDSTORAGE_DOCTEST_CI=1`.
+#
+# Local equivalent: `make docs-doctest` against an
+# operator-supplied PG (no skip-in-ci, runs everything).
+
+name: docs-doctest
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docs/tutorials/**"
+      - "docs/how-to/**"
+      - "docs/CONTRIBUTING-DOCS.md"
+      - "cmd/doctest/**"
+      - "internal/cli/**"
+      - "Makefile"
+      - ".github/workflows/docs-doctest.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "docs/tutorials/**"
+      - "docs/how-to/**"
+      - "docs/CONTRIBUTING-DOCS.md"
+      - "cmd/doctest/**"
+      - "internal/cli/**"
+      - "Makefile"
+
+concurrency:
+  group: docs-doctest-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: "1.26.4"
+
+jobs:
+  doctest:
+    name: docs doctest (PG ${{ matrix.pg }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        # PG 17 is the current upstream-stable major and the
+        # version every tutorial's `--pg-connection` example
+        # implicitly assumes.  We pin a single cell so doctest
+        # runs stay fast; the broader PG-version compatibility
+        # matrix is the test-integration job's job.
+        pg: ["17"]
+    services:
+      postgres:
+        image: postgres:${{ matrix.pg }}
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        # The replication-protocol tests need wal_level=logical
+        # / max_wal_senders elevated on the server side.  We
+        # pass them through the postgres entrypoint's command
+        # override.
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+        ports:
+          - 5432:5432
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: install matching postgresql-client
+        # The doctest harness drives `pg_hardstorage` on the
+        # runner host; restore's postverify step shells out to
+        # `pg_ctl` to start the restored data dir and confirm
+        # it boots.  pg_ctl MUST match the data-dir major (a
+        # v16 pg_ctl refuses a v17 PGDATA with "database files
+        # are incompatible with server").  Ubuntu 24.04's
+        # default `postgresql-client` package is pinned to PG
+        # 16 — not the service-container's PG ${{ matrix.pg }}.
+        # Pull `postgresql-${{ matrix.pg }}` from the PGDG apt
+        # repo so the on-host binaries line up with the
+        # service container.
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq curl ca-certificates gnupg
+          sudo install -d /etc/apt/keyrings
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+              | sudo gpg --dearmor -o /etc/apt/keyrings/postgresql.gpg
+          codename=$(. /etc/os-release && echo "$VERSION_CODENAME")
+          echo "deb [signed-by=/etc/apt/keyrings/postgresql.gpg] http://apt.postgresql.org/pub/repos/apt ${codename}-pgdg main" \
+              | sudo tee /etc/apt/sources.list.d/pgdg.list >/dev/null
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq postgresql-client-${{ matrix.pg }} postgresql-${{ matrix.pg }}
+
+      - name: configure postgres for replication
+        # The default postgres image starts with
+        # wal_level=replica, max_wal_senders=10 — enough for
+        # `BASE_BACKUP` over the replication protocol but not
+        # enough for the logical-decoding tutorials.  We bump
+        # via ALTER SYSTEM + reload.  Tutorials that need
+        # logical decoding live behind skip-in-ci anyway, so
+        # this is belt-and-suspenders for future expansion.
+        env:
+          PGPASSWORD: postgres
+          PGHOST: 127.0.0.1
+          PGPORT: 5432
+          PGUSER: postgres
+          PGDATABASE: postgres
+        run: |
+          psql -c "ALTER SYSTEM SET wal_level = 'logical';" || true
+          psql -c "ALTER SYSTEM SET max_wal_senders = 20;" || true
+          psql -c "ALTER SYSTEM SET max_replication_slots = 20;" || true
+          # ALTER SYSTEM needs a server restart for wal_level;
+          # we'd need to control the postgres service container
+          # to do that.  The default `replica` level is
+          # sufficient for every tutorial that's not
+          # skip-in-ci'd, so we accept the as-is config and
+          # leave the ALTERs as documentation of the fuller
+          # posture.
+
+      - name: build pg_hardstorage
+        run: make build
+
+      - name: list runnable blocks
+        # Surface what's in scope before executing — useful
+        # when a maintainer's reading job logs to see what
+        # the runner thinks is runnable.
+        env:
+          PG_HARDSTORAGE_DOCTEST_CI: "1"
+        run: go run ./cmd/doctest -root docs/tutorials -list
+
+      - name: run doctest (CI mode)
+        env:
+          PG_HARDSTORAGE_DOCTEST_CI: "1"
+          PG_HARDSTORAGE_DOCTEST_PG: "postgres://postgres:postgres@127.0.0.1:5432/postgres?sslmode=disable"
+          PG_HARDSTORAGE_DOCTEST_BIN: ${{ github.workspace }}/bin/pg_hardstorage
+        run: go run ./cmd/doctest -root docs/tutorials -v

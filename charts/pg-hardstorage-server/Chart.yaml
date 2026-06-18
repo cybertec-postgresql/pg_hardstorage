@@ -1,0 +1,26 @@
+apiVersion: v2
+name: pg-hardstorage-server
+description: |
+  Stub chart for the pg_hardstorage control-plane server.
+  The server binary lands with v0.5; for v0.1.x, deploy the
+  pg-hardstorage-sidecar chart instead -- it ships the host
+  agent that v0.1 callers actually need.
+type: application
+version: 0.0.1
+appVersion: "0.0.0"
+kubeVersion: ">= 1.24.0-0"
+home: https://github.com/cybertec-postgresql/pg_hardstorage
+sources:
+  - https://github.com/cybertec-postgresql/pg_hardstorage
+maintainers:
+  - name: Hans-Jürgen Schönig
+    email: hs@cybertec.at
+keywords:
+  - postgresql
+  - backup
+  - control-plane
+  - cybertec
+deprecated: false
+annotations:
+  category: Database
+  pg-hardstorage.cybertec.at/status: stub

@@ -1,0 +1,91 @@
+# L2_scale_fleet.scenario.yaml
+#
+# Tier L2 — fleet-scale mechanisms end-to-end via the CLI.
+#
+# Two of the fleet-scale changes are exercised together against a
+# real repo:
+#
+#   * deployment index — `status` enumerates the fleet through the
+#     per-deployment marker index (O(num deployments), not a full
+#     manifest scan). All backed-up deployments must appear.
+#   * sharded audit chain — each deployment's backup.create event
+#     lands in its own chain (audit/shards/d.<name>/); `audit
+#     verify-chain` walks every shard and must report clean.
+#
+# Why this matters: unit tests prove the index/sharding code in
+# isolation; this scenario proves the wired-up CLI surface produces
+# a repo whose fleet enumeration and audit verification both work
+# across MULTIPLE deployments — the shape that bites at fleet scale.
+#
+# What gets exercised:
+#
+#   * take_backup x3 (distinct deployment labels, same testbed PG)
+#   * status — enumerates deployments via the index
+#   * audit verify-chain — walks + checks every per-deployment shard
+#
+# Pass criterion: every command exits 0, `status` lists all three
+# deployments, and verify-chain reports clean across the shards.
+# A regression in the index (a dropped deployment) or in sharded
+# verification surfaces as a missing name or a non-zero exit.
+#
+# Wall-clock budget: ~25s.
+
+schema: pg_hardstorage.scenario.v1
+name: L2-scale-fleet
+tier: L2
+description: |
+  Back up three distinct deployments against the testbed PG, then
+  prove the deployment index enumerates them (status) and the
+  sharded audit chain verifies clean across every shard.
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  # 1-3. Back up three distinct deployments. Each lands in its own
+  # audit shard and its own deployment-index marker.
+  - take_backup:
+      deployment: scale-alpha
+  - take_backup:
+      deployment: scale-bravo
+  - take_backup:
+      deployment: scale-charlie
+
+  # 4. Deployment index: `status` enumerates the fleet through the
+  # index. All three deployments must appear.
+  - cli_run:
+      args:
+        - "status"
+        - "--repo"
+        - "$REPO"
+        - "--output"
+        - "json"
+      expect_exit: 0
+      expect_stdout_contains: "scale-alpha"
+  - cli_run:
+      args:
+        - "status"
+        - "--repo"
+        - "$REPO"
+        - "--output"
+        - "json"
+      expect_exit: 0
+      expect_stdout_contains: "scale-charlie"
+
+  # 5. Sharded audit chain: verify-chain walks every per-deployment
+  # shard. Must exit 0 (clean) — a hash mismatch, chain break, or
+  # misfiled event in ANY shard would exit non-zero.
+  - cli_run:
+      args:
+        - "audit"
+        - "verify-chain"
+        - "--repo"
+        - "$REPO"
+        - "--output"
+        - "json"
+      expect_exit: 0
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

@@ -1,0 +1,73 @@
+# L2_compat_pgbackrest_tls.scenario.yaml
+#
+# Tier L2: pg-hardstorage-pgbackrest end-to-end against an
+# S3-API endpoint over HTTPS with a self-signed cert.  Boots
+# the testkit's `tls-minio` sink runtime (a fresh MinIO
+# container with an ED25519 self-signed cert valid for 24 h,
+# SANs covering 127.0.0.1 / localhost / ::1), points the shim
+# at it via --repo1-s3-endpoint=https://..., archives a
+# synthetic 16 MiB segment + .backup companion through TLS,
+# asserts the bucket carries the manifest, then round-trips
+# via archive-get.
+#
+# What this scenario protects (the SSL story):
+#
+#   - The AWS SDK trusts the self-signed cert via
+#     AWS_CA_BUNDLE — both at the testkit's host process and
+#     inside the shim container.  Regression: a future code
+#     path that strips AWS_CA_BUNDLE from the env (e.g. an
+#     "exec.Command without inheriting env" refactor) would
+#     surface here as `x509: certificate signed by unknown
+#     authority`.
+#
+#   - The pgbackrest shim's URL builder forwards the https://
+#     scheme verbatim into the native CLI's --repo flag — a
+#     regression that downgrades to http:// at translation
+#     time would surface as a TLS-handshake error (MinIO
+#     refuses plaintext on the TLS port).
+#
+#   - The native S3 plugin's BaseEndpoint override picks up
+#     the https:// scheme and the AWS SDK's transport
+#     correctly upgrades.  No env-based downgrade
+#     (AWS_CA_BUNDLE_DISABLE / NO_PROXY / ...) leaks through.
+#
+#   - End-to-end byte equality on round-trip: the segment
+#     transits the AWS SDK twice (PUT in archive-push, GET in
+#     archive-get) under TLS.  TLS termination + envelope
+#     stripping must preserve every byte.
+#
+# Multi-distro coverage: run_compat_testing.sh substitutes
+# os_image: per cell at scenario-run time, exercising the
+# AWS SDK's TLS stack on different glibc / libssl
+# combinations.  Critical for catching bugs that show only
+# under a specific OpenSSL version's policy.
+
+schema: pg_hardstorage.scenario.v1
+name: L2-compat-pgbackrest-tls
+tier: L2
+description: |
+  pg-hardstorage-pgbackrest end-to-end against TLS MinIO with
+  a self-signed cert: archive-push 16 MiB segment + .backup,
+  archive-get round-trip — every byte traverses TLS twice.
+  Inside the os_image container the driver picks.
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  - compat_archive:
+      shim: pgbackrest
+      deployment: compat-pgbr-tls
+      fixture: segment
+      sink: tls-minio
+
+  - compat_archive:
+      shim: pgbackrest
+      deployment: compat-pgbr-tls
+      fixture: segment_plus_backup
+      sink: tls-minio
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"

@@ -1,0 +1,147 @@
+# L3_compat_migration_pgbackrest_to_native_s3.scenario.yaml
+#
+# Tier L3: full migration story — an operator running
+# pgbackrest with a filesystem repo transitions to native
+# pg_hardstorage with an S3 repo, with a Patroni-style
+# failover in the middle to confirm archive_command continuity
+# isn't broken by either the migration or the failure.
+#
+# The operator's narrative this scenario reproduces:
+#
+#   1. We were running pgbackrest with a filesystem
+#      repository for the last few months.  archive_command
+#      pointed at `pgbackrest archive-push`; backups landed
+#      in /var/lib/pgbackrest.
+#
+#   2. We dropped pg-hardstorage-pgbackrest into PATH as a
+#      symlink for `pgbackrest` — same archive_command line,
+#      same repo URL, same cron jobs.  Backups now go through
+#      pg_hardstorage's native chunked manifests under the
+#      hood, but the operator surface is unchanged.
+#
+#   3. PG SIGTERM / restart (controlled "failover") — the
+#      shim must not lose archives across the bounce.
+#
+#   4. We're rolling out an S3 backup repo for compliance /
+#      capacity reasons.  We update archive_command to call
+#      `pg_hardstorage wal push --repo s3://...` directly
+#      (drop the shim) and point a new --repo at MinIO over
+#      HTTP.  Old file:// repo keeps existing backups for
+#      retention; new archives flow to S3.
+#
+#   5. After cutover we run a fresh `wal push` against S3 to
+#      prove the new pipeline works.
+#
+# What this scenario protects:
+#
+#   - Phase 1 archives accumulate in the file:// repo
+#     across multiple shim invocations (the runner's compat-
+#     repo dir is shared across compat_archive steps in the
+#     same scenario, mirroring the operator's persistent
+#     /var/lib/pgbackrest).
+#
+#   - Failover (pg_kill SIGTERM with 5 s heal_window) does
+#     NOT corrupt the file:// repo; the next archive succeeds
+#     and the manifest count grows by one.
+#
+#   - The transition step (shim=native, sink=s3-minio)
+#     boots a clean MinIO and proves `pg_hardstorage wal
+#     push` works against it — no shim involvement at all,
+#     reflecting the post-cutover operator workflow.
+#
+#   - Both repos end the scenario in valid pg_hardstorage
+#     state.  The compat_archive step's per-call assertions
+#     handle this; the file:// repo has phase-1 segments,
+#     the s3:// repo has phase-2 segments.
+
+schema: pg_hardstorage.scenario.v1
+name: L3-compat-migration-pgbackrest-to-native-s3
+tier: L3
+description: |
+  pgbackrest+filesystem → pg_hardstorage+S3 migration with
+  a controlled PG failover in the middle.  Drives the
+  pgbackrest shim through phase 1, then native CLI directly
+  against MinIO through phase 2.
+
+topology:
+  provider: local-docker
+  pg_version: "17"
+
+steps:
+  # === PHASE 1: pgbackrest shim + file:// repo =====================
+
+  # 1.1 — initial archive, simulating the operator's existing
+  #       cron / archive_command line that's been running for
+  #       months.
+  - compat_archive:
+      shim: pgbackrest
+      deployment: legacy-prod
+      fixture: segment
+
+  # 1.2 — backup-history file (the issue #10 path).  Whatever
+  #       was running before the migration emitted these too;
+  #       the shim must route them correctly.
+  - compat_archive:
+      shim: pgbackrest
+      deployment: legacy-prod
+      fixture: segment_plus_backup
+
+  # === FAILOVER ====================================================
+
+  # 2 — controlled SIGTERM on the PG container; testcontainers'
+  #     restart policy brings PG back.  The 5 s heal_window
+  #     gives PG time to rewind its replication slot before
+  #     the next archive call.  Mirrors a real Patroni
+  #     promote/restart cycle from the operator's perspective.
+  - inject:
+      kind: pg_kill
+      target: pg
+      # SIGINT (fast shutdown) — SIGTERM hangs on smart-
+      # shutdown waiting for the runner's libpq pool.
+      signal: 2
+      # heal_window is now a max-budget for pg_isready, not
+      # a fixed sleep; runInject advances as soon as PG
+      # accepts connections.
+      heal_window: 30s
+
+  # 2.1 — post-failover archive.  The shim's archive_command
+  #       continues to flow into the SAME file:// repo (the
+  #       compat-repo dir under artefactDir is shared across
+  #       compat_archive steps in this scenario).
+  - compat_archive:
+      shim: pgbackrest
+      deployment: legacy-prod
+      fixture: segment_idempotent
+
+  # === PHASE 2: cutover to native CLI + S3 repo ====================
+
+  # 3.1 — operator updates archive_command to call
+  #       `pg_hardstorage wal push` directly.  Native shim
+  #       (no compat layer involved), sink runtime spins up
+  #       a MinIO container, repo URL is s3://...
+  #
+  #       fixture: segment_plus_backup exercises both the
+  #       segment and the .backup companion through the new
+  #       pipeline in a single step (so the sink only boots
+  #       once — sink lifecycle is per-step today).
+  - compat_archive:
+      shim: native
+      deployment: prod-s3
+      fixture: segment_plus_backup
+      sink: s3-minio
+
+  # 3.2 — idempotency on the new pipeline.  Re-pushing the
+  #       same segment must succeed (PG retries
+  #       archive_command on transient errors; the new
+  #       --repo s3:// path has to honour the same
+  #       RenameIfNotExists contract the legacy --repo
+  #       file:// path did).
+  - compat_archive:
+      shim: native
+      deployment: prod-s3
+      fixture: segment_idempotent
+      sink: s3-minio
+
+cleanup:
+  on_success: tear_down
+  on_failure: "keep_for:1h"
