@@ -181,8 +181,8 @@ Stop and remove with `nssm stop` + `nssm remove`.
 
 ## Roadmap
 
-Tracked in [issue #11 — Windows
-support](https://github.com/cybertec-postgresql/pg_hardstorage/issues/11).
+Tracked on the project [issues
+list](https://github.com/cybertec-postgresql/pg_hardstorage/issues).
 The remaining surface (signed `.msi` installer,
 SCM-aware agent, automated `windows/amd64` test job in
 CI) is sequenced after the v1.0 stabilisation work.
