@@ -1,9 +1,23 @@
 ---
-title: pg_hardstorage
-description: PostgreSQL backup, done right — agent + CLI documentation
+# `title` drives only the <title>/browser-tab text, not the on-page
+# H1.  It must NOT repeat the site_name ("pg_hardstorage"), or
+# Material renders the duplicate "pg_hardstorage - pg_hardstorage".
+# Keep it descriptive + keyword-front-loaded for SEO; Material
+# appends " - pg_hardstorage" automatically.
+title: PostgreSQL backup, WAL streaming & PITR
+description: >-
+  pg_hardstorage is an open-source PostgreSQL backup agent and CLI:
+  continuous WAL streaming, point-in-time recovery, content-addressed
+  deduplication, envelope encryption, and signed manifests. PG 15+,
+  Apache 2.0.
 ---
 
 # pg_hardstorage
+
+<p class="hero-logo" markdown>
+![pg_hardstorage](assets/pghardstorage_logo_dark.png){.logo-on-light}
+![pg_hardstorage](assets/pghardstorage_logo_light.png){.logo-on-dark}
+</p>
 
 > PostgreSQL backup, done right — agent + CLI for
 > resilient, compliant, content-addressed backup with native

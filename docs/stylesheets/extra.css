@@ -1,0 +1,249 @@
+/* pg_hardstorage documentation — brand theming.
+ *
+ * Why this file exists: the site must match the colours of
+ * the main pghardstorage.org website, which uses a bespoke
+ * navy + cyan palette that does NOT map onto any of MkDocs
+ * Material's named primary/accent colours.  So mkdocs.yml
+ * sets `primary: custom` / `accent: custom` and the real
+ * values live here as Material's CSS custom properties.
+ *
+ * Air-gapped constraint: every value below is a literal
+ * colour or a repo-local asset.  No webfont @import, no CDN
+ * reference — doc readers are often on networks that block
+ * external CDNs (see the `font: false` note in mkdocs.yml).
+ *
+ * Palette source of truth (mirrors the website's :root):
+ *   --navy        #060e18   --accent          #3db8f5
+ *   --navy-light  #0d1f33   --accent-bright   #5ecbff
+ *   --navy-mid    #13304d   --accent-light    #8ee0ff
+ *   --blue-dark   #1a4a72   --accent-ink      #176ba3
+ *   text-primary  #0a1628   text-secondary    #3d5068
+ */
+
+/* ------------------------------------------------------------------ *
+ * Brand palette as Material design tokens.
+ *
+ * Material derives most of the chrome (header, nav, buttons,
+ * links) from --md-primary-* and --md-accent-*.  We pin them
+ * to the website palette here.  Light mode uses navy chrome
+ * with cyan accents; dark mode (slate) keeps the same accent
+ * and lets Material's slate background carry the navy feel.
+ * ------------------------------------------------------------------ */
+
+:root {
+  /* Header / nav chrome. */
+  --md-primary-fg-color:        #0d1f33; /* navy-light */
+  --md-primary-fg-color--light: #13304d; /* navy-mid   */
+  --md-primary-fg-color--dark:  #060e18; /* navy       */
+  /* Text that sits ON the primary (header title, icons). */
+  --md-primary-bg-color:        #ffffff;
+  --md-primary-bg-color--light: rgba(255, 255, 255, 0.72);
+
+  /* Links, hover, focus rings, active states. */
+  --md-accent-fg-color:         #3db8f5; /* accent        */
+  --md-accent-fg-color--transparent: rgba(61, 184, 245, 0.12); /* accent-glow */
+}
+
+/* Light scheme: cyan links that read on white. */
+[data-md-color-scheme="default"] {
+  --md-typeset-a-color: #176ba3; /* accent-ink — darker cyan for AA contrast on white */
+}
+
+/* Dark scheme (slate): brighter cyan + navy backgrounds so the
+ * doc body matches the website's dark hero, not Material's
+ * default near-black slate. */
+[data-md-color-scheme="slate"] {
+  --md-accent-fg-color:  #5ecbff; /* accent-bright */
+  --md-typeset-a-color:  #5ecbff;
+
+  --md-default-bg-color:        #060e18; /* navy      */
+  --md-default-bg-color--light: #0d1f33; /* navy-light */
+  --md-code-bg-color:           #0d1f33; /* navy-light — code blocks lift off the page */
+}
+
+/* ------------------------------------------------------------------ *
+ * Typography.
+ *
+ * Air-gapped: no webfont download.  We tune the system /
+ * Material default stack (Roboto when present, system-ui
+ * fallback) for a slightly tighter, more editorial read:
+ * larger line-height in body copy, heavier headings, and a
+ * monospace stack for code that degrades gracefully offline.
+ * ------------------------------------------------------------------ */
+
+.md-typeset {
+  /* Comfortable reading measure + line height for long-form
+   * explanation pages. */
+  line-height: 1.7;
+}
+
+.md-typeset h1,
+.md-typeset h2,
+.md-typeset h3 {
+  font-weight: 700;
+  letter-spacing: -0.01em; /* tightens large headings */
+}
+
+.md-typeset h1 {
+  color: var(--md-default-fg-color);
+}
+
+/* Code: keep a robust offline monospace stack. */
+.md-typeset code,
+.md-typeset pre {
+  font-family: "Roboto Mono", ui-monospace, "SFMono-Regular",
+    "Menlo", "Consolas", monospace;
+}
+
+/* ------------------------------------------------------------------ *
+ * Header tweaks.
+ *
+ * The header brand is the full wordmark (assets/pghardstorage_logo_light.png,
+ * set in mkdocs.yml).  We hide the redundant site-name text so
+ * the wordmark stands alone, and size the logo by HEIGHT so the
+ * wide 3.7:1 image scales proportionally into the narrow header.
+ *
+ * Two fixes over the naive `height: 1.5rem`:
+ *   1. Desktop was too small — a wordmark needs more height than
+ *      a square icon to stay legible.  Bumped to 2rem.
+ *   2. Mobile showed nothing — Material hides .md-logo on small
+ *      screens (it normally falls back to the __title text, which
+ *      we've suppressed).  We force the logo visible again and
+ *      cap its width so it can't crowd the hamburger / search. */
+
+/* Desktop: size the wordmark by height; width follows. */
+.md-header__button.md-logo img {
+  height: 2rem;
+  width: auto;
+}
+
+/* Hide the site-name text + the “return to home” topic next to
+ * the logo.  site_name still drives the <title>, search index
+ * and meta tags — only the visible header text is suppressed. */
+.md-header__topic {
+  display: none;
+}
+
+/* Mobile (Material's breakpoint is 76.1875em / ~1220px for the
+ * header layout shift).  Re-show the logo Material would hide,
+ * shrink it slightly, and bound its width so the wide wordmark
+ * shares the row cleanly with the menu + search icons. */
+@media screen and (max-width: 76.1875em) {
+  .md-header__button.md-logo {
+    display: inline-flex;   /* override Material's display:none */
+    padding-right: 0.4rem;
+  }
+  .md-header__button.md-logo img {
+    height: 1.5rem;
+    max-width: 9rem;        /* never push the menu/search off-row */
+    object-fit: contain;
+  }
+}
+
+/* ------------------------------------------------------------------ *
+ * Right-hand drawer (hamburger menu).
+ *
+ * DELIBERATE override of Material's stock behaviour: by default
+ * the hamburger sits immediately after the logo (left) and the
+ * nav drawer slides in from the LEFT.  Glued to the wide
+ * wordmark it looked cramped, so we:
+ *   1. push the hamburger button to the far right of the header,
+ *   2. flip the primary drawer to sit on the right and slide in
+ *      from the right, so icon-position and open-direction agree.
+ *
+ * Two non-obvious facts (verified against the built main.*.css):
+ *   - Material's mobile breakpoint is 76.234375em, NOT 76.1875em
+ *     (that one is for the navigation tabs).  Match it exactly so
+ *     the override engages over the same range as the drawer.
+ *   - Material scopes the drawer's resting position with a
+ *     [dir=ltr] prefix: `[dir=ltr] .md-sidebar--primary{left:-12.1rem}`.
+ *     An unprefixed `.md-sidebar--primary{right:...}` has LOWER
+ *     specificity and loses, so the drawer stays parked on the
+ *     left (overlay shows, panel invisible).  We therefore mirror
+ *     Material's own [dir=rtl] right-hand rules under [dir=ltr].
+ *   - 12.1rem is today's drawer width; re-check if a future
+ *     mkdocs-material bumps it. */
+@media screen and (max-width: 76.234375em) {
+  /* 1. Hamburger to the far right.  The header is a flex row;
+   *    ordering the button last floats it past the title gap to
+   *    the right edge, mirroring the search/scheme icons' side. */
+  .md-header__button.md-icon[for="__drawer"] {
+    order: 100;
+    margin-left: auto;   /* eat the slack so it pins to the edge */
+  }
+
+  /* 2a. Park the hidden drawer off-screen on the RIGHT.  [dir=ltr]
+   *     prefix matches Material's own specificity so this actually
+   *     wins over its `left:-12.1rem`. */
+  [dir=ltr] .md-sidebar--primary {
+    left: auto;
+    right: -12.1rem;
+  }
+
+  /* 2b. Slide it in from the right when the drawer toggle is
+   *     checked (Material default for ltr is translateX(12.1rem);
+   *     we use the negative magnitude, same as its rtl rule). */
+  [dir=ltr] [data-md-toggle="drawer"]:checked ~ .md-container .md-sidebar--primary {
+    transform: translateX(-12.1rem);
+  }
+}
+
+/* ------------------------------------------------------------------ *
+ * Home-page hero logo (light/dark swap).
+ *
+ * Material's header takes a single logo, so the wide
+ * light/dark wordmarks can't live there.  Instead the home
+ * page (docs/index.md) carries a <p class="hero-logo"> block
+ * with BOTH images; CSS shows the right one per colour scheme.
+ *
+ * Usage in index.md (md_in_html is enabled):
+ *   <p class="hero-logo" markdown>
+ *   ![pg_hardstorage](assets/pghardstorage_logo_dark.png){.logo-on-light}
+ *   ![pg_hardstorage](assets/pghardstorage_logo_light.png){.logo-on-dark}
+ *   </p>
+ * ------------------------------------------------------------------ */
+.hero-logo img {
+  max-width: min(560px, 100%);
+  height: auto;
+  margin: 0.5rem 0 1.5rem;
+}
+
+/* Show the dark wordmark on the light page, hide the light one. */
+[data-md-color-scheme="default"] .hero-logo .logo-on-dark  { display: none; }
+[data-md-color-scheme="default"] .hero-logo .logo-on-light { display: inline; }
+
+/* And the inverse on the dark page. */
+[data-md-color-scheme="slate"] .hero-logo .logo-on-light { display: none; }
+[data-md-color-scheme="slate"] .hero-logo .logo-on-dark  { display: inline; }
+
+/* ------------------------------------------------------------------ *
+ * Footer.
+ *
+ * Material's footer already inherits the primary (navy) chrome.
+ * Nudge the cyan accent into footer links so they match the
+ * body link colour rather than the muted footer default. */
+.md-footer-meta {
+  background-color: #060e18; /* navy — slightly darker than the header */
+}
+
+.md-footer-meta a:hover,
+.md-footer-meta a:focus {
+  color: #5ecbff; /* accent-bright */
+}
+
+/* ------------------------------------------------------------------ *
+ * Buttons rendered via the `.md-button` class on landing pages.
+ * Give the primary call-to-action the website's cyan→teal
+ * gradient instead of a flat fill. */
+.md-typeset .md-button--primary {
+  background: linear-gradient(135deg, #3db8f5 0%, #22d3bb 100%); /* gradient-primary */
+  border-color: transparent;
+  color: #060e18;
+}
+
+.md-typeset .md-button--primary:hover,
+.md-typeset .md-button--primary:focus {
+  background: linear-gradient(135deg, #5ecbff 0%, #3de8d0 100%); /* gradient-primary-h */
+  border-color: transparent;
+  color: #060e18;
+}

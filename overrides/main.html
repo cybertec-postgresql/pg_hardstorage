@@ -1,0 +1,61 @@
+{#-
+  Theme override: social / Open Graph + Twitter Card meta tags.
+
+  Why a manual override instead of Material's `social` plugin:
+  that plugin renders card images at build time via Cairo/Pango,
+  which aren't installed in CI and would add system-level build
+  dependencies.  These static tags need none — they reuse the
+  repo-local wordmark as the share image, so the air-gapped /
+  no-new-deps posture holds.
+
+  Material exposes the `extrahead` block for exactly this; we
+  append to <head> without touching the rest of the template.
+
+  Values are derived from page + site config so every page gets
+  a correct, specific card:
+    - og:title       → "<page title> · pg_hardstorage" on sub-pages,
+                        the bare page title on the home page (which
+                        already front-loads keywords); avoids the
+                        terse Material nav title ("Home", "FAQ") that
+                        reads poorly in a share card
+    - og:description  → the page meta description (falls back to
+                        site_description)
+    - og:url / canonical → page.canonical_url (needs site_url,
+                        which is set to https://docs.pghardstorage.org)
+    - og:image        → the light wordmark, absolute URL
+-#}
+{% extends "base.html" %}
+
+{% block extrahead %}
+  {#- Page-specific title/description with sensible fallbacks.
+      Home page: use its (already descriptive) title as-is.
+      Sub-pages: append the site name so the card is self-identifying. -#}
+  {% if page and page.is_homepage %}
+    {#- On the home page Material sets page.title to the nav label
+        ("Home"); the descriptive SEO title lives in front matter,
+        readable as page.meta.title. -#}
+    {% set og_title = page.meta.title | default(page.title, true) | default(config.site_name, true) %}
+  {% elif page and page.title %}
+    {% set og_title = page.title ~ " · " ~ config.site_name %}
+  {% else %}
+    {% set og_title = config.site_name %}
+  {% endif %}
+  {% set og_desc = page.meta.description if page and page.meta and page.meta.description else config.site_description %}
+  {% set og_image = config.site_url ~ "assets/pghardstorage_logo_light.png" %}
+
+  {#- Open Graph (Slack, LinkedIn, Facebook, Teams). -#}
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="{{ config.site_name }}">
+  <meta property="og:title" content="{{ og_title }}">
+  <meta property="og:description" content="{{ og_desc }}">
+  {% if page and page.canonical_url %}
+  <meta property="og:url" content="{{ page.canonical_url }}">
+  {% endif %}
+  <meta property="og:image" content="{{ og_image }}">
+
+  {#- Twitter / X large-image card. -#}
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="{{ og_title }}">
+  <meta name="twitter:description" content="{{ og_desc }}">
+  <meta name="twitter:image" content="{{ og_image }}">
+{% endblock %}
