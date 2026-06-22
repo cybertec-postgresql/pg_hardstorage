@@ -29,6 +29,11 @@ site_dir: site
 # aware, native admonitions + tabs + code-copy buttons.
 theme:
   name: material
+  # Template overrides live in overrides/ — currently just
+  # main.html, which appends Open Graph + Twitter Card meta
+  # tags (social share previews) without the social plugin's
+  # Cairo/Pango build dependency.  See overrides/main.html.
+  custom_dir: overrides
   features:
     # Single-page-app navigation: pre-fetches linked pages,
     # cuts perceived latency.
@@ -52,18 +57,31 @@ theme:
     # Tab groups inside content (e.g. for one tutorial that
     # shows the same flow in CLI vs REST vs gRPC).
     - content.tabs.link
+  # Header brand: the full light wordmark (the header chrome is
+  # navy in BOTH colour schemes, so the light-on-dark wordmark
+  # reads correctly either way).  The site-name text next to it
+  # is hidden via CSS (.md-header__topic) so the logo stands
+  # alone; site_name is still set for the <title>, search index
+  # and meta tags.  favicon is the small square mark for the
+  # browser tab.  All assets are repo-local (air-gapped posture).
+  logo: assets/pghardstorage_logo_light.png
+  favicon: assets/pghardstorage_favicon.png
   palette:
+    # primary/accent are `custom`: the real colour values are
+    # the website's bespoke navy + cyan palette, pinned as
+    # Material design tokens in stylesheets/extra.css (no
+    # named Material colour matches the brand).
     - media: "(prefers-color-scheme: light)"
       scheme: default
-      primary: indigo
-      accent: indigo
+      primary: custom
+      accent: custom
       toggle:
         icon: material/brightness-7
         name: Switch to dark mode
     - media: "(prefers-color-scheme: dark)"
       scheme: slate
-      primary: indigo
-      accent: indigo
+      primary: custom
+      accent: custom
       toggle:
         icon: material/brightness-4
         name: Switch to light mode
@@ -122,6 +140,12 @@ markdown_extensions:
   - toc:
       permalink: true
       permalink_title: "Permalink to this section"
+
+# Brand stylesheet: pins the website's navy + cyan palette
+# onto Material's design tokens, tunes typography, and drives
+# the home-page hero logo light/dark swap.  Repo-local only.
+extra_css:
+  - stylesheets/extra.css
 
 plugins:
   - search:
@@ -306,11 +330,27 @@ extra:
     - icon: fontawesome/brands/github
       link: https://github.com/cybertec-postgresql/pg_hardstorage
       name: pg_hardstorage on GitHub
+    - icon: fontawesome/solid/globe
+      link: https://www.cybertec-postgresql.com/
+      name: CYBERTEC PostgreSQL
+    - icon: fontawesome/brands/linkedin
+      link: https://www.linkedin.com/company/cybertec-postgresql/
+      name: CYBERTEC on LinkedIn
 
+# Footer copyright + legal links.  Imprint / privacy policy /
+# accessibility live on the main pghardstorage.org site (the
+# single source of truth) — we link out rather than duplicate
+# legal text here.  "Cookie settings" uses the bare
+# #CCM.openWidget anchor on the CURRENT page: it opens the CCM19
+# consent widget once that script is present on this site (the
+# CCM19 embed is added separately, outside this repo change).
 copyright: >
   Copyright © CYBERTEC PostgreSQL International GmbH ·
   Licensed under Apache 2.0 ·
-  <a href="#__consent">Change cookie settings</a>
+  <a href="https://www.pghardstorage.org/imprint">Imprint</a> ·
+  <a href="https://www.pghardstorage.org/privacy-policy">Privacy policy</a> ·
+  <a href="https://www.pghardstorage.org/accessibility">Accessibility</a> ·
+  <a href="#CCM.openWidget">Cookie settings</a>
 
 # Strict mode is enabled at the CLI level (`mkdocs build
 # --strict`) by the Makefile — broken cross-link or missing
