@@ -11,6 +11,12 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ## [Unreleased]
 
+### Docs: publish the documentation site to GitHub Pages
+
+The docs CI built and validated the site but never published it. A
+push-on-main-gated deploy job now publishes it to GitHub Pages at
+docs.pghardstorage.org. PRs continue to only build + preview.
+
 ### Added
 
 - Initial public release.

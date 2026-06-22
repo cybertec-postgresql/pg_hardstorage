@@ -16,6 +16,11 @@
 # The build artefact is the rendered ./site/ directory,
 # uploaded so PR reviewers can preview the rendered site
 # without spinning up MkDocs locally.
+#
+# On push to main the rendered site is published to GitHub
+# Pages (custom domain docs.pghardstorage.org via docs/CNAME).
+# PRs only build + preview — the deploy job is gated to
+# push-to-main, so a fork PR can never publish.
 
 name: docs
 
@@ -45,6 +50,13 @@ concurrency:
 
 permissions:
   contents: read
+  # pages + id-token are needed only by the deploy job
+  # (actions/deploy-pages uses the OIDC token to publish).
+  # Declared workflow-wide because GitHub merges, not
+  # overrides, job-level perms — the build/linkcheck jobs
+  # never exercise the write scopes.
+  pages: write
+  id-token: write
 
 env:
   GO_VERSION: "1.26.4"
@@ -102,11 +114,20 @@ jobs:
       - name: build
         run: mkdocs build --strict
       - name: upload site artefact
+        # Plain artefact kept for PR reviewers to download a
+        # rendered preview without GitHub Pages access.
         uses: actions/upload-artifact@v4
         with:
           name: docs-site
           path: site/
           retention-days: 14
+      - name: upload Pages artefact
+        # Pages-specific packaging (tarball the deploy job
+        # consumes).  docs/CNAME is copied into site/ by
+        # MkDocs, so the custom domain survives each deploy.
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site/
 
   linkcheck:
     # External-link reachability gate.  Soft-fail for now
@@ -146,3 +167,21 @@ jobs:
             --accept 200..=299,401,403
             './site/**/*.html'
           fail: false
+
+  deploy:
+    # Publish to GitHub Pages.  Gated to push-on-main so PRs
+    # (including from forks) only build + preview, never
+    # publish.  Needs the strict build to have passed.
+    name: deploy to GitHub Pages
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    needs: [build]
+    environment:
+      # The github-pages environment should be branch-protected
+      # to main in repo settings as a second backstop.
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: deploy
+        id: deployment
+        uses: actions/deploy-pages@v4
