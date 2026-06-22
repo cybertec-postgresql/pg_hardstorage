@@ -21,6 +21,18 @@ the agent talks to PostgreSQL over the replication protocol, so the
 optional psql client is surfaced as a caveat instead. The formula push
 uses a dedicated HOMEBREW_TAP_TOKEN secret.
 
+### Installer: fix and harden the curl|sh installer
+
+The `scripts/install.sh` one-liner now works against real releases: it
+builds the versioned goreleaser archive name, resolves `latest` via the
+GitHub release redirect, and parses `--version`/`--bindir`/`--no-verify`
+flags correctly (previously `latest` and the unversioned archive name
+both 404'd, and `--version` was mis-read). The script is strict POSIX
+`sh` so the canonical `curl | sh` works under dash/busybox without a
+bash re-exec. Downloads are verified by SHA-256 against `checksums.txt`,
+and by cosign signature when cosign is installed. Added a Cloudflare
+Worker (`deploy/cloudflare/`) to serve the script at get.pghardstorage.org.
+
 ### Docs: brand the documentation site
 
 The documentation site now matches the pghardstorage.org brand: the
