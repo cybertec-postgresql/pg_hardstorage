@@ -11,6 +11,16 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ## [Unreleased]
 
+### Packaging: publish a Homebrew formula on release
+
+goreleaser now generates and pushes a Homebrew formula to the org-wide
+tap (cybertec-postgresql/homebrew-tap) on each release, so
+`brew install cybertec-postgresql/tap/pg_hardstorage` works on macOS
+(Apple Silicon) and Linux (amd64/arm64). No hard PostgreSQL dependency:
+the agent talks to PostgreSQL over the replication protocol, so the
+optional psql client is surfaced as a caveat instead. The formula push
+uses a dedicated HOMEBREW_TAP_TOKEN secret.
+
 ### Docs: publish the documentation site to GitHub Pages
 
 The docs CI built and validated the site but never published it. A

@@ -93,6 +93,50 @@ archives:
       - LICENSE
       - README.md
 
+# Homebrew tap — publishes Formula/pg_hardstorage.rb to the org-wide
+# tap repo on each release, so `brew install cybertec-postgresql/tap/
+# pg_hardstorage` works on macOS (Apple Silicon) and Linux
+# (amd64/arm64).  goreleaser generates the formula from the
+# pg_hardstorage archive and commits it to the tap.
+#
+# Auth: the default GITHUB_TOKEN can only write the current repo, so the
+# push to the separate tap repo uses HOMEBREW_TAP_TOKEN (a fine-grained
+# PAT scoped to contents:write on homebrew-tap), passed through in
+# .github/workflows/release.yml.
+brews:
+  - name: pg_hardstorage
+    repository:
+      owner: cybertec-postgresql
+      name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+    # Commit author for the formula bump in the tap repo.
+    commit_author:
+      name: cybertec-postgresql
+      email: office@cybertec.at
+    commit_msg_template: "pg_hardstorage: update formula to {{ .Tag }}"
+    homepage: "https://github.com/cybertec-postgresql/pg_hardstorage"
+    description: >-
+      PostgreSQL backup, done right — agent + CLI with continuous WAL
+      streaming, content-addressed dedup, envelope encryption, and
+      signed manifests.
+    license: "Apache-2.0"
+    # No hard PostgreSQL dependency: the agent talks to PostgreSQL over
+    # the replication protocol (often a *remote* DB), so forcing a local
+    # server build on every install is wrong.  Surface the optional
+    # client as a caveat instead.
+    caveats: |
+      pg_hardstorage connects to PostgreSQL over the replication protocol
+      and needs no local PostgreSQL server. If you want the psql client
+      locally, install it separately:
+        brew install libpq           # client only
+        brew install postgresql@18   # full server
+
+      Docs: https://docs.pghardstorage.org
+    test: |
+      system "#{bin}/pg_hardstorage", "version"
+    install: |
+      bin.install "pg_hardstorage"
+
 checksum:
   name_template: "checksums.txt"
   algorithm: sha256
