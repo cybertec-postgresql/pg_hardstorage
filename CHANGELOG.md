@@ -11,6 +11,13 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ## [Unreleased]
 
+### Packaging: remove the obsolete homebrew-formula.json manifest
+
+Dropped `scripts/homebrew-formula.json`, a leftover hand-maintained tap
+manifest that nothing consumes: the Homebrew artefact is generated and
+pushed to the tap by goreleaser on release. Updated `scripts/README.md`
+accordingly.
+
 ### Packaging: publish a Homebrew formula on release
 
 goreleaser now generates and pushes a Homebrew formula to the org-wide
