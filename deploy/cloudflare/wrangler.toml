@@ -1,0 +1,23 @@
+# Wrangler config for the get.pghardstorage.org installer Worker.
+#
+# Consumed both by `wrangler deploy` and by Cloudflare's Git
+# integration (Workers Builds): point the build at this directory
+# (deploy/cloudflare) as the root and Cloudflare reads this file.
+#
+# The `routes` block binds the Worker to the custom hostname on the
+# pghardstorage.org zone, so a deploy also wires up serving at
+# https://get.pghardstorage.org (custom_domain = Cloudflare manages the
+# DNS record + TLS cert automatically).
+
+name = "pghardstorage-get"
+main = "get-installer-worker.js"
+
+# Pin the Workers runtime semantics to a known date.  Bump deliberately
+# after testing if you need newer runtime behaviour.
+compatibility_date = "2025-06-22"
+
+# Serve the Worker at the custom hostname.  Requires the
+# pghardstorage.org zone to be on this Cloudflare account (it is).
+[[routes]]
+pattern = "get.pghardstorage.org"
+custom_domain = true
