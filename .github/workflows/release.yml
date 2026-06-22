@@ -63,6 +63,11 @@ jobs:
           args: release --clean --skip=docker
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Separate fine-grained PAT (contents:write on the homebrew-tap
+          # repo) so goreleaser can push the updated formula there; the
+          # default GITHUB_TOKEN can't write a second repo.  Consumed by
+          # the brews: stanza in .goreleaser.yaml.
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
 
       # Capture the goreleaser-emitted artifact list as JSON so the
       # SLSA generator can compute checksums for the binaries +
