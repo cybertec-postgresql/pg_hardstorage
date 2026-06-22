@@ -105,6 +105,10 @@ archives:
 # .github/workflows/release.yml.
 brews:
   - name: pg_hardstorage
+    # Only the pg_hardstorage CLI archive — without this filter goreleaser
+    # would also pull in the pg_hardstorage_testkit archive (two archives
+    # per OS/arch), producing an ambiguous formula. Mirrors nfpms.ids.
+    ids: [pg_hardstorage]
     repository:
       owner: cybertec-postgresql
       name: homebrew-tap
