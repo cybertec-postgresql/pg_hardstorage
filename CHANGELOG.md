@@ -18,15 +18,18 @@ manifest that nothing consumes: the Homebrew artefact is generated and
 pushed to the tap by goreleaser on release. Updated `scripts/README.md`
 accordingly.
 
-### Packaging: publish a Homebrew formula on release
+### Packaging: publish a Homebrew cask on release
 
-goreleaser now generates and pushes a Homebrew formula to the org-wide
-tap (cybertec-postgresql/homebrew-tap) on each release, so
+goreleaser now generates and pushes a Homebrew cask to the org-wide tap
+(cybertec-postgresql/homebrew-tap) on each release, so
 `brew install cybertec-postgresql/tap/pg_hardstorage` works on macOS
-(Apple Silicon) and Linux (amd64/arm64). No hard PostgreSQL dependency:
+(Apple Silicon) and Linux (amd64/arm64). A cask (not a formula) is used
+because goreleaser deprecated the formula pipe in v2.16. The macOS path
+strips the Gatekeeper quarantine xattr on install, since the binaries
+are cosign-signed but not Apple-notarised. No hard PostgreSQL dependency:
 the agent talks to PostgreSQL over the replication protocol, so the
-optional psql client is surfaced as a caveat instead. The formula push
-uses a dedicated HOMEBREW_TAP_TOKEN secret.
+optional psql client is surfaced as a caveat instead. The push uses a
+dedicated HOMEBREW_TAP_TOKEN secret.
 
 ### Installer: fix and harden the curl|sh installer
 
