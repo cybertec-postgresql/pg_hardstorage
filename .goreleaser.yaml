@@ -93,37 +93,42 @@ archives:
       - LICENSE
       - README.md
 
-# Homebrew tap — publishes Formula/pg_hardstorage.rb to the org-wide
-# tap repo on each release, so `brew install cybertec-postgresql/tap/
-# pg_hardstorage` works on macOS (Apple Silicon) and Linux
-# (amd64/arm64).  goreleaser generates the formula from the
-# pg_hardstorage archive and commits it to the tap.
+# Homebrew cask — publishes Casks/pg_hardstorage.rb to the org-wide tap
+# on each release, so `brew install cybertec-postgresql/tap/pg_hardstorage`
+# works on macOS (Apple Silicon) and Linux (amd64/arm64).  goreleaser
+# generates the cask from the pg_hardstorage archive and commits it.
+#
+# Why a cask and not a formula: goreleaser deprecated the `brews:`
+# (formula) pipe in v2.16 in favour of `homebrew_casks:` — formulas were
+# a hack for shipping pre-compiled binaries; casks are the supported way
+# now.  The install command for end users is unchanged.
 #
 # Auth: the default GITHUB_TOKEN can only write the current repo, so the
 # push to the separate tap repo uses HOMEBREW_TAP_TOKEN (a fine-grained
 # PAT scoped to contents:write on homebrew-tap), passed through in
 # .github/workflows/release.yml.
-brews:
+homebrew_casks:
   - name: pg_hardstorage
     # Only the pg_hardstorage CLI archive — without this filter goreleaser
     # would also pull in the pg_hardstorage_testkit archive (two archives
-    # per OS/arch), producing an ambiguous formula. Mirrors nfpms.ids.
+    # per OS/arch), producing an ambiguous cask. Mirrors nfpms.ids.
     ids: [pg_hardstorage]
+    binaries:
+      - pg_hardstorage
     repository:
       owner: cybertec-postgresql
       name: homebrew-tap
       token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
-    # Commit author for the formula bump in the tap repo.
+    # Commit author for the cask bump in the tap repo.
     commit_author:
       name: cybertec-postgresql
       email: office@cybertec.at
-    commit_msg_template: "pg_hardstorage: update formula to {{ .Tag }}"
+    commit_msg_template: "pg_hardstorage: update cask to {{ .Tag }}"
     homepage: "https://github.com/cybertec-postgresql/pg_hardstorage"
     description: >-
       PostgreSQL backup, done right — agent + CLI with continuous WAL
       streaming, content-addressed dedup, envelope encryption, and
       signed manifests.
-    license: "Apache-2.0"
     # No hard PostgreSQL dependency: the agent talks to PostgreSQL over
     # the replication protocol (often a *remote* DB), so forcing a local
     # server build on every install is wrong.  Surface the optional
@@ -136,10 +141,18 @@ brews:
         brew install postgresql@18   # full server
 
       Docs: https://docs.pghardstorage.org
-    test: |
-      system "#{bin}/pg_hardstorage", "version"
-    install: |
-      bin.install "pg_hardstorage"
+    hooks:
+      post:
+        # The release binaries are cosign-signed but NOT Apple-notarised,
+        # so on macOS Gatekeeper would quarantine the binary and refuse to
+        # run it ("pg_hardstorage is damaged and cannot be opened").  Strip
+        # the quarantine xattr on install.  Guarded by OS.mac? so the Linux
+        # cask path is unaffected.
+        install: |
+          if OS.mac?
+            system_command "/usr/bin/xattr",
+                           args: ["-dr", "com.apple.quarantine", "#{staged_path}/pg_hardstorage"]
+          end
 
 checksum:
   name_template: "checksums.txt"
