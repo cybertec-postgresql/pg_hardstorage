@@ -48,7 +48,7 @@ binaries / `.deb` / `.rpm` / Homebrew as before. Image-level SLSA
 provenance remains roadmap. A `goreleaser check` step now validates the
 release config in CI.
 
-## [Unreleased]
+## [1.0.4] — 2026-06-24
 
 ### Fix: deployment-scoped commands now read the deployment config (#12)
 
@@ -62,6 +62,8 @@ omitted (explicit flags still win); a deployment that isn't configured,
 or a genuinely missing flag, still errors as before. Resolution happens
 once, in a shared root pre-run hook, so every deployment-scoped command
 behaves identically.
+
+## [Unreleased]
 
 ### Packaging: remove the obsolete homebrew-formula.json manifest
 
