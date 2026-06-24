@@ -46,11 +46,9 @@ __PG_HARDSTORAGE_VERIFY__:FAIL <stderr>
 __PG_HARDSTORAGE_VERIFY__:SKIPPED <reason>
 ```
 
-A reference rootfs build script ships under
-`scripts/firecracker-rootfs.sh`. Operators with custom
-security baselines roll their own rootfs and keep the magic
-prefix exact — the prefix is part of the v1.0 schema-
-compatibility commitment.
+No rootfs image is bundled: operators build their own
+Firecracker rootfs and keep the magic prefix exact — the
+prefix is part of the v1.0 schema-compatibility commitment.
 
 The init script must halt after printing (`reboot -f` is
 fine; the kernel cmdline carries `panic=1 reboot=k` so any

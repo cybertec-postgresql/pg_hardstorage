@@ -7,7 +7,7 @@ contributions, but the bar is "this would land in the project anyway"
 
 ## Before you start
 
-1. **Read `docs/SPEC.md`.** It's the single source of truth for what
+1. **Read `SPEC.md`** (at the repo root). It's the single source of truth for what
    the system is and isn't supposed to do. Most of what looks like a
    missing feature is on a later milestone (v0.5 or v1.0); arguing for
    an earlier landing is a great use of an issue.

@@ -285,6 +285,19 @@ docker_manifests:
       - "ghcr.io/cybertec-postgresql/pg_hardstorage:latest-amd64"
       - "ghcr.io/cybertec-postgresql/pg_hardstorage:latest-arm64"
 
+# Keyless cosign signing of the published images + manifests (Sigstore +
+# GitHub Actions OIDC), mirroring the blob `signs:` stanza. Only runs in
+# the docker phase, i.e. when PUBLISH_CONTAINERS enables image publishing.
+docker_signs:
+  - id: cosign-images
+    cmd: cosign
+    artifacts: all
+    args:
+      - "sign"
+      - "--yes"
+      - "${artifact}@${digest}"
+    output: true
+
 release:
   github:
     owner: cybertec-postgresql
