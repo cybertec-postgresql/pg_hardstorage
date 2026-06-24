@@ -27,8 +27,8 @@ description: >-
 `pg_hardstorage` is a single Go binary that doubles as a
 long-running host agent and an interactive CLI.  It ferries
 base backups and WAL via the **PostgreSQL replication
-protocol** (so it works against managed databases like RDS,
-Cloud SQL, and Aiven without OS-level access), deduplicates
+protocol** (so it needs no SSH, OS access, or `archive_command`
+on the database host), deduplicates
 content-addressed chunks, AES-256-GCM-encrypts under a
 per-backup DEK wrapped by a configurable KEK, and signs
 every manifest with Ed25519.

@@ -16,7 +16,7 @@ Manage encryption keys
 
 ### Synopsis
 
-v0.1.1 ships the read-only `kms inspect` surface. Mutating
+The read-only `kms inspect` surface. Mutating
 verbs (rotate, shred, hsm-status) land alongside the KMS
 plugin tier (gcp-kms, azure-key-vault, vault-transit) and the PKCS#11
 / TPM 2.0 integrations.

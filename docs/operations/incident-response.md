@@ -47,7 +47,7 @@ after acknowledging each.
 | --- | --- | --- | --- |
 | `HSWALSilence`, `wal.slot_missing` | Replication slot dropped | `pg_hardstorage wal repair <deployment>` | [R6](../reference/runbooks/R6-slot-dropped-gap.md) |
 | `HSWALSilence`, slot present, lag rising | Network partition or PG primary stuck | Check `pg_replication_slots`; verify libpq reachability | [R6](../reference/runbooks/R6-slot-dropped-gap.md) |
-| `HSBackupOverdue`, RPO target exceeded | Schedule paused / agent down | `pg_hardstorage agent status`; rerun `backup` manually | [R3](../reference/runbooks/R3-cold-start-from-backups.md) |
+| `HSBackupOverdue`, RPO target exceeded | Schedule paused / agent down | `pg_hardstorage status <deployment>`; rerun `backup` manually | [R3](../reference/runbooks/R3-cold-start-from-backups.md) |
 | `HSKEKUnreachable`, `kms.unreachable` | KMS provider degraded or IAM revoked | Check provider console; restore IAM grants | [R2](../reference/runbooks/R2-kms-key-destroyed.md) |
 | `HSScrubFindings{kind="bit-rot"}` | Chunk corruption at rest | Quarantine prefix; heal from replica region | [R4](../reference/runbooks/R4-repo-corruption-at-rest.md) |
 | `HSScrubFindings{kind="missing"}` | Manifest references absent chunk | `repo check` to confirm; restore from replica | [R4](../reference/runbooks/R4-repo-corruption-at-rest.md) |
@@ -151,7 +151,7 @@ Once the incident is resolved:
        --since "2026-04-28T03:00:00Z" \
        --until "2026-04-28T09:00:00Z" \
        --include-anchors \
-       -o ./incident-2026-04-28.tar.gz
+       --out ./incident-2026-04-28.tar.gz
    ```
 
    See [audit evidence bundles](../compliance/audit-evidence-bundles.md)

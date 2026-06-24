@@ -278,7 +278,7 @@ correlating across separate logs.
 The exportable evidence bundle (`pg_hardstorage llm
 export-session`) includes a Merkle proof that the session's
 events anchor at specific positions in the chain, signed with
-cosign.  An auditor can verify the session is exactly what the
+the agent's Ed25519 keyring.  An auditor can verify the session is exactly what the
 chain says it was, with no trust in the binary's good-faith
 reporting.
 

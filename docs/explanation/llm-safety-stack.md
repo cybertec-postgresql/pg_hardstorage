@@ -252,9 +252,9 @@ Wrote signed evidence bundle to ./session-20260428T1423-db1-restore.evidence.tar
   - executed_commands.ndjson  (every command actually run, exit code, duration)
   - audit_chain_proof.json    (Merkle proof: this session's events anchor at chain pos 1428..1547)
   - skill_used.yaml           (the exact skill file at the version used)
-  - skill_signature.sig       (cosign signature)
+  - skill_signature.sig       (Ed25519 signature, agent keyring)
   - model_metadata.json       (provider, model id, model version, model fingerprint)
-  - signature.sig             (cosign signature on the bundle)
+  - signature.sig             (Ed25519 signature on the bundle)
 ```
 
 The bundle is what an admin shows in a post-incident review or a
@@ -284,10 +284,10 @@ functions baked into the binary.  Implications:
 - **Skill isolation.**  A bug in the postmortem skill cannot
   touch the restore skill.  Each skill loads independently, has
   its own tool allowlist, its own guardrails, its own RBAC scope.
-- **Signed.**  Shipped skills are cosign-signed by the project
-  key; user-added skills are signed by the operator's local
-  cosign key.  Loading an unsigned skill emits a critical audit
-  event and requires `--allow-unsigned-skill` confirmation.
+- **Inspectable, with signing on the roadmap.**  Skills load as
+  plain, reviewable YAML today.  Cryptographic skill signing and
+  signature verification (a project key for shipped skills, the
+  operator's key for local ones) are planned, not yet shipped.
 - **Linted + golden-tested.**  `pg_hardstorage llm skill lint
   <file>` validates the schema and static-checks the tool list
   (no banned tools, no missing required ones).

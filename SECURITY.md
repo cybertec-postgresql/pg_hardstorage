@@ -48,4 +48,4 @@ The systemd units we ship apply the standard hardening set
 (`NoNewPrivileges=yes`, `ProtectSystem=strict`, `PrivateTmp=yes`,
 `SystemCallFilter=@system-service`, etc.). If you're running outside
 systemd, the equivalent posture is documented in
-[docs/operator-guide.md](docs/operator-guide.md).
+[docs/operations/operator-guide.md](docs/operations/operator-guide.md).

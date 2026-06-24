@@ -33,7 +33,7 @@ The pipeline is `BASE_BACKUP` over libpq → tar parser → FastCDC
 chunker → CAS PUTs → signed manifest. Default compression is
 zstd `SpeedBetterCompression`; default encryption is on if a KEK is
 present at the keyring path. Force one or the other with
-`--encrypt` / `--no-encrypt`, `--no-compression`. Backup IDs follow
+`--encrypt` / `--no-encrypt`. Backup IDs follow
 the shape `db1.full.20260427T093017Z`.
 
 For NDJSON progress (one event per line) suitable for piping to `jq`:
@@ -117,7 +117,7 @@ pg_hardstorage restore db1 latest \
 
 Prints what would happen — source backup, WAL replay range, RTO
 estimate, target tablespace mapping, verification gate — and exits
-without touching disk. Pair with `--confirm` to run the same
+without touching disk. Pair with `--force` to run the same
 operation non-interactively after operator review.
 
 ### Refusals (pre-flight, exit 4)

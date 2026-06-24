@@ -46,11 +46,9 @@ __PG_HARDSTORAGE_VERIFY__:FAIL <stderr>
 __PG_HARDSTORAGE_VERIFY__:SKIPPED <reason>
 ```
 
-A reference rootfs build script ships under
-`scripts/firecracker-rootfs.sh`. Operators with custom
-security baselines roll their own rootfs and keep the magic
-prefix exact — the prefix is part of the v1.0 schema-
-compatibility commitment.
+No rootfs image is bundled: operators build their own
+Firecracker rootfs and keep the magic prefix exact — the
+prefix is part of the v1.0 schema-compatibility commitment.
 
 The init script must halt after printing (`reboot -f` is
 fine; the kernel cmdline carries `panic=1 reboot=k` so any
@@ -76,10 +74,9 @@ The Firecracker backend refuses with a clear remediation if
 ```bash
 pg_hardstorage-firecracker verify db1 latest \
     --repo s3://acme-pg-backups \
-    --full \
-    --sandbox-backend firecracker \
-    --firecracker-kernel /var/lib/pg_hardstorage/firecracker/vmlinux \
-    --firecracker-rootfs /var/lib/pg_hardstorage/firecracker/rootfs.ext4
+    --full
+# The sandbox backend and the kernel / rootfs paths are configured in
+# pg_hardstorage.yaml (see step 3), not via CLI flags.
 ```
 
 (For agent-driven verify the same fields go in

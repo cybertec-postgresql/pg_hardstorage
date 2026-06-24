@@ -111,7 +111,7 @@ The system section lists every configured KEK and reports
 
 ## What just happened
 
-The `pkcs11` build tag activates `internal/plugin/encryption/pkcs11`,
+The `pkcs11` build tag activates `internal/plugin/kms/pkcs11`,
 which holds the `EncryptionPlugin` implementation backed by
 `miekg/pkcs11`. At runtime the provider:
 

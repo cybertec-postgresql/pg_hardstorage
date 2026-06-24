@@ -71,7 +71,7 @@ make all-binaries
 ```
 
 ```console
-pg_hardstorage v0.9.x
+pg_hardstorage v1.0.x
   commit: abcdef1
   date:   2026-05-04T08:13:42Z
   fips:   false
@@ -79,7 +79,7 @@ pg_hardstorage v0.9.x
 ```
 
 A clean checkout that's not on a tagged commit produces
-`v0.9.x-N-gabcdef1` — which is what you want, because that's
+`v1.0.x-N-gabcdef1` — which is what you want, because that's
 the unique identifier of the build that's running.
 
 ## What just happened
@@ -160,7 +160,7 @@ rather than calling `go build` directly, or pass the flag
 yourself:
 
 ```bash
-go build -ldflags '-X github.com/cybertec-postgresql/pg_hardstorage/internal/version.Version=v0.9.0-dev' ...
+go build -ldflags '-X github.com/cybertec-postgresql/pg_hardstorage/internal/version.Version=v1.0.0-dev' ...
 ```
 
 ### Binary works on the build host but not on a target

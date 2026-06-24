@@ -80,8 +80,7 @@ func init() {
 }
 ```
 
-The `cmd/pg_hardstorage/main.go` (or a build-flavour-
-specific `cmd/pg_hardstorage_fips/main.go`) imports the
+The `cmd/pg_hardstorage/main.go` imports the
 concrete plugin packages with `_ "…/internal/plugin/sink/slack"`
 to trigger that side-effect.  Drop the import; lose the
 plugin.

@@ -557,6 +557,14 @@ jobs:
     needs: [vet]
     steps:
       - uses: actions/checkout@v4
+      # Validate the release config (dockers, docker_signs, manifests,
+      # signs, nfpms, homebrew_casks) parses before a tag ever relies on
+      # it — a malformed .goreleaser.yaml otherwise aborts the release.
+      - name: goreleaser check
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          version: latest
+          args: check
       - name: shellcheck packaging scripts
         run: |
           sudo apt-get update -qq

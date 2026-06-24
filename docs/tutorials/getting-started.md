@@ -9,9 +9,15 @@ backup on a schedule (e.g. nightly) that the stream rolls
 forward from.  Daily backup + always-on stream = PITR to any
 segment-aligned point.
 
-It works against managed PG (RDS, Cloud SQL, Azure DB) the same as
-bare metal, deduplicates and encrypts content-addressed chunks, and
-restores with PITR.  PG 15+, Apache 2.0.
+It backs up PostgreSQL you run yourself — bare metal, VMs, containers,
+Patroni clusters, and operators like CloudNativePG — over the physical
+replication protocol, deduplicates and encrypts content-addressed
+chunks, and restores with PITR.  PG 15+, Apache 2.0.
+
+Managed DBaaS (Amazon RDS, Aurora, Cloud SQL, Azure Database, Neon,
+Supabase, and similar) do **not** expose the `BASE_BACKUP` replication
+command to customers, so pg_hardstorage cannot take a physical base
+backup of them — see the [FAQ](../faq.md).
 
 This page gets you from zero to a running streamer, a first base
 backup, and a restored data dir in five minutes. After that, see
@@ -29,8 +35,9 @@ tarballs (Windows is CLI-only). Grab the matching one from
 verify the cosign signature, and drop the binary on your `$PATH`:
 
 ```sh
-curl -LO https://github.com/cybertec-postgresql/pg_hardstorage/releases/download/v0.1.1/pg_hardstorage_linux_amd64.tar.gz
-tar xzf pg_hardstorage_linux_amd64.tar.gz
+VERSION=1.0.3   # latest release: https://github.com/cybertec-postgresql/pg_hardstorage/releases/latest
+curl -LO "https://github.com/cybertec-postgresql/pg_hardstorage/releases/download/v${VERSION}/pg_hardstorage_${VERSION}_linux_amd64.tar.gz"
+tar xzf "pg_hardstorage_${VERSION}_linux_amd64.tar.gz"
 sudo install -m 0755 pg_hardstorage /usr/local/bin/
 pg_hardstorage version
 ```
@@ -38,7 +45,8 @@ pg_hardstorage version
 ### `.deb` (Debian / Ubuntu)
 
 ```sh
-sudo dpkg -i pg-hardstorage_0.1.1_amd64.deb
+VERSION=1.0.3   # the release you downloaded
+sudo dpkg -i "pg-hardstorage_${VERSION}_amd64.deb"
 ```
 
 The package installs the binary at `/usr/bin/pg_hardstorage`, drops a
@@ -49,7 +57,8 @@ creates `/etc/pg_hardstorage/`, `/var/lib/pg_hardstorage/`,
 ### `.rpm` (Fedora / RHEL / Rocky / Alma)
 
 ```sh
-sudo rpm -i pg-hardstorage-0.1.1-1.x86_64.rpm
+VERSION=1.0.3   # the release you downloaded
+sudo rpm -i "pg-hardstorage-${VERSION}-1.x86_64.rpm"
 ```
 
 Same layout as the `.deb`.
@@ -57,8 +66,9 @@ Same layout as the `.deb`.
 ### Container image
 
 ```sh
-docker pull ghcr.io/cybertec-postgresql/pg_hardstorage:v0.1.1
-docker run --rm ghcr.io/cybertec-postgresql/pg_hardstorage:v0.1.1 version
+VERSION=1.0.3   # latest release tag
+docker pull "ghcr.io/cybertec-postgresql/pg_hardstorage:v${VERSION}"
+docker run --rm "ghcr.io/cybertec-postgresql/pg_hardstorage:v${VERSION}" version
 ```
 
 The image is distroless. Mount a config dir at `/etc/pg_hardstorage`
@@ -247,7 +257,7 @@ you are doing — exit 9 means the verifier said no.
 
 ```sh
 $ pg_hardstorage version
-pg_hardstorage v0.1.1 (abc1234, built 2026-04-29T12:00:00Z)
+pg_hardstorage v1.0.3 (abc1234, built 2026-04-29T12:00:00Z)
 ```
 
 `doctor` is the single-command "is anything wrong" check:

@@ -85,9 +85,9 @@ homelabs, to have them.
 
 Concrete consequences:
 
-- The cipher default is AES-256-GCM-SIV (RFC 8452, nonce-misuse
-  resistant).  AES-256-GCM with a random 96-bit nonce is the FIPS
-  fallback when `BoringCrypto` is in use.  See [envelope
+- AES-256-GCM (random 96-bit nonce) is the cipher shipping today;
+  AES-256-GCM-SIV (RFC 8452, nonce-misuse-resistant) is the planned
+  default once a validated implementation lands.  See [envelope
   encryption](envelope-encryption.md).
 
 - The audit log is hash-chained on every write — no opt-in, no
@@ -184,12 +184,18 @@ spawning a wrapper script.  Not a polling loop on `pg_wal/`.  Not
 SSH into the host to read files.
 
 The reasoning is a single sentence: **we want the agent to work
-where SSH and `archive_library` cannot reach.**  Managed PostgreSQL
-on AWS RDS, GCP Cloud SQL, Azure Database, Aiven, Supabase, Neon —
-none of them let you install a C extension, none of them let you
-SSH into the host.  All of them expose the standard PostgreSQL
-replication endpoint.  Streaming over the replication protocol
-works on every one of them, identically to a self-hosted PG.
+where SSH and `archive_library` cannot reach.**  On self-managed
+PostgreSQL you often can't install a C extension or SSH into the
+host — a locked-down VM, a host another team owns, a container you
+don't control.  As long as the database exposes the standard
+physical replication endpoint, streaming over the replication
+protocol works identically to a co-located setup, from anywhere the
+agent can reach it.
+
+Fully-managed DBaaS — AWS RDS, Aurora, GCP Cloud SQL, Azure Database,
+Neon, Supabase — are a different case: they do **not** expose
+`BASE_BACKUP` or physical replication to customers, so pg_hardstorage
+cannot back them up.  It targets PostgreSQL you run yourself.
 
 Bonus consequence: a persistent slot **closes the WAL gap window
 to zero by default**.  PG holds WAL on disk until our agent ACKs.
@@ -250,10 +256,12 @@ the higher-numbered one yields.  Some real examples:
   complexity is hidden.
 
 - **Compliance vs WAL via replication protocol:** what about FIPS?
-  AES-256-GCM-SIV isn't FIPS.  We ship a `pg-hardstorage-fips`
-  build with `GOEXPERIMENT=boringcrypto` that falls back to plain
-  AES-256-GCM with a random 96-bit nonce.  Both principles are
-  served — at the cost of two build flavours.
+  GCM-SIV isn't FIPS, and the planned GCM-SIV default will not be
+  available in the FIPS build.  We ship a `pg-hardstorage-fips`
+  build with `GOEXPERIMENT=boringcrypto`; it uses AES-256-GCM with
+  a random 96-bit nonce today, and will likewise use GCM when
+  GCM-SIV lands.  Both principles are served — at the cost of two
+  build flavours.
 
 The principles are not aspirational.  Every one of them is
 load-bearing in a specific subsystem; if you propose changing one,

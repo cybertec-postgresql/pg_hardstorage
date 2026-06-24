@@ -45,10 +45,15 @@ One connection model, one credential, one mental model.
 
 The agent needs no OS-level access to the database host. It can be in
 a different VM, different region, different cloud, different K8s
-cluster. It works on AWS RDS, GCP Cloud SQL, Azure DB, Aiven,
-Supabase, Neon — anything that exposes a standard PG replication
-endpoint. This is the largest single architectural difference from
-pgBackRest, which assumes co-location and SSH.
+cluster. It works against any self-managed PostgreSQL that exposes the
+physical replication endpoint. This is the largest single
+architectural difference from pgBackRest, which assumes co-location
+and SSH.
+
+Fully-managed DBaaS — AWS RDS, Aurora, GCP Cloud SQL, Azure Database,
+Neon, Supabase — do **not** expose `BASE_BACKUP` or physical
+replication to customers, so they are out of scope: pg_hardstorage
+cannot take a physical base backup of them.
 
 ### How
 

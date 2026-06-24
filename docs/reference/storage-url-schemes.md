@@ -1,7 +1,7 @@
 <!-- AUTO-GEN candidate: emit from storage.Schemes() and per-plugin URL parser godoc; per docs/DOC_PLAN.md auto-generation map. -->
 ---
 title: Storage URL schemes
-description: The five repo-URL schemes — URL form, query parameters, auth chain, and capability matrix.
+description: The six repo-URL schemes — URL form, query parameters, auth chain, and capability matrix.
 tags:
   - reference
   - storage

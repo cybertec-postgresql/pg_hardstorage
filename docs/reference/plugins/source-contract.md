@@ -18,7 +18,7 @@ managed-disk).
 
 !!! warning "Forward-looking contract"
     The Source tier is **not yet refactored into a
-    pluggable interface**.  v0.9+ ships a single
+    pluggable interface**.  v1.0 ships a single
     streaming-backup implementation in
     `internal/backup/runner/` whose orchestration is hard-
     coded.  The interface signature below is the SPEC's

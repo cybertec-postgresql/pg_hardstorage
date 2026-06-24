@@ -25,27 +25,58 @@ a documentation gap.
 
 ## Getting started
 
-#### Will pg_hardstorage work against AWS RDS, GCP Cloud SQL, Aiven, Supabase, or Neon?
+#### Will pg_hardstorage work against AWS RDS, Aurora, GCP Cloud SQL, Azure Database, Neon, or Supabase?
 
-Yes.  The entire data plane runs over the PostgreSQL
-**replication protocol** on a normal database connection —
-no SSH, no OS access, no `archive_library` install needed.
-Anything that exposes a standard PG replication endpoint to
-a replication-role user works.  This is the single biggest
-architectural difference from pgBackRest; see the
+No.  pg_hardstorage's data plane runs over the PostgreSQL
+**physical replication protocol** — a physical replication
+slot plus `BASE_BACKUP`.  Fully-managed DBaaS providers do
+not expose `BASE_BACKUP` (or physical replication) to
+customers, so pg_hardstorage cannot take a physical base
+backup of them.  It targets PostgreSQL you run yourself.
+
+**Why, per provider** (checked June 2026 against each
+vendor's own replication documentation): RDS and Aurora are
+documented not to support external physical replication /
+`pg_basebackup`; Cloud SQL and Azure Database expose only
+logical replication / decoding to external consumers
+(physical replication there is internal managed-HA, not a
+customer-reachable `BASE_BACKUP` endpoint); Neon uses a
+custom storage architecture with no traditional
+`pg_basebackup`; and hosted Supabase can *publish* via
+logical replication but cannot serve as a physical replica
+target.  The general test: **if a service does not let an
+external client open a physical replication connection and
+run `BASE_BACKUP`, pg_hardstorage cannot back it up.**
+
+!!! note "What we have *not* verified"
+    This list is not exhaustive, and we have not run
+    pg_hardstorage end-to-end against every managed provider;
+    the above reflects each vendor's documented replication
+    capabilities, which can change over time.  Treat the
+    `BASE_BACKUP` test as the source of truth — run
+    `pg_hardstorage wal preflight <deployment>` against your
+    endpoint to confirm it exposes what streaming needs before
+    relying on it.  A self-hosted Postgres distribution you run
+    yourself (including self-hosted Supabase) counts as
+    self-managed and is supported.
+
+What the replication-protocol design *does* remove is the
+need for host-level access.  On self-managed PostgreSQL —
+bare metal, VMs, containers, Patroni clusters, and operators
+like CloudNativePG — the agent backs up over a normal database
+connection with no SSH, no OS access, and no
+`archive_library`/`archive_command` on the host, and it can
+run in a different VM, region, or cluster from the database.
+This is the single biggest architectural difference from
+pgBackRest; see the
 [architecture tour](explanation/architecture-tour.md#2-wal-via-the-replication-protocol)
 for the full reasoning.
 
-The one caveat: managed PG generally does not let you load
-a custom `archive_library`, so the optional double-archive
-path is unavailable.  Streaming replication is the primary
-path either way, so this changes nothing about backup
-correctness.
-
 #### What PostgreSQL versions are supported?
 
-PG 15, 16, and 17 are first-class.  PG 18 is supported in
-the test matrix from v0.9 onward.  PG 14 and earlier are
+PG 15, 16, and 17 are first-class — required to pass CI.
+PG 18 runs in the test matrix under allow-failure guardrails
+while readiness is confirmed.  PG 14 and earlier are
 out of scope — `BASE_BACKUP` non-exclusive mode and
 `pg_backup_start` / `pg_backup_stop` are PG 15-only APIs we
 rely on.
@@ -558,9 +589,9 @@ Tier-2 plugins via your own channel; a checked-in
 
 #### How is this different from pgBackRest?
 
-The short version: WAL via replication protocol (works on
-managed PG), no chained incrementals (CAS dedup with no
-chain dependency), encryption / KMS / audit chain / WORM
+The short version: WAL via replication protocol (no SSH or
+`archive_command` on the host), no chained incrementals (CAS
+dedup with no chain dependency), encryption / KMS / audit chain / WORM
 on by default.  pgBackRest's strengths — production
 maturity at very large scale, mature operator integrations
 — are real and we're explicit about them.  Full comparison

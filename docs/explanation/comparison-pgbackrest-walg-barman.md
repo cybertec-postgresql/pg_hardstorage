@@ -17,8 +17,11 @@ you can pick the right tool for your case.
 The short version of where `pg_hardstorage` differs:
 
 - **WAL via the replication protocol, not file-based archiving.**
-  Works on managed PG (RDS, Cloud SQL, Aiven, Neon).  No SSH, no
-  archive_library install required.
+  No SSH, no `archive_command`, and no extension on the database
+  host — the agent backs up any self-managed PostgreSQL it can reach
+  over the physical replication endpoint, from a different VM, region,
+  or cluster.  (Fully-managed DBaaS such as RDS or Cloud SQL don't
+  expose `BASE_BACKUP` and are out of scope.)
 - **Content-addressed dedup with no chain dependency.**  Every
   backup is independently restorable; deleting one cannot break
   another.
@@ -39,16 +42,17 @@ time to earn equivalent confidence.
 |  | pg_hardstorage | pgBackRest | WAL-G | Barman |
 | --- | --- | --- | --- | --- |
 | **Primary WAL transport** | Replication protocol streaming | `archive_command` | `archive_command` | `archive_command` + streaming |
-| **Works on managed PG (RDS / Cloud SQL)?** | Yes (no host access needed) | No (needs SSH or archive_library) | Yes (file-based) | Partial (streaming variant) |
+| **Backs up self-managed PG without host/SSH access?** | Yes (replication connection only) | No (needs SSH or archive_library) | No (archive_command on host) | Partial (streaming variant) |
+| **Backs up managed DBaaS (RDS / Cloud SQL)?** | No (`BASE_BACKUP` not exposed) | No | No | No |
 | **Backup chain model** | None (CAS, every backup independent) | Differential / incremental chained | Delta backups chained | Differential / incremental chained |
 | **Dedup** | Cross-backup, cross-deployment, cross-tenant-ish | Within incremental chain | Page-delta | Within chain |
-| **Encryption default** | AES-256-GCM-SIV envelope, on by default | Optional, configurable | Optional | Optional |
+| **Encryption default** | AES-256-GCM envelope, on by default | Optional, configurable | Optional | Optional |
 | **KMS support** | AWS / GCP / Azure / Vault / HSM | Per-deployment | AWS / GCP / Azure | Per-deployment |
 | **Audit log** | Hash-chained Merkle, transparency-anchored (v0.5+) | Standard log file | Standard log file | Standard log file |
 | **WORM** | First-class (S3 Object Lock, Azure immutable, NetApp SnapLock) | Backend-dependent | Backend-dependent | Backend-dependent |
 | **FIPS build** | `pg-hardstorage-fips` flavour | Build-time | Build-time | Build-time |
 | **Patroni integration** | REST-aware + permanent_slots + dual-slot + sync-target | Config integration | Patroni `bootstrap.method` | Standard PG replication |
-| **K8s integration** | CNPG-I, WAL-G shim, pgBackRest shim, Helm charts | pgBackRest operators | WAL-G operators | Custom |
+| **K8s integration** | WAL-G shim, pgBackRest shim, Helm charts (CNPG-I provider on the v0.5 roadmap) | pgBackRest operators | WAL-G operators | Custom |
 | **LLM helper** | First-class, audited, gated | n/a | n/a | n/a |
 | **License** | Apache 2.0 | MIT | Apache 2.0 | GPL-3 |
 
@@ -75,10 +79,12 @@ pgBackRest is excellent and we're comfortable saying so:
 
 The places to think twice:
 
-- **You can't SSH into the host.**  Managed PG offerings
-  (RDS, Cloud SQL, Aiven) make pgBackRest's primary model
-  difficult or impossible.  Workarounds exist but they're
-  workarounds.
+- **You can't SSH into the host.**  When the backup tool can't
+  get SSH/OS access to a self-managed primary (a locked-down VM,
+  a host another team owns, a container you don't control),
+  pgBackRest's co-location model is difficult; pg_hardstorage only
+  needs a replication connection.  (Neither tool can back up a
+  managed DBaaS like RDS — `BASE_BACKUP` isn't exposed there.)
 
 - **You want backup chains that don't cascade.**  pgBackRest's
   incremental backup chain creates dependencies; one corrupt
@@ -155,9 +161,12 @@ The places to think twice:
 The cases where the architecture genuinely earns its
 differentiation:
 
-- **Managed PostgreSQL** (RDS, Cloud SQL, Azure DB, Aiven, Neon).
-  No SSH, no archive_library install.  Replication protocol
-  streaming works identically across all of them.
+- **Self-managed PostgreSQL without host access.**  Backup runs
+  over a replication connection, so the agent can live in a
+  different VM, region, or K8s cluster from the database — no SSH,
+  no `archive_command`, no extension on the host.  (Managed DBaaS
+  like RDS or Cloud SQL are *not* supported: they don't expose
+  `BASE_BACKUP`.)
 
 - **Mixed fleet** of self-hosted + managed + K8s.  Same binary,
   same config schema, same repo schema.  The operator learns one
@@ -178,9 +187,10 @@ differentiation:
   story (REST + permanent_slots + dual-slot + sync-target) rather
   than rolling your own.
 
-- **K8s with the operator-shim model**.  CNPG-I, WAL-G shim, and
+- **K8s with the operator-shim model**.  The WAL-G shim and
   pgBackRest shim let you swap into existing operator-managed
-  clusters without rewriting the operator.
+  clusters without rewriting the operator.  (A native CNPG-I
+  provider is on the roadmap for v0.5.)
 
 - **Transparent Data Encryption (TDE) at the source.**  PG forks
   that encrypt heap / index / WAL at rest — CYBERTEC PGEE,

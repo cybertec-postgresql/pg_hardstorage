@@ -9,6 +9,35 @@ on-disk and on-the-wire schema (backup manifests, configuration, output JSON,
 and the on-disk chunk envelope): an agent built against a given schema version
 keeps reading that version for at least 24 months after a successor lands.
 
+## [1.0.3] — 2026-06-24
+
+### Documentation: correctness sweep + cloud-support accuracy
+
+Audited the documentation against the codebase and corrected false or
+stale claims. The big one: pg_hardstorage backs up self-managed
+PostgreSQL over the physical replication protocol (`BASE_BACKUP` + a
+physical slot); fully-managed DBaaS — Amazon RDS, Aurora, Cloud SQL,
+Azure Database, Neon, Supabase — do **not** expose `BASE_BACKUP` and are
+out of scope. Every "works on managed PG" claim was removed (web-verified
+against each vendor's replication docs). Also fixed: feature counts (six
+storage backends, one LLM provider), PG-version support (15–18; 15/16/17
+CI-required, 18 allow-failure), nonexistent CLI flags in tutorials / ops
+guides, broken in-repo file paths, stale version strings, and the
+AES-256-GCM-SIV-vs-GCM and cosign-vs-Ed25519 descriptions. CNPG-I, Rekor
+anchoring, skill signing, and the FIPS image are now clearly marked
+roadmap. Download / verify examples use a `VERSION` variable so they no
+longer go stale.
+
+### Packaging: wire container-image publishing (GHCR)
+
+The release pipeline can now build and publish multi-arch (amd64/arm64)
+distroless images to GHCR with keyless cosign image signatures. Publishing
+is gated on the `PUBLISH_CONTAINERS` repo variable — set it once the org
+enables Actions package-write on `ghcr.io`; until then the release ships
+binaries / `.deb` / `.rpm` / Homebrew as before. Image-level SLSA
+provenance remains roadmap. A `goreleaser check` step now validates the
+release config in CI.
+
 ## [Unreleased]
 
 ### Packaging: remove the obsolete homebrew-formula.json manifest

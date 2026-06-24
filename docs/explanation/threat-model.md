@@ -137,7 +137,7 @@ any object.
 
 **Defences:**
 
-- **Per-chunk authentication.**  AES-256-GCM(-SIV) is an AEAD
+- **Per-chunk authentication.**  AES-256-GCM is an AEAD
   cipher.  Substituting a chunk's ciphertext for a different
   ciphertext fails authentication on read — the agent rejects
   the modified chunk with a structured error.  Restore aborts.
@@ -258,8 +258,9 @@ they have the controls.
 - Anomalous patterns (off-hours bulk reads, novel principals,
   unusual download volume) trigger alerts via the configured
   Sinks.
-- The transparency-log-anchored audit chain means the attacker
-  cannot silently rewrite the evidence after the fact.
+- The hash-chained, transparency-log-anchored (self-hosted) audit
+  chain means the attacker cannot silently rewrite the evidence
+  after the fact.
 
 The customer's external IAM and threat-detection systems are
 expected to cover this case.  We provide the evidence trail.

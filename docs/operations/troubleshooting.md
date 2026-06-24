@@ -290,9 +290,9 @@ restore won't overwrite arbitrary files.
 
 - For a clean restore: pick an empty target directory.
 - For a deliberate overwrite: pass `--force`. The body lists every
-  top-level entry that will be deleted, and the operation prompts
-  again before doing anything. With `--force --confirm` the second
-  prompt is suppressed.
+  top-level entry that will be deleted before it proceeds. Overwriting
+  a target that is a *different* cluster additionally requires
+  `--force-foreign`.
 
 `--force` is destructive: it removes the existing contents of the
 target directory before unpacking. Use it on data dirs, not on `/`.

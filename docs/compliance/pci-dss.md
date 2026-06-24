@@ -30,8 +30,8 @@ report.
 
 | Requirement | Description | Product feature | Command | Audit event |
 | --- | --- | --- | --- | --- |
-| 3.5.1 | PAN rendered unreadable | AES-256-GCM-SIV on every chunk; per-chunk key derivation | (automatic) | `backup.create` records `encryption.scheme` |
-| 3.5.1.1 | Strong cryptography | AES-256-GCM-SIV (RFC 8452) by default; AES-256-GCM (FIPS) in FIPS variant | (automatic) | `backup.create` |
+| 3.5.1 | PAN rendered unreadable | AES-256-GCM on every chunk; per-chunk key derivation | (automatic) | `backup.create` records `encryption.scheme` |
+| 3.5.1.1 | Strong cryptography | AES-256-GCM (random 96-bit nonce) shipping today; AES-256-GCM-SIV (RFC 8452) planned | (automatic) | `backup.create` |
 | 3.5.1.2 | Disk-level encryption alone is insufficient | Per-chunk encryption is in addition to any underlying disk encryption | (automatic) | `backup.create` |
 | 3.6.1.1 | Cryptographic key custody | KMS-backed RKEK; per-tenant KEK; on-disk keyring with mode 0600 | `pg_hardstorage kms inspect` | `kms.*` |
 | 3.6.1.2 | Cryptographic keys protected | Keys never appear in logs or output; `kms inspect` is read-only and shows only fingerprints | `pg_hardstorage kms inspect` | (read-only) |
@@ -143,13 +143,15 @@ audit period plus the cosign signatures on the running
 binary:
 
 ```sh
+VERSION=1.0.3   # the release / image tag you're attesting
+
 # 1. Audit chain bundle
 pg_hardstorage audit export-bundle \
     --repo s3://acme-pci-backups/ \
     --since 2026-01-01T00:00:00Z \
     --until 2026-04-01T00:00:00Z \
     --include-anchors \
-    -o ./qsa-q1-2026-audit.tar.gz
+    --out ./qsa-q1-2026-audit.tar.gz
 
 # 2. Compliance report (Markdown for the QSA)
 pg_hardstorage compliance report \
@@ -161,7 +163,7 @@ pg_hardstorage compliance report \
 # 3. Build provenance attestation
 cosign verify-attestation \
     --type slsaprovenance \
-    ghcr.io/cybertec-postgresql/pg_hardstorage:v0.9.2 \
+    "ghcr.io/cybertec-postgresql/pg_hardstorage:v${VERSION}" \
     --certificate-identity-regexp \
         "https://github.com/cybertec-postgresql/pg_hardstorage/.*" \
     --certificate-oidc-issuer \

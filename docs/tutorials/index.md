@@ -16,7 +16,7 @@ take the full getting-started instead.
 ## Getting started
 
 - [Getting started (simple)](getting-started-simple.md) — the
-  interactive `pg_hardstorage simple` helper; a working backup in
+  interactive `pg_hardstorage_simple` helper; a working backup in
   five minutes, no config file to write.
 - [Getting started (full CLI)](getting-started.md) — the complete
   `init` → `backup` → `status` → `restore` walkthrough against a
