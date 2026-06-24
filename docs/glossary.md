@@ -28,12 +28,14 @@ the same turn, with explicit user confirmation.  Off by
 default.  See the
 [LLM safety stack](explanation/llm-safety-stack.md).
 
-#### AES-256-GCM-SIV
+#### AES-256-GCM
 
-The default chunk-encryption cipher — RFC 8452,
-nonce-misuse-resistant.  AES-256-GCM with a random 96-bit
-nonce is used in FIPS mode where BoringCrypto doesn't yet
-expose GCM-SIV.  See
+The chunk-encryption cipher shipping today — a random
+96-bit nonce per chunk.  AES-256-GCM-SIV (RFC 8452,
+nonce-misuse-resistant) is the planned default once a
+validated implementation lands; the Go standard library
+does not yet ship it, and BoringCrypto (FIPS) does not
+expose it either.  See
 [envelope encryption](explanation/envelope-encryption.md).
 
 #### Agent
@@ -48,8 +50,8 @@ multiplexes every deployment on that host.  See
 #### `archive_command`
 
 PG's per-segment WAL archive hook.  pg_hardstorage offers
-a thin shim (`pg_hardstorage wal push %p`) for managed-PG
-environments where the streaming path can't be used; both
+a thin shim (`pg_hardstorage wal push %p`) for setups that
+want classical archiving alongside streaming; both
 shims feed the same content-addressed chunk store.  See
 [wal pipeline](explanation/wal-pipeline.md).
 
@@ -62,7 +64,8 @@ C) for the optional double-archiving path.
 
 #### Attestation
 
-A cosign-signed claim attached to a manifest or a build
+An Ed25519-signed claim (agent keyring) attached to a backup
+manifest, or a cosign-signed claim attached to a release
 artefact, optionally anchored to a transparency log.  Both
 backups and release binaries carry attestations.  See
 [audit chain](explanation/audit-chain.md).
@@ -71,8 +74,9 @@ backups and release binaries carry attestations.  See
 
 The append-only, hash-chained Merkle log of every
 significant event (backup committed, restore started, KMS
-rotated, LLM session opened, …).  Periodic anchors land in
-Rekor.  Verifiable post-hoc via
+rotated, LLM session opened, …).  Periodic anchors land in a
+transparency log (self-hosted today; external Rekor anchoring
+is roadmap).  Verifiable post-hoc via
 `pg_hardstorage audit verify-chain`.  See
 [audit chain](explanation/audit-chain.md).
 
@@ -175,10 +179,10 @@ coordination service needed.  See
 
 #### cosign
 
-The Sigstore CLI used to sign manifests, attestations, and
-release artefacts.  Public keys are pinned in repo
-configuration; verification is mandatory on every manifest
-read.
+The Sigstore CLI used to sign release artefacts (keyless).
+Backup manifests are signed separately with the agent's
+Ed25519 keyring, and that signature is verified on every
+manifest read.
 
 #### Cross-account replication
 

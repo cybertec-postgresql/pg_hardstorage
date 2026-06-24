@@ -20,7 +20,7 @@ committed page.
 
 - [CLI reference](cli/index.md) — one page per
   `pg_hardstorage` subcommand, auto-generated from the
-  Cobra command tree.  202 pages today.
+  Cobra command tree.  216 pages today.
 
 ## REST API
 

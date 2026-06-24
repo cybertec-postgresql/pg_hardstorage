@@ -36,9 +36,10 @@ Every encrypted chunk is sealed under a layered key system:
    wrapped under the RKEK. Stored in
    `manifest.json.encryption.wrapped_dek`.
 3. **Per-chunk key** derived `Kc = HKDF-SHA256(BDEK,
-   info=chunk_hash)`. Cipher: AES-256-GCM-SIV by default
-   (RFC 8452, nonce-misuse resistant); AES-256-GCM with
-   random 96-bit nonce in FIPS mode.
+   info=chunk_hash)`. Cipher: AES-256-GCM with a random
+   96-bit nonce is shipping today; AES-256-GCM-SIV (RFC 8452,
+   nonce-misuse resistant) is the planned default once a
+   validated implementation lands.
 
 A tenant's KEK wraps every BDEK for every backup of every
 deployment under that tenant. Destroy that one key and
@@ -182,7 +183,7 @@ pg_hardstorage audit append kms.shred \
 | Art. 17(1) — right to erasure | `kms shred` per-tenant KEK destruction | `kms.shred` |
 | Art. 17(2) — communication of erasure to recipients | Cross-region replicas hold the same wrapped DEKs; KEK destruction propagates implicitly. Replica audit chain records `kms.shred`. | `kms.shred` (replicated) |
 | Art. 30 — record of processing activities | Hash-chained audit log; `audit verify-chain` proves untampered. | `audit.*` |
-| Art. 32(1)(a) — encryption of personal data | AES-256-GCM-SIV per chunk (FIPS-validated GCM in FIPS build). | `backup.create` (records `encryption.scheme`) |
+| Art. 32(1)(a) — encryption of personal data | AES-256-GCM per chunk (AES-256-GCM-SIV planned; FIPS-validated GCM in FIPS build). | `backup.create` (records `encryption.scheme`) |
 | Art. 32(1)(b) — confidentiality, integrity | Ed25519-signed manifests, Merkle audit chain. | `backup.create`, `audit.*` |
 
 ---

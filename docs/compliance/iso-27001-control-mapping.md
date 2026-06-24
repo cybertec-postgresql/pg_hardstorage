@@ -59,7 +59,7 @@ constrains the geography.
 | A.8.16 | Monitoring activities | Prometheus metrics; OpenTelemetry traces; insider-threat scan | `pg_hardstorage insider scan` | `insider.scan` |
 | A.8.17 | Clock synchronisation | UTC timestamps everywhere; NTP recommended in operator guide | (operator) | (timestamp on every event) |
 | A.8.21 | Security of network services | TLS 1.2+ for storage backends; mTLS for control plane ↔ agent | (config) | (network failures captured) |
-| A.8.24 | Use of cryptography | AES-256-GCM-SIV + Ed25519 + SHA-256 + HKDF-SHA256 | (automatic) | `backup.create` records `encryption.scheme` |
+| A.8.24 | Use of cryptography | AES-256-GCM + Ed25519 + SHA-256 + HKDF-SHA256 (AES-256-GCM-SIV planned) | (automatic) | `backup.create` records `encryption.scheme` |
 | A.8.25 | Secure development life cycle | SLSA L3 build provenance; reproducible builds verified weekly | (build-time) | (cosign attest) |
 | A.8.26 | Application security requirements | Static analysis + race detector + sanitizers in CI | (build-time) | — |
 | A.8.27 | Secure system architecture and engineering principles | Documented threat model + design north stars in `SPEC.md` | — | — |
@@ -107,7 +107,7 @@ information-asset register entry should record:
 | Asset | `pg_hardstorage` backup repository at `s3://...` |
 | Owner | (operator org) |
 | Classification | Per-deployment via `classify` |
-| Encryption | AES-256-GCM-SIV per chunk (FIPS variant: AES-256-GCM) |
+| Encryption | AES-256-GCM per chunk (AES-256-GCM-SIV planned) |
 | Retention | Per `retention` policy in deployment config |
 | Audit | Hash-chained Merkle log; quarterly bundle export |
 | Region | Per `residency` policy |

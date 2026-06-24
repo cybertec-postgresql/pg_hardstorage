@@ -63,7 +63,7 @@ JSON is `fedramp`.
 | CP-9 | System backup | Full backup pipeline | `pg_hardstorage backup ...` | `backup.create` |
 | CP-9(1) | Testing for reliability and integrity | Verifier subsystem + post-restore `pg_verifybackup` | `pg_hardstorage verify ...` | `verify.run` |
 | CP-9(3) | Separate storage for critical information | Cross-region replication | `pg_hardstorage repo replicate ...` | `replicate.completed` |
-| CP-9(8) | Cryptographic protection | AES-256-GCM-SIV per chunk; Ed25519 manifest signatures | (automatic) | `backup.create` |
+| CP-9(8) | Cryptographic protection | AES-256-GCM per chunk; Ed25519 manifest signatures | (automatic) | `backup.create` |
 | CP-10 | System recovery and reconstitution | Restore command + sandbox `pg_verifybackup` gate | `pg_hardstorage restore ...` | `restore.completed` |
 
 ---
@@ -85,9 +85,9 @@ JSON is `fedramp`.
 | SC-7 | Boundary protection | Air-gap mode rejects public endpoints; storage plugin per-region scoping | `pg_hardstorage residency set ...` | (config) |
 | SC-8 | Transmission confidentiality | TLS 1.2+ on all storage backends; mTLS control plane | (config) | — |
 | SC-12 | Cryptographic key establishment and management | KMS-backed RKEK; per-tenant KEK | `pg_hardstorage kms ...` | `kms.*` |
-| SC-13 | Cryptographic protection | AES-256-GCM-SIV (default); AES-256-GCM (FIPS variant) | (automatic) | `backup.create` |
+| SC-13 | Cryptographic protection | AES-256-GCM (shipping today); AES-256-GCM-SIV planned, also for FIPS variant when GCM-SIV lands | (automatic) | `backup.create` |
 | SC-28 | Protection of information at rest | Three-layer envelope encryption | (automatic) | `backup.create` |
-| SC-28(1) | Cryptographic protection | AES-256-GCM-SIV per chunk; Ed25519 manifest sigs | (automatic) | `backup.create` |
+| SC-28(1) | Cryptographic protection | AES-256-GCM per chunk; Ed25519 manifest sigs | (automatic) | `backup.create` |
 
 ---
 
@@ -97,7 +97,7 @@ JSON is `fedramp`.
 | --- | --- | --- | --- | --- |
 | SI-3 | Malicious code protection | Tier-1 plugin model + cosign-signed releases | (build) | — |
 | SI-4 | System monitoring | Prometheus metrics; OpenTelemetry traces; insider-threat scanner | `pg_hardstorage insider scan` | `insider.scan` |
-| SI-7 | Software, firmware, and information integrity | SLSA L3 build provenance + reproducible builds | (build-time) | (cosign attest) |
+| SI-7 | Software, firmware, and information integrity | SLSA L3 build provenance + reproducible builds | (build-time) | (SLSA provenance via slsa-github-generator + cosign sign-blob) |
 | SI-7(1) | Integrity checks | Continuous-attestation `integrity` runs over the repo | `pg_hardstorage integrity run` | `integrity.run` |
 | SI-7(7) | Integration of detection and response | `doctor` emits structured remediation commands for operator action | `pg_hardstorage doctor` | `doctor.suggested_fix` |
 

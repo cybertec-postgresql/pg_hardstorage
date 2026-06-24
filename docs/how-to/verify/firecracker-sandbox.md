@@ -76,10 +76,9 @@ The Firecracker backend refuses with a clear remediation if
 ```bash
 pg_hardstorage-firecracker verify db1 latest \
     --repo s3://acme-pg-backups \
-    --full \
-    --sandbox-backend firecracker \
-    --firecracker-kernel /var/lib/pg_hardstorage/firecracker/vmlinux \
-    --firecracker-rootfs /var/lib/pg_hardstorage/firecracker/rootfs.ext4
+    --full
+# The sandbox backend and the kernel / rootfs paths are configured in
+# pg_hardstorage.yaml (see step 3), not via CLI flags.
 ```
 
 (For agent-driven verify the same fields go in

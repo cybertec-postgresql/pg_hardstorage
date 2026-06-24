@@ -16,6 +16,13 @@ tags:
 > MinIO repo running in-cluster. About 30 minutes from a clean
 > `kind` node.
 
+!!! warning "Roadmap — not yet shipped"
+    The CNPG-I provider this tutorial uses lands with **v0.5**. The
+    `kubectl apply` of the provider manifest shown below does not work
+    against a released build yet. Until then, the verified path is the
+    [sidecar Helm chart](../how-to/kubernetes/helm-sidecar-chart.md)
+    plus a CronJob. This page documents the target shape.
+
 CloudNativePG (CNPG) ships its own backup story; this tutorial wires
 the cluster to `pg_hardstorage` via the **CNPG-I provider** so the
 operator manages backups through the familiar `Cluster.spec.backup`

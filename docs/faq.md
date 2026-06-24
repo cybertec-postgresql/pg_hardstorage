@@ -48,8 +48,9 @@ for the full reasoning.
 
 #### What PostgreSQL versions are supported?
 
-PG 15, 16, and 17 are first-class.  PG 18 is supported in
-the test matrix from v0.9 onward.  PG 14 and earlier are
+PG 15, 16, and 17 are first-class — required to pass CI.
+PG 18 runs in the test matrix under allow-failure guardrails
+while readiness is confirmed.  PG 14 and earlier are
 out of scope — `BASE_BACKUP` non-exclusive mode and
 `pg_backup_start` / `pg_backup_stop` are PG 15-only APIs we
 rely on.
@@ -562,9 +563,9 @@ Tier-2 plugins via your own channel; a checked-in
 
 #### How is this different from pgBackRest?
 
-The short version: WAL via replication protocol (works on
-managed PG), no chained incrementals (CAS dedup with no
-chain dependency), encryption / KMS / audit chain / WORM
+The short version: WAL via replication protocol (no SSH or
+`archive_command` on the host), no chained incrementals (CAS
+dedup with no chain dependency), encryption / KMS / audit chain / WORM
 on by default.  pgBackRest's strengths — production
 maturity at very large scale, mature operator integrations
 — are real and we're explicit about them.  Full comparison

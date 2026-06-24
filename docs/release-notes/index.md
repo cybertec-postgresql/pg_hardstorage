@@ -20,7 +20,7 @@ operator deciding whether to upgrade.
   compatible — no migration.
 - **[v1.0](v1.0.md)** — the first stable release.  Five
   Tier-1 KMS providers (AWS / GCP / Azure / Vault / HSM),
-  five Tier-1 storage backends (fs / s3 / gcs / azblob /
-  sftp), Patroni-aware WAL streaming, LLM-assisted
+  six Tier-1 storage backends (fs / s3 / gcs / azblob /
+  sftp / scp), Patroni-aware WAL streaming, LLM-assisted
   operations, two verifier sandboxes, full compliance
   surface.  24-month schema-compatibility commitment.

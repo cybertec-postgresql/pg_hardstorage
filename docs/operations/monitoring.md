@@ -355,7 +355,7 @@ The agent's HTTP listener exposes:
 | --- | --- |
 | `/healthz` | Liveness — the process is alive. Always 200 if reachable. |
 | `/readyz` | Readiness — KMS reachable, repo reachable, leader-elected. |
-| `/doctor` | Full doctor report as JSON; the same content as `pg_hardstorage doctor --json`. |
+| `/doctor` | Full doctor report as JSON; the same content as `pg_hardstorage doctor -o json`. |
 | `/metrics` | Prometheus scrape. Served by the control plane unconditionally; served by the agent only when started with `--metrics-listen`. |
 
 Wire `/healthz` to your container liveness probe and `/readyz`

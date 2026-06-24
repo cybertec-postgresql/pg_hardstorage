@@ -30,8 +30,8 @@ report.
 
 | Requirement | Description | Product feature | Command | Audit event |
 | --- | --- | --- | --- | --- |
-| 3.5.1 | PAN rendered unreadable | AES-256-GCM-SIV on every chunk; per-chunk key derivation | (automatic) | `backup.create` records `encryption.scheme` |
-| 3.5.1.1 | Strong cryptography | AES-256-GCM-SIV (RFC 8452) by default; AES-256-GCM (FIPS) in FIPS variant | (automatic) | `backup.create` |
+| 3.5.1 | PAN rendered unreadable | AES-256-GCM on every chunk; per-chunk key derivation | (automatic) | `backup.create` records `encryption.scheme` |
+| 3.5.1.1 | Strong cryptography | AES-256-GCM (random 96-bit nonce) shipping today; AES-256-GCM-SIV (RFC 8452) planned | (automatic) | `backup.create` |
 | 3.5.1.2 | Disk-level encryption alone is insufficient | Per-chunk encryption is in addition to any underlying disk encryption | (automatic) | `backup.create` |
 | 3.6.1.1 | Cryptographic key custody | KMS-backed RKEK; per-tenant KEK; on-disk keyring with mode 0600 | `pg_hardstorage kms inspect` | `kms.*` |
 | 3.6.1.2 | Cryptographic keys protected | Keys never appear in logs or output; `kms inspect` is read-only and shows only fingerprints | `pg_hardstorage kms inspect` | (read-only) |

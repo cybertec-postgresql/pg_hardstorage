@@ -41,14 +41,14 @@ JSON is `hipaa`.
 | §164.312(a)(2)(i) | Unique user identification | RBAC actor identity recorded on every event | (automatic) | (every event records `actor`) |
 | §164.312(a)(2)(ii) | Emergency access procedure | JIT tokens + n-of-m approval | `pg_hardstorage jit issue ...`, `approval request ...` | `jit.issue`, `approval.request` |
 | §164.312(a)(2)(iii) | Automatic logoff | JIT tokens auto-expire (max 24h) | (automatic) | `jit.issue` |
-| §164.312(a)(2)(iv) | Encryption and decryption (Addressable) | AES-256-GCM-SIV per chunk; FIPS variant uses AES-256-GCM | (automatic) | `backup.create` records `encryption.scheme` |
+| §164.312(a)(2)(iv) | Encryption and decryption (Addressable) | AES-256-GCM per chunk (AES-256-GCM-SIV planned) | (automatic) | `backup.create` records `encryption.scheme` |
 | §164.312(b) | Audit controls | Hash-chained Merkle audit log | `pg_hardstorage audit verify-chain` | (every event) |
 | §164.312(c)(1) | Integrity | Ed25519-signed manifests + chunk SHA round-trip | `pg_hardstorage verify ...` | `verify.run` |
 | §164.312(c)(2) | Mechanism to authenticate ePHI | Manifest signatures + audit chain hashing | `pg_hardstorage audit verify-chain` | `verify.manifest_signature` (on fail) |
 | §164.312(d) | Person or entity authentication | mTLS for control plane ↔ agent; Ed25519 keypair per operator | (config) | (auth failures captured) |
 | §164.312(e)(1) | Transmission security | TLS 1.2+ for storage backends; air-gap mode for offline networks | (config) | — |
 | §164.312(e)(2)(i) | Integrity controls | End-to-end checksums; chunk SHA round-trip | (automatic) | `verify.scrub_mismatch` (on fail) |
-| §164.312(e)(2)(ii) | Encryption (Addressable, transmission) | TLS 1.2+ on every storage backend; AES-256-GCM-SIV on the chunk itself | (config) | — |
+| §164.312(e)(2)(ii) | Encryption (Addressable, transmission) | TLS 1.2+ on every storage backend; AES-256-GCM on the chunk itself | (config) | — |
 
 ---
 
@@ -60,7 +60,7 @@ when:
 
 | Layer | Requirement | `pg_hardstorage` posture |
 | --- | --- | --- |
-| At rest | NIST-validated cipher | AES-256-GCM-SIV (RFC 8452) by default; AES-256-GCM (FIPS 140-validated via BoringCrypto) in `pg-hardstorage-fips` build |
+| At rest | NIST-validated cipher | AES-256-GCM (random 96-bit nonce) shipping today; AES-256-GCM-SIV (RFC 8452) is the planned default once a validated implementation lands. The `pg-hardstorage-fips` build uses AES-256-GCM (FIPS 140-validated via BoringCrypto) — BoringCrypto does not ship GCM-SIV, so the FIPS variant will likewise use GCM when GCM-SIV lands |
 | In transit (storage backend) | TLS 1.2+ | All cloud backends; on-prem via plugin config |
 | In transit (agent ↔ control plane) | TLS / mTLS | mTLS by default |
 | Key management | NIST SP 800-57 lifecycle | KMS-backed RKEK; per-tenant KEK; KEK rotation with documented audit trail |

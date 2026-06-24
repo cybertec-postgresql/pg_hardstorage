@@ -146,7 +146,7 @@ Self-describing.  Readers at v0.1+ handle:
 - Envelope `0x02` — encryption-aware, the current default.
 
 Compression algos: `zstd`, `none`.  Encryption algos:
-`aes-256-gcm-siv` (default), `aes-256-gcm` (FIPS), `none`.
+`aes-256-gcm` (shipping today), `aes-256-gcm-siv` (planned), `none`.
 
 The 24-month manifest schema commitment also covers the chunk
 envelope: a v0.1 reader will keep working with chunks written by

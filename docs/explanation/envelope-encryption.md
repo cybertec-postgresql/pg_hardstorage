@@ -65,27 +65,33 @@ Three properties fall out of this layout:
 
 ## The cipher choices
 
-There are two cipher modes the system actually ships:
+The cipher that ships today:
 
-- **AES-256-GCM-SIV** (RFC 8452) is the default.  It's
-  nonce-misuse resistant — accidentally reusing a nonce reveals
-  only that the same plaintext was encrypted twice, not the
-  plaintexts themselves.  This matters because we derive `Kc`
-  deterministically from chunk hash, and we must not assume nonce
-  uniqueness across the whole chunk population.
+- **AES-256-GCM** with a random 96-bit nonce is the cipher
+  shipping today.  The agent computes a fresh 96-bit nonce per
+  chunk and stores it in the chunk envelope; correctness depends
+  on those nonces never repeating under a given key.
 
-- **AES-256-GCM** with a random 96-bit nonce is the **FIPS
-  fallback**.  BoringCrypto (which is what `GOEXPERIMENT=boringcrypto`
-  builds against) doesn't yet ship GCM-SIV, and we will not ship a
-  FIPS build that uses an unvalidated module.  In FIPS mode the
-  agent computes a fresh 96-bit nonce per chunk and stores it in
-  the chunk envelope; the trade is "don't reuse nonces" replaces
-  "tolerates nonce reuse".
+The planned default:
 
-The choice is build-time (`pg-hardstorage` vs `pg-hardstorage-fips`)
-and surfaced in the manifest's `encryption.scheme` field
-(`aes-256-gcm-siv` or `aes-256-gcm`).  Readers handle both
-transparently.
+- **AES-256-GCM-SIV** (RFC 8452) is the planned default once a
+  validated implementation lands.  It's nonce-misuse resistant —
+  accidentally reusing a nonce reveals only that the same
+  plaintext was encrypted twice, not the plaintexts themselves.
+  This matters because we derive `Kc` deterministically from chunk
+  hash, and we must not assume nonce uniqueness across the whole
+  chunk population.  The Go standard library does not yet ship
+  GCM-SIV, so it is not implemented today.
+
+A FIPS contrast applies to the same shipping cipher.  BoringCrypto
+(which is what `GOEXPERIMENT=boringcrypto` builds against) doesn't
+ship GCM-SIV either, and we will not ship a FIPS build that uses an
+unvalidated module — so the FIPS variant (`pg-hardstorage-fips`)
+will likewise use AES-256-GCM when GCM-SIV lands.
+
+The active scheme is surfaced in the manifest's `encryption.scheme`
+field (`aes-256-gcm` today; `aes-256-gcm-siv` once it lands).
+Readers handle both transparently.
 
 The on-disk chunk envelope is self-describing:
 

@@ -176,8 +176,8 @@ Do it host-by-host inside the one-minor compat window:
    `doctor` is clean.
 2. Repeat for every non-leader.
 3. For the leader (or active control plane), trigger a leader
-   election (`pg_hardstorage agent --step-down` in v0.5+, or
-   `systemctl restart` today) so a freshly-upgraded agent takes
+   election (`systemctl restart` today; a dedicated agent
+   step-down flag is planned) so a freshly-upgraded agent takes
    over.
 4. Replace the old leader's binary, restart.
 

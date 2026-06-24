@@ -148,11 +148,10 @@ restarts don't reset the cadence.
 
 ## Schedules and the LLM helper
 
-`pg_hardstorage llm propose backup-schedule …` is the
-LLM-assisted variant: given a constraint set ("RPO ≤ 1h, off-
-peak window 02-05"), it proposes a schedule, runs it through
-the same parser, and stages the change. The schedule writes
-themselves still go through `pg_hardstorage schedule`. See
+`pg_hardstorage llm ask "..."` is the LLM-assisted variant:
+given a constraint set ("RPO ≤ 1h, off-peak window 02-05"), it
+can suggest a schedule and explain the trade-offs. The schedule
+writes themselves still go through `pg_hardstorage schedule`. See
 the [`llm` CLI reference](../../reference/cli/pg_hardstorage_llm.md).
 
 ## Troubleshooting

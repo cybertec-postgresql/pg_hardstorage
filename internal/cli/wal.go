@@ -59,8 +59,7 @@ protocol over a libpq connection — no host-level access to the database
 is needed. It targets PostgreSQL you run yourself; fully-managed DBaaS
 (RDS, Cloud SQL, ...) do not expose BASE_BACKUP / physical replication
 and are not supported.
-
-The push / fetch / list / repair subcommands are scaffold for now.`,
+`,
 	}
 	c.AddCommand(newWalStreamCmd())
 	c.AddCommand(newWalPreflightCmd())
