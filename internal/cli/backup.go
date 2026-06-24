@@ -16,6 +16,7 @@ import (
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup/runner"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup/tarsink"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/capacity"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/config"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/kms"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/output"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/paths"
@@ -170,13 +171,37 @@ func runBackup(cmd *cobra.Command, opts runOptions) error {
 		return runBackupControlPlane(cmd, opts)
 	}
 
-	// Required-field checks. We surface usage errors with the right
-	// exit-code mapping so the CLI contract is consistent.
-	// Conditional requirement: needed only in local mode — a control-plane
-	// dispatch returned above. requireFlags is MarkFlagRequired's runtime
-	// sibling for exactly this case.
-	if err := requireFlags(cmd, "pg-connection", "repo"); err != nil {
-		return err
+	// `backup <deployment>` resolves --pg-connection / --repo from the
+	// named deployment in pg_hardstorage.yaml when the operator didn't
+	// pass them on the command line; explicit flags still win. Without
+	// this, a configured deployment would wrongly demand the flags (#12).
+	if opts.deployment != "" && (opts.pgConn == "" || opts.repoURL == "") {
+		if p, perr := paths.Resolve(paths.DefaultOptions()); perr == nil {
+			if loaded, lerr := config.Load(p); lerr == nil {
+				if dep, ok := loaded.Config.Deployments[opts.deployment]; ok {
+					if opts.pgConn == "" {
+						opts.pgConn = dep.PGConnection
+					}
+					if opts.repoURL == "" {
+						opts.repoURL = dep.Repo
+					}
+				}
+			}
+		}
+	}
+
+	// Required-field checks (local mode only — a control-plane dispatch
+	// returned above). Validate the resolved values, not the raw flags:
+	// they may have been filled from the deployment config just above.
+	var missing []string
+	if opts.pgConn == "" {
+		missing = append(missing, "--pg-connection")
+	}
+	if opts.repoURL == "" {
+		missing = append(missing, "--repo")
+	}
+	if len(missing) > 0 {
+		return missingFlagErr(cmd, missing...)
 	}
 
 	// Resolve the keyring path via the same precedence chain doctor
