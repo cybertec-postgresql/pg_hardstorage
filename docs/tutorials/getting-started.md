@@ -35,8 +35,9 @@ tarballs (Windows is CLI-only). Grab the matching one from
 verify the cosign signature, and drop the binary on your `$PATH`:
 
 ```sh
-curl -LO https://github.com/cybertec-postgresql/pg_hardstorage/releases/download/v1.0.1/pg_hardstorage_1.0.1_linux_amd64.tar.gz
-tar xzf pg_hardstorage_1.0.1_linux_amd64.tar.gz
+VERSION=1.0.1   # latest release: https://github.com/cybertec-postgresql/pg_hardstorage/releases/latest
+curl -LO "https://github.com/cybertec-postgresql/pg_hardstorage/releases/download/v${VERSION}/pg_hardstorage_${VERSION}_linux_amd64.tar.gz"
+tar xzf "pg_hardstorage_${VERSION}_linux_amd64.tar.gz"
 sudo install -m 0755 pg_hardstorage /usr/local/bin/
 pg_hardstorage version
 ```
@@ -44,7 +45,8 @@ pg_hardstorage version
 ### `.deb` (Debian / Ubuntu)
 
 ```sh
-sudo dpkg -i pg-hardstorage_1.0.1_amd64.deb
+VERSION=1.0.1   # the release you downloaded
+sudo dpkg -i "pg-hardstorage_${VERSION}_amd64.deb"
 ```
 
 The package installs the binary at `/usr/bin/pg_hardstorage`, drops a
@@ -55,7 +57,8 @@ creates `/etc/pg_hardstorage/`, `/var/lib/pg_hardstorage/`,
 ### `.rpm` (Fedora / RHEL / Rocky / Alma)
 
 ```sh
-sudo rpm -i pg-hardstorage-1.0.1-1.x86_64.rpm
+VERSION=1.0.1   # the release you downloaded
+sudo rpm -i "pg-hardstorage-${VERSION}-1.x86_64.rpm"
 ```
 
 Same layout as the `.deb`.
@@ -63,8 +66,9 @@ Same layout as the `.deb`.
 ### Container image
 
 ```sh
-docker pull ghcr.io/cybertec-postgresql/pg_hardstorage:v1.0.1
-docker run --rm ghcr.io/cybertec-postgresql/pg_hardstorage:v1.0.1 version
+VERSION=1.0.1   # latest release tag
+docker pull "ghcr.io/cybertec-postgresql/pg_hardstorage:v${VERSION}"
+docker run --rm "ghcr.io/cybertec-postgresql/pg_hardstorage:v${VERSION}" version
 ```
 
 The image is distroless. Mount a config dir at `/etc/pg_hardstorage`

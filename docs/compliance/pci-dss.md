@@ -143,13 +143,15 @@ audit period plus the cosign signatures on the running
 binary:
 
 ```sh
+VERSION=1.0.1   # the release / image tag you're attesting
+
 # 1. Audit chain bundle
 pg_hardstorage audit export-bundle \
     --repo s3://acme-pci-backups/ \
     --since 2026-01-01T00:00:00Z \
     --until 2026-04-01T00:00:00Z \
     --include-anchors \
-    -o ./qsa-q1-2026-audit.tar.gz
+    --out ./qsa-q1-2026-audit.tar.gz
 
 # 2. Compliance report (Markdown for the QSA)
 pg_hardstorage compliance report \
@@ -161,7 +163,7 @@ pg_hardstorage compliance report \
 # 3. Build provenance attestation
 cosign verify-attestation \
     --type slsaprovenance \
-    ghcr.io/cybertec-postgresql/pg_hardstorage:v1.0.1 \
+    "ghcr.io/cybertec-postgresql/pg_hardstorage:v${VERSION}" \
     --certificate-identity-regexp \
         "https://github.com/cybertec-postgresql/pg_hardstorage/.*" \
     --certificate-oidc-issuer \
