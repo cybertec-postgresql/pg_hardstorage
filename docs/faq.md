@@ -329,11 +329,25 @@ guidance and sizing rules of thumb.
 
 #### Where is the KEK stored?
 
-Wherever you point the encryption plugin: AWS KMS, GCP
-KMS, Azure Key Vault, HashiCorp Vault Transit, or — for
-single-host dev — an `aes-256-gcm` keyring directory.
-HSM (PKCS#11) lands in the v1.0 build flavour.  Reference:
-[KEKRef schemes](reference/cli/pg_hardstorage_kms.md);
+With a cloud KMS scheme (AWS KMS, GCP KMS, Azure Key
+Vault, HashiCorp Vault Transit) the KEK never leaves the
+provider — pg_hardstorage only stores a reference. With the
+local `aes-256-gcm` scheme the KEK is a 32-byte file,
+`kek.bin`, in the **keyring directory** (`<config>/keyring`
+— e.g. `/etc/pg_hardstorage/keyring` for a system install,
+under your user config dir otherwise). Run `pg_hardstorage
+doctor` for the resolved path; override it with the
+`PG_HARDSTORAGE_KEYRING_DIR` environment variable. HSM
+(PKCS#11) is available in the `pkcs11` / FIPS build flavour.
+
+!!! danger "Back up your local KEK"
+    `kek.bin` unwraps every backup made under it. If you
+    lose the keyring directory you **cannot restore** — back
+    it up separately from the repository, or use a cloud KMS
+    scheme so custody isn't a single local file. The signing
+    keypair lives in the same directory.
+
+Reference: [KEKRef schemes](reference/kekref-schemes.md);
 explanation:
 [envelope encryption](explanation/envelope-encryption.md).
 
@@ -361,10 +375,11 @@ and
 
 #### What encryption algorithm does pg_hardstorage use?
 
-AES-256-GCM-SIV (RFC 8452, nonce-misuse resistant) by
-default.  AES-256-GCM with a random 96-bit nonce in FIPS
-mode (BoringCrypto's FIPS module doesn't yet ship GCM-SIV
-acceleration).  Per-chunk key derived as
+AES-256-GCM (random 96-bit nonce) is the cipher shipping
+today; AES-256-GCM-SIV (RFC 8452, nonce-misuse resistant)
+is the planned default once a validated implementation
+lands (the Go standard library and BoringCrypto's FIPS
+module don't ship GCM-SIV).  Per-chunk key derived as
 `HKDF-SHA256(BDEK, info=chunk_hash)`; see
 [envelope encryption](explanation/envelope-encryption.md).
 

@@ -26,9 +26,22 @@ copy lands in the manifest. There are two KEK schemes shipped today:
   `KMS:Encrypt` / `KMS:Decrypt` against the configured key. Good
   for fleets that already centralise key custody.
 
-Other cloud KMS providers (`gcp-kms://`, `azure-key-vault://`,
-`vault-transit://`) are slated for v0.5+; `kms shred`,
-`kms rotate`, and PKCS#11 / TPM2 binding land in the same window.
+GCP KMS (`gcp-kms://`), Azure Key Vault (`azure-key-vault://`), and
+HashiCorp Vault Transit (`vault-transit://`) ship as well, and
+`kms shred` (crypto-shred) is available today. PKCS#11 / TPM2 (HSM)
+binding ships in the `pkcs11` / FIPS build flavour.
+
+!!! danger "Back up your keys — you cannot restore without them"
+    With the local `local:default` scheme, `kek.bin` in the keyring
+    directory unwraps **every** backup. Lose the keyring directory and
+    your encrypted backups are **mathematically unrecoverable** — the
+    same effect `kms shred` produces on purpose. Find the resolved path
+    with `pg_hardstorage doctor`, override it with the
+    `PG_HARDSTORAGE_KEYRING_DIR` environment variable, and **back the
+    keyring directory up separately from the repository**, with at least
+    the care you'd give a database password. The Ed25519 signing keypair
+    lives in the same directory. For production, prefer a cloud KMS
+    scheme so key custody isn't a single local file.
 
 ---
 
