@@ -10,6 +10,8 @@
 package cli
 
 import (
+	"github.com/spf13/cobra"
+
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/config"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/paths"
 )
@@ -54,4 +56,51 @@ func deploymentDefaults(deployment, pgConn, repoURL string) (string, string) {
 		return pgConn, repoURL
 	}
 	return resolveDeploymentDefaults(deployment, pgConn, repoURL, loaded.Config.Deployments)
+}
+
+// resolveDeploymentDefaultsPreRun is the root PersistentPreRunE handler
+// (added to the chain in NewRoot) that fills an unset --repo /
+// --pg-connection from the deployment named as the command's first
+// positional argument, *before* Cobra validates required flags. This
+// makes every deployment-scoped command honour the deployment catalogue
+// in pg_hardstorage.yaml (#12) instead of demanding flags a configured
+// deployment already declares.
+//
+// It is deliberately conservative: it acts only when the command has the
+// flag, the flag is unset on the command line, and the first argument
+// names a known deployment. A command whose first argument is not a
+// deployment sees a lookup miss and is left untouched, so it still errors
+// exactly as before. Path/config-load failures are non-fatal — Cobra's
+// required-flag check then fires just as it did previously.
+func resolveDeploymentDefaultsPreRun(cmd *cobra.Command, args []string) error {
+	if len(args) == 0 {
+		return nil
+	}
+	fl := cmd.Flags()
+	repoF := fl.Lookup("repo")
+	pgF := fl.Lookup("pg-connection")
+	repoNeed := repoF != nil && !repoF.Changed
+	pgNeed := pgF != nil && !pgF.Changed
+	if !repoNeed && !pgNeed {
+		return nil
+	}
+	p, err := paths.Resolve(paths.DefaultOptions())
+	if err != nil {
+		return nil
+	}
+	loaded, err := config.Load(p)
+	if err != nil {
+		return nil
+	}
+	dep, ok := loaded.Config.Deployments[args[0]]
+	if !ok {
+		return nil
+	}
+	if repoNeed && dep.Repo != "" {
+		_ = fl.Set("repo", dep.Repo)
+	}
+	if pgNeed && dep.PGConnection != "" {
+		_ = fl.Set("pg-connection", dep.PGConnection)
+	}
+	return nil
 }

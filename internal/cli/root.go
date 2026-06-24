@@ -119,7 +119,7 @@ sandbox-PG runtime — extend per docs/SPEC.md.`,
 		// Order matters — running the dispatcher as root would
 		// open the keyring + state dirs with root-owned files that
 		// a later legitimate run as `pgbackup` couldn't read.
-		PersistentPreRunE: chainPreRunE(refuseRoot, installDispatcher),
+		PersistentPreRunE: chainPreRunE(refuseRoot, installDispatcher, resolveDeploymentDefaultsPreRun),
 	}
 
 	// Flag-parse failures (unknown flag, bad flag value) are usage
