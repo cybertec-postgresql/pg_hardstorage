@@ -28,6 +28,16 @@ anchoring, skill signing, and the FIPS image are now clearly marked
 roadmap. Download / verify examples use a `VERSION` variable so they no
 longer go stale.
 
+### Documentation: highlight encryption-key custody (#8)
+
+The encryption tutorial and FAQ now state plainly where the local KEK
+lives (`kek.bin` in the keyring directory), that losing it makes every
+backup under it unrecoverable, that the keyring directory must be backed
+up separately from the repository, and that `PG_HARDSTORAGE_KEYRING_DIR`
+overrides its location (with `pg_hardstorage doctor` reporting the
+resolved path). Also corrected a stale "GCP/Azure/Vault KMS slated for
+v0.5+" note (those providers ship today).
+
 ### Packaging: wire container-image publishing (GHCR)
 
 The release pipeline can now build and publish multi-arch (amd64/arm64)
