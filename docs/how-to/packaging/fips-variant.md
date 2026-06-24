@@ -90,7 +90,7 @@ subcommand also surfaces the flag:
 ```
 
 ```console
-pg_hardstorage v0.9.x
+pg_hardstorage v1.0.x
   commit: abcdef1
   ...
   fips:   true

@@ -77,8 +77,8 @@ Verify a downloaded artifact against its provenance with the
 slsa-verifier verify-artifact \
     --provenance-path pg_hardstorage.intoto.jsonl \
     --source-uri github.com/cybertec-postgresql/pg_hardstorage \
-    --source-tag v0.9.2 \
-    pg_hardstorage_0.9.2_linux_amd64.tar.gz
+    --source-tag v1.0.1 \
+    pg_hardstorage_1.0.1_linux_amd64.tar.gz
 ```
 
 The provenance predicate documents:
@@ -106,7 +106,7 @@ signature plus an image-level SLSA provenance attestation:
 
 ```sh
 # Verify the image signature
-cosign verify ghcr.io/cybertec-postgresql/pg_hardstorage:v0.9.2 \
+cosign verify ghcr.io/cybertec-postgresql/pg_hardstorage:v1.0.1 \
     --certificate-identity-regexp \
         "https://github.com/cybertec-postgresql/pg_hardstorage/.*" \
     --certificate-oidc-issuer \
@@ -115,7 +115,7 @@ cosign verify ghcr.io/cybertec-postgresql/pg_hardstorage:v0.9.2 \
 # Inspect the SLSA provenance
 cosign verify-attestation \
     --type slsaprovenance \
-    ghcr.io/cybertec-postgresql/pg_hardstorage:v0.9.2 \
+    ghcr.io/cybertec-postgresql/pg_hardstorage:v1.0.1 \
     --certificate-identity-regexp \
         "https://github.com/cybertec-postgresql/pg_hardstorage/.*" \
     --certificate-oidc-issuer \
@@ -135,7 +135,7 @@ and attached to the GitHub Release:
 ```sh
 # The SBOM is a plain file on the Release; inspect it directly
 jq -r '.packages[].name' \
-    pg_hardstorage_0.9.2_linux_amd64.tar.gz.spdx.sbom.json
+    pg_hardstorage_1.0.1_linux_amd64.tar.gz.spdx.sbom.json
 ```
 
 Like every other release artifact, the SBOM file is itself

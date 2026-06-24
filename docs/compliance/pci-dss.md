@@ -161,7 +161,7 @@ pg_hardstorage compliance report \
 # 3. Build provenance attestation
 cosign verify-attestation \
     --type slsaprovenance \
-    ghcr.io/cybertec-postgresql/pg_hardstorage:v0.9.2 \
+    ghcr.io/cybertec-postgresql/pg_hardstorage:v1.0.1 \
     --certificate-identity-regexp \
         "https://github.com/cybertec-postgresql/pg_hardstorage/.*" \
     --certificate-oidc-issuer \

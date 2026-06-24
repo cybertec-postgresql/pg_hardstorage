@@ -29,7 +29,7 @@ just wants to *back this database up*.
 
 ## What you need
 
-- `pg_hardstorage` ≥ v0.9 installed on `$PATH`
+- `pg_hardstorage` ≥ v1.0 installed on `$PATH`
 - `pg_hardstorage_simple` next to it (same release, same `make`)
 - A reachable PostgreSQL 15+ instance with a connection string
   that includes the REPLICATION attribute on the user

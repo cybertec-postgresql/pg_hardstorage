@@ -18,7 +18,7 @@ import (
 )
 
 // newKmsCmd implements `pg_hardstorage kms` — the operator-facing
-// surface of the keyring. v0.1.1 ships only the read-only `inspect`
+// surface of the keyring. Ships only the read-only `inspect`
 // verb; the mutating verbs (rotate, shred, hsm-status) require
 // substantial new infrastructure (rewrap walker; PKCS#11 binding)
 // and remain stubs in the SPEC's+ tree.
@@ -33,7 +33,7 @@ func newKmsCmd() *cobra.Command {
 	c := &cobra.Command{
 		Use:   "kms",
 		Short: "Manage encryption keys",
-		Long: `v0.1.1 ships the read-only ` + "`kms inspect`" + ` surface. Mutating
+		Long: `The read-only ` + "`kms inspect`" + ` surface. Mutating
 verbs (rotate, shred, hsm-status) land alongside the KMS
 plugin tier (gcp-kms, azure-key-vault, vault-transit) and the PKCS#11
 / TPM 2.0 integrations.`,

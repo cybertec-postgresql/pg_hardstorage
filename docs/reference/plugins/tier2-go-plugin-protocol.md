@@ -22,7 +22,7 @@ plugin-side dispatcher both); the gRPC-shaped contract
 that v1.1 will move to is at `proto/plugin/v1/plugin.proto`.
 
 !!! note "Two protocol shapes"
-    pg_hardstorage v0.9 ships a **stdio JSON-RPC**
+    pg_hardstorage v1.0 ships a **stdio JSON-RPC**
     protocol (`pg_hardstorage.plugin.v1`) for Tier-2
     plugins.  The SPEC and the in-repo `.proto` file
     describe the gRPC-over-`hashicorp/go-plugin` contract

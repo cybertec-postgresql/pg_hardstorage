@@ -16,7 +16,7 @@ layered on top via `SupportsTools()`; the orchestrator in
 `internal/llm/chat` handles prompt construction, message
 history, and tool dispatch.
 
-v0.9+ ships exactly two providers in-tree:
+v1.0 ships exactly two providers in-tree:
 
 - **`mock`** — for tests; canned responses.
 - **`openai`** — speaks the OpenAI Chat Completions wire
@@ -27,7 +27,7 @@ v0.9+ ships exactly two providers in-tree:
   llama.cpp server.
 
 Older Anthropic-native and Ollama-native providers were
-removed in v0.9+ (audit-driven simplification): one wire
+removed before v1.0 (audit-driven simplification): one wire
 format, one set of tests, one deployment story including
 the air-gapped path.
 
