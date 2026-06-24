@@ -36,6 +36,12 @@ func TestRestore_RequiresPositionalArgs(t *testing.T) {
 }
 
 func TestRestore_RequiresRepo(t *testing.T) {
+	// Isolate from ambient config so `restore db1` has no deployment to
+	// resolve --repo from (it now reads the config — #12).
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("PG_HARDSTORAGE_ROOT", "")
+	t.Setenv("PG_HARDSTORAGE_CONFIG_DIR", "")
+	t.Setenv("PG_HARDSTORAGE_CONFIG", "")
 	stdout, errb, exit := runRestore(t, "db1", "abc123", "--target", "/tmp/x", "-o", "json")
 	if exit != int(output.ExitMisuse) {
 		t.Errorf("missing --repo should map to ExitMisuse(%d); got %d", output.ExitMisuse, exit)
@@ -59,6 +65,10 @@ func TestRestore_RequiresRepo(t *testing.T) {
 }
 
 func TestRestore_RequiresTarget(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("PG_HARDSTORAGE_ROOT", "")
+	t.Setenv("PG_HARDSTORAGE_CONFIG_DIR", "")
+	t.Setenv("PG_HARDSTORAGE_CONFIG", "")
 	_, errb, exit := runRestore(t, "db1", "abc123", "--repo", "file:///tmp/x", "-o", "json")
 	if exit != int(output.ExitMisuse) {
 		t.Errorf("missing --target should map to ExitMisuse; got %d", exit)
@@ -69,6 +79,24 @@ func TestRestore_RequiresTarget(t *testing.T) {
 	}
 	if !strings.Contains(res.Error.Message, "--target") {
 		t.Errorf("message should mention --target: %q", res.Error.Message)
+	}
+}
+
+// Regression for #12: `restore <deployment> <id> --target ...` must
+// resolve --repo from the named deployment in config when omitted.
+func TestRestore_ResolvesRepoFromDeployment(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("PG_HARDSTORAGE_ROOT", "")
+	t.Setenv("PG_HARDSTORAGE_CONFIG_DIR", "")
+	repoDir := t.TempDir()
+	t.Setenv("PG_HARDSTORAGE_CONFIG",
+		"deployments:\n  mytest:\n    repo: file://"+repoDir+"\n")
+
+	// No --repo: it must be taken from the deployment. The restore still
+	// fails (empty dir isn't a repo), but NOT with usage.missing_flag.
+	_, errb, _ := runRestore(t, "mytest", "latest", "--target", t.TempDir()+"/r", "-o", "json")
+	if strings.Contains(errb, "usage.missing_flag") {
+		t.Fatalf("restore of a configured deployment must not demand --repo (issue #12); stderr:\n%s", errb)
 	}
 }
 

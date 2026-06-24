@@ -50,6 +50,19 @@ release config in CI.
 
 ## [Unreleased]
 
+### Fix: deployment-scoped commands now read the deployment config (#12)
+
+`pg_hardstorage backup <deployment>` (and `restore`, `verify`, `list`,
+`show`, `status`, `hold`, `rotate`, `recovery`, `repair`, `wal
+preflight/stream/list/audit/prune/gaps`, `partial`, `kms verify/shred`,
+…) used to demand `--pg-connection` / `--repo` even when the named
+deployment already declared them in `pg_hardstorage.yaml`. They now
+resolve those values from the deployment catalogue when the flags are
+omitted (explicit flags still win); a deployment that isn't configured,
+or a genuinely missing flag, still errors as before. Resolution happens
+once, in a shared root pre-run hook, so every deployment-scoped command
+behaves identically.
+
 ### Packaging: remove the obsolete homebrew-formula.json manifest
 
 Dropped `scripts/homebrew-formula.json`, a leftover hand-maintained tap

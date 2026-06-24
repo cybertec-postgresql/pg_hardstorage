@@ -208,9 +208,19 @@ func runRestore(cmd *cobra.Command, opts restoreOpts) error {
 		return runRestoreControlPlane(cmd, opts)
 	}
 
-	// Conditional: only in local mode (control-plane dispatch returned above).
-	if err := requireFlags(cmd, "repo", "target"); err != nil {
-		return err
+	// Resolve --repo from the named deployment in config when omitted
+	// (explicit flag wins); --target is restore-specific and not stored
+	// in config. Local mode only — control-plane dispatch returned above (#12).
+	_, opts.repoURL = deploymentDefaults(opts.deployment, "", opts.repoURL)
+	var missing []string
+	if opts.repoURL == "" {
+		missing = append(missing, "--repo")
+	}
+	if f := cmd.Flags().Lookup("target"); f == nil || f.Value.String() == "" {
+		missing = append(missing, "--target")
+	}
+	if len(missing) > 0 {
+		return missingFlagErr(cmd, missing...)
 	}
 
 	verifyMode, err := restore.ParseVerifyMode(opts.verifyMode)

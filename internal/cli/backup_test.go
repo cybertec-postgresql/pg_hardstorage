@@ -32,6 +32,12 @@ func TestBackup_RequiresDeployment(t *testing.T) {
 }
 
 func TestBackup_RequiresPGConnection(t *testing.T) {
+	// Isolate from any ambient config so `backup db1` has no deployment
+	// to resolve --pg-connection from (it now reads the config — #12).
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("PG_HARDSTORAGE_ROOT", "")
+	t.Setenv("PG_HARDSTORAGE_CONFIG_DIR", "")
+	t.Setenv("PG_HARDSTORAGE_CONFIG", "")
 	stdout, errb, exit := runBackup(t, "db1", "--repo", "file:///tmp/x", "-o", "json")
 	if exit != int(output.ExitMisuse) {
 		t.Errorf("missing --pg-connection should map to ExitMisuse(%d); got %d", output.ExitMisuse, exit)
@@ -55,6 +61,12 @@ func TestBackup_RequiresPGConnection(t *testing.T) {
 }
 
 func TestBackup_RequiresRepo(t *testing.T) {
+	// Isolate from any ambient config so `backup db1` has no deployment
+	// to resolve --repo from (it now reads the config — #12).
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("PG_HARDSTORAGE_ROOT", "")
+	t.Setenv("PG_HARDSTORAGE_CONFIG_DIR", "")
+	t.Setenv("PG_HARDSTORAGE_CONFIG", "")
 	_, errb, exit := runBackup(t, "db1", "--pg-connection", "postgres://x@y/z", "-o", "json")
 	if exit != int(output.ExitMisuse) {
 		t.Errorf("missing --repo should map to ExitMisuse; got %d", exit)
@@ -68,6 +80,28 @@ func TestBackup_RequiresRepo(t *testing.T) {
 	}
 	if !strings.Contains(res.Error.Message, "repo") {
 		t.Errorf("error message should mention repo: %q", res.Error.Message)
+	}
+}
+
+// Regression for #12: `backup <deployment>` must resolve --pg-connection
+// and --repo from the named deployment in the config when the operator
+// omits them on the command line, instead of demanding the flags.
+func TestBackup_ResolvesFlagsFromDeployment(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("PG_HARDSTORAGE_ROOT", "")
+	t.Setenv("PG_HARDSTORAGE_CONFIG_DIR", "")
+	repoDir := t.TempDir()
+	t.Setenv("PG_HARDSTORAGE_CONFIG",
+		"deployments:\n"+
+			"  mytest:\n"+
+			"    pg_connection: postgresql://postgres@127.0.0.1:5432/postgres\n"+
+			"    repo: file://"+repoDir+"\n")
+
+	// The backup still fails (empty repo / unreachable PG), but it must
+	// get PAST the required-flag gate — i.e. NOT a usage.missing_flag.
+	_, errb, _ := runBackup(t, "mytest", "-o", "json")
+	if strings.Contains(errb, "usage.missing_flag") {
+		t.Fatalf("backup of a configured deployment must not demand --pg-connection/--repo (issue #12); stderr:\n%s", errb)
 	}
 }
 
