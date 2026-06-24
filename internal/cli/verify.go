@@ -126,8 +126,10 @@ Backup ID:
 
 func runVerify(cmd *cobra.Command, deployment, backupID, repoURL string, sample int, existenceOnly bool) error {
 	d := DispatcherFrom(cmd)
-	if err := requireFlags(cmd, "repo"); err != nil {
-		return err
+	// Resolve --repo from the named deployment in config when omitted (#12).
+	_, repoURL = deploymentDefaults(deployment, "", repoURL)
+	if repoURL == "" {
+		return missingFlagErr(cmd, "--repo")
 	}
 	if sample < 0 {
 		return output.NewError("usage.bad_flag",

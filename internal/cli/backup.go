@@ -16,7 +16,6 @@ import (
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup/runner"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup/tarsink"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/capacity"
-	"github.com/cybertec-postgresql/pg_hardstorage/internal/config"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/kms"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/output"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/paths"
@@ -173,22 +172,8 @@ func runBackup(cmd *cobra.Command, opts runOptions) error {
 
 	// `backup <deployment>` resolves --pg-connection / --repo from the
 	// named deployment in pg_hardstorage.yaml when the operator didn't
-	// pass them on the command line; explicit flags still win. Without
-	// this, a configured deployment would wrongly demand the flags (#12).
-	if opts.deployment != "" && (opts.pgConn == "" || opts.repoURL == "") {
-		if p, perr := paths.Resolve(paths.DefaultOptions()); perr == nil {
-			if loaded, lerr := config.Load(p); lerr == nil {
-				if dep, ok := loaded.Config.Deployments[opts.deployment]; ok {
-					if opts.pgConn == "" {
-						opts.pgConn = dep.PGConnection
-					}
-					if opts.repoURL == "" {
-						opts.repoURL = dep.Repo
-					}
-				}
-			}
-		}
-	}
+	// pass them on the command line; explicit flags still win (#12).
+	opts.pgConn, opts.repoURL = deploymentDefaults(opts.deployment, opts.pgConn, opts.repoURL)
 
 	// Required-field checks (local mode only — a control-plane dispatch
 	// returned above). Validate the resolved values, not the raw flags:

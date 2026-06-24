@@ -52,8 +52,10 @@ import (
 //     differ from the source PG.
 func runVerifyFull(cmd *cobra.Command, deployment, backupID, repoURL, pgMajorOverride string) error {
 	d := DispatcherFrom(cmd)
-	if err := requireFlags(cmd, "repo"); err != nil {
-		return err
+	// Resolve --repo from the named deployment in config when omitted (#12).
+	_, repoURL = deploymentDefaults(deployment, "", repoURL)
+	if repoURL == "" {
+		return missingFlagErr(cmd, "--repo")
 	}
 
 	verifier, err := loadVerifier()
