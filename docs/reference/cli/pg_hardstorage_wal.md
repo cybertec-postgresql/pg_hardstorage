@@ -24,6 +24,7 @@ is needed. It targets PostgreSQL you run yourself; fully-managed DBaaS
 (RDS, Cloud SQL, ...) do not expose BASE_BACKUP / physical replication
 and are not supported.
 
+
 ### Options
 
 ```
