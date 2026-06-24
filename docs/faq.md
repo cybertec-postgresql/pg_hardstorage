@@ -34,6 +34,32 @@ not expose `BASE_BACKUP` (or physical replication) to
 customers, so pg_hardstorage cannot take a physical base
 backup of them.  It targets PostgreSQL you run yourself.
 
+**Why, per provider** (checked June 2026 against each
+vendor's own replication documentation): RDS and Aurora are
+documented not to support external physical replication /
+`pg_basebackup`; Cloud SQL and Azure Database expose only
+logical replication / decoding to external consumers
+(physical replication there is internal managed-HA, not a
+customer-reachable `BASE_BACKUP` endpoint); Neon uses a
+custom storage architecture with no traditional
+`pg_basebackup`; and hosted Supabase can *publish* via
+logical replication but cannot serve as a physical replica
+target.  The general test: **if a service does not let an
+external client open a physical replication connection and
+run `BASE_BACKUP`, pg_hardstorage cannot back it up.**
+
+!!! note "What we have *not* verified"
+    This list is not exhaustive, and we have not run
+    pg_hardstorage end-to-end against every managed provider;
+    the above reflects each vendor's documented replication
+    capabilities, which can change over time.  Treat the
+    `BASE_BACKUP` test as the source of truth — run
+    `pg_hardstorage wal preflight <deployment>` against your
+    endpoint to confirm it exposes what streaming needs before
+    relying on it.  A self-hosted Postgres distribution you run
+    yourself (including self-hosted Supabase) counts as
+    self-managed and is supported.
+
 What the replication-protocol design *does* remove is the
 need for host-level access.  On self-managed PostgreSQL —
 bare metal, VMs, containers, Patroni clusters, and operators
