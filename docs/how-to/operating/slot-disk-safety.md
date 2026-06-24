@@ -53,8 +53,8 @@ the failure before it becomes an incident.
 
 ### Most deployments — bound the slot, alert on lag
 
-For the typical case — a managed PG or a single primary where
-losing a few MB of WAL after a sustained outage is acceptable —
+For the typical case — a single primary where losing a few MB
+of WAL after a sustained outage is acceptable —
 configure `max_slot_wal_keep_size` to a value larger than the
 worst-case streamer downtime you can tolerate, and alert before
 the cap is reached.

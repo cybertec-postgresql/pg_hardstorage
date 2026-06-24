@@ -13,7 +13,7 @@ tags:
 
 > Install `charts/pg-hardstorage-sidecar` to run the host
 > agent as a StatefulSet that backs up an external
-> PostgreSQL cluster (managed RDS / CloudSQL, bare metal,
+> self-managed PostgreSQL cluster (bare metal or
 > VMs reachable from the cluster network). One replica;
 > persistent state PVC; the agent's same posture you'd run
 > as a `systemd` service on a VM, packaged for K8s.

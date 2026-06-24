@@ -184,12 +184,18 @@ spawning a wrapper script.  Not a polling loop on `pg_wal/`.  Not
 SSH into the host to read files.
 
 The reasoning is a single sentence: **we want the agent to work
-where SSH and `archive_library` cannot reach.**  Managed PostgreSQL
-on AWS RDS, GCP Cloud SQL, Azure Database, Aiven, Supabase, Neon —
-none of them let you install a C extension, none of them let you
-SSH into the host.  All of them expose the standard PostgreSQL
-replication endpoint.  Streaming over the replication protocol
-works on every one of them, identically to a self-hosted PG.
+where SSH and `archive_library` cannot reach.**  On self-managed
+PostgreSQL you often can't install a C extension or SSH into the
+host — a locked-down VM, a host another team owns, a container you
+don't control.  As long as the database exposes the standard
+physical replication endpoint, streaming over the replication
+protocol works identically to a co-located setup, from anywhere the
+agent can reach it.
+
+Fully-managed DBaaS — AWS RDS, Aurora, GCP Cloud SQL, Azure Database,
+Neon, Supabase — are a different case: they do **not** expose
+`BASE_BACKUP` or physical replication to customers, so pg_hardstorage
+cannot back them up.  It targets PostgreSQL you run yourself.
 
 Bonus consequence: a persistent slot **closes the WAL gap window
 to zero by default**.  PG holds WAL on disk until our agent ACKs.

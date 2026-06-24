@@ -9,9 +9,15 @@ backup on a schedule (e.g. nightly) that the stream rolls
 forward from.  Daily backup + always-on stream = PITR to any
 segment-aligned point.
 
-It works against managed PG (RDS, Cloud SQL, Azure DB) the same as
-bare metal, deduplicates and encrypts content-addressed chunks, and
-restores with PITR.  PG 15+, Apache 2.0.
+It backs up PostgreSQL you run yourself — bare metal, VMs, containers,
+Patroni clusters, and operators like CloudNativePG — over the physical
+replication protocol, deduplicates and encrypts content-addressed
+chunks, and restores with PITR.  PG 15+, Apache 2.0.
+
+Managed DBaaS (Amazon RDS, Aurora, Cloud SQL, Azure Database, Neon,
+Supabase, and similar) do **not** expose the `BASE_BACKUP` replication
+command to customers, so pg_hardstorage cannot take a physical base
+backup of them — see the [FAQ](../faq.md).
 
 This page gets you from zero to a running streamer, a first base
 backup, and a restored data dir in five minutes. After that, see

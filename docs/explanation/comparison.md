@@ -9,7 +9,7 @@ in learning a new workflow. Here is the reasoning.
 
 | Dimension | pgBackRest | pg_hardstorage |
 |---|---|---|
-| **WAL transport** | archive_command or async archive-push over SSH | replication-protocol streaming (START_REPLICATION SLOT) — works on managed PG too |
+| **WAL transport** | archive_command or async archive-push over SSH | replication-protocol streaming (START_REPLICATION SLOT) — no SSH or archive_command on the host |
 | **Agent locality** | co-located; needs SSH to primary | remote — libpq replication connection; agent can run anywhere |
 | **Dependency model** | C + Perl + libpq, requires OS access | single static Go binary, zero CGO (default), works without a compiler |
 | **Backup chain** | incremental depends on chain ancestors — a corrupt increment breaks the chain | chunk-CAS — every backup is independent; no chain to maintain |

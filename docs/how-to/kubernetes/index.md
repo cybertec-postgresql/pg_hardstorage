@@ -49,7 +49,7 @@ shapes:
 
 | You run                                  | Use                                  |
 |------------------------------------------|--------------------------------------|
-| External PG (managed RDS / CloudSQL / VM) | [Sidecar chart](helm-sidecar-chart.md) |
+| External self-managed PG (VM / bare metal / non-operator) | [Sidecar chart](helm-sidecar-chart.md) |
 | CloudNativePG (CNPG)                     | [CNPG-I provider](cnpg-i-provider.md) (v0.5)  |
 | Zalando postgres-operator                | [WAL-G shim](walg-shim.md)            |
 | Crunchy PGO                              | [pgBackRest shim](pgbackrest-shim.md) |

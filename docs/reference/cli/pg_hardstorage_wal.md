@@ -19,8 +19,10 @@ WAL transport: continuous streaming, push/fetch, list, repair
 WAL transport plumbing.
 
 The streaming subcommand connects via the PostgreSQL replication
-protocol over a libpq connection — no host-level access needed, so
-this works against managed databases (RDS, Cloud SQL, ...).
+protocol over a libpq connection — no host-level access to the database
+is needed. It targets PostgreSQL you run yourself; fully-managed DBaaS
+(RDS, Cloud SQL, ...) do not expose BASE_BACKUP / physical replication
+and are not supported.
 
 The push / fetch / list / repair subcommands are scaffold for now.
 

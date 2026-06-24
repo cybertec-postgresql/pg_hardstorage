@@ -26,11 +26,14 @@ the agent decides which streaming mode to run.
 
 Three separate properties make the choice easy:
 
-1. **It works on managed PostgreSQL.**  RDS, Cloud SQL, Azure
-   Database, Aiven, Supabase, Neon — none of them let you install a
-   C extension or SSH into the host.  All of them expose the
-   replication endpoint.  Pull-based, file-based archive paths can
-   fail invisibly on these providers; the replication slot can't.
+1. **It needs no host access.**  On self-managed PostgreSQL you
+   often can't (or don't want to) SSH into the database host or
+   install a C extension.  The replication endpoint is enough: the
+   agent runs from a different VM, region, or cluster.  A persistent
+   slot also can't fail invisibly the way pull-based, file-based
+   archive paths can.  (Fully-managed DBaaS — RDS, Cloud SQL, Azure
+   Database, Neon, Supabase — do **not** expose `BASE_BACKUP` or
+   physical replication, so they are out of scope.)
 
 2. **A persistent slot closes the WAL gap window.**  PG holds WAL
    in `pg_wal/` until the consumer (us) confirms the LSN with a
@@ -229,8 +232,8 @@ Both shim into the same chunker pipeline:
   install for paranoid double-archiving.  PG 15+.
 
 - **`archive_command` shim** — `/usr/bin/pg_hardstorage wal push %p`
-  for managed PG that doesn't expose `archive_library` and where
-  customers want classical archiving alongside streaming.  Same
+  for self-managed PG that can't load `archive_library` and where
+  operators want classical archiving alongside streaming.  Same
   chunker pipeline.
 
 Both paths feed the same content-addressed chunk store.  CAS

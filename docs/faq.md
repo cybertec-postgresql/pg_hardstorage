@@ -25,22 +25,26 @@ a documentation gap.
 
 ## Getting started
 
-#### Will pg_hardstorage work against AWS RDS, GCP Cloud SQL, Aiven, Supabase, or Neon?
+#### Will pg_hardstorage work against AWS RDS, Aurora, GCP Cloud SQL, Azure Database, Neon, or Supabase?
 
-Yes.  The entire data plane runs over the PostgreSQL
-**replication protocol** on a normal database connection —
-no SSH, no OS access, no `archive_library` install needed.
-Anything that exposes a standard PG replication endpoint to
-a replication-role user works.  This is the single biggest
-architectural difference from pgBackRest; see the
+No.  pg_hardstorage's data plane runs over the PostgreSQL
+**physical replication protocol** — a physical replication
+slot plus `BASE_BACKUP`.  Fully-managed DBaaS providers do
+not expose `BASE_BACKUP` (or physical replication) to
+customers, so pg_hardstorage cannot take a physical base
+backup of them.  It targets PostgreSQL you run yourself.
+
+What the replication-protocol design *does* remove is the
+need for host-level access.  On self-managed PostgreSQL —
+bare metal, VMs, containers, Patroni clusters, and operators
+like CloudNativePG — the agent backs up over a normal database
+connection with no SSH, no OS access, and no
+`archive_library`/`archive_command` on the host, and it can
+run in a different VM, region, or cluster from the database.
+This is the single biggest architectural difference from
+pgBackRest; see the
 [architecture tour](explanation/architecture-tour.md#2-wal-via-the-replication-protocol)
 for the full reasoning.
-
-The one caveat: managed PG generally does not let you load
-a custom `archive_library`, so the optional double-archive
-path is unavailable.  Streaming replication is the primary
-path either way, so this changes nothing about backup
-correctness.
 
 #### What PostgreSQL versions are supported?
 

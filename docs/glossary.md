@@ -215,7 +215,7 @@ from the BDEK via HKDF.  See
 #### Deployment
 
 A logical PostgreSQL service we back up — one Patroni
-cluster, one RDS instance, one CNPG `Cluster`.  Replaces
+cluster, one standalone primary, one CNPG `Cluster`.  Replaces
 the word *stanza* from pgBackRest.  Bound to ≥ 1 agents
 for HA.
 
@@ -496,8 +496,8 @@ against single-key corruption.  Recoverable via
 The PG protocol (`replication=database` connection
 parameter) used for `BASE_BACKUP`, `START_REPLICATION`,
 and `IDENTIFY_SYSTEM`.  pg_hardstorage's entire data plane
-runs over this — the reason it works on managed PG
-without OS access.  See
+runs over this — the reason the agent needs no SSH or OS
+access to the database host.  See
 [wal pipeline](explanation/wal-pipeline.md).
 
 #### Replication slot
