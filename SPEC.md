@@ -84,14 +84,14 @@ PG 15+. WAL transport prefers the **PostgreSQL replication protocol over a datab
 1. **Resilience above all.**
    Every operation is idempotent. Every commit is atomic via content-addressed storage + CAS rename. No backup chain — every backup is independently restorable. Crash-only design: no graceful shutdown is required for correctness. Pre-flight checks block destructive operations. Plain-English errors with a "next step" suggestion baked into every failure.
 
-2. **Compliance is a feature, not a tier.**
-   Encryption, KMS, audit log, signed manifests are *on by default*. WORM, FIPS, crypto-shred ship as standard, not as paid add-ons (Apache 2.0 — there is no paid add-on).
+2. **Compliance is a feature.**
+   Encryption, KMS, audit log, signed manifests are *on by default*. WORM, FIPS, crypto-shred ship in the base build. The base version is Apache 2.0; a paid tier with additional features is planned.
 
 3. **Simplicity is the headline product.**
    Common workflows are one command. Defaults are correct. We ship retention, verification, scheduling, alerting *built-in*, not bolted on. The 3am operator must succeed without reading docs.
 
 4. **Scale-spanning.**
-   Same binary, same UX, same config file from a 10 GB single-host PG to a 100+ TB Patroni cluster on Kubernetes. Big-database features (parallel chunk pipeline, snapshot base backups, multiple WAL streams from replicas) are *automatic upgrades* the system picks based on database size and topology — not a separate "enterprise mode."
+   Same binary, same UX, same config file from a 10 GB single-host PG to a 100+ TB Patroni cluster on Kubernetes. Big-database features (parallel chunk pipeline, snapshot base backups, multiple WAL streams from replicas) are *automatic upgrades* the system picks based on database size and topology — the operator does not have to opt into them manually.
 
 5. **WAL via the replication protocol, not URLs.**
    Default WAL transport is `START_REPLICATION` over libpq. It works on managed PostgreSQL where you can't install an archive library. It survives network blips because of the persistent slot. The C archive-library extension is an *optional* secondary path for environments where pulling can't keep up.

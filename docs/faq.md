@@ -654,10 +654,11 @@ as the streaming path.
 
 #### What's the license?
 
+The base version is
 [Apache 2.0](https://www.apache.org/licenses/LICENSE-2.0).
-No paid tier, no enterprise edition gate.  Compliance,
-encryption, audit chain, FIPS, HSM, and the LLM helper are
-all in the open-source build.
+Compliance, encryption, audit chain, FIPS, HSM, and the LLM
+helper are available in the open-source build today.  A paid
+tier with additional features is planned.
 
 #### Who owns the project?
 

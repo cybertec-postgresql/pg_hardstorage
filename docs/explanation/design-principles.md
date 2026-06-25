@@ -69,19 +69,18 @@ and the [repair toolkit reference](../reference/runbooks/index.md).
 
 ---
 
-## 2. Compliance is a feature, not a tier
+## 2. Compliance is a feature
 
-`pg_hardstorage` is Apache 2.0.  There is no paid edition.
-Encryption, KMS integration, audit log, signed manifests, WORM,
-FIPS, and crypto-shred are *on by default* in the open-source
-binary — not held back behind a license check.
+The base version of `pg_hardstorage` is Apache 2.0.  Encryption,
+KMS integration, audit log, signed manifests, WORM, FIPS, and
+crypto-shred are *on by default* in the open-source binary.
 
-We picked this for two reasons.  First, "compliance as upsell" has
-historically meant that the most security-critical defaults are
-the *worst* ones in the free tier; we refuse to ship that posture.
-Second, audit logs and signed manifests are how the system stays
-honest with its own operators — we want every install, including
-homelabs, to have them.
+We picked this for two reasons.  First, the most security-critical
+defaults should be the *best* ones, not the worst; strong
+compliance behaviour ships in the base build rather than being
+bolted on as an afterthought.  Second, audit logs and signed
+manifests are how the system stays honest with its own operators —
+we want every install, including homelabs, to have them.
 
 Concrete consequences:
 
@@ -90,12 +89,12 @@ Concrete consequences:
   default once a validated implementation lands.  See [envelope
   encryption](envelope-encryption.md).
 
-- The audit log is hash-chained on every write — no opt-in, no
-  feature flag.  The chain is verifiable post-hoc with `audit
-  verify-chain`.  See [the audit chain](audit-chain.md).
+- The audit log is hash-chained on every write, automatically.
+  The chain is verifiable post-hoc with `audit verify-chain`.
+  See [the audit chain](audit-chain.md).
 
-- WORM (Object Lock / immutable blob) is a per-deployment flag,
-  not a tier.
+- WORM (Object Lock / immutable blob) is a per-deployment flag
+    configured on the deployment itself.
 
 - Per-tenant KEKs are mandatory architecture even for single-org
   installs (you get a default tenant you never see).  This makes
@@ -152,8 +151,8 @@ Same binary, same UX, same config file from a 10 GB single-host
 PostgreSQL to a 100+ TB Patroni cluster on Kubernetes.  Big-database
 features (parallel chunk pipeline, snapshot base backups, multiple
 WAL streams from replicas) are *automatic upgrades* the system
-chooses based on database size and topology — they are **not** a
-separate "enterprise mode" the operator has to opt into.
+chooses based on database size and topology — the operator does
+not have to opt into them manually.
 
 The size-tiered defaults table:
 

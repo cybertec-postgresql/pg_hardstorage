@@ -26,7 +26,7 @@ The short version of where `pg_hardstorage` differs:
   backup is independently restorable; deleting one cannot break
   another.
 - **Compliance posture (encryption / KMS / audit chain / WORM /
-  FIPS) on by default, no paid tier.**
+  FIPS) on by default.**
 - **3 AM operator UX as a design principle**, not a side effect.
 
 The places `pg_hardstorage` does *not* lead: **production
@@ -91,9 +91,9 @@ The places to think twice:
   incremental can compromise the chain.  CAS backups don't have
   this property.
 
-- **You want strong-default compliance posture without a paid
-  tier.**  pgBackRest's encryption is opt-in; we want it on for
-  every install.
+- **You want strong-default compliance posture.**  pgBackRest's
+  encryption is opt-in; we want it on by default for every
+  install.
 
 ---
 
@@ -172,8 +172,8 @@ differentiation:
   same config schema, same repo schema.  The operator learns one
   tool.
 
-- **Compliance-first posture** without a paid tier.  Encryption,
-  KMS, audit chain, WORM, FIPS, crypto-shred all on by default.
+- **Compliance-first posture.**  Encryption, KMS, audit chain,
+  WORM, FIPS, crypto-shred all on by default.
 
 - **3 AM operator UX as a feature**.  `--preview`, plain-English
   errors with suggested next commands, `doctor`'s per-issue
