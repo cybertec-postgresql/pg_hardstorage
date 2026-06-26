@@ -210,7 +210,7 @@ Three properties hold across all modes:
   dual-stream config against a single-node cluster is rejected at
   parse time, not at run time.
 
-- **Mode is not a tier.**  Switching from single-stream to
+- **Mode is just configuration.**  Switching from single-stream to
   dual-stream is a config change.  Nothing in the repo schema
   changes; old manifests remain restorable; the new manifests gain
   a second stream's-worth of dedup-coverage and that's all.

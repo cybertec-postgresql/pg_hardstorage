@@ -65,6 +65,10 @@ behaves identically.
 
 ## [Unreleased]
 
+### Docs: update product messaging
+
+Updated the documentation.
+
 ### Packaging: remove the obsolete homebrew-formula.json manifest
 
 Dropped `scripts/homebrew-formula.json`, a leftover hand-maintained tap

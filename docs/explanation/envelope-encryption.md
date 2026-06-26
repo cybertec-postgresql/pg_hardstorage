@@ -136,7 +136,7 @@ fingerprinting via repeated chunk identity).
 
 Single-org installs get a default tenant they never see — but the
 tenant boundary exists in the data layout regardless.  This is a
-design choice, not a tier:
+deliberate architectural choice, baked into the data layout:
 
 - **GDPR crypto-shred** is `pg_hardstorage kms shred --confirm-keyring <keyring-dir>
   --reason "GDPR Art. 17 request #4421"`.  One key-destruction op.  The
