@@ -244,7 +244,7 @@ curl --cacert /etc/pg_hardstorage/server/cert.pem \
 #       {
 #         "id": "db1.example.com",
 #         "host": "db1.example.com",
-#         "version": "v1.0.4",
+#         "version": "v1.0.5",
 #         "deployments": ["db1", "db2"],
 #         "registered_at": "...",
 #         "last_heartbeat": "..."

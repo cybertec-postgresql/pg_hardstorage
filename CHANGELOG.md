@@ -9,6 +9,31 @@ on-disk and on-the-wire schema (backup manifests, configuration, output JSON,
 and the on-disk chunk envelope): an agent built against a given schema version
 keeps reading that version for at least 24 months after a successor lands.
 
+## [Unreleased]
+
+## [1.0.5] — 2026-06-26
+
+### Docs: refine product messaging and positioning
+
+More precise product messaging and positioning across the documentation
+and the project spec. Wording-only; no code, CLI/API, or on-disk schema
+changes.
+
+## [1.0.4] — 2026-06-24
+
+### Fix: deployment-scoped commands now read the deployment config (#12)
+
+`pg_hardstorage backup <deployment>` (and `restore`, `verify`, `list`,
+`show`, `status`, `hold`, `rotate`, `recovery`, `repair`, `wal
+preflight/stream/list/audit/prune/gaps`, `partial`, `kms verify/shred`,
+…) used to demand `--pg-connection` / `--repo` even when the named
+deployment already declared them in `pg_hardstorage.yaml`. They now
+resolve those values from the deployment catalogue when the flags are
+omitted (explicit flags still win); a deployment that isn't configured,
+or a genuinely missing flag, still errors as before. Resolution happens
+once, in a shared root pre-run hook, so every deployment-scoped command
+behaves identically.
+
 ## [1.0.3] — 2026-06-24
 
 ### Documentation: correctness sweep + cloud-support accuracy
@@ -48,26 +73,7 @@ binaries / `.deb` / `.rpm` / Homebrew as before. Image-level SLSA
 provenance remains roadmap. A `goreleaser check` step now validates the
 release config in CI.
 
-## [1.0.4] — 2026-06-24
-
-### Fix: deployment-scoped commands now read the deployment config (#12)
-
-`pg_hardstorage backup <deployment>` (and `restore`, `verify`, `list`,
-`show`, `status`, `hold`, `rotate`, `recovery`, `repair`, `wal
-preflight/stream/list/audit/prune/gaps`, `partial`, `kms verify/shred`,
-…) used to demand `--pg-connection` / `--repo` even when the named
-deployment already declared them in `pg_hardstorage.yaml`. They now
-resolve those values from the deployment catalogue when the flags are
-omitted (explicit flags still win); a deployment that isn't configured,
-or a genuinely missing flag, still errors as before. Resolution happens
-once, in a shared root pre-run hook, so every deployment-scoped command
-behaves identically.
-
-## [Unreleased]
-
-### Docs: update product messaging
-
-Updated the documentation.
+## [1.0.1] — 2026-06-23
 
 ### Packaging: remove the obsolete homebrew-formula.json manifest
 
@@ -116,6 +122,8 @@ All assets are repo-local (air-gapped posture); no new build dependencies.
 The docs CI built and validated the site but never published it. A
 push-on-main-gated deploy job now publishes it to GitHub Pages at
 docs.pghardstorage.org. PRs continue to only build + preview.
+
+## [1.0.0] — 2026-06-18
 
 ### Added
 
