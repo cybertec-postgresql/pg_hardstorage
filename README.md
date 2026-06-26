@@ -58,7 +58,9 @@ pg_hardstorage demo
 ```
 
 The demo prints progress and a result summary. No existing PostgreSQL or
-pg_hardstorage configuration is needed — just a running Docker daemon.
+pg_hardstorage configuration is needed — just a running Docker daemon. It
+drives your `docker` CLI, so a non-default daemon set via `DOCKER_HOST`
+(Lima, Colima, Podman, a remote socket) is picked up automatically.
 
 ### One-command setup
 

@@ -62,15 +62,5 @@ func newGlossaryCmdImpl() *cobra.Command {
 	}
 }
 
-func newDemoCmdImpl() *cobra.Command {
-	return &cobra.Command{
-		Use: "demo", Short: "Run a 60-second demo with temporary PG 18 via Docker",
-		Args: cobra.NoArgs, SilenceUsage: true,
-		RunE: func(cmd *cobra.Command, _ []string) error {
-			d := DispatcherFrom(cmd)
-			return d.Result(output.NewResult(cmd.CommandPath()).WithBody(map[string]any{
-				"message": "pg_hardstorage demo — requires Docker, runs PG 18, cleanup automatic",
-			}))
-		},
-	}
-}
+// newDemoCmdImpl now lives in demo.go (issue #15) — it runs the real
+// end-to-end flow instead of printing a placeholder message.

@@ -322,32 +322,57 @@ func TestTarsink_BackupLabel_And_TablespaceMap_Captured(t *testing.T) {
 	}
 }
 
-func TestTarsink_SpecialFiles_OnlyInTablespaceZero(t *testing.T) {
+// TestTarsink_BackupLabel_CapturedFromBaseTablespace_NotIndexZero is the
+// regression for issue #17: when a non-default tablespace exists, PG
+// streams the user tablespace archive(s) FIRST and the base/default
+// tablespace (the one carrying backup_label + tablespace_map) LAST. The
+// sink must capture those special files from whichever archive holds
+// them, not assume tablespace index 0. The previous idx==0 gate dropped
+// backup_label here, leaving an empty manifest field that failed its own
+// invariant check ("backup_label is empty (required for restore)") and
+// refused to commit the backup.
+func TestTarsink_BackupLabel_CapturedFromBaseTablespace_NotIndexZero(t *testing.T) {
 	sink, _ := newSinkAndCAS(t)
-	// A second tablespace also has a file called backup_label — but it
-	// is NOT the special one (only tablespace 0's is). The test confirms
-	// we don't intercept it.
-	t0 := buildTar(t, []fileSpec{
-		{name: "backup_label", body: []byte("real label")},
+
+	wantLabel := []byte("START WAL LOCATION: 0/23000168 (file 000000010000000000000023)\n")
+	wantMap := []byte("16384 /data/postgresql/18/tablespaces/tbs1\n")
+
+	// idx 0 — the USER tablespace (tbs1). Its tar entries are nested
+	// under PG_<ver>_<cat>/<dboid>/...; there is no root backup_label.
+	userTS := buildTar(t, []fileSpec{
+		{name: "PG_18_202209061/16384/12345", body: []byte("user tablespace relfile")},
 	})
-	t1 := buildTar(t, []fileSpec{
-		{name: "backup_label", body: []byte("not actually a label, just a same-named file")},
+	// idx 1 — the BASE/default tablespace, streamed last, carrying the
+	// special files at its root.
+	baseTS := buildTar(t, []fileSpec{
+		{name: "backup_label", body: wantLabel},
+		{name: "tablespace_map", body: wantMap},
+		{name: "PG_VERSION", body: []byte("18\n")},
+		{name: "global/pg_control", body: []byte("control")},
 	})
-	if err := drive(t, sink, 0, basebackup.TablespaceInfo{OID: 1663}, t0, 0); err != nil {
-		t.Fatal(err)
+
+	if err := drive(t, sink, 0, basebackup.TablespaceInfo{OID: 16384}, userTS, 0); err != nil {
+		t.Fatalf("drive user tablespace: %v", err)
 	}
-	if err := drive(t, sink, 1, basebackup.TablespaceInfo{OID: 16384}, t1, 0); err != nil {
-		t.Fatal(err)
+	if err := drive(t, sink, 1, basebackup.TablespaceInfo{OID: 0}, baseTS, 0); err != nil {
+		t.Fatalf("drive base tablespace: %v", err)
 	}
 
-	// Tablespace 0's backup_label is captured.
-	if string(sink.BackupLabel()) != "real label" {
-		t.Errorf("BackupLabel mismatch: %q", sink.BackupLabel())
+	if !bytes.Equal(sink.BackupLabel(), wantLabel) {
+		t.Errorf("backup_label not captured from the base tablespace (issue #17): got %q", sink.BackupLabel())
 	}
-	// Tablespace 1's same-named file IS in Files (it's not the special one).
-	files1 := sink.Files(1)
-	if len(files1) != 1 || files1[0].Path != "backup_label" {
-		t.Errorf("tablespace 1 should keep its backup_label as a regular file: %+v", files1)
+	if !bytes.Equal(sink.TablespaceMap(), wantMap) {
+		t.Errorf("tablespace_map not captured from the base tablespace: got %q", sink.TablespaceMap())
+	}
+	// The special files must not leak into the base tablespace's file list.
+	for _, f := range sink.Files(1) {
+		if f.Path == "backup_label" || f.Path == "tablespace_map" {
+			t.Errorf("special file %q leaked into Files(1)", f.Path)
+		}
+	}
+	// The user tablespace's real relfile is preserved as a normal file.
+	if files0 := sink.Files(0); len(files0) != 1 || files0[0].Path != "PG_18_202209061/16384/12345" {
+		t.Errorf("user tablespace file list = %+v, want the single relfile", files0)
 	}
 }
 

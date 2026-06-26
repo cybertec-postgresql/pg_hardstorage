@@ -548,20 +548,28 @@ func (s *Sink) parseTar(ctx context.Context, r io.Reader, idx int) ([]backup.Fil
 			continue
 		}
 
-		// Special files captured for the manifest.
-		if idx == 0 {
-			switch hdr.Name {
-			case BackupLabelName:
-				if err := s.captureSpecial(tr, &s.backupLabel); err != nil {
-					return files, dirs, fmt.Errorf("read %s: %w", hdr.Name, err)
-				}
-				continue
-			case TablespaceMapName:
-				if err := s.captureSpecial(tr, &s.tablespaceMap); err != nil {
-					return files, dirs, fmt.Errorf("read %s: %w", hdr.Name, err)
-				}
-				continue
+		// Special files captured for the manifest. backup_label and
+		// tablespace_map sit at the root of the base/default tablespace's
+		// tar — and PG streams that archive LAST when user tablespaces
+		// exist, not first. Keying on idx==0 therefore silently dropped
+		// backup_label whenever a non-default tablespace was present,
+		// producing a manifest that fails its own invariant check and
+		// refuses to commit (issue #17). Match by name in whichever
+		// archive carries them instead: the exact-name match can only
+		// fire for the base tar, since user-tablespace entries are nested
+		// under PG_<ver>_<cat>/... and never named exactly "backup_label"
+		// or "tablespace_map" at the root.
+		switch hdr.Name {
+		case BackupLabelName:
+			if err := s.captureSpecial(tr, &s.backupLabel); err != nil {
+				return files, dirs, fmt.Errorf("read %s: %w", hdr.Name, err)
 			}
+			continue
+		case TablespaceMapName:
+			if err := s.captureSpecial(tr, &s.tablespaceMap); err != nil {
+				return files, dirs, fmt.Errorf("read %s: %w", hdr.Name, err)
+			}
+			continue
 		}
 
 		entry, err := s.chunkFile(ctx, hdr, tr)
