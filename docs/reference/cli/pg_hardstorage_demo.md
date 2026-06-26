@@ -12,7 +12,7 @@ tags:
 
 ## pg_hardstorage demo
 
-Run a 60-second demo with temporary PG 18 via Docker
+Run a throwaway end-to-end demo (init → backup → restore → verify) on a temporary PG in Docker
 
 ```
 pg_hardstorage demo [flags]
