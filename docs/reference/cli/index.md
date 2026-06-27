@@ -58,7 +58,7 @@ generated from the Cobra command tree on every
 | [`pg_hardstorage db`](pg_hardstorage_db.md) | In-database integration (SQL views, upsert helpers) |
 | [`pg_hardstorage db install-extension`](pg_hardstorage_db_install-extension.md) | Install the pg_hardstorage in-DB extension (creates schema + tables + views + functions) |
 | [`pg_hardstorage db uninstall-extension`](pg_hardstorage_db_uninstall-extension.md) | Remove the pg_hardstorage in-DB schema |
-| [`pg_hardstorage demo`](pg_hardstorage_demo.md) | Run a 60-second demo with temporary PG 18 via Docker |
+| [`pg_hardstorage demo`](pg_hardstorage_demo.md) | Run a throwaway end-to-end demo (init → backup → restore → verify) on a temporary PG in Docker |
 | [`pg_hardstorage deployment`](pg_hardstorage_deployment.md) | Manage deployments (add/list/remove/edit/test) |
 | [`pg_hardstorage deployment add`](pg_hardstorage_deployment_add.md) | Add a new deployment to the config |
 | [`pg_hardstorage deployment edit`](pg_hardstorage_deployment_edit.md) | Update fields on an existing deployment |

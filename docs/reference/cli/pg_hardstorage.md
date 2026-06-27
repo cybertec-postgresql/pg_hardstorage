@@ -59,7 +59,7 @@ sandbox-PG runtime — extend per docs/SPEC.md.
 * [pg_hardstorage compliance](pg_hardstorage_compliance.md)	 - Compliance reporting (SOC 2 / ISO 27001 / HIPAA / PCI / FedRAMP-friendly)
 * [pg_hardstorage cost](pg_hardstorage_cost.md)	 - Per-deployment / per-tenant repository cost
 * [pg_hardstorage db](pg_hardstorage_db.md)	 - In-database integration (SQL views, upsert helpers)
-* [pg_hardstorage demo](pg_hardstorage_demo.md)	 - Run a 60-second demo with temporary PG 18 via Docker
+* [pg_hardstorage demo](pg_hardstorage_demo.md)	 - Run a throwaway end-to-end demo (init → backup → restore → verify) on a temporary PG in Docker
 * [pg_hardstorage deployment](pg_hardstorage_deployment.md)	 - Manage deployments (add/list/remove/edit/test)
 * [pg_hardstorage doctor](pg_hardstorage_doctor.md)	 - Run health checks and suggest fixes
 * [pg_hardstorage dsa](pg_hardstorage_dsa.md)	 - GDPR Data Subject Access helper: locate which backups contain a subject's data

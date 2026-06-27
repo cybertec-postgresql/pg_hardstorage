@@ -75,6 +75,25 @@ release config in CI.
 
 ## [1.0.1] — 2026-06-23
 
+### Fix: backups with a non-default tablespace (#17)
+
+A backup of a cluster that has any user tablespace failed to commit with
+`backup.manifest_invalid: backup_label is empty (required for restore)`.
+PG streams the base/default tablespace archive — the one carrying
+`backup_label` and `tablespace_map` — *last* when user tablespaces exist,
+but the tar sink only looked for those files in the first archive. It now
+captures them from whichever archive holds them, so multi-tablespace
+clusters back up (and restore) correctly.
+
+### Fix: `pg_hardstorage demo` now actually runs (#15)
+
+The `demo` command previously printed a one-line description and exited
+without doing anything. It now runs the real end-to-end flow — start a
+throwaway PostgreSQL in Docker, initialise a repo, back up, restore, and
+verify, then clean up — driving your `docker` CLI so a non-default daemon
+set via `DOCKER_HOST` (Lima, Colima, Podman) is honoured, and reporting a
+clear error if Docker isn't reachable instead of silently succeeding.
+
 ### Packaging: remove the obsolete homebrew-formula.json manifest
 
 Dropped `scripts/homebrew-formula.json`, a leftover hand-maintained tap
