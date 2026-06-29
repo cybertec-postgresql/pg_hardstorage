@@ -459,6 +459,28 @@ jobs:
           PG_HARDSTORAGE_TEST_PG_MAJOR: ${{ matrix.pg }}
         run: make test-integration
 
+  test-patroni:
+    # Heavy Patroni failover / recovery / data-integrity suite: each test
+    # stands up a real 3-node Spilo/Patroni cluster, so the whole set runs
+    # well past the per-PR integration budget and lives in its own lane with
+    # a generous timeout. The tests are PostgreSQL-version independent (the
+    # Spilo image pins its own PG), so a single cell suffices rather than the
+    # 4-way matrix.
+    name: test (patroni failover)
+    runs-on: ubuntu-24.04
+    needs: [vet]
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      # Docker is preinstalled on ubuntu-24.04 runners; the topology brings
+      # up etcd + 3 Spilo nodes via `docker compose`.
+      - name: patroni failover suite
+        run: make test-patroni
+
   lint:
     name: golangci-lint
     runs-on: ubuntu-24.04

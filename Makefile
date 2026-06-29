@@ -340,6 +340,17 @@ $(HS_TMPDIR):
 test-integration: | $(HS_TMPDIR)
 	go test -tags=integration -race -count=1 -timeout=$(INTEGRATION_TIMEOUT) $(GO_PKGS)
 
+# Heavy Patroni failover / recovery / data-integrity suite: each test
+# stands up a real 3-node Spilo/Patroni cluster, so the whole set runs far
+# longer than the per-PR integration budget and lives behind an extra
+# `patroni` build tag (see internal/testkit/topology/*patroni_failover*).
+# Runs in its own CI lane, once (the tests are PG-version independent).
+# No -race: these are Docker-orchestration tests with little in-process
+# concurrency, and -race roughly doubles their already-long wallclock.
+PATRONI_TIMEOUT ?= 30m
+test-patroni: | $(HS_TMPDIR)
+	go test -tags='integration patroni' -count=1 -timeout=$(PATRONI_TIMEOUT) ./internal/testkit/topology/...
+
 # Mutation harness. Loops over internal/testkit/mutation/Registry and
 # runs `go test -tags=<mutation-tag>` against each affected package,
 # asserting the suite catches the deliberate regression. A failure
