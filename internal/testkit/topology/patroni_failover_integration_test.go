@@ -1,10 +1,13 @@
-// Build-tagged: brings up a real 3-node Spilo/Patroni cluster (1+ GB
-// image, ~30 s start) and drives a real switchover, so it only runs
-// under the integration tag / the Docker CI job.
+// Each test here brings up a real 3-node Spilo/Patroni cluster (1+ GB
+// image, ~30 s start) and the full suite runs well past the per-PR
+// integration budget — so it sits behind an extra `patroni` build tag and
+// runs in its own CI lane (`make test-patroni`) rather than the standard
+// `make test-integration` matrix. These tests are PostgreSQL-version
+// independent (the Spilo image pins its own PG), so a single lane suffices.
 //
-//	go test -tags integration ./internal/testkit/topology/...
+//	go test -tags 'integration patroni' ./internal/testkit/topology/...
 //
-//go:build integration
+//go:build integration && patroni
 
 package topology_test
 
