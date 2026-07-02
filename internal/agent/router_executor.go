@@ -4,6 +4,7 @@ package agent
 import (
 	"context"
 	"fmt"
+	"sort"
 )
 
 // RouterExecutor dispatches a ControlPlaneJob to a per-Kind
@@ -51,5 +52,12 @@ func (r *RouterExecutor) kinds() []string {
 	for k := range r.executors {
 		out = append(out, k)
 	}
+	sort.Strings(out)
 	return out
 }
+
+// Kinds exposes the registered job kinds so the control-plane client
+// can advertise/claim exactly what this agent can execute (rather than
+// a hardcoded slice). Returned sorted for deterministic wire order.
+// Implements the kindLister interface the ControlPlaneClient probes.
+func (r *RouterExecutor) Kinds() []string { return r.kinds() }

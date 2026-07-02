@@ -249,6 +249,36 @@ func (e *RestoreExecutor) Execute(ctx context.Context, job *ControlPlaneJob, pro
 		"stopped_at":          res.StoppedAt.Format(time.RFC3339Nano),
 		"duration_ms":         res.Duration.Milliseconds(),
 	}
+
+	// Honor verify_after: run the post-restore pg_verifybackup gate
+	// against the materialised target. A truthy verify_after means the
+	// operator wants the restore to be a HARD gate — a failed (or, when
+	// pg_verifybackup is absent, un-runnable) verification fails the
+	// job rather than silently reporting success. Previously this option
+	// was documented but never read, so a verify-gated restore returned
+	// success without ever verifying.
+	verifyMode, err := verifyModeFromArg(job.Args["verify_after"])
+	if err != nil {
+		return nil, err
+	}
+	if verifyMode != "" {
+		progress(map[string]any{"op": "restore.verify_started",
+			"body": map[string]any{"mode": string(verifyMode), "target": targetDir}})
+		vres, verr := restore.Verify(ctx, targetDir, verifyMode)
+		if vres != nil {
+			out["verify"] = map[string]any{
+				"mode":      string(vres.Mode),
+				"status":    vres.Status,
+				"exit_code": vres.ExitCode,
+			}
+		}
+		if verr != nil {
+			// A required verify that failed (or a missing tool under
+			// require) is a job failure — the restored bytes are not
+			// trustworthy, so we must not report success.
+			return out, fmt.Errorf("restore-executor: verify_after: %w", verr)
+		}
+	}
 	if rec != nil && rec.Enable {
 		out["recovery_configured"] = true
 		if rec.TargetLSN != "" {
@@ -344,6 +374,38 @@ func buildRecoveryFromArgs(args map[string]any, targetTime time.Time) (*restore.
 	// RestoreCommand when Enable=true. Keeping the wiring in Execute
 	// avoids threading repoURL/binary through this pure args translator.
 	return r, nil
+}
+
+// verifyModeFromArg maps the control-plane verify_after arg to a
+// restore.VerifyMode. It returns "" (no verification) when the arg is
+// absent or an explicit false/skip. A bare `true` means "hard gate"
+// (VerifyRequire) — the documented intent of a verify-gated restore.
+// A string value routes through restore.ParseVerifyMode so operators
+// can request auto|skip|require explicitly. JSON numbers are rejected
+// with a clear error rather than silently ignored.
+func verifyModeFromArg(raw any) (restore.VerifyMode, error) {
+	switch v := raw.(type) {
+	case nil:
+		return "", nil
+	case bool:
+		if v {
+			// Truthy verify_after → hard gate; anything less would let a
+			// verify-gated restore report success without verifying.
+			return restore.VerifyRequire, nil
+		}
+		return "", nil
+	case string:
+		mode, err := restore.ParseVerifyMode(v)
+		if err != nil {
+			return "", fmt.Errorf("restore-executor: verify_after: %w", err)
+		}
+		if mode == restore.VerifySkip {
+			return "", nil
+		}
+		return mode, nil
+	default:
+		return "", fmt.Errorf("restore-executor: verify_after must be a bool or one of auto|skip|require, got %T", raw)
+	}
 }
 
 func parsePositiveUint32(s string) (uint32, error) {

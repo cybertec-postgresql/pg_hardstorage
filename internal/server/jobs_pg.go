@@ -362,13 +362,31 @@ func (b *PGBackend) AppendProgress(ctx context.Context, id string, ev ProgressEv
 	// jsonb || jsonb appends; we cast the new event to a single-
 	// element array to match. The state guard is a CASE that flips
 	// to NULL on mismatch, which the trailing WHERE filters out.
+	//
+	// Cap the retained history to the same bound as MemoryBackend
+	// (maxProgressEvents). Without this the jsonb grew unbounded and
+	// every append rewrote the whole array — O(n) per event and an
+	// unbounded row. We append, then keep only the most recent
+	// maxProgressEvents entries: jsonb_array_elements over the appended
+	// array, ordered by ordinality, take the tail via OFFSET, and
+	// re-aggregate. The $4 bound is passed as a parameter so the SQL
+	// stays a single prepared statement.
 	cmd, err := b.pool.Exec(ctx, `
         UPDATE phs.jobs
-           SET progress = progress || $1::jsonb,
+           SET progress = (
+               SELECT COALESCE(jsonb_agg(e.val ORDER BY e.ord), '[]'::jsonb)
+                 FROM (
+                     SELECT val, ord
+                       FROM jsonb_array_elements(progress || $1::jsonb)
+                            WITH ORDINALITY AS t(val, ord)
+                 ) e
+                WHERE e.ord > GREATEST(
+                    jsonb_array_length(progress || $1::jsonb) - $4, 0)
+           ),
                updated_at = $2
          WHERE id = $3
            AND state = 'running'
-    `, "["+string(body)+"]", ev.At, id)
+    `, "["+string(body)+"]", ev.At, id, maxProgressEvents)
 	if err != nil {
 		return fmt.Errorf("pgbackend: append progress: %w", err)
 	}

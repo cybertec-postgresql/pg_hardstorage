@@ -33,6 +33,7 @@ import (
 	"math/rand"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/obs/metrics"
@@ -60,6 +61,16 @@ type ControlPlaneClient struct {
 	// against this list — an agent that doesn't manage db1 won't
 	// be assigned a db1 job.
 	Deployments []string
+
+	// Kinds declares which job kinds this agent claims. When empty,
+	// Run derives it from the JobExecutor: if the executor implements
+	// kindLister (RouterExecutor does), its registered kinds are used;
+	// otherwise it falls back to {"backup"} for backward compatibility.
+	// This keeps the advertised/claimed kinds in lockstep with the
+	// executors the agent actually has — a restore/verify executor is
+	// wired but a hardcoded {"backup"} claim would leave those jobs
+	// queued forever.
+	Kinds []string
 
 	// HTTPClient is the HTTP client used for every request. nil
 	// defaults to a 30s-timeout client; tests substitute a
@@ -144,6 +155,9 @@ func (c *ControlPlaneClient) Run(ctx context.Context) error {
 	if c.JobExecutor == nil {
 		c.JobExecutor = notImplExecutor{}
 	}
+	if len(c.Kinds) == 0 {
+		c.Kinds = resolveKinds(c.JobExecutor)
+	}
 	// Jitter: 0 → default; negative → disabled (exact intervals).
 	c.JitterFraction = resolveJitterFraction(c.JitterFraction)
 
@@ -167,9 +181,24 @@ func (c *ControlPlaneClient) Run(ctx context.Context) error {
 		metrics.ControlPlaneError("heartbeat")
 	}
 
+	// jobDone fires when the in-flight job goroutine returns. running
+	// gates the claim path so we keep the historical one-job-at-a-time
+	// semantics: while a job runs we skip claiming (the executor never
+	// runs two jobs concurrently), but the heartbeat timer keeps
+	// servicing so the agent does NOT drop out of the fleet mid-job.
+	// Previously runOne executed synchronously inside this select, so a
+	// long backup blocked the heartbeat for its whole duration and the
+	// control plane reaped the agent after HeartbeatTimeout.
+	jobDone := make(chan struct{}, 1)
+	running := false
+	var wg sync.WaitGroup
+
 	for {
 		select {
 		case <-ctx.Done():
+			// Wait for any in-flight job goroutine to observe the
+			// cancelled ctx and return, so we don't leak it past Run.
+			wg.Wait()
 			return ctx.Err()
 		case <-hbTimer.C:
 			if err := c.heartbeat(ctx); err != nil {
@@ -177,7 +206,16 @@ func (c *ControlPlaneClient) Run(ctx context.Context) error {
 				metrics.ControlPlaneError("heartbeat")
 			}
 			hbTimer.Reset(jitteredInterval(c.HeartbeatInterval, c.JitterFraction))
+		case <-jobDone:
+			// The in-flight job finished; free the claim path.
+			running = false
 		case <-pollTimer.C:
+			if running {
+				// A job is already executing; don't claim another
+				// (one-at-a-time). Heartbeats keep flowing above.
+				pollTimer.Reset(jitteredInterval(c.PollInterval, c.JitterFraction))
+				continue
+			}
 			job, err := c.claim(ctx)
 			if err != nil {
 				if !errors.Is(err, errNoJobs) {
@@ -187,10 +225,45 @@ func (c *ControlPlaneClient) Run(ctx context.Context) error {
 				pollTimer.Reset(jitteredInterval(c.PollInterval, c.JitterFraction))
 				continue
 			}
-			c.runOne(ctx, job)
+			// Execute off the select loop so heartbeats keep firing for
+			// the job's whole duration. Signal completion via jobDone.
+			running = true
+			wg.Add(1)
+			go func(j *ControlPlaneJob) {
+				defer wg.Done()
+				c.runOne(ctx, j)
+				select {
+				case jobDone <- struct{}{}:
+				case <-ctx.Done():
+				}
+			}(job)
 			pollTimer.Reset(jitteredInterval(c.PollInterval, c.JitterFraction))
 		}
 	}
+}
+
+// kindLister is implemented by executors that can enumerate the job
+// kinds they handle (RouterExecutor). The client probes for it so the
+// advertised/claimed kinds track the wired executors automatically.
+type kindLister interface {
+	Kinds() []string
+}
+
+// resolveKinds derives the job kinds to advertise/claim from the
+// configured executor. A kindLister (RouterExecutor) reports exactly
+// the kinds it has executors for; anything else falls back to the
+// historical {"backup"} so a bespoke single-purpose executor keeps
+// working. An empty kindLister still falls back rather than claiming
+// nothing (which would strand every job).
+func resolveKinds(exec JobExecutor) []string {
+	if kl, ok := exec.(kindLister); ok {
+		if ks := kl.Kinds(); len(ks) > 0 {
+			out := make([]string, len(ks))
+			copy(out, ks)
+			return out
+		}
+	}
+	return []string{"backup"}
 }
 
 // resolveJitterFraction applies the default/disable convention: 0 →
@@ -246,6 +319,11 @@ func (c *ControlPlaneClient) heartbeat(ctx context.Context) error {
 		"host":        c.Host,
 		"version":     c.Version,
 		"deployments": c.Deployments,
+		// NB: kinds are advertised on the claim (POST /v1/jobs/claim),
+		// not the heartbeat — the current HeartbeatRequest schema has no
+		// kinds field and the server decodes with DisallowUnknownFields,
+		// so a kinds key here would be rejected. Adding it needs a shared
+		// server-side change (HeartbeatRequest.Kinds); see report.
 	}
 	_, err := c.post(ctx, "/v1/agents/heartbeat", body, http.StatusOK)
 	return err
@@ -258,7 +336,7 @@ func (c *ControlPlaneClient) claim(ctx context.Context) (*ControlPlaneJob, error
 	body := map[string]any{
 		"agent_id":    c.AgentID,
 		"deployments": c.Deployments,
-		"kinds":       []string{"backup"}, // v0.1: agent-side execution covers backups
+		"kinds":       c.Kinds, // exactly the kinds this agent has executors for
 	}
 	resp, err := c.post(ctx, "/v1/jobs/claim", body, http.StatusOK)
 	if err != nil {

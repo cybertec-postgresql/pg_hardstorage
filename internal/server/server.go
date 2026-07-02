@@ -253,6 +253,13 @@ func (s *Server) Run(ctx context.Context) error {
 			s.logger.Infof("jobs: sweeper reaped %d abandoned job(s)", reaped)
 		}
 	})
+	// Stop the sweeper when Run returns. RunSweeper binds the goroutine
+	// only to ctx, so if Serve returns on its own (a listener error, or
+	// an external srv.Close) WITHOUT a ctx cancel, the sweeper would keep
+	// ticking against a possibly-Closed backend. Stop is idempotent and
+	// self-sufficient (cancels its own derived context), so it's safe on
+	// every exit path.
+	defer s.jobs.Stop()
 
 	// Spawn the shutdown goroutine before serving so a ctx cancel
 	// during the Serve call routes through Shutdown, not just by

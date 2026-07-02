@@ -55,6 +55,30 @@ func decodeJSONBody(w http.ResponseWriter, r *http.Request, dst any) error {
 	return dec.Decode(dst)
 }
 
+// decodeOptionalJSONBody decodes a JSON body when one is present and
+// reports whether it was. It does NOT gate on r.ContentLength: chunked
+// / unknown-length POSTs arrive with ContentLength == -1 (and some
+// clients send 0 even with a body), so gating on ContentLength dropped
+// valid chunked bodies. Instead we attempt a decode and treat an empty
+// body (immediate EOF) as "no body present" (present=false, err=nil).
+// A non-empty but malformed body returns present=true + the decode
+// error so the caller can 400. Handlers that require a body treat
+// !present as the "body required" 400; handlers where the body is
+// optional simply proceed with a zero dst.
+func decodeOptionalJSONBody(w http.ResponseWriter, r *http.Request, dst any) (present bool, err error) {
+	r.Body = http.MaxBytesReader(w, r.Body, MaxJSONRequestBytes)
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if derr := dec.Decode(dst); derr != nil {
+		if errors.Is(derr, io.EOF) {
+			// Empty body: no content at all.
+			return false, nil
+		}
+		return true, derr
+	}
+	return true, nil
+}
+
 // parseLimit clamps a user-supplied `?limit=` to [1, max].
 // Returns an error for malformed input (so the caller emits 400
 // rather than silently fudging the value).
@@ -524,13 +548,14 @@ func (s *Server) handleAgentsHeartbeat(w http.ResponseWriter, r *http.Request) {
 // optional; when provided, fields ride into Job.Args so the agent
 // can honour --type=full|incremental, --tag, etc.
 func (s *Server) handleEnqueueBackup(w http.ResponseWriter, r *http.Request, deployment string) {
+	// Body is optional for backups. Parse it when present (including
+	// chunked/unknown-length POSTs, which don't set ContentLength); an
+	// absent body just means "use defaults".
 	var args map[string]any
-	if r.ContentLength > 0 {
-		if err := decodeJSONBody(w, r, &args); err != nil {
-			s.writeError(w, http.StatusBadRequest, "usage.bad_body",
-				"deployments/<n>/backups: parse body: "+err.Error())
-			return
-		}
+	if _, err := decodeOptionalJSONBody(w, r, &args); err != nil {
+		s.writeError(w, http.StatusBadRequest, "usage.bad_body",
+			"deployments/<n>/backups: parse body: "+err.Error())
+		return
 	}
 	repoURL := ""
 	if v, ok := args["repo"].(string); ok {
@@ -565,15 +590,19 @@ func (s *Server) handleEnqueueBackup(w http.ResponseWriter, r *http.Request, dep
 //	  "tempdir":   "/var/lib/pg_hardstorage/verify-tmp"   // optional
 //	}
 func (s *Server) handleEnqueueVerify(w http.ResponseWriter, r *http.Request, deployment string) {
+	// Body is required (must carry backup_id) but may arrive chunked
+	// with no ContentLength — parse it, and only 400 when genuinely
+	// absent or malformed.
 	var args map[string]any
-	if r.ContentLength <= 0 {
-		s.writeError(w, http.StatusBadRequest, "usage.bad_body",
-			"deployments/<n>/verifies: body required (JSON with backup_id)")
-		return
-	}
-	if err := decodeJSONBody(w, r, &args); err != nil {
+	present, err := decodeOptionalJSONBody(w, r, &args)
+	if err != nil {
 		s.writeError(w, http.StatusBadRequest, "usage.bad_body",
 			"deployments/<n>/verifies: parse body: "+err.Error())
+		return
+	}
+	if !present {
+		s.writeError(w, http.StatusBadRequest, "usage.bad_body",
+			"deployments/<n>/verifies: body required (JSON with backup_id)")
 		return
 	}
 	backupID, _ := args["backup_id"].(string)
@@ -619,15 +648,19 @@ func (s *Server) handleEnqueueVerify(w http.ResponseWriter, r *http.Request, dep
 // Required: backup_id, target_dir. Everything else flows into
 // Job.Args; the agent's RestoreExecutor parses them.
 func (s *Server) handleEnqueueRestore(w http.ResponseWriter, r *http.Request, deployment string) {
+	// Body is required (backup_id + target_dir) but may arrive chunked
+	// with no ContentLength — parse it, and only 400 when genuinely
+	// absent or malformed.
 	var args map[string]any
-	if r.ContentLength <= 0 {
-		s.writeError(w, http.StatusBadRequest, "usage.bad_body",
-			"deployments/<n>/restores: body required (JSON with backup_id and target_dir)")
-		return
-	}
-	if err := decodeJSONBody(w, r, &args); err != nil {
+	present, err := decodeOptionalJSONBody(w, r, &args)
+	if err != nil {
 		s.writeError(w, http.StatusBadRequest, "usage.bad_body",
 			"deployments/<n>/restores: parse body: "+err.Error())
+		return
+	}
+	if !present {
+		s.writeError(w, http.StatusBadRequest, "usage.bad_body",
+			"deployments/<n>/restores: body required (JSON with backup_id and target_dir)")
 		return
 	}
 	// Required fields. We validate at the route boundary so the
