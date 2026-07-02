@@ -304,6 +304,58 @@ func TestBuildStatusUpdate_Shape(t *testing.T) {
 // the pipe receives until the pipe is closed. Used by tests that
 // don't care about the standby-status replies but need them drained
 // to avoid deadlocking the synchronous net.Pipe.
+// TestRunReceiveLoop_TickSendErrorSurfacesPromptly pins bug #57: when a
+// ticker-goroutine status send fails, the receive loop must surface the
+// error PROMPTLY — not only after Receive returns. With the watchdog
+// effectively disabled (a long InactivityTimeout / no server traffic),
+// Receive would otherwise block for the whole timeout while the tick
+// error sat parked in a buffered channel. The fix cancels the receive
+// context when a tick send fails, so the loop returns right away with
+// that error.
+func TestRunReceiveLoop_TickSendErrorSurfacesPromptly(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Long inactivity timeout so a still-blocked Receive would take
+	// seconds; the test asserts we return WELL before that.
+	clientConn, serverConn := net.Pipe()
+	reader := streaming.NewWithConn(ctx, clientConn, streaming.Options{
+		InactivityTimeout: 30 * time.Second,
+	})
+	t.Cleanup(func() { _ = reader.Close(); _ = serverConn.Close() })
+
+	// Drain exactly the initial status update, then close the server
+	// side so EVERY subsequent send (the ticker's) fails on a broken
+	// pipe. The server never emits any data, so Receive would block on
+	// the 30s inactivity budget if the tick error weren't surfaced.
+	go func() {
+		buf := make([]byte, 4096)
+		_, _ = serverConn.Read(buf) // consume the initial status update
+		_ = serverConn.Close()      // break the pipe → next Send fails
+	}()
+
+	done := make(chan error, 1)
+	go func() {
+		// Short status interval so the failing tick fires quickly.
+		done <- runReceiveLoop(ctx, reader, &recordingSink{}, 20*time.Millisecond)
+	}()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("expected the tick send error to surface; got nil")
+		}
+		// Must NOT be the plain ctx cancellation — we cancelled the
+		// receive to unblock, but the surfaced error should be the send
+		// failure, which mentions the status update / send.
+		if errors.Is(err, context.Canceled) {
+			t.Errorf("surfaced ctx.Canceled instead of the send error: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("runReceiveLoop did not return promptly after a tick send failure (bug #57)")
+	}
+}
+
 func drainServerWrites(conn net.Conn) {
 	buf := make([]byte, 4096)
 	for {

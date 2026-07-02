@@ -127,6 +127,70 @@ func TestPushSegmentFile_RejectsWrongSize(t *testing.T) {
 	}
 }
 
+// TestPushSegmentFile_RejectsTruncatedToSmallerPowerOfTwo reproduces
+// bug #58: a 16 MiB segment truncated to 8 MiB (itself a valid
+// wal_segment_size) used to be ACCEPTED — the code inferred the segment
+// size from the file's byte length, producing the wrong SegmentsPerLog
+// and segment-number and corrupting hole-detection math. It must now be
+// rejected because 8 MiB != the declared/expected 16 MiB.
+func TestPushSegmentFile_RejectsTruncatedToSmallerPowerOfTwo(t *testing.T) {
+	dir := t.TempDir()
+	sp, cas := openFSRepo(t, "file://"+dir)
+	defer sp.Close()
+
+	segPath := filepath.Join(t.TempDir(), "000000010000000000000005")
+	// 8 MiB — a valid power-of-two segment size, but NOT the default
+	// 16 MiB this cluster runs.
+	body := make([]byte, 8*1024*1024)
+	if err := os.WriteFile(segPath, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := walsink.PushSegmentFile(context.Background(), cas, sp, segPath, walsink.PushOptions{
+		Deployment:       "db1",
+		SystemIdentifier: "7000000000000000001",
+		// SegmentSize unset -> defaults to 16 MiB.
+	})
+	if err == nil {
+		t.Fatal("expected rejection of an 8 MiB file against a 16 MiB cluster; got nil (bug #58 regressed)")
+	}
+	if !strings.Contains(err.Error(), "does not match the declared wal_segment_size") {
+		t.Errorf("expected declared-size-mismatch error; got %v", err)
+	}
+}
+
+// TestPushSegmentFile_AcceptsDeclaredNonDefaultSize confirms a cluster
+// with a non-default (but explicitly declared) segment size still works:
+// an 8 MiB file is accepted when SegmentSize=8 MiB is passed, and the
+// segment number is computed with the matching SegmentsPerLog.
+func TestPushSegmentFile_AcceptsDeclaredNonDefaultSize(t *testing.T) {
+	dir := t.TempDir()
+	sp, cas := openFSRepo(t, "file://"+dir)
+	defer sp.Close()
+
+	const segSize = 8 * 1024 * 1024
+	segPath := filepath.Join(t.TempDir(), "000000010000000000000005")
+	body := make([]byte, segSize)
+	if err := os.WriteFile(segPath, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	m, err := walsink.PushSegmentFile(context.Background(), cas, sp, segPath, walsink.PushOptions{
+		Deployment:       "db1",
+		SystemIdentifier: "7000000000000000001",
+		SegmentSize:      segSize,
+	})
+	if err != nil {
+		t.Fatalf("push with matching declared size: %v", err)
+	}
+	if m.SegmentSize != segSize {
+		t.Errorf("manifest SegmentSize = %d, want %d", m.SegmentSize, segSize)
+	}
+	// segmentsPerLog for 8 MiB = 4 GiB / 8 MiB = 512; seg_in_log = 5,
+	// log_id = 0 -> contiguous segment number 5.
+	if m.SegmentNumber != 5 {
+		t.Errorf("SegmentNumber = %d, want 5", m.SegmentNumber)
+	}
+}
+
 func TestPushSegmentFile_RejectsHistoryFile(t *testing.T) {
 	dir := t.TempDir()
 	repoURL := "file://" + dir

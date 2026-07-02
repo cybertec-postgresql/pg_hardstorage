@@ -150,6 +150,39 @@ func TestMessageAsCopyData(t *testing.T) {
 	}
 }
 
+// TestControlMessageAction pins bug #26: a mid-stream ErrorResponse or
+// CopyDone from the walsender must NOT be swallowed. Previously every
+// non-CopyData message was ignored, so an ERROR re-blocked the loop in
+// ReceiveMessage forever. controlMessageAction is the extracted, pure
+// classifier that decides the loop's action.
+func TestControlMessageAction(t *testing.T) {
+	// ErrorResponse -> ctrlError with a descriptive, SQLSTATE-bearing err.
+	act, err := controlMessageAction(&pgproto3.ErrorResponse{
+		Severity: "ERROR", Code: "XX000", Message: "boom",
+	})
+	if act != ctrlError {
+		t.Fatalf("ErrorResponse action = %v, want ctrlError", act)
+	}
+	if err == nil || !strings.Contains(err.Error(), "XX000") || !strings.Contains(err.Error(), "boom") {
+		t.Errorf("ErrorResponse error should carry SQLSTATE+message; got %v", err)
+	}
+
+	// CopyDone -> ctrlDone, clean shutdown (no error).
+	if act, err := controlMessageAction(&pgproto3.CopyDone{}); act != ctrlDone || err != nil {
+		t.Errorf("CopyDone action=%v err=%v, want ctrlDone/nil", act, err)
+	}
+
+	// NoticeResponse -> ctrlIgnore (keep streaming).
+	if act, err := controlMessageAction(&pgproto3.NoticeResponse{}); act != ctrlIgnore || err != nil {
+		t.Errorf("NoticeResponse action=%v err=%v, want ctrlIgnore/nil", act, err)
+	}
+
+	// CopyData -> ctrlNone (fall through to payload handling).
+	if act, err := controlMessageAction(&pgproto3.CopyData{Data: []byte{0x77}}); act != ctrlNone || err != nil {
+		t.Errorf("CopyData action=%v err=%v, want ctrlNone/nil", act, err)
+	}
+}
+
 // TestUint64FromBytes — the XLogData-frame helper must big-endian
 // decode 8 bytes and degrade to 0 on a short slice rather than
 // panicking on an out-of-range index.

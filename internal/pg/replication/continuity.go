@@ -32,17 +32,25 @@ const (
 
 // SlotContinuityResult is what EnsureSlot returns.
 //
-// GapBytes is positive when SlotRecreated AND the new slot's
-// restart_lsn is AHEAD of the caller's last_confirmed_lsn (i.e.,
-// PG has advanced past the point we last acknowledged). That's a
-// genuine WAL hole — PITR across the gap is impossible from this
-// repo alone. The leader-follow loop emits a wal_gap_detected
-// alert on Gap > 0.
+// GapBytes is positive when the slot's restart_lsn is AHEAD of the
+// caller's last_confirmed_lsn (i.e., PG has advanced past the point we
+// last acknowledged) — for BOTH outcomes:
+//   - SlotRecreated: the freshly-created slot's restart_lsn is ahead
+//     of last-confirmed; OR
+//   - SlotFound: an existing/synced/Patroni-recreated slot is already
+//     present on the new leader but its restart_lsn is ahead of
+//     last-confirmed (a slot recreated at promotion by Patroni MASKS
+//     the hole if we don't compare).
+//
+// Either case is a genuine WAL hole — PITR across the gap is
+// impossible from this repo alone. The leader-follow loop emits a
+// wal_gap_detected alert on Gap > 0.
 //
 // GapBytes is zero when:
-//   - SlotFound (no recreation happened); OR
-//   - SlotRecreated AND new restart_lsn ≤ last_confirmed_lsn
-//     (we acknowledged further than PG's restart_lsn — no gap).
+//   - restart_lsn ≤ last_confirmed_lsn (we acknowledged at/past PG's
+//     restart_lsn — no gap); OR
+//   - last_confirmed_lsn is 0 (fresh follower, gap undefined); OR
+//   - the slot's restart_lsn is empty (never used).
 type SlotContinuityResult struct {
 	Outcome          SlotContinuityOutcome
 	Slot             *SlotInfo
@@ -69,8 +77,11 @@ type SlotContinuityResult struct {
 //
 //   - Strategy A (Patroni permanent_slots): the slot exists on
 //     every node, including the new leader. EnsureSlot returns
-//     Outcome=SlotFound, Gap=0. The leader-follow loop resumes
-//     streaming via START_REPLICATION at last_confirmed_lsn.
+//     Outcome=SlotFound. Gap is USUALLY 0 — but a slot that Patroni
+//     (re)created at promotion can carry a restart_lsn ahead of
+//     last_confirmed_lsn, so EnsureSlot compares and reports the gap
+//     even on SlotFound. The leader-follow loop resumes streaming via
+//     START_REPLICATION at last_confirmed_lsn only when Gap==0.
 //
 //   - Strategy C (recreate-on-detection fallback): the slot
 //     doesn't exist on the new leader. EnsureSlot runs
@@ -96,11 +107,27 @@ func EnsureSlot(ctx context.Context, regConn, replConn *pg.Conn, slotName string
 	// Strategy A / B: slot is present on the new leader.
 	info, err := GetSlot(ctx, regConn, slotName)
 	if err == nil {
-		return &SlotContinuityResult{
+		res := &SlotContinuityResult{
 			Outcome:          SlotFound,
 			Slot:             info,
 			LastConfirmedLSN: lastConfirmedLSN,
-		}, nil
+		}
+		// DATA-INTEGRITY: a found slot is NOT automatically gap-free.
+		// Patroni (permanent_slots / synced-slots / a recreate-on-
+		// promotion race) can present a slot on the new leader whose
+		// restart_lsn is AHEAD of the LSN we last archived — PG advanced
+		// past our last-confirmed position and recycled the intervening
+		// WAL. That is a genuine WAL hole, identical in effect to the
+		// recreate path, and must be reported so the leader-follow loop
+		// raises wal_gap_detected / sets gapstate and restore preflight
+		// can refuse. Compute the gap here exactly as the recreate path
+		// below does. When restart_lsn is empty (never used) or
+		// lastConfirmedLSN is 0 (fresh follower) there's nothing to
+		// compare — leave Gap zero.
+		if err := populateGap(res, info, lastConfirmedLSN); err != nil {
+			return res, err
+		}
+		return res, nil
 	}
 	if !errors.Is(err, ErrSlotMissing) {
 		return nil, fmt.Errorf("replication: probe slot %q: %w", slotName, err)
@@ -128,35 +155,57 @@ func EnsureSlot(ctx context.Context, regConn, replConn *pg.Conn, slotName string
 		LastConfirmedLSN: lastConfirmedLSN,
 	}
 
-	// Compute the gap.
-	//
-	// info.RestartLSN is a string ("0/3000028" form). Parse to
-	// pglogrepl.LSN for arithmetic. The post-RESERVE_WAL slot
-	// always has a populated restart_lsn; an empty value here
-	// would be a PG bug or a wrong-mode call (logical slot →
-	// confirmed_flush_lsn instead) — surface explicitly.
+	// Compute the gap. The post-RESERVE_WAL slot always has a
+	// populated restart_lsn; an empty value on the recreate path is a
+	// PG bug or a wrong-mode call (logical slot → confirmed_flush_lsn
+	// instead) — surface explicitly rather than silently reporting no
+	// gap.
 	if info.RestartLSN == "" {
 		return res, fmt.Errorf("replication: slot %q has empty restart_lsn after RESERVE_WAL recreation (this should not happen on PG 15+)",
 			slotName)
 	}
+	if err := populateGap(res, info, lastConfirmedLSN); err != nil {
+		return res, err
+	}
+	return res, nil
+}
+
+// populateGap fills res's Gap* fields from the slot's restart_lsn and
+// the caller's lastConfirmedLSN. Shared by BOTH the SlotFound and the
+// SlotRecreated paths so a found slot whose restart_lsn is ahead of
+// last-confirmed is reported identically to a recreated one (a genuine
+// WAL hole either way — see EnsureSlot).
+//
+//   - Empty restart_lsn: nothing to compare (the slot has never been
+//     used). Leave Gap zero and return nil. The recreate path treats
+//     an empty restart_lsn as an error separately, before calling here.
+//   - lastConfirmedLSN == 0: no prior position (fresh follower / first
+//     connection on this slot). Gap is undefined — leave zero.
+//   - restart_lsn > lastConfirmedLSN: a real gap. GapBytes is the
+//     byte distance; GapStart/GapEnd bracket the hole.
+//   - restart_lsn <= lastConfirmedLSN: we've confirmed at/past PG's
+//     restart position; no gap.
+func populateGap(res *SlotContinuityResult, info *SlotInfo, lastConfirmedLSN pglogrepl.LSN) error {
+	if info == nil || info.RestartLSN == "" {
+		return nil
+	}
+	// info.RestartLSN is a string ("0/3000028" form). Parse to
+	// pglogrepl.LSN for arithmetic.
 	end, err := pglogrepl.ParseLSN(info.RestartLSN)
 	if err != nil {
-		return res, fmt.Errorf("replication: parse new restart_lsn %q: %w", info.RestartLSN, err)
+		return fmt.Errorf("replication: parse restart_lsn %q: %w", info.RestartLSN, err)
 	}
 	res.GapEndLSN = end
 	res.GapStartLSN = lastConfirmedLSN
 	if lastConfirmedLSN == 0 {
 		// No prior position — gap is undefined, leave at zero.
-		// The caller treats this as "first-time bootstrap on
-		// this slot" rather than a regression.
-		return res, nil
+		return nil
 	}
 	if end > lastConfirmedLSN {
 		res.GapBytes = uint64(end - lastConfirmedLSN)
 	}
-	// end <= lastConfirmedLSN: we're past PG's current position;
-	// no gap. Leaving GapBytes at zero is correct.
-	return res, nil
+	// end <= lastConfirmedLSN: we're past PG's current position; no gap.
+	return nil
 }
 
 // HasGap reports whether the result indicates a non-zero WAL gap.

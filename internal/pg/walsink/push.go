@@ -46,6 +46,21 @@ type PushOptions struct {
 	// same DEK so the chunks are actually encrypted; this field only
 	// stamps the envelope, it does not encrypt (issue #106).
 	Encryption *EncryptionInfo
+
+	// SegmentSize is the cluster's DECLARED wal_segment_size (from
+	// initdb --wal-segsize, probed once per cluster). The pushed file
+	// MUST be exactly this many bytes; a file of any other length is
+	// rejected rather than having its size inferred from len(body).
+	//
+	// Inferring the size from the file length is unsafe: a segment
+	// truncated to a SMALLER power of two (e.g. a 16 MiB segment cut to
+	// 8 MiB by a crash mid-copy) is itself a valid segment size, so it
+	// would be accepted and archived with the wrong SegmentsPerLog /
+	// segment-number, corrupting hole-detection and PITR math (audit
+	// #58). Zero resolves to DefaultSegmentSize (16 MiB) so callers that
+	// haven't yet threaded the probed size through still get the correct
+	// behaviour for a default cluster.
+	SegmentSize int64
 }
 
 // PushSegmentFile reads a 16 MiB WAL segment from path, runs it through
@@ -84,21 +99,25 @@ func PushSegmentFile(ctx context.Context, cas *repo.CAS, sp storage.StoragePlugi
 
 	base := filepath.Base(path)
 
+	// The cluster's DECLARED segment size drives BOTH the exact-length
+	// check on the file and the contiguous segment-number math. Never
+	// infer it from the file length: a truncated segment is a smaller
+	// valid size and would be silently mis-numbered (audit #58).
+	segSize := NormSegmentSize(opts.SegmentSize)
+	if !ValidSegmentSize(segSize) {
+		return nil, fmt.Errorf("walsink push: declared SegmentSize=%d is not a valid WAL segment size (want a power of two in [1 MiB, 1 GiB])", opts.SegmentSize)
+	}
+
 	// Validate the NAME shape first so non-segment files (.history,
 	// .partial, .backup, garbage) are rejected with ErrNotASegmentFile
-	// and routed to the aux path before we read any bytes. The size
-	// passed here is only for shape validation; the real segment size —
-	// and thus the contiguous segment number — comes from the file's
-	// own length below (a valid WAL segment file is exactly
-	// wal_segment_size bytes).
-	if _, _, err := ParseSegmentName(base, DefaultSegmentSize); err != nil {
+	// and routed to the aux path before we read any bytes.
+	if _, _, err := ParseSegmentName(base, segSize); err != nil {
 		return nil, err
 	}
-	body, err := readSegmentFile(path)
+	body, err := readSegmentFile(path, segSize)
 	if err != nil {
 		return nil, err
 	}
-	segSize := int64(len(body))
 	tli, segNum, err := ParseSegmentName(base, segSize)
 	if err != nil {
 		return nil, err
@@ -213,12 +232,15 @@ func ReadSystemIdentifierFromSegment(path string) (string, error) {
 }
 
 // readSegmentFile reads a WAL segment file in full and returns its
-// bytes. A valid WAL segment is exactly wal_segment_size bytes — a power
-// of two in [1 MiB, 1 GiB] — so the file's own length IS the cluster's
-// segment size; the caller derives it from len(body). Anything outside
-// that range (a truncated file, a .history file routed here by mistake)
+// bytes. The file MUST be EXACTLY wantSize bytes — the cluster's
+// declared wal_segment_size. We do NOT infer the size from the file's
+// own length: a segment truncated to a smaller power of two (e.g. a
+// crash mid-copy) is itself a valid segment size, so inferring would
+// accept it and archive it with the wrong segment-number, corrupting
+// hole-detection math (audit #58). Any length other than wantSize —
+// truncated, over-long, or a non-segment file routed here by mistake —
 // is refused with an obvious error.
-func readSegmentFile(path string) ([]byte, error) {
+func readSegmentFile(path string, wantSize int64) ([]byte, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("walsink push: open %s: %w", path, err)
@@ -228,8 +250,8 @@ func readSegmentFile(path string) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("walsink push: stat %s: %w", path, err)
 	}
-	if !ValidSegmentSize(st.Size()) {
-		return nil, fmt.Errorf("walsink push: %s: size=%d is not a valid WAL segment size (want a power of two in [1 MiB, 1 GiB] — a truncated segment or a non-segment file?)", path, st.Size())
+	if st.Size() != wantSize {
+		return nil, fmt.Errorf("walsink push: %s: size=%d does not match the declared wal_segment_size=%d (a truncated segment, a non-segment file, or a cluster whose segment size wasn't threaded through?)", path, st.Size(), wantSize)
 	}
 	body := make([]byte, st.Size())
 	if _, err := io.ReadFull(f, body); err != nil {

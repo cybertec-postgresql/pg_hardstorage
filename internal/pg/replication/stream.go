@@ -179,25 +179,31 @@ func runReceiveLoop(ctx context.Context, reader *streaming.Reader, sink WALSink,
 	}
 
 	// Ticker goroutine: sends periodic status updates. Lifetime is
-	// bound to a child context that we cancel when the receive loop
-	// exits, so the goroutine always cleans up.
-	tickCtx, cancelTick := context.WithCancel(ctx)
-	defer cancelTick()
-	tickErrs := make(chan error, 1)
+	// bound to a child context (recvCtx) that we cancel when the receive
+	// loop exits, so the goroutine always cleans up.
+	//
+	// Crucially, reader.Receive below also blocks on recvCtx — so when a
+	// tick's status send fails, the goroutine records the error AND
+	// cancels recvCtx, which UNBLOCKS the receive immediately (audit
+	// #57). Previously the tick error was parked in a buffered channel
+	// drained only at the top of the loop; with the watchdog disabled
+	// (no InactivityTimeout) Receive could block forever, so a broken
+	// send path never surfaced. tickErr is read after Receive returns to
+	// distinguish "our send failed" from a plain ctx cancellation.
+	recvCtx, cancelRecv := context.WithCancel(ctx)
+	defer cancelRecv()
+	var tickErr atomic.Pointer[error]
 	go func() {
 		tick := time.NewTicker(statusInterval)
 		defer tick.Stop()
 		for {
 			select {
-			case <-tickCtx.Done():
+			case <-recvCtx.Done():
 				return
 			case <-tick.C:
 				if err := sendStatusUpdate(reader, sink, &written); err != nil {
-					// Don't block on send — buffered.
-					select {
-					case tickErrs <- err:
-					default:
-					}
+					tickErr.Store(&err)
+					cancelRecv() // unblock the receive loop promptly
 					return
 				}
 			}
@@ -205,15 +211,13 @@ func runReceiveLoop(ctx context.Context, reader *streaming.Reader, sink WALSink,
 	}()
 
 	for {
-		// Drain any pending tick error so it surfaces promptly.
-		select {
-		case err := <-tickErrs:
-			return err
-		default:
-		}
-
-		msg, err := reader.Receive(ctx)
+		msg, err := reader.Receive(recvCtx)
 		if err != nil {
+			// If the receive unblocked because a tick send failed,
+			// surface THAT error rather than the resulting cancellation.
+			if te := tickErr.Load(); te != nil {
+				return *te
+			}
 			return err
 		}
 		// Server-initiated end of COPY. PG sends CopyDone when the

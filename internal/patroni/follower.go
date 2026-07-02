@@ -3,8 +3,11 @@ package patroni
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"strings"
 	"sync"
 	"time"
 )
@@ -100,6 +103,11 @@ type Follower struct {
 	onEvent       func(LeaderChange)
 	onPollError   func(error)
 
+	// sysIDProbe, when non-nil, overrides the default HTTP system-id
+	// probe. Set only by tests (via an internal export) so the
+	// cluster-identity check can be exercised without a live Patroni.
+	sysIDProbe systemIDProbe
+
 	mu        sync.RWMutex
 	current   *LeaderEndpoint
 	disabled  bool   // set if cluster-identity mismatch
@@ -187,6 +195,42 @@ func (f *Follower) poll(ctx context.Context) {
 		}
 	}
 
+	// Cluster-identity defence (the doc at ExpectedSystemID): when the
+	// operator pinned an expected pg_control system identifier, verify
+	// the cluster we're polling really is that cluster before we let a
+	// leader update through. A mismatch means a misconfigured fleet is
+	// about to stream WAL from a DIFFERENT cluster's primary — corrupt
+	// the repo's WAL continuity. On mismatch we DISABLE the follower
+	// (stop emitting leaders) and surface a critical error. Previously
+	// expectedSysID was stored but never read: the documented defence
+	// was dead code (audit #24).
+	if f.expectedSysID != "" {
+		observed, ok, serr := f.observeSystemID(ctx)
+		switch {
+		case serr != nil:
+			// Couldn't read the system id this tick. Not fatal — treat
+			// like any transient poll failure and try again next tick,
+			// rather than disabling on a blip.
+			if f.onPollError != nil {
+				f.onPollError(fmt.Errorf("patroni: system-identifier probe: %w", serr))
+			}
+			return
+		case ok && observed != f.expectedSysID:
+			reason := fmt.Sprintf("cluster system-identifier mismatch: expected %s, observed %s (misconfigured fleet — refusing to follow a different cluster's leader)",
+				f.expectedSysID, observed)
+			f.Disable(reason)
+			if f.onPollError != nil {
+				f.onPollError(errors.New("patroni: " + reason))
+			}
+			return
+		case !ok:
+			// Patroni didn't surface a system_identifier this tick
+			// (older Patroni, or the field is absent). We can't verify;
+			// leave the defence inactive for this poll rather than
+			// blocking on an unverifiable field. Documented behaviour.
+		}
+	}
+
 	f.mu.Lock()
 	old := f.current
 	if leadersEqual(old, newLeader) {
@@ -203,6 +247,76 @@ func (f *Follower) poll(ctx context.Context) {
 			New: newLeader,
 		})
 	}
+}
+
+// systemIDProbe returns the observed cluster system identifier and
+// whether one was surfaced. Overridable in tests via the follower's
+// sysIDProbe field; defaults to (*Follower).probeSystemIDHTTP.
+type systemIDProbe func(ctx context.Context) (id string, ok bool, err error)
+
+// observeSystemID reads the cluster's pg_control system identifier via
+// the configured probe (HTTP by default, overridable in tests via the
+// sysIDProbe field). Returns (id, true, nil) when present, ("", false,
+// nil) when the field is absent (older Patroni), and ("", false, err)
+// on a fetch/decode failure.
+func (f *Follower) observeSystemID(ctx context.Context) (string, bool, error) {
+	f.mu.RLock()
+	probe := f.sysIDProbe
+	f.mu.RUnlock()
+	if probe != nil {
+		return probe(ctx)
+	}
+	return f.probeSystemIDHTTP(ctx)
+}
+
+// probeSystemIDHTTP reads Patroni's /cluster endpoint and extracts the
+// top-level `system_identifier` field (newer Patroni surfaces it).
+// Returns ("", false, nil) when the field is absent.
+//
+// It uses a plain http.Client rather than the shared patroni.Client's
+// configured transport / basic-auth: the client exposes no accessor for
+// those, and widening its public surface is out of this change's scope
+// (see the report — the cleaner follow-up is a Cluster.SystemIdentifier
+// field on the shared type). This covers the common open-/cluster case.
+// Patroni normally emits system_identifier as a JSON string; we also
+// tolerate a JSON number for robustness.
+func (f *Follower) probeSystemIDHTTP(ctx context.Context) (string, bool, error) {
+	base := strings.TrimRight(f.client.BaseURL(), "/")
+	if base == "" {
+		return "", false, errors.New("patroni: follower has no base URL")
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/cluster", nil)
+	if err != nil {
+		return "", false, err
+	}
+	hc := &http.Client{Timeout: DefaultTimeout}
+	resp, err := hc.Do(req)
+	if err != nil {
+		return "", false, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", false, fmt.Errorf("patroni: GET /cluster for system id: status %d", resp.StatusCode)
+	}
+	var raw struct {
+		SystemID json.RawMessage `json:"system_identifier"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+		return "", false, fmt.Errorf("patroni: decode /cluster system_identifier: %w", err)
+	}
+	if len(raw.SystemID) == 0 || string(raw.SystemID) == "null" {
+		return "", false, nil
+	}
+	// Prefer a string; fall back to a bare number.
+	var s string
+	if err := json.Unmarshal(raw.SystemID, &s); err == nil && s != "" {
+		return s, true, nil
+	}
+	var n json.Number
+	if err := json.Unmarshal(raw.SystemID, &n); err == nil && n.String() != "" {
+		return n.String(), true, nil
+	}
+	return "", false, nil
 }
 
 // GetLeader returns the most recently observed leader endpoint,

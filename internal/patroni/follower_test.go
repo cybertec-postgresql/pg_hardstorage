@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -365,6 +366,145 @@ func TestFollower_DoneClosesOnContextCancel(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("Done channel did not close after context cancel")
 	}
+}
+
+// TestFollower_SystemIDMismatchDisables reproduces bug #24: with
+// ExpectedSystemID set, an observed cluster system identifier that
+// differs must DISABLE the follower (stop emitting leaders) and surface
+// a critical error. Previously ExpectedSystemID was stored but never
+// read — the documented cluster-identity defence was dead code.
+func TestFollower_SystemIDMismatchDisables(t *testing.T) {
+	srv := newFakeFollowSrv(t, clusterWithLeader("node-1", "host-1", 5432, 1))
+
+	c, err := patroni.NewClient(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	pollErrs := make(chan error, 8)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	f, err := patroni.Start(ctx, patroni.FollowerOptions{
+		Client:           c,
+		Interval:         25 * time.Millisecond,
+		ExpectedSystemID: "7000000000000000001",
+		OnEvent:          func(patroni.LeaderChange) {},
+		OnPollError:      func(e error) { pollErrs <- e },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Observed cluster reports a DIFFERENT system identifier.
+	f.SetSystemIDProbe(func(context.Context) (string, bool, error) {
+		return "9999999999999999999", true, nil
+	})
+
+	select {
+	case e := <-pollErrs:
+		if e == nil || !contains(e.Error(), "system-identifier mismatch") {
+			t.Fatalf("expected system-identifier mismatch error; got %v", e)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for mismatch poll error")
+	}
+
+	// The follower must now be disabled.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, disabled := f.DisabledReason(); disabled {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("follower was not disabled after system-id mismatch")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestFollower_SystemIDMatchKeepsFollowing: when the observed system
+// identifier matches ExpectedSystemID, the follower behaves normally and
+// emits the leader.
+func TestFollower_SystemIDMatchKeepsFollowing(t *testing.T) {
+	srv := newFakeFollowSrv(t, clusterWithLeader("node-1", "host-1", 5432, 1))
+
+	c, err := patroni.NewClient(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	events := make(chan patroni.LeaderChange, 8)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	f, err := patroni.Start(ctx, patroni.FollowerOptions{
+		Client:           c,
+		Interval:         25 * time.Millisecond,
+		ExpectedSystemID: "7000000000000000001",
+		OnEvent:          func(ev patroni.LeaderChange) { events <- ev },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.SetSystemIDProbe(func(context.Context) (string, bool, error) {
+		return "7000000000000000001", true, nil
+	})
+
+	select {
+	case ev := <-events:
+		if ev.New == nil || ev.New.Name != "node-1" {
+			t.Errorf("expected node-1 leader; got %+v", ev.New)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for leader event under matching system id")
+	}
+	if _, disabled := f.DisabledReason(); disabled {
+		t.Fatal("follower should not be disabled when system id matches")
+	}
+}
+
+// TestFollower_SystemIDAbsentKeepsFollowing: when Patroni doesn't
+// surface a system_identifier (older versions), the follower can't
+// verify and must keep working rather than blocking on the missing
+// field.
+func TestFollower_SystemIDAbsentKeepsFollowing(t *testing.T) {
+	srv := newFakeFollowSrv(t, clusterWithLeader("node-1", "host-1", 5432, 1))
+
+	c, err := patroni.NewClient(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	events := make(chan patroni.LeaderChange, 8)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	f, err := patroni.Start(ctx, patroni.FollowerOptions{
+		Client:           c,
+		Interval:         25 * time.Millisecond,
+		ExpectedSystemID: "7000000000000000001",
+		OnEvent:          func(ev patroni.LeaderChange) { events <- ev },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// ok=false: field absent.
+	f.SetSystemIDProbe(func(context.Context) (string, bool, error) {
+		return "", false, nil
+	})
+
+	select {
+	case ev := <-events:
+		if ev.New == nil || ev.New.Name != "node-1" {
+			t.Errorf("expected node-1 leader; got %+v", ev.New)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for leader event when system id absent")
+	}
+	if _, disabled := f.DisabledReason(); disabled {
+		t.Fatal("follower should not disable when system id is unavailable")
+	}
+}
+
+func contains(s, sub string) bool {
+	return strings.Contains(s, sub)
 }
 
 // TestFollower_RejectsNilClient: the constructor surfaces a clear

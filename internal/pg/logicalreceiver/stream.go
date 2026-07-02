@@ -181,74 +181,104 @@ func Stream(ctx context.Context, conn *pg.Conn, opts StreamOptions, sink Sink) (
 		return nil
 	}
 
-	statusTick := time.NewTicker(opts.StatusUpdateInterval)
-	defer statusTick.Stop()
+	// Periodic status deadline: the loop reports at least this often
+	// so a quiet publication (or wal_sender_timeout=0, where PG never
+	// sends a reply-requested keepalive) still advances the slot's
+	// confirmed_flush_lsn. We drive it by bounding each ReceiveMessage
+	// with a per-iteration deadline = now + StatusUpdateInterval. When
+	// ReceiveMessage hits THAT deadline we flush/report and loop — we do
+	// NOT treat it as an error. See nextStatus tracking below.
+	//
+	// Sends stay on this (the sole) goroutine: pgconn's frontend is not
+	// safe for a concurrent Send while ReceiveMessage blocks, so we must
+	// not spin up a writer goroutine (the previous statusReq goroutine
+	// only signalled — and was never observed while ReceiveMessage was
+	// blocked on a quiet stream, so status never fired: audit #56 /
+	// #27's leaked goroutine).
+	nextStatus := time.Now().Add(opts.StatusUpdateInterval)
 
-	// Dedicated channel + goroutine for the status-update tick: we
-	// don't want to block on the wire while sending status, and the
-	// receive goroutine's blocking ReceiveMessage loop can't
-	// interleave timer fires.
-	type statusSig struct{}
-	statusReq := make(chan statusSig, 1)
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-statusTick.C:
-				select {
-				case statusReq <- statusSig{}:
-				default:
-				}
-			}
-		}
-	}()
-
-	// Inactivity deadline: bound the amount of time we'll wait
-	// without server traffic before treating it as a stuck connection.
-	deadline := func() time.Time {
+	// Inactivity deadline: bound the total time we'll wait without ANY
+	// server traffic before treating it as a stuck connection. Distinct
+	// from the status cadence: a status-deadline hit is normal (flush &
+	// continue); an inactivity-deadline hit is fatal.
+	inactivityDeadline := func() time.Time {
 		if opts.InactivityTimeout <= 0 {
 			return time.Time{} // no deadline; rely on ctx cancellation
 		}
 		return time.Now().Add(opts.InactivityTimeout)
 	}
+	lastTraffic := time.Now()
 
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 
-		// Check for status-update request before blocking on receive.
-		select {
-		case <-statusReq:
+		// Fire the periodic flush/status whenever the cadence elapses,
+		// independent of whether a message just arrived (audit #56).
+		if !time.Now().Before(nextStatus) {
 			if err := flushAndReport(ctx); err != nil {
 				return err
 			}
-		default:
+			nextStatus = time.Now().Add(opts.StatusUpdateInterval)
 		}
 
-		// The deadline only needs to bound this one ReceiveMessage
-		// call. Cancel it as soon as ReceiveMessage returns —
-		// `defer cancel()` here would pile one un-cancelled context
-		// (and its timer goroutine) per received message onto the
-		// defer stack, leaking unbounded over a long-lived stream.
-		recvCtx := ctx
-		var cancel context.CancelFunc
-		if t := deadline(); !t.IsZero() {
-			recvCtx, cancel = context.WithDeadline(ctx, t)
+		// Bound this ReceiveMessage by the SOONER of the next status
+		// tick and the inactivity deadline, so a quiet stream wakes to
+		// flush/report on the status cadence rather than blocking until
+		// server traffic. Cancel as soon as ReceiveMessage returns —
+		// `defer cancel()` here would leak one context+timer per message.
+		waitUntil := nextStatus
+		inact := inactivityDeadline()
+		if !inact.IsZero() && inact.Before(waitUntil) {
+			waitUntil = inact
 		}
+		recvCtx, cancel := context.WithDeadline(ctx, waitUntil)
 		msg, err := pgc.ReceiveMessage(recvCtx)
-		if cancel != nil {
-			cancel()
-		}
+		cancel()
 		if err != nil {
 			if errors.Is(err, context.Canceled) {
 				return ctx.Err()
 			}
 			if errors.Is(err, context.DeadlineExceeded) {
-				return fmt.Errorf("logicalreceiver: inactivity timeout (%s)", opts.InactivityTimeout)
+				// Which deadline fired? If the inactivity budget is
+				// exhausted (no traffic for the whole window), that's
+				// fatal. Otherwise it's just the status cadence: flush,
+				// report, and loop back to keep receiving.
+				if !inact.IsZero() && !time.Now().Before(inact) &&
+					time.Since(lastTraffic) >= opts.InactivityTimeout {
+					return fmt.Errorf("logicalreceiver: inactivity timeout (%s)", opts.InactivityTimeout)
+				}
+				if err := flushAndReport(ctx); err != nil {
+					return err
+				}
+				nextStatus = time.Now().Add(opts.StatusUpdateInterval)
+				continue
 			}
 			return fmt.Errorf("logicalreceiver: receive: %w", err)
+		}
+		lastTraffic = time.Now()
+
+		// Handle the non-CopyData protocol messages the walsender can
+		// send mid-stream. Previously EVERYTHING that wasn't CopyData
+		// was silently ignored (`continue`), so an ERROR-severity
+		// ErrorResponse or a server CopyDone was swallowed and the loop
+		// re-blocked in ReceiveMessage forever (audit #26). Mirror the
+		// physical receiver's taxonomy via controlMessageAction (a pure
+		// function so the classification is unit-testable without a live
+		// walsender).
+		switch act, cerr := controlMessageAction(msg); act {
+		case ctrlError:
+			return cerr
+		case ctrlDone:
+			// Server-initiated clean end of COPY (e.g. PG shutting down).
+			// Not a failure — return nil and let the exit defers do the
+			// final flush + status update.
+			return nil
+		case ctrlIgnore:
+			// Non-fatal control message (e.g. NoticeResponse); keep
+			// streaming.
+			continue
 		}
 
 		// Look at the message body. pgconn surfaces CopyData for
@@ -310,6 +340,44 @@ func finalCommit(sink Sink) error {
 		return fmt.Errorf("logicalreceiver: final flush on shutdown: %w", err)
 	}
 	return nil
+}
+
+// controlAction is what the receive loop should do with a non-CopyData
+// backend message.
+type controlAction int
+
+const (
+	// ctrlNone: not a control message we handle here — fall through to
+	// the CopyData path.
+	ctrlNone controlAction = iota
+	// ctrlError: fatal server ErrorResponse — return the accompanying err.
+	ctrlError
+	// ctrlDone: server CopyDone — clean end of stream, return nil.
+	ctrlDone
+	// ctrlIgnore: non-fatal control message (NoticeResponse) — continue.
+	ctrlIgnore
+)
+
+// controlMessageAction classifies a backend message the logical
+// receive loop got from ReceiveMessage. It mirrors the physical
+// receiver's taxonomy so a mid-stream ErrorResponse or CopyDone isn't
+// swallowed (audit #26): an ErrorResponse aborts with a descriptive
+// error, a CopyDone ends the stream cleanly, a NoticeResponse is
+// ignored, and anything else falls through (ctrlNone) to the CopyData
+// handling. Pure function — no I/O — so it's unit-testable without a
+// live walsender.
+func controlMessageAction(msg pgproto3.BackendMessage) (controlAction, error) {
+	switch m := msg.(type) {
+	case *pgproto3.ErrorResponse:
+		return ctrlError, fmt.Errorf("logicalreceiver: server error: %s (SQLSTATE %s): %s",
+			m.Severity, m.Code, m.Message)
+	case *pgproto3.CopyDone:
+		return ctrlDone, nil
+	case *pgproto3.NoticeResponse:
+		return ctrlIgnore, nil
+	default:
+		return ctrlNone, nil
+	}
 }
 
 // messageAsCopyData unwraps a pgproto3.CopyData into its payload
