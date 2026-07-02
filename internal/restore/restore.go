@@ -2178,14 +2178,12 @@ func secureStagingDir(stagingRoot string) error {
 				Human: "another process (possibly another user) may have created it; remove it or pass --chain-staging-root / --reset-chain-staging",
 			})
 	}
-	if st, ok := info.Sys().(*syscall.Stat_t); ok {
-		if uint64(st.Uid) != uint64(os.Getuid()) {
-			return output.NewError("restore.staging_insecure",
-				fmt.Sprintf("restore: staging dir %q is owned by uid %d, not the current uid %d; refusing to stage into another user's directory", stagingRoot, st.Uid, os.Getuid())).
-				WithSuggestion(&output.Suggestion{
-					Human: "a different user created this staging dir; remove it or pass --chain-staging-root pointing at a directory only you own",
-				})
-		}
+	if uid, foreign := stagingForeignOwner(info); foreign {
+		return output.NewError("restore.staging_insecure",
+			fmt.Sprintf("restore: staging dir %q is owned by uid %d, not the current uid %d; refusing to stage into another user's directory", stagingRoot, uid, os.Getuid())).
+			WithSuggestion(&output.Suggestion{
+				Human: "a different user created this staging dir; remove it or pass --chain-staging-root pointing at a directory only you own",
+			})
 	}
 	return nil
 }
