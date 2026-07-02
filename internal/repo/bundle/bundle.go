@@ -372,9 +372,22 @@ func Import(ctx context.Context, r io.Reader, sp storage.StoragePlugin, opts Imp
 				return nil, fmt.Errorf("bundle: unsupported bundle schema %q (want %q)", bm.Schema, SchemaBundle)
 			}
 		case strings.HasPrefix(clean, "chunks/"):
-			// Chunk: PutIfNotExists.  PUT semantics give us
-			// idempotent re-import for free.
-			if err := putIfNotExists(ctx, sp, clean, tr); err != nil {
+			// Chunk: content-addressed write.  Before trusting the
+			// bundle we MUST confirm the payload's SHA-256 matches
+			// the hash embedded in the key — otherwise a corrupt or
+			// malicious bundle could plant a chunk whose bytes don't
+			// match its address, silently poisoning the CAS (every
+			// future reader that trusts the key would serve wrong
+			// content).  Read the entry fully, verify, then
+			// PutIfNotExists (idempotent re-import for free).
+			body, err := io.ReadAll(io.LimitReader(tr, MaxEntryBytes+1))
+			if err != nil {
+				return nil, fmt.Errorf("bundle: read chunk %s: %w", clean, err)
+			}
+			if err := verifyChunkPayload(clean, body); err != nil {
+				return nil, err
+			}
+			if err := putIfNotExists(ctx, sp, clean, strings_NewReader(string(body))); err != nil {
 				return nil, fmt.Errorf("bundle: write chunk %s: %w", clean, err)
 			}
 		case strings.HasPrefix(clean, "manifests/") || strings.HasPrefix(clean, "wal/"):
@@ -565,11 +578,37 @@ func pathClean(p string) (string, bool) {
 	return cleaned, true
 }
 
+// verifyChunkPayload confirms that body's SHA-256 matches the
+// content-address embedded in a chunk key (chunks/sha256/aa/bb/<hex>.chk).
+// The CAS is content-addressed: the key IS the hash of the bytes, so a
+// bundle that ships a chunk whose payload doesn't hash to its key is
+// corrupt or forged and must be rejected before it lands in the repo —
+// otherwise every later reader that trusts the key serves wrong content.
+func verifyChunkPayload(key string, body []byte) error {
+	want, err := repo.ParseChunkKey(key)
+	if err != nil {
+		return fmt.Errorf("bundle: reject chunk %s: not a valid chunk key: %w", key, err)
+	}
+	got := repo.HashOf(body)
+	if got != want {
+		return fmt.Errorf("bundle: reject chunk %s: payload SHA-256 %s does not match key hash %s",
+			key, got.String(), want.String())
+	}
+	return nil
+}
+
 // walSegmentKey builds the repo-relative storage key of a WAL
 // segment under the agent's standard layout.  The segment name
 // itself encodes timeline+LSN, so we don't subdivide further.
 func walSegmentKey(deployment string, timeline uint32, segName string) string {
-	return fmt.Sprintf("wal/%s/%d/%s", deployment, timeline, segName)
+	// WAL segment manifests live at wal/<dep>/<TIMELINE-8-hex>/<seg>.json
+	// (see internal/pg/walsink.SegmentPath).  The timeline is an
+	// 8-digit uppercase-hex directory and the file carries a .json
+	// suffix; a decimal timeline with no suffix pointed at a key that
+	// never existed, breaking bundle WAL export/import.  segName may
+	// already carry .json (defensive) — strip it before re-adding.
+	segName = strings.TrimSuffix(segName, ".json")
+	return fmt.Sprintf("wal/%s/%08X/%s.json", deployment, timeline, segName)
 }
 
 // readBundleManifest reads + parses one manifest, optionally

@@ -524,7 +524,16 @@ func FindMissing(ctx context.Context, sp storage.StoragePlugin, refs *RefSet) ([
 		}
 		_, err := sp.Stat(ctx, ChunkKey(h))
 		if err != nil {
-			missing = append(missing, h)
+			// Only a definitive "not present" counts as missing.
+			// Transient/backend errors (throttling, network,
+			// permission) must abort rather than falsely reporting
+			// the backup as damaged — otherwise a blip during a scan
+			// would flag healthy chunks and trigger needless alarm.
+			if errors.Is(err, storage.ErrNotFound) {
+				missing = append(missing, h)
+				continue
+			}
+			return missing, fmt.Errorf("repo: FindMissing: stat %s: %w", ChunkKey(h), err)
 		}
 	}
 	return missing, nil

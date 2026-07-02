@@ -4,26 +4,34 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
-	"fmt"
 	"strings"
 	"testing"
 
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo/bundle"
 )
 
-// tarWithChunkEntries builds a tar of n regular "chunks/xN" entries, each
-// `size` bytes. They import cleanly (putIfNotExists), so only the
-// whole-bundle caps can stop the import.
+// tarWithChunkEntries builds a tar of n regular content-addressed chunk
+// entries, each `size` bytes. Each chunk lives at its canonical
+// chunks/sha256/... key so it passes Import's payload-hash verification and
+// imports cleanly (putIfNotExists) — leaving only the whole-bundle caps as
+// the mechanism that can stop the import.
 func tarWithChunkEntries(t *testing.T, n, size int) []byte {
 	t.Helper()
 	var buf bytes.Buffer
 	tw := tar.NewWriter(&buf)
-	body := bytes.Repeat([]byte("a"), size)
 	for i := 0; i < n; i++ {
+		// Distinct bytes per entry so keys differ; each key is the
+		// content-address of its own body.
+		body := append(bytes.Repeat([]byte("a"), size-1), byte(i))
+		if size == 0 {
+			body = nil
+		}
+		key := repo.ChunkKey(repo.HashOf(body))
 		if err := tw.WriteHeader(&tar.Header{
-			Name:     fmt.Sprintf("chunks/x%d", i),
+			Name:     key,
 			Typeflag: tar.TypeReg,
-			Size:     int64(size),
+			Size:     int64(len(body)),
 			Mode:     0o644,
 		}); err != nil {
 			t.Fatal(err)

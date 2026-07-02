@@ -146,6 +146,11 @@ type ReplicateVerifyResult struct {
 	ManifestsPresent      int `json:"manifests_present"`
 	ManifestsMissing      int `json:"manifests_missing,omitempty"`
 	ManifestsContentDrift int `json:"manifests_content_drift,omitempty"`
+	// ManifestsTombstoned counts src manifests skipped because the
+	// backup is soft-deleted (tombstoned). Replicate deliberately
+	// never copies these, so verify must skip them too — otherwise a
+	// healthy replica is judged "broken" for correctly lacking them.
+	ManifestsTombstoned int `json:"manifests_tombstoned,omitempty"`
 
 	ChunksConsidered   int `json:"chunks_considered"`
 	ChunksPresent      int `json:"chunks_present"`
@@ -224,6 +229,32 @@ func VerifyReplicate(ctx context.Context, src, dst storage.StoragePlugin, opts R
 		prefix = "manifests/" + opts.Deployment + "/backups/"
 	}
 
+	// Collect tombstoned backup IDs at src first (mirrors Replicate's
+	// Pass 1). Tombstoned backups are soft-deleted; Replicate never
+	// copies them, so their manifests/chunks legitimately do not exist
+	// at the replica. Verifying them would flag a healthy replica as
+	// broken. A separate pass keeps this O(N) without a
+	// list-during-iteration footgun.
+	tombstoned := map[string]struct{}{}
+	for info, lerr := range src.List(ctx, prefix) {
+		if err := ctx.Err(); err != nil {
+			finish()
+			return res, err
+		}
+		if lerr != nil {
+			finish()
+			return res, fmt.Errorf("repo: VerifyReplicate: list src %q: %w", prefix, lerr)
+		}
+		if !strings.HasSuffix(info.Key, "/manifest.json.tombstone") {
+			continue
+		}
+		// Layout: manifests/<dep>/backups/<id>/manifest.json.tombstone
+		parts := strings.Split(info.Key, "/")
+		if len(parts) >= 4 {
+			tombstoned[parts[3]] = struct{}{}
+		}
+	}
+
 	// Pass 1: walk manifest keys at src.  For each manifest:
 	//   - confirm the same key exists at dst (Stat-only by default)
 	//   - parse the manifest body to enumerate chunk hashes
@@ -246,11 +277,26 @@ func VerifyReplicate(ctx context.Context, src, dst storage.StoragePlugin, opts R
 		if !isManifestKey(info.Key) {
 			continue
 		}
+		// Skip tombstoned (soft-deleted) backups: Replicate never
+		// copies them, so a healthy replica correctly lacks them.
+		if id := backupIDFromKey(info.Key); id != "" {
+			if _, dead := tombstoned[id]; dead {
+				res.ManifestsTombstoned++
+				continue
+			}
+		}
 		res.ManifestsConsidered++
 
 		// Manifest presence + content check.
 		drift, err := verifyKey(ctx, src, dst, info.Key, info.Size, opts)
 		if err != nil {
+			if !errors.Is(err, errReplicaKeyMissing) {
+				// Transient/backend or src-side error — we cannot
+				// conclude the replica is broken. Abort the verify
+				// and propagate rather than falsely flagging missing.
+				finish()
+				return res, fmt.Errorf("repo: VerifyReplicate: verify manifest %q: %w", info.Key, err)
+			}
 			recordReplicateVerifyFailure(res, ReplicateVerifyFailure{
 				Kind:   "missing_manifest",
 				Key:    info.Key,
@@ -295,6 +341,12 @@ func VerifyReplicate(ctx context.Context, src, dst storage.StoragePlugin, opts R
 			res.ChunksConsidered++
 			drift, err := verifyKey(ctx, src, dst, chunkKey, 0, opts)
 			if err != nil {
+				if !errors.Is(err, errReplicaKeyMissing) {
+					// Transient/backend or src-side error — abort
+					// rather than falsely flagging the chunk missing.
+					finish()
+					return res, fmt.Errorf("repo: VerifyReplicate: verify chunk %q: %w", chunkKey, err)
+				}
 				recordReplicateVerifyFailure(res, ReplicateVerifyFailure{
 					Kind:     "missing_chunk",
 					Key:      chunkKey,
@@ -342,6 +394,10 @@ func VerifyReplicate(ctx context.Context, src, dst storage.StoragePlugin, opts R
 			if isWALAuxKey(info.Key) {
 				res.WALAuxConsidered++
 				if _, aerr := verifyKey(ctx, src, dst, info.Key, info.Size, opts); aerr != nil {
+					if !errors.Is(aerr, errReplicaKeyMissing) {
+						finish()
+						return res, fmt.Errorf("repo: VerifyReplicate: verify wal aux %q: %w", info.Key, aerr)
+					}
 					recordReplicateVerifyFailure(res, ReplicateVerifyFailure{
 						Kind:   "missing_wal_aux",
 						Key:    info.Key,
@@ -361,6 +417,10 @@ func VerifyReplicate(ctx context.Context, src, dst storage.StoragePlugin, opts R
 			res.WALManifestsConsidered++
 			drift, err := verifyKey(ctx, src, dst, info.Key, info.Size, opts)
 			if err != nil {
+				if !errors.Is(err, errReplicaKeyMissing) {
+					finish()
+					return res, fmt.Errorf("repo: VerifyReplicate: verify wal manifest %q: %w", info.Key, err)
+				}
 				recordReplicateVerifyFailure(res, ReplicateVerifyFailure{
 					Kind:   "missing_wal_manifest",
 					Key:    info.Key,
@@ -405,8 +465,19 @@ func computeReplicateVerdict(r *ReplicateVerifyResult) ReplicateVerifyVerdict {
 	return VerdictConsistent
 }
 
+// errReplicaKeyMissing is returned by verifyKey when the key is
+// DEFINITIVELY absent at dst (dst.Stat returned storage.ErrNotFound).
+// Only this condition classifies the replica as broken. A transient
+// dst error, or any src-side error, is returned as a plain error that
+// does NOT match errors.Is(err, errReplicaKeyMissing) so the caller
+// aborts the verify rather than falsely declaring the replica broken.
+var errReplicaKeyMissing = errors.New("key missing at replica")
+
 // verifyKey checks dst for key.  Returns (drift, err) where:
-//   - err non-nil ↔ the key is MISSING at dst
+//   - err matches errors.Is(err, errReplicaKeyMissing) ↔ the key is
+//     DEFINITIVELY MISSING at dst (dst.Stat → ErrNotFound)
+//   - err non-nil but NOT errReplicaKeyMissing ↔ a transient/src
+//     error the caller must propagate (do NOT classify as missing)
 //   - drift=true ↔ the key is present but with mismatched
 //     content (size compared by default; in --deep mode, body
 //     SHA-256 compared as well)
@@ -417,6 +488,14 @@ func computeReplicateVerdict(r *ReplicateVerifyResult) ReplicateVerifyVerdict {
 func verifyKey(ctx context.Context, src, dst storage.StoragePlugin, key string, expectedSize int64, opts ReplicateVerifyOptions) (bool, error) {
 	dstInfo, err := dst.Stat(ctx, key)
 	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			// Definitively absent at the replica → missing.
+			return false, fmt.Errorf("%w: dst.Stat: %v", errReplicaKeyMissing, err)
+		}
+		// Transient/backend error (throttling, network, permission):
+		// we can't conclude the key is missing, so surface a plain
+		// error the caller propagates instead of marking the replica
+		// broken.
 		return false, fmt.Errorf("dst.Stat: %w", err)
 	}
 	if expectedSize == 0 {
