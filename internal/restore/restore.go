@@ -193,6 +193,10 @@ type chainLinkMarker struct {
 const chainLinkMarkerSchema = "pg_hardstorage.restore.chain_link_marker.v1"
 
 // Result is the structured outcome of a successful restore.
+//
+// Duration serializes as WHOLE MILLISECONDS under the frozen key
+// duration_ms (MarshalJSON below): a raw time.Duration under a _ms key
+// would emit nanoseconds, inflating every consumer's reading 1e6x.
 type Result struct {
 	BackupID          string        `json:"backup_id"`
 	Deployment        string        `json:"deployment"`
@@ -204,7 +208,30 @@ type Result struct {
 	TablespaceMapSize int           `json:"tablespace_map_size"`
 	StartedAt         time.Time     `json:"started_at"`
 	StoppedAt         time.Time     `json:"stopped_at"`
-	Duration          time.Duration `json:"duration_ms"`
+	Duration          time.Duration `json:"-"`
+}
+
+// MarshalJSON emits duration_ms as whole milliseconds (see Result doc).
+func (r Result) MarshalJSON() ([]byte, error) {
+	type alias Result // no methods: avoids recursing into MarshalJSON
+	return stdjson.Marshal(struct {
+		alias
+		DurationMS int64 `json:"duration_ms"`
+	}{alias(r), r.Duration.Milliseconds()})
+}
+
+// UnmarshalJSON is the inverse of MarshalJSON (ms → time.Duration).
+func (r *Result) UnmarshalJSON(b []byte) error {
+	type alias Result
+	aux := struct {
+		*alias
+		DurationMS int64 `json:"duration_ms"`
+	}{alias: (*alias)(r)}
+	if err := stdjson.Unmarshal(b, &aux); err != nil {
+		return err
+	}
+	r.Duration = time.Duration(aux.DurationMS) * time.Millisecond
+	return nil
 }
 
 // Restore materialises the named backup at TargetDir. See package
@@ -429,12 +456,27 @@ func Restore(ctx context.Context, opts Options) (res *Result, err error) {
 		))
 	var bytesWritten int64 = resumedBytes
 	var chunksFetched int = resumedChunks
+	// Resolve each non-default tablespace's on-disk destination once so
+	// tablespace files land at their real location (consistent with the
+	// tablespace_map we write below), not flattened under PGDATA root.
+	tsDests := tablespaceDestRoots(m, opts.TablespaceRemap)
 	for i := range m.Files {
 		f := &m.Files[i]
-		if _, alreadyDone := completed[f.Path]; alreadyDone {
+		// Checkpoint identity is (tablespace, path): two tablespaces
+		// can carry the same relative path, so keying resume on the
+		// bare path would wrongly skip a not-yet-written file.
+		fkey := checkpointKey(f)
+		if _, alreadyDone := completed[fkey]; alreadyDone {
 			continue
 		}
-		n, k, err := materializeFile(matCtx, cas, opts.TargetDir, f)
+		destRoot, err := fileDestRoot(opts.TargetDir, tsDests, f.TablespaceOID)
+		if err != nil {
+			matSpan.SetStatus(codes.Error, err.Error())
+			matSpan.End()
+			span.SetStatus(codes.Error, err.Error())
+			return nil, err
+		}
+		n, k, err := materializeFile(matCtx, cas, destRoot, f)
 		if err != nil {
 			// Best-effort flush of what we did manage so the next
 			// resume picks up here. A flush failure is non-fatal —
@@ -447,7 +489,7 @@ func Restore(ctx context.Context, opts Options) (res *Result, err error) {
 		}
 		bytesWritten += n
 		chunksFetched += k
-		if err := cw.MarkFileDone(f.Path, n, k); err != nil {
+		if err := cw.MarkFileDone(fkey, n, k); err != nil {
 			return nil, output.NewError("restore.checkpoint_write_failed",
 				fmt.Sprintf("restore: write checkpoint: %v", err)).Wrap(err)
 		}
@@ -485,7 +527,14 @@ func Restore(ctx context.Context, opts Options) (res *Result, err error) {
 		if d.Path == "" {
 			continue
 		}
-		full, err := safeJoinTarget(opts.TargetDir, d.Path)
+		// Same tablespace-aware resolution as files: a non-default
+		// tablespace's (possibly empty) dirs live under the
+		// tablespace's real location, not under PGDATA root.
+		dirRoot, err := fileDestRoot(opts.TargetDir, tsDests, d.TablespaceOID)
+		if err != nil {
+			return nil, fmt.Errorf("restore: dir %s: %w", d.Path, err)
+		}
+		full, err := safeJoinTarget(dirRoot, d.Path)
 		if err != nil {
 			return nil, fmt.Errorf("restore: dir %s: %w", d.Path, err)
 		}
@@ -1110,15 +1159,23 @@ func targetIsResumeEligible(target string, entries []os.DirEntry) (bool, error) 
 	return false, nil
 }
 
-// materializeFile creates the FileEntry's path under target and writes
-// the chunks in order. The destination is opened with O_TRUNC so a
-// retry over a non-empty target overwrites cleanly.
+// materializeFile creates the FileEntry's path under its resolved
+// destination root and writes the chunks in order. The destination is
+// opened with O_TRUNC so a retry over a non-empty target overwrites
+// cleanly.
+//
+// destRoot is the directory the FileEntry's (root-relative) Path is
+// joined onto: TargetDir for a default-tablespace file (OID 0), or the
+// non-default tablespace's real on-disk location (from tablespace_map,
+// after any operator remap) for a tablespace file. The join is
+// escape-guarded relative to destRoot, so a tablespace file's Path
+// still cannot climb out of its tablespace root.
 //
 // Returns (bytesWritten, chunksFetched, error). Named returns are
 // load-bearing — the deferred Close-error capture writes back into
 // `err` when Close itself fails.
-func materializeFile(ctx context.Context, cas *repo.CAS, target string, f *backup.FileEntry) (bytesWritten int64, chunksFetched int, err error) {
-	full, err := safeJoinTarget(target, f.Path)
+func materializeFile(ctx context.Context, cas *repo.CAS, destRoot string, f *backup.FileEntry) (bytesWritten int64, chunksFetched int, err error) {
+	full, err := safeJoinTarget(destRoot, f.Path)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -1179,6 +1236,92 @@ func materializeFile(ctx context.Context, cas *repo.CAS, target string, f *backu
 		return bytesWritten, len(f.Chunks), fmt.Errorf("fsync: %w", err)
 	}
 	return bytesWritten, len(f.Chunks), nil
+}
+
+// tablespaceDestRoots maps each non-default tablespace OID to the
+// ABSOLUTE directory its files must be materialised under.  The
+// mapping starts from the manifest's recorded Tablespace.Location
+// (where the tablespace lived on the source cluster) and applies the
+// operator's --tablespace-mapping remap so restore writes to the
+// target-cluster path the operator chose — the SAME path the rewritten
+// tablespace_map records, so PG's recovery-time pg_tblspc/ symlinks
+// point at the bytes we actually wrote.
+//
+// A tablespace is "non-default" — and thus gets an entry here — only
+// when its Location is an ABSOLUTE path.  PG reports the main data
+// directory's archive with OID 0 and an EMPTY Location; some tooling
+// records the implicit pg_default tablespace with its catalog OID
+// (1663) and a non-absolute location like "pg_default".  Neither is a
+// real external tablespace: their files belong under PGDATA root.
+// Keying on "absolute Location" is the reliable discriminator (a real
+// CREATE TABLESPACE always has an absolute directory) and keeps those
+// PGDATA-root files routed to TargetDir via fileDestRoot's fallback.
+func tablespaceDestRoots(m *backup.Manifest, remap TablespaceRemap) map[uint32]string {
+	out := make(map[uint32]string, len(m.Tablespaces))
+	for _, ts := range m.Tablespaces {
+		if ts.OID == 0 || !filepath.IsAbs(ts.Location) {
+			continue
+		}
+		dest := ts.Location
+		if !remap.Empty() {
+			// Reuse the tablespace_map rewrite logic so the path we
+			// write to and the path PG reads from tablespace_map stay
+			// identical.  Apply operates on "<oid> <path>" lines; feed
+			// it a single synthetic line and read the path back.
+			rewritten := remap.Apply(fmt.Sprintf("%d %s\n", ts.OID, ts.Location))
+			if p := parseTablespaceMapLinePath(rewritten); p != "" {
+				dest = p
+			}
+		}
+		out[ts.OID] = dest
+	}
+	return out
+}
+
+// parseTablespaceMapLinePath extracts the PATH from a single
+// "<oid> <path>\n" tablespace_map line.  Returns "" when the line is
+// malformed.  Used by tablespaceDestRoots to read back a remapped
+// location without duplicating TablespaceRemap.Apply's line grammar.
+func parseTablespaceMapLinePath(line string) string {
+	line = strings.TrimRight(line, "\n")
+	i := strings.Index(line, " ")
+	if i <= 0 || i == len(line)-1 {
+		return ""
+	}
+	return line[i+1:]
+}
+
+// fileDestRoot returns the directory a FileEntry's (root-relative)
+// Path is joined onto.
+//
+//   - A file whose OID resolves to a real external tablespace (one
+//     with an ABSOLUTE Location, present in dests) is materialised
+//     under that tablespace's on-disk location — NOT flattened under
+//     PGDATA root.  This is the core of the bug-3 fix.
+//   - Every other file — OID 0 (the main data directory's archive) or
+//     an OID that maps only to a PGDATA-root pseudo-tablespace like
+//     pg_default (non-absolute location, absent from dests) — is
+//     materialised under TargetDir, because its Path is already
+//     PGDATA-relative.
+func fileDestRoot(target string, dests map[uint32]string, oid uint32) (string, error) {
+	if oid == 0 {
+		return target, nil
+	}
+	if dest, ok := dests[oid]; ok {
+		return dest, nil
+	}
+	// Non-zero OID with no absolute-location tablespace: PGDATA-root.
+	return target, nil
+}
+
+// checkpointKey is the resume-checkpoint identity for a FileEntry.
+// It composes the tablespace OID and the path so two tablespaces that
+// carry the same relative path (their tars are both rooted at
+// PG_<ver>_<cat>/...) get distinct checkpoint entries.  OID 0 (the
+// default tablespace) yields "0\x00<path>" — stable and back-compat
+// safe because pre-tablespace-fix restores only ever had OID-0 files.
+func checkpointKey(f *backup.FileEntry) string {
+	return fmt.Sprintf("%d\x00%s", f.TablespaceOID, f.Path)
 }
 
 // writeSpecial materialises one of the manifest's special files
@@ -1390,6 +1533,20 @@ func restoreIncrementalChain(ctx context.Context, opts Options, sp storage.Stora
 			fmt.Sprintf("restore: leaf %q is marked incremental but the resolved chain has only one entry", leaf.BackupID))
 	}
 
+	// L1 — manifest self-consistency for EVERY link in the chain.
+	// The full-restore path validates its single manifest before
+	// touching disk (see Restore ~L334); the chain path validated
+	// none, so a malformed anchor or intermediate manifest surfaced
+	// only as a downstream materialise/pg_combinebackup failure (or
+	// worse, a subtly-wrong merged datadir).  Fail fast, before any
+	// I/O, naming the offending link.  See issue #16.
+	for i := range chain {
+		if verr := chain[i].Validate(); verr != nil {
+			return nil, output.NewError("manifest.invalid",
+				fmt.Sprintf("restore chain: link %d (%s): %v", i, chain[i].BackupID, verr)).Wrap(verr)
+		}
+	}
+
 	// 5. Allocate a staging area.  Stable across retries (keyed on
 	//    deployment + leaf_backup_id) so a re-run after a crash or
 	//    pg_combinebackup failure can skip already-materialised
@@ -1411,9 +1568,21 @@ func restoreIncrementalChain(ctx context.Context, opts Options, sp storage.Stora
 		emit(output.NewEvent(output.SeverityNotice, "restore", "chain_staging_reset").
 			WithBody(map[string]any{"staging_root": stagingRoot}))
 	}
-	if err := os.MkdirAll(stagingRoot, 0o700); err != nil {
-		return nil, output.NewError("internal",
-			fmt.Sprintf("restore: mkdir staging: %v", err)).Wrap(err)
+	// Create the staging root securely.  The DEFAULT path lives under
+	// the world-writable os.TempDir() at a name derived from
+	// (deployment, leaf_backup_id) — predictable, so a hostile local
+	// user could pre-create it (and its per-link completion markers)
+	// before we run.  A plain MkdirAll SUCCEEDS on such a pre-existing
+	// dir, exposing our staged bytes and letting a forged
+	// .pg_hardstorage_link_complete.json trick resume into skipping a
+	// link (serving attacker-controlled datadir bytes into the merged
+	// output).  secureStagingDir refuses any pre-existing staging dir
+	// we don't own or whose mode isn't 0700, and creates a fresh one
+	// with 0700 otherwise — preserving legitimate resume (a dir WE
+	// created and still own) while closing the tamper window.  See
+	// data-loss/security audit #44.
+	if err := secureStagingDir(stagingRoot); err != nil {
+		return nil, err
 	}
 	// Track success so the deferred cleanup only fires when the
 	// whole chain restore (including pg_combinebackup) succeeded.
@@ -1634,6 +1803,48 @@ func restoreIncrementalChain(ctx context.Context, opts Options, sp storage.Stora
 	// inputs.
 	chainSucceeded = true
 
+	// L2 — in-process pg_verifybackup over the MERGED output.
+	// pg_combinebackup writes a fresh backup_manifest into its output
+	// describing the flattened datadir; we hash every file it lists
+	// and compare, catching a missing / truncated / corrupted file
+	// the merge produced.  The full-restore path runs the same gate
+	// (see Restore ~L584); the chain path ran none.  Same TDE skip as
+	// the full path: under source-TDE the on-disk bytes are
+	// ciphertext and PG's plaintext checksums cannot match in-process.
+	// Read the merged manifest from disk (we don't carry it in a
+	// manifest struct for the chain).  See issue #16.
+	if leaf.SourceTDE != nil {
+		emit(output.NewEvent(output.SeverityNotice, "restore", "verifybackup_skipped_tde").
+			WithSubject(output.Subject{Deployment: leaf.Deployment, BackupID: leaf.BackupID}).
+			WithBody(map[string]any{
+				"reason": "source PG had TDE enabled at backup time; merged bytes are ciphertext and PG's plaintext checksums cannot match in-process. Boot the restored datadir under a TDE-capable PG with key access to run a meaningful pg_verifybackup.",
+				"engine": leaf.SourceTDE.Engine,
+			}))
+	} else if mergedManifest, rerr := os.ReadFile(filepath.Join(opts.TargetDir, "backup_manifest")); rerr == nil {
+		if vbRes, vberr := verifybackup.Verify(chainCtx, mergedManifest, opts.TargetDir); vberr != nil {
+			if errors.Is(vberr, verifybackup.ErrNoManifest) {
+				emit(output.NewEvent(output.SeverityNotice, "restore", "verifybackup_skipped_no_manifest").
+					WithSubject(output.Subject{Deployment: leaf.Deployment, BackupID: leaf.BackupID}).
+					WithBody(map[string]any{"reason": "merged output has no backup_manifest; in-process verifybackup unavailable"}))
+			} else {
+				return nil, output.NewError("restore.verifybackup_failed",
+					fmt.Sprintf("restore chain: %v", vberr)).Wrap(vberr)
+			}
+		} else if vbRes != nil {
+			emit(output.NewEvent(output.SeverityInfo, "restore", "verifybackup_ok").
+				WithSubject(output.Subject{Deployment: leaf.Deployment, BackupID: leaf.BackupID}).
+				WithBody(map[string]any{
+					"files_checked": vbRes.FilesChecked,
+					"bytes_hashed":  vbRes.BytesHashed,
+					"algorithm":     vbRes.Algorithm,
+				}))
+		}
+	} else {
+		emit(output.NewEvent(output.SeverityNotice, "restore", "verifybackup_skipped_no_manifest").
+			WithSubject(output.Subject{Deployment: leaf.Deployment, BackupID: leaf.BackupID}).
+			WithBody(map[string]any{"reason": fmt.Sprintf("could not read merged backup_manifest: %v", rerr)}))
+	}
+
 	// 9. PITR plumbing — same posture as full restore.
 	if opts.Recovery != nil && opts.Recovery.Enable {
 		if err := WriteRecoveryFiles(opts.TargetDir, *opts.Recovery); err != nil {
@@ -1650,6 +1861,79 @@ func restoreIncrementalChain(ctx context.Context, opts Options, sp storage.Stora
 				"timeline":    defaultIfEmpty(opts.Recovery.Timeline, "latest"),
 				"inclusive":   opts.Recovery.Inclusive,
 			}))
+	} else {
+		// 9b. NON-PITR chain restore still needs standby.signal +
+		// recovery_target='immediate' + a restore_command, exactly
+		// like the full-restore path (see WriteAutoRecovery ~L649).
+		// A chain's merged datadir has the same "trailing WAL segment
+		// not bundled" property as a full snapshot, so without this
+		// PG FATALs at startup or waits forever in standby.  The full
+		// path grew this else-branch; the chain path had no else at
+		// all, so a plain chain restore shipped an unbootable datadir.
+		// See issue #15.
+		if err := WriteAutoRecovery(opts.TargetDir, leaf.Deployment, opts.RepoURL); err != nil {
+			return nil, output.NewError("restore.auto_recovery_write",
+				fmt.Sprintf("restore chain: stage auto-recovery: %v", err)).Wrap(err)
+		}
+		emit(output.NewEvent(output.SeverityInfo, "restore", "auto_recovery_armed").
+			WithSubject(output.Subject{Deployment: leaf.Deployment, BackupID: leaf.BackupID}).
+			WithBody(map[string]any{
+				"signal":          "standby.signal",
+				"recovery_target": "immediate",
+				"restore_command": "wired",
+			}))
+	}
+
+	// L3 — post-restore cluster-start smoke test, honouring
+	// Options.VerifyMode exactly like the full-restore path (see
+	// Restore ~L671).  The chain path previously ran no L3 and never
+	// honoured VerifyMode="required", so a merged datadir that PG
+	// refuses to start (dangling tablespace symlink, missing empty
+	// dir, broken perms) shipped as "success".  Default OFF for the
+	// library; the CLI flips it to "auto".  See issue #16.
+	if opts.VerifyMode == "" {
+		opts.VerifyMode = string(postverify.ModeOff)
+	}
+	if mode, perr := postverify.ParseMode(opts.VerifyMode); perr != nil {
+		return nil, output.NewError("restore.verify_mode_invalid",
+			"restore chain: "+perr.Error()).Wrap(perr)
+	} else if mode != postverify.ModeOff {
+		recoveryArmed := opts.Recovery != nil && opts.Recovery.Enable
+		pvRes, pverr := postverify.Verify(chainCtx, postverify.Options{
+			Mode:           mode,
+			DataDir:        opts.TargetDir,
+			PGMajorVersion: leaf.PGVersion,
+			RecoveryArmed:  recoveryArmed,
+			RepoURL:        opts.RepoURL,
+			Deployment:     leaf.Deployment,
+		})
+		if pverr != nil {
+			return nil, output.NewError("restore.postverify_failed",
+				fmt.Sprintf("restore chain: %v", pverr)).Wrap(pverr)
+		}
+		if pvRes.Skipped {
+			emit(output.NewEvent(output.SeverityWarning, "restore", "postverify_skipped").
+				WithSubject(output.Subject{Deployment: leaf.Deployment, BackupID: leaf.BackupID}).
+				WithBody(map[string]any{
+					"reason": pvRes.SkipReason,
+					"mode":   string(mode),
+					"hint":   "install postgresql-client/server on the runner host or pass --verify-restore=off to silence",
+				}))
+		} else {
+			body := map[string]any{
+				"mode":           string(mode),
+				"start_ms":       pvRes.StartDuration.Milliseconds(),
+				"queries_ran":    pvRes.QueriesRan,
+				"recovery_armed": recoveryArmed,
+			}
+			if pvRes.DumpRan {
+				body["dump_ran"] = true
+				body["dump_ms"] = pvRes.DumpDuration.Milliseconds()
+			}
+			emit(output.NewEvent(output.SeverityInfo, "restore", "postverify_ok").
+				WithSubject(output.Subject{Deployment: leaf.Deployment, BackupID: leaf.BackupID}).
+				WithBody(body))
+		}
 	}
 
 	stoppedAt := time.Now().UTC()
@@ -1828,9 +2112,82 @@ func chainStagingPath(opts Options) (string, error) {
 	}
 	// Filename-safe key: deployment IDs are well-formed; backup
 	// IDs are timestamp-shaped (e.g. db1.full.20260428T0900Z) so
-	// they're already filesystem-safe.
+	// they're already filesystem-safe.  The path is derived (stable
+	// across retries) so resume works — but that also makes it
+	// predictable, so secureStagingDir enforces owner+mode before we
+	// trust anything already at this path.  Nest under a per-uid
+	// parent so a hostile user can't squat the exact path before us
+	// (they'd have to own our uid-scoped parent, which they can't
+	// create with our uid).
 	dir := fmt.Sprintf("pg_hardstorage-restore-chain-%s-%s", opts.Deployment, opts.BackupID)
-	return filepath.Join(os.TempDir(), dir), nil
+	parent := fmt.Sprintf("pg_hardstorage-restore-%d", os.Getuid())
+	return filepath.Join(os.TempDir(), parent, dir), nil
+}
+
+// secureStagingDir makes stagingRoot exist as a private (0700)
+// directory that the current user owns, without ever trusting a
+// pre-existing directory created by someone else.
+//
+// The default staging path is predictable (see chainStagingPath), so
+// on a shared host a hostile local user could pre-create it — a plain
+// MkdirAll would happily adopt that dir, exposing the bytes we stage
+// and letting the attacker plant forged completion markers.  We
+// therefore:
+//
+//   - MkdirAll the PARENT with 0700 (the uid-scoped parent from
+//     chainStagingPath; harmless for an operator-pinned path).
+//   - Try to create the leaf with os.Mkdir + 0700 (Mkdir, unlike
+//     MkdirAll, FAILS if the leaf already exists — so we notice a
+//     squatted dir instead of silently adopting it).
+//   - If the leaf already exists, lstat it and REFUSE unless it is a
+//     real directory (not a symlink), owned by our uid, with mode
+//     exactly 0700.  A dir that passes these checks is one WE created
+//     on a previous attempt — legitimate resume — so we keep it.
+func secureStagingDir(stagingRoot string) error {
+	if parent := filepath.Dir(stagingRoot); parent != "" && parent != "." {
+		if err := os.MkdirAll(parent, 0o700); err != nil {
+			return output.NewError("internal",
+				fmt.Sprintf("restore: mkdir staging parent %q: %v", parent, err)).Wrap(err)
+		}
+	}
+	err := os.Mkdir(stagingRoot, 0o700)
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, stdfs.ErrExist) {
+		return output.NewError("internal",
+			fmt.Sprintf("restore: mkdir staging %q: %v", stagingRoot, err)).Wrap(err)
+	}
+	// Pre-existing: verify it is ours and private before reusing it.
+	info, lerr := os.Lstat(stagingRoot)
+	if lerr != nil {
+		return output.NewError("internal",
+			fmt.Sprintf("restore: stat staging %q: %v", stagingRoot, lerr)).Wrap(lerr)
+	}
+	if info.Mode()&stdfs.ModeSymlink != 0 || !info.IsDir() {
+		return output.NewError("restore.staging_insecure",
+			fmt.Sprintf("restore: staging path %q exists and is not a plain directory (symlink or non-dir); refusing to stage into it", stagingRoot)).
+			WithSuggestion(&output.Suggestion{
+				Human: "remove the offending path or pass --chain-staging-root pointing at a directory only you can write, then retry (--reset-chain-staging forces a clean start)",
+			})
+	}
+	if info.Mode().Perm() != 0o700 {
+		return output.NewError("restore.staging_insecure",
+			fmt.Sprintf("restore: staging dir %q has mode %#o, want 0700; refusing to reuse a world/group-accessible staging dir", stagingRoot, info.Mode().Perm())).
+			WithSuggestion(&output.Suggestion{
+				Human: "another process (possibly another user) may have created it; remove it or pass --chain-staging-root / --reset-chain-staging",
+			})
+	}
+	if st, ok := info.Sys().(*syscall.Stat_t); ok {
+		if uint64(st.Uid) != uint64(os.Getuid()) {
+			return output.NewError("restore.staging_insecure",
+				fmt.Sprintf("restore: staging dir %q is owned by uid %d, not the current uid %d; refusing to stage into another user's directory", stagingRoot, st.Uid, os.Getuid())).
+				WithSuggestion(&output.Suggestion{
+					Human: "a different user created this staging dir; remove it or pass --chain-staging-root pointing at a directory only you own",
+				})
+		}
+	}
+	return nil
 }
 
 // readChainLinkMarker attempts to load + parse a chain-link

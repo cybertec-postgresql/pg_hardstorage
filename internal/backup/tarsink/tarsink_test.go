@@ -703,3 +703,67 @@ func TestTarsink_ChunkContentsHashCorrectly(t *testing.T) {
 		t.Error("rebuilt bytes do not match original")
 	}
 }
+
+// TestTarsink_StampsTablespaceOID pins the bug-#3 fix: every FileEntry
+// and DirEntry the sink produces must carry the OID of the tablespace
+// whose tar it came from.  Without this association, restore cannot
+// tell a non-default tablespace's files (relative to the tablespace
+// root) from PGDATA-root files, and flattens them under PGDATA — a
+// silently-corrupt restore where tablespace_map points at an empty dir.
+func TestTarsink_StampsTablespaceOID(t *testing.T) {
+	sink, _ := newSinkAndCAS(t)
+
+	// idx 0 — a non-default (user) tablespace, OID 16384. Its entries
+	// are relative to the tablespace root (PG_<ver>_<cat>/...), carrying
+	// both a TypeDir and a regular file so we can assert both stamps.
+	var udir bytes.Buffer
+	utw := tar.NewWriter(&udir)
+	utw.WriteHeader(&tar.Header{Name: "PG_18_202209061/", Typeflag: tar.TypeDir, Mode: 0o700})
+	utw.WriteHeader(&tar.Header{Name: "PG_18_202209061/16384/12345", Typeflag: tar.TypeReg, Mode: 0o600, Size: int64(len("user relfile"))})
+	utw.Write([]byte("user relfile"))
+	utw.Close()
+
+	// idx 1 — the base/default data directory, OID 0.
+	baseTS := buildTar(t, []fileSpec{
+		{name: "backup_label", body: []byte("START WAL LOCATION: 0/1 (file 0)\n")},
+		{name: "PG_VERSION", body: []byte("18\n")},
+	})
+
+	if err := drive(t, sink, 0, basebackup.TablespaceInfo{OID: 16384, Location: "/srv/ts1"}, udir.Bytes(), 0); err != nil {
+		t.Fatalf("drive user tablespace: %v", err)
+	}
+	if err := drive(t, sink, 1, basebackup.TablespaceInfo{OID: 0}, baseTS, 0); err != nil {
+		t.Fatalf("drive base tablespace: %v", err)
+	}
+
+	// Non-default tablespace files/dirs must carry OID 16384.
+	for _, f := range sink.Files(0) {
+		if f.TablespaceOID != 16384 {
+			t.Errorf("user tablespace file %q TablespaceOID = %d, want 16384", f.Path, f.TablespaceOID)
+		}
+	}
+	for _, d := range sink.AllDirs() {
+		if d.Path == "PG_18_202209061/" && d.TablespaceOID != 16384 {
+			t.Errorf("user tablespace dir %q TablespaceOID = %d, want 16384", d.Path, d.TablespaceOID)
+		}
+	}
+	// Default data-directory files must carry OID 0.
+	for _, f := range sink.Files(1) {
+		if f.TablespaceOID != 0 {
+			t.Errorf("base file %q TablespaceOID = %d, want 0", f.Path, f.TablespaceOID)
+		}
+	}
+	// AllFiles preserves the stamp across the flatten.
+	var sawUser bool
+	for _, f := range sink.AllFiles() {
+		if f.Path == "PG_18_202209061/16384/12345" {
+			sawUser = true
+			if f.TablespaceOID != 16384 {
+				t.Errorf("AllFiles lost the user-tablespace OID stamp: got %d", f.TablespaceOID)
+			}
+		}
+	}
+	if !sawUser {
+		t.Error("user tablespace relfile missing from AllFiles")
+	}
+}

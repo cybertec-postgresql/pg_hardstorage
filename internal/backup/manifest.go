@@ -219,12 +219,26 @@ type Tablespace struct {
 // FileEntry is one file in PGDATA captured by the backup. The Chunks
 // slice is the ordered list of chunk references whose concatenation
 // reconstitutes the file's bytes.
+//
+// TablespaceOID records which tablespace the file belongs to. Zero
+// (the default, and the zero value so pre-fix manifests read cleanly)
+// means the DEFAULT tablespace — Path is relative to PGDATA root and
+// restore materialises it under the target data directory. A non-zero
+// OID means Path is relative to that non-default tablespace's ROOT
+// (the tar PG streams for a user tablespace names its entries relative
+// to the tablespace root, NOT PGDATA); restore must materialise the
+// file under the tablespace's real location (from tablespace_map, or
+// the operator's --tablespace-mapping remap) rather than under the
+// data directory. Without this association every tablespace's tar
+// entries flattened into one list and landed under PGDATA root while
+// tablespace_map pointed at an empty dir — a silently-corrupt restore.
 type FileEntry struct {
-	Path    string     `json:"path"`
-	Size    int64      `json:"size"`
-	Mode    uint32     `json:"mode,omitempty"`
-	ModTime time.Time  `json:"mod_time,omitempty"`
-	Chunks  []ChunkRef `json:"chunks"`
+	Path          string     `json:"path"`
+	Size          int64      `json:"size"`
+	Mode          uint32     `json:"mode,omitempty"`
+	ModTime       time.Time  `json:"mod_time,omitempty"`
+	TablespaceOID uint32     `json:"tablespace_oid,omitempty"`
+	Chunks        []ChunkRef `json:"chunks"`
 }
 
 // DirEntry is one directory PG sent as a tar TypeDir entry in
@@ -240,6 +254,11 @@ type FileEntry struct {
 type DirEntry struct {
 	Path string `json:"path"`
 	Mode uint32 `json:"mode,omitempty"`
+	// TablespaceOID mirrors FileEntry.TablespaceOID: zero means the
+	// directory lives under PGDATA root; a non-zero OID means Path is
+	// relative to that non-default tablespace's root and restore
+	// re-creates it under the tablespace's real location.
+	TablespaceOID uint32 `json:"tablespace_oid,omitempty"`
 }
 
 // ChunkRef points at one chunk in the CAS. Offset is the chunk's first
@@ -531,19 +550,27 @@ func (m *Manifest) Validate() error {
 
 	// File invariants — uniqueness, chunk-len-sums-to-size,
 	// every chunk has a non-zero hash and len.
+	//
+	// Uniqueness is keyed on (TablespaceOID, Path), not Path alone:
+	// a non-default tablespace's tar entries are named relative to
+	// the tablespace root (e.g. "PG_18_202209061/16384/12345"), so
+	// two DIFFERENT tablespaces can legitimately carry the same
+	// relative path.  Keying on Path alone would reject a
+	// perfectly-valid multi-tablespace backup.
 	seenFile := map[string]bool{}
 	for i := range m.Files {
 		f := &m.Files[i]
 		if f.Path == "" {
 			return fmt.Errorf("manifest: files[%d] empty path", i)
 		}
-		if seenFile[f.Path] {
-			return fmt.Errorf("manifest: duplicate file path %q", f.Path)
+		fileKey := fmt.Sprintf("%d\x00%s", f.TablespaceOID, f.Path)
+		if seenFile[fileKey] {
+			return fmt.Errorf("manifest: duplicate file path %q in tablespace %d", f.Path, f.TablespaceOID)
 		}
 		if err := safeManifestPath(f.Path); err != nil {
 			return fmt.Errorf("manifest: files[%d]: %w", i, err)
 		}
-		seenFile[f.Path] = true
+		seenFile[fileKey] = true
 		if f.Size < 0 {
 			return fmt.Errorf("manifest: files[%d] %q size=%d (must be ≥0)", i, f.Path, f.Size)
 		}
@@ -581,15 +608,16 @@ func (m *Manifest) Validate() error {
 		if d.Path == "" {
 			return fmt.Errorf("manifest: dirs[%d] empty path", i)
 		}
-		if seenDir[d.Path] {
-			return fmt.Errorf("manifest: duplicate dir path %q", d.Path)
+		dirKey := fmt.Sprintf("%d\x00%s", d.TablespaceOID, d.Path)
+		if seenDir[dirKey] {
+			return fmt.Errorf("manifest: duplicate dir path %q in tablespace %d", d.Path, d.TablespaceOID)
 		}
 		if err := safeManifestPath(d.Path); err != nil {
 			return fmt.Errorf("manifest: dirs[%d]: %w", i, err)
 		}
-		seenDir[d.Path] = true
-		if seenFile[d.Path] {
-			return fmt.Errorf("manifest: dir %q collides with a file path of the same name", d.Path)
+		seenDir[dirKey] = true
+		if seenFile[dirKey] {
+			return fmt.Errorf("manifest: dir %q collides with a file path of the same name in tablespace %d", d.Path, d.TablespaceOID)
 		}
 	}
 

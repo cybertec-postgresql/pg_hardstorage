@@ -3,6 +3,7 @@ package restore
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os/exec"
@@ -50,6 +51,10 @@ func ParseVerifyMode(s string) (VerifyMode, error) {
 //	"missing_tool"    — VerifyAuto noted the absent binary; restore proceeds
 //	"passed"          — pg_verifybackup exited 0
 //	"failed"          — pg_verifybackup exited non-zero
+//
+// Duration serializes as WHOLE MILLISECONDS under the frozen key
+// duration_ms (MarshalJSON below) — a raw time.Duration would emit
+// nanoseconds under a _ms key.
 type VerifyResult struct {
 	Mode     VerifyMode    `json:"mode"`
 	Status   string        `json:"status"`
@@ -57,7 +62,30 @@ type VerifyResult struct {
 	ExitCode int           `json:"exit_code,omitempty"`
 	Stdout   string        `json:"stdout,omitempty"`
 	Stderr   string        `json:"stderr,omitempty"`
-	Duration time.Duration `json:"duration_ms,omitempty"`
+	Duration time.Duration `json:"-"`
+}
+
+// MarshalJSON emits duration_ms as whole milliseconds.
+func (v VerifyResult) MarshalJSON() ([]byte, error) {
+	type alias VerifyResult
+	return json.Marshal(struct {
+		alias
+		DurationMS int64 `json:"duration_ms,omitempty"`
+	}{alias(v), v.Duration.Milliseconds()})
+}
+
+// UnmarshalJSON is the inverse of MarshalJSON (ms → time.Duration).
+func (v *VerifyResult) UnmarshalJSON(b []byte) error {
+	type alias VerifyResult
+	aux := struct {
+		*alias
+		DurationMS int64 `json:"duration_ms,omitempty"`
+	}{alias: (*alias)(v)}
+	if err := json.Unmarshal(b, &aux); err != nil {
+		return err
+	}
+	v.Duration = time.Duration(aux.DurationMS) * time.Millisecond
+	return nil
 }
 
 // Verify runs the post-restore verification gate against target.

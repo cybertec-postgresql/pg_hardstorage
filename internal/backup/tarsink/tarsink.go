@@ -108,6 +108,17 @@ type Sink struct {
 	// history.
 	dirs map[int][]backup.DirEntry
 
+	// tsOID[idx] is the tablespace OID PG reported for tablespace
+	// idx in the BASE_BACKUP header (TablespaceInfo.OID).  The
+	// DEFAULT tablespace has OID 0 and its tar entries are relative
+	// to PGDATA root; a NON-DEFAULT tablespace has a non-zero OID
+	// and its tar entries are relative to the tablespace root.  We
+	// stamp this OID onto every FileEntry/DirEntry parsed from
+	// tablespace idx so restore can materialise non-default-
+	// tablespace files under their real location (from
+	// tablespace_map) instead of flattening them under PGDATA root.
+	tsOID map[int]uint32
+
 	// Special-file bytes captured from the first tablespace's tar.
 	backupLabel   []byte
 	tablespaceMap []byte
@@ -224,6 +235,7 @@ func New(ctx context.Context, cas *repo.CAS, opts ...Option) *Sink {
 		chunkConcurrency: defaultChunkConcurrency(),
 		files:            map[int][]backup.FileEntry{},
 		dirs:             map[int][]backup.DirEntry{},
+		tsOID:            map[int]uint32{},
 		currentIdx:       unsetIdx,
 	}
 	for _, o := range opts {
@@ -323,7 +335,7 @@ func (s *Sink) ManifestBytes() []byte {
 // (idx >= 0) it spawns the tar-parsing goroutine and opens the io.Pipe.
 // For the manifest CopyOut (idx == ManifestSinkIndex) it switches to
 // raw-byte accumulation.
-func (s *Sink) OnTablespaceStart(idx int, _ basebackup.TablespaceInfo) error {
+func (s *Sink) OnTablespaceStart(idx int, info basebackup.TablespaceInfo) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.currentIdx != unsetIdx {
@@ -336,6 +348,12 @@ func (s *Sink) OnTablespaceStart(idx int, _ basebackup.TablespaceInfo) error {
 		return nil
 	}
 
+	// Record the tablespace OID so parseTar can stamp every FileEntry
+	// / DirEntry from this tar with its owning tablespace.  OID 0 (the
+	// default tablespace) is stored as 0 and is the zero value, so the
+	// stamp is a no-op for PGDATA-root files.
+	s.tsOID[idx] = info.OID
+
 	pr, pw := io.Pipe()
 	s.pipeWriter = pw
 	done := make(chan parserResult, 1)
@@ -346,11 +364,12 @@ func (s *Sink) OnTablespaceStart(idx int, _ basebackup.TablespaceInfo) error {
 	// doesn't re-read s.parserDone at send time, which would race with
 	// OnTablespaceEnd nilling it out), and idx (immutable per-call).
 	ctx := s.ctx
+	tsOID := info.OID
 	go func() {
 		// Defer pr.Close so any subsequent Write on pw returns
 		// io.ErrClosedPipe rather than blocking forever.
 		defer pr.Close()
-		files, dirs, err := s.parseTar(ctx, pr, idx)
+		files, dirs, err := s.parseTar(ctx, pr, idx, tsOID)
 		done <- parserResult{files: files, dirs: dirs, err: err}
 	}()
 	return nil
@@ -487,7 +506,7 @@ func waitParser(ctx context.Context, done <-chan parserResult) (parserResult, bo
 //
 // Errors at any step abort the parse: subsequent OnTablespaceData
 // writes will see io.ErrClosedPipe and be re-surfaced as this error.
-func (s *Sink) parseTar(ctx context.Context, r io.Reader, idx int) ([]backup.FileEntry, []backup.DirEntry, error) {
+func (s *Sink) parseTar(ctx context.Context, r io.Reader, idx int, tsOID uint32) ([]backup.FileEntry, []backup.DirEntry, error) {
 	tr := tar.NewReader(r)
 	var files []backup.FileEntry
 	var dirs []backup.DirEntry
@@ -534,8 +553,9 @@ func (s *Sink) parseTar(ctx context.Context, r io.Reader, idx int) ([]backup.Fil
 			// restored datadir is missing pg_wal/ etc., so PG
 			// refuses to start (issue #7).
 			dirs = append(dirs, backup.DirEntry{
-				Path: hdr.Name,
-				Mode: uint32(hdr.Mode),
+				Path:          hdr.Name,
+				Mode:          uint32(hdr.Mode),
+				TablespaceOID: tsOID,
 			})
 			continue
 		case tar.TypeReg:
@@ -576,6 +596,10 @@ func (s *Sink) parseTar(ctx context.Context, r io.Reader, idx int) ([]backup.Fil
 		if err != nil {
 			return files, dirs, fmt.Errorf("chunk %s: %w", hdr.Name, err)
 		}
+		// Stamp the owning tablespace so restore materialises a
+		// non-default-tablespace file under its real location rather
+		// than flattening it under PGDATA root.
+		entry.TablespaceOID = tsOID
 		files = append(files, entry)
 	}
 }

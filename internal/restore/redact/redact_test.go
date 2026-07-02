@@ -1,6 +1,9 @@
 package redact_test
 
 import (
+	"crypto/md5"
+	"crypto/sha256"
+	"encoding/hex"
 	"strings"
 	"testing"
 
@@ -173,5 +176,51 @@ tables: {}
 `)
 	if _, err := redact.ParseRules(body); err == nil {
 		t.Error("expected empty-rules refusal")
+	}
+}
+
+// TestRedactValue_HashToUUID_UsesMD5NotSHA256 pins the bug-#75 fix:
+// the dry-run RedactValue must hash with MD5 so its preview matches
+// the value the production SQL — md5(decode(salt,'hex')||col)::uuid —
+// actually writes. Before the fix RedactValue hashed with SHA-256, so
+// every previewed value diverged from the applied one.
+func TestRedactValue_HashToUUID_UsesMD5NotSHA256(t *testing.T) {
+	salt := []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08}
+	const value = "alice@example.com"
+
+	// What PG's md5(decode(salt,'hex') || value::text)::uuid::text yields:
+	// MD5 over salt-bytes concatenated with the value bytes, hex-encoded,
+	// then formatted 8-4-4-4-12.
+	h := md5.Sum(append(append([]byte(nil), salt...), []byte(value)...))
+	hx := hex.EncodeToString(h[:])
+	wantMD5 := hx[0:8] + "-" + hx[8:12] + "-" + hx[12:16] + "-" + hx[16:20] + "-" + hx[20:32]
+
+	got := redact.RedactValue("hash_to_uuid", salt, value)
+	if got != wantMD5 {
+		t.Errorf("hash_to_uuid = %q, want md5-derived %q", got, wantMD5)
+	}
+
+	// Prove it is NOT the old SHA-256 output (defends against a revert).
+	sh := sha256.Sum256(append(append([]byte(nil), salt...), []byte(value)...))
+	shx := hex.EncodeToString(sh[:16])
+	sha := shx[0:8] + "-" + shx[8:12] + "-" + shx[12:16] + "-" + shx[16:20] + "-" + shx[20:32]
+	if got == sha {
+		t.Errorf("hash_to_uuid still produces the SHA-256 preview %q (bug #75 regressed)", sha)
+	}
+}
+
+// TestRedactValue_HashKeepDomain_MatchesProductionSQL pins that the
+// preview for hash_keep_domain equals left(md5(salt||localpart),8) plus
+// the '@domain' suffix — the exact shape strategyToSQLExpr emits.
+func TestRedactValue_HashKeepDomain_MatchesProductionSQL(t *testing.T) {
+	salt := []byte{0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x11}
+	const value = "bob@corp.example"
+
+	h := md5.Sum(append(append([]byte(nil), salt...), []byte("bob")...))
+	want := hex.EncodeToString(h[:])[:8] + "@corp.example"
+
+	got := redact.RedactValue("hash_keep_domain", salt, value)
+	if got != want {
+		t.Errorf("hash_keep_domain = %q, want %q (must mirror md5 SQL)", got, want)
 	}
 }

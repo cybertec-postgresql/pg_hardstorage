@@ -28,7 +28,7 @@
 //
 //   - nullify             — set to NULL
 //   - hash_to_uuid        — replace with a deterministic uuid
-//     derived from sha256(value | salt)
+//     derived from md5(salt | value) (matches the production SQL)
 //   - hash_keep_domain    — emails: hash localpart, keep @domain
 //   - replace_with_xxx    — replace every char with 'x'
 //   - constant:<value>    — replace with a literal value
@@ -59,8 +59,8 @@
 package redact
 
 import (
+	"crypto/md5"
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -236,11 +236,15 @@ func RedactValue(strategy Strategy, salt []byte, value string) string {
 	case strategy == "hash_to_uuid":
 		return hashUUID(salt, value)
 	case strategy == "hash_keep_domain":
-		i := strings.LastIndexByte(value, '@')
-		if i < 0 {
-			return hashUUID(salt, value)
-		}
-		return hashUUID(salt, value[:i])[:8] + value[i:]
+		// Mirror the production SQL exactly:
+		//   left(md5(salt||split_part(v,'@',1)),8)||'@'||split_part(v,'@',2)
+		// split_part(v,'@',1) is everything before the FIRST '@' (empty
+		// if none); split_part(v,'@',2) is the segment between the
+		// first and second '@' (empty when there is no '@').  We match
+		// that byte-for-byte so the dry-run preview equals the applied
+		// value.
+		local, domain := splitFirst(value, '@')
+		return md5Hex(salt, local)[:8] + "@" + domain
 	case strategy == "replace_with_xxx":
 		out := make([]byte, len(value))
 		for i := range out {
@@ -263,17 +267,46 @@ func RedactValue(strategy Strategy, salt []byte, value string) string {
 	return value
 }
 
-// hashUUID is sha256-keyed by the salt; we take 16 bytes and
-// format as a UUID-looking string so it slots into typical
-// PG UUID / VARCHAR columns.
+// hashUUID reproduces the production SQL for hash_to_uuid:
+//
+//	md5(decode('<salt>','hex') || <value>::text)::uuid::text
+//
+// PG's md5() digests (salt-bytes || value-bytes) and returns 32 lower-
+// case hex chars; ::uuid::text then re-emits them dash-grouped
+// (8-4-4-4-12).  We compute the identical MD5 over the identical byte
+// sequence and format it the same way, so a dry-run preview equals the
+// value the SQL will write.  (It previously used SHA-256, so previews
+// never matched applied values — issue #75.)
 func hashUUID(salt []byte, value string) string {
-	h := sha256.New()
-	h.Write(salt)
-	h.Write([]byte(value))
-	sum := h.Sum(nil)
-	hexStr := hex.EncodeToString(sum[:16])
+	hexStr := md5Hex(salt, value)
 	return fmt.Sprintf("%s-%s-%s-%s-%s",
 		hexStr[0:8], hexStr[8:12], hexStr[12:16], hexStr[16:20], hexStr[20:32])
+}
+
+// md5Hex returns the 32-char lowercase hex MD5 of (salt || value) —
+// the byte input PG's md5(decode(salt,'hex') || value::text) hashes.
+func md5Hex(salt []byte, value string) string {
+	h := md5.New()
+	h.Write(salt)
+	h.Write([]byte(value))
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// splitFirst splits value at the first occurrence of sep, mirroring
+// PostgreSQL's split_part(value, sep, 1) / split_part(value, sep, 2):
+// before is everything up to the first sep (all of value when sep is
+// absent); after is the segment between the first and second sep
+// (empty when sep is absent or is the last character).
+func splitFirst(value string, sep byte) (before, after string) {
+	i := strings.IndexByte(value, sep)
+	if i < 0 {
+		return value, ""
+	}
+	rest := value[i+1:]
+	if j := strings.IndexByte(rest, sep); j >= 0 {
+		return value[:i], rest[:j]
+	}
+	return value[:i], rest
 }
 
 // buildSetClauses renders one "col = SQL_expr" per column.

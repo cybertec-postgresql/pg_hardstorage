@@ -227,3 +227,39 @@ func TestWriteAutoRecovery_PrimesNonPITRRestore(t *testing.T) {
 		t.Errorf("standby.signal missing from auto-recovery primer: %v", err)
 	}
 }
+
+// TestWriteAutoRecovery_NeverSignalWithoutRestoreCommand pins the
+// bug-#73 fix: when a repo URL and deployment ARE supplied, the primer
+// must NOT drop standby.signal onto disk without a restore_command.
+// Previously, if os.Executable() errored, the restore_command line was
+// silently skipped while standby.signal was still written — producing a
+// cluster that enters recovery and then waits forever for WAL it has no
+// way to fetch.  The fix couples the two: on the happy path both are
+// present; on the (unforceable-in-test) os.Executable failure path the
+// call returns an error instead of writing a half-armed data dir.  Here
+// we assert the coupling holds on the happy path — a standby.signal is
+// never emitted alongside an auto-recovery block lacking a
+// restore_command.
+func TestWriteAutoRecovery_NeverSignalWithoutRestoreCommand(t *testing.T) {
+	dir := t.TempDir()
+	if err := restore.WriteAutoRecovery(dir, "db1", "file:///r"); err != nil {
+		t.Fatalf("WriteAutoRecovery: %v", err)
+	}
+	body, _ := os.ReadFile(filepath.Join(dir, "postgresql.auto.conf"))
+	_, sigErr := os.Stat(filepath.Join(dir, "standby.signal"))
+	if sigErr == nil && !strings.Contains(string(body), "restore_command") {
+		t.Fatalf("standby.signal written WITHOUT a restore_command — bug #73 regressed; conf:\n%s", body)
+	}
+
+	// Signal-only mode (empty repo + deployment) is the documented
+	// escape hatch for offline / synthesised-manifest use, and stays
+	// legal: no restore_command, and that is intentional.
+	dir2 := t.TempDir()
+	if err := restore.WriteAutoRecovery(dir2, "", ""); err != nil {
+		t.Fatalf("WriteAutoRecovery signal-only: %v", err)
+	}
+	body2, _ := os.ReadFile(filepath.Join(dir2, "postgresql.auto.conf"))
+	if strings.Contains(string(body2), "restore_command") {
+		t.Errorf("signal-only primer should not emit a restore_command; got:\n%s", body2)
+	}
+}

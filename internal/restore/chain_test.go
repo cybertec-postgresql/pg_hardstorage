@@ -384,3 +384,84 @@ func TestRestore_ChainSuccessfulCombineFinalizesTarget(t *testing.T) {
 		t.Errorf("staging dir should be gone after a successful finalize")
 	}
 }
+
+// fakeCombine writes a fake pg_combinebackup that copies a caller-chosen
+// set of files into its -o output dir and exits 0.  Registers it via the
+// version-scoped env var the discovery uses.
+func fakeCombine(t *testing.T, dir string, pgVersion int, extraScript string) {
+	t.Helper()
+	fake := filepath.Join(dir, "pg_combinebackup")
+	script := "#!/bin/sh\n" +
+		"out=\"\"\n" +
+		"while [ $# -gt 0 ]; do if [ \"$1\" = \"-o\" ]; then out=\"$2\"; fi; shift; done\n" +
+		"mkdir -p \"$out\"\n" +
+		"echo 17 > \"$out/PG_VERSION\"\n" +
+		extraScript +
+		"exit 0\n"
+	if err := os.WriteFile(fake, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(fmt.Sprintf("PG_COMBINEBACKUP_%d", pgVersion), fake)
+}
+
+// TestRestore_ChainNonPITR_ArmsAutoRecovery is the regression for bug
+// #15: a plain (non-PITR) chain restore must drop standby.signal + a
+// recovery_target='immediate' block + a restore_command, exactly like
+// the full-restore path.  Before the fix the chain path had no
+// else-branch, so a non-PITR chain restore shipped a datadir with no
+// recovery signal at all — PG FATALed at startup.
+func TestRestore_ChainNonPITR_ArmsAutoRecovery(t *testing.T) {
+	fx := newChainFixture(t)
+	dir := t.TempDir()
+	target := filepath.Join(dir, "merged")
+	fakeCombine(t, dir, fx.inc.PGVersion, "")
+
+	if _, err := restore.Restore(context.Background(), restore.Options{
+		RepoURL:    fx.repoURL,
+		Deployment: "db1",
+		BackupID:   fx.inc.BackupID,
+		TargetDir:  target,
+		Verifier:   fx.verifier,
+		// VerifyMode left default (off) so no host PG is needed.
+	}); err != nil {
+		t.Fatalf("non-PITR chain restore should succeed: %v", err)
+	}
+
+	if _, err := os.Stat(filepath.Join(target, "standby.signal")); err != nil {
+		t.Errorf("standby.signal missing after non-PITR chain restore (bug #15): %v", err)
+	}
+	conf, _ := os.ReadFile(filepath.Join(target, "postgresql.auto.conf"))
+	for _, want := range []string{"recovery_target = 'immediate'", "restore_command", "wal fetch"} {
+		if !strings.Contains(string(conf), want) {
+			t.Errorf("auto-recovery block missing %q after chain restore; got:\n%s", want, conf)
+		}
+	}
+}
+
+// TestRestore_ChainVerifyModeRequired_HardFails is the regression for
+// bug #16: the chain path must honour VerifyMode="required".  With the
+// fake pg_combinebackup producing a datadir that lacks global/pg_control,
+// postverify in required mode must hard-fail — proving the L3 gate is
+// wired into the chain path (it previously ran no verification at all).
+func TestRestore_ChainVerifyModeRequired_HardFails(t *testing.T) {
+	fx := newChainFixture(t)
+	dir := t.TempDir()
+	target := filepath.Join(dir, "merged")
+	fakeCombine(t, dir, fx.inc.PGVersion, "")
+
+	_, err := restore.Restore(context.Background(), restore.Options{
+		RepoURL:    fx.repoURL,
+		Deployment: "db1",
+		BackupID:   fx.inc.BackupID,
+		TargetDir:  target,
+		Verifier:   fx.verifier,
+		VerifyMode: "required",
+	})
+	if err == nil {
+		t.Fatal("VerifyMode=required must hard-fail the chain restore when the merged datadir can't be verified (bug #16)")
+	}
+	var oerr *output.Error
+	if !errors.As(err, &oerr) || oerr.Code != "restore.postverify_failed" {
+		t.Fatalf("expected restore.postverify_failed, got %v", err)
+	}
+}

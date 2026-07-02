@@ -373,9 +373,18 @@ func Verify(ctx context.Context, opts Options) (*Result, error) {
 		"-t", fmt.Sprintf("%d", int(opts.StartTimeout.Seconds())),
 		"-w", "start",
 	}
+	// Always stop on the way out, even when pg_ctl start itself
+	// FAILS.  `pg_ctl -w start` can report failure (non-zero exit,
+	// e.g. "server did not start in time") while the postmaster it
+	// forked is in fact alive and holding the datadir lockfile +
+	// port — a leaked live postmaster.  registerStopGuard installs
+	// the best-effort `pg_ctl stop` defer BEFORE the start attempt
+	// (rather than after it succeeds) so the cleanup fires on the
+	// failure path too.
+	defer registerStopGuard(pgCtl, opts.DataDir)()
+
 	startedAt := time.Now()
-	startCmd := exec.CommandContext(ctx, pgCtl, startArgs...)
-	if out, err := startCmd.CombinedOutput(); err != nil {
+	if out, err := runStart(ctx, pgCtl, startArgs); err != nil {
 		// Capture the postgres start log for forensics.  Truncation
 		// limits were originally 256 / 1024 but a tier-7 validate
 		// soak surfaced a B11-class failure whose actual FATAL log
@@ -394,17 +403,8 @@ func Verify(ctx context.Context, opts Options) (*Result, error) {
 	}
 	res.StartDuration = time.Since(startedAt)
 
-	// Always stop on the way out, even on probe failure.
-	// Best-effort: a hung postmaster shouldn't block the
-	// caller for more than 30s.
-	stopOnReturn := func() {
-		stopCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		stopCmd := exec.CommandContext(stopCtx, pgCtl,
-			"-D", opts.DataDir, "-m", "fast", "stop")
-		_ = stopCmd.Run()
-	}
-	defer stopOnReturn()
+	// (the stop guard was registered before the start attempt above
+	// so it also cleans up a postmaster leaked by a failed start.)
 
 	// Connection-string preference (issue #85): the local Unix
 	// socket has two advantages over TCP for the postverify
@@ -474,6 +474,33 @@ func Verify(ctx context.Context, opts Options) (*Result, error) {
 	}
 
 	return res, nil
+}
+
+// runStart runs `pg_ctl … -w start` and returns its combined
+// output + error.  Split out from Verify so the start/stop
+// sequencing (the stop guard must be armed BEFORE this runs) is
+// unit-testable with a stub pg_ctl — see bug 52.
+func runStart(ctx context.Context, pgCtl string, startArgs []string) ([]byte, error) {
+	startCmd := exec.CommandContext(ctx, pgCtl, startArgs...)
+	return startCmd.CombinedOutput()
+}
+
+// registerStopGuard returns a best-effort `pg_ctl -m fast stop`
+// closure for dataDir.  Callers `defer` the returned func BEFORE
+// attempting start so a postmaster leaked by a FAILED
+// `pg_ctl -w start` (non-zero exit but a live forked postmaster
+// still holding the datadir lock + port) is still stopped.  A
+// stop against a stopped/absent postmaster is a harmless no-op
+// whose error is intentionally discarded; a hung postmaster is
+// bounded to 30s so it can't block the caller.
+func registerStopGuard(pgCtl, dataDir string) func() {
+	return func() {
+		stopCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		stopCmd := exec.CommandContext(stopCtx, pgCtl,
+			"-D", dataDir, "-m", "fast", "stop")
+		_ = stopCmd.Run()
+	}
 }
 
 // probeDumpall runs `pg_dumpall > /dev/null` against the

@@ -98,6 +98,42 @@ func TestVerify_ErrNoEnvironment_IsSentinel(t *testing.T) {
 	}
 }
 
+// TestStopGuard_RunsWhenStartFails is the bug-52 regression: when
+// `pg_ctl -w start` fails (non-zero exit) it may still have forked
+// a live postmaster holding the datadir/port.  Verify must run a
+// `pg_ctl stop` even on the start-failure path.  Before the fix
+// the stop defer was registered only AFTER a successful start, so
+// a failed start leaked the postmaster.  We drive the extracted
+// start/stop sequencing with a stub pg_ctl that fails `start` and
+// records that `stop` was invoked.
+func TestStopGuard_RunsWhenStartFails(t *testing.T) {
+	if _, err := os.Stat("/bin/sh"); err != nil {
+		t.Skip("needs /bin/sh for the stub pg_ctl")
+	}
+	dir := t.TempDir()
+	stopMarker := filepath.Join(dir, "stop-was-called")
+	// Stub pg_ctl: exit 1 on `start`, touch the marker on `stop`.
+	// The subcommand is the last positional arg pg_ctl receives.
+	stub := filepath.Join(dir, "pg_ctl")
+	script := "#!/bin/sh\n" +
+		"for a in \"$@\"; do last=\"$a\"; done\n" +
+		"if [ \"$last\" = start ]; then echo 'server did not start in time' 1>&2; exit 1; fi\n" +
+		"if [ \"$last\" = stop ]; then : > \"" + stopMarker + "\"; exit 0; fi\n" +
+		"exit 0\n"
+	if err := os.WriteFile(stub, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	startArgs := []string{"-D", dir, "-w", "start"}
+	err := postverify.StartWithStopGuardForTest(context.Background(), stub, dir, startArgs)
+	if err == nil {
+		t.Fatal("stub start should have failed")
+	}
+	if _, statErr := os.Stat(stopMarker); statErr != nil {
+		t.Fatalf("stop guard did not run after failed start (bug 52 regression): %v", statErr)
+	}
+}
+
 // TestStageForRecovery_PITRArmed_NoImmediateTarget locks the issue-#56
 // fix: when the restore already armed a PITR recovery_target_* block,
 // postverify must not append its own `recovery_target = 'immediate'`

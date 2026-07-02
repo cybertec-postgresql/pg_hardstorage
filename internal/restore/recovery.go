@@ -189,18 +189,34 @@ func WriteAutoRecovery(target, deployment, repoURL string) error {
 	b.WriteString("recovery_target = 'immediate'\n")
 	b.WriteString("recovery_target_action = 'promote'\n")
 	if repoURL != "" && deployment != "" {
+		// os.Executable() is how we discover the agent binary to embed
+		// in restore_command.  If it fails (or returns empty) we CANNOT
+		// silently drop the line: without restore_command PG enters
+		// recovery via the standby.signal below and then waits forever
+		// for a WAL segment nobody will ever hand it — the exact
+		// "standby waits forever" failure this function exists to
+		// prevent.  Surface it as a hard error so the caller sees the
+		// gap instead of shipping a cluster that never reaches
+		// consistency.  (Callers that deliberately want a signal-only
+		// data dir pass empty repoURL/deployment, handled above.)
 		bin, err := os.Executable()
-		if err == nil && bin != "" {
-			// quoteSQL not naked '%s': walfetchcmd.Build returns a
-			// shell command that contains single-quoted args (POSIX
-			// safety for repo URLs with `&`), so wrapping in raw PG
-			// single quotes here would produce nested apostrophes
-			// PG parses as `'sh -c "'<break>` → "syntax error near
-			// token /".  The PITR-config path (configPITR) routes
-			// through quoteSQL for the same reason.
-			fmt.Fprintf(&b, "restore_command = %s\n",
-				quoteSQL(walfetchcmd.Build(bin, deployment, repoURL)))
+		if err != nil {
+			return fmt.Errorf("auto-recovery: cannot resolve agent binary for restore_command (os.Executable: %w); "+
+				"the restored cluster would enter recovery and wait forever for WAL with no way to fetch it", err)
 		}
+		if bin == "" {
+			return errors.New("auto-recovery: os.Executable returned an empty path; " +
+				"cannot build restore_command, and the restored cluster would wait forever for WAL")
+		}
+		// quoteSQL not naked '%s': walfetchcmd.Build returns a
+		// shell command that contains single-quoted args (POSIX
+		// safety for repo URLs with `&`), so wrapping in raw PG
+		// single quotes here would produce nested apostrophes
+		// PG parses as `'sh -c "'<break>` → "syntax error near
+		// token /".  The PITR-config path (configPITR) routes
+		// through quoteSQL for the same reason.
+		fmt.Fprintf(&b, "restore_command = %s\n",
+			quoteSQL(walfetchcmd.Build(bin, deployment, repoURL)))
 	}
 	if err := appendAutoConf(autoPath, b.String()); err != nil {
 		return err

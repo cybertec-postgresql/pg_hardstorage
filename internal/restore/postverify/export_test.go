@@ -17,3 +17,16 @@ func StageForRecoveryForTest(dataDir, repoURL, deployment, agentBinary string, p
 func PickProbeDSNForTest(ctx context.Context, psql, socketDSN, tcpDSN string) (string, string, error) {
 	return pickProbeDSN(ctx, psql, socketDSN, tcpDSN)
 }
+
+// StartWithStopGuardForTest mirrors Verify's start sequencing: it
+// arms the stop guard BEFORE attempting the start, then runs the
+// start.  Used by the bug-52 regression test to prove a FAILED
+// start still triggers the stop (no leaked postmaster).  Returns
+// the start error (nil on success).  The stop guard runs when
+// this function returns, exactly as the deferred guard does in
+// Verify.
+func StartWithStopGuardForTest(ctx context.Context, pgCtl, dataDir string, startArgs []string) (err error) {
+	defer registerStopGuard(pgCtl, dataDir)()
+	_, err = runStart(ctx, pgCtl, startArgs)
+	return err
+}
