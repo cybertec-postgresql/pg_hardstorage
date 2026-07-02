@@ -14,6 +14,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"os/exec"
 	"sync"
 	"testing"
 	"time"
@@ -282,12 +283,19 @@ func TestStream_ContextCancel(t *testing.T) {
 	}
 }
 
-// TestStream_InactivityTimeout — with no traffic at all, Stream must
-// return the inactivity-timeout error within roughly the configured
-// budget. This is the path that creates a per-iteration deadline
-// context; a regression of the defer-in-loop leak would still pass
-// this test functionally, but running it under -count exercises the
-// path repeatedly.
+// TestStream_InactivityTimeout — the watchdog's contract is STUCK-
+// CONNECTION detection, not quiet-publication detection.
+//
+// Since the cadence-flush fix, an idle Stream sends a standby status
+// update every StatusUpdateInterval and the walsender echoes each one
+// with a keepalive — a healthy idle stream therefore continuously
+// proves its liveness and must NOT trip the inactivity error (phase 1;
+// the pre-fix behaviour of erroring on a merely-quiet publication would
+// make the supervisor restart a healthy stream every window). When the
+// server genuinely stalls — simulated here by pausing the container, so
+// echoes stop while the socket stays open — the anchored inactivity
+// window must fire the classified error within roughly one window
+// (phase 2).
 func TestStream_InactivityTimeout(t *testing.T) {
 	pgInst := pgtestkit.StartPostgres(t)
 	const (
@@ -302,25 +310,51 @@ func TestStream_InactivityTimeout(t *testing.T) {
 	if err != nil {
 		t.Fatalf("connect stream: %v", err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
-	start := time.Now()
-	err = logicalreceiver.Stream(ctx, streamConn, logicalreceiver.StreamOptions{
-		Slot:                 slot,
-		PluginArgs:           pubArgs(pub),
-		StatusUpdateInterval: time.Second,
-		InactivityTimeout:    4 * time.Second,
-	}, &countingSink{})
-	elapsed := time.Since(start)
+	const window = 4 * time.Second
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- logicalreceiver.Stream(ctx, streamConn, logicalreceiver.StreamOptions{
+			Slot:                 slot,
+			PluginArgs:           pubArgs(pub),
+			StatusUpdateInterval: time.Second,
+			InactivityTimeout:    window,
+		}, &countingSink{})
+	}()
 
-	if err == nil || !errMentions(err, "inactivity timeout") {
-		t.Fatalf("Stream returned %v, want inactivity-timeout error", err)
+	// Phase 1: idle but healthy for 3x the window. The stream must keep
+	// running — status echoes are liveness, so no inactivity error.
+	select {
+	case err := <-errCh:
+		t.Fatalf("Stream ended during healthy idle (%v); an idle publication must not trip the watchdog", err)
+	case <-time.After(3 * window):
 	}
-	// PG sends keepalives, so each one resets the inactivity window;
-	// the bound is "doesn't hang forever", not a tight deadline.
-	if elapsed > 25*time.Second {
-		t.Errorf("inactivity timeout took %s — far longer than expected", elapsed)
+
+	// Phase 2: stall the server for real. `docker pause` freezes the
+	// walsender, so echoes stop while the TCP connection stays open —
+	// exactly the stuck-connection shape the watchdog exists to catch.
+	id := pgInst.Container.GetContainerID()
+	if out, err := exec.Command("docker", "pause", id).CombinedOutput(); err != nil {
+		t.Fatalf("docker pause %s: %v\n%s", id, err, out)
+	}
+	t.Cleanup(func() {
+		// Unpause so container termination doesn't hang.
+		_ = exec.Command("docker", "unpause", id).Run()
+	})
+
+	start := time.Now()
+	select {
+	case err := <-errCh:
+		if err == nil || !errMentions(err, "inactivity timeout") {
+			t.Fatalf("Stream returned %v, want the classified inactivity-timeout error", err)
+		}
+		if elapsed := time.Since(start); elapsed > 4*window {
+			t.Errorf("inactivity fired after %s — far beyond the %s window", elapsed, window)
+		}
+	case <-time.After(6 * window):
+		t.Fatal("stalled server: Stream did not trip the inactivity watchdog")
 	}
 }
 
