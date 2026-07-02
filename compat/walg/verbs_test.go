@@ -127,10 +127,12 @@ func TestBackupFetch_Latest(t *testing.T) {
 	if exit != 0 {
 		t.Fatalf("exit %d", exit)
 	}
+	// Bug #46: native `restore` does NOT register --pg-connection
+	// (it reads the repository, not a live PG), so it must not be
+	// injected here even though PGHOST is set.
 	want := []string{
 		"restore", "db.example.com", "latest",
 		"--target", "/tmp/restore",
-		"--pg-connection", "postgres://postgres@db.example.com/postgres",
 		"--repo", "s3://acme/wal-g",
 	}
 	if !slicesEqual(got, want) {
@@ -149,8 +151,17 @@ func TestBackupFetch_NamedBackup(t *testing.T) {
 	if exit != 0 {
 		t.Fatalf("exit %d", exit)
 	}
-	if !sliceContainsAdjacent(got, "--to-backup", "base_000000010000000000000010") {
-		t.Errorf("expected --to-backup adjacency; got %v", got)
+	// Bug #13: native `restore <dep> <backup-id|latest>` takes the
+	// backup selector as a POSITIONAL (ExactArgs(2)); there is no
+	// --to-backup flag. A named backup must be the backup-id positional,
+	// and --pg-connection must NOT be injected (bug #46).
+	want := []string{
+		"restore", "db.example.com", "base_000000010000000000000010",
+		"--target", "/tmp/restore",
+		"--repo", "s3://acme/wal-g",
+	}
+	if !slicesEqual(got, want) {
+		t.Errorf("dispatch:\n got %v\nwant %v", got, want)
 	}
 }
 
@@ -167,6 +178,13 @@ func TestBackupList_DefaultPretty(t *testing.T) {
 	}
 	if got[0] != "list" {
 		t.Errorf("expected verb=list; got %v", got)
+	}
+	// Bug #46: `list` does NOT register --pg-connection; it must not be
+	// injected even though PGHOST is set.
+	for _, a := range got {
+		if a == "--pg-connection" {
+			t.Errorf("`list` must NOT inject --pg-connection; got %v", got)
+		}
 	}
 }
 
@@ -221,6 +239,13 @@ func TestWalFetch(t *testing.T) {
 	}
 	if got[0] != "wal" || got[1] != "fetch" {
 		t.Errorf("expected `wal fetch`; got %v", got)
+	}
+	// Bug #46: `wal fetch` does NOT register --pg-connection even
+	// though PGHOST is set; it must not be injected.
+	for _, a := range got {
+		if a == "--pg-connection" {
+			t.Errorf("`wal fetch` must NOT inject --pg-connection; got %v", got)
+		}
 	}
 }
 

@@ -102,6 +102,16 @@ func registerCommonFlags(fs *pflag.FlagSet) {
 		fs.String(ignored, "", "")
 		_ = fs.MarkHidden(ignored)
 	}
+
+	// start-fast / stop-auto / backup-standby are BOOLEAN pgBackRest
+	// knobs: operators write a bare `--start-fast` (no value). If they
+	// were registered as string flags (like the ignored knobs above),
+	// cobra would fail parsing with "flag needs an argument". Register
+	// them as bool flags so a bare flag parses; the values are ignored.
+	for _, ignoredBool := range silentlyIgnoredBoolFlags {
+		fs.Bool(ignoredBool, false, "")
+		_ = fs.MarkHidden(ignoredBool)
+	}
 }
 
 // silentlyIgnoredFlags is the list of pgBackRest knobs that
@@ -115,12 +125,19 @@ var silentlyIgnoredFlags = []string{
 	"log-level-file",
 	"log-path",
 	"process-max",
-	"start-fast",
-	"stop-auto",
-	"backup-standby",
 	"db-timeout",
 	"protocol-timeout",
 	"buffer-size",
+}
+
+// silentlyIgnoredBoolFlags are pgBackRest BOOLEAN knobs. pgBackRest
+// accepts them as bare switches (`--start-fast`), so they must be
+// registered as bool flags — a string flag would make cobra demand a
+// value and fail to parse. They carry no semantic weight in the shim.
+var silentlyIgnoredBoolFlags = []string{
+	"start-fast",
+	"stop-auto",
+	"backup-standby",
 }
 
 // globalArgs holds the parsed root-level flags.  Sub-verbs
@@ -146,13 +163,28 @@ func mapToNativeArgs(verb string, a pgbackrestArgs) (native []string, warnings [
 		return nil, nil, fmt.Errorf("pg-hardstorage-pgbackrest: --stanza is required")
 	}
 
-	native = append(native, verb)
+	// `verb` may be a multi-word native verb ("wal push", "wal fetch")
+	// so we can distinguish sub-verbs that differ in flag acceptance.
+	// native[0] carries only the FIRST token; callers append the rest
+	// of the positional shape themselves.
+	head := verb
+	if i := strings.IndexByte(verb, ' '); i >= 0 {
+		head = verb[:i]
+	}
+	native = append(native, head)
 
 	// Verb-specific positional arg shapes are appended by the
 	// caller; here we only emit shared flags.
 
-	if conn := buildPGConnection(a); conn != "" {
-		native = append(native, "--pg-connection", conn)
+	// Only append --pg-connection for verbs that actually register it.
+	// Native `restore`, `list` (info), `verify`, and `wal fetch`
+	// (archive-get) do NOT define --pg-connection — passing it makes
+	// cobra reject the argv as unknown. `backup` and `wal push`
+	// (archive-push) do accept it.
+	if verbAcceptsPGConnection(verb) {
+		if conn := buildPGConnection(a); conn != "" {
+			native = append(native, "--pg-connection", conn)
+		}
 	}
 	if repoURL, w, e := buildRepoURL(a); e != nil {
 		return nil, nil, e
@@ -186,6 +218,20 @@ func mapToNativeArgs(verb string, a pgbackrestArgs) (native []string, warnings [
 	}
 
 	return native, warnings, nil
+}
+
+// verbAcceptsPGConnection reports whether the native verb registers a
+// --pg-connection flag. Only `backup` and `wal push` (archive-push)
+// do; `restore`, `list` (info), `verify`, and `wal fetch`
+// (archive-get) reject it — they operate on the repository, not a
+// live PG endpoint.
+func verbAcceptsPGConnection(verb string) bool {
+	switch verb {
+	case "backup", "wal push":
+		return true
+	default:
+		return false
+	}
 }
 
 // buildPGConnection assembles a libpq URI from the four

@@ -69,7 +69,11 @@ func newRecoverCmd(stdout, stderr io.Writer) *cobra.Command {
 
 			native := []string{"restore", server, backupID, "--target", targetDir}
 			native = append(native, translated...)
-			native, err = injectDeploymentFlags(native, server, true)
+			// Native `restore` accepts --repo but NOT --pg-connection
+			// (it talks to the repository, not a live PG). Inject --repo
+			// only; passing --pg-connection here makes cobra reject the
+			// argv as an unknown flag.
+			native, err = injectDeploymentFlags(native, server, false)
 			if err != nil {
 				return err
 			}

@@ -122,10 +122,25 @@ func (e walgEnv) deploymentName() string {
 // on stderr.  The verb arg appears as the FIRST element of the
 // returned slice; per-verb positionals are appended by the caller.
 func mapEnvToNativeArgs(verb string, e walgEnv) (native []string, warnings []string, err error) {
-	native = append(native, verb)
+	// `verb` may be a multi-word native verb ("wal push", "wal fetch")
+	// so we can distinguish sub-verbs that differ in flag acceptance.
+	// native[0] carries only the FIRST token; callers append the rest
+	// of the positional shape themselves.
+	head := verb
+	if i := strings.IndexByte(verb, ' '); i >= 0 {
+		head = verb[:i]
+	}
+	native = append(native, head)
 
-	if conn := buildPGConnection(e); conn != "" {
-		native = append(native, "--pg-connection", conn)
+	// Only append --pg-connection for verbs that actually register it.
+	// Native `restore`, `list`, and `wal fetch` do NOT define
+	// --pg-connection (they read the repository, not a live PG); passing
+	// it makes cobra reject the argv as an unknown flag. `backup` and
+	// `wal push` do accept it.
+	if verbAcceptsPGConnection(verb) {
+		if conn := buildPGConnection(e); conn != "" {
+			native = append(native, "--pg-connection", conn)
+		}
 	}
 	repo, repoWarn, repoErr := buildRepoURL(e)
 	if repoErr != nil {
@@ -170,6 +185,19 @@ func mapEnvToNativeArgs(verb string, e walgEnv) (native []string, warnings []str
 	// by buildRepoURL — no warning needed.
 
 	return native, warnings, nil
+}
+
+// verbAcceptsPGConnection reports whether the native verb registers a
+// --pg-connection flag. Only `backup` and `wal push` do; `restore`,
+// `list`, and `wal fetch` reject it (they operate on the repository,
+// not a live PG endpoint).
+func verbAcceptsPGConnection(verb string) bool {
+	switch verb {
+	case "backup", "wal push":
+		return true
+	default:
+		return false
+	}
 }
 
 // buildPGConnection assembles a libpq URI from the standard PG env

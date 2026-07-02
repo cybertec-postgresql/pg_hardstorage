@@ -24,23 +24,28 @@ func TestSampleBarmanConfRoundTrip(t *testing.T) {
 		t.Fatalf("Translate: %v", err)
 	}
 
-	// Key claims that must hold for the test fixture.
+	// Key claims that must hold for the test fixture. Deployments are
+	// emitted as a MAPPING keyed by name (config.Load decodes
+	// `deployments:` as map[string]DeploymentConfig, KnownFields(true)),
+	// so we assert `  <name>:` map keys, not `- name:` sequence items.
 	mustContain := []string{
 		"deployments:",
-		"name: db1",
-		"name: db2-reporting",
-		"connection: ", // streaming_conninfo gets collapsed onto connection:
-		"description:",
+		"  db1:",
+		"  db2-reporting:",
+		// conninfo -> pg_connection (the native field name); the paired
+		// streaming_conninfo collapses onto the same key (see below).
+		`pg_connection: "host=db1.example.com user=barman dbname=postgres"`,
 		"slot:",
 		"name: barman_db1",
-		"create: auto",
 		"parallelism: 4",
 		"compression:",
 		"algorithm: zstd",
 		"retention:",
-		"keep_for: 7 days",
-		"keep_full: 4",
-		"minimum_redundancy: 2",
+		// RECOVERY WINDOW OF 7 DAYS -> time.ParseDuration-compatible 168h
+		// (the agent rejects "7 days"); REDUNDANCY 4 -> keep_fulls (the
+		// config field name is keep_fulls, not keep_full).
+		"keep_for: 168h",
+		"keep_fulls: 4",
 		`repo: "file:///var/lib/barman/db1"`,
 		`repo: "file:///mnt/nfs/barman/db2-reporting"`,
 		"backup:",
@@ -52,11 +57,19 @@ func TestSampleBarmanConfRoundTrip(t *testing.T) {
 		}
 	}
 
-	// Drop checks: refused settings must NOT appear as a live YAML
-	// line (only as a "# ..." comment).  Walk line-by-line so the
-	// elided-as-comment notes don't trip the assertion.
+	// Field-name / duplicate-key correctness (bug #9): the loader uses
+	// the field `pg_connection`, never `connection:`, and rejects
+	// duplicate mapping keys. streaming_conninfo, create_slot, and
+	// minimum_redundancy each pair with an earlier key onto the same
+	// native top-level key, so they must be collapsed to comments —
+	// never re-emitted as a live duplicate. Also assert the buggy
+	// `--to-backup`-era field names are gone.
 	bannedLive := []string{
-		"backup_method:",
+		"connection:", // must be pg_connection, not connection
+		"keep_full:",  // must be keep_fulls
+		"minimum_redundancy:",
+		"description:",   // native has no description field
+		"backup_method:", // refused method must be a comment, not live
 	}
 	for _, line := range strings.Split(got.YAML, "\n") {
 		trimmed := strings.TrimLeft(line, " \t")
@@ -64,10 +77,16 @@ func TestSampleBarmanConfRoundTrip(t *testing.T) {
 			continue
 		}
 		for _, banned := range bannedLive {
-			if strings.Contains(trimmed, banned) {
+			if strings.HasPrefix(trimmed, banned) {
 				t.Errorf("YAML emitted live %q line: %q", banned, line)
 			}
 		}
+	}
+	// Exactly one pg_connection per deployment (no duplicate key from
+	// conninfo + streaming_conninfo).
+	if n := strings.Count(got.YAML, "pg_connection:") - strings.Count(got.YAML, "# streaming_conninfo"); n != 2 {
+		// db1 (conninfo) + db2-reporting (conninfo) = 2 live keys.
+		t.Errorf("want 2 live pg_connection keys, got %d\n--- yaml ---\n%s", n, got.YAML)
 	}
 
 	// Unmapped summary must mention the expected entries — both

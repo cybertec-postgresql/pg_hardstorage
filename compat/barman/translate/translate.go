@@ -105,11 +105,24 @@ func emitGlobal(b *strings.Builder, sec *iniSection, un *[]Unmapped) {
 // emitDeployment renders one [<server>] section as one entry under
 // top-level `deployments:`.
 func emitDeployment(b *strings.Builder, sec *iniSection, un *[]Unmapped) {
-	fmt.Fprintf(b, "  - name: %s\n", yamlString(sec.name))
+	// config.Load decodes `deployments:` as map[string]DeploymentConfig
+	// (KnownFields(true)), so each deployment must be a MAPPING keyed by
+	// its name — not a `- name:` sequence item. Emit `  <name>:` and nest
+	// the deployment's fields one level deeper.
+	fmt.Fprintf(b, "  %s:\n", yamlString(sec.name))
 
 	// Two passes: known-mapped first (so the YAML reads predictably),
 	// then unmapped settings as comments under the deployment.
+	//
+	// Several Barman keys collapse onto the SAME native top-level key
+	// (conninfo + streaming_conninfo → pg_connection; slot_name +
+	// create_slot → slot; retention_policy + minimum_redundancy →
+	// retention). YAML forbids duplicate keys in a mapping and the
+	// strict loader would reject the file, so we emit each top-level
+	// key at most once — the first Barman key wins and any later key
+	// that would re-emit it is preserved as a comment for the operator.
 	known := map[string]bool{}
+	emittedTopKey := map[string]bool{}
 	for _, k := range sec.keys {
 		row, ok := mappingByKey[k]
 		if !ok {
@@ -127,6 +140,24 @@ func emitDeployment(b *strings.Builder, sec *iniSection, un *[]Unmapped) {
 			fmt.Fprintf(b, "    # %s = %s  (%s)\n", k, v, reason)
 			known[k] = true
 			continue
+		}
+		// Dedup by the block's top-level YAML key. If a prior Barman
+		// setting already emitted this native key, don't emit it a
+		// second time (would produce a duplicate mapping key); comment
+		// the collapse instead.
+		if top := topLevelKey(rendered); top != "" {
+			if emittedTopKey[top] {
+				fmt.Fprintf(b, "    # %s = %s  (collapsed into earlier %s:)\n", k, v, top)
+				*un = append(*un, Unmapped{
+					Section: sec.name,
+					Key:     k,
+					Value:   v,
+					Reason:  fmt.Sprintf("collapsed into earlier %s:", top),
+				})
+				known[k] = true
+				continue
+			}
+			emittedTopKey[top] = true
 		}
 		// rendered may be multiple lines (e.g. a nested block).
 		for _, line := range strings.Split(strings.TrimRight(rendered, "\n"), "\n") {
@@ -159,6 +190,34 @@ func emitDeployment(b *strings.Builder, sec *iniSection, un *[]Unmapped) {
 			})
 		}
 	}
+}
+
+// topLevelKey returns the top-level mapping key a rendered block
+// introduces (e.g. "pg_connection" for "pg_connection: postgres://…",
+// "retention" for a "retention:\n  keep_for: …" block).  It scans for
+// the first non-comment, non-indented "key:" line so blocks whose first
+// line is a comment (e.g. "# backup_method: postgres …") don't count as
+// introducing a key.  Returns "" when the block emits no top-level key
+// (pure comment blocks), which the caller treats as "always emit".
+func topLevelKey(rendered string) string {
+	for _, line := range strings.Split(rendered, "\n") {
+		if line == "" {
+			continue
+		}
+		// Nested / indented lines belong to a block already counted by
+		// its header line; skip them.
+		if line[0] == ' ' || line[0] == '\t' {
+			continue
+		}
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		if i := strings.Index(trimmed, ":"); i > 0 {
+			return trimmed[:i]
+		}
+	}
+	return ""
 }
 
 // yamlString quotes a YAML string only if it would otherwise be

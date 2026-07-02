@@ -23,14 +23,21 @@ func TestMapToNativeArgs(t *testing.T) {
 			want: []string{"--to", "2026-04-27 09:42 UTC"},
 		},
 		{
-			name: "target-name -> --to-backup",
+			// Bug #12: native restore has no --to-backup flag; a named
+			// restore point maps to --to-name.
+			name: "target-name -> --to-name",
 			in:   recoverArgs{targetName: "release-cut"},
-			want: []string{"--to-backup", "release-cut"},
+			want: []string{"--to-name", "release-cut"},
 		},
 		{
-			name: "target-immediate -> --to-lsn 0/0",
+			// Bug #45: --target-immediate must map to NO recovery target.
+			// A plain native restore already stops at the backup's
+			// consistency point (recovery_target='immediate'). The old
+			// mapping to --to-lsn 0/0 was always refused (0/0 is below any
+			// real stop LSN, so recovery could never reach it).
+			name: "target-immediate -> no target",
 			in:   recoverArgs{targetImmed: true},
-			want: []string{"--to-lsn", "0/0"},
+			want: nil,
 		},
 		{
 			name: "target-action pause",

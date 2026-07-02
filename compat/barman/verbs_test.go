@@ -99,6 +99,43 @@ func TestRecoverVerbBasic(t *testing.T) {
 	}
 }
 
+// TestRecoverVerbNoPGConnection is the regression test for bug #10:
+// native `restore` registers --repo but NOT --pg-connection (it reads
+// the repository, not a live PG). The recover shim must inject --repo
+// only; injecting --pg-connection would make cobra reject the argv.
+func TestRecoverVerbNoPGConnection(t *testing.T) {
+	var captured []string
+	restore := swapDispatcher(func(_, _ io.Writer, args []string) error {
+		captured = append([]string(nil), args...)
+		return nil
+	})
+	defer restore()
+	restoreDep := swapDeploymentLookup(func(server string) (deploymentSettings, error) {
+		return deploymentSettings{
+			Repo:         "file:///tmp/test-repo",
+			PGConnection: "postgres://postgres@h/postgres",
+		}, nil
+	})
+	defer restoreDep()
+
+	var sout, serr bytes.Buffer
+	root := NewRoot(&sout, &serr)
+	root.SetArgs([]string{"recover", "db1", "20260427T0942-abc", "/srv/pg17"})
+	root.SetOut(&sout)
+	root.SetErr(&serr)
+	if _, err := root.ExecuteC(); err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+	if !containsPair(captured, "--repo", "file:///tmp/test-repo") {
+		t.Errorf("recover must inject --repo; captured: %v", captured)
+	}
+	for _, a := range captured {
+		if a == "--pg-connection" {
+			t.Errorf("recover must NOT inject --pg-connection (native restore has no such flag); captured: %v", captured)
+		}
+	}
+}
+
 func TestRecoverVerbPITR(t *testing.T) {
 	got, _, _, err := runShim(t,
 		"recover", "db1", "latest", "/srv/pg17",
@@ -172,6 +209,41 @@ func TestCheckVerb(t *testing.T) {
 	}
 }
 
+// TestCheckVerbNoInjectedFlags is the regression test for bug #11:
+// native `doctor [<deployment>]` takes the deployment as a POSITIONAL
+// and registers NEITHER --repo NOR --pg-connection (only
+// --exit-on-issues plus the persistent --output/--template). The check
+// shim must dispatch a bare `doctor <server>` — injecting either flag
+// makes cobra reject the argv.
+func TestCheckVerbNoInjectedFlags(t *testing.T) {
+	var captured []string
+	restore := swapDispatcher(func(_, _ io.Writer, args []string) error {
+		captured = append([]string(nil), args...)
+		return nil
+	})
+	defer restore()
+	restoreDep := swapDeploymentLookup(func(server string) (deploymentSettings, error) {
+		return deploymentSettings{
+			Repo:         "file:///tmp/test-repo",
+			PGConnection: "postgres://postgres@h/postgres",
+		}, nil
+	})
+	defer restoreDep()
+
+	var sout, serr bytes.Buffer
+	root := NewRoot(&sout, &serr)
+	root.SetArgs([]string{"check", "db1"})
+	root.SetOut(&sout)
+	root.SetErr(&serr)
+	if _, err := root.ExecuteC(); err != nil {
+		t.Fatalf("check: %v", err)
+	}
+	want := []string{"doctor", "db1"}
+	if !equalSlices(captured, want) {
+		t.Errorf("check must dispatch a bare `doctor <server>`; got %v want %v", captured, want)
+	}
+}
+
 func TestCheckVerbNagios(t *testing.T) {
 	got, _, _, err := runShim(t, "check", "db1", "--nagios")
 	if err != nil {
@@ -211,7 +283,11 @@ func TestWALArchiveVerb(t *testing.T) {
 
 	var sout, serr bytes.Buffer
 	root := NewWALArchiveRoot(&sout, &serr)
-	root.SetArgs([]string{"db1", "pg_wal/000000010000000000000005"})
+	// Bug #49: real barman-wal-archive takes THREE positionals —
+	// BARMAN_HOST SERVER_NAME WAL_PATH. BARMAN_HOST (the SSH target) is
+	// accepted for argv compatibility and ignored; SERVER_NAME is the
+	// deployment and WAL_PATH is the segment.
+	root.SetArgs([]string{"backup.internal", "db1", "pg_wal/000000010000000000000005"})
 	root.SetOut(&sout)
 	root.SetErr(&serr)
 	if _, err := root.ExecuteC(); err != nil {

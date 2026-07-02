@@ -56,16 +56,17 @@ func runBackupFetch(stderr io.Writer, args []string) error {
 	}
 	emitWarnings(warnings)
 
-	// Verb argument shape: `restore <deployment> [latest|<name>]
-	// --target <dir> ...flags...`.
-	out := []string{native[0], env.deploymentName()}
-
-	if strings.EqualFold(backupName, "LATEST") {
-		out = append(out, "latest")
-	} else {
-		out = append(out, "--to-backup", backupName)
+	// Verb argument shape: native `restore` is
+	// `restore <deployment> <backup-id|latest>` (cobra ExactArgs(2)),
+	// so the backup selector is a POSITIONAL, not a flag. WAL-G's
+	// LATEST maps to the `latest` keyword; a named backup is passed
+	// through as the backup-id positional. There is no --to-backup
+	// flag on native restore.
+	backupID := "latest"
+	if !strings.EqualFold(backupName, "LATEST") {
+		backupID = backupName
 	}
-	out = append(out, "--target", target)
+	out := []string{native[0], env.deploymentName(), backupID, "--target", target}
 	out = append(out, native[1:]...)
 
 	if rc := dispatchNative(out); rc != 0 {

@@ -44,8 +44,11 @@ func TestTranslate_RoundTrip(t *testing.T) {
 
 	must := []string{
 		"deployments:",
-		"- name: db1",
-		"- name: db2",
+		// Deployments are emitted as a mapping keyed by name (config.Load
+		// decodes `deployments:` as map[string]DeploymentConfig with
+		// KnownFields(true)), not a `- name:` sequence item.
+		"  db1:",
+		"  db2:",
 		`pg_connection: "postgres://pgbackup@db1.example.com:5432/postgres"`,
 		`repo: "file:///var/lib/pgbackrest"`,
 		`repo: "s3://acme-pg-backups/db2-prefix"`,

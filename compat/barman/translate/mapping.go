@@ -3,8 +3,40 @@ package translate
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 )
+
+// barmanWindowToDuration converts a Barman recovery-window quantity
+// (e.g. "7 DAYS", "4 WEEKS", "12 HOURS") into a Go time.ParseDuration-
+// compatible string.  The native agent parses retention.keep_for with
+// time.ParseDuration, which only understands h/m/s — so DAYS / WEEKS /
+// MONTHS are expanded to hours (1 day = 24h, 1 week = 168h, 1 month =
+// 720h ≈ 30 days).  Returns ok=false for anything it can't parse.
+func barmanWindowToDuration(window string) (string, bool) {
+	fields := strings.Fields(strings.TrimSpace(window))
+	if len(fields) != 2 {
+		return "", false
+	}
+	n, err := strconv.Atoi(fields[0])
+	if err != nil || n < 0 {
+		return "", false
+	}
+	var hoursPerUnit int
+	switch strings.ToUpper(strings.TrimSuffix(fields[1], "S")) {
+	case "HOUR":
+		hoursPerUnit = 1
+	case "DAY":
+		hoursPerUnit = 24
+	case "WEEK":
+		hoursPerUnit = 168
+	case "MONTH":
+		hoursPerUnit = 720 // 30 days
+	default:
+		return "", false
+	}
+	return fmt.Sprintf("%dh", n*hoursPerUnit), true
+}
 
 // mappingRow describes how to translate one Barman key.
 //
@@ -20,20 +52,24 @@ type mappingRow struct {
 // alphabetically sorted so adding entries is mechanical.
 var mappingByKey = map[string]mappingRow{
 	// Connection.  Barman uses libpq DSN strings; native uses the
-	// same wire format under deployment.connection.
+	// same wire format under deployment.pg_connection.
 	"conninfo": {render: func(v string) (string, bool, string) {
-		return fmt.Sprintf("connection: %s", yamlString(v)), false, ""
+		return fmt.Sprintf("pg_connection: %s", yamlString(v)), false, ""
 	}},
 	"streaming_conninfo": {render: func(v string) (string, bool, string) {
-		// Native uses one connection field; if both are set we
-		// prefer streaming_conninfo (it's the slot conn) — but emit
-		// a comment so the operator notices the collapse.
-		return fmt.Sprintf("connection: %s  # collapsed from streaming_conninfo", yamlString(v)), false, ""
+		// Native uses one pg_connection field; if both conninfo and
+		// streaming_conninfo are set the emitter collapses them to a
+		// single key (see dedup in emitDeployment) — whichever the INI
+		// lists first wins, and the loser is surfaced as a comment so
+		// the operator notices.
+		return fmt.Sprintf("pg_connection: %s", yamlString(v)), false, ""
 	}},
 
-	// Description / display name.
+	// Description / display name — native has no per-deployment
+	// description field, so carry it as a comment (KnownFields(true)
+	// would reject a bare `description:` key).
 	"description": {render: func(v string) (string, bool, string) {
-		return fmt.Sprintf("description: %s", yamlString(v)), false, ""
+		return "", true, "native has no per-deployment description field"
 	}},
 
 	// Backup method.  rsync / postgres / snapshot — only `postgres`
@@ -56,21 +92,31 @@ var mappingByKey = map[string]mappingRow{
 	// Retention.
 	"retention_policy": {render: func(v string) (string, bool, string) {
 		// Barman: "RECOVERY WINDOW OF 7 DAYS" or "REDUNDANCY 4".
-		// Native YAML uses retention.{keep_full,keep_for}.
+		// Native YAML uses retention.{keep_fulls,keep_for}.  keep_for
+		// is parsed by the agent with time.ParseDuration, which rejects
+		// "days"/"weeks"/"months" — so convert the Barman window into a
+		// Go-parseable hour count (7 days -> 168h).
 		up := strings.ToUpper(strings.TrimSpace(v))
 		switch {
 		case strings.HasPrefix(up, "RECOVERY WINDOW OF "):
 			window := strings.TrimSpace(strings.TrimPrefix(up, "RECOVERY WINDOW OF "))
-			return fmt.Sprintf("retention:\n  keep_for: %s", strings.ToLower(window)), false, ""
+			dur, ok := barmanWindowToDuration(window)
+			if !ok {
+				return "", true, fmt.Sprintf("unrecognised recovery window %q (expected e.g. \"7 DAYS\")", window)
+			}
+			return fmt.Sprintf("retention:\n  keep_for: %s", dur), false, ""
 		case strings.HasPrefix(up, "REDUNDANCY "):
 			n := strings.TrimSpace(strings.TrimPrefix(up, "REDUNDANCY "))
-			return fmt.Sprintf("retention:\n  keep_full: %s", n), false, ""
+			return fmt.Sprintf("retention:\n  keep_fulls: %s", n), false, ""
 		default:
 			return "", true, fmt.Sprintf("unrecognised retention_policy %q", v)
 		}
 	}},
-	"minimum_redundancy": {render: func(v string) (string, bool, string) {
-		return fmt.Sprintf("retention:\n  minimum_redundancy: %s", v), false, ""
+	"minimum_redundancy": {render: func(_ string) (string, bool, string) {
+		// Native retention has no minimum_redundancy field; carry as a
+		// comment (KnownFields(true) would reject the key, and it also
+		// collides with the retention: block emitted by retention_policy).
+		return "", true, "native retention has no minimum_redundancy field"
 	}},
 
 	// WAL / archive_command knobs.  Native streams from a slot by

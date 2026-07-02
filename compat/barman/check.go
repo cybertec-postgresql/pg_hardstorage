@@ -28,6 +28,11 @@ func newCheckCmd(stdout, stderr io.Writer) *cobra.Command {
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			server := args[0]
+			// Native `doctor [<deployment>]` takes the deployment as a
+			// positional and registers NO --repo / --pg-connection flags
+			// (only --exit-on-issues plus the persistent --output/--template).
+			// Do NOT inject deployment flags here — cobra rejects them as
+			// unknown. The server name is already the doctor positional.
 			native := []string{"doctor", server}
 			if nagios {
 				// Nagios convention: a single line "<SERVICE> OK|WARNING|CRITICAL ..."
@@ -35,10 +40,6 @@ func newCheckCmd(stdout, stderr io.Writer) *cobra.Command {
 					"--output", "template",
 					"--template", `{{if .ok}}BARMAN OK - {{.summary}}{{else}}BARMAN CRITICAL - {{.summary}}{{end}}`,
 				)
-			}
-			native, err := injectDeploymentFlags(native, server, true)
-			if err != nil {
-				return err
 			}
 			return dispatchNative(stdout, stderr, native)
 		},

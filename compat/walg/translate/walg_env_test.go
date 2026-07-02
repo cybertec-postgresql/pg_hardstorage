@@ -76,7 +76,10 @@ func TestTranslate_HappyPath(t *testing.T) {
 
 	want := []string{
 		"deployments:",
-		"name: db1.example.com",
+		// Deployments are emitted as a mapping keyed by name (config.Load
+		// decodes `deployments:` as map[string]DeploymentConfig with
+		// KnownFields(true)), not a `- name:` sequence item.
+		"  db1.example.com:",
 		"pg_connection: \"postgres://pgbackup@db1.example.com:5432/postgres\"",
 		"repo: \"s3://acme-pg-backups/wal-g\"",
 		// libsodium triggers the encryption stub.
@@ -185,7 +188,7 @@ func TestTranslate_DefaultDeploymentName(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(res.YAML, "name: default") {
+	if !strings.Contains(res.YAML, "  default:") {
 		t.Errorf("expected fallback name=default; got\n%s", res.YAML)
 	}
 }
@@ -203,7 +206,7 @@ PG_HARDSTORAGE_DEPLOYMENT=prod-db
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(res.YAML, "name: prod-db") {
+	if !strings.Contains(res.YAML, "  prod-db:") {
 		t.Errorf("explicit deployment name should win; got\n%s", res.YAML)
 	}
 }

@@ -146,7 +146,10 @@ func writeDeployment(b *strings.Builder, s *Section, global map[string]string, r
 		return global[k]
 	}
 
-	fmt.Fprintf(b, "  - name: %s\n", s.Name)
+	// config.Load decodes `deployments:` as map[string]DeploymentConfig
+	// (KnownFields(true)), so each deployment must be a MAPPING keyed by
+	// its name — not a `- name:` sequence item.
+	fmt.Fprintf(b, "  %s:\n", s.Name)
 
 	// PG connection
 	host := resolve("pg1-host")

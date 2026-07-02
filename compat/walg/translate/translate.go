@@ -121,7 +121,10 @@ func Translate(env *EnvFile) (*Result, error) {
 	if i := strings.IndexAny(name, ":/"); i >= 0 {
 		name = name[:i]
 	}
-	fmt.Fprintf(&b, "  - name: %s\n", name)
+	// config.Load decodes `deployments:` as map[string]DeploymentConfig
+	// (KnownFields(true)), so the deployment must be a MAPPING keyed by
+	// its name — not a `- name:` sequence item.
+	fmt.Fprintf(&b, "  %s:\n", name)
 
 	// PG connection
 	if host := env.KV["PGHOST"]; host != "" {

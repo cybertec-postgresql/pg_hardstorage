@@ -27,7 +27,7 @@ func newArchivePushCmd() *cobra.Command {
 }
 
 func runArchivePush(a pgbackrestArgs, segmentPath string) error {
-	native, warnings, err := mapToNativeArgs("wal", a)
+	native, warnings, err := mapToNativeArgs("wal push", a)
 	if err != nil {
 		return err
 	}
@@ -62,7 +62,7 @@ func newArchiveGetCmd() *cobra.Command {
 }
 
 func runArchiveGet(a pgbackrestArgs, segmentName, targetPath string) error {
-	native, warnings, err := mapToNativeArgs("wal", a)
+	native, warnings, err := mapToNativeArgs("wal fetch", a)
 	if err != nil {
 		return err
 	}

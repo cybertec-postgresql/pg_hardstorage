@@ -33,7 +33,7 @@ func newWalFetchCmd(stderr io.Writer) *cobra.Command {
 
 func runWalFetch(stderr io.Writer, segName, outputPath string) error {
 	env := loadEnv()
-	native, warnings, err := mapEnvToNativeArgs("wal", env)
+	native, warnings, err := mapEnvToNativeArgs("wal fetch", env)
 	if err != nil {
 		return err
 	}

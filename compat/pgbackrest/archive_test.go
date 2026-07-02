@@ -31,9 +31,12 @@ func TestArchiveGet(t *testing.T) {
 	if err := runArchiveGet(globalArgs, "000000010000000000000001", "/tmp/seg"); err != nil {
 		t.Fatal(err)
 	}
+	// Bug #47: native `wal fetch` (archive-get) does NOT register
+	// --pg-connection (it reads the repository, not a live PG), so it
+	// must not be injected even though --pg1-host is set. `wal push`
+	// (archive-push) still gets it — see TestArchivePush.
 	want := []string{
 		"wal", "fetch", "db1", "000000010000000000000001", "/tmp/seg",
-		"--pg-connection", "postgres://postgres@h/postgres",
 		"--repo", "file:///r",
 	}
 	if !reflect.DeepEqual(*got, want) {

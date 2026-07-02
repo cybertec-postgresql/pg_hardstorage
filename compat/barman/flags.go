@@ -90,18 +90,23 @@ var recoverFlagTable = []flagMap{
 		},
 	},
 	{
-		// --target-name -> --to-backup
+		// --target-name -> --to-name (recover to a PG named restore
+		// point). Native `restore` has no --to-backup flag.
 		pick: func(r *recoverArgs) bool { return r.targetName != "" },
 		apply: func(r *recoverArgs, n *[]string, _ io.Writer) error {
-			*n = append(*n, "--to-backup", r.targetName)
+			*n = append(*n, "--to-name", r.targetName)
 			return nil
 		},
 	},
 	{
-		// --target-immediate -> --to-lsn 0/0 (recover until consistent)
+		// --target-immediate -> NO target. A plain native restore (no
+		// --to* flag) already stops at the backup's consistency point
+		// (recovery_target='immediate'), which is exactly what Barman's
+		// --target-immediate means. Mapping it to `--to-lsn 0/0` was a
+		// bug: 0/0 is below any real stop LSN, so recovery could never
+		// reach it and the restore was always refused.
 		pick: func(r *recoverArgs) bool { return r.targetImmed },
-		apply: func(_ *recoverArgs, n *[]string, _ io.Writer) error {
-			*n = append(*n, "--to-lsn", "0/0")
+		apply: func(_ *recoverArgs, _ *[]string, _ io.Writer) error {
 			return nil
 		},
 	},

@@ -40,7 +40,7 @@ func newWalPushCmd(stderr io.Writer) *cobra.Command {
 
 func runWalPush(stderr io.Writer, segmentPath string) error {
 	env := loadEnv()
-	native, warnings, err := mapEnvToNativeArgs("wal", env)
+	native, warnings, err := mapEnvToNativeArgs("wal push", env)
 	if err != nil {
 		return err
 	}
