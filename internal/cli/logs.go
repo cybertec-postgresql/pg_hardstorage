@@ -124,15 +124,26 @@ func runLogs(cmd *cobra.Command, deployment, overrideUnit, since string, lines i
 	if follow || d.Renderer().Name() == "text" {
 		c := exec.CommandContext(cmd.Context(), bin, args...)
 		c.Stdout = os.Stdout
-		c.Stderr = os.Stderr
+		// Tee stderr to the terminal AND capture it, so we can tell a
+		// benign "no entries" (empty stderr) apart from a real failure
+		// (e.g. a bad --since value, whose message journalctl writes to
+		// stderr) without hiding the message from the operator.
+		var stderrBuf strings.Builder
+		c.Stderr = io.MultiWriter(os.Stderr, &stderrBuf)
 		if err := c.Run(); err != nil {
-			// Exit code 1 from journalctl typically means "no entries
-			// for this unit" — treat as a structured notfound rather
-			// than a generic error so monitoring tools can pivot.
+			// Exit code 1 is overloaded: "no entries for this unit"
+			// (empty stderr) vs a genuine failure (non-empty stderr).
+			// Only the former is a structured notfound; a real error
+			// like `--since garbage` must surface, not misreport "no
+			// entries".
 			if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
-				return output.NewError("notfound.unit",
-					fmt.Sprintf("logs: no journal entries for unit %q (is the agent running?)",
-						unit))
+				if stderr := strings.TrimSpace(stderrBuf.String()); stderr == "" {
+					return output.NewError("notfound.unit",
+						fmt.Sprintf("logs: no journal entries for unit %q (is the agent running?)",
+							unit))
+				} else {
+					return fmt.Errorf("logs: journalctl: %s", stderr)
+				}
 			}
 			return fmt.Errorf("logs: journalctl: %w", err)
 		}
@@ -148,8 +159,18 @@ func runLogs(cmd *cobra.Command, deployment, overrideUnit, since string, lines i
 	out, err := c.Output()
 	if err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
-			return output.NewError("notfound.unit",
-				fmt.Sprintf("logs: no journal entries for unit %q", unit))
+			// Exit 1 is overloaded: journalctl uses it BOTH for "no
+			// entries for this unit" (empty stderr) AND for real
+			// failures like a bad --since value ("Failed to parse
+			// timestamp: garbage"). Only the former is a notfound;
+			// otherwise surface the real error + its stderr so
+			// `logs --since garbage` doesn't misreport "no entries".
+			if stderr := strings.TrimSpace(string(exitErr.Stderr)); stderr == "" {
+				return output.NewError("notfound.unit",
+					fmt.Sprintf("logs: no journal entries for unit %q", unit))
+			} else {
+				return fmt.Errorf("logs: journalctl: %s", stderr)
+			}
 		}
 		return fmt.Errorf("logs: journalctl: %w", err)
 	}

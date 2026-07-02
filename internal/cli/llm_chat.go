@@ -184,10 +184,13 @@ func runLlmChat(cmd *cobra.Command, opts llmChatOptions) error {
 	if modeErr != nil {
 		return output.NewError("config.bad_privacy_mode", modeErr.Error()).Wrap(modeErr)
 	}
-	endpoint := opts.endpoint
-	if endpoint == "" {
-		endpoint = llmCfg.Endpoint
-	}
+	// Use the endpoint the provider actually resolved (flag → env →
+	// yaml → provider default) so the privacy gate enforces against
+	// the same host requests will hit.  Resolving flag→yaml only here
+	// would skip PG_HARDSTORAGE_URL / OPENAI_BASE_URL, letting
+	// local-only silently egress to a public endpoint (or wrongly
+	// refuse a local env endpoint).
+	endpoint := resolvedEndpoint
 
 	// 6. Build the session.  Bootstrap pre-loads cluster state
 	//    into the system prompt; the operator's first prompt
@@ -270,8 +273,17 @@ func runLlmChat(cmd *cobra.Command, opts llmChatOptions) error {
 	for {
 		fmt.Fprint(stdout, "> ")
 		if !scanner.Scan() {
-			// EOF (Ctrl-D) — graceful exit.
+			// Scan()==false is either a clean EOF (Ctrl-D) or a
+			// read error / oversized line (bufio.ErrTooLong when a
+			// single line exceeds the 1 MiB buffer).  Distinguish
+			// them: a nil Err() is a graceful exit; a non-nil Err()
+			// must be surfaced rather than silently ending the
+			// session like Ctrl-D.
 			fmt.Fprintln(stdout)
+			if serr := scanner.Err(); serr != nil {
+				return output.NewError("llm.chat_read_failed",
+					fmt.Sprintf("llm chat: read input: %v", serr)).Wrap(serr)
+			}
 			return nil
 		}
 		line := strings.TrimSpace(scanner.Text())

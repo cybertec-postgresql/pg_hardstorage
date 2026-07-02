@@ -87,6 +87,14 @@ func runList(cmd *cobra.Command, deployment, repoURL string, includeDeleted, onl
 		for entry, err := range store.ListIncludingTombstoned(cmd.Context(), deployment, verifier) {
 			if err != nil {
 				skipped++
+				// Mirror the live-only path: a key mismatch means the
+				// backup EXISTS but was signed with a different key, so
+				// the "signed with a DIFFERENT key" notice must fire
+				// under --include-deleted / --only-deleted too — without
+				// this the notice silently disappeared for these flags.
+				if errors.Is(err, backup.ErrPublicKeyMismatch) {
+					mismatched++
+				}
 				continue
 			}
 			if onlyDeleted && !entry.Tombstoned {

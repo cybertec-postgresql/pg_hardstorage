@@ -83,6 +83,23 @@ func newRepoBundleExportCmd() *cobra.Command {
 				return output.NewError("repo.bundle_export_failed",
 					fmt.Sprintf("repo bundle export: %v", err)).Wrap(err)
 			}
+			// Flush + close BEFORE reporting success. A deferred Close
+			// whose error is ignored can leave a truncated tar on disk
+			// while the command still exits 0 — an operator would
+			// discover the corruption only at import time. fsync the
+			// bytes and surface a close-time error as a failure (and
+			// remove the torn file).
+			if syncErr := f.Sync(); syncErr != nil {
+				f.Close()
+				os.Remove(outPath)
+				return output.NewError("repo.bundle_export_failed",
+					fmt.Sprintf("repo bundle export: fsync %s: %v", outPath, syncErr)).Wrap(syncErr)
+			}
+			if closeErr := f.Close(); closeErr != nil {
+				os.Remove(outPath)
+				return output.NewError("repo.bundle_export_failed",
+					fmt.Sprintf("repo bundle export: close %s: %v", outPath, closeErr)).Wrap(closeErr)
+			}
 			body := repoBundleExportBody{
 				OutPath:    outPath,
 				Backups:    len(bm.Backups),

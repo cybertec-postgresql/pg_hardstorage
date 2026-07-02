@@ -1024,18 +1024,141 @@ func spliceDSNHostPort(dsn, host string, port int) string {
 		u.Host = fmt.Sprintf("%s:%d", host, port)
 		return u.String()
 	}
-	// Key-value form: rebuild with host/port replaced. Walk the
-	// space-separated tokens; carry through everything except
-	// host= and port=.
-	tokens := strings.Fields(dsn)
-	out := make([]string, 0, len(tokens)+2)
-	for _, tok := range tokens {
-		if strings.HasPrefix(tok, "host=") || strings.HasPrefix(tok, "hostaddr=") || strings.HasPrefix(tok, "port=") {
+	// Key-value form: rebuild with host/port replaced. A naive
+	// strings.Fields split corrupts DSNs with quoted values that
+	// contain spaces (e.g. password='a b') — it would split the value
+	// across two tokens and drop the rest. Parse with a libpq-aware
+	// tokenizer that respects single-quoted values, carry through every
+	// pair except host / hostaddr / port, then re-serialize.
+	pairs, ok := parseKeyValueDSN(dsn)
+	if !ok {
+		return ""
+	}
+	out := make([]string, 0, len(pairs)+2)
+	for _, kv := range pairs {
+		switch kv.key {
+		case "host", "hostaddr", "port":
 			continue
 		}
-		out = append(out, tok)
+		out = append(out, kv.key+"="+quoteDSNValue(kv.value))
 	}
 	out = append(out, fmt.Sprintf("host=%s", host))
 	out = append(out, fmt.Sprintf("port=%d", port))
 	return strings.Join(out, " ")
+}
+
+// dsnKV is one parsed key=value pair from a libpq keyword/value DSN.
+type dsnKV struct {
+	key   string
+	value string
+}
+
+// parseKeyValueDSN parses a libpq keyword/value connection string into
+// ordered key=value pairs, respecting single-quoted values (which may
+// contain spaces) and backslash escapes inside quotes. It follows the
+// libpq grammar closely enough for the DSNs we splice on a Patroni
+// leader change: whitespace-separated `key = value` pairs, optional
+// spaces around '=', and single-quoted values with \' and \\ escapes.
+// Returns ok=false on a malformed string (unterminated quote, missing
+// value) so the caller can fail closed rather than emit a corrupt DSN.
+func parseKeyValueDSN(dsn string) ([]dsnKV, bool) {
+	var pairs []dsnKV
+	i, n := 0, len(dsn)
+	isSpace := func(b byte) bool { return b == ' ' || b == '\t' || b == '\n' || b == '\r' }
+	for {
+		for i < n && isSpace(dsn[i]) {
+			i++
+		}
+		if i >= n {
+			break
+		}
+		// Read the key up to '=' or whitespace.
+		start := i
+		for i < n && dsn[i] != '=' && !isSpace(dsn[i]) {
+			i++
+		}
+		key := dsn[start:i]
+		if key == "" {
+			return nil, false
+		}
+		for i < n && isSpace(dsn[i]) {
+			i++
+		}
+		if i >= n || dsn[i] != '=' {
+			return nil, false
+		}
+		i++ // consume '='
+		for i < n && isSpace(dsn[i]) {
+			i++
+		}
+		// Read the value: single-quoted (may contain spaces + escapes)
+		// or a bare token terminated by whitespace.
+		var val strings.Builder
+		if i < n && dsn[i] == '\'' {
+			i++ // opening quote
+			closed := false
+			for i < n {
+				c := dsn[i]
+				if c == '\\' && i+1 < n {
+					val.WriteByte(dsn[i+1])
+					i += 2
+					continue
+				}
+				if c == '\'' {
+					i++
+					closed = true
+					break
+				}
+				val.WriteByte(c)
+				i++
+			}
+			if !closed {
+				return nil, false // unterminated quote
+			}
+		} else {
+			for i < n && !isSpace(dsn[i]) {
+				if dsn[i] == '\\' && i+1 < n {
+					val.WriteByte(dsn[i+1])
+					i += 2
+					continue
+				}
+				val.WriteByte(dsn[i])
+				i++
+			}
+		}
+		pairs = append(pairs, dsnKV{key: key, value: val.String()})
+	}
+	return pairs, true
+}
+
+// quoteDSNValue renders a value for a libpq keyword/value DSN,
+// single-quoting (and escaping) it when it is empty or contains
+// whitespace / quote / backslash characters — so a round-tripped value
+// with spaces (password='a b') survives re-serialization intact.
+func quoteDSNValue(v string) string {
+	needQuote := v == ""
+	if !needQuote {
+		for i := 0; i < len(v); i++ {
+			switch v[i] {
+			case ' ', '\t', '\n', '\r', '\'', '\\':
+				needQuote = true
+			}
+			if needQuote {
+				break
+			}
+		}
+	}
+	if !needQuote {
+		return v
+	}
+	var b strings.Builder
+	b.WriteByte('\'')
+	for i := 0; i < len(v); i++ {
+		if v[i] == '\'' || v[i] == '\\' {
+			b.WriteByte('\\')
+		}
+		b.WriteByte(v[i])
+	}
+	b.WriteByte('\'')
+	return b.String()
 }

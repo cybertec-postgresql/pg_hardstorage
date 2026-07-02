@@ -235,6 +235,10 @@ func runRepoGC(cmd *cobra.Command, repoURL string, apply bool, approvalID string
 		StaleTempCount:   len(staleTmp),
 	}
 
+	// partialErr, when non-nil, records that some deletions failed. We
+	// defer returning it until after the result body + audit event are
+	// emitted so a partial sweep still reports what it reclaimed.
+	var partialErr error
 	if apply {
 		cas := casdefault.New(sp)
 		var deleted int
@@ -286,7 +290,15 @@ func runRepoGC(cmd *cobra.Command, repoURL string, apply bool, approvalID string
 			// exit code reflects "the cleanup was partial." Use the
 			// generic-error namespace; nothing in our exit-code map flags
 			// this as preflight or verify.
-			return output.NewError("repo.gc.partial_failure",
+			//
+			// Deletions DID occur, so we must NOT return here and
+			// discard the computed body (Applied / BytesReclaimed /
+			// Failures) or skip the approval-gated audit event.  Stash
+			// the error and let control fall through to the audit
+			// emission + d.Result below; the error is returned last so
+			// the operator still gets the structured result body AND a
+			// non-zero exit.
+			partialErr = output.NewError("repo.gc.partial_failure",
 				fmt.Sprintf("repo gc: %d deletion(s) failed (of %d orphan chunk(s) + %d stale staging file(s))",
 					failureCount, body.OrphanCount, body.StaleTempCount)).
 				WithSuggestion(&output.Suggestion{
@@ -337,7 +349,12 @@ func runRepoGC(cmd *cobra.Command, repoURL string, apply bool, approvalID string
 		}
 		body.Hashes = append(body.Hashes, h.String())
 	}
-	return d.Result(output.NewResult(cmd.CommandPath()).WithBody(body))
+	if err := d.Result(output.NewResult(cmd.CommandPath()).WithBody(body)); err != nil {
+		return err
+	}
+	// Signal the partial-failure exit code last, after the result body
+	// and audit event have been emitted.
+	return partialErr
 }
 
 // sumChunkBytes Stats every orphan once to compute the total reclaim

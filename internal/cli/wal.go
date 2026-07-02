@@ -87,11 +87,12 @@ and are not supported.
 // gives up via archive_timeout / archive_failures.
 func newWalPushCmd() *cobra.Command {
 	var (
-		repoURL   string
-		pgConn    string
-		tde       bool
-		kekRef    string
-		kmsConfig map[string]string
+		repoURL      string
+		pgConn       string
+		tde          bool
+		kekRef       string
+		kmsConfig    map[string]string
+		walSegSizeMB int
 	)
 	c := &cobra.Command{
 		Use:   "push <deployment> <segment-path>",
@@ -148,6 +149,7 @@ Exit codes:
 				tde:         tde,
 				kekRef:      kekRef,
 				kmsConfig:   kmsConfig,
+				segSize:     int64(walSegSizeMB) << 20,
 			})
 		},
 	}
@@ -164,6 +166,8 @@ Exit codes:
 		"KEK reference for WAL encryption under a cloud KMS (e.g. aws-kms://...); MUST match the deployment's base-backup KEKRef. Local-KEK encryption is automatic when a keyring kek.bin is present.")
 	c.Flags().StringToStringVar(&kmsConfig, "kms-config", nil,
 		"cloud KMS provider config (region/endpoint/credentials); only consulted when --kek is a cloud scheme — the same values base backups use.")
+	c.Flags().IntVar(&walSegSizeMB, "wal-segsize", 16,
+		"cluster wal_segment_size in megabytes (matches initdb --wal-segsize); a segment file whose length differs from this is refused as truncated/corrupt")
 	return c
 }
 
@@ -176,6 +180,7 @@ type walPushOptions struct {
 	tde         bool
 	kekRef      string
 	kmsConfig   map[string]string
+	segSize     int64 // declared wal_segment_size in bytes; 0 → 16 MiB
 }
 
 func runWalPush(cmd *cobra.Command, opts walPushOptions) error {
@@ -311,6 +316,7 @@ func runWalPush(cmd *cobra.Command, opts walPushOptions) error {
 		SystemIdentifier: sysID,
 		WORM:             repoMeta.WORM,
 		Encryption:       encInfo,
+		SegmentSize:      opts.segSize,
 	})
 	if err != nil {
 		return mapWalPushError(opts.segmentPath, err)

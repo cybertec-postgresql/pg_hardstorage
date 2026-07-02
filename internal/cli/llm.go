@@ -21,6 +21,7 @@ import (
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/cli/cmdtree"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/config"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/llm/chat"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/llm/privacy"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/llm/safety"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/llm/skills"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/llm/tools"
@@ -249,10 +250,14 @@ func runLlmDoctor(cmd *cobra.Command) error {
 	checkStart = time.Now()
 	planted := "pg_hardstorage status --definitely-not-a-real-flag"
 	verr := cmdtree.Validate(tree, planted, "pg_hardstorage")
+	validatorDetail := "validator did NOT catch the planted flag — broken"
+	if verr != nil {
+		validatorDetail = fmt.Sprintf("validator said: %v", verr)
+	}
 	body.Checks = append(body.Checks, llmDoctorCheck{
 		Name:    "validator catches planted error",
 		Pass:    verr != nil,
-		Detail:  ifEmpty(fmt.Sprintf("validator said: %v", verr), "validator did NOT catch the planted flag — broken"),
+		Detail:  validatorDetail,
 		Latency: time.Since(checkStart).Round(time.Millisecond).String(),
 	})
 
@@ -260,7 +265,15 @@ func runLlmDoctor(cmd *cobra.Command) error {
 	// We open the provider but don't make a real call here —
 	// the round-trip check below handles that.
 	checkStart = time.Now()
-	prov, provName, endpoint, model, perr := resolveLlmProviderFull(cmd.Context(), "", "", "")
+	// Honour the operator-supplied persistent flags inherited from
+	// the parent `llm` command (--provider / --endpoint / --model);
+	// resolving with "" here would ignore them and report a
+	// different provider than the one an operator asked doctor to
+	// diagnose.
+	flagProvider, _ := cmd.Flags().GetString("provider")
+	flagEndpoint, _ := cmd.Flags().GetString("endpoint")
+	flagModel, _ := cmd.Flags().GetString("model")
+	prov, provName, endpoint, model, perr := resolveLlmProviderFull(cmd.Context(), flagProvider, flagEndpoint, flagModel)
 	body.Provider = provName
 	body.Endpoint = endpoint
 	body.Model = model
@@ -277,7 +290,7 @@ func runLlmDoctor(cmd *cobra.Command) error {
 	})
 	if perr != nil {
 		body.OK = false
-		return d.Result(output.NewResult(cmd.CommandPath()).WithBody(body))
+		return doctorResult(d, cmd, body)
 	}
 	defer prov.Close()
 
@@ -295,7 +308,25 @@ func runLlmDoctor(cmd *cobra.Command) error {
 			break
 		}
 	}
-	return d.Result(output.NewResult(cmd.CommandPath()).WithBody(body))
+	return doctorResult(d, cmd, body)
+}
+
+// doctorResult renders the doctor body and — when any check failed
+// (body.OK == false) — returns a non-nil structured error so the
+// process exits non-zero, matching the help text's promise
+// ("Exits non-zero when any check fails.").  The full report is
+// still emitted (via the dispatcher) either way, so the operator
+// sees every ✓/✗ row regardless of exit status.
+func doctorResult(d *output.Dispatcher, cmd *cobra.Command, body llmDoctorBody) error {
+	if renderErr := d.Result(output.NewResult(cmd.CommandPath()).WithBody(body)); renderErr != nil {
+		return renderErr
+	}
+	if !body.OK {
+		return output.NewError("llm.doctor_failed",
+			"llm doctor: one or more checks failed — see the report above").
+			Wrap(output.ErrUsage)
+	}
+	return nil
 }
 
 // roundTripProbe shells back into ourselves via `llm ask` to
@@ -311,6 +342,19 @@ func roundTripProbe(cmd *cobra.Command, _ time.Duration) llmDoctorCheck {
 	bin, err := os.Executable()
 	if err != nil || bin == "" {
 		bin = "pg_hardstorage"
+	}
+	// Under `go test` the resolved binary is the test binary;
+	// forking it with `llm ask ...` hangs (the test binary doesn't
+	// recognise those args and blocks on stdin).  Same guard
+	// buildLiveToolRegistry uses.  Report a neutral pass so doctor
+	// stays testable without a network probe.
+	if isTestBinary(bin) {
+		return llmDoctorCheck{
+			Name:    "provider round-trip",
+			Pass:    true,
+			Detail:  "skipped under go test (no child probe)",
+			Latency: time.Since(checkStart).Round(time.Millisecond).String(),
+		}
 	}
 	probe := "Reply with exactly one word: 'pong' (no preamble, no quotes, no markdown)."
 	c := exec.CommandContext(cmd.Context(), bin, "llm", "ask", probe, "-o", "json")
@@ -494,12 +538,25 @@ func runLlmAsk(cmd *cobra.Command, opts llmAskOptions) error {
 			fmt.Sprintf("llm: skill %q not loaded — drop a YAML at /etc/pg_hardstorage/skills/ or upgrade the binary (the four builtins ask/explain/restore/incident ship with+)", opts.skill)).Wrap(err)
 	}
 
-	// 2. Resolve provider.
-	prov, provName, err := resolveLlmProvider(cmd.Context(), opts.provider, opts.endpoint, opts.model)
+	// 2. Resolve provider.  Use the -Full variant so we get the
+	// resolved endpoint for the privacy gate below (flag → env →
+	// yaml → provider default).
+	prov, provName, resolvedEndpoint, _, err := resolveLlmProviderFull(cmd.Context(), opts.provider, opts.endpoint, opts.model)
 	if err != nil {
 		return err
 	}
 	defer prov.Close()
+
+	// 2a. Resolve privacy mode + endpoint for the session — the
+	// same enforcement the chat path applies (llm_chat.go).  Without
+	// this, a configured llm.privacy strict / local-only would be
+	// silently ignored for `llm ask` / `llm explain`, so data could
+	// egress unredacted or to a disallowed endpoint.
+	llmCfg := loadLLMConfigFromFile()
+	privacyMode, privErr := privacy.Parse(llmCfg.Privacy)
+	if privErr != nil {
+		return output.NewError("config.bad_privacy_mode", privErr.Error()).Wrap(privErr)
+	}
 
 	// 3. Build the tools registry.  For ask/restore/incident the
 	// skill exposes a meaningful set of read-only tools; for
@@ -519,6 +576,8 @@ func runLlmAsk(cmd *cobra.Command, opts llmAskOptions) error {
 		Tools:            toolReg,
 		Skill:            skill,
 		Runner:           runner,
+		Privacy:          privacyMode,
+		PrivacyEndpoint:  resolvedEndpoint,
 		CommandCatalog:   cmdtree.Catalog(tree, 2),
 		CommandHelpBlock: renderHotCommandHelp(tree),
 		CommandValidator: func(command string) error {

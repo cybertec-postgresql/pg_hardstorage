@@ -98,6 +98,16 @@ func runDoctor(cmd *cobra.Command, _ []string) error {
 		report.ManifestSig, report.Issues = appendManifestSignatureChecks(cmd.Context(), cfg, report.Issues)
 	}
 
+	// Recompute Healthy from the FINAL issue set. buildDoctorReport
+	// froze Healthy=true (flipping it false only for the config/path
+	// checks it runs inline), but the root-euid check and the per-repo
+	// probes above (appendRepoChecks/WALGaps/ManifestSig/…) append
+	// error- and critical-severity issues AFTER that. Without this, a
+	// JSON report could claim healthy:true alongside a critical issue.
+	if doctorHasErrorOrHigher(report.Issues) {
+		report.Healthy = false
+	}
+
 	res := output.NewResult(cmd.CommandPath()).WithBody(report)
 	if err := d.Result(res); err != nil {
 		return err
@@ -125,6 +135,19 @@ func runDoctor(cmd *cobra.Command, _ []string) error {
 func doctorHasWarningOrHigher(issues []doctorIssue) bool {
 	for _, i := range issues {
 		if doctorSeverityRank(i.Severity) >= doctorSeverityRank(output.SeverityWarning) {
+			return true
+		}
+	}
+	return false
+}
+
+// doctorHasErrorOrHigher reports whether any collected issue is at
+// error severity or above (error / critical / alert / emergency).
+// This is the threshold at which the report's Healthy verdict flips
+// to false — matching buildDoctorReport's inline SeverityError flips.
+func doctorHasErrorOrHigher(issues []doctorIssue) bool {
+	for _, i := range issues {
+		if doctorSeverityRank(i.Severity) >= doctorSeverityRank(output.SeverityError) {
 			return true
 		}
 	}

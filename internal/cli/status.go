@@ -139,6 +139,13 @@ func computeAnchorStatus(ctx context.Context, sp storage.StoragePlugin, repoMeta
 		if strings.HasPrefix(info.Key, audit.AnchorPrefix) {
 			continue
 		}
+		// Per-shard head pointers (audit/shards/<shard>/_head.json) are
+		// perf caches, not chain events — counting them inflated the
+		// event count by one per shard. Exclude them like the global
+		// HeadKey above.
+		if strings.HasPrefix(info.Key, "audit/shards/") && strings.HasSuffix(info.Key, "/_head.json") {
+			continue
+		}
 		chainKeys++
 	}
 	a.ChainEventCount = chainKeys
@@ -156,12 +163,25 @@ func computeAnchorStatus(ctx context.Context, sp storage.StoragePlugin, repoMeta
 	}
 	a.Present = true
 	a.HeadSequence = latest.HeadSequence
-	want := int64(chainKeys - 1)
-	if latest.HeadSequence == want {
+	// Freshness compares the anchor's head sequence against the CURRENT
+	// head sequence of the SAME shard it witnesses, read from that
+	// shard's authoritative head pointer — NOT the chainKeys-1 event
+	// count, which is wrong under WORM retention pruning and across
+	// shards (see doctor.go readAuditHeadSequence + the anchor-freshness
+	// notes there). Mirror that logic.
+	headSeq, ok := readAuditHeadSequence(ctx, sp, latest.Shard)
+	if !ok {
+		// No readable head pointer — falling back to the retention-
+		// truncated count is the false positive we're avoiding. Treat
+		// the present anchor as fresh rather than emit a guess.
 		a.Fresh = true
 		return a
 	}
-	a.BehindEvents = chainKeys - int(latest.HeadSequence) - 1
+	if latest.HeadSequence >= headSeq {
+		a.Fresh = true
+		return a
+	}
+	a.BehindEvents = int(headSeq - latest.HeadSequence)
 	return a
 }
 

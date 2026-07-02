@@ -1033,7 +1033,20 @@ func runRepairScrub(cmd *cobra.Command, repoURL string, limit int, heal bool, re
 	// Carry the destination repo's WORM policy so healed chunks are re-locked
 	// on a compliance repo (the heal's IfNotExists Put carries no retention).
 	healUntil, healMode := wormPolicyFor(scrubMeta)
-	healRes, herr := repo.Heal(cmd.Context(), sp, replicaSP, res.Mismatches, repo.HealOptions{
+	// Skip the synthetic all-zero repo.Hash{} KEK-missing marker that
+	// scrubManifestAware (~1375) appends for manifests we can't decrypt.
+	// It isn't a real chunk: feeding it to repo.Heal makes Heal Stat a
+	// nonexistent zero-hash chunk and forces a misleading
+	// verify.heal_incomplete. reverifyChunksPlaintext already skips it;
+	// mirror that here.
+	healTargets := make([]repo.Hash, 0, len(res.Mismatches))
+	for _, h := range res.Mismatches {
+		if h == (repo.Hash{}) {
+			continue
+		}
+		healTargets = append(healTargets, h)
+	}
+	healRes, herr := repo.Heal(cmd.Context(), sp, replicaSP, healTargets, repo.HealOptions{
 		RetainUntil:   healUntil,
 		RetentionMode: healMode,
 	})
@@ -1404,7 +1417,11 @@ func scrubManifestAware(ctx context.Context, sp storage.StoragePlugin, limit int
 	defaultCAS := casdefault.New(sp)
 	for info, lerr := range sp.List(ctx, "wal/") {
 		if lerr != nil {
-			break
+			// A transient List failure must NOT be swallowed: silently
+			// break-ing here truncates the walk and reports a clean "no
+			// integrity failures" while WAL chunks went unchecked.
+			// Propagate so the scrub surfaces the error instead.
+			return agg, distinctRefs, lerr
 		}
 		if !strings.HasSuffix(info.Key, ".json") || strings.Contains(info.Key, ".json.tmp.") {
 			continue

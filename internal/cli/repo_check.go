@@ -3,6 +3,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"sort"
@@ -102,6 +103,18 @@ func runRepoCheck(cmd *cobra.Command, repoURL string) error {
 		dr := repoCheckDeployment{Name: dep}
 		for m, err := range store.List(cmd.Context(), dep, verifier) {
 			if err != nil {
+				// Distinguish a genuine signature/parse failure (the
+				// manifest was fetched but failed Ed25519 verification,
+				// schema/parse, or the embedded key mismatched) from a
+				// transient backend/List error. Counting a List/Get
+				// failure as a signature failure would report
+				// "potential tampering" (exit 9) and present a
+				// truncated walk as complete — a storage hiccup must
+				// not masquerade as corruption.
+				if !isManifestSignatureFailure(err) {
+					return output.NewError("repo.check.manifest_walk_failed",
+						fmt.Sprintf("repo check: list manifests for %s: %v", dep, err)).Wrap(err)
+				}
 				dr.SignatureFailures++
 				totalSigFailed++
 				continue
@@ -195,6 +208,37 @@ func runRepoCheck(cmd *cobra.Command, repoURL string) error {
 			})
 	}
 	return d.Result(output.NewResult(cmd.CommandPath()).WithBody(body))
+}
+
+// isManifestSignatureFailure reports whether err from a manifest walk
+// is a genuine signature/verification failure — the manifest bytes
+// were fetched but failed to parse, verify, or matched a different
+// signing key — rather than a transient backend/List error (storage
+// unreachable, listing interrupted, context cancelled). Only the
+// former is "potential tampering" (exit 9); the latter means the walk
+// was TRUNCATED and must be surfaced as a backend error so a storage
+// hiccup doesn't masquerade as corruption or report an incomplete
+// walk as clean.
+//
+// Classification is by exclusion: a storage-layer sentinel or a
+// cancellation is unambiguously a backend error; everything else that
+// bubbles out of ParseAndVerify (key mismatch, unsigned, bad
+// signature, JSON-parse, schema-mismatch) is a real verification
+// failure over bytes we DID fetch.
+func isManifestSignatureFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, storage.ErrNotFound) ||
+		errors.Is(err, storage.ErrChecksumMismatch) ||
+		errors.Is(err, storage.ErrUnsupported) ||
+		errors.Is(err, storage.ErrUnknownScheme) ||
+		errors.Is(err, storage.ErrAlreadyExists) ||
+		errors.Is(err, context.Canceled) ||
+		errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	return true
 }
 
 // countTombstones walks the deployment's manifest tree once and

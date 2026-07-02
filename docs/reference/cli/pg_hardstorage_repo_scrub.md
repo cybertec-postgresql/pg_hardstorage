@@ -37,7 +37,7 @@ pg_hardstorage repo scrub <url> [flags]
 ```
       --full                 shorthand for --sample-percent 100 (scan every referenced chunk)
   -h, --help                 help for scrub
-      --repo string          repository URL — alternative to the positional <url>
+      --repo string          repository URL — must already exist (positional <url> is also accepted)
       --sample-percent int   percent of referenced chunks to sample (1-100); default 1 for hourly cron, 100 for quarterly full scan (default 1)
 ```
 

@@ -71,6 +71,7 @@ pg_hardstorage wal push <deployment> <segment-path> [flags]
       --repo string                 repository URL (file://, s3://, ...) — must already exist (required)
       --system-identifier string    explicit pg_control system_identifier (skip libpq round-trip)
       --tde                         the source PG has Transparent Data Encryption enabled; skip on-segment header parsing (requires --system-identifier or --pg-connection). See docs/explanation/tde-awareness.md.
+      --wal-segsize int             cluster wal_segment_size in megabytes (matches initdb --wal-segsize); a segment file whose length differs from this is refused as truncated/corrupt (default 16)
 ```
 
 ### Options inherited from parent commands

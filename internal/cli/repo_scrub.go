@@ -55,14 +55,25 @@ quarterly checks pass --full (equivalent to --sample-percent 100).
 Scrub mismatches map to ExitVerifyFailed (9) so a cron-wired scrub
 alarms when integrity slips. Findings are also captured in the
 hash-chained audit log.`,
-		Args:         cobra.ExactArgs(1),
+		Args:         cobra.MaximumNArgs(1),
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runRepoScrub(cmd, args[0], samplePercent, fullScan)
+			// Positional-or-flag, matching the sibling repo verbs
+			// (repo check, repo gc): --repo is an accepted alternative
+			// to the positional <url>; a positional that disagrees
+			// with --repo is a conflict rather than a silent override.
+			if len(args) == 1 {
+				if repoURL != "" && repoURL != args[0] {
+					return output.NewError("usage.repo_conflict",
+						"repo scrub: --repo and the positional URL disagree").Wrap(output.ErrUsage)
+				}
+				repoURL = args[0]
+			}
+			return runRepoScrub(cmd, repoURL, samplePercent, fullScan)
 		},
 	}
 	c.Flags().StringVar(&repoURL, "repo", "",
-		"repository URL — alternative to the positional <url>")
+		"repository URL — must already exist (positional <url> is also accepted)")
 	c.Flags().IntVar(&samplePercent, "sample-percent", 1,
 		"percent of referenced chunks to sample (1-100); default 1 for hourly cron, 100 for quarterly full scan")
 	c.Flags().BoolVar(&fullScan, "full", false,

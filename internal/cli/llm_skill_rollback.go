@@ -12,6 +12,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/fsutil"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/llm/skills"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/output"
 )
@@ -271,25 +272,28 @@ func listSkillSnapshots(dir, name string) ([]string, error) {
 	return snaps, nil
 }
 
+// copyFile copies src to dst. It reads the whole source BEFORE
+// touching dst and writes via a temp-file+rename, so:
+//
+//   - re-installing a skill from its own installed path (src == dst)
+//     no longer truncates the file with O_TRUNC before it is read; and
+//   - a crash mid-copy leaves either the old or the new file, never a
+//     torn half-written one.
+//
+// fsutil.WriteFileAtomic handles the tmp+fsync+rename+dir-fsync dance.
 func copyFile(src, dst string) error {
-	in, err := os.Open(src)
+	data, err := os.ReadFile(src)
 	if err != nil {
 		return err
 	}
-	defer in.Close()
-	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
-	if err != nil {
-		return err
+	mode := os.FileMode(0o644)
+	if fi, statErr := os.Stat(src); statErr == nil {
+		mode = fi.Mode().Perm()
 	}
-	if _, err := io.Copy(out, in); err != nil {
-		out.Close()
-		return err
-	}
-	if err := out.Sync(); err != nil {
-		out.Close()
-		return err
-	}
-	return out.Close()
+	// WriteFileAtomic opens the tmp with O_EXCL; clear any stale tmp
+	// from a prior crashed write so a re-install doesn't wedge.
+	_ = os.Remove(dst + ".tmp")
+	return fsutil.WriteFileAtomic(dst, data, mode)
 }
 
 // --- result bodies (v1 schema) ----------------------------------------

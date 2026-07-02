@@ -10,26 +10,19 @@ import (
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/output"
 )
 
-// TestRepoScrub_RequiresURL surfaces the missing-arg
-// error from `repo scrub` with no URL.  After the
-// arg-error enrichment landed (see args_error.go),
-// cobra's bare "accepts 1 arg(s)" is rewritten into the
-// friendlier shape the operator actually wants — the
-// assertion checks both the count and the placeholder
-// name so a future regression can't slip the old shape
-// back in.
+// TestRepoScrub_RequiresURL surfaces the missing-arg error from `repo
+// scrub` with neither a positional <url> nor --repo. Since --repo is
+// now accepted as an alternative to the positional (matching the
+// sibling repo verbs), the arg count is MaximumNArgs(1) and the
+// missing-URL condition is enforced at runtime by runRepoScrub, which
+// reports "<url> is required".
 func TestRepoScrub_RequiresURL(t *testing.T) {
 	_, stderr, exit := runCLI(t, "repo", "scrub", "-o", "json")
 	if exit == int(output.ExitOK) {
 		t.Errorf("missing URL should not exit 0\nstderr=%s", stderr)
 	}
-	for _, want := range []string{
-		"needs 1 argument",
-		"<url>", // the placeholder from `Use: "scrub <url>"`
-	} {
-		if !strings.Contains(stderr, want) {
-			t.Errorf("expected missing-arg message to include %q; stderr=%s", want, stderr)
-		}
+	if !strings.Contains(stderr, "<url> is required") {
+		t.Errorf("expected missing-URL message; stderr=%s", stderr)
 	}
 }
 

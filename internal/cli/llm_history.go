@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -160,15 +161,27 @@ func newLlmHistoryListCmd() *cobra.Command {
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			d := DispatcherFrom(cmd)
+			wildcard := principal == "*"
 			scoped := resolvePrincipal(principal)
-			if principal == "*" {
+			if wildcard {
 				scoped = ""
 			}
 			store, err := openHistoryStoreForRead(scoped)
 			if err != nil {
 				return err
 			}
-			metas, err := store.List(scoped, "")
+			var metas []history.SessionMeta
+			if wildcard {
+				// '*' enumerates EVERY principal on the host.
+				// store.List("") would sanitise the empty
+				// principal to the "_default" directory (which
+				// is never written), so it would always come back
+				// empty.  Instead walk each recorded principal
+				// directory and aggregate.
+				metas, err = listAllPrincipals(store)
+			} else {
+				metas, err = store.List(scoped, "")
+			}
 			if err != nil {
 				return output.NewError("history.list_failed",
 					fmt.Sprintf("history list: %v", err)).Wrap(err)
@@ -266,6 +279,51 @@ func newLlmHistoryShredCmd() *cobra.Command {
 	c.Flags().BoolVar(&yes, "yes", false,
 		"acknowledge that the deletion is irreversible (no backup of these transcripts is taken anywhere — they live only on the operator's host)")
 	return c
+}
+
+// listAllPrincipals aggregates session metadata across every
+// principal directory under the conversations root.  Backs
+// `llm history list --principal '*'`: each immediate child of the
+// conversations root is a sanitised principal directory, and
+// store.List(<dir>, "") walks that principal's sessions.  Listing
+// reads only the unencrypted .meta.json sidecars, so no per-
+// principal DEK is required.
+func listAllPrincipals(store *history.Store) ([]history.SessionMeta, error) {
+	root, err := historyConversationsRoot()
+	if err != nil {
+		return nil, err
+	}
+	dirents, err := os.ReadDir(root)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil // nothing recorded yet
+		}
+		return nil, err
+	}
+	var out []history.SessionMeta
+	for _, de := range dirents {
+		if !de.IsDir() {
+			continue
+		}
+		metas, err := store.List(de.Name(), "")
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, metas...)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].StartedAt.Before(out[j].StartedAt) })
+	return out, nil
+}
+
+// historyConversationsRoot resolves <state>/llm/conversations,
+// the directory whose immediate children are the per-principal
+// session stores.  Shared by the wildcard list path.
+func historyConversationsRoot() (string, error) {
+	stateRoot, err := paths.Resolve(paths.DefaultOptions())
+	if err != nil {
+		return "", output.NewError("internal", err.Error()).Wrap(err)
+	}
+	return filepath.Join(stateRoot.State.Value, "llm", "conversations"), nil
 }
 
 // openHistoryStoreForRead is the shared open path for the

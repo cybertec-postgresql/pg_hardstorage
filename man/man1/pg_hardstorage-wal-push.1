@@ -98,6 +98,10 @@ Exit codes:
 \fB--tde\fP[=false]
 	the source PG has Transparent Data Encryption enabled; skip on-segment header parsing (requires --system-identifier or --pg-connection). See docs/explanation/tde-awareness.md.
 
+.PP
+\fB--wal-segsize\fP=16
+	cluster wal_segment_size in megabytes (matches initdb --wal-segsize); a segment file whose length differs from this is refused as truncated/corrupt
+
 
 .SH OPTIONS INHERITED FROM PARENT COMMANDS
 .PP
