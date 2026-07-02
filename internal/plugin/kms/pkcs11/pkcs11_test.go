@@ -308,6 +308,39 @@ func TestProvider_ClosedRefuses(t *testing.T) {
 	}
 }
 
+// TestProvider_KEKRefRedactsSecrets is the bug-20 regression:
+// KEKRef() is stamped into manifests on untrusted-readable repo
+// storage, so it must never contain the HSM PIN (or the
+// pin_source path).  The redacted ref must stay a valid,
+// re-parseable pkcs11:// identifier with the non-secret params
+// (token, key, module, mech, slot) intact.
+func TestProvider_KEKRefRedactsSecrets(t *testing.T) {
+	ref := "pkcs11://prod-token/db-kek?module=/usr/lib/softhsm/libsofthsm2.so&pin=SUPERSECRET&pin_source=/etc/hsm/pin&slot=2"
+	cli := newFakeAESHSM("db-kek")
+	p, err := pkcs11.NewWithClient(ref, cli)
+	if err != nil {
+		t.Fatalf("NewWithClient: %v", err)
+	}
+	got := p.KEKRef()
+
+	if strings.Contains(got, "SUPERSECRET") || strings.Contains(strings.ToLower(got), "pin=") {
+		t.Errorf("KEKRef leaks PIN: %q", got)
+	}
+	if strings.Contains(got, "pin_source") || strings.Contains(got, "/etc/hsm/pin") {
+		t.Errorf("KEKRef leaks pin_source: %q", got)
+	}
+	// Non-secret params must survive so the ref stays resolvable.
+	for _, want := range []string{"pkcs11://prod-token/db-kek", "module=", "slot=2"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("KEKRef dropped %q: %q", want, got)
+		}
+	}
+	// The redacted ref must still parse as a valid KEKRef.
+	if _, err := pkcs11.NewWithClient(got+"&pin=x", newFakeAESHSM("db-kek")); err != nil {
+		t.Errorf("redacted KEKRef no longer parseable: %v", err)
+	}
+}
+
 func TestParseKEKRef_Cases(t *testing.T) {
 	cases := []struct {
 		name string
@@ -379,8 +412,17 @@ func TestProvider_NameAndKEKRef(t *testing.T) {
 	if p.Name() != "pkcs11" {
 		t.Errorf("Name = %q", p.Name())
 	}
-	if p.KEKRef() != sampleKEKRef {
-		t.Errorf("KEKRef round-trip lost bytes")
+	// KEKRef is stamped into manifests, so the PIN is redacted
+	// (bug 20); the non-secret parts must still round-trip.
+	got := p.KEKRef()
+	if strings.Contains(got, "pin=") {
+		t.Errorf("KEKRef must not carry the PIN: %q", got)
+	}
+	if !strings.HasPrefix(got, "pkcs11://prod-token/db-kek") {
+		t.Errorf("KEKRef lost the token/key identity: %q", got)
+	}
+	if !strings.Contains(got, "module=") {
+		t.Errorf("KEKRef dropped the module param: %q", got)
 	}
 }
 

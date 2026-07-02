@@ -47,10 +47,21 @@ type cgoClient struct {
 	ctx     *pkcs11.Ctx
 	session pkcs11.SessionHandle
 
-	// keyCache maps CKA_LABEL → object handle so repeated
-	// wraps don't FindObjects every time.  Cleared on key
+	// keyCache maps (CKA_LABEL, CKA_CLASS) → object handle so
+	// repeated wraps don't FindObjects every time.  The class is
+	// part of the key because an RSA-OAEP keypair shares a single
+	// CKA_LABEL: the public half (encrypt) and the private half
+	// (decrypt) are distinct objects, and caching one handle for
+	// both operations would use the wrong half.  Cleared on key
 	// destroy.
-	keyCache map[string]pkcs11.ObjectHandle
+	keyCache map[cacheKey]pkcs11.ObjectHandle
+}
+
+// cacheKey identifies a cached object by its label and PKCS#11
+// object class (CKO_SECRET_KEY / CKO_PUBLIC_KEY / CKO_PRIVATE_KEY).
+type cacheKey struct {
+	label string
+	class uint
 }
 
 // newRealClient opens the PKCS#11 module, finds the named
@@ -91,7 +102,7 @@ func newRealClient(_ context.Context, cfg realClientConfig) (Client, error) {
 	return &cgoClient{
 		ctx:      c,
 		session:  sess,
-		keyCache: map[string]pkcs11.ObjectHandle{},
+		keyCache: map[cacheKey]pkcs11.ObjectHandle{},
 	}, nil
 }
 
@@ -122,12 +133,64 @@ func resolveSlot(c *pkcs11.Ctx, cfg realClientConfig) (uint, error) {
 	return 0, fmt.Errorf("pkcs11: no slot with token label %q (saw %d slots)", cfg.TokenLabel, len(slots))
 }
 
-// findKey returns the object handle for the named CKA_LABEL.
-// Caches per-session.
-func (cc *cgoClient) findKey(label string) (pkcs11.ObjectHandle, error) {
-	if h, ok := cc.keyCache[label]; ok {
+// keyClassFor returns the PKCS#11 object class to search for
+// given the wrap mechanism and the operation direction.
+//
+//   - AES-GCM is symmetric: a single CKO_SECRET_KEY object serves
+//     both encrypt and decrypt.
+//   - RSA-OAEP is asymmetric: the public half (CKO_PUBLIC_KEY)
+//     encrypts and the private half (CKO_PRIVATE_KEY) decrypts.
+//     Both halves share the same CKA_LABEL, so the class is the
+//     only thing that disambiguates them.
+func keyClassFor(mech Mechanism, encrypt bool) uint {
+	if mech == MechRSAOAEP {
+		if encrypt {
+			return pkcs11.CKO_PUBLIC_KEY
+		}
+		return pkcs11.CKO_PRIVATE_KEY
+	}
+	return pkcs11.CKO_SECRET_KEY
+}
+
+// findKey returns the object handle for the named CKA_LABEL that
+// also matches the requested CKA_CLASS.  Constraining on class is
+// essential for RSA-OAEP, where the encrypt (public) and decrypt
+// (private) halves share a label; searching label-only would
+// return whichever object the token happens to enumerate first
+// and cache the wrong half for the opposite operation.  Caches
+// per (label, class) so encrypt and decrypt keep independent
+// handles.
+func (cc *cgoClient) findKey(label string, class uint) (pkcs11.ObjectHandle, error) {
+	ck := cacheKey{label: label, class: class}
+	if h, ok := cc.keyCache[ck]; ok {
 		return h, nil
 	}
+	template := []*pkcs11.Attribute{
+		pkcs11.NewAttribute(pkcs11.CKA_LABEL, []byte(label)),
+		pkcs11.NewAttribute(pkcs11.CKA_CLASS, class),
+	}
+	if err := cc.ctx.FindObjectsInit(cc.session, template); err != nil {
+		return 0, fmt.Errorf("FindObjectsInit: %w", err)
+	}
+	defer func() { _ = cc.ctx.FindObjectsFinal(cc.session) }()
+	objs, _, err := cc.ctx.FindObjects(cc.session, 1)
+	if err != nil {
+		return 0, fmt.Errorf("FindObjects: %w", err)
+	}
+	if len(objs) == 0 {
+		return 0, fmt.Errorf("no key with label %q and class %d", label, class)
+	}
+	cc.keyCache[ck] = objs[0]
+	return objs[0], nil
+}
+
+// findAnyKey returns the first object handle matching CKA_LABEL
+// regardless of class.  Used by DestroyKey/DescribeKey, which
+// operate on the key object by label alone (they don't wrap or
+// unwrap, so the encrypt/decrypt class distinction doesn't apply).
+// Not cached: these are one-shot operations and DestroyKey must
+// not leave a stale handle behind.
+func (cc *cgoClient) findAnyKey(label string) (pkcs11.ObjectHandle, error) {
 	template := []*pkcs11.Attribute{
 		pkcs11.NewAttribute(pkcs11.CKA_LABEL, []byte(label)),
 	}
@@ -142,7 +205,6 @@ func (cc *cgoClient) findKey(label string) (pkcs11.ObjectHandle, error) {
 	if len(objs) == 0 {
 		return 0, fmt.Errorf("no key with label %q", label)
 	}
-	cc.keyCache[label] = objs[0]
 	return objs[0], nil
 }
 
@@ -150,7 +212,7 @@ func (cc *cgoClient) findKey(label string) (pkcs11.ObjectHandle, error) {
 // is supplied by the caller for aes-gcm and ignored for
 // rsa-oaep.
 func (cc *cgoClient) Encrypt(_ context.Context, mech Mechanism, keyLabel string, iv, plaintext []byte) ([]byte, error) {
-	key, err := cc.findKey(keyLabel)
+	key, err := cc.findKey(keyLabel, keyClassFor(mech, true))
 	if err != nil {
 		return nil, err
 	}
@@ -175,7 +237,7 @@ func (cc *cgoClient) Encrypt(_ context.Context, mech Mechanism, keyLabel string,
 
 // Decrypt unwraps `ciphertext` under `keyLabel`.
 func (cc *cgoClient) Decrypt(_ context.Context, mech Mechanism, keyLabel string, iv, ciphertext []byte) ([]byte, error) {
-	key, err := cc.findKey(keyLabel)
+	key, err := cc.findKey(keyLabel, keyClassFor(mech, false))
 	if err != nil {
 		return nil, err
 	}
@@ -199,14 +261,21 @@ func (cc *cgoClient) Decrypt(_ context.Context, mech Mechanism, keyLabel string,
 // entry on success so a subsequent operation triggers a fresh
 // FindObjects (which will fail — by design, Shred is final).
 func (cc *cgoClient) DestroyKey(_ context.Context, keyLabel string) error {
-	key, err := cc.findKey(keyLabel)
+	key, err := cc.findAnyKey(keyLabel)
 	if err != nil {
 		return err
 	}
 	if err := cc.ctx.DestroyObject(cc.session, key); err != nil {
 		return fmt.Errorf("DestroyObject: %w", err)
 	}
-	delete(cc.keyCache, keyLabel)
+	// Drop every cached handle for this label (all classes) so a
+	// subsequent operation triggers a fresh FindObjects (which
+	// will fail — by design, Shred is final).
+	for k := range cc.keyCache {
+		if k.label == keyLabel {
+			delete(cc.keyCache, k)
+		}
+	}
 	return nil
 }
 
@@ -215,7 +284,7 @@ func (cc *cgoClient) DestroyKey(_ context.Context, keyLabel string) error {
 // attributes (CKA_VALUE / CKA_PRIVATE_EXPONENT) — those are
 // either non-extractable or wouldn't fit a JSON dump.
 func (cc *cgoClient) DescribeKey(_ context.Context, keyLabel string) (map[string]any, error) {
-	key, err := cc.findKey(keyLabel)
+	key, err := cc.findAnyKey(keyLabel)
 	if err != nil {
 		return nil, err
 	}

@@ -235,7 +235,7 @@ func builder(ctx context.Context, kekRef string, cfg map[string]any) (stdkms.Pro
 	fipsMode, _ := cfg["use_fips_mode"].(bool)
 
 	return &Provider{
-		kekRef:    kekRef,
+		kekRef:    redactKEKRef(kekRef),
 		tokenLbl:  parsed.tokenLabel,
 		keyLbl:    parsed.keyLabel,
 		modulePth: parsed.modulePath,
@@ -263,7 +263,7 @@ func NewWithClient(kekRef string, client Client, opts ...Option) (*Provider, err
 		return nil, err
 	}
 	p := &Provider{
-		kekRef:    kekRef,
+		kekRef:    redactKEKRef(kekRef),
 		tokenLbl:  parsed.tokenLabel,
 		keyLbl:    parsed.keyLabel,
 		modulePth: parsed.modulePath,
@@ -285,7 +285,11 @@ func WithFIPSMode(fips bool) Option { return func(p *Provider) { p.fipsMode = fi
 // Name implements kms.Provider.
 func (p *Provider) Name() string { return Scheme }
 
-// KEKRef implements kms.Provider.
+// KEKRef implements kms.Provider. The returned reference has all
+// secret query parameters (pin, pin_source) redacted so it is safe
+// to persist into manifests stored on untrusted-readable repo
+// storage; secrets are resolved at Open time from the original
+// ref / cfg / environment and are never surfaced here.
 func (p *Provider) KEKRef() string { return p.kekRef }
 
 // FIPSMode implements kms.Provider.
@@ -501,4 +505,38 @@ func parseKEKRef(kekRef string) (parsedRef, error) {
 		out.slotSet = true
 	}
 	return out, nil
+}
+
+// secretKEKRefParams are query parameters that carry (or point
+// at) HSM secrets and must never survive into a returned KEKRef.
+// KEKRef values are stamped into manifests written to
+// untrusted-readable repo storage, so an inline `pin=` (or a
+// `pin_source=` path that discloses local layout) would persist
+// a credential in cleartext.
+var secretKEKRefParams = []string{"pin", "pin_source"}
+
+// redactKEKRef returns kekRef with any secret query parameters
+// (see secretKEKRefParams) stripped, while preserving the rest of
+// the reference so it stays a valid, resolvable identifier
+// (token, key label, module, mech, slot). If kekRef can't be
+// parsed it is returned unchanged rather than leaking — but a
+// malformed ref never reaches here because the Provider is only
+// constructed after a successful parseKEKRef.
+func redactKEKRef(kekRef string) string {
+	u, err := url.Parse(kekRef)
+	if err != nil {
+		// Should be unreachable (parse already succeeded); fall
+		// back to the safest thing we can do without a parse:
+		// drop everything after '?'.
+		if i := strings.IndexByte(kekRef, '?'); i >= 0 {
+			return kekRef[:i]
+		}
+		return kekRef
+	}
+	q := u.Query()
+	for _, k := range secretKEKRefParams {
+		q.Del(k)
+	}
+	u.RawQuery = q.Encode()
+	return u.String()
 }

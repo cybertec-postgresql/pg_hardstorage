@@ -97,6 +97,13 @@ type Provider struct {
 
 	mu     sync.Mutex
 	closed bool
+
+	// lastDeletionDate records the scheduled destruction time
+	// returned by the most recent successful Shred.  AWS KMS
+	// returns this as the operator's compliance receipt — the
+	// exact instant the key material becomes unrecoverable — and
+	// the CLI surfaces it via LastDeletionDate after Shred.
+	lastDeletionDate *time.Time
 }
 
 // builder is the registry entry-point.  Reads the KEKRef +
@@ -260,13 +267,30 @@ func (p *Provider) Shred(ctx context.Context) error {
 		return fmt.Errorf("%w: ScheduleKeyDeletion %s: %v", stdkms.ErrShredFailed, p.keyID, err)
 	}
 	if out != nil && out.DeletionDate != nil {
-		// Deletion-date logging is the operator's compliance
+		// The deletion date is the operator's compliance
 		// receipt — they need to know exactly when the key
 		// material is gone, in case the window's about to
 		// elapse on a backup they actually want to keep.
-		_ = out.DeletionDate
+		// Surface it on the Provider so the CLI can report it
+		// (Shred's interface signature returns only error, so we
+		// can't return it directly).
+		dd := *out.DeletionDate
+		p.mu.Lock()
+		p.lastDeletionDate = &dd
+		p.mu.Unlock()
 	}
 	return nil
+}
+
+// LastDeletionDate returns the scheduled key-destruction time
+// from the most recent successful Shred, or nil if Shred has not
+// run (or AWS KMS returned no date).  This is the awskms-specific
+// compliance receipt surfaced to the CLI; it is not part of the
+// generic kms.Provider interface.
+func (p *Provider) LastDeletionDate() *time.Time {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.lastDeletionDate
 }
 
 // Close implements kms.Provider.

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/kms"
@@ -25,6 +26,7 @@ type fakeKMS struct {
 	scheduleKeyID     string
 	scheduleWindow    int32
 	scheduleErr       error
+	scheduleDeletion  *time.Time
 	describeKeyID     string
 	describeOut       *kms.DescribeKeyOutput
 }
@@ -50,7 +52,7 @@ func (f *fakeKMS) ScheduleKeyDeletion(_ context.Context, in *kms.ScheduleKeyDele
 	if f.scheduleErr != nil {
 		return nil, f.scheduleErr
 	}
-	return &kms.ScheduleKeyDeletionOutput{}, nil
+	return &kms.ScheduleKeyDeletionOutput{DeletionDate: f.scheduleDeletion}, nil
 }
 func (f *fakeKMS) DescribeKey(_ context.Context, in *kms.DescribeKeyInput, _ ...func(*kms.Options)) (*kms.DescribeKeyOutput, error) {
 	f.describeKeyID = aws.ToString(in.KeyId)
@@ -112,6 +114,43 @@ func TestProvider_Shred(t *testing.T) {
 	}
 	if cli.scheduleWindow != 7 {
 		t.Errorf("Shred pending window = %d, want 7", cli.scheduleWindow)
+	}
+}
+
+// TestProvider_ShredSurfacesDeletionDate is the bug-55 regression:
+// Shred must retain the DeletionDate AWS returns (the operator's
+// compliance receipt) rather than discarding it, and expose it via
+// LastDeletionDate.
+func TestProvider_ShredSurfacesDeletionDate(t *testing.T) {
+	want := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	cli := &fakeKMS{scheduleDeletion: &want}
+	p, _ := awskms.NewWithClient("aws-kms://my-key", cli)
+
+	if got := p.LastDeletionDate(); got != nil {
+		t.Fatalf("LastDeletionDate before Shred = %v, want nil", got)
+	}
+	if err := p.Shred(context.Background()); err != nil {
+		t.Fatalf("Shred: %v", err)
+	}
+	got := p.LastDeletionDate()
+	if got == nil {
+		t.Fatal("LastDeletionDate after Shred = nil, want the AWS deletion date")
+	}
+	if !got.Equal(want) {
+		t.Errorf("LastDeletionDate = %v, want %v", got, want)
+	}
+}
+
+// TestProvider_ShredNoDeletionDate: when AWS returns no date,
+// LastDeletionDate stays nil (no phantom receipt).
+func TestProvider_ShredNoDeletionDate(t *testing.T) {
+	cli := &fakeKMS{}
+	p, _ := awskms.NewWithClient("aws-kms://my-key", cli)
+	if err := p.Shred(context.Background()); err != nil {
+		t.Fatalf("Shred: %v", err)
+	}
+	if got := p.LastDeletionDate(); got != nil {
+		t.Errorf("LastDeletionDate = %v, want nil", got)
 	}
 }
 
