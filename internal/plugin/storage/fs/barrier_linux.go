@@ -52,11 +52,26 @@ func (p *Plugin) Barrier(ctx context.Context) error {
 		p.requeue(rest)
 		return err
 	}
+	// Final syncfs makes the new directory entries (the links) and
+	// the staging-temp removals durable. If it fails the barrier is
+	// NOT satisfied — the dir entries may never have flushed — so
+	// requeue the whole list. A retried Barrier re-runs syncfsRoot,
+	// publishDeferred (whose link sees EEXIST and just discards the
+	// temp), then syncfs again. Without this requeue a retried
+	// Barrier finds nothing outstanding and returns nil, telling the
+	// caller the data is durable when no syncfs ever completed.
 	if err := p.syncfsRoot(); err != nil {
+		p.requeue(list)
 		return err
 	}
 	return nil
 }
+
+// syncfsFn performs the syncfs(2) syscall against fd. It is a package
+// var (not a direct call) purely so tests can inject a failure at a
+// chosen call — the syncfs syscall itself cannot be made to fail
+// portably. Production always uses the real syscall.
+var syncfsFn = func(fd int) error { return unix.Syncfs(fd) }
 
 // syncfsRoot flushes the entire filesystem the repository lives on.
 func (p *Plugin) syncfsRoot() error {
@@ -69,7 +84,7 @@ func (p *Plugin) syncfsRoot() error {
 		return fmt.Errorf("fs: barrier open %q: %w", p.root, err)
 	}
 	defer d.Close()
-	if err := unix.Syncfs(int(d.Fd())); err != nil {
+	if err := syncfsFn(int(d.Fd())); err != nil {
 		return fmt.Errorf("fs: barrier syncfs %q: %w", p.root, err)
 	}
 	return nil

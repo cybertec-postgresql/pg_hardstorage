@@ -405,7 +405,7 @@ func (p *Plugin) RenameIfNotExists(ctx context.Context, src, dst string) error {
 		NewBlobClient(p.fullKey(dst))
 
 	srcURL := srcBlob.URL()
-	_, err := dstBlob.StartCopyFromURL(ctx, srcURL, &blob.StartCopyFromURLOptions{
+	startResp, err := dstBlob.StartCopyFromURL(ctx, srcURL, &blob.StartCopyFromURLOptions{
 		AccessConditions: &blob.AccessConditions{
 			ModifiedAccessConditions: &blob.ModifiedAccessConditions{
 				IfNoneMatch: to.Ptr(azcore.ETagAny),
@@ -421,10 +421,83 @@ func (p *Plugin) RenameIfNotExists(ctx context.Context, src, dst string) error {
 		}
 		return fmt.Errorf("azblob: rename copy %s → %s: %w", src, dst, err)
 	}
+
+	// StartCopyFromURL is ASYNCHRONOUS: the copy may still be pending
+	// when the call returns.  Deleting the source before the copy
+	// reaches Success would leave the destination absent (a pending
+	// copy that later fails/aborts) while rename reported success —
+	// silent data loss.  Wait until the copy definitively succeeds
+	// before deleting; fail on any non-success terminal state.
+	if err := p.awaitCopyComplete(ctx, dstBlob, startResp.CopyStatus); err != nil {
+		return fmt.Errorf("azblob: rename copy %s → %s: %w", src, dst, err)
+	}
+
 	if _, err := srcBlob.Delete(ctx, nil); err != nil && !isNotFound(err) {
 		return fmt.Errorf("azblob: rename %s → %s: copied OK but source delete failed: %w", src, dst, err)
 	}
 	return nil
+}
+
+// copyPollInterval is how long awaitCopyComplete waits between
+// GetProperties polls while a server-side copy is pending.  A short
+// interval keeps intra-account copies (the common case — they complete
+// almost immediately) snappy without hammering the service.
+var copyPollInterval = 200 * time.Millisecond
+
+// copyStatusVerdict classifies an Azure copy-status header value.
+// Returns (done, err):
+//   - done=true,  err=nil        → copy reached Success; safe to delete src
+//   - done=true,  err!=nil       → terminal failure (Failed/Aborted); do NOT delete
+//   - done=false, err=nil        → still pending/aborting; keep polling
+//
+// A nil/empty status is treated as pending: some responses omit the
+// header until the copy is registered, and treating "unknown" as done
+// would risk deleting the source before the copy landed.
+func copyStatusVerdict(status *blob.CopyStatusType) (bool, error) {
+	if status == nil {
+		return false, nil
+	}
+	switch *status {
+	case blob.CopyStatusTypeSuccess:
+		return true, nil
+	case blob.CopyStatusTypeFailed:
+		return true, fmt.Errorf("copy failed (status %q)", *status)
+	case blob.CopyStatusTypeAborted:
+		return true, fmt.Errorf("copy aborted (status %q)", *status)
+	case blob.CopyStatusTypePending:
+		return false, nil
+	default:
+		// Empty header or an unrecognised value: not yet terminal.
+		return false, nil
+	}
+}
+
+// awaitCopyComplete polls the destination blob's copy status until the
+// server-side copy reaches a terminal state.  firstStatus is the status
+// reported by StartCopyFromURL, checked before the first poll so an
+// already-completed synchronous copy skips the GetProperties round-trip.
+// Returns nil only when the copy reached Success.
+func (p *Plugin) awaitCopyComplete(ctx context.Context, dstBlob *blob.Client, firstStatus *blob.CopyStatusType) error {
+	if done, err := copyStatusVerdict(firstStatus); done {
+		return err
+	}
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		props, err := dstBlob.GetProperties(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("poll copy status: %w", err)
+		}
+		if done, verr := copyStatusVerdict(props.CopyStatus); done {
+			return verr
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(copyPollInterval):
+		}
+	}
 }
 
 // SetRetention implements storage.StoragePlugin via Azure

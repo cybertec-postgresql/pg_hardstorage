@@ -49,7 +49,7 @@
 // Same model as the sftp backend:
 //
 //  1. Stat the destination — if present, return ErrAlreadyExists.
-//  2. Write to "<dst>.tmp.<rand>".
+//  2. Write to "<dst>.hstmp-<rand>".
 //  3. mv -T tmp dst (atomic via rename(2) on the same fs).
 //
 // `mv -T` is atomic on every POSIX system when source + dest are
@@ -214,13 +214,22 @@ func (p *Plugin) resolve(key string) (string, error) {
 	if key == "" {
 		return "", fmt.Errorf("scp: empty key (refused)")
 	}
-	if strings.Contains(key, "..") {
-		return "", fmt.Errorf("scp: key %q contains '..' (refused)", key)
+	return p.resolvePrefix(key)
+}
+
+// resolvePrefix maps a repo-relative prefix to an absolute remote
+// path. Unlike resolve it accepts the empty prefix, which maps to the
+// repo root — List(ctx, "") must enumerate the whole repository
+// (repo.Wipe relies on it). The ".."/absolute refusals still apply so
+// a listing can never escape the root.
+func (p *Plugin) resolvePrefix(prefix string) (string, error) {
+	if strings.Contains(prefix, "..") {
+		return "", fmt.Errorf("scp: key %q contains '..' (refused)", prefix)
 	}
-	if path.IsAbs(key) {
-		return "", fmt.Errorf("scp: absolute key %q (refused)", key)
+	if path.IsAbs(prefix) {
+		return "", fmt.Errorf("scp: absolute key %q (refused)", prefix)
 	}
-	return path.Join(p.root, key), nil
+	return path.Join(p.root, prefix), nil
 }
 
 // Put writes r to key.  Atomicity model mirrors the sftp plugin:
@@ -245,7 +254,7 @@ func (p *Plugin) Put(ctx context.Context, key string, r io.Reader, opts storage.
 		return storage.PutResult{}, err
 	}
 
-	tmp := full + ".tmp." + randomSuffix()
+	tmp := full + ".hstmp-" + randomSuffix()
 	written, err := p.uploadVia(ctx, "cat > "+shellQuote(tmp), r)
 	if err != nil {
 		_, _ = p.runShell(ctx, "rm -f "+shellQuote(tmp))
@@ -303,8 +312,18 @@ func (p *Plugin) Stat(ctx context.Context, key string) (storage.ObjectInfo, erro
 	if err != nil {
 		return storage.ObjectInfo{}, err
 	}
-	out, err := p.runShell(ctx, "stat -c '%s %Y' "+shellQuote(full)+" 2>/dev/null")
-	if err != nil || strings.TrimSpace(out) == "" {
+	// Test for existence first, then stat. If the file is absent the
+	// remote command prints a sentinel and exits 0, so a genuine
+	// "not found" is a nil-error empty-marker case. Only that maps to
+	// ErrNotFound; any runShell error (SSH drop, exec failure, host
+	// unreachable) now propagates instead of being masked as a
+	// missing object — which would let a caller treat a transient
+	// failure as proof the object doesn't exist.
+	out, err := p.runShell(ctx, statCommand(full))
+	if err != nil {
+		return storage.ObjectInfo{}, fmt.Errorf("scp: stat %s: %w", full, err)
+	}
+	if strings.TrimSpace(out) == statNotFoundMarker || strings.TrimSpace(out) == "" {
 		return storage.ObjectInfo{}, storage.ErrNotFound
 	}
 	parts := strings.Fields(strings.TrimSpace(out))
@@ -336,7 +355,7 @@ func (p *Plugin) List(ctx context.Context, prefix string) iter.Seq2[storage.Obje
 			yield(storage.ObjectInfo{}, err)
 			return
 		}
-		full, err := p.resolve(prefix)
+		full, err := p.resolvePrefix(prefix)
 		if err != nil {
 			yield(storage.ObjectInfo{}, err)
 			return
@@ -344,18 +363,17 @@ func (p *Plugin) List(ctx context.Context, prefix string) iter.Seq2[storage.Obje
 		// %P is path relative to the find arg, %s is size,
 		// %T@ is mtime as seconds.fractional.  TAB-separated
 		// so paths with spaces parse cleanly.
-		out, err := p.runShell(ctx,
-			"find "+shellQuote(full)+
-				` -type f -printf '%P\t%s\t%T@\n' 2>/dev/null`)
-		if err != nil {
-			// find returns 1 when the root doesn't exist;
-			// we treat "no entries" as "empty list".
-			if strings.Contains(err.Error(), "exit status 1") {
-				return
-			}
-			yield(storage.ObjectInfo{}, err)
-			return
-		}
+		//
+		// We must NOT collapse every find exit-1 to "empty list":
+		// find also exits 1 on permission-denied / file-vanished
+		// errors and may have emitted a PARTIAL listing on stdout
+		// before failing. Silently returning would truncate the
+		// listing — a caller wiping the repo would then leave the
+		// unlisted tail behind. So we (a) guard the absent-root case
+		// explicitly with a test-then-find (absent root => exit 0,
+		// no output), and (b) keep find's stderr so a real failure
+		// propagates, but only AFTER yielding whatever find produced.
+		out, err := p.runShell(ctx, listCommand(full))
 		for _, line := range strings.Split(out, "\n") {
 			line = strings.TrimRight(line, "\r")
 			if line == "" {
@@ -366,6 +384,14 @@ func (p *Plugin) List(ctx context.Context, prefix string) iter.Seq2[storage.Obje
 				continue
 			}
 			rel := parts[0]
+			// Hide scp-internal staging temps ("<key>.hstmp-<rand>",
+			// written by Put between upload and mv -T). Caller keys
+			// that merely contain ".tmp." (the repo layer's manifest
+			// commit temps, which GC must be able to reap) are NOT
+			// filtered — ".hstmp-" is reserved for backend staging.
+			if strings.Contains(rel, ".hstmp-") {
+				continue
+			}
 			size, _ := strconv.ParseInt(parts[1], 10, 64)
 			mtimeFloat, _ := strconv.ParseFloat(parts[2], 64)
 			mtime := time.Unix(int64(mtimeFloat), 0).UTC()
@@ -379,6 +405,14 @@ func (p *Plugin) List(ctx context.Context, prefix string) iter.Seq2[storage.Obje
 			}, nil) {
 				return
 			}
+		}
+		// A find failure (permission denied, entry vanished mid-walk,
+		// SSH drop) is surfaced only after emitting the partial
+		// listing above, so the caller sees both what find found and
+		// that the listing is incomplete — never a silent truncation.
+		if err != nil {
+			yield(storage.ObjectInfo{}, fmt.Errorf("scp: list %s: %w", full, err))
+			return
 		}
 	}
 }
@@ -575,8 +609,14 @@ func (s *sessionReader) Close() error {
 // exists returns true when path is a present file or directory.
 // Used by Put / RenameIfNotExists for the IfNotExists check.
 func (p *Plugin) exists(ctx context.Context, fullPath string) (bool, error) {
-	out, err := p.runShell(ctx,
-		"sh -c '[ -e "+shellQuote(fullPath)+" ] && echo y || echo n'")
+	// runShell already runs the command through the remote login
+	// shell (ssh exec), so the test expression goes there directly.
+	// Wrapping it in an inner `sh -c '...'` would double-quote the
+	// path: the inner single quotes emitted by shellQuote collide
+	// with the single quotes delimiting the `sh -c` argument, so
+	// the quoting cancels out — spaces break the check and
+	// $()/backticks in a key would be executed by the outer shell.
+	out, err := p.runShell(ctx, existsCommand(fullPath))
 	if err != nil {
 		return false, fmt.Errorf("scp: exists check %s: %w", fullPath, err)
 	}
@@ -625,6 +665,41 @@ func shellQuote(s string) string {
 		return "''"
 	}
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// statNotFoundMarker is printed by statCommand when the path is
+// absent, so Stat can distinguish "the file isn't there" (nil error,
+// this marker) from a transport/exec failure (non-nil runShell error).
+const statNotFoundMarker = "__PGHS_NOTFOUND__"
+
+// existsCommand builds the remote test-expression for exists(). The
+// path is shellQuote'd exactly once and handed straight to the remote
+// login shell (runShell exec's it) — NOT re-wrapped in an inner
+// `sh -c '...'`, which would collide with shellQuote's single quotes
+// and let $()/backticks in a key execute.
+func existsCommand(fullPath string) string {
+	return "[ -e " + shellQuote(fullPath) + " ] && echo y || echo n"
+}
+
+// statCommand builds the remote command for Stat. An absent path
+// prints statNotFoundMarker and exits 0, so a genuine "not found" is a
+// nil-error case and any runShell error is a real transport failure to
+// propagate.
+func statCommand(fullPath string) string {
+	q := shellQuote(fullPath)
+	return "if [ -e " + q + " ]; then stat -c '%s %Y' " + q +
+		"; else echo " + statNotFoundMarker + "; fi"
+}
+
+// listCommand builds the remote command for List. An absent root exits
+// 0 with no output (a legitimately empty listing); otherwise find runs
+// with stderr intact so a permission/vanish error surfaces to the
+// caller after the partial listing is emitted, never silently
+// truncated.
+func listCommand(fullPath string) string {
+	q := shellQuote(fullPath)
+	return "if [ ! -e " + q + " ]; then exit 0; fi; " +
+		"find " + q + ` -type f -printf '%P\t%s\t%T@\n'`
 }
 
 func randomSuffix() string {

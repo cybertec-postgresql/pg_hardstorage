@@ -6,9 +6,9 @@
 //     existence check and creation are a single atomic syscall — no
 //     read-modify-write race with concurrent writers.
 //
-//   - Overwrite Puts go to "<key>.tmp", get fsynced, then atomically
-//     rename(2)'d into place. A crash between sync and rename never
-//     leaves a half-written object visible.
+//   - Overwrite Puts go to "<key>.hstmp-<rand>", get fsynced, then
+//     atomically rename(2)'d into place. A crash between sync and rename
+//     never leaves a half-written object visible.
 //
 //   - RenameIfNotExists is link(2) + unlink(2). link() returns EEXIST
 //     atomically when the target exists, on every POSIX system; this
@@ -126,6 +126,20 @@ func (p *Plugin) publishDeferred(ctx context.Context, list []deferredWrite) ([]d
 		switch err := os.Link(dw.staging, dw.final); {
 		case err == nil, errors.Is(err, stdfs.ErrExist):
 			_ = os.Remove(dw.staging)
+		case errors.Is(err, stdfs.ErrNotExist):
+			// The staging temp is gone. This happens on a retried
+			// Barrier: a previous run already linked this temp to its
+			// final key and removed the temp, but the barrier was
+			// requeued because a later step (e.g. the final syncfs)
+			// failed. If the final key is present the publish is
+			// already done — treat it as success. If neither exists,
+			// the staged content was truly lost, which is a real
+			// error.
+			if _, statErr := os.Stat(dw.final); statErr == nil {
+				continue
+			}
+			return list[i:], fmt.Errorf("fs: publish chunk %q: staging temp %q vanished and final absent: %w",
+				dw.final, dw.staging, err)
 		default:
 			return list[i:], fmt.Errorf("fs: publish chunk %q: %w", dw.final, err)
 		}
@@ -134,11 +148,23 @@ func (p *Plugin) publishDeferred(ctx context.Context, list []deferredWrite) ([]d
 }
 
 // isFSStagingName reports whether name is an fs-internal staging/temp
-// file produced by an atomic write (overwrite "<key>.tmp", deferred
-// "<key>.deferred-<rand>", or exclusive "<key>.excl-<rand>"). These
-// exist only transiently and must never be returned by List as keys.
+// file produced by an atomic write (overwrite "<key>.hstmp-<rand>",
+// deferred "<key>.deferred-<rand>", or exclusive "<key>.excl-<rand>").
+// These exist only transiently and must never be returned by List as
+// keys.
+//
+// Deliberately NOT matched: the generic ".tmp." infix. Caller-created
+// keys legitimately use it — the repo layer stages manifest/history
+// commits at "<name>.json.tmp.<rand>" / "<name>.history.tmp.<rand>",
+// and GC's FindStaleTempManifests must be able to List those to reap
+// them after a crash. Hiding every ".tmp." infix here would silently
+// disable that reaper. Backend-internal staging therefore uses the
+// reserved ".hstmp-" marker instead. (Leftover ".tmp.<rand>" overwrite
+// temps written by older builds surface as keys — the pre-existing
+// behaviour — and are harmless.)
 func isFSStagingName(name string) bool {
 	return strings.HasSuffix(name, ".tmp") ||
+		strings.Contains(name, ".hstmp-") ||
 		strings.Contains(name, ".deferred-") ||
 		strings.Contains(name, ".excl-")
 }
@@ -388,7 +414,7 @@ func (p *Plugin) putOverwrite(ctx context.Context, key, full string, r io.Reader
 	// path; os.Rename atomically publishes one complete content
 	// (last-writer-wins, which is the overwrite contract). Mirrors the
 	// IfNotExists path's `.excl-<rand>` staging.
-	tmp := full + ".tmp." + randHex()
+	tmp := full + ".hstmp-" + randHex()
 	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, repoFileMode)
 	if err != nil {
 		return storage.PutResult{}, fmt.Errorf("fs: open tmp %q: %w", tmp, err)

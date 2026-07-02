@@ -30,7 +30,7 @@
 // emulate `IfNotExists` via:
 //
 //  1. Stat the destination — if present, return ErrAlreadyExists.
-//  2. Write to "<dst>.tmp.<rand>".
+//  2. Write to "<dst>.hstmp-<rand>".
 //  3. fsync (via Posix_rename if the server supports it; else
 //     best-effort).
 //  4. Rename `<tmp>` -> `<dst>`.
@@ -283,7 +283,7 @@ func (p *Plugin) Put(ctx context.Context, key string, r io.Reader, opts storage.
 		return storage.PutResult{}, err
 	}
 
-	tmp := full + ".tmp." + randomSuffix()
+	tmp := full + ".hstmp-" + randomSuffix()
 	f, err := p.client.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC)
 	if err != nil {
 		return storage.PutResult{}, fmt.Errorf("sftp: create tmp %s: %w", tmp, err)
@@ -449,6 +449,15 @@ func (p *Plugin) List(ctx context.Context, prefix string) iter.Seq2[storage.Obje
 			if info == nil || info.IsDir() {
 				continue
 			}
+			// Skip our own staging temps. Put writes to
+			// "<key>.tmp.<rand>" and renames into place; a temp
+			// briefly visible to a concurrent List must never surface
+			// as a real object (a caller would treat it as a chunk /
+			// manifest that will vanish on the rename). The fs plugin
+			// filters these the same way.
+			if isStagingName(info.Name()) {
+				continue
+			}
 			absPath := walker.Path()
 			rel := strings.TrimPrefix(absPath, p.root+"/")
 			rel = strings.TrimPrefix(rel, p.root)
@@ -568,6 +577,20 @@ func randomSuffix() string {
 	var b [8]byte
 	_, _ = rand.Read(b[:])
 	return hex.EncodeToString(b[:])
+}
+
+// isStagingName reports whether name is an sftp-internal staging temp
+// produced by Put ("<key>.hstmp-<rand>"). These exist only transiently
+// between the write and the rename-into-place, and must never be
+// returned by List as real objects.
+//
+// Deliberately NOT matched: the generic ".tmp." infix — caller-created
+// keys legitimately use it (the repo layer's manifest/history commit
+// temps, "<name>.json.tmp.<rand>", which GC's FindStaleTempManifests
+// must List to reap). Backend-internal staging uses the reserved
+// ".hstmp-" marker so the two can never collide.
+func isStagingName(name string) bool {
+	return strings.Contains(name, ".hstmp-")
 }
 
 // Sanity import used to reference the net package symbol via

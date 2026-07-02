@@ -207,8 +207,23 @@ func (t *Throttle) acquire(ctx context.Context, n int) error {
 		return ctx.Err()
 	default:
 	}
-	t.sleepFn(wait)
-	return ctx.Err()
+	// Run the (possibly test-injected) sleep off-thread and race it
+	// against ctx.Done() so a cancellation preempts the wait rather
+	// than blocking for the full duration — the doc promise. The
+	// sleepFn goroutine still runs to completion in the background
+	// (it may be a fake clock that must record the duration), but we
+	// return as soon as ctx fires.
+	done := make(chan struct{})
+	go func() {
+		t.sleepFn(wait)
+		close(done)
+	}()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-done:
+		return ctx.Err()
+	}
 }
 
 // throttledReader wraps an io.Reader so each Read call reads at
