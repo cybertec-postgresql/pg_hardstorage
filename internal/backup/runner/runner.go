@@ -12,6 +12,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -264,6 +265,10 @@ type IncrementalConfig struct {
 // Result is the structured outcome of a successful TakeBackup. It maps
 // 1:1 to the JSON shape the CLI emits and is what the dispatcher hands
 // back to consumers.
+//
+// Duration serializes as WHOLE MILLISECONDS under the frozen key
+// duration_ms (MarshalJSON below): a raw time.Duration under a _ms key
+// would emit nanoseconds, inflating every consumer's reading 1e6x.
 type Result struct {
 	BackupID         string        `json:"backup_id"`
 	Deployment       string        `json:"deployment"`
@@ -275,7 +280,7 @@ type Result struct {
 	Timeline         uint32        `json:"timeline"`
 	StartedAt        time.Time     `json:"started_at"`
 	StoppedAt        time.Time     `json:"stopped_at"`
-	Duration         time.Duration `json:"duration_ms"`
+	Duration         time.Duration `json:"-"`
 
 	// File and chunk counters — useful for the audit log and for
 	// progress reporting.
@@ -296,6 +301,29 @@ type Result struct {
 	// PrimaryKey is where the manifest landed in the repository. The
 	// CLI prints it; orchestrators use it to fetch the manifest back.
 	PrimaryKey string `json:"primary_key"`
+}
+
+// MarshalJSON emits duration_ms as whole milliseconds (see Result doc).
+func (r Result) MarshalJSON() ([]byte, error) {
+	type alias Result // no methods: avoids recursing into MarshalJSON
+	return json.Marshal(struct {
+		alias
+		DurationMS int64 `json:"duration_ms"`
+	}{alias(r), r.Duration.Milliseconds()})
+}
+
+// UnmarshalJSON is the inverse of MarshalJSON (ms → time.Duration).
+func (r *Result) UnmarshalJSON(b []byte) error {
+	type alias Result
+	aux := struct {
+		*alias
+		DurationMS int64 `json:"duration_ms"`
+	}{alias: (*alias)(r)}
+	if err := json.Unmarshal(b, &aux); err != nil {
+		return err
+	}
+	r.Duration = time.Duration(aux.DurationMS) * time.Millisecond
+	return nil
 }
 
 // Take executes the full backup pipeline:

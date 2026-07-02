@@ -45,6 +45,7 @@ package gameday
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
@@ -97,17 +98,73 @@ type RunOptions struct {
 }
 
 // Result is the structured outcome of one Run.
+//
+// Duration and RecoveryTime serialize as WHOLE MILLISECONDS under the
+// frozen keys duration_ms / recovery_time_ms (custom marshaler below) —
+// a raw time.Duration would emit nanoseconds under a _ms key, inflating
+// every consumer's reading 1e6x.
 type Result struct {
 	Schema       string        `json:"schema"`
 	Scenario     string        `json:"scenario"`
 	Pass         bool          `json:"pass"`
 	StartedAt    time.Time     `json:"started_at"`
 	StoppedAt    time.Time     `json:"stopped_at"`
-	Duration     time.Duration `json:"duration_ms"`
+	Duration     time.Duration `json:"-"`
 	DryRun       bool          `json:"dry_run,omitempty"`
-	RecoveryTime time.Duration `json:"recovery_time_ms,omitempty"`
+	RecoveryTime time.Duration `json:"-"`
 	Evidence     []Event       `json:"evidence,omitempty"`
 	Failure      string        `json:"failure,omitempty"`
+}
+
+// resultJSON mirrors Result for JSON with millisecond duration fields.
+type resultJSON struct {
+	Schema     string    `json:"schema"`
+	Scenario   string    `json:"scenario"`
+	Pass       bool      `json:"pass"`
+	StartedAt  time.Time `json:"started_at"`
+	StoppedAt  time.Time `json:"stopped_at"`
+	DurationMS int64     `json:"duration_ms"`
+	DryRun     bool      `json:"dry_run,omitempty"`
+	RecoveryMS int64     `json:"recovery_time_ms,omitempty"`
+	Evidence   []Event   `json:"evidence,omitempty"`
+	Failure    string    `json:"failure,omitempty"`
+}
+
+// MarshalJSON emits duration_ms / recovery_time_ms as whole milliseconds.
+func (r Result) MarshalJSON() ([]byte, error) {
+	return json.Marshal(resultJSON{
+		Schema:     r.Schema,
+		Scenario:   r.Scenario,
+		Pass:       r.Pass,
+		StartedAt:  r.StartedAt,
+		StoppedAt:  r.StoppedAt,
+		DurationMS: r.Duration.Milliseconds(),
+		DryRun:     r.DryRun,
+		RecoveryMS: r.RecoveryTime.Milliseconds(),
+		Evidence:   r.Evidence,
+		Failure:    r.Failure,
+	})
+}
+
+// UnmarshalJSON is the inverse of MarshalJSON (ms → time.Duration).
+func (r *Result) UnmarshalJSON(b []byte) error {
+	var j resultJSON
+	if err := json.Unmarshal(b, &j); err != nil {
+		return err
+	}
+	*r = Result{
+		Schema:       j.Schema,
+		Scenario:     j.Scenario,
+		Pass:         j.Pass,
+		StartedAt:    j.StartedAt,
+		StoppedAt:    j.StoppedAt,
+		Duration:     time.Duration(j.DurationMS) * time.Millisecond,
+		DryRun:       j.DryRun,
+		RecoveryTime: time.Duration(j.RecoveryMS) * time.Millisecond,
+		Evidence:     j.Evidence,
+		Failure:      j.Failure,
+	}
+	return nil
 }
 
 // Event is one observation captured during a Run. Scenarios append
