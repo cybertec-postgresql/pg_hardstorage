@@ -479,7 +479,17 @@ func (ms *ManifestStore) Read(ctx context.Context, deployment, backupID string, 
 	replicaKey := ReplicaPath(backupID)
 	replicaM, replicaErr := ms.readVerified(ctx, replicaKey, verifier)
 	if replicaErr == nil {
-		return replicaM, nil
+		// Replicas are keyed by backupID alone (ReplicaPath ignores
+		// deployment), so a replica for the same backupID under a
+		// DIFFERENT deployment would otherwise be served here — bypassing
+		// this deployment's tombstone gate (checked above against the
+		// requested deployment). Confirm identity before trusting it,
+		// mirroring EnsureReplica's primary-identity guard.
+		if replicaM.Deployment == deployment && replicaM.BackupID == backupID {
+			return replicaM, nil
+		}
+		replicaErr = fmt.Errorf("backup: replica identity %s/%s != requested %s/%s",
+			replicaM.Deployment, replicaM.BackupID, deployment, backupID)
 	}
 
 	// Common case: the backup just doesn't exist. Both primary and
@@ -1200,7 +1210,84 @@ func (ms *ManifestStore) SoftDeleteCascade(ctx context.Context, deployment, back
 		return deleted, fmt.Errorf("backup: cascade-delete root %s: %w", backupID, err)
 	}
 	deleted = append(deleted, backupID)
+
+	// Write-then-verify (closes the cascade-vs-concurrent-incremental race,
+	// symmetric to SoftDelete ~1056 and SoftDeleteBatch ~1278). The
+	// pre-flight scan above ran BEFORE any tombstone existed, so a child
+	// incremental that committed against any link in the window between that
+	// scan and these tombstone writes would be missed — leaving the chain
+	// tombstoned-but-orphaned. Re-scan now that every tombstone is durable:
+	// any still-live descendant of the root means a child slipped in, so we
+	// roll back all tombstones we installed and refuse.
+	if live, rescanErr := ms.findLiveDescendants(ctx, deployment, backupID); rescanErr != nil {
+		return deleted, fmt.Errorf("backup: SoftDeleteCascade: re-scan descendants: %w", rescanErr)
+	} else if len(live) > 0 {
+		if rbErr := ms.rollbackTombstones(ctx, deployment, deleted); rbErr != nil {
+			return nil, fmt.Errorf("backup: SoftDeleteCascade: a child of %s committed concurrently; rolling back the cascade's tombstones failed — those chains may now be tombstoned-but-orphaned (run `backup undelete` on the affected backups): %w",
+				backupID, rbErr)
+		}
+		return nil, &ChainHasLiveDescendantsError{
+			Deployment:  deployment,
+			BackupID:    backupID,
+			Descendants: live,
+		}
+	}
+
+	// Write-then-verify for legal holds (race-condition audit #1, symmetric
+	// to SoftDelete's post-write hold re-check ~1078). The pre-flight hold
+	// check ran BEFORE any tombstone existed, so a hold placed on any link
+	// in the window would be silently defeated. Re-check the whole chain now
+	// that the tombstones are visible: if any link is actively held, roll
+	// back all tombstones and refuse.
+	now = time.Now().UTC()
+	var heldAfter []ManifestHeldLink
+	for _, id := range deleted {
+		h, herr := ms.GetHold(ctx, deployment, id)
+		if herr != nil {
+			if errors.Is(herr, storage.ErrNotFound) {
+				continue
+			}
+			return deleted, fmt.Errorf("backup: SoftDeleteCascade: hold re-check %s: %w", id, herr)
+		}
+		if h == nil || !h.ActiveAt(now) {
+			continue
+		}
+		heldAfter = append(heldAfter, ManifestHeldLink{
+			BackupID: id,
+			Holder:   h.Holder,
+			Reason:   h.Reason,
+			HeldAt:   h.HeldAt,
+		})
+	}
+	if len(heldAfter) > 0 {
+		if rbErr := ms.rollbackTombstones(ctx, deployment, deleted); rbErr != nil {
+			return nil, fmt.Errorf("backup: SoftDeleteCascade: a hold was placed on the chain rooted at %s concurrently; rolling back the cascade's tombstones failed — held backups may now be tombstoned (run `backup undelete` on the affected backups): %w",
+				backupID, rbErr)
+		}
+		return nil, &ChainHasHeldLinksError{
+			Deployment: deployment,
+			BackupID:   backupID,
+			Held:       heldAfter,
+		}
+	}
+
 	return deleted, nil
+}
+
+// rollbackTombstones removes the tombstones installed for the given ids,
+// joining any per-id removal failures. Shared by SoftDeleteCascade's
+// write-then-verify rollback paths.
+func (ms *ManifestStore) rollbackTombstones(ctx context.Context, deployment string, ids []string) error {
+	var rbErrs []error
+	for _, id := range ids {
+		if _, rbErr := ms.removeTombstone(ctx, deployment, id); rbErr != nil {
+			rbErrs = append(rbErrs, fmt.Errorf("%s: %w", id, rbErr))
+		}
+	}
+	if len(rbErrs) > 0 {
+		return errors.Join(rbErrs...)
+	}
+	return nil
 }
 
 // SoftDeleteBatch soft-deletes many backups with a SINGLE scan of the
@@ -1296,6 +1383,34 @@ func (ms *ManifestStore) SoftDeleteBatch(ctx context.Context, deployment string,
 		}
 		return nil, &ChainHasLiveDescendantsError{
 			Deployment: deployment, BackupID: id, Descendants: []string{dep},
+		}
+	}
+
+	// Write-then-verify for legal holds (symmetric to SoftDelete's
+	// post-write hold re-check ~1078). The hold pre-check ran BEFORE any
+	// tombstone existed, so a hold placed on a member in the window would
+	// be silently defeated. Re-check the tombstoned members now that the
+	// markers are durable: if any is actively held, roll back all of the
+	// batch's tombstones and refuse.
+	nowAfter := time.Now().UTC()
+	for _, id := range installed {
+		h, herr := ms.GetHold(ctx, deployment, id)
+		if herr != nil {
+			if errors.Is(herr, storage.ErrNotFound) {
+				continue
+			}
+			return installed, fmt.Errorf("backup: SoftDeleteBatch: hold re-check %s: %w", id, herr)
+		}
+		if h == nil || !h.ActiveAt(nowAfter) {
+			continue
+		}
+		if rbErr := ms.rollbackTombstones(ctx, deployment, installed); rbErr != nil {
+			return nil, fmt.Errorf("backup: SoftDeleteBatch: a hold was placed on %s concurrently; rolling back the batch's tombstones failed — held backups may now be tombstoned (run `backup undelete` on the affected backups): %w",
+				id, rbErr)
+		}
+		return nil, &ManifestHeldError{
+			Deployment: deployment, BackupID: id,
+			Holder: h.Holder, Reason: h.Reason, HeldAt: h.HeldAt,
 		}
 	}
 	return installed, nil

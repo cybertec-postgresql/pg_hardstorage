@@ -207,3 +207,33 @@ func TestManifestValidate_Encryption(t *testing.T) {
 		t.Errorf("nil encryption (unencrypted) should pass: %v", err)
 	}
 }
+
+// TestManifestValidate_SamePathAcrossTablespacesAllowed pins the
+// bug-#3-adjacent fix: a non-default tablespace's tar entries are named
+// relative to the tablespace root (e.g. "PG_18_.../16384/1259"), so two
+// DIFFERENT tablespaces can legitimately carry the SAME relative path.
+// Uniqueness is keyed on (TablespaceOID, Path); keying on Path alone
+// would wrongly reject a valid multi-tablespace backup.
+func TestManifestValidate_SamePathAcrossTablespacesAllowed(t *testing.T) {
+	hash := repo.Hash{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+		17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32}
+	m := validManifest()
+	const shared = "PG_18_202209061/16384/1259"
+	m.Files = append(m.Files,
+		backup.FileEntry{Path: shared, Size: 10, TablespaceOID: 16384, Chunks: []backup.ChunkRef{{Hash: hash, Offset: 0, Len: 10}}},
+		backup.FileEntry{Path: shared, Size: 10, TablespaceOID: 16385, Chunks: []backup.ChunkRef{{Hash: hash, Offset: 0, Len: 10}}},
+	)
+	if err := m.Validate(); err != nil {
+		t.Fatalf("same path in two tablespaces must validate: %v", err)
+	}
+
+	// But a true duplicate — same path AND same tablespace — must fail.
+	m2 := validManifest()
+	m2.Files = append(m2.Files,
+		backup.FileEntry{Path: shared, Size: 10, TablespaceOID: 16384, Chunks: []backup.ChunkRef{{Hash: hash, Offset: 0, Len: 10}}},
+		backup.FileEntry{Path: shared, Size: 10, TablespaceOID: 16384, Chunks: []backup.ChunkRef{{Hash: hash, Offset: 0, Len: 10}}},
+	)
+	if err := m2.Validate(); err == nil {
+		t.Error("duplicate (path, tablespace) must be rejected")
+	}
+}

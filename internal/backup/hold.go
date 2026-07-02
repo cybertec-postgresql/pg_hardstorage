@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	stdio "io"
 	"strings"
 	"time"
 
@@ -110,6 +109,13 @@ func (ms *ManifestStore) PutHold(ctx context.Context, deployment, backupID, hold
 func (ms *ManifestStore) PutHoldUntil(ctx context.Context, deployment, backupID, holder, reason string, expiresAt time.Time) error {
 	if deployment == "" || backupID == "" {
 		return errors.New("backup: PutHold requires deployment and backupID")
+	}
+	// Validate the storage identifiers up front, mirroring the sibling
+	// tombstone paths (SoftDelete etc. all validateRef before touching
+	// storage). Without this, a hold could be written under a key derived
+	// from an unsafe identifier that the tombstone paths would reject.
+	if err := validateRef(deployment, backupID); err != nil {
+		return err
 	}
 	// Refuse to hold a backup that doesn't exist.
 	if _, err := ms.sp.Stat(ctx, PrimaryPath(deployment, backupID)); err != nil {
@@ -279,7 +285,12 @@ func (ms *ManifestStore) GetHold(ctx context.Context, deployment, backupID strin
 		return nil, err
 	}
 	defer rc.Close()
-	body, err := stdio.ReadAll(rc)
+	// Cap the read like the manifest/tombstone/lease paths do: an
+	// unbounded io.ReadAll over a corrupt or maliciously oversized hold
+	// object would OOM every hold path (IsActivelyHeld, ListHolds,
+	// PutHoldUntil's HeldAt-preserve read, the retention pre-filter).
+	// Same MaxManifestBytes cap as readAllLimited's manifest callers.
+	body, err := readAllLimited(rc, MaxManifestBytes)
 	if err != nil {
 		return nil, fmt.Errorf("backup: read hold: %w", err)
 	}

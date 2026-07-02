@@ -28,7 +28,12 @@ func (p SimplePolicy) Apply(now time.Time, in []*backup.Manifest) Decision {
 
 	cutoff := now.Add(-p.KeepFor)
 	for _, m := range sorted {
-		if m.StoppedAt.After(cutoff) {
+		// Keep every backup whose StoppedAt is at or newer than the
+		// cutoff. The documented contract (see the type comment) is
+		// that a backup EXACTLY KeepFor old is kept, so the boundary
+		// comparison is !Before (>= cutoff), not After (> cutoff) —
+		// the latter deleted the exact-boundary backup.
+		if !m.StoppedAt.Before(cutoff) {
 			d.addReason(m.BackupID, fmt.Sprintf("within-%s", p.KeepFor))
 		}
 	}
