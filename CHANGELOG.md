@@ -11,6 +11,76 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ## [Unreleased]
 
+## [1.0.7] — 2026-07-02
+
+A broad code-review pass fixed 79 correctness bugs across the codebase,
+each with a regression test. The whole suite — unit, race, integration
+(against real PostgreSQL), and the Patroni failover / data-integrity
+lane — is green. Highlights, grouped by blast radius:
+
+### Fix: data-integrity and durability
+
+- Restore placed non-default tablespace contents under the data
+  directory root instead of their real tablespace location (while
+  `tablespace_map` pointed at an empty directory). Files now carry
+  their owning tablespace and restore to the correct path.
+- The local-filesystem barrier could, on a retried commit after an
+  fsync error, drop already-staged chunks — leaving a committed
+  manifest that referenced objects never published (an unrestorable
+  backup). Retries now preserve every staged write.
+- The Azure backend's rename deleted the source before its async copy
+  completed, so a manifest commit could report success with the
+  destination absent; it now waits for copy completion.
+- Air-gap bundle import now verifies each chunk's SHA-256 against its
+  content-addressed key, so a corrupt or tampered bundle can't plant a
+  wrong-content chunk that later backups dedup against.
+- A WAL slot that Patroni re-created at promotion, ahead of the agent's
+  last archived byte, silently masked a real WAL hole; the gap is now
+  detected and surfaced so restore pre-flight can refuse a PITR into
+  the missing range.
+
+### Fix: security and privacy
+
+- The PKCS#11 KMS reference stamped into every manifest could carry an
+  inline HSM PIN in cleartext; the PIN is now stripped from the
+  persisted reference.
+- `llm ask` / `llm explain` silently ignored a configured `strict` /
+  `local-only` privacy mode, and the chat privacy gate ignored an
+  endpoint set via environment — either could let a local-only session
+  reach a public endpoint. Both now enforce the resolved endpoint.
+- Chain-restore staging moved off a predictable, world-writable temp
+  path to a private per-restore directory.
+
+### Fix: retention, holds, and the control plane
+
+- Concurrent retention sweeps could orphan a live backup chain or
+  defeat a legal hold placed mid-sweep; both delete paths now re-check
+  and roll back.
+- Agents advertised only `backup`, so restore and verify jobs enqueued
+  through the control plane sat queued forever; agents now claim every
+  job kind they can execute, and job execution no longer blocks
+  heartbeats.
+
+### Fix: compatibility shims
+
+- The Barman, WAL-G, and pgBackRest compatibility layers emitted
+  command-line arguments and generated configuration the native CLI
+  rejected; the affected `recover` / `check` / `backup-fetch` /
+  recovery-target / config-translation paths now work.
+
+### Fix: reporting
+
+- `duration_ms` fields in backup, restore, gameday, and verification
+  JSON emitted nanoseconds under a millisecond key (values inflated a
+  million-fold); they now emit milliseconds. The JSON keys are
+  unchanged.
+
+Also fixed: numerous CLI verb correctness issues (`repo scrub` /
+`repo gc` / `repo check` / `status` / `doctor` / `repair` / `audit` /
+`list` / `logs`), storage-backend listing/temp-file hygiene, logical-
+receiver shutdown and flush correctness, and post-restore verification
+cleanup. See the commit history for the full itemised list.
+
 ## [1.0.6] — 2026-06-27
 
 ### Fix: backups with a non-default tablespace (#17)
