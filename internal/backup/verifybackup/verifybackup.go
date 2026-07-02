@@ -70,11 +70,41 @@ type pgManifest struct {
 }
 
 type pgManifestFile struct {
-	Path              string `json:"Path"`
+	Path string `json:"Path"`
+	// EncodedPath is PG's alternative to Path for filenames that
+	// aren't valid UTF-8 (or contain characters PG chooses not to
+	// emit literally): the path is hex-encoded and carried here
+	// instead.  Exactly one of Path / Encoded-Path is present per
+	// entry.  See resolvePath.
+	EncodedPath       string `json:"Encoded-Path"`
 	Size              int64  `json:"Size"`
 	LastModified      string `json:"Last-Modified"`
 	ChecksumAlgorithm string `json:"Checksum-Algorithm"`
 	Checksum          string `json:"Checksum"`
+}
+
+// resolvePath returns the file's path relative to the data
+// directory, decoding PG's hex-encoded "Encoded-Path" when the
+// plain "Path" field is absent.
+//
+// Why this matters: pg_basebackup emits "Encoded-Path" (a hex
+// string) instead of "Path" for filenames that are not valid
+// UTF-8 or that contain control characters.  Without decoding
+// it, Path stays "" and filepath.Join(dataDir, "") resolves to
+// dataDir itself — a directory — so verifyOne false-fails every
+// such entry with "expected regular file, got mode=…dir".
+func (f *pgManifestFile) resolvePath() (string, error) {
+	if f.Path != "" {
+		return f.Path, nil
+	}
+	if f.EncodedPath == "" {
+		return "", errors.New("manifest entry has neither Path nor Encoded-Path")
+	}
+	raw, err := hex.DecodeString(strings.TrimSpace(f.EncodedPath))
+	if err != nil {
+		return "", fmt.Errorf("Encoded-Path is not valid hex: %w", err)
+	}
+	return string(raw), nil
 }
 
 // ErrNoManifest signals that the backup didn't carry PG's
@@ -123,7 +153,13 @@ func Verify(ctx context.Context, manifestBytes []byte, dataDir string) (*Result,
 		}
 		f := &m.Files[i]
 		if err := verifyOne(dataDir, f, res); err != nil {
-			return res, fmt.Errorf("verifybackup: file[%d] %q: %w", i, f.Path, err)
+			// Prefer the resolved (possibly hex-decoded) path in the
+			// error; fall back to whatever raw path field was set.
+			name := f.Path
+			if rp, rerr := f.resolvePath(); rerr == nil {
+				name = rp
+			}
+			return res, fmt.Errorf("verifybackup: file[%d] %q: %w", i, name, err)
 		}
 		if alg := strings.ToUpper(f.ChecksumAlgorithm); alg != "" {
 			algos[alg] = struct{}{}
@@ -153,7 +189,11 @@ func Verify(ctx context.Context, manifestBytes []byte, dataDir string) (*Result,
 // verifyOne stats + hashes one file, comparing against the
 // manifest entry.  Updates res counters in-place.
 func verifyOne(dataDir string, f *pgManifestFile, res *Result) error {
-	full := filepath.Join(dataDir, f.Path)
+	relPath, err := f.resolvePath()
+	if err != nil {
+		return err
+	}
+	full := filepath.Join(dataDir, relPath)
 	st, err := os.Lstat(full)
 	if err != nil {
 		if os.IsNotExist(err) {

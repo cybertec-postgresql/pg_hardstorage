@@ -2,12 +2,15 @@ package sandbox_test
 
 import (
 	"context"
+	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/verify/sandbox"
 )
@@ -109,6 +112,78 @@ func TestVerify_FirecrackerStubRefuses(t *testing.T) {
 	}
 }
 
+// TestResult_DurationMS_IsMilliseconds is the bug-79
+// regression: Result.Duration is a time.Duration (nanoseconds)
+// but is serialised under the frozen JSON key "duration_ms".
+// Before the fix the raw nanosecond count leaked out, inflating
+// every reported duration 1e6x.  The value under "duration_ms"
+// must now be whole milliseconds while the KEY stays unchanged.
+func TestResult_DurationMS_IsMilliseconds(t *testing.T) {
+	r := sandbox.Result{
+		Schema:   sandbox.SchemaResult,
+		Backend:  "docker",
+		Duration: 5 * time.Second, // 5000 ms, 5e9 ns
+	}
+	b, err := json.Marshal(r)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	// The frozen key must still be present verbatim.
+	if !strings.Contains(string(b), `"duration_ms"`) {
+		t.Fatalf("frozen key duration_ms missing from JSON: %s", b)
+	}
+
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(b, &raw); err != nil {
+		t.Fatalf("unmarshal to map: %v", err)
+	}
+	got, ok := raw["duration_ms"]
+	if !ok {
+		t.Fatalf("duration_ms key absent: %s", b)
+	}
+	if string(got) != "5000" {
+		t.Errorf("duration_ms = %s, want 5000 (whole ms, not %d ns)",
+			got, (5 * time.Second).Nanoseconds())
+	}
+}
+
+// TestResult_JSON_RoundTrip ensures the custom (Un)MarshalJSON
+// pair is self-consistent: a Result survives a marshal/unmarshal
+// with its Duration intact at millisecond granularity, and the
+// other fields untouched.
+func TestResult_JSON_RoundTrip(t *testing.T) {
+	orig := sandbox.Result{
+		Schema:     sandbox.SchemaResult,
+		Backend:    "docker",
+		PGMajor:    "17",
+		Image:      "postgres:17",
+		Passed:     true,
+		Tool:       "pg_verifybackup",
+		Duration:   1234 * time.Millisecond,
+		Stdout:     "ok",
+		Stderr:     "",
+		Skipped:    false,
+		SkipReason: "",
+	}
+	b, err := json.Marshal(orig)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var back sandbox.Result
+	if err := json.Unmarshal(b, &back); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if back.Duration != orig.Duration {
+		t.Errorf("Duration round-trip: got %v want %v", back.Duration, orig.Duration)
+	}
+	if back.Backend != orig.Backend || back.PGMajor != orig.PGMajor ||
+		back.Passed != orig.Passed || back.Tool != orig.Tool ||
+		back.Stdout != orig.Stdout || back.Schema != orig.Schema {
+		t.Errorf("field drift after round-trip: %+v vs %+v", back, orig)
+	}
+}
+
 func TestParseMagic_AllVerdicts(t *testing.T) {
 	cases := []struct {
 		name        string
@@ -169,6 +244,65 @@ func TestParseMagic_AllVerdicts(t *testing.T) {
 				t.Errorf("Detail = %q want %q", got.Detail, c.wantDetail)
 			}
 		})
+	}
+}
+
+// dockerFrame builds one Docker exec-stream frame: an 8-byte
+// header (stream type in byte 0, big-endian payload length in
+// bytes 4-7) followed by the payload.  streamType 1 = stdout,
+// 2 = stderr.
+func dockerFrame(streamType byte, payload string) []byte {
+	hdr := make([]byte, 8)
+	hdr[0] = streamType
+	binary.BigEndian.PutUint32(hdr[4:8], uint32(len(payload)))
+	return append(hdr, []byte(payload)...)
+}
+
+// TestReadMultiplexed_SplitsStderr is the bug-51 regression:
+// readMultiplexed used to fold everything into stdout and
+// return "" for stderr, so the missing-backup_manifest message
+// (which PG writes to stderr) never reached
+// isMissingManifestError and a manifest-less backup was
+// mis-reported as a verification FAILURE instead of Skipped.
+func TestReadMultiplexed_SplitsStderr(t *testing.T) {
+	const errMsg = `pg_verifybackup: error: could not open file "backup_manifest": No such file or directory`
+	var stream []byte
+	stream = append(stream, dockerFrame(1, "some stdout chatter\n")...)
+	stream = append(stream, dockerFrame(2, errMsg+"\n")...)
+
+	stdout, stderr := sandbox.ReadMultiplexedForTesting(stream)
+	if !strings.Contains(stdout, "stdout chatter") {
+		t.Errorf("stdout not captured: %q", stdout)
+	}
+	if !strings.Contains(stderr, "backup_manifest") {
+		t.Fatalf("stderr not captured (bug 51 regression): %q", stderr)
+	}
+	// The whole point: the classifier must now match.
+	if !sandbox.IsMissingManifestErrorForTesting(stderr) {
+		t.Errorf("isMissingManifestError should match demuxed stderr: %q", stderr)
+	}
+}
+
+// TestReadMultiplexed_UnframedFallback checks that a non-framed
+// buffer (e.g. a TTY-allocated or raw combined stream) still
+// surfaces its text on stderr so message-matching keeps working
+// rather than silently dropping to an empty stderr.
+func TestReadMultiplexed_UnframedFallback(t *testing.T) {
+	raw := `pg_verifybackup: error: could not open file "backup_manifest": No such file or directory` + "\n"
+	stdout, stderr := sandbox.ReadMultiplexedForTesting([]byte(raw))
+	if stdout != "" {
+		t.Errorf("unframed stream should not populate stdout, got %q", stdout)
+	}
+	if !sandbox.IsMissingManifestErrorForTesting(stderr) {
+		t.Errorf("unframed fallback should preserve stderr for classification: %q", stderr)
+	}
+}
+
+// TestReadMultiplexed_Empty guards the nil/empty edge.
+func TestReadMultiplexed_Empty(t *testing.T) {
+	stdout, stderr := sandbox.ReadMultiplexedForTesting(nil)
+	if stdout != "" || stderr != "" {
+		t.Errorf("empty input should yield empty output, got %q / %q", stdout, stderr)
 	}
 }
 

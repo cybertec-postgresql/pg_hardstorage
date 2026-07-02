@@ -224,6 +224,57 @@ func TestVerify_RejectsUnsupportedAlgorithm(t *testing.T) {
 	}
 }
 
+// TestVerify_EncodedPath_HexDecodesToRealFile is the bug-78
+// regression: PG emits "Encoded-Path" (hex) instead of "Path"
+// for filenames that aren't clean UTF-8.  Before the fix,
+// Path=="" made filepath.Join(dataDir,"") resolve to the
+// dataDir itself (a directory), so verifyOne false-failed with
+// "expected regular file, got mode=…dir".  With the fix the hex
+// is decoded and the real file is verified.
+func TestVerify_EncodedPath_HexDecodesToRealFile(t *testing.T) {
+	body := []byte("weirdly-named file body\n")
+	name := "base/16384/odd\xff\x01name"
+	root := writeFiles(t, map[string][]byte{name: body})
+	encoded := hex.EncodeToString([]byte(name))
+	manifest := []byte(`{
+		"PostgreSQL-Backup-Manifest-Version": 1,
+		"Files": [
+			{"Encoded-Path": "` + encoded + `", "Size": ` + itoa(len(body)) + `,
+			 "Checksum-Algorithm": "CRC32C", "Checksum": "` + crc32cHex(body) + `"}
+		]
+	}`)
+	res, err := verifybackup.Verify(context.Background(), manifest, root)
+	if err != nil {
+		t.Fatalf("Encoded-Path entry should verify, got %v", err)
+	}
+	if res.FilesChecked != 1 {
+		t.Errorf("FilesChecked = %d, want 1", res.FilesChecked)
+	}
+}
+
+// TestVerify_EncodedPath_DetectsMissingFile ensures the decoded
+// path is actually used for the on-disk lookup: a manifest
+// entry whose Encoded-Path points at an absent file must fail
+// as "missing", not silently pass by resolving to the dataDir.
+func TestVerify_EncodedPath_DetectsMissingFile(t *testing.T) {
+	root := writeFiles(t, map[string][]byte{}) // nothing on disk
+	encoded := hex.EncodeToString([]byte("base/16384/gone\xfffile"))
+	manifest := []byte(`{
+		"PostgreSQL-Backup-Manifest-Version": 1,
+		"Files": [
+			{"Encoded-Path": "` + encoded + `", "Size": 3,
+			 "Checksum-Algorithm": "NONE", "Checksum": ""}
+		]
+	}`)
+	_, err := verifybackup.Verify(context.Background(), manifest, root)
+	if err == nil {
+		t.Fatal("expected error for missing Encoded-Path file")
+	}
+	if !strings.Contains(err.Error(), "missing") {
+		t.Errorf("error %q does not mention missing", err.Error())
+	}
+}
+
 // itoa is a tiny helper to avoid pulling strconv into a string-
 // concatenation embedded JSON literal.
 func itoa(n int) string {

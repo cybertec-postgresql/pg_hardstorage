@@ -49,6 +49,7 @@ package sandbox
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -65,15 +66,20 @@ import (
 // verification.json, the LLM evidence-bundle exporter,
 // recovery-drill reports) get 24-month forward compatibility.
 type Result struct {
-	Schema     string        `json:"schema"`
-	Backend    string        `json:"backend"`
-	PGMajor    string        `json:"pg_major"`
-	Image      string        `json:"image,omitempty"`
-	Passed     bool          `json:"passed"`
-	Tool       string        `json:"tool"` // "pg_verifybackup"
-	StartedAt  time.Time     `json:"started_at"`
-	StoppedAt  time.Time     `json:"stopped_at"`
-	Duration   time.Duration `json:"duration_ms"`
+	Schema    string    `json:"schema"`
+	Backend   string    `json:"backend"`
+	PGMajor   string    `json:"pg_major"`
+	Image     string    `json:"image,omitempty"`
+	Passed    bool      `json:"passed"`
+	Tool      string    `json:"tool"` // "pg_verifybackup"
+	StartedAt time.Time `json:"started_at"`
+	StoppedAt time.Time `json:"stopped_at"`
+	// Duration is serialised via Result.MarshalJSON as whole
+	// milliseconds under the frozen JSON key "duration_ms" — the
+	// struct tag is "-" because the (Un)MarshalJSON pair own the
+	// field's wire representation (a raw time.Duration would
+	// otherwise emit nanoseconds under that key).
+	Duration   time.Duration `json:"-"`
 	Stdout     string        `json:"stdout,omitempty"`
 	Stderr     string        `json:"stderr,omitempty"`
 	Skipped    bool          `json:"skipped,omitempty"`
@@ -83,6 +89,80 @@ type Result struct {
 // SchemaResult is the JSON schema string for sandbox verify
 // results.  Frozen for 24 months.
 const SchemaResult = "pg_hardstorage.verify.sandbox.v1"
+
+// resultJSON is the wire form of Result.  It mirrors every
+// Result field EXCEPT Duration, which it replaces with an
+// integer-milliseconds field under the same frozen JSON key
+// ("duration_ms").
+//
+// Why the custom form: Result.Duration is a time.Duration,
+// whose natural JSON encoding is its nanosecond count.  Emitting
+// that under the key "duration_ms" told every consumer the run
+// took 1e6x longer than it did (a 5s run serialised as
+// 5000000000, read back as "5 000 000 000 ms").  We can't rename
+// the key — it's part of the 24-month-frozen schema — so we keep
+// the KEY and fix the VALUE: divide nanoseconds down to whole
+// milliseconds on the way out, and multiply back on the way in.
+type resultJSON struct {
+	Schema     string    `json:"schema"`
+	Backend    string    `json:"backend"`
+	PGMajor    string    `json:"pg_major"`
+	Image      string    `json:"image,omitempty"`
+	Passed     bool      `json:"passed"`
+	Tool       string    `json:"tool"`
+	StartedAt  time.Time `json:"started_at"`
+	StoppedAt  time.Time `json:"stopped_at"`
+	DurationMS int64     `json:"duration_ms"`
+	Stdout     string    `json:"stdout,omitempty"`
+	Stderr     string    `json:"stderr,omitempty"`
+	Skipped    bool      `json:"skipped,omitempty"`
+	SkipReason string    `json:"skip_reason,omitempty"`
+}
+
+// MarshalJSON emits Result with duration_ms carrying whole
+// milliseconds instead of the raw nanosecond count of the
+// underlying time.Duration.  The "duration_ms" key is
+// preserved verbatim.
+func (r Result) MarshalJSON() ([]byte, error) {
+	return json.Marshal(resultJSON{
+		Schema:     r.Schema,
+		Backend:    r.Backend,
+		PGMajor:    r.PGMajor,
+		Image:      r.Image,
+		Passed:     r.Passed,
+		Tool:       r.Tool,
+		StartedAt:  r.StartedAt,
+		StoppedAt:  r.StoppedAt,
+		DurationMS: r.Duration.Milliseconds(),
+		Stdout:     r.Stdout,
+		Stderr:     r.Stderr,
+		Skipped:    r.Skipped,
+		SkipReason: r.SkipReason,
+	})
+}
+
+// UnmarshalJSON reads a Result back, interpreting duration_ms
+// as whole milliseconds (the inverse of MarshalJSON).
+func (r *Result) UnmarshalJSON(b []byte) error {
+	var j resultJSON
+	if err := json.Unmarshal(b, &j); err != nil {
+		return err
+	}
+	r.Schema = j.Schema
+	r.Backend = j.Backend
+	r.PGMajor = j.PGMajor
+	r.Image = j.Image
+	r.Passed = j.Passed
+	r.Tool = j.Tool
+	r.StartedAt = j.StartedAt
+	r.StoppedAt = j.StoppedAt
+	r.Duration = time.Duration(j.DurationMS) * time.Millisecond
+	r.Stdout = j.Stdout
+	r.Stderr = j.Stderr
+	r.Skipped = j.Skipped
+	r.SkipReason = j.SkipReason
+	return nil
+}
 
 // Options configures one verify run.  The same struct is
 // passed to every Backend; backend-specific fields (e.g.

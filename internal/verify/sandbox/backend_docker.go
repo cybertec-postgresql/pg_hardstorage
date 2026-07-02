@@ -7,11 +7,11 @@
 package sandbox
 
 import (
-	"bufio"
 	"bytes"
 	"context"
+	"encoding/binary"
 	"fmt"
-	"strings"
+	"io"
 	"time"
 
 	"github.com/moby/moby/api/types/container"
@@ -114,40 +114,88 @@ func (dockerBackend) Verify(ctx context.Context, opts Options) (*Result, error) 
 }
 
 // readMultiplexed reads testcontainers' multiplexed exec
-// output into stdout / stderr strings.  The multiplexed
-// stream has 8-byte headers per chunk; we don't bother
-// parsing — we just split the resulting text on the
-// conventional headers and trust that PG client tools emit
-// reasonably-clean lines.
+// output and de-multiplexes it into separate stdout / stderr
+// strings.
 //
-// The simpler robust approach is to capture everything into
-// one buffer; testcontainers' Reader returns the multiplexed
-// stream and callers either de-multiplex via stdcopy or
-// accept the noise.  We choose the lossy path: read
-// everything into one string, treat it as combined output.
-// Operators don't care about stdout vs stderr for
-// pg_verifybackup — the message says what's wrong either
-// way.
+// Docker's exec stream (when not TTY-allocated, which is the
+// case here) frames each chunk with an 8-byte header:
+//
+//	byte 0     stream type (1 = stdout, 2 = stderr)
+//	bytes 1-3  reserved (zero)
+//	bytes 4-7  big-endian uint32 payload length
+//
+// De-muxing matters because the caller classifies a
+// missing-backup_manifest run as Skipped by matching
+// pg_verifybackup's message — which PG writes to STDERR.  The
+// old implementation folded everything into stdout and
+// returned an empty stderr, so isMissingManifestError could
+// never match and a manifest-less backup was mis-reported as a
+// verification FAILURE instead of Skipped.
+//
+// If the buffer doesn't look framed (e.g. a TTY-allocated
+// stream, or a backend that returns raw combined output), we
+// fall back to treating the whole thing as stderr so the
+// classifier still gets a chance to see the message — the same
+// place PG would have written it.
 func readMultiplexed(r interface{ Read(p []byte) (int, error) }) (string, string) {
 	if r == nil {
 		return "", ""
 	}
-	var buf bytes.Buffer
-	_, _ = bufio.NewReader(asReader(r)).WriteTo(&buf)
-	body := buf.String()
-	// Strip non-printable control bytes that the multiplexed
-	// framing leaks into the buffer when we don't de-mux
-	// properly.  The lossy approach is acceptable here: the
-	// emitted text is for an operator to read.
-	return strings.Map(func(r rune) rune {
-		if r >= 32 && r <= 126 {
-			return r
+	var raw bytes.Buffer
+	_, _ = io.Copy(&raw, asReader(r))
+	body := raw.Bytes()
+
+	var outBuf, errBuf bytes.Buffer
+	if !demuxDockerStream(body, &outBuf, &errBuf) {
+		// Not a framed stream — treat everything as stderr so
+		// message-matching (missing manifest) still works.
+		return "", stripControl(string(body))
+	}
+	return stripControl(outBuf.String()), stripControl(errBuf.String())
+}
+
+// demuxDockerStream parses Docker's 8-byte-header multiplexed
+// exec stream, appending stdout payloads to out and stderr
+// payloads to errW.  Returns false when the buffer does not
+// conform to the framing (in which case out/errW are left
+// untouched and the caller falls back to combined handling).
+func demuxDockerStream(body []byte, out, errW *bytes.Buffer) bool {
+	const headerLen = 8
+	if len(body) < headerLen {
+		return false
+	}
+	i := 0
+	sawFrame := false
+	for i+headerLen <= len(body) {
+		streamType := body[i]
+		// Valid stream types are 0 (stdin), 1 (stdout), 2
+		// (stderr).  Anything else means we're not looking at a
+		// real frame header — bail so the caller falls back.
+		if streamType > 2 || body[i+1] != 0 || body[i+2] != 0 || body[i+3] != 0 {
+			return false
 		}
-		if r == '\n' || r == '\t' {
-			return r
+		n := int(binary.BigEndian.Uint32(body[i+4 : i+8]))
+		i += headerLen
+		if n < 0 || i+n > len(body) {
+			// Truncated / malformed frame — not a clean stream.
+			return false
 		}
-		return -1
-	}, body), ""
+		payload := body[i : i+n]
+		i += n
+		switch streamType {
+		case 2:
+			errW.Write(payload)
+		default:
+			out.Write(payload)
+		}
+		sawFrame = true
+	}
+	// Trailing bytes that don't form a full header means the
+	// buffer isn't cleanly framed.
+	if i != len(body) {
+		return false
+	}
+	return sawFrame
 }
 
 // asReader normalises an `interface{ Read(p []byte) (int,

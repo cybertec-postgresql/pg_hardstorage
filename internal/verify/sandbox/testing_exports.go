@@ -9,6 +9,8 @@
 
 package sandbox
 
+import "bytes"
+
 // MagicVerdictTestForm is the test-friendly serialisation of
 // the internal magicResult.  Test code asserts on string
 // verdicts ("PASS"/"FAIL"/"SKIP"/"UNKNOWN") rather than
@@ -49,4 +51,19 @@ func StripControlForTesting(in string) string { return stripControl(in) }
 // firecracker.
 func ValidateFirecrackerOptsForTesting(opts Options) error {
 	return validateFirecrackerOpts(opts)
+}
+
+// ReadMultiplexedForTesting exposes readMultiplexed for unit
+// tests so the Docker exec-stream de-multiplexing (stdout vs
+// stderr split) can be exercised without a live Docker daemon.
+// Returns (stdout, stderr).
+func ReadMultiplexedForTesting(b []byte) (string, string) {
+	return readMultiplexed(bytes.NewReader(b))
+}
+
+// IsMissingManifestErrorForTesting exposes isMissingManifestError
+// so tests can assert the classifier matches pg_verifybackup's
+// missing-backup_manifest message on stderr.
+func IsMissingManifestErrorForTesting(stderr string) bool {
+	return isMissingManifestError(stderr)
 }
