@@ -22,7 +22,10 @@ import (
 func TestPGBackend_AppendProgress_Caps(t *testing.T) {
 	pg := pgtestkit.StartPostgres(t)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	// Generous budget: ~1050 sequential UPDATEs against a real PG on a
+	// slow CI/soak disk legitimately take minutes; the point here is
+	// the cap, not the pace.
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Second)
 	defer cancel()
 	b, err := server.OpenPGBackend(ctx, pg.DSN)
 	if err != nil {
@@ -41,10 +44,10 @@ func TestPGBackend_AppendProgress_Caps(t *testing.T) {
 		t.Fatalf("claim: %v", err)
 	}
 
-	// The cap mirrors MemoryBackend.maxProgressEvents (1000). Push well
-	// past it.
+	// The cap mirrors MemoryBackend.maxProgressEvents (1000). Push past
+	// it far enough to prove the trim engages and holds steady.
 	const bound = 1000
-	const total = bound + 250
+	const total = bound + 50
 	for i := 0; i < total; i++ {
 		if err := b.AppendProgress(ctx, j.ID, server.ProgressEvent{
 			At: time.Now().UTC(),

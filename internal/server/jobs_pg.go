@@ -366,23 +366,30 @@ func (b *PGBackend) AppendProgress(ctx context.Context, id string, ev ProgressEv
 	// Cap the retained history to the same bound as MemoryBackend
 	// (maxProgressEvents). Without this the jsonb grew unbounded and
 	// every append rewrote the whole array — O(n) per event and an
-	// unbounded row. We append, then keep only the most recent
-	// maxProgressEvents entries: jsonb_array_elements over the appended
-	// array, ordered by ordinality, take the tail via OFFSET, and
-	// re-aggregate. The $4 bound is passed as a parameter so the SQL
-	// stays a single prepared statement.
+	// unbounded row.
+	//
+	// The trim is CONDITIONAL: the common path (array still under the
+	// cap) is a plain `progress || $1`, and only an over-cap array pays
+	// the jsonb_array_elements + re-aggregate tail-slice. CASE evaluates
+	// only the chosen arm, so under-cap appends never run the expensive
+	// subquery — an unconditional re-aggregate made every append O(cap)
+	// and real-PG runs crawled at ~150 ms/append. The $4 bound is a
+	// parameter so the SQL stays a single prepared statement.
 	cmd, err := b.pool.Exec(ctx, `
         UPDATE phs.jobs
-           SET progress = (
-               SELECT COALESCE(jsonb_agg(e.val ORDER BY e.ord), '[]'::jsonb)
-                 FROM (
-                     SELECT val, ord
-                       FROM jsonb_array_elements(progress || $1::jsonb)
-                            WITH ORDINALITY AS t(val, ord)
-                 ) e
-                WHERE e.ord > GREATEST(
-                    jsonb_array_length(progress || $1::jsonb) - $4, 0)
-           ),
+           SET progress = CASE
+               WHEN jsonb_array_length(progress || $1::jsonb) <= $4
+               THEN progress || $1::jsonb
+               ELSE (
+                   SELECT COALESCE(jsonb_agg(e.val ORDER BY e.ord), '[]'::jsonb)
+                     FROM (
+                         SELECT val, ord
+                           FROM jsonb_array_elements(progress || $1::jsonb)
+                                WITH ORDINALITY AS t(val, ord)
+                     ) e
+                    WHERE e.ord > jsonb_array_length(progress || $1::jsonb) - $4
+               )
+           END,
                updated_at = $2
          WHERE id = $3
            AND state = 'running'

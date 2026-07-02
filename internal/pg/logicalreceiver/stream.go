@@ -201,13 +201,21 @@ func Stream(ctx context.Context, conn *pg.Conn, opts StreamOptions, sink Sink) (
 	// server traffic before treating it as a stuck connection. Distinct
 	// from the status cadence: a status-deadline hit is normal (flush &
 	// continue); an inactivity-deadline hit is fatal.
+	//
+	// ANCHORED TO lastTraffic, not recomputed from time.Now() each
+	// iteration — the status cadence wakes the loop more often than the
+	// inactivity window, and a now-based deadline would reset the budget
+	// on every wake, so a genuinely silent stream could never trip it
+	// (callers then hung until their outer ctx died with a bare
+	// "context deadline exceeded" instead of the classified inactivity
+	// error the contract promises).
+	lastTraffic := time.Now()
 	inactivityDeadline := func() time.Time {
 		if opts.InactivityTimeout <= 0 {
 			return time.Time{} // no deadline; rely on ctx cancellation
 		}
-		return time.Now().Add(opts.InactivityTimeout)
+		return lastTraffic.Add(opts.InactivityTimeout)
 	}
-	lastTraffic := time.Now()
 
 	for {
 		if err := ctx.Err(); err != nil {
