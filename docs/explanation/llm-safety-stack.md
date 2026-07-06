@@ -270,29 +270,28 @@ independent layers of evidence.
 
 ---
 
-## Skills are signed YAML files, not Go code
+## Skills are YAML files, not Go code
 
-The skills (`restore`, `incident`, `ask`, `explain`, `runbook`,
-`postmortem`) are versioned, declarative YAML files — not Go
-functions baked into the binary.  Implications:
+The builtin skills (`ask`, `explain`, `incident`, `restore`) are
+versioned, declarative YAML files — not Go functions baked into
+the binary.  Implications:
 
 - **Hot-fix loop in minutes, not weeks.**  A bad skill response in
-  production gets a same-day patch — drop a new YAML file in
-  `/etc/pg_hardstorage/skills/`, increment the version, restart
-  the agent (or `pg_hardstorage llm reload-skills`).  No binary
-  rebuild, no Debian package release.
-- **Skill isolation.**  A bug in the postmortem skill cannot
+  production gets a same-day patch — author a new YAML file,
+  increment the version, and `pg_hardstorage llm skill install
+  <file>` into the operator overlay (any existing version is
+  snapshotted for rollback).  No binary rebuild, no Debian package
+  release.
+- **Skill isolation.**  A bug in the incident skill cannot
   touch the restore skill.  Each skill loads independently, has
   its own tool allowlist, its own guardrails, its own RBAC scope.
 - **Inspectable, with signing on the roadmap.**  Skills load as
   plain, reviewable YAML today.  Cryptographic skill signing and
   signature verification (a project key for shipped skills, the
   operator's key for local ones) are planned, not yet shipped.
-- **Linted + golden-tested.**  `pg_hardstorage llm skill lint
-  <file>` validates the schema and static-checks the tool list
-  (no banned tools, no missing required ones).
-  `pg_hardstorage llm skill test <file>` runs golden test cases
-  against a pinned model checkpoint per release.
+- **Linted.**  `pg_hardstorage llm skill lint <file>` validates
+  the schema and static-checks the tool list (no banned tools, no
+  missing required ones).
 
 A skill file declares which tools are available to the LLM in
 that session.  The `restore` skill explicitly excludes
@@ -334,8 +333,10 @@ specific set of failure modes:
 - **"You released a bad model update."**  The bundle records the
   exact model id and version.  Provider-side model versioning is
   captured.
-- **"The skill was malicious."**  Skills are signed; unsigned
-  skills require a flag whose use is audited.
+- **"The skill was malicious."**  Skills load as reviewable YAML
+  and are schema-linted before install; the exact skill name and
+  version are recorded in the audit bundle.  (Cryptographic skill
+  signing is roadmap, not yet shipped.)
 - **"You hid prompts from me."**  `/show-context` plus the export
   bundle prove otherwise.
 - **"A prompt injection in a manifest description executed

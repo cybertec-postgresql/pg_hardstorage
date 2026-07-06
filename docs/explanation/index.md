@@ -63,7 +63,7 @@ SPEC is the source of truth and we want to know — file an issue.
 - [Coordination without etcd](coordination-without-etcd.md) — the
   progressive ladder from JSON state files up to opt-in etcd.
 - [Tier-1 vs Tier-2 plugins](tier1-vs-tier2-plugins.md) —
-  compile-time vs `go-plugin`, trust posture, registry roadmap.
+  compile-time vs stdio-JSON-RPC subprocess, trust posture, registry roadmap.
 - [Verify-sandbox tradeoffs](verify-sandbox-tradeoffs.md) —
   Docker default vs Firecracker microVM; isolation vs setup
   cost.

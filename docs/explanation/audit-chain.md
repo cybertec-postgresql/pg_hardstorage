@@ -212,14 +212,13 @@ The default 5-minute cadence is a tradeoff between two costs:
 - Sparse anchoring widens the rewrite window — events
   between two anchors are still rewritable until the next anchor.
 
-`pg_hardstorage repo set audit.anchor_interval` accepts any
-duration from 30 s to 1 h.  Production tuning typically picks
-between 1 min (security-sensitive, accept higher log volume) and
-15 min (capacity-constrained).
+The cadence is set per deployment via the `schedule.audit_anchor`
+spec in `pg_hardstorage.yaml` (e.g. `every: 5m`).  Production
+tuning typically picks between 1 min (security-sensitive, accept
+higher log volume) and 15 min (capacity-constrained).
 
-The `pg_hardstorage_audit_anchor_lag_seconds` metric exposes how
-long it's been since the last successful anchor; the default
-alerting recipe fires if it exceeds 3× the configured interval.
+Track anchor freshness from the `audit verify-chain` output, which
+reports how long it's been since the last successful anchor.
 
 ---
 
@@ -284,7 +283,7 @@ reporting.
 
 ---
 
-## What's deferred to v1.0
+## What's deferred past v1.0
 
 The chain is real and verifiable; the audit subsystem ships
 hash-chained from v0.1 onward and the durable monotonic

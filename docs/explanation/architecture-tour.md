@@ -147,7 +147,7 @@ manifest is independently verifiable without external state.
   "encryption": {
     "scheme":           "aes-256-gcm",
     "wrapped_dek":      "base64...",
-    "kek_ref":          "local-keyring://default",
+    "kek_ref":          "local:default",
     "envelope_version": 2
   },
   "tablespaces": [{"oid":1663,"location":"pg_default"}],
@@ -363,13 +363,15 @@ cooperating mechanisms:
    - **Strategy C (fallback):** recreate the slot on detection.
      The agent runs `IDENTIFY_SYSTEM` after reconnect; if the slot
      doesn't exist, recreate it and report any gap loudly.
-3. **Dual-slot mode** (≥ 50 TB or `availability=high`).  Two slots
-   on two nodes feed the same CAS; either stream can fail without
-   RPO impact.  Shipped in v1.0.
-4. **Synchronous-target mode** (`wal_mode: synchronous`). Agent
-   advertises as a `synchronous_standby_names` candidate, PG waits
-   for our flush ACK before commit. RPO = 0 at the cost of write
-   latency.  Shipped in v1.0.
+3. **Dual-slot mode** (≥ 50 TB, opt-in via a `patroni.slots:` list
+   of `{name, role}` entries).  Two slots on two nodes feed the
+   same CAS; either stream can fail without RPO impact.
+4. **Synchronous-target mode** (`wal_mode: synchronous`) — *not
+   implemented*.  The aspiration is for the agent to advertise as a
+   `synchronous_standby_names` candidate so PG waits for our flush
+   ACK before commit (RPO = 0 at the cost of write latency).  Today
+   there is no `wal_mode: synchronous` config key; only preflight
+   *detection* of where `sync_standby` slots are placed ships.
 
 Strategy C is honest about loss — it never silently glosses over a
 gap. Manifests record the gap; PITR inside the gap window is

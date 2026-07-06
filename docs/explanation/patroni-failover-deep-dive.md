@@ -179,11 +179,10 @@ the dual-slot mode eliminates this entire class of problem:
 ```yaml
 deployments:
   db1:
-    physical_wal:
-      mode: dual
+    patroni:
       slots:
-        - { node: primary,  name: pg_hardstorage_db1_primary }
-        - { node: replica1, name: pg_hardstorage_db1_replica }
+        - { name: pg_hardstorage_db1_primary, role: leader }
+        - { name: pg_hardstorage_db1_replica, role: replica }
 ```
 
 Both slots stream concurrently into the same content-addressed
@@ -200,24 +199,22 @@ the gap is typically zero.
 
 ---
 
-## Mechanism 4 — synchronous-target mode
+## Mechanism 4 — synchronous-target mode (not implemented)
 
-The opt-in `wal_mode: synchronous` makes the agent advertise
-itself as a candidate in `synchronous_standby_names`.  PG **will
-not commit a transaction until our agent has fsynced the WAL into
-the repo**.  On failover, no committed transaction can be missing,
-because none committed without our ACK.  RTO unaffected; RPO = 0
-across the failover boundary.
+Synchronous-target mode is a design aspiration, not a shipped
+feature.  The intended posture: an opt-in `wal_mode: synchronous`
+would make the agent advertise itself as a candidate in
+`synchronous_standby_names`, so PG **would not commit a
+transaction until our agent had fsynced the WAL into the repo**.
+On failover, no committed transaction could be missing, because
+none committed without our ACK — RPO = 0 across the failover
+boundary.
 
-The cost is a real one: write latency increases by the
-backup-side flush latency, which on cloud object storage is on the
-order of tens to low hundreds of milliseconds.  Recommended only
-for tier-0 deployments where the customer has explicitly accepted
-the tradeoff.
-
-This is the strongest available posture and the only one that
-makes "no transaction loss across failover" a structural
-guarantee rather than a probabilistic one.
+What ships today is *detection only*: preflight checks report
+where `sync_standby` slots are placed and flag configurations that
+would strand WAL, but there is no `wal_mode: synchronous` config
+key and the agent does not itself join
+`synchronous_standby_names`.  The always-on ACK path is roadmap.
 
 ---
 
@@ -320,8 +317,13 @@ A few combinations the design refuses by construction:
 
 - Strategy A — Patroni `permanent_slots` integration.
 - Strategy B — PG 17+ synced slots.
-- Dual-slot mode (≥ 50 TB or `availability=high`).
-- Sync-target mode (`wal_mode: synchronous`).
+- Dual-slot mode (≥ 50 TB, via a `patroni.slots:` list).
+
+**Roadmap:**
+
+- Sync-target mode (`wal_mode: synchronous`) — detection of
+  `sync_standby` placement ships today; the always-on ACK path is
+  not yet implemented.
 
 ---
 

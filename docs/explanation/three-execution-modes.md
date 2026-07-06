@@ -141,14 +141,16 @@ election — no extra coordination service needed.
 
 The K8s integrations specifically:
 
-- **CNPG-I provider** for CloudNativePG (v0.5 roadmap).
+- **CloudNativePG** is supported today via the barman-cloud
+  drop-in shim (`compat/barmancloud`); a native CNPG-I gRPC
+  provider is still roadmap.
 - **WAL-G drop-in shim** (`pg-hardstorage-walg` binary) for
-  Zalando — shipped in v1.1.
+  Zalando — shipped (v1.0.7).
 - **pgBackRest drop-in shim** (`pg-hardstorage-pgbackrest`
-  binary) for Crunchy PGO — shipped in v1.1.
+  binary) for Crunchy PGO — shipped (v1.0.7).
 - **Barman drop-in shim** (`pg-hardstorage-barman` +
   `pg-hardstorage-barman-wal-archive` binaries) for in-pod
-  Barman wrappers — shipped in v1.1.
+  Barman wrappers — shipped (v1.0.7).
 - **Helm charts**: `charts/pg-hardstorage-server` (control plane)
   and `charts/pg-hardstorage-sidecar` (per-Pod sidecar) — shipped.
 
