@@ -11,6 +11,37 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ## [Unreleased]
 
+## [1.0.8] — 2026-07-06
+
+### Fix: post-restore verification failed on every base-only restore
+
+The `restore --verify` gate ran `pg_verifybackup` without `-n`, so it
+tried to parse WAL. A pg_hardstorage restore lays down the base backup
+only — the WAL needed to reach consistency is fetched at recovery time
+via the `restore_command` — so the restored data directory has no
+`pg_wal` segments yet, and `pg_verifybackup` failed every normal restore
+with `could not find any WAL file`, reporting `Verification: failed`. It
+now passes `-n` (`--no-parse-wal`), verifying the manifest and file
+checksums; a clean restore reports `Verification: passed`.
+
+### Fix: the interactive `simple` helper accepted the wrong repo schemes
+
+`pg_hardstorage_simple` validated `gs://` and `azure://` — schemes with
+no registered backend — and rejected the real `gcs://` and `azblob://`.
+It now accepts exactly the schemes the storage registry provides
+(`file` / `s3` / `gcs` / `azblob` / `sftp` / `scp`).
+
+### Documentation: full accuracy pass against the code
+
+Validated the README and the entire documentation tree against the
+shipped binary — capturing real command output where examples are shown
+— and corrected everything that did not match: nonexistent commands and
+flags, wrong error codes and config keys, stale "roadmap/v0.5" framing
+for shipped features, an incorrect Tier-2 plugin-protocol description
+(the shipped transport is stdio JSON-RPC), unpublished-artifact
+references, and roughly thirty fabricated sample-output blocks. Link
+integrity was verified (no dead links).
+
 ## [1.0.7] — 2026-07-02
 
 A broad code-review pass fixed 79 correctness bugs across the codebase,
