@@ -26,8 +26,8 @@ and is exposed in Prometheus text exposition format
 !!! info "Live vs. reserved (SPEC drift #7)"
     The families marked **Live** below emit real samples today.
     The families marked **Reserved** have a committed name +
-    label layout but no producer yet — they render as
-    `# HELP`/`# TYPE` headers with no samples, and are tracked
+    label layout but no producer and no registration yet — they
+    don't appear in the exposition at all, and are tracked
     as drift items #7/#8 in
     [`docs/SPEC_DRIFT.md`](../SPEC_DRIFT.md). Until a reserved
     signal lands, operators read it from the

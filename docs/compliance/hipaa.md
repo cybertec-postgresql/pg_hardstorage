@@ -37,7 +37,7 @@ JSON is `hipaa`.
 
 | Section | Description | Product feature | Command | Audit event |
 | --- | --- | --- | --- | --- |
-| §164.312(a)(1) | Access control | Per-tenant KEK + RBAC scopes | `pg_hardstorage rbac ...` | `rbac.*` |
+| §164.312(a)(1) | Access control | Per-tenant KEK + RBAC scopes (RBAC enforced server-side / SCIM-provisioned; no operator CLI verb) | (server-side) | (server-side) |
 | §164.312(a)(2)(i) | Unique user identification | RBAC actor identity recorded on every event | (automatic) | (every event records `actor`) |
 | §164.312(a)(2)(ii) | Emergency access procedure | JIT tokens + n-of-m approval | `pg_hardstorage jit issue ...`, `approval request ...` | `jit.issue`, `approval.request` |
 | §164.312(a)(2)(iii) | Automatic logoff | JIT tokens auto-expire (max 24h) | (automatic) | `jit.issue` |
@@ -72,7 +72,9 @@ make build-fips
 ```
 
 The FIPS variant refuses to start if `crypto/tls` reports
-non-FIPS. `--fips-strict` panics on any non-FIPS plugin.
+non-FIPS. In that FIPS build, `--fips-strict` panics on any
+non-FIPS plugin. (The FIPS build is not yet shipped; `--fips-strict`
+is not present in the default binary.)
 
 ---
 

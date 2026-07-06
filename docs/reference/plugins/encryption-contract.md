@@ -31,7 +31,7 @@ on-disk envelope they share.
       HashiCorp Vault Transit; on-prem-friendly, FIPS via
       Vault Enterprise.
     The local-keystore provider at
-    `internal/keystore/` is the dev / single-host default
+    `internal/backup/keystore/` is the dev / single-host default
     (`local:default`) and a useful minimal example of the
     interface shape.
 

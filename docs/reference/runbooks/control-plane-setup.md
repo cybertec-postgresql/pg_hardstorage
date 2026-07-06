@@ -15,15 +15,20 @@ control plane becomes useful when:
 - Your fleet sits behind **mTLS** and you want one auth-policy
   surface instead of per-host configuration.
 
-What this runbook does NOT cover (yet — those land in v0.5+):
+Current limitations (still on the roadmap):
 
-- gRPC. v0.4 ships REST-only. The same handlers will be exposed
-  over gRPC in v0.5; the proto schema isn't stable yet.
-- OIDC + per-verb RBAC. v0.4 is single-token. Use mTLS for fleets
+- gRPC. The control plane ships REST-only. The same handlers are
+  planned over gRPC; the proto schema isn't stable yet.
+- OIDC + per-verb RBAC. Auth is single-token. Use mTLS for fleets
   that need richer auth today.
-- Persistent dispatch state. v0.4's JobRegistry is in-memory; a
-  control-plane restart loses queued + in-flight jobs. Persistent
-  PG-backed state lands in v0.5.
+
+Already shipped and covered below:
+
+- Persistent dispatch state is optional. The default JobRegistry
+  is in-memory (`--coord-backend memory`); a control-plane restart
+  then loses queued + in-flight jobs. Pass `--coord-backend pg`
+  with `--coord-dsn` for a persistent, multi-instance-HA
+  PostgreSQL-backed registry (used throughout this runbook).
 
 ---
 
@@ -326,17 +331,19 @@ sudo ufw allow out to <pg-backup-host> port 5432 proto tcp
 
 ### Multi-AZ availability
 
-v0.4's control plane is single-instance. For HA today:
+With the in-memory backend the control plane is effectively
+single-instance. For HA:
 
 - Run two control-plane instances behind a load balancer; agents
-  heartbeat the LB hostname. **Caveat:** in-memory job state isn't
-  shared, so a job enqueued on instance A is invisible to instance
-  B until A processes it. Use sticky sessions on the LB to
-  mitigate, or queue outside the control plane (Kafka, Redis) and
-  have the control plane be a thin REST adapter.
-- v0.5's PG-backed JobRegistry removes this caveat: any
-  control-plane instance can see + dispatch any job. Wait for v0.5
-  if you need multi-instance dispatch correctness today.
+  heartbeat the LB hostname. **Caveat (in-memory backend only):**
+  with `--coord-backend memory`, job state isn't shared, so a job
+  enqueued on instance A is invisible to instance B until A
+  processes it. Use sticky sessions on the LB to mitigate, or
+  queue outside the control plane (Kafka, Redis) and have the
+  control plane be a thin REST adapter.
+- The PG-backed JobRegistry (`--coord-backend pg`) removes this
+  caveat: any control-plane instance can see + dispatch any job.
+  Use it if you need multi-instance dispatch correctness.
 
 ### Observability
 
@@ -350,8 +357,9 @@ visible signals:
   pg_hardstorage.server.v1`, `error.code`, `error.message`)
 
 For Prometheus scraping, point the scraper at `/v1/version` (cheap,
-authenticated) for liveness; v0.5 adds dedicated `/metrics` and
-control-plane-specific gauges.
+authenticated) for liveness, or at the dedicated `/metrics`
+endpoint (unauthenticated, like the health probes) for
+control-plane and job gauges.
 
 ---
 
@@ -404,10 +412,13 @@ wrong bucket. To fix:
 
 ### Restore-time job shows `pre-condition not met`
 
-v0.4 doesn't dispatch restores yet (the agent-side executor returns
-a v0.5-deferred error for `restore` and `verify` kinds). Run
-restores via `pg_hardstorage restore` directly on the agent host
-until v0.5 lands.
+Restore and verify jobs are dispatched today: `POST
+/v1/deployments/<n>/restores` and `.../verifies` enqueue
+`JobRestore` / `JobVerify`, which the agent's RestoreExecutor /
+VerifyExecutor run. A `pre-condition not met` result means the
+job's guardrails (e.g. repo-URL match, non-empty target) failed —
+check the job result body. You can still run restores via
+`pg_hardstorage restore` directly on the agent host.
 
 ### Control plane refuses agent client cert
 
@@ -425,13 +436,19 @@ CA to the bundle and restart the control plane.
 
 ---
 
-## What ships in v0.5+
+## Already shipped
+
+- PostgreSQL-backed JobRegistry (`--coord-backend pg`) for
+  multi-instance HA dispatch
+- Dispatch of restore / verify kinds (`JobRestore` / `JobVerify`)
+- Dedicated `/metrics` endpoint
+
+## Still on the roadmap
 
 - gRPC alongside REST (same handlers, proto schema)
-- PostgreSQL-backed JobRegistry (multi-instance HA dispatch)
 - pg_timetable integration as the recommended scheduler
 - OIDC + multi-token + per-verb RBAC
-- Dispatch of restore / verify kinds with full progress streaming
+- Full progress streaming for restore / verify dispatch
 - Job result persistence beyond the registry's in-memory window
 
 This runbook is updated alongside each milestone.

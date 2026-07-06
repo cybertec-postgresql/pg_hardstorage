@@ -12,7 +12,7 @@ gap window is now refused.
 - `wal stream` logs include a `wal.slot_recreated` notice with
   non-zero `gap_bytes` or `gap_seconds`.
 - An attempted PITR within the gap window fails with
-  `wal.gap_in_target` (exit 6).
+  `restore.target_in_wal_gap` (exit 7).
 - Patroni's REST endpoint shows a recent leader change.
 
 ## Pre-flight

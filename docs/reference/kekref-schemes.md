@@ -13,8 +13,13 @@ tags:
 
 A **KEKRef** is the manifest-stamped pointer to the
 Key-Encryption Key that wraps a backup's per-backup DEK.
-The first segment of the KEKRef selects a `kms.Provider`
-implementation in `internal/kms`; resolution is by
+The first segment of the KEKRef selects how the DEK is
+unwrapped. `local:` is resolved inline by the keystore
+([`internal/backup/keystore/unwrap.go`](https://github.com/cybertec-postgresql/pg_hardstorage/blob/main/internal/backup/keystore/unwrap.go)),
+*not* via `kms.DefaultRegistry`. Every other (cloud / HSM)
+scheme — `aws-kms`, `gcp-kms`, `azure-kv`, `vault-transit`,
+`pkcs11` — selects a `kms.Provider` implementation in
+`internal/kms` and is dispatched by
 [`kms.DefaultRegistry`](https://github.com/cybertec-postgresql/pg_hardstorage/blob/main/internal/kms/kms.go).
 
 | Scheme | Provider | Built in | FIPS posture | Source |

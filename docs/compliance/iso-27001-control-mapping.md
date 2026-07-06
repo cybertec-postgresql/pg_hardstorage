@@ -22,7 +22,7 @@ JSON is `iso27001`.
 | Control | Title | Product feature | Command | Audit event |
 | --- | --- | --- | --- | --- |
 | A.5.10 | Acceptable use of information | RBAC scopes + JIT tokens for break-glass | `pg_hardstorage jit issue ...` | `jit.issue`, `jit.revoke` |
-| A.5.15 | Access control | Per-tenant KEK + RBAC scope | `pg_hardstorage rbac ...` | `rbac.*` |
+| A.5.15 | Access control | Per-tenant KEK + RBAC scope (RBAC enforced server-side / SCIM-provisioned; no operator CLI verb) | (server-side) | (server-side) |
 | A.5.23 | Information security for use of cloud services | Storage plugin per-region scoping; air-gap mode | (config) | (config) |
 | A.5.30 | ICT readiness for business continuity | Disaster runbooks R1–R7; recovery drills with measured RTO | `pg_hardstorage recovery drill ...` | `recovery.drill_failed` (on fail) |
 | A.5.34 | Privacy and protection of PII | Data residency + classification | `pg_hardstorage residency set ...`, `classify set ...` | (config), (manifest tag) |

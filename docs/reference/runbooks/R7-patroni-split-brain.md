@@ -2,14 +2,19 @@
 
 Two nodes both claim to be primary. Patroni's REST endpoint
 disagrees with the connected PG instance about the leader, or two
-Patroni instances both report `role=primary`. The agent's pre-flight
-refuses to write WAL or take backups in this state because it
-cannot determine which timeline is canonical.
+Patroni instances both report `role=primary`. There is no
+Patroni-specific preflight that refuses in this state; instead,
+`wal push` refuses a segment that a divergent writer already
+archived (raising a `splitbrain.*` code), because it cannot
+determine which timeline is canonical.
 
 ## Symptoms
 
-- `wal stream` and `backup` exit 4 with
-  `preflight.patroni_split_brain`.
+- A `wal push` of a segment already archived by a divergent
+  writer fails with a `splitbrain.*` code —
+  `splitbrain.system_identifier_mismatch` (different cluster) or
+  `splitbrain.content_mismatch` (same cluster, conflicting
+  content). There is no Patroni-specific preflight refusal.
 - `pg_hardstorage doctor` flags `Patroni topology` as critical.
 - `curl http://patroni-a:8008/cluster` and `curl
   http://patroni-b:8008/cluster` show conflicting `members[].role`
