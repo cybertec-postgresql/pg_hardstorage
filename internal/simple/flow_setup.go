@@ -226,11 +226,11 @@ func validateDeploymentName(s string) error {
 	return nil
 }
 
-// validateRepoURL accepts any URL scheme the runner accepts.  The
-// short list (file://, s3://, gs://, azure://, sftp://, scp://) is
-// validated by trying a probe write only for file:// — remote
-// schemes can't be probed without credentials and we don't ask for
-// those at setup time.
+// validateRepoURL accepts the URL schemes the storage registry actually
+// registers (file, s3, gcs, azblob, sftp, scp — see
+// internal/plugin/storage/*). It is validated by trying a probe write
+// only for file:// — remote schemes can't be probed without credentials
+// and we don't ask for those at setup time.
 func validateRepoURL(s string) error {
 	s = strings.TrimSpace(s)
 	if s == "" {
@@ -247,12 +247,13 @@ func validateRepoURL(s string) error {
 		}
 		return nil
 	}
-	for _, p := range []string{"s3://", "gs://", "azure://", "sftp://", "scp://"} {
+	// Must match the schemes registered in internal/plugin/storage/*.
+	for _, p := range []string{"s3://", "gcs://", "azblob://", "sftp://", "scp://"} {
 		if strings.HasPrefix(s, p) {
 			return nil
 		}
 	}
-	return errors.New(`unknown URL scheme; expected file:// / s3:// / gs:// / azure:// / sftp:// / scp://`)
+	return errors.New(`unknown URL scheme; expected file:// / s3:// / gcs:// / azblob:// / sftp:// / scp://`)
 }
 
 // dbnameFromDSN pulls the dbname out of a libpq URI, used as the
