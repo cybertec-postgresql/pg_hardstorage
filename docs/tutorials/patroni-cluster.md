@@ -55,11 +55,13 @@ pg_hardstorage patroni status \
 ```
 
 ```console
-Cluster: pg-tutorial · scope=patroni-tutorial
-  Member       Role      State    TLI  Lag    Host:Port
-  patroni-1    Leader    running  3    0      10.0.0.11:5432
-  patroni-2    Replica   running  3    24kB   10.0.0.12:5432
-  patroni-3    Replica   running  3    8kB    10.0.0.13:5432
+patroni cluster "patroni-tutorial"
+  Leader: patroni-1 (TLI 3)
+
+  NAME       ROLE     STATE      HOST       PORT  TLI  LAG
+  patroni-1  Leader   running    10.0.0.11  5432  3    0
+  patroni-2  Replica  streaming  10.0.0.12  5432  3    0
+  patroni-3  Replica  streaming  10.0.0.13  5432  3    0
 ```
 
 `patroni history` prints the timeline-history events that record
@@ -157,9 +159,9 @@ pg_hardstorage backup pg-tutorial \
     --repo file:///srv/hs-patroni-repo
 ```
 
-For clusters at ≥ 5 TB the agent prefers a Patroni *replica* for the
-base backup to keep primary I/O free. Replica preference is
-automatic — there is no flag to flip.
+The base backup connects to the endpoint you give it. To take it from
+a replica (to keep primary I/O free), point `--pg-connection` at a
+replica's host — there is no automatic replica routing.
 
 ### 6. Force a failover and watch the slot survive
 
@@ -176,18 +178,29 @@ pg_hardstorage patroni follow \
     --url http://patroni-leader:8008
 ```
 
+`patroni follow` streams a `patroni.leader_change` event each time the
+leader changes (and `patroni.poll_error` on a transient REST error);
+each event carries the old and new leader's name and host:port. In
+text mode it renders through the generic event renderer:
+
 ```console
-2026-05-04T11:02:11Z  initial-leader  patroni-1 → 10.0.0.11:5432  TLI=3
-2026-05-04T11:03:42Z  leader-change   patroni-1 → patroni-2       TLI=3 → 4
+11:03:42 [NOTICE] patroni.leader_change
 ```
 
-In the `wal stream` terminal you will see the agent reconnect:
+In the `wal stream` terminal you will see the follower coordinator
+react. It emits events under the `wal.follower` namespace — the ones
+that matter on a failover:
+
+- `wal.follower.leader_change` — the coordinator saw the new leader;
+- `wal.follower.slot_reconciled` — the physical slot was found (or
+  recreated) on the new leader;
+- `wal.follower.wal_gap_detected` — **critical**, emitted only if the
+  reconnect could not bridge the WAL (e.g. the slot was lost and
+  recreated past the last archived LSN).
 
 ```console
-patroni.leader_change   from=patroni-1 to=patroni-2 new_lsn=0/A0000000
-slot.repair             slot=pg_hardstorage_pg_tutorial result=created
-wal.gap_recorded        range=[0/9F800000..0/A0000000]  cause=patroni-failover
-wal.stream              receiving from patroni-2:5432
+11:03:42 [NOTICE] wal.follower.leader_change
+11:03:43 [NOTICE] wal.follower.slot_reconciled
 ```
 
 The agent recreated its replication slot on the new primary at the

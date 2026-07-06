@@ -164,7 +164,10 @@ the whole round-trip end to end.
 - **Kubernetes** — runs as a CronJob / Deployment; verified
   end-to-end against CloudNativePG.
 - Content-addressed **deduplication** (FastCDC, page-aligned splits)
-  — no incremental chains to break.
+  — every base backup is a self-contained full, deduplicated against
+  what's already in the repo, so storage stays incremental-sized
+  without a mandatory chain. PG 17+ incremental backups
+  (`backup --incremental-from`) are supported too when you want them.
 - **AES-256-GCM** envelope encryption; a FIPS / BoringCrypto build
   variant is available.
 - **4 Tier-1 KMS providers** — AWS KMS · GCP KMS · Azure Key Vault ·
@@ -305,8 +308,9 @@ build.
 Or via the canonical Makefile:
 
 ```sh
-make                   # build bin/pg_hardstorage + bin/pg_hardstorage_testkit
-make build-simple      # the interactive quick-start helper
+make build             # build bin/pg_hardstorage  (bare `make` prints the help menu)
+make all-binaries      # build + testkit + interactive helper
+make build-simple      # just the interactive quick-start helper
 make build-compat      # the pgBackRest / Barman / WAL-G shims
 make build-fips        # FIPS / BoringCrypto variant
 make build-firecracker # microVM verifier-sandbox variant

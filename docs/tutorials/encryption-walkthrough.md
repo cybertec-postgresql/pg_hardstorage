@@ -85,10 +85,14 @@ pg_hardstorage kms inspect
 ```
 
 ```console
-Keyring: /home/you/.config/pg_hardstorage/keyring
-  signing-public.pem    ed25519  fp=ab12...ef34
-  signing-private.pem   0600
-  kek.bin               0600  · 32 bytes
+keyring at /home/you/.config/pg_hardstorage/keyring
+  manifest_signing.ed25519
+    present:     yes (mode -rw-------, 165 bytes, 2026-07-06T12:49:28Z)
+  manifest_signing.pub
+    present:     yes (mode -rw-r--r--, 159 bytes, 2026-07-06T12:49:28Z)
+    fingerprint: sha256:4324b42cc21f7259
+  kek.bin
+    present:     yes (mode -rw-------, 32 bytes, 2026-07-06T12:49:28Z)
 ```
 
 If you already have a keyring without a KEK, generate one with:
@@ -123,8 +127,9 @@ pg_hardstorage show db1 latest \
 
 ```console
 {
+  "scheme": "aes-256-gcm",
   "kek_ref": "local:default",
-  "wrapped_dek_b64": "...",
+  "wrapped_dek": "...",
   "envelope_version": 1
 }
 ```
@@ -218,8 +223,9 @@ pg_hardstorage show db1 latest \
 
 ```console
 {
+  "scheme": "aes-256-gcm",
   "kek_ref": "aws-kms://arn:aws:kms:eu-central-1:123456789012:key/abc-...",
-  "wrapped_dek_b64": "...",
+  "wrapped_dek": "...",
   "envelope_version": 1
 }
 ```
@@ -238,8 +244,9 @@ pg_hardstorage restore db1 latest \
 
 No extra flags. The restore reads the KEKRef, opens the matching
 provider, and asks AWS KMS to unwrap. If the calling principal lacks
-`kms:Decrypt`, you get `kms.unauthorized` (exit 8) with the suggested
-IAM statement to add.
+`kms:Decrypt`, the unwrap fails as an authorization error (exit 3) with
+the suggested IAM statement to add. (Exit 8 is reserved for a KMS
+endpoint that is *unreachable*, not one that denies the call.)
 
 #### 5. Verify the envelope across every backup
 
@@ -253,12 +260,17 @@ limited, so a large repo takes longer than the local-KEK case.
 
 ---
 
-## Crypto-shred and rotation (preview)
+## Crypto-shred and rotation
 
-Two operations are wired in v0.2 but locked behind n-of-m approval:
+Both operations ship today. `kms shred` destroys the KEK so every
+backup wrapped by it becomes unrecoverable — it is gated behind an
+n-of-m approval (`--require-approval`) plus a typed-keyring confirmation
+(`--confirm-keyring`). `kms rotate` re-wraps each manifest's DEK under a
+new KEK (no chunk data is re-read) and is not approval-gated.
 
 ```bash
-pg_hardstorage kms shred --confirm-keyring <keyring-dir> --require-approval ...
+pg_hardstorage kms shred --repo "$REPO" \
+    --confirm-keyring <keyring-dir> --require-approval <approval-id>
 pg_hardstorage kms rotate --repo "$REPO" \
     --old-kek-ref local:default --old-kek-file old-kek.bin \
     --new-kek-ref aws-kms://alias/pg-hardstorage-demo-2026 --new-kek-file new-kek.bin --apply
