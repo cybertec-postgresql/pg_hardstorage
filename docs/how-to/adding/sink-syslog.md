@@ -38,7 +38,7 @@ pg_hardstorage notify add syslog \
 ```
 
 ```console
-sink "prod-syslog" added (plugin=syslog)
+✓ Sink added — prod-syslog (plugin syslog)
 ```
 
 `--set` covers top-level keys only.  Add the nested `tls:`

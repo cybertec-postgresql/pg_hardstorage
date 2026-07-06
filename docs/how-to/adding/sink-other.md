@@ -55,7 +55,7 @@ sinks:
 
 CEF severity is rendered as 0-10 from the RFC 5424 ladder.
 
-## Datadog (`datadog`)
+## Datadog (`datadog-events`)
 
 Posts events to Datadog's `/api/v1/events` endpoint with the
 Datadog API key.
@@ -63,7 +63,7 @@ Datadog API key.
 ```yaml
 sinks:
   - name: dd
-    plugin: datadog
+    plugin: datadog-events
     config:
       api_key: <DATADOG_API_KEY>
       site: datadoghq.com         # or datadoghq.eu, ddog-gov.com
@@ -85,10 +85,10 @@ sinks:
     config:
       smtp_host: smtp.example.com
       smtp_port: 587
-      tls_mode: starttls
-      auth_mode: plain
+      tls: starttls
+      auth: plain
       username: pg-hardstorage
-      password_secret: kms-secret://ops/smtp-password
+      password: kms-secret://ops/smtp-password
       from: backups@example.com
       to: ["dba@example.com"]
       cc: ["ops@example.com"]
@@ -140,8 +140,8 @@ sinks:
     plugin: opsgenie
     config:
       api_key: <OPSGENIE_API_KEY>
-      region: us              # us | eu
-      team: dba-on-call       # routes to the team's escalation
+      api_url: https://api.opsgenie.com   # EU shard: https://api.eu.opsgenie.com
+      teams: [dba-on-call]                # routes to each team's escalation
 ```
 
 ## ServiceNow (`servicenow`)
@@ -154,14 +154,14 @@ sinks:
   - name: sn
     plugin: servicenow
     config:
-      base_url: https://acme.service-now.com
+      instance_url: https://acme.service-now.com
       username: svc-pg-hardstorage
       password: <secret>
-      table: incident
+      category: software
       assignment_group: dba-team
 ```
 
-## Splunk HEC (`splunkhec`)
+## Splunk HEC (`splunk-hec`)
 
 HTTP Event Collector for Splunk. POSTs to the HEC endpoint
 with the per-token auth header.
@@ -169,7 +169,7 @@ with the per-token auth header.
 ```yaml
 sinks:
   - name: splunk
-    plugin: splunkhec
+    plugin: splunk-hec
     config:
       url: https://splunk.example.com:8088/services/collector
       token: <HEC_TOKEN>
@@ -177,7 +177,7 @@ sinks:
       index: pg_hardstorage
 ```
 
-## OpenTelemetry events (`otelevents`)
+## OpenTelemetry events (`otel-events`)
 
 Emits events as OTLP/HTTP log records to an OpenTelemetry
 collector. Pair with the agent's `--otel-endpoint` for the
@@ -186,7 +186,7 @@ trace path; this sink covers the structured-log path.
 ```yaml
 sinks:
   - name: otel
-    plugin: otelevents
+    plugin: otel-events
     config:
       endpoint: http://otel-collector:4318
       service_name: pg_hardstorage

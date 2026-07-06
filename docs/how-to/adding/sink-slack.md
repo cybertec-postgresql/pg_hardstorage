@@ -36,7 +36,7 @@ pg_hardstorage notify add slack \
 ```
 
 ```console
-sink "ops-slack" added (plugin=slack)
+✓ Sink added — ops-slack (plugin slack)
 ```
 
 The CLI runs the same builder the agent uses at start-up, so a
@@ -50,8 +50,11 @@ pg_hardstorage notify list
 ```
 
 ```console
-NAME       PLUGIN  MIN_SEVERITY  COMPONENTS
-ops-slack  slack   warning       *
+1 sink(s) configured
+  ops-slack
+    plugin:       slack
+    endpoint:     https://hooks.slack.com/****
+    min_severity: warning
 ```
 
 ### 3. Smoke-test (optional)

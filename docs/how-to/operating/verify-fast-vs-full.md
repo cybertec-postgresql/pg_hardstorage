@@ -22,7 +22,7 @@ tags:
 | Mode | Reads | Decrypts | Restores | pg_verifybackup | Typical use |
 | --- | --- | --- | --- | --- | --- |
 | Fast (default) | every chunk | yes | no | no | Hourly / daily cron |
-| Sampled (`--sample N`) | N random chunks | yes | no | no | Spot-check a cold archive |
+| Sampled (`--sample N`) | first N chunks in hash-sorted order | yes | no | no | Spot-check a cold archive |
 | Existence-only (`--existence-only`) | metadata only (Stat) | no | no | no | Pre-flight before `backup undelete` |
 | Full (`--full`) | every chunk | yes | yes (sandbox) | yes | Quarterly / pre-DR drill |
 
@@ -39,7 +39,10 @@ pg_hardstorage verify db1 latest
 ```
 
 ```console
-db1.full.20260427T020000Z   verified  12.3 GiB  3245 chunks  9.4s
+verify db1/db1.full.20260427T020000Z (full)
+  manifest signature: valid
+  chunks: 3245 referenced, 3245 unique, 3245 sampled
+  ✓ 3245 chunk(s) verified — 12.3 GiB in 9412ms
 ```
 
 `--repo <url>` overrides the deployment's configured repo for
@@ -55,9 +58,11 @@ the chunk loop runs.
 pg_hardstorage verify db1 <backup-id> --sample 1000
 ```
 
-Caps the chunk count to a random subset. Useful for cheap
-periodic sanity checks on cold archives where running the full
-verify weekly is overkill.
+Caps the chunk count to the first N chunks in hash-sorted
+order — deterministic, so repeated runs check the same subset
+and results are reproducible. Useful for cheap periodic sanity
+checks on cold archives where running the full verify weekly is
+overkill.
 
 `--sample 0` and omitting the flag both mean "full chunk
 list."
@@ -148,12 +153,12 @@ expected SHA-256. Either the storage backend corrupted them
 (scrub the rest of the repo with [scrub-and-heal](scrub-and-heal.md))
 or the chunk was tampered with.
 
-**`verify.missing_chunks`** — a referenced chunk is absent.
+**`verify.chunks_missing`** — a referenced chunk is absent.
 Could be: a partial replicate, an over-aggressive `repo gc`,
 or storage-backend data loss. Pair with
 `pg_hardstorage repair manifest` and a replica.
 
-**`verify.signature_mismatch`** — the manifest's Ed25519
+**`verify.manifest_signature`** — the manifest's Ed25519
 signature is invalid. Treat as untrusted. Either the signing
 key changed and the manifest was never re-signed, or the
 manifest was modified after commit. Cross-check with the

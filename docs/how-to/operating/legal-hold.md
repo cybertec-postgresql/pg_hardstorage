@@ -36,10 +36,11 @@ pg_hardstorage list db1
 ```
 
 ```console
-ID                              TYPE  WHEN                  SIZE       STATUS
-db1.full.20260427T020000Z       full  2026-04-27 02:00 UTC  12.3 GiB   ok
-db1.full.20260420T020000Z       full  2026-04-20 02:00 UTC  12.1 GiB   ok
-db1.full.20260413T020000Z       full  2026-04-13 02:00 UTC  11.9 GiB   ok
+Backups for db1 (3):
+  BACKUP ID                  TYPE  WHEN              FILES  SIZE      DEDUP  DURATION
+  db1.full.20260427T020000Z  full  2026-04-27 02:00  1284   12.3 GiB  1.42x  38210ms
+  db1.full.20260420T020000Z  full  2026-04-20 02:00  1281   12.1 GiB  1.41x  37544ms
+  db1.full.20260413T020000Z  full  2026-04-13 02:00  1279   11.9 GiB  1.40x  36988ms
 ```
 
 ### 2. Place an indefinite hold
@@ -111,10 +112,15 @@ pg_hardstorage hold list db1 --repo file:///srv/pg_hardstorage/repo
 ### 5. Purge expired holds
 
 ```bash
-pg_hardstorage hold purge-expired --repo file:///srv/pg_hardstorage/repo
+# Preview first (no mutations, no audit emits):
+pg_hardstorage hold purge-expired --repo file:///srv/pg_hardstorage/repo --dry-run
+
+# Then actually remove:
+pg_hardstorage hold purge-expired --repo file:///srv/pg_hardstorage/repo --yes
 ```
 
-Removes every marker whose `ExpiresAt` is in the past. The
+`--yes` is required for the live removal (`--dry-run` is the only
+way to run it without `--yes`). Removes every marker whose `ExpiresAt` is in the past. The
 markers themselves are gone, but the underlying manifest is now
 eligible for rotation (it was never deleted; just protected).
 
@@ -137,12 +143,14 @@ side of the marker, and it should be deliberate.
 the soft-delete sweep:
 
 ```console
-rotate db1     policy=gfs
-   ...
-   held: 2 backup(s) pinned by legal hold
-       db1.full.20260420T020000Z   (ops@acme.example.com)
-       db1.full.20260413T020000Z   (counsel@acme.example.com)
-   tombstoned: 0 backup(s)
+✓ Rotation applied
+  Policy: gfs
+
+  db1
+    keep:    3
+    delete:  0
+    held:    2 (excluded from delete: db1.full.20260420T020000Z, db1.full.20260413T020000Z)
+    applied: 0
 ```
 
 The result body's `held` / `held_ids` fields capture what

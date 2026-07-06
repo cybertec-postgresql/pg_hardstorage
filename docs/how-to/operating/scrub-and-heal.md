@@ -37,8 +37,14 @@ pg_hardstorage repo scrub file:///srv/pg_hardstorage/repo --sample-percent 1
 ```
 
 ```console
-scrub  repo=file:///srv/pg_hardstorage/repo  sample=1%
-       chunks_checked=412   mismatches=0   ok
+repo scrub — 1% sample
+  Referenced chunks: 41200
+  Sampled:           412
+  OK:                412
+  Mismatches:        0
+  Bytes scanned:     3.2 GiB
+  Duration:          8140 ms
+  ✓ no integrity findings
 ```
 
 Wire this into a cron job:
@@ -84,14 +90,23 @@ pg_hardstorage repair scrub \
 ```
 
 ```console
-chunks_checked=12453  mismatches=2  healed=2  not_at_replica=0
-  healed: sha256=abc123... refetched=4 KiB
-  healed: sha256=def456... refetched=64 KiB
+repair scrub
+  sampled 12453 / 12453 referenced chunks (68.4 GiB verified)
+  ✗ 2 chunk(s) failed integrity check:
+    sha256:abc123…
+    sha256:def456…
+  heal — replica file:///srv/pg_hardstorage/repo-replica
+    Healed:         2
+    Already OK:     0
+    Not at replica: 0
+    Failed:         0
+    Bytes copied:   68 KiB
+    ✓ all mismatches healed
 ```
 
 Heal is **best-effort**: a chunk missing at the replica is
-reported as `NotAtReplica` and the run continues with the next
-mismatch. To preview without writing, run scrub **without**
+counted in the result body's `Not at replica` line and the run
+continues with the next mismatch. To preview without writing, run scrub **without**
 `--heal` — it reports every mismatch (exactly what a heal would
 repair) and touches nothing:
 
@@ -158,13 +173,16 @@ attach that to your incident postmortem.
 
 ## Troubleshooting
 
-**`scrub.unreachable`** — the repo URL doesn't resolve.
-Confirm credentials / network.
+**`verify.scrub_mismatch`** — one or more sampled chunks failed
+the hash check (exit code 9). The storage backend has corrupted
+bytes for the listed chunks; heal from a replica with
+`pg_hardstorage repair scrub --heal --replica <replica-url>`.
 
-**`heal.NotAtReplica` for every mismatch** — the replica
-isn't fully populated, or it was cut from a cold archive that
-predates the corrupted chunks. Re-run `repo replicate` to
-top up.
+**`Not at replica` equals the mismatch count** — this is a
+result-body field, not an error code: every corrupted chunk was
+also missing at the replica. The replica isn't fully populated,
+or it was cut from a cold archive that predates the corrupted
+chunks. Re-run `repo replicate` to top up.
 
 **Heal runs but `repo check` still fails** — there's a deeper
 problem (missing manifest, broken signature, GC collision).

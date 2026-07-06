@@ -43,30 +43,44 @@ Both patterns benefit from the shim: the wrapper script,
 job spec, and on-disk config stay identical, but the bytes
 that land in the repository are pg_hardstorage-flavour.
 
-If you're not running such a pod, the
-[host-package](../packaging/debian-rpm.md) install with
-the Debian or RPM `pg-hardstorage-compat-barman` subpackage
-plus a `/usr/local/bin/barman` symlink is the simpler path.
+If you're not running such a pod, a
+[host-package](../packaging/debian-rpm.md) install of
+pg_hardstorage plus a `/usr/local/bin/barman` symlink is the
+simpler path. Note that the `.deb`/`.rpm` packages ship only
+the `pg_hardstorage` binary — the compat shims are not
+packaged, so you build `pg-hardstorage-barman` from source
+(see below) and drop it in yourself.
 
 ## What you need
 
 - A pod or container image that today exec's `barman` /
   `barman-wal-archive`.
-- The pg_hardstorage v1.1 image carrying both shim
-  binaries.
+- The two shim binaries. These are **not** shipped in any
+  published image or package — the `ghcr.io/cybertec-postgresql/pg_hardstorage`
+  image is distroless and carries only the `pg_hardstorage`
+  binary. Build the shims from source (`cmd/pg-hardstorage-barman`
+  and `cmd/pg-hardstorage-barman-wal-archive`) as shown below.
 - A repository URL accessible from the pod.
 
 ## Steps
 
 ### 1. Build the image with the shim
 
+Compile the shim binaries from the pg_hardstorage source
+tree in a builder stage, then copy them into your image:
+
 ```dockerfile
+FROM golang:1.26 AS shim-builder
+WORKDIR /src
+# Clone or COPY the pg_hardstorage source here.
+RUN git clone https://github.com/cybertec-postgresql/pg_hardstorage . \
+ && CGO_ENABLED=0 go build -o /out/pg-hardstorage-barman ./cmd/pg-hardstorage-barman \
+ && CGO_ENABLED=0 go build -o /out/pg-hardstorage-barman-wal-archive ./cmd/pg-hardstorage-barman-wal-archive
+
 FROM your-existing-barman-image:tag
 
-COPY --from=ghcr.io/cybertec-postgresql/pg_hardstorage:v1.1 \
-    /usr/bin/pg-hardstorage-barman /usr/bin/pg-hardstorage-barman
-COPY --from=ghcr.io/cybertec-postgresql/pg_hardstorage:v1.1 \
-    /usr/bin/pg-hardstorage-barman-wal-archive /usr/bin/pg-hardstorage-barman-wal-archive
+COPY --from=shim-builder /out/pg-hardstorage-barman /usr/bin/pg-hardstorage-barman
+COPY --from=shim-builder /out/pg-hardstorage-barman-wal-archive /usr/bin/pg-hardstorage-barman-wal-archive
 
 # Drop-in: barman invocations land on our binary.
 RUN ln -sf /usr/bin/pg-hardstorage-barman /usr/local/bin/barman \

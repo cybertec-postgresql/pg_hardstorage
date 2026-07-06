@@ -43,7 +43,7 @@ pg_hardstorage notify add jira \
 ```
 
 ```console
-sink "ops-jira" added (plugin=jira)
+✓ Sink added — ops-jira (plugin jira)
 ```
 
 The builder validates `base_url` parses, `project` is set, and

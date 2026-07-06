@@ -37,11 +37,7 @@ pg_hardstorage deployment add db1 \
 ```
 
 ```console
-deployment "db1" added
-  pg_connection: postgres://pgbackup@db1.example.com/postgres
-  repo:          file:///srv/pg_hardstorage/repo
-  schedule:      backup=every 6h, rotate=daily_at 04:00
-  probe:         ok (PG 17.2)
+✓ Deployment "db1" added
 ```
 
 The CLI runs a connection probe by default; pass `--skip-probe`

@@ -72,28 +72,34 @@ CGO_ENABLED=1 go build -tags pkcs11 \
 
 ### 3. Configure a KEK against your HSM
 
-```yaml
-# /etc/pg_hardstorage/pg_hardstorage.yaml
-kms:
-  default:
-    type: pkcs11
-    pkcs11:
-      module: /usr/lib/softhsm/libsofthsm2.so
-      slot: 0
-      pin_file: /etc/pg_hardstorage/keyring/hsm-pin
-      key_label: pg_hardstorage_master_kek
+There is no `kms:` YAML block. A PKCS#11 KEK is addressed by
+a `pkcs11://` KEKRef URL, whose form is:
+
+```
+pkcs11://<token-label>/<key-label>?module=<path>&pin=<pin>&slot=<id>&mech=<mechanism>
 ```
 
-The `module:` path is whatever your HSM vendor ships;
-`slot:` and `key_label:` come from your HSM admin console.
-`pin_file` is mode-0600, owner `pgbackup`, one-line file
-containing the PIN — the same posture as the rest of the
-keyring directory.
+For example, against SoftHSM:
+
+```
+pkcs11://prod-token/pg_hardstorage_master_kek?module=/usr/lib/softhsm/libsofthsm2.so&slot=0&pin_source=/etc/pg_hardstorage/keyring/hsm-pin
+```
+
+The `module=` path is whatever your HSM vendor ships;
+`<token-label>`, `<key-label>`, and `slot=` come from your
+HSM admin console. Rather than embedding the PIN in the URL,
+point `pin_source=` at a mode-0600 file owned by `pgbackup`
+(one line, the PIN) — the same posture as the rest of the
+keyring directory. `module=` can also be supplied out of
+band via `$PKCS11_MODULE_PATH`.
 
 ### 4. Run `kms verify`
 
+Pass the full `pkcs11://` KEKRef to `--kek-ref`:
+
 ```bash
-pg_hardstorage-pkcs11 kms verify --kek-ref pkcs11://default
+pg_hardstorage-pkcs11 kms verify --repo <repo-url> \
+    --kek-ref 'pkcs11://prod-token/pg_hardstorage_master_kek?module=/usr/lib/softhsm/libsofthsm2.so&slot=0&pin_source=/etc/pg_hardstorage/keyring/hsm-pin'
 ```
 
 This is the post-install smoke check: round-trip a tiny

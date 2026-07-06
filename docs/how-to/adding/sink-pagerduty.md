@@ -35,7 +35,7 @@ pg_hardstorage notify add pagerduty \
 ```
 
 ```console
-sink "ops-pd" added (plugin=pagerduty)
+✓ Sink added — ops-pd (plugin pagerduty)
 ```
 
 ### 2. Verify
@@ -68,7 +68,7 @@ sinks:
 | --- | --- | --- |
 | `routing_key` | required | 32-hex Events API v2 integration key. |
 | `source` | `pg_hardstorage` | Free-form; appears as the alert's source. Pair with the deployment name. |
-| `client` | empty | Optional client name on the incident. |
+| `client` | `pg_hardstorage` | Client name on the incident. |
 | `client_url` | empty | Optional URL on the incident — runbook link. |
 | `min_severity` | `error` | PD is for waking people; the floor is deliberately strict. |
 

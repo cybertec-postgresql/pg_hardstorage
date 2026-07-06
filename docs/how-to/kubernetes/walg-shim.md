@@ -55,10 +55,15 @@ chunks, signed manifests, sandbox-verifiable).
 ### 1. Build a Spilo image with the shim
 
 ```dockerfile
+FROM golang:1.26 AS shim-builder
+WORKDIR /src
+# Clone or COPY the pg_hardstorage source here.
+RUN git clone https://github.com/cybertec-postgresql/pg_hardstorage . \
+ && CGO_ENABLED=0 go build -o /out/pg-hardstorage-walg ./cmd/pg-hardstorage-walg
+
 FROM ghcr.io/zalando/spilo-15:latest
 
-COPY --from=ghcr.io/cybertec-postgresql/pg_hardstorage:v1.1 \
-    /usr/bin/pg-hardstorage-walg /usr/bin/pg-hardstorage-walg
+COPY --from=shim-builder /out/pg-hardstorage-walg /usr/bin/pg-hardstorage-walg
 
 # Replace wal-g with the shim wrapper.
 RUN ln -sf /usr/bin/pg-hardstorage-walg /usr/bin/wal-g
@@ -68,9 +73,12 @@ RUN ln -sf /usr/bin/pg-hardstorage-walg /usr/bin/wal-g
 # the shim if you'd rather not symlink.
 ```
 
-The official ghcr.io tag carries every `compat/*` shim
-binary; pulling them all costs <30 MiB (single static Go
-binaries).
+The compat shims are **not** published in any image: the
+`ghcr.io/cybertec-postgresql/pg_hardstorage` image is
+distroless and carries only the `pg_hardstorage` binary. You
+build `pg-hardstorage-walg` from its `cmd/pg-hardstorage-walg`
+package (a single static Go binary, <30 MiB) as shown in the
+builder stage above.
 
 ### 2. Configure via standard Zalando env vars
 

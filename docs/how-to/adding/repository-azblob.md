@@ -61,8 +61,11 @@ pg_hardstorage repo init 'azblob://acmebackups/prod'
 ```
 
 ```console
-repo: azblob://acmebackups/prod
-mode: ok    region: <azure-region-from-account>
+✓ Repository initialised
+  URL:    azblob://acmebackups/prod
+  ID:     b7d2f1a0c3e94856a1f0d9b8c7e6a5f4
+  Schema: pg_hardstorage.repo.v1
+  Created: 2026-07-06T13:56:12Z
 ```
 
 The agent's pod identity / VM-managed identity is read by

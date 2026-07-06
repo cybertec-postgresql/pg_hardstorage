@@ -20,8 +20,8 @@ tags:
 ## What you need
 
 - The destination repository URL (must be a valid storage
-  scheme: `s3://`, `file://`, `azure://`, `gs://`, `sftp://`,
-  …).
+  scheme: `s3://`, `file://`, `azblob://`, `gcs://`, `sftp://`,
+  `scp://`).
 - The path to the bundle tar received over the air gap.
 - Read access to the bundle, write access to the
   destination repo.

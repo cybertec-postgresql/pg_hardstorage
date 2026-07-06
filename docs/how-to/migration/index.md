@@ -22,12 +22,16 @@ old repo when its window expires. Old backups stay
 restorable by the legacy tool itself for as long as you
 keep the binary around.
 
-For pgBackRest and Barman, **v1.1 ships drop-in shim
+For pgBackRest and Barman, the one-shot config translator
+(`pg_hardstorage compat translate --from ...`) ships in the
+main `pg_hardstorage` binary today. The **drop-in shim
 binaries** (`pg-hardstorage-pgbackrest`,
-`pg-hardstorage-barman`) plus a one-shot config
-translator (`pg_hardstorage compat translate --from ...`)
-so existing cron jobs and `archive_command` settings keep
-working but produce native pg_hardstorage backups. See
+`pg-hardstorage-barman`) are **built from source** — their
+`cmd/pg-hardstorage-*` packages live in the repo, but no
+release artifact (tarball, `.deb`/`.rpm`, or container
+image) ships them. Compile them yourself, then drop them on
+PATH so existing cron jobs and `archive_command` settings
+keep working but produce native pg_hardstorage backups. See
 the per-tool pages.
 
 ## Pages

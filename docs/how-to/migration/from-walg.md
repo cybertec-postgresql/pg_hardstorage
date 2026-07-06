@@ -86,7 +86,11 @@ $EDITOR /etc/pg_hardstorage/pg_hardstorage.yaml
 #    WAL-G prefix).
 pg_hardstorage repo init <new-repo-url>
 
-# 5. Drop the shim onto PATH, ahead of /usr/bin/wal-g.
+# 5. Build the shim from source (it is not installed by any
+#    release artifact) and drop it onto PATH, ahead of
+#    /usr/bin/wal-g.
+go build -o /usr/local/bin/pg-hardstorage-walg \
+    ./cmd/pg-hardstorage-walg
 sudo ln -sf /usr/local/bin/pg-hardstorage-walg \
     /usr/local/bin/wal-g
 
