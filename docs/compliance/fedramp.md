@@ -28,10 +28,10 @@ JSON is `fedramp`.
 
 | Control | Title | Product feature | Command | Audit event |
 | --- | --- | --- | --- | --- |
-| AC-2 | Account management | RBAC scopes; per-tenant KEK; JIT tokens | `pg_hardstorage rbac ...`, `jit issue ...` | `rbac.*`, `jit.*` |
+| AC-2 | Account management | RBAC scopes (enforced server-side / SCIM-provisioned; no operator CLI verb); per-tenant KEK; JIT tokens | `pg_hardstorage jit issue ...` | `jit.*` |
 | AC-3 | Access enforcement | n-of-m approval gates on destructive ops | `pg_hardstorage approval request ...` | `approval.request`, `approval.approve` |
 | AC-6 | Least privilege | RBAC scope per principal; JIT for break-glass elevation | `pg_hardstorage jit issue --scope ...` | `jit.issue` |
-| AC-6(7) | Review of user privileges | `audit search --action-prefix rbac.` | `pg_hardstorage audit search ...` | `rbac.*` |
+| AC-6(7) | Review of user privileges | JIT grant/revoke history via audit search; RBAC changes reviewed server-side | `pg_hardstorage audit search --action-prefix jit.` | `jit.*` |
 | AC-7 | Unsuccessful logon attempts | RBAC denials recorded | (automatic) | `auth.denied` |
 | AC-12 | Session termination | JIT tokens auto-expire (max 24h) | (automatic) | `jit.issue` |
 
@@ -125,8 +125,10 @@ make build-fips
 
 The variant uses `GOEXPERIMENT=boringcrypto` and links
 against the BoringCrypto FIPS-validated module. Refuses to
-start if `crypto/tls` reports non-FIPS. `--fips-strict`
-panics on any non-FIPS plugin.
+start if `crypto/tls` reports non-FIPS. In that FIPS build,
+`--fips-strict` panics on any non-FIPS plugin. (The FIPS build is
+not yet shipped; `--fips-strict` is not present in the default
+binary.)
 
 ### FedRAMP High vs Moderate
 
@@ -146,9 +148,13 @@ Use `residency` to pin to GovCloud regions:
 pg_hardstorage residency set fedramp-prod us-gov-east-1 us-gov-west-1
 ```
 
-The replication subsystem refuses cross-boundary
-replication unless explicitly overridden via
-`--allow-cross-region` (which is itself audit-logged).
+Cross-boundary residency enforcement on replication is on
+the roadmap and not yet shipped — `repo replicate` does not
+refuse cross-region copies, and there is no
+`--allow-cross-region` flag. What ships today is the
+read-only `pg_hardstorage residency check <deployment>`,
+which reports `verify.residency_violation` (exit 9) when the
+configured repo's region is outside the policy.
 
 ---
 

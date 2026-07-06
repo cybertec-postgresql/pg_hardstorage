@@ -121,8 +121,11 @@ pg_hardstorage repo init scp://backup@nas.example.com/srv/pg-hardstorage
 ```
 
 ```console
-repo: scp://backup@nas.example.com/srv/pg-hardstorage
-mode: ok
+✓ Repository initialised
+  URL:    scp://backup@nas.example.com/srv/pg-hardstorage
+  ID:     3f8c1e5b9a2d4076c8e1f3a5b7d9c0e2
+  Schema: pg_hardstorage.repo.v1
+  Created: 2026-07-06T13:56:34Z
 ```
 
 The plugin reads `identity_file`, `identity_passphrase`, and

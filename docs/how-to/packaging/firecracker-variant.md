@@ -65,34 +65,28 @@ go build -tags firecracker \
 `CGO_ENABLED=0` works for this variant — the SDK is pure
 Go. The Makefile inherits the project default `CGO_ENABLED=0`.
 
-### 3. Confirm the firecracker backend is registered
+### 3. Confirm the firecracker backend is compiled in
 
-```bash
-./bin/pg_hardstorage-firecracker doctor
-```
-
-The system section lists registered sandbox backends. On
-the firecracker build:
-
-```console
-Sandbox backends: docker, firecracker
-```
-
-On the default build:
-
-```console
-Sandbox backends: docker
-```
+The `firecracker` build tag swaps the default stub backend
+(`backend_firecracker_stub.go`, which refuses with a clear
+"this build doesn't include the firecracker backend"
+message) for the real implementation
+(`backend_firecracker_real.go`). There is no `doctor` output
+that enumerates sandbox backends; the confirmation is simply
+that a firecracker-backed verify succeeds instead of
+returning the stub's refusal.
 
 ### 4. Run a verify with the new backend
+
+The sandbox backend and its Firecracker kernel / rootfs
+paths are configured in `pg_hardstorage.yaml`, not via CLI
+flags — there is no `--sandbox-backend`, `--firecracker-kernel`,
+or `--firecracker-rootfs` flag. Run the verify as usual:
 
 ```bash
 pg_hardstorage-firecracker verify db1 latest \
     --repo s3://acme-pg-backups \
-    --full \
-    --sandbox-backend firecracker \
-    --firecracker-kernel /var/lib/pg_hardstorage/firecracker/vmlinux \
-    --firecracker-rootfs /var/lib/pg_hardstorage/firecracker/rootfs.ext4
+    --full
 ```
 
 See [Verify with the Firecracker sandbox](../verify/firecracker-sandbox.md)
@@ -128,7 +122,9 @@ needing KVM in CI.
 | Portable across non-Linux operator workstations | Yes | No (Linux + KVM only) |
 
 If both Docker and Firecracker are available on a host,
-operators select per-verify via `--sandbox-backend`.
+operators select the backend through the sandbox
+configuration in `pg_hardstorage.yaml` (there is no
+`--sandbox-backend` CLI flag).
 
 ## Distribution
 

@@ -57,18 +57,26 @@ signed, sandbox-verifiable).
 ### 1. Build a PGO image with the shim
 
 ```dockerfile
+FROM golang:1.26 AS shim-builder
+WORKDIR /src
+# Clone or COPY the pg_hardstorage source here.
+RUN git clone https://github.com/cybertec-postgresql/pg_hardstorage . \
+ && CGO_ENABLED=0 go build -o /out/pg-hardstorage-pgbackrest ./cmd/pg-hardstorage-pgbackrest
+
 FROM registry.developers.crunchydata.com/crunchydata/crunchy-postgres:ubi9-15
 
-COPY --from=ghcr.io/cybertec-postgresql/pg_hardstorage:v1.1 \
-    /usr/bin/pg-hardstorage-pgbackrest /usr/bin/pg-hardstorage-pgbackrest
+COPY --from=shim-builder /out/pg-hardstorage-pgbackrest /usr/bin/pg-hardstorage-pgbackrest
 
 # Drop-in: pgbackrest invocations land at our binary.
 RUN ln -sf /usr/bin/pg-hardstorage-pgbackrest /usr/bin/pgbackrest
 ```
 
-The official ghcr.io tag carries every `compat/*` shim
-binary; pulling them all costs <30 MiB (single static Go
-binaries).
+The compat shims are **not** published in any image: the
+`ghcr.io/cybertec-postgresql/pg_hardstorage` image is
+distroless and carries only the `pg_hardstorage` binary. You
+build each shim from its `cmd/pg-hardstorage-*` package (a
+single static Go binary, <30 MiB) as shown in the builder
+stage above.
 
 ### 2. Configure via standard PGO repo spec
 

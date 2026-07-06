@@ -132,10 +132,12 @@ Firecracker pays for itself.
 
 ---
 
-## The k8s `Job` middle ground
+## The k8s `Job` middle ground (roadmap)
 
-In K8s installs, the natural sandbox is a `Job` running in a
-dedicated namespace with strict `PodSecurity`:
+A k8s `Job` backend is on the roadmap, not yet shipped — only the
+`docker` and `firecracker` backends are registered in the binary
+today.  When it lands, the natural K8s sandbox is a `Job` running
+in a dedicated namespace with strict `PodSecurity`:
 
 - `runAsNonRoot: true`
 - `readOnlyRootFilesystem: true`
@@ -143,13 +145,13 @@ dedicated namespace with strict `PodSecurity`:
 - `capabilities: drop: [ALL]`
 - NetworkPolicy restricting egress to the repo and KMS only
 
-This sits between Docker and Firecracker on the isolation
+This would sit between Docker and Firecracker on the isolation
 spectrum.  The kernel boundary is the host's kernel, but the
 combination of namespaces + cgroups + seccomp + minimal
 capabilities is sufficient for most threat models.
 
-The verifier sub-system uses k8s `Job` automatically when
-running in K8s; the operator doesn't have to choose.
+Until it ships, K8s installs select `docker` or `firecracker`
+explicitly via `Options.Backend`.
 
 ---
 
@@ -194,7 +196,7 @@ backup, so an auditor can reconstruct coverage.
 ## Further reading
 
 - [Architecture tour: verifier]
-  (architecture-tour.md#9-resilience-design) — where verification
+  (architecture-tour.md#8-resilience-design) — where verification
   sits in the larger architecture.
 - [Verify how-to](../how-to/verify/index.md) — the operator
   recipes.

@@ -128,7 +128,14 @@ func Verify(ctx context.Context, target string, mode VerifyMode) (*VerifyResult,
 	res.ToolPath = path
 
 	start := time.Now()
-	cmd := exec.CommandContext(ctx, path, target)
+	// -n / --no-parse-wal: verify the backup_manifest + file checksums
+	// only, WITHOUT trying to parse pg_wal. pg_hardstorage restores a
+	// base backup on its own; the WAL it needs to reach consistency is
+	// fetched at recovery time via the restore_command, so the restored
+	// data directory legitimately has no WAL segments yet. Without -n,
+	// pg_verifybackup fails every normal restore with "could not find
+	// any WAL file", defeating the gate.
+	cmd := exec.CommandContext(ctx, path, "-n", target)
 	var stdout, stderr strings.Builder
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr

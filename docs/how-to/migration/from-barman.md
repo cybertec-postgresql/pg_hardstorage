@@ -74,7 +74,12 @@ $EDITOR /etc/pg_hardstorage/pg_hardstorage.yaml
 # 4. Initialise the new repo.
 pg_hardstorage repo init <new-repo-url>
 
-# 5. Drop both shim binaries onto PATH.
+# 5. Build the shim binaries from source (they are not
+#    installed by any release artifact) and drop them on PATH.
+go build -o /usr/local/bin/pg-hardstorage-barman \
+    ./cmd/pg-hardstorage-barman
+go build -o /usr/local/bin/pg-hardstorage-barman-wal-archive \
+    ./cmd/pg-hardstorage-barman-wal-archive
 sudo ln -sf /usr/local/bin/pg-hardstorage-barman \
     /usr/local/bin/barman
 sudo ln -sf /usr/local/bin/pg-hardstorage-barman-wal-archive \

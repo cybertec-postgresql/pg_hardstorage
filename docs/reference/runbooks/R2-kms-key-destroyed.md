@@ -39,10 +39,18 @@ new backups from being written under a missing key.
 2. **Inventory affected backups.** The `KEKRef` lives in each
    manifest under `encryption.kek_ref`:
 
+   `list` does not carry the `encryption` block; the per-backup
+   manifest does. Enumerate backups, then read each manifest with
+   `manifest show` (whose body embeds the full manifest, including
+   `encryption.kek_ref` and `backup_id`):
+
    ```sh
    for d in $(pg_hardstorage deployment list -o json | jq -r '.result.body.deployments[].name'); do
-     pg_hardstorage list "$d" -o json | jq -r --arg key "<missing-kek-ref>" \
-       '.result.body.backups[] | select(.encryption.kek_ref == $key) | "\($d) \(.id)"'
+     for b in $(pg_hardstorage list "$d" -o json | jq -r '.result.body.backups[].backup_id'); do
+       pg_hardstorage manifest show "$d" "$b" -o json | jq -r --arg key "<missing-kek-ref>" \
+         'select(.result.body.encryption.kek_ref == $key) | "\(.result.body.backup_id)"' \
+         | sed "s|^|$d |"
+     done
    done
    ```
 

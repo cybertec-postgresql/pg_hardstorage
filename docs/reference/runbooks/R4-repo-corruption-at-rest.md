@@ -39,8 +39,12 @@ what isn't.
    pg_hardstorage repair chunks --missing --repo <url> -o json | tee /tmp/missing.json
    ```
 
-2. **If a replica exists, fetch known-good chunks.** Manual today
-   (auto-heal lands in v0.5+). For each corrupt chunk hash, copy
+2. **If a replica exists, auto-heal from it.** The fastest path is
+   `pg_hardstorage repair scrub --heal --replica <replica-url>`,
+   which re-fetches every mismatched chunk from the replica and
+   rewrites it locally (use `--dry-run-heal` first to preview).
+
+   To heal by hand instead, for each corrupt chunk hash copy
    the corresponding object from the replica region's
    `chunks/sha256/aa/bb/aabb<rest>.chk` to the same path under
    the primary region. Fail-safe because writes are CAS — the

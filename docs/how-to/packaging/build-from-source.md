@@ -58,11 +58,15 @@ make build-testkit
 Writes `bin/pg_hardstorage_testkit`. Same flags; different
 entry point under `cmd/pg_hardstorage_testkit`.
 
-### 3. Build both at once
+### 3. Build all binaries at once
 
 ```bash
 make all-binaries
 ```
+
+This runs `build`, `build-testkit`, and `build-simple` —
+three binaries: `bin/pg_hardstorage`,
+`bin/pg_hardstorage_testkit`, and `bin/pg_hardstorage_simple`.
 
 ### 4. Confirm the build is stamped
 
@@ -71,12 +75,15 @@ make all-binaries
 ```
 
 ```console
-pg_hardstorage v1.0.x
-  commit: abcdef1
-  date:   2026-05-04T08:13:42Z
-  fips:   false
-  build:  default
+pg_hardstorage v1.0.x (abcdef1, built 2026-05-04T08:13:42Z)
 ```
+
+The output is a single line: `pg_hardstorage <version>
+[FIPS] (<commit>, built <date>)`. The `[FIPS]` marker only
+appears on the FIPS variant. For machine-readable output run
+`version --output json`; the JSON carries `version`,
+`commit`, `date`, `variant` (`"default"` or `"fips"`), and
+`fips` fields.
 
 A clean checkout that's not on a tagged commit produces
 `v1.0.x-N-gabcdef1` — which is what you want, because that's

@@ -45,15 +45,16 @@ A minimum viable config for one deployment:
 # /etc/pg_hardstorage/pg_hardstorage.yaml
 schema: pg_hardstorage.config.v1
 
-# Repository shared across deployments unless overridden per-deployment.
-repo: s3://my-backups/prod
-
+# `deployments` is a MAP keyed by deployment name — not a list.
+# There is no top-level `repo:` field; the repository is configured
+# per deployment.
 deployments:
-  - name: prod
-    connection: postgresql://backup_user@db.host:5432/postgres
+  prod:
+    pg_connection: postgresql://backup_user@db.host:5432/postgres
+    repo: s3://my-backups/prod
     schedule:
-      backup: "daily_at 02:00"
-      rotate: "daily_at 04:00"
+      backup: { daily_at: "02:00" }
+      rotate: { daily_at: "04:00" }
     retention:
       policy: simple
       keep_for: 30d

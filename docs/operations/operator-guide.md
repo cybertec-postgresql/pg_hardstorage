@@ -169,7 +169,7 @@ retention:
 ```yaml
 retention:
   policy: count
-  keep_full_count: 14  # keep last N fulls; WAL kept while needed for PITR
+  keep_fulls: 14  # keep last N fulls; WAL kept while needed for PITR
 ```
 
 ### Soft-delete via tombstones
@@ -231,10 +231,14 @@ on mismatch.
 
 ### Full verify (sandbox restore + pg_verifybackup)
 
-The `verify` command's full mode is in v0.5; today, the
-`pg_verifybackup` gate runs automatically after every `restore` —
-that is the integration test. Skip it with `--verify=skip` only after
-acknowledging that exit 9 is the contract.
+`verify --full` performs a full restore into a Docker sandbox and runs
+`pg_verifybackup` against it (requires Docker locally). To dispatch the
+sandbox verify to an agent instead of running Docker on your host, pass
+`--control-plane <url>` — it always implies `--full` semantics.
+
+In addition, the `pg_verifybackup` gate runs automatically after every
+`restore` — that is the integration test. Skip it with `--verify=skip`
+only after acknowledging that exit 9 is the contract.
 
 `--verify=auto` (default) runs `pg_verifybackup` if the binary is on
 `$PATH`. `--verify=require` returns `usage.no_pg_verifybackup` (exit 2)
@@ -297,11 +301,22 @@ pg_hardstorage repo usage file:///srv/backups
 Bytes by category — chunks, primary manifests, replica manifests,
 trash, WAL, audit. Useful for explaining the bill.
 
-### scrub stub
+### scrub
 
-`repo scrub` is the periodic auto-heal job (re-hash a percentage of
-chunks per day, heal from replica region on mismatch). It is a stub
-in v0.1; use `repair scrub` for the full pass today.
+`repo scrub` is the periodic bit-rot check: it samples a percentage of
+referenced chunks and re-hashes each against its key, surfacing any
+mismatch as a "storage backend corrupted bytes" finding.
+
+```sh
+pg_hardstorage repo scrub file:///srv/backups              # 1% sample
+pg_hardstorage repo scrub file:///srv/backups --full       # every chunk
+```
+
+`--sample-percent` defaults to `1` (1% per run) — the operator-friendly
+cadence for an hourly cron. Pass `--full` (shorthand for
+`--sample-percent 100`) for exhaustive quarterly checks. Mismatches map
+to exit 9 so a cron-wired scrub alarms when integrity slips; findings
+are also captured in the hash-chained audit log.
 
 ---
 
@@ -349,8 +364,23 @@ environments double-archive), the binary doubles as a shim:
 archive_command = '/usr/bin/pg_hardstorage wal push db1 %p --repo file:///srv/backups'
 ```
 
-`wal push` is a stub in v0.1 (lands in v0.5+); for now stick with
-streaming as the only path.
+`wal push` ships: PG invokes it from `archive_command`, and it reads
+the `%p` segment, chunks it through the CAS, and commits a segment
+manifest atomically. Re-pushes of an already-committed segment are
+no-ops.
+
+The segment's `system_identifier` (stamped on every manifest so
+cross-cluster contamination is detectable) is derived without a libpq
+round-trip: it reads `xlp_sysid` from the segment's first-page header,
+or you may pass `--system-identifier <decimal>` (the unsigned-decimal
+form `pg_control_system()` reports) to skip the header parse. Pass
+`--tde` when the source PG has Transparent Data Encryption enabled —
+the on-disk segment is ciphertext, so header parsing is skipped and you
+must supply `--system-identifier` or `--pg-connection`.
+
+Exit-code contract: `0` on success (including already-present), `>0` on
+error, whereupon PG retries per `archive_timeout`. Run
+`pg_hardstorage wal push --help` for the full flag set.
 
 ### restore_command shim
 
@@ -387,24 +417,41 @@ works across compression posture, encryption setting, and re-runs.
 ### KEK rotation
 
 ```sh
-pg_hardstorage kms rotate     # v0.5 — walks all manifests, rewraps DEKs
+pg_hardstorage kms rotate \
+    --repo s3://acme-backups/ \
+    --old-kek-ref <ref> --old-kek-file old-kek.bin \
+    --new-kek-ref <ref> --new-kek-file new-kek.bin \
+    --apply
 ```
 
-`kms rotate` is deferred to v0.5. For v0.1, the practical path is to
-run a final backup under the old KEK, then move the keyring path to
-the new KEK and start fresh — old backups are still readable as long
-as the old keyring is preserved.
+`kms rotate` ships: it walks every committed manifest wrapped with
+`--old-kek-ref`, decrypts the wrapped DEK with `--old-kek-file`,
+re-wraps it under `--new-kek-file`, records `--new-kek-ref`, re-signs,
+and atomically rewrites the manifest. Chunks are **not** re-encrypted —
+per-chunk keys derive from the unchanged BDEK, so rotation is
+O(manifest count). Default mode is dry-run; pass `--apply` to actually
+rewrite. Manifests under other KEK refs (other tenants) are skipped,
+and an interrupted rotation is safely re-runnable.
 
 ### Crypto-shred
 
 ```sh
-pg_hardstorage kms shred --confirm-keyring <keyring-dir> --reason "GDPR Art 17 #4421" --yes
+pg_hardstorage kms shred \
+    --repo s3://acme-backups/ \
+    --require-approval <approval-id> \
+    --confirm-keyring <keyring-dir> \
+    --reason "GDPR Art 17 #4421" --yes
 ```
 
-`kms shred` is deferred to v0.5. The semantic is "destroy the KEK,
-all backups become bit-for-bit unrecoverable, audit log entry is the
-compliance artefact." Plan for it; do not rely on it shipping in
-v0.1.
+`kms shred` ships: it destroys the local KEK, after which every backup
+whose DEK was wrapped with it is permanently unrecoverable — the audit
+log entry is the compliance artefact. The op is gated by three
+independent safety mechanisms: a mandatory n-of-m approval workflow
+(`--require-approval <id>` is **required**; shred is refused without an
+approved gate), a typed-confirmation flag (`--confirm-keyring`, where
+you repeat the literal keyring directory path), and an acknowledgement
+flag (`--yes`). Use `--dry-run` to enumerate the affected backups
+without destroying the KEK or requiring the gates.
 
 ### Inspect the keyring
 

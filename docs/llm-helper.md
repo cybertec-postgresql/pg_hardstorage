@@ -64,7 +64,7 @@ Every `llm ask` invocation returns a structured body:
 ```json
 {
   "skill": "ask",
-  "skill_version": "0.2.0",
+  "skill_version": "1.0.0",
   "provider": "openai",
   "question": "...",
   "answer": "...",

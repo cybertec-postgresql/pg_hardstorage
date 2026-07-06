@@ -83,45 +83,21 @@ production fleets.
 
 ---
 
-## Per-tenant exports
+## Per-deployment exports
 
-A tenant boundary in `pg_hardstorage` is a logical grouping
-of deployments under a shared KEK. The report splits per
-tenant when the deployments are tagged:
+The JSON report carries a `deployments[]` array — one row per
+deployment. Each row has `name`, `backup_count`,
+`logical_bytes` (pre-dedup), `manifest_bytes`, and `wal_bytes`:
 
 ```sh
-pg_hardstorage cost report --repo s3://acme-backups/ \
-    -o json
+pg_hardstorage cost report --repo s3://acme-backups/ -o json
 ```
 
-Returns one row per tenant in the result body. The KEK
-namespace alignment makes tenant-level chunk attribution
-exact: chunks under tenant T's KEK never dedup against
-tenant U's chunks (different per-chunk keys), so per-tenant
-chunk bytes is the sum of chunks encrypted under T's
-wrapped DEK.
-
-JSON shape (excerpt):
-
-```json
-{
-  "schema": "pg_hardstorage.cost.v1",
-  "by_tenant": [
-    {
-      "tenant": "acme-prod",
-      "deployments": ["db1", "db2"],
-      "physical_bytes": 1389567800832,
-      "estimated_monthly_usd": 29.78
-    },
-    {
-      "tenant": "acme-staging",
-      "deployments": ["db1-staging"],
-      "physical_bytes": 64236000000,
-      "estimated_monthly_usd": 1.38
-    }
-  ]
-}
-```
+Per-tenant splitting (a `by_tenant[]` breakdown grouping
+deployments under a shared KEK) is **not yet shipped** — the
+report has no `by_tenant` field. Aggregate deployments into
+tenants downstream from the `deployments[]` rows if you need
+tenant-level rollups today.
 
 ---
 
@@ -149,9 +125,9 @@ chargeback pipeline:
 ```sh
 pg_hardstorage cost report --repo s3://acme-backups/ \
     -o json \
-    | jq -c '.result.body.by_tenant[] |
-        {tenant, physical_gb: (.physical_bytes / 1e9),
-         monthly_usd: .estimated_monthly_usd}' \
+    | jq -c '.result.body.deployments[] |
+        {name, logical_gb: (.logical_bytes / 1e9),
+         manifest_bytes, wal_bytes}' \
     | curl --data-binary @- https://billing.acme.example.com/api/v1/usage
 ```
 
@@ -173,7 +149,7 @@ pg_hardstorage repo usage --repo s3://acme-backups/ -o json \
     > usage.json
 pg_hardstorage cost report --repo s3://acme-backups/ -o json \
     > cost.json
-jq -s '.[0].result.body.bytes_total - .[1].result.body.total_physical_bytes' \
+jq -s '.[0].result.body.total_bytes - .[1].result.body.total_physical_bytes' \
     usage.json cost.json
 # Expect: 0
 ```

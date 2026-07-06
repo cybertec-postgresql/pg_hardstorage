@@ -59,8 +59,7 @@ Or pull the official `pg-hardstorage-fips` artifact — built
 with `-tags pkcs11` by default since FIPS-validated HSM-backed
 envelopes are the canonical FIPS posture. See
 [the FIPS variant build how-to](../packaging/fips-variant.md)
-when that page lands; until then, ship `-tags pkcs11`
-yourselves.
+for the full build recipe.
 
 ## What you need
 
@@ -86,11 +85,13 @@ pkcs11-tool \
 
 ```bash
 pg_hardstorage kms verify \
+    --repo file:///srv/pg_hardstorage/repo \
     --kek-ref 'pkcs11://test-token/db-kek?module=/usr/lib/softhsm/libsofthsm2.so&pin=1234'
 ```
 
-`inspect` reads the key's metadata only — confirms the binary
-has the PKCS#11 backend and the URL resolves. No mutation.
+`kms verify --repo … --kek-ref` reads the key's metadata only —
+confirms the binary has the PKCS#11 backend and the URL resolves.
+No mutation.
 
 ### 2. Production: file-based PIN
 

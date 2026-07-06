@@ -27,7 +27,7 @@ The framework string in the report's JSON is `soc2`.
 | --- | --- | --- | --- | --- |
 | CC6.1 | Logical access security | Three-layer envelope encryption (RKEK → BDEK → per-chunk Kc) | `pg_hardstorage backup ...` | `backup.create` |
 | CC6.6 | Logical access — boundary protection | Storage plugin per-region scoping; air-gap mode rejects public endpoints | `pg_hardstorage residency set ...` | (config) |
-| CC6.7 | Restricted access to information assets | Per-tenant KEK + RBAC scopes | `pg_hardstorage rbac ...` | `rbac.*` |
+| CC6.7 | Restricted access to information assets | Per-tenant KEK + RBAC scopes (RBAC enforced server-side / SCIM-provisioned; no operator CLI verb) | (server-side) | (server-side) |
 | CC6.8 | Detection and prevention of unauthorised software | SLSA L3 build provenance + cosign signatures on every release | (build-time) | (cosign attest) |
 | CC7.1 | Detection of system anomalies | Anomaly score (Z-score over 30-day baseline) per backup | `pg_hardstorage backup ...` | `anomaly.detected` |
 | CC7.2 | System events logged in tamper-evident chain | Hash-chained Merkle audit log | `pg_hardstorage audit verify-chain` | (every event) |

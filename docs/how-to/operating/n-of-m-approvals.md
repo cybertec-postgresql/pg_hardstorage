@@ -50,7 +50,7 @@ the approval is not an operator surface.
 pg_hardstorage approval request \
     --repo file:///srv/pg_hardstorage/repo \
     --op kms.shred \
-    --target /etc/pg_hardstorage/keys \
+    --target /etc/pg_hardstorage/keyring \
     --reason "GDPR Art 17 #4421 — subject deletion request" \
     --threshold 2 \
     --ttl 24h \
@@ -60,13 +60,13 @@ pg_hardstorage approval request \
 ```
 
 ```console
-request_id:  apr-2026-04-28-7f3a1b2c
-op:          kms.shred
-target:      /etc/pg_hardstorage/keys
-threshold:   2 of 3
-ttl:         24h0m0s
-status:      pending
-created_at:  2026-04-28T14:21:08Z
+✓ approval request created
+  ID:        appr-6a4bb4064d13c6f0
+  Op:        kms.shred
+  Target:    /etc/pg_hardstorage/keyring
+  Threshold: 2 of 3 allowlisted approvers
+  Expires:   2026-07-07T13:56:22Z
+  Approve:   pg_hardstorage approval approve appr-6a4bb4064d13c6f0 --repo <url>
 ```
 
 The request is signed against the operator's keypair and
@@ -77,27 +77,26 @@ invalidates every existing approval.
 
 ```bash
 # On Alice's machine
-pg_hardstorage approval status apr-2026-04-28-7f3a1b2c \
+pg_hardstorage approval status appr-6a4bb4064d13c6f0 \
     --repo file:///srv/pg_hardstorage/repo
 ```
 
 ```console
-op:           kms.shred
-target:       /etc/pg_hardstorage/keys
-reason:       GDPR Art 17 #4421 — subject deletion request
-threshold:    2 of 3 (1 approval so far)
-status:       pending
-ttl_remaining: 23h47m
-approvers:
-  - alice.pub  (not signed)
-  - bob.pub    (not signed)
-  - carol.pub  (signed at 2026-04-28T14:24:11Z)
+approval appr-6a4bb4064d13c6f0
+  Op:           kms.shred
+  Initiator:    hardstorage
+  Target:       /etc/pg_hardstorage/keyring
+  Reason:       GDPR Art 17 #4421 — subject deletion request
+  Status:       pending (1/2 approvals)
+  Expires:      2026-07-07T13:56:22Z
+  Approvals:
+    2026-07-06T13:56:34Z  carol@acme.example.com  confirm subject 4421 deletion
 ```
 
 If Alice agrees:
 
 ```bash
-pg_hardstorage approval approve apr-2026-04-28-7f3a1b2c \
+pg_hardstorage approval approve appr-6a4bb4064d13c6f0 \
     --repo file:///srv/pg_hardstorage/repo \
     --approver alice@acme.example.com \
     --key /home/alice/.ssh/pg_hardstorage_alice.pem \
@@ -111,28 +110,30 @@ ed25519 signature.
 ### 3. Watch for "approved"
 
 ```bash
-pg_hardstorage approval status apr-2026-04-28-7f3a1b2c \
+pg_hardstorage approval status appr-6a4bb4064d13c6f0 \
     --repo file:///srv/pg_hardstorage/repo
 ```
 
 ```console
-op:           kms.shred
-target:       /etc/pg_hardstorage/keys
-threshold:    2 of 3 (2 approvals — APPROVED)
-status:       approved
-approved_at:  2026-04-28T14:31:42Z
-ttl_remaining: 23h36m
-approvers:
-  - alice.pub  (signed at 2026-04-28T14:31:42Z by alice@acme.example.com)
-  - bob.pub    (not signed)
-  - carol.pub  (signed at 2026-04-28T14:24:11Z by carol@acme.example.com)
+approval appr-6a4bb4064d13c6f0
+  Op:           kms.shred
+  Initiator:    hardstorage
+  Target:       /etc/pg_hardstorage/keyring
+  Reason:       GDPR Art 17 #4421 — subject deletion request
+  Status:       approved (2/2 approvals)
+  Expires:      2026-07-07T13:56:22Z
+  Approvals:
+    2026-07-06T13:56:42Z  alice@acme.example.com  I confirm subject 4421's deletion is in flight
+    2026-07-06T13:56:34Z  carol@acme.example.com  confirm subject 4421 deletion
 ```
 
 ### 4. Consume the approval
 
 ```bash
 pg_hardstorage kms shred \
-    --confirm-keyring /etc/pg_hardstorage/keys \
+    --repo file:///srv/pg_hardstorage/repo \
+    --require-approval appr-6a4bb4064d13c6f0 \
+    --confirm-keyring /etc/pg_hardstorage/keyring \
     --reason "GDPR Art 17 #4421" \
     --yes
 ```
@@ -145,7 +146,7 @@ to prevent replay.
 ### 5. (Optional) Revoke a request before approval
 
 ```bash
-pg_hardstorage approval revoke apr-2026-04-28-7f3a1b2c \
+pg_hardstorage approval revoke appr-6a4bb4064d13c6f0 \
     --repo file:///srv/pg_hardstorage/repo \
     --reason "Wrong target — opened against staging keyring"
 ```
@@ -161,9 +162,9 @@ pg_hardstorage approval list \
 ```
 
 ```console
-ID                         OP          TARGET                       THRESHOLD  STATUS    TTL_REMAINING
-apr-2026-04-28-7f3a1b2c    kms.shred   /etc/pg_hardstorage/keys     2 of 3     approved  23h36m
-apr-2026-04-27-3e1f9a04    repo.wipe   s3://acme-pg-backups/        3 of 5     pending   8h12m
+ID                     OP         STATUS    APPROVALS  EXPIRES               TARGET
+appr-6a4bb4064d13c6f0  kms.shred  approved  2/2        2026-07-07T13:56:22Z  /etc/pg_hardstorage/keyring
+appr-3e1f9a04c2b18d5a  repo.wipe  pending   1/3        2026-07-06T22:12:00Z  s3://acme-pg-backups/
 ```
 
 ## Threshold sizing

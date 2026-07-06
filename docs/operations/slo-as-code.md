@@ -182,9 +182,9 @@ straightforward:
 ```sh
 pg_hardstorage slo report -o json \
     | jq '.result.body.deployments[] |
-          {deployment, target: .rpo_target,
-           actual: .rpo_actual,
-           headroom: (.rpo_target - .rpo_actual)}'
+          {deployment, target: .rpo_target_seconds,
+           actual: .rpo_actual_seconds,
+           headroom: (.rpo_target_seconds - .rpo_actual_seconds)}'
 ```
 
 Push to your monitoring backend; alert on `headroom < 0.2 *

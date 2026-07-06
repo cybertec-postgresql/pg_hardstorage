@@ -46,6 +46,7 @@ type StoragePlugin interface {
     Delete(ctx context.Context, key string) error
     RenameIfNotExists(ctx context.Context, src, dst string) error
     SetRetention(ctx context.Context, key string, until time.Time, mode WORMMode) error
+    Barrier(ctx context.Context) error // makes deferred Puts crash-durable
     Capabilities() Capabilities
     Close() error
 }

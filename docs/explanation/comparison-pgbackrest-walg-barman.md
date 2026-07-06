@@ -190,7 +190,7 @@ differentiation:
 - **K8s with the operator-shim model**.  The WAL-G shim and
   pgBackRest shim let you swap into existing operator-managed
   clusters without rewriting the operator.  (A native CNPG-I
-  provider is on the roadmap for v0.5.)
+  provider is on the roadmap.)
 
 - **Transparent Data Encryption (TDE) at the source.**  PG forks
   that encrypt heap / index / WAL at rest — CYBERTEC PGEE,
@@ -211,9 +211,6 @@ Where we are *honest* about being behind:
 - **Ecosystem of expert operators.**  More humans in the world
   know pgBackRest than know `pg_hardstorage` today.  Onboarding
   cost is real.
-- **Storage backends.**  S3 and FS are first-class in v0.1.
-  Azure Blob and GCS are second-class until v0.5; SFTP and tar
-  are scoped for v0.5 / v1.0.
 
 ---
 

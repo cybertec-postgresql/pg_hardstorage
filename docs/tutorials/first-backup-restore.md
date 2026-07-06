@@ -91,9 +91,19 @@ keypair is generated under your keyring directory (run
 Sample output:
 
 ```console
-✓ Connected to PostgreSQL 17.x
-✓ Backup db1.full.20260504T120000Z.a1b2 complete · 33 MB physical · 1 chunk
-✓ Manifest committed (signed, ed25519)
+✓ Backup committed
+  ID:               db1.full.20260504T120000Z.a1b2
+  Deployment:       db1
+  PostgreSQL:       17
+  Cluster ID:       7659398055633653799
+  Stop LSN / TLI:   0/2000100 / 1
+  Files:            967 in 1 tablespace(s)
+  Logical bytes:    22.2 MiB
+  Unique chunks:    363 (8.7 MiB after dedup)
+  Dedup ratio:      2.56x
+  Duration:         1722 ms
+  Encryption:       none
+  Manifest:         manifests/db1/backups/db1.full.20260504T120000Z.a1b2/manifest.json
 ```
 
 The backup ID has the shape `db1.full.YYYYMMDDThhmmssZ.<hash>` —
@@ -108,8 +118,9 @@ pg_hardstorage list db1 --repo file:///tmp/hs-tutorial-repo
 ```
 
 ```console
-ID                                       STARTED              SIZE      STATE
-db1.full.20260504T120000Z.a1b2           2026-05-04 12:00:00  33 MB     committed
+Backups for db1 (1):
+  BACKUP ID                       TYPE  WHEN              FILES  SIZE      DEDUP  DURATION
+  db1.full.20260504T120000Z.a1b2  full  2026-05-04 12:00  967    22.2 MiB  2.56x  1617ms
 ```
 
 The backup ID has the shape `db1.full.YYYYMMDDThhmmssZ.<hash>` —
@@ -131,8 +142,8 @@ pg_hardstorage show db1 "$BACKUP_ID" \
     --repo file:///tmp/hs-tutorial-repo
 ```
 
-`show` prints LSN range, timeline, dedup ratio, encryption envelope
-state, and a verification record once one is written.  Pipe through
+`show` prints the LSN range, timeline, compression, tablespaces, dedup
+ratio, and the manifest's ed25519 signature fingerprint.  Pipe through
 `-o json` if you want to parse it.
 
 ### 5. Verify the manifest without restoring
@@ -164,14 +175,23 @@ pg_hardstorage restore db1 latest \
 Sample output:
 
 ```console
-✓ Pre-flight: repo reachable, KMS reachable, target empty
-✓ Restored 1 chunk · 33 MB to /tmp/hs-tutorial-restored
-✓ pg_verifybackup OK
+✓ Restore complete
+  Backup:        db1.full.20260504T120000Z.a1b2
+  Deployment:    db1
+  Target:        /tmp/hs-tutorial-restored
+  Files:         967
+  Bytes written: 22.2 MiB
+  Chunks:        919
+  backup_label:  230 bytes
+  Duration:      868 ms
+  Verification:  passed
 ```
 
-The post-restore `pg_verifybackup` is the gate that decides exit
-code: 0 on success, 9 if the verifier rejects anything. `--verify=skip`
-turns it off (audited; do not skip in production).
+By default (`--verify=auto`) a `pg_verifybackup` manifest check runs
+against the restored data dir when the matching `postgresql-client` is
+on the runner's PATH, and its result shows in the `Verification:` line.
+`--verify=require` makes a failed check fail the restore (exit 9);
+`--verify=skip` turns it off (audited; do not skip in production).
 
 ### 7. Boot the restored data dir
 

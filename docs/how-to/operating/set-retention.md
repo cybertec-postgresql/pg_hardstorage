@@ -58,7 +58,7 @@ calendar buckets. Use durations: `30d`, `2w`, `12h`, `45m`.
 ```yaml
 retention:
   policy: count
-  keep_full_count: 14
+  keep_fulls: 14
 ```
 
 WAL is kept while needed for PITR onto any retained full.
@@ -79,13 +79,16 @@ pg_hardstorage rotate db1 --repo file:///srv/pg_hardstorage/repo
 ```
 
 ```console
-deployment: db1     policy: gfs
-   kept     id                              reason
-    ✓       db1.full.20260427T020000Z       newest (always kept)
-    ✓       db1.full.20260426T020000Z       daily slot 1
-    ✓       db1.full.20260420T020000Z       weekly slot 1
-    ✗       db1.full.20260419T020000Z       superseded by 20260420
-   ...
+Rotation plan (dry-run — no manifests soft-deleted)
+  Policy: gfs
+
+  db1
+    keep:    3
+    delete:  1
+      [keep] db1.full.20260427T020000Z @ 2026-04-27T02:00:00Z  (daily-1,weekly-1)
+      [keep] db1.full.20260426T020000Z @ 2026-04-26T02:00:00Z  (daily-2)
+      [keep] db1.full.20260420T020000Z @ 2026-04-20T02:00:00Z  (weekly-2)
+      [del ] db1.full.20260419T020000Z @ 2026-04-19T02:00:00Z
 ```
 
 `rotate` defaults to dry-run. Read the table; nothing's

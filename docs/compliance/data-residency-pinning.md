@@ -126,12 +126,17 @@ For v0.1, the safety is layered:
 - An operator who configures a violating repo is responsible
   for re-checking after configuration changes.
 
-For v1.0+ the planned enforcement is:
+What ships today is the read-only `residency check`
+command: `pg_hardstorage residency check <deployment>`
+reports `verify.residency_violation` (exit 9) when the
+configured repo's region is outside the policy. It does not
+mutate anything.
+
+Planned enforcement (roadmap, not yet shipped):
 
 - `residency check` becomes part of the pre-flight refusal
   gate; backup commit refuses with `verify.residency_violation`
-  (exit 4) when the configured repo's region is outside the
-  policy.
+  when the configured repo's region is outside the policy.
 - The audit chain records every residency check + violation
   attempt.
 
@@ -141,16 +146,15 @@ For v1.0+ the planned enforcement is:
 
 A deployment with residency `["eu"]` whose repo is also
 async-replicated to a US region for DR is a policy
-violation at the replica side. The replication subsystem
-respects per-deployment residency:
+violation at the replica side.
 
-- `repo replicate --from <eu-repo> --to <us-repo>` for a
-  deployment with `residency: ["eu"]` refuses with
-  `verify.residency_violation` unless explicitly
-  overridden via `--allow-cross-region`.
-- The `--allow-cross-region` flag is recorded in the audit
-  chain — an explicit operator decision, not an
-  invisible default.
+Residency enforcement on the replication path is on the
+roadmap and not yet shipped: `repo replicate` does not
+consult per-deployment residency, does not refuse
+cross-region copies, and there is no `--allow-cross-region`
+flag. Until it lands, run `pg_hardstorage residency check`
+against the replica repo out-of-band to detect a
+cross-boundary replica.
 
 ---
 

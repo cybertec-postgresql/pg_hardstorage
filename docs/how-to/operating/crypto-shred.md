@@ -38,17 +38,14 @@ tags:
 ### 1. Dry-run: enumerate the affected backups
 
 ```bash
-pg_hardstorage kms shred --dry-run
+pg_hardstorage kms shred --dry-run --repo file:///srv/pg_hardstorage/repo
 ```
 
 ```console
-shred dry-run
-  keyring:                  /etc/pg_hardstorage/keys
-  affected manifests:       1184
-  affected deployments:     db1, db2
-  affected total bytes:     487.3 GiB
-  oldest manifest:          2024-08-12T03:11:04Z
-  newest manifest:          2026-04-28T14:21:08Z
+✓ kms shred --dry-run — preview only, KEK NOT destroyed
+  Keyring:  /etc/pg_hardstorage/keyring
+  Affected: 0 backup(s) would become unrecoverable (none — no encrypted backups in this repo were wrapped with this KEK)
+  Note:     re-run without --dry-run plus --require-approval / --confirm-keyring / --yes to actually destroy the KEK
 ```
 
 Dry-run never writes to the audit chain (no state change worth
@@ -61,7 +58,7 @@ size the consequences before requesting approval.
 pg_hardstorage approval request \
     --repo file:///srv/pg_hardstorage/repo \
     --op kms.shred \
-    --target /etc/pg_hardstorage/keys \
+    --target /etc/pg_hardstorage/keyring \
     --reason "GDPR Art 17 #4421 — subject deletion request" \
     --threshold 2 \
     --approver-key /etc/pg_hardstorage/approvers/alice.pub \
@@ -70,10 +67,13 @@ pg_hardstorage approval request \
 ```
 
 ```console
-request_id:  apr-2026-04-28-7f3a1b2c
-threshold:   2 of 3
-ttl:         24h0m0s
-status:      pending
+✓ approval request created
+  ID:        appr-6a4bb4064d13c6f0
+  Op:        kms.shred
+  Target:    /etc/pg_hardstorage/keyring
+  Threshold: 2 of 3 allowlisted approvers
+  Expires:   2026-07-07T13:56:22Z
+  Approve:   pg_hardstorage approval approve appr-6a4bb4064d13c6f0 --repo <url>
 ```
 
 The request is signed against the operator's keypair; tampering
@@ -99,7 +99,9 @@ See [n-of-m approvals](n-of-m-approvals.md) for the full flow.
 
 ```bash
 pg_hardstorage kms shred \
-    --confirm-keyring /etc/pg_hardstorage/keys \
+    --repo file:///srv/pg_hardstorage/repo \
+    --require-approval appr-6a4bb4064d13c6f0 \
+    --confirm-keyring /etc/pg_hardstorage/keyring \
     --reason "GDPR Art 17 #4421" \
     --yes
 ```
@@ -115,13 +117,12 @@ The command:
    affected scope.
 
 ```console
-shred complete
-  keyring:                  /etc/pg_hardstorage/keys
-  destroyed_at:             2026-04-28T14:24:11Z
-  approval_request_id:      apr-2026-04-28-7f3a1b2c
-  approvers:                alice@acme.example.com, bob@acme.example.com
-  audit_event:              shred-2026-04-28-c91e84f0
-  affected_backups_count:   1184
+✓ kms shred — KEK irreversibly destroyed
+  Keyring:  /etc/pg_hardstorage/keyring
+  Reason:   GDPR Art 17 #4421
+  Affected: 0 backup(s) now unrecoverable (none — no encrypted backups in this repo were wrapped with this KEK)
+  Approval: appr-6a4bb4064d13c6f0
+  Note:     every backup wrapped with this KEK is now permanently unrecoverable
 ```
 
 The audit event is your compliance artefact: it records
@@ -196,15 +197,18 @@ contract.
 
 ## Troubleshooting
 
-**`shred.no_approval`** — no approved n-of-m request matches
-`op=kms.shred, target=<keyring>`. Open one, get it approved.
+**`usage.missing_flag`** — `--require-approval` was omitted;
+`kms shred` refuses to run without an approved n-of-m gate.
+Open an approval request for `op=kms.shred, target=<keyring>`,
+get it approved, then pass its ID.
 
-**`shred.confirm_keyring_mismatch`** — `--confirm-keyring`
+**`usage.confirmation_mismatch`** — `--confirm-keyring`
 doesn't match the resolved keyring path. Compare against
 `pg_hardstorage kms inspect`.
 
-**`shred.yes_required`** — running interactively without
-`--yes`. Add it.
+**`usage.confirmation_required`** — `--confirm-keyring` or
+`--yes` was omitted. Both are required for a live shred; add
+whichever is missing.
 
 **Provider-side destroy refused (HSM)** — the HSM has policy
 gates (operator card, ACS quorum) beyond pg_hardstorage's

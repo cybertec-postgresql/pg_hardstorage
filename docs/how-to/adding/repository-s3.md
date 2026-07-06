@@ -51,8 +51,11 @@ pg_hardstorage repo init 's3://acme-pg-backups/?region=eu-central-1'
 ```
 
 ```console
-repo: s3://acme-pg-backups/?region=eu-central-1
-mode: ok    region: eu-central-1
+✓ Repository initialised
+  URL:    s3://acme-pg-backups/?region=eu-central-1
+  ID:     a96bbb87cdf922544033b4fe285a8025
+  Schema: pg_hardstorage.repo.v1
+  Created: 2026-07-06T13:54:25Z
 ```
 
 ### 2. AWS S3 with a prefix
@@ -102,8 +105,9 @@ unset.
 pg_hardstorage repo check s3://acme-pg-backups/
 ```
 
-Roundtrips a manifest signature, sample-checks a chunk reference,
-and reports the total live byte count. Mismatches return exit 9.
+Reports the live-manifest count, verifies every manifest
+signature, counts distinct chunk references, and flags any
+missing chunks. Mismatches return exit 9.
 
 ## IAM policy (minimum)
 

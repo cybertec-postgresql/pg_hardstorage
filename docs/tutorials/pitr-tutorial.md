@@ -129,19 +129,22 @@ backup, computes the WAL replay range, estimates RTO, and prints the
 checklist *without writing anything*:
 
 ```console
-PITR plan for db1
-  Source backup     db1.full.20260504T120000Z (full · 33 MB)
-  Replay WAL to     2026-05-04 11:55:00 UTC  (resolved from "5 minutes ago")
-  Target            /tmp/hs-tutorial-pitr  (empty ✓)
-  Verify gate       auto (pg_verifybackup will run)
-  RTO estimate      ~30s
-Pre-flight checks
-  ✓ Repository reachable (file:///tmp/hs-tutorial-repo)
-  ✓ Keystore reachable
-  ✓ WAL coverage [0/1A000000 .. 0/22000000] available
-  ✓ Target directory empty
-This is a preview — no changes were written. Re-run without --preview
-to apply.
+Restore plan (preview only — no files written)
+  Backup:            db1.full.20260504T120000Z.a1b2
+  Deployment:        db1
+  Target:            /tmp/hs-tutorial-pitr
+  PostgreSQL:        17
+  Cluster ID:        7659399478052106285
+  Backup stop LSN:   0/2000100 (TLI 1)
+  Recovery target:   time 2026-05-04T11:55:00Z (inclusive=true)
+  On target reached: pause
+  Recovery TLI:      latest
+  Files:             967
+  Total bytes:       22.2 MiB
+  Chunk refs:        919 (363 unique, 8.7 MiB after dedup)
+  backup_label:      230 bytes
+  Estimated RTO:     222 ms (assuming 100.0 MiB/s)
+  Pre-flight:        ✓ ready
 ```
 
 Natural-language parsing supports `<n> minutes/hours/days ago`,
@@ -179,11 +182,21 @@ appends a managed `recovery_target_*` block to
 recovery proceeds.
 
 ```console
-✓ Restored 1 chunk · 33 MB to /tmp/hs-tutorial-pitr
-✓ recovery.signal armed
-✓ recovery_target_time = '2026-05-04 11:55:00 UTC'
-✓ pg_verifybackup OK
-RTO actual: 28s
+✓ Restore complete
+  Backup:        db1.full.20260504T120000Z.a1b2
+  Deployment:    db1
+  Target:        /tmp/hs-tutorial-pitr
+  Files:         967
+  Bytes written: 22.2 MiB
+  Chunks:        919
+  backup_label:  230 bytes
+  Duration:      790 ms
+  Verification:  passed
+  Recovery armed:
+    Stop at time: 2026-05-04T11:55:00Z
+    Action:       pause
+    Timeline:     latest
+    Inclusive:    true
 ```
 
 ### 6. Boot the restored cluster and confirm

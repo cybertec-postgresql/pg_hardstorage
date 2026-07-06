@@ -48,10 +48,14 @@ pg_hardstorage schedule
 ```
 
 ```console
-DEPLOYMENT  BACKUP                ROTATE
-db1         every 6h              daily_at 04:00
-db2         daily_at 02:00        daily_at 03:30
-db3         (unscheduled)         (unscheduled)
+Schedules for 3 deployment(s):
+  DEPLOYMENT  TASK    WHEN
+  db1         backup  every 6h0m0s
+  db1         rotate  daily at 04:00 (Local)
+  db2         backup  daily at 02:00 (Local)
+  db2         rotate  daily at 03:30 (Local)
+  db3         backup  off
+  db3         rotate  off
 ```
 
 The fleet listing surfaces both tasks — useful for spotting
@@ -65,7 +69,9 @@ pg_hardstorage schedule db1
 ```
 
 ```console
-db1  backup: every 6h
+Schedule for db1.backup:
+  every 6h0m0s
+  every:    6h
 ```
 
 `--task=rotate` shows the rotate schedule instead:

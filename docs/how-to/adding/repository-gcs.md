@@ -47,8 +47,11 @@ pg_hardstorage repo init 'gcs://acme-pg-backups'
 ```
 
 ```console
-repo: gcs://acme-pg-backups
-mode: ok
+✓ Repository initialised
+  URL:    gcs://acme-pg-backups
+  ID:     54663a3581cb6b76c87e8c962daa186b
+  Schema: pg_hardstorage.repo.v1
+  Created: 2026-07-06T13:55:51Z
 ```
 
 Workload Identity on GKE: bind the Kubernetes service account to

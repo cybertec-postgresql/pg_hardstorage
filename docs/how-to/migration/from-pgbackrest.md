@@ -86,7 +86,11 @@ $EDITOR /etc/pg_hardstorage/pg_hardstorage.yaml
 #    pgbackrest repo).
 pg_hardstorage repo init <new-repo-url>
 
-# 5. Drop the shim onto PATH, ahead of /usr/bin/pgbackrest.
+# 5. Build the shim from source (it is not installed by any
+#    release artifact) and drop it onto PATH, ahead of
+#    /usr/bin/pgbackrest.
+go build -o /usr/local/bin/pg-hardstorage-pgbackrest \
+    ./cmd/pg-hardstorage-pgbackrest
 sudo ln -sf /usr/local/bin/pg-hardstorage-pgbackrest \
     /usr/local/bin/pgbackrest
 

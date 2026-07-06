@@ -68,7 +68,9 @@ reflectors land (see [`DOC_PLAN.md`](../DOC_PLAN.md)
 - [Skill schema](skill-schema.md) — LLM skill YAML format
   and tool allowlist.
 - [Metric catalogue](metric-catalogue.md) — Prometheus
-  metric names; **implementation pending** (see SPEC drift).
+  metric names; the catalogue is largely **live** (~20 metric
+  families registered), only the Reserved families are still
+  outstanding (see SPEC drift).
 
 ## Runbooks
 

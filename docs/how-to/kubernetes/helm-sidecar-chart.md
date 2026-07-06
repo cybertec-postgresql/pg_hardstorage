@@ -42,9 +42,12 @@ helm install pg-hardstorage \
     --values my-values.yaml
 ```
 
-(Once the OCI registry is published, the install is a
-single-line `helm install pg-hardstorage
-oci://ghcr.io/cybertec-postgresql/pg-hardstorage-sidecar`.)
+The in-tree chart is the only supported install path today.
+No OCI Helm chart is published yet;
+`oci://ghcr.io/cybertec-postgresql/pg-hardstorage-sidecar`
+does not exist. Once it is published, the install will
+collapse to a single-line `helm install pg-hardstorage
+oci://ghcr.io/cybertec-postgresql/pg-hardstorage-sidecar`.
 
 ### 2. Provide a values file
 

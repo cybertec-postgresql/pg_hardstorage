@@ -12,14 +12,15 @@ tags:
 
 # Install pg_hardstorage on Windows
 
-> Status — **alpha**.  Every command in the CLI is
-> cross-compiled for `windows/amd64` and `windows/arm64`
-> on every commit (CI gate `build (windows/amd64)`), but
-> the agent's scheduled-job runner has no Windows Service
-> integration yet, and the installer (`.msi`, signed
-> bundle) is not yet packaged.  This page covers the
-> **manual binary install** that an operator can use
-> today against a remote PostgreSQL.
+> Status — **alpha**.  CI compile-tests every command for
+> both `windows/amd64` and `windows/arm64` on every commit
+> (the `build (windows/…)` gate), but only `windows/amd64`
+> is shipped as a tagged release asset — `windows/arm64` is
+> CI-verified, not released.  The agent's scheduled-job
+> runner has no Windows Service integration yet, and the
+> installer (`.msi`, signed bundle) is not yet packaged.
+> This page covers the **manual binary install** that an
+> operator can use today against a remote PostgreSQL.
 
 ## What works on Windows today
 
@@ -64,20 +65,30 @@ tags:
 
 ### 1. Download the binaries
 
-CI uploads `pg_hardstorage-windows-<arch>-<sha>.zip`
-artifacts on every commit.  For a tagged release,
-download the corresponding asset from the GitHub release
-page.  The bundle contains seven `.exe` files:
+There are two distinct sources, and they ship different
+sets of binaries:
 
-```
-pg_hardstorage.exe
-pg_hardstorage_testkit.exe
-pg-hardstorage-pgbackrest.exe
-pg-hardstorage-barman.exe
-pg-hardstorage-barman-wal-archive.exe
-pg-hardstorage-walg.exe
-pg-hardstorage-compat.exe
-```
+- **Per-commit CI artifact** — `pg_hardstorage-windows-<arch>-<sha>`
+  is uploaded on every commit (7-day retention) for both
+  `amd64` and `arm64`. This bundle contains seven `.exe`
+  files:
+
+  ```
+  pg_hardstorage.exe
+  pg_hardstorage_testkit.exe
+  pg-hardstorage-pgbackrest.exe
+  pg-hardstorage-barman.exe
+  pg-hardstorage-barman-wal-archive.exe
+  pg-hardstorage-walg.exe
+  pg-hardstorage-compat.exe
+  ```
+
+- **Tagged release** — the GitHub release ships only
+  `pg_hardstorage.exe`, and only for `windows/amd64`
+  (goreleaser publishes no `windows/arm64` release asset and
+  none of the shim/testkit `.exe` files). If you need the
+  shims or testkit on Windows, grab the per-commit CI
+  artifact or build them from source with `GOOS=windows`.
 
 ### 2. Place them on PATH
 
@@ -119,7 +130,7 @@ keyring location, and any environment misconfiguration.
 
 Following Microsoft's Known Folders guidance:
 
-| Domain | User mode (default) | System mode (`--mode system`) |
+| Domain | User mode (default) | System mode (elevated / LocalSystem) |
 |---|---|---|
 | Config | `%APPDATA%\pg_hardstorage\` (roams) | `%PROGRAMDATA%\pg_hardstorage\config\` |
 | State | `%LOCALAPPDATA%\pg_hardstorage\state\` | `%PROGRAMDATA%\pg_hardstorage\state\` |
@@ -127,6 +138,11 @@ Following Microsoft's Known Folders guidance:
 | Logs  | `%LOCALAPPDATA%\pg_hardstorage\logs\`  | `%PROGRAMDATA%\pg_hardstorage\logs\` |
 | Runtime | `%LOCALAPPDATA%\pg_hardstorage\run\` | `%PROGRAMDATA%\pg_hardstorage\run\` |
 | Shared data | `%PROGRAMDATA%\pg_hardstorage\` | `%PROGRAMDATA%\pg_hardstorage\share\` |
+
+System mode is not selected by a flag — there is no
+`--mode` switch. The resolver auto-detects it: an elevated
+Administrator / LocalSystem context resolves to system mode,
+the interactive user resolves to user mode.
 
 Resolved paths show in `pg_hardstorage doctor` with
 `source: windows` so it's unambiguous why the resolver

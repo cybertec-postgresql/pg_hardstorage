@@ -48,7 +48,7 @@ pg_hardstorage residency set db1 eu-west-1
 ```
 
 ```console
-residency: db1 → ["eu-west-1"]
+✓ db1: residency = [eu-west-1] (was [])
 ```
 
 ### 2. Pin to a continent
@@ -77,10 +77,11 @@ pg_hardstorage residency list
 ```
 
 ```console
-DEPLOYMENT  POLICY
-db1         eu-west-1
-db2         eu
-db3         (none)
+3 deployment(s)
+  DEPLOYMENT  RESIDENCY
+  db1         eu-west-1
+  db2         eu
+  db3         —
 ```
 
 ### 5. Verify the configured repo's region matches
@@ -90,13 +91,20 @@ pg_hardstorage residency check db1
 ```
 
 ```console
-db1   policy=["eu-west-1"]   repo_region=eu-west-1   ok
+residency check — db1
+  Repo:      s3://acme-pg-backups/?region=eu-west-1
+  Region:    eu-west-1
+  Allowed:   eu-west-1
+  ✓ region "eu-west-1" matches policy entry "eu-west-1" exactly
 ```
 
-A mismatch returns exit code 9:
+A mismatch returns exit code 9 and a `verify.residency_violation`
+error:
 
 ```console
-db1   policy=["eu-west-1"]   repo_region=us-east-1   FAIL
+ERROR verify.residency_violation: residency check: region "us-east-1" does not match any allowed entry [eu-west-1]
+  hint: either update the deployment's repo to a region that matches the policy, or relax the policy with `pg_hardstorage residency set` / `clear`.
+    run: pg_hardstorage residency list
 ```
 
 `doctor` runs the same check and surfaces the result among its
@@ -151,12 +159,13 @@ See [Add AWS KMS](../adding/kms-aws.md), [GCP KMS](../adding/kms-gcp.md),
 
 ## Troubleshooting
 
-**`residency.fs_unknown`** — the deployment's repo is `file://…`,
-which doesn't report a region. Move to an object store, or
-clear the residency policy.
+**`verify.residency_violation`** (repo region unknown) — the
+deployment's repo is `file://…`, which doesn't report a region.
+Move to an object store, or clear the residency policy.
 
-**`residency.mismatch`** — `repo_region` doesn't match the
-allowlist. Either move the repo or relax the policy.
+**`verify.residency_violation`** (region mismatch) — the repo's
+region doesn't match the allowlist. Either move the repo or relax
+the policy.
 
 **`region` empty on S3-compatible endpoints** — MinIO, R2,
 Wasabi often don't report a meaningful region. Pin

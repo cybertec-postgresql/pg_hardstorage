@@ -22,8 +22,8 @@ question is *where the trust boundary sits*.
   path.
 - **Tier 2 plugins** (third-party storage, third-party sinks,
   domain-specific extensions) ship as separate binaries discovered
-  on `$HSPLUGIN_PATH`, talking to the agent over
-  `hashicorp/go-plugin` (gRPC over Unix-domain stdio).
+  on `$HSPLUGIN_PATH`, talking to the agent over a one-shot
+  stdio JSON-RPC protocol (`pg_hardstorage.plugin.v1`).
   Crash-isolated, language-agnostic.
 
 This page explains the trust posture each tier implies, and why
@@ -75,7 +75,7 @@ that it doesn't bottleneck users.
 
 ---
 
-## Why Tier 2 is `hashicorp/go-plugin`
+## Why Tier 2 is a stdio JSON-RPC subprocess
 
 Tier 2 exists for plugins we don't (or shouldn't) maintain
 in-tree:
@@ -93,9 +93,9 @@ in-tree:
    structured error, and falls through to whatever fallback the
    caller chose (typically retry-with-degraded-mode).
 
-2. **Language-agnostic.**  The wire protocol is gRPC over
-   Unix-domain stdio.  Plugin authors can write in Go, Rust,
-   Python — anything with a gRPC binding.
+2. **Language-agnostic.**  The wire protocol is one-shot
+   stdio JSON-RPC.  Plugin authors can write in Go, Rust,
+   Python — anything that can read and write JSON on stdio.
 
 3. **Independent release cadence.**  A vendor can ship a new
    plugin without waiting for our release cycle.
@@ -140,9 +140,10 @@ Default policy:
   emits a critical audit event, and is recorded in every
   subsequent operation's audit trail.
 
-This mirrors the [LLM safety stack](llm-safety-stack.md)'s
-posture for skill files: signed by default, unsigned-with-flag
-for development, the flag's use is audited.
+Skill files follow a different posture today: the
+[LLM safety stack](llm-safety-stack.md)'s skills are unsigned
+YAML, gated by schema linting rather than signatures.  Skill
+signing is on the roadmap, not shipped.
 
 ---
 

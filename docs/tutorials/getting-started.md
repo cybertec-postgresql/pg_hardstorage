@@ -65,27 +65,29 @@ Same layout as the `.deb`.
 
 ### Container image
 
+Pre-built images are not yet published to a registry. Build a
+distroless image locally from the in-tree Dockerfile:
+
 ```sh
-VERSION=1.0.7   # latest release tag
-docker pull "ghcr.io/cybertec-postgresql/pg_hardstorage:v${VERSION}"
-docker run --rm "ghcr.io/cybertec-postgresql/pg_hardstorage:v${VERSION}" version
+docker build -t pg_hardstorage:local -f deploy/docker/Dockerfile .
+docker run --rm pg_hardstorage:local version
 ```
 
-The image is distroless. Mount a config dir at `/etc/pg_hardstorage`
-and a state dir at `/var/lib/pg_hardstorage`; both must be writable by
-UID 65532.
+The image is distroless and runs as `nonroot`. Mount a config dir at
+`/etc/pg_hardstorage` and a state dir at `/var/lib/pg_hardstorage`;
+both must be writable by UID 65532.
 
 ### From source
 
 ```sh
 git clone https://github.com/cybertec-postgresql/pg_hardstorage
 cd pg_hardstorage
-make                       # produces bin/pg_hardstorage
+make build                 # produces bin/pg_hardstorage (bare `make` prints the help menu)
 sudo install -m 0755 bin/pg_hardstorage /usr/local/bin/
 ```
 
 Requires Go 1.26+. `make test` runs the full unit suite under the race
-detector; `make test-integration` exercises a real PostgreSQL 17
+detector; `make test-integration` exercises a real PostgreSQL
 container via testcontainers-go (needs Docker).
 
 ---
@@ -260,21 +262,36 @@ $ pg_hardstorage version
 pg_hardstorage v1.0.7 (abc1234, built 2026-04-29T12:00:00Z)
 ```
 
-`doctor` is the single-command "is anything wrong" check:
+`doctor` is the single-command "is anything wrong" check. It prints a
+sectioned report — resolved PATHS, CONFIG, KEYSTORE, AIRGAP posture,
+REPOS reachability, and an ISSUES list:
 
 ```sh
 $ pg_hardstorage doctor
-db1 — PG 17.2 — primary @ db1.example.com
-  ✓ PostgreSQL reachable
-  ✓ Replication slot 'pg_hardstorage_db1' active, lag 12s
-  ✓ Last backup 47m ago
-  ✓ Repository file:///srv/backups writable
-  ✓ KMS keyring present (~/.config/pg_hardstorage/keyring)
-  ✓ Schedule: next at 04:00 UTC
-Summary: 1 healthy.
+Mode: user
+
+CONFIG
+  Status:        configured
+  Schema:        pg_hardstorage.config.v1
+  Deployments:   1 (db1)
+    db1                  class: internal
+  Source files:
+    [loaded ] ~/.config/pg_hardstorage/pg_hardstorage.yaml
+
+KEYSTORE
+  Signing key:   ✓ present
+  KEK:           ✓ present (encryption ON by default for new backups)
+
+REPOS
+  file:///srv/backups — reachable
+    audit chain: 5 event(s)
+
+ISSUES
+  [WARNING] audit.anchor_missing: 5 audit event(s) but no transparency-log anchor; run `pg_hardstorage audit anchor`
+    hint: run `pg_hardstorage audit anchor --repo <url>`
 ```
 
-Any `✗` line carries a `Suggested fix:` block underneath. Run
+Each issue line carries an indented `hint:` line underneath. Run
 `pg_hardstorage doctor -o json` for a machine-readable form.
 
 `doctor` exits 0 when healthy and exit 10 with `--exit-on-issues` when

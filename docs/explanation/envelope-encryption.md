@@ -138,9 +138,11 @@ Single-org installs get a default tenant they never see — but the
 tenant boundary exists in the data layout regardless.  This is a
 deliberate architectural choice, baked into the data layout:
 
-- **GDPR crypto-shred** is `pg_hardstorage kms shred --confirm-keyring <keyring-dir>
-  --reason "GDPR Art. 17 request #4421"`.  One key-destruction op.  The
-  audit event is the compliance artifact.
+- **GDPR crypto-shred** is `pg_hardstorage kms shred --repo <url>
+  --require-approval <approval-id> --confirm-keyring <keyring-dir>
+  --reason "GDPR Art. 17 request #4421"`.  One key-destruction op,
+  gated behind an approved n-of-m request.  The audit event is the
+  compliance artifact.
 - **Multi-tenant SaaS** can isolate customer A from customer B
   cryptographically: even if every chunk leaks, only the owner's
   KEK can decrypt their tenant's BDEKs.
@@ -157,8 +159,10 @@ this effectively free for steady-state workloads.
 
 ## KEK rotation flow
 
-`pg_hardstorage kms rotate --repo <url> --old-kek-ref <old> --new-kek-ref <new>` walks
-every manifest in the repo wrapped under the old KEK ref:
+`pg_hardstorage kms rotate --repo <url> --old-kek-ref <old>
+--new-kek-ref <new> --old-kek-file <old-bytes> --new-kek-file
+<new-bytes> --apply` walks every manifest in the repo wrapped
+under the old KEK ref (omit `--apply` for a dry-run preview):
 
 ```mermaid
 sequenceDiagram
@@ -200,7 +204,7 @@ A few properties worth highlighting:
   After retirement the old KEK can be scheduled for deletion via
   the KMS's own retention policy.
 
-`pg_hardstorage repair attestation <backup-id>` exists for the
+`pg_hardstorage repair attestation <deployment> <backup-id>` exists for the
 adjacent case — re-signing a manifest whose Ed25519 signature no
 longer validates after a rotation that also rotated the
 attestation key.  See the architecture tour for the full repair

@@ -39,6 +39,11 @@ tags:
 
 ### 1. Install the control plane
 
+> **Not yet published.** This is a v0.5 roadmap surface. The
+> `oci://ghcr.io/cybertec-postgresql/pg-hardstorage-server`
+> chart below does not exist yet — no OCI Helm chart is
+> published today. The command shows the intended shape only.
+
 ```bash
 helm install pg-hardstorage \
     oci://ghcr.io/cybertec-postgresql/pg-hardstorage-server \

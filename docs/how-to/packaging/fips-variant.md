@@ -18,7 +18,8 @@ tags:
 
 ## What you need
 
-- Go 1.19 or later. `GOEXPERIMENT=boringcrypto` is built
+- Go 1.26+ (the version pinned in `go.mod`).
+  `GOEXPERIMENT=boringcrypto` is built
   into the upstream Go toolchain on `linux/amd64`; on
   every other GOOS/GOARCH the experiment fails with a
   clear error.
@@ -54,10 +55,9 @@ GOEXPERIMENT=boringcrypto CGO_ENABLED=1 \
 ```
 
 The `fips` build tag is the runtime selector:
-`internal/fips.Enabled()` returns `true` in this flavour;
-`pg_hardstorage doctor` surfaces it under the system
-section so operators see at a glance which variant is
-running.
+`internal/fips.Enabled()` returns `true` in this flavour.
+The `pg_hardstorage version` subcommand surfaces the variant
+so operators see at a glance which flavour is running.
 
 ### 2. Confirm BoringCrypto symbols are linked in
 
@@ -78,24 +78,19 @@ verify `GOEXPERIMENT=boringcrypto` was set during the build.
 
 ### 3. Confirm the runtime flag
 
-```bash
-./bin/pg_hardstorage-fips doctor
-```
-
-The system section reports `fips: true`. The `version`
-subcommand also surfaces the flag:
+The `version` subcommand surfaces the variant:
 
 ```bash
 ./bin/pg_hardstorage-fips version
 ```
 
 ```console
-pg_hardstorage v1.0.x
-  commit: abcdef1
-  ...
-  fips:   true
-  build:  fips
+pg_hardstorage v1.0.x [FIPS] (abcdef1, built 2026-01-02T03:04:05Z)
 ```
+
+The `[FIPS]` marker in the one-line output is your runtime
+confirmation. The JSON form (`version --output json`) carries
+`"variant": "fips"` and `"fips": true`.
 
 ## What just happened
 
@@ -112,7 +107,7 @@ in older versions) refuse at runtime under
 The `fips` build tag activates the project's own FIPS
 posture: refuses non-FIPS encryption providers, refuses
 unsigned manifests in compliance mode, and surfaces the
-flag in `doctor` output.
+variant in `version` output.
 
 ## What FIPS mode actually changes for the operator
 
@@ -121,7 +116,7 @@ flag in `doctor` output.
 | Storage envelope | AES-256-GCM-SIV via BoringCrypto. |
 | TLS to control plane / repos | Only FIPS-approved ciphersuites. |
 | KMS providers | Refuses providers that aren't FIPS-approved. |
-| `doctor` | Reports `fips: true` and a "FIPS mode active" event. |
+| `version` | Prints the `[FIPS]` marker (JSON `variant: "fips"`, `fips: true`). |
 | Unit / integration tests | Same suite, run with the FIPS build. |
 
 Operators who don't need FIPS should stay on the default
@@ -138,8 +133,11 @@ The packaging story is roadmap from the SPEC:
 | v0.5 | `pg-hardstorage-fips` `.deb` / `.rpm` shipped with
   goreleaser; `Conflicts: pg-hardstorage` on Debian so the
   two binaries don't co-install. |
-| v0.5+ | `ghcr.io/cybertec-postgresql/pg_hardstorage-fips:<ver>`
-  distroless container image, cosign-signed, SBOM via syft. |
+| v0.5+ | A distroless FIPS container image, cosign-signed,
+  SBOM via syft. **Not yet published** — no `-fips` image
+  variant exists today; only the default
+  `ghcr.io/cybertec-postgresql/pg_hardstorage` image is
+  published, and it is not FIPS-built. |
 
 For v0.1 the path is "build it yourself with the
 instructions on this page."

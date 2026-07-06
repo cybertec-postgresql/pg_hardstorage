@@ -114,8 +114,8 @@ WAL inventory. PITR inside the gap window is then explicitly refused.
 ## WAL gap detected
 
 **Symptom.** A `wal_gap_detected` notice in `wal stream` logs, or a
-restore returns `wal.gap_in_target` (exit 6) when the requested LSN
-falls inside a known gap.
+restore returns `restore.target_in_wal_gap` (exit 7) when the requested
+LSN falls inside a known gap.
 
 **What it means.** Some range of WAL LSNs is missing from the repo.
 The gap auditor records the start and end of every gap it knows
@@ -260,22 +260,22 @@ with the exact next step. Common refusals:
 
 ---
 
-## Patroni split-brain refusal
+## Split-brain / repo-contamination refusal
 
-**Symptom.** `wal stream` or `backup` exits 4 with
-`preflight.patroni_split_brain`.
+**Symptom.** `wal push` refuses a segment with
+`splitbrain.system_identifier_mismatch` or `splitbrain.content_mismatch`.
 
-**What it means.** The agent's view of "who is the leader" disagrees
-with PG's view. Either Patroni's REST endpoint reports a different
-leader than the connected node thinks it is, or two candidates
-report `role=primary`. Continuing would risk writing WAL or backup
-chunks tagged with the wrong timeline.
+**What it means.** The repo already holds a segment at that name whose
+`system_identifier` — or whose bytes, at the same name — differ from the
+one being pushed. That means two different clusters (or two divergent
+timelines after a mishandled failover) are archiving into the same
+deployment path. Continuing would let one cluster's WAL overwrite or
+interleave with another's, corrupting the recovery chain.
 
 **What to do.** This is an operator-only resolution. See
 [runbooks/R7-patroni-split-brain](../reference/runbooks/R7-patroni-split-brain.md).
-Do not `--force` past it.
-
-**Doctor check.** `Patroni topology` flags it as a critical finding.
+Do not force past it — separate the clusters into distinct deployment
+paths first.
 
 ---
 

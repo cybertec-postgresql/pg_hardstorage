@@ -35,7 +35,7 @@ pg_hardstorage audit export-bundle \
     --until 2026-05-01T00:00:00Z \
     --include-anchors \
     --operator "ops@acme" \
-    -o ./acme-april-2026.tar.gz
+    --out ./acme-april-2026.tar.gz
 ```
 
 ### Verify

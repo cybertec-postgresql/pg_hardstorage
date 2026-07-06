@@ -109,16 +109,23 @@ pg_hardstorage wal stream db1 \
     --repo file:///tmp/hs-llm-repo
 ```
 
+`wal stream` does **not** abort. Its reconnect path runs
+`EnsureSlot`, which finds the slot missing and recreates it with
+`CREATE_REPLICATION_SLOT ... RESERVE_WAL`. Because the recreated slot
+starts at the server's current position — past the agent's last
+confirmed LSN — the run emits a structured `wal_gap_detected` event:
+
 ```console
-ERROR: WAL stream replication slot 'pg_hardstorage_db1' is not present on the server.
-What to do: the slot was probably dropped by an admin. Recreate it
-with:
-  pg_hardstorage wal repair db1
+[wal.follower] wal_gap_detected  the new leader's slot was recreated and
+has advanced past the agent's last confirmed LSN; PITR within the gap is
+impossible from this repo. Backup taken after this point will note the
+gap so PITR is refused. Investigate via `pg_hardstorage repair slot db1`
+for diagnostics.
 ```
 
-The exit code is non-zero and the structured event ID is
-`wal_gap_detected`. You could `pg_hardstorage wal repair` blindly —
-or you can ask the helper to talk you through it.
+The slot is back, but a WAL gap is now recorded in the repo. You could
+inspect it with `pg_hardstorage repair slot db1` blindly — or you can
+ask the helper to talk you through what the gap means.
 
 ### 3. Drop into the incident skill
 
@@ -190,6 +197,7 @@ read_runbook
 search_docs
 suggest_command
 preview_command
+read_command_help
 ```
 
 ```text
@@ -230,7 +238,7 @@ The recorded gap is the exact range during which the slot was
 absent. You can chase it with `wal audit` or accept it as a known
 recovery limitation depending on your RPO target.
 
-### 7. Export the signed evidence bundle
+### 7. Export the evidence bundle
 
 Note the session ID printed in the chat header (`session=01HXX...`)
 and pass it to `llm export-session`:
@@ -242,18 +250,26 @@ pg_hardstorage llm export-session 01HXX... \
 ```
 
 ```console
-✓ exported 14 audit events
-✓ Merkle root anchored: sha256:c1aa...
-✓ wrote /tmp/hs-llm-incident.tar.gz (signed, ed25519)
+✓ exported LLM session 01HXX...
+  path:        /tmp/hs-llm-incident.tar.gz
+  events:      14
+  bundle:      8213 bytes
+  first hash:  sha256:a13f...
+  last hash:   sha256:c1aa...
+  verify:      pg_hardstorage audit verify-chain --repo <url>
 ```
+
+The bundle is not signed today; its integrity rests on the audit
+chain it was drawn from — verify that chain with the `verify:`
+command above.
 
 Inside the tarball:
 
 ```text
-session.json              # session metadata (skill, provider, principal)
-events.ndjson             # every llm.* event in order, hash-chained
-manifest.json             # bundle index + audit chain head
-manifest.sig              # ed25519 signature over manifest.json
+transcript.ndjson         # every llm.* event in commit order
+tool_results/*.json       # full tool-result bodies for tool calls
+manifest.json             # schema, session_id, event count
+audit_chain_proof.json    # chain head + first/last event hashes
 ```
 
 This is the artefact you hand to the auditor: **what the operator

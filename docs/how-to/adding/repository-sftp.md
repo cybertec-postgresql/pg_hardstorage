@@ -99,8 +99,11 @@ pg_hardstorage repo init sftp://backup@nas.example.com/srv/pg-hardstorage
 ```
 
 ```console
-repo: sftp://backup@nas.example.com/srv/pg-hardstorage
-mode: ok
+✓ Repository initialised
+  URL:    sftp://backup@nas.example.com/srv/pg-hardstorage
+  ID:     6a0d2f4b8c1e3057a9b2d4f6c8e0a1b3
+  Schema: pg_hardstorage.repo.v1
+  Created: 2026-07-06T13:56:58Z
 ```
 
 The plugin reads `identity_file`, `identity_passphrase`, and

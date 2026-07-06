@@ -34,7 +34,7 @@ pg_hardstorage notify add webhook \
 ```
 
 ```console
-sink "ops-webhook" added (plugin=webhook)
+✓ Sink added — ops-webhook (plugin webhook)
 ```
 
 ### 2. Verify
