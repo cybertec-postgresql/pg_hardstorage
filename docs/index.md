@@ -8,7 +8,7 @@ title: PostgreSQL backup, WAL streaming & PITR
 description: >-
   pg_hardstorage is an open-source PostgreSQL backup agent and CLI:
   continuous WAL streaming, point-in-time recovery, content-addressed
-  deduplication, envelope encryption, and signed manifests. PG 15+,
+  deduplication, envelope encryption, and signed manifests. PG 15–18,
   Apache 2.0.
 ---
 
@@ -33,7 +33,7 @@ content-addressed chunks, AES-256-GCM-encrypts under a
 per-backup DEK wrapped by a configurable KEK, and signs
 every manifest with Ed25519.
 
-PG 15+, Apache 2.0.  Targets single-host deployments,
+PG 15–18, Apache 2.0.  Targets single-host deployments,
 multi-tenant SaaS, and Patroni clusters with the same
 binary.
 

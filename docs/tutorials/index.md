@@ -44,4 +44,4 @@ take the full getting-started instead.
 ## Extending pg_hardstorage
 
 - [Build a Tier-2 storage plugin](build-a-storage-plugin.md) — author
-  an out-of-tree storage backend over the `go-plugin` contract.
+  an out-of-tree storage backend over the Tier-2 JSON-RPC/stdio contract.

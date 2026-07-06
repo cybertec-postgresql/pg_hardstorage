@@ -301,11 +301,13 @@ isolation when verifying untrusted backups.  Linux + KVM
 only.  See
 [firecracker sandbox](how-to/verify/firecracker-sandbox.md).
 
-#### `go-plugin`
+#### Tier-2 plugin transport
 
-`hashicorp/go-plugin` — the gRPC-over-stdio framework
-pg_hardstorage uses to host Tier-2 plugins.  Crash-
-isolated, language-agnostic.  See
+The wire contract pg_hardstorage uses to host Tier-2
+plugins: a one-shot stdio JSON-RPC protocol
+(`pg_hardstorage.plugin.v1`) — the host launches the plugin
+executable per operation and exchanges line-delimited JSON
+over stdin/stdout.  Crash-isolated, language-agnostic.  See
 [Tier-2 protocol](reference/plugins/tier2-go-plugin-protocol.md).
 
 #### `HSREPO`
@@ -334,7 +336,7 @@ crypto-shred primitive.  See
 
 The URL-shaped reference to a KEK
 (`aws-kms://arn:...`, `gcp-kms://...`, `vault-transit://...`,
-`local-keyring://...`, etc.).  Stored in
+`local:default`, etc.).  Stored in
 `manifest.json.encryption.kek_ref`.  Schemes documented in
 the auto-generated KEKRef reference page.
 
@@ -366,7 +368,7 @@ confirmation.  Read-only by default.  See
 
 The plugin tier for chat-completion backends (OpenAI,
 Bedrock, Vertex, Ollama, llama.cpp, Hugging Face, …).
-Tier-1 in-tree, Tier-2 external via `go-plugin`.  See the
+Tier-1 in-tree, Tier-2 external via stdio JSON-RPC.  See the
 [LLM provider contract](reference/plugins/llm-provider-contract.md).
 
 #### Manifest
@@ -460,7 +462,7 @@ encryption, compression, renderer, sink, and LLM provider.
 Tier-1 plugins are first-party and compiled into the
 binary; Tier-2 plugins are third-party, ship as separate
 binaries, and are discovered on `$HSPLUGIN_PATH` via
-`go-plugin`.  See
+stdio JSON-RPC.  See
 [Tier-1 vs Tier-2](explanation/tier1-vs-tier2-plugins.md).
 
 #### Recovery slot
@@ -639,8 +641,8 @@ pg_hardstorage we use [Deployment](#deployment).
 #### Storage URL scheme
 
 The URL prefix that selects a storage backend —
-`s3://`, `gs://`, `azblob://`, `sftp://`, `scp://`,
-`fs://`, etc.  Auto-generated reference page lists all
+`s3://`, `gcs://`, `azblob://`, `sftp://`, `scp://`,
+`file://`, etc.  Auto-generated reference page lists all
 built-in schemes.
 
 #### Subject
@@ -682,8 +684,8 @@ audit, FIPS-build, and ship.  See
 #### Tier-2 plugin
 
 A third-party plugin shipped as a separate binary,
-discovered on `$HSPLUGIN_PATH`, hosted via `go-plugin`
-(gRPC over stdio).  Crash-isolated, language-agnostic.
+discovered on `$HSPLUGIN_PATH`, hosted via one-shot stdio
+JSON-RPC.  Crash-isolated, language-agnostic.
 
 #### Timeline
 

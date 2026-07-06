@@ -74,9 +74,8 @@ for the full reasoning.
 
 #### What PostgreSQL versions are supported?
 
-PG 15, 16, and 17 are first-class — required to pass CI.
-PG 18 runs in the test matrix under allow-failure guardrails
-while readiness is confirmed.  PG 14 and earlier are
+PG 15 through 18 are supported and required to pass CI;
+PG 18 is first-class.  PG 14 and earlier are
 out of scope — `BASE_BACKUP` non-exclusive mode and
 `pg_backup_start` / `pg_backup_stop` are PG 15-only APIs we
 rely on.
@@ -476,8 +475,10 @@ binary.  Index:
 #### Does it produce SOC 2 evidence?
 
 Yes — the audit log is hash-chained Merkle, periodically
-anchored to a transparency log (Rekor by default,
-customer-managed log on request).  `compliance report`
+anchored to a self-hosted, storage-backed transparency log.
+External-witness anchoring (a real Rekor / Sigstore backend)
+is on the roadmap and drops in behind the same interface.
+`compliance report`
 auto-generates a monthly PDF that maps observed events to
 SOC 2 control IDs.  Mapping page:
 [SOC 2 control mapping](compliance/soc2-control-mapping.md).
@@ -563,7 +564,8 @@ Tier-1 plugins are first-party, compiled into the binary,
 self-register via `init()`, and ride the same signed
 release.  Tier-2 plugins are third-party, ship as separate
 binaries, and the agent discovers them on `$HSPLUGIN_PATH`
-via `hashicorp/go-plugin` (gRPC over stdio).  Side-by-side
+via a one-shot stdio JSON-RPC handshake
+(`pg_hardstorage.plugin.v1`).  Side-by-side
 table:
 [Tier-1 vs Tier-2](explanation/tier1-vs-tier2-plugins.md);
 contract reference:
@@ -579,8 +581,9 @@ walks through writing one end-to-end.
 
 #### Can I write a plugin in a language other than Go?
 
-Yes — Tier-2 plugins use `hashicorp/go-plugin`'s gRPC
-transport, so anything that speaks gRPC works.  The
+Yes — Tier-2 plugins speak stdio JSON-RPC (each request is
+a line of JSON the plugin reads from stdin; each response a
+line it writes to stdout), so any language works.  The
 [Tier-2 protocol reference](reference/plugins/tier2-go-plugin-protocol.md)
 documents the wire format.
 

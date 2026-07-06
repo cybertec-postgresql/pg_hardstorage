@@ -141,7 +141,7 @@ can't bit-rot:
 ````markdown
 ```bash
 # RUNNABLE
-pg_hardstorage init --pg-connection postgres://… --repo fs:///tmp/hsr --yes
+pg_hardstorage init --pg-connection postgres://… --repo file:///tmp/hsr --yes
 ```
 ````
 

@@ -30,8 +30,8 @@ You author Tier-2. The host launches your binary on demand for
 each RPC; persistence and concurrency are not your problem.
 
 For the precise contract — every method signature, every error code,
-the full handler set — see the [Tier-2 plugin reference](../reference/plugins/index.md)
-(Agent F). This page is the guided "build one" walkthrough.
+the full handler set — see the [Tier-2 plugin reference](../reference/plugins/index.md).
+This page is the guided "build one" walkthrough.
 
 ---
 
@@ -277,59 +277,57 @@ probe time is dropped from the registry with a logged warning.
 ```bash
 # RUNNABLE skip-in-ci="needs scaffolded Go plugin in /tmp/hs-plugin-tutorial"
 HSPLUGIN_PATH=/tmp/hs-plugin-tutorial \
-    pg_hardstorage doctor
+    pg_hardstorage plugin list
 ```
 
 ```console
-...
-Plugins
-  ✓ mem (storage, scheme=mem://) v0.1.0  · /tmp/hs-plugin-tutorial/pg-hardstorage-plugin-mem
+NAME                 KIND         VERSION    PATH
+mem                  storage      0.1.0      /tmp/hs-plugin-tutorial/pg-hardstorage-plugin-mem
 ```
 
-Your scheme (`mem://`) is now valid wherever `--repo` is accepted.
+The host walked `$HSPLUGIN_PATH`, probed the binary, and got a valid
+handshake back — so it lists here.
 
 ### 7. Smoke-test by reading repo audit (no real backup)
 
 A real backup against `mem://` requires the storage interface
 methods this tutorial does *not* implement (`Delete`,
-`RenameIfNotExists`, `SetRetention`, `Capabilities`,
-`Close`). The minimal set above is enough for `pg_hardstorage repo
-init` and `pg_hardstorage repo audit` — the surface that exercises
-discovery and the put/get/stat path:
+`RenameIfNotExists`, `SetRetention`, `Barrier`, `Capabilities`,
+`Close`) — the full interface is 12 methods.
+
+!!! warning "Not yet wired end-to-end"
+
+    The steps below are **aspirational**. Tier-2 external plugins are
+    discovered and probed (step 6 above works today), but they are not
+    yet registered as storage factories, so a `--repo mem://…` URL does
+    not resolve through the external plugin. `pg_hardstorage repo init`
+    / `repo audit` against a plugin scheme will not run until that
+    wiring lands. Treat the following as a preview of the intended
+    surface, not a runnable step.
 
 ```bash
+# ASPIRATIONAL — mem:// does not resolve through a Tier-2 plugin yet
 HSPLUGIN_PATH=/tmp/hs-plugin-tutorial \
     pg_hardstorage repo init mem:///hs-tutorial
 ```
 
 ```bash
+# ASPIRATIONAL — see the warning above
 HSPLUGIN_PATH=/tmp/hs-plugin-tutorial \
     pg_hardstorage repo audit mem:///hs-tutorial
 ```
 
-Inspect the backing JSON:
-
-```bash
-cat /tmp/hs-plugin-tutorial/store.json | jq 'keys'
-```
-
-```console
-[
-  "HSREPO",
-  "config/repo.json"
-]
-```
-
-Two objects — the magic file and the repo config. The plugin moved
-real bytes through your handler.
+Once wired, the backing JSON would hold two objects — the `HSREPO`
+magic file and the repo config — showing that the plugin moved real
+bytes through your handler.
 
 ### 8. Watch the host re-spawn the plugin
 
-Tail the plugin's stderr to watch every RPC:
+Tail the plugin's stderr to watch the host spawn and probe it:
 
 ```bash
 HSPLUGIN_PATH=/tmp/hs-plugin-tutorial \
-    pg_hardstorage repo audit mem:///hs-tutorial 2>>/tmp/plugin-stderr.log
+    pg_hardstorage plugin list 2>>/tmp/plugin-stderr.log
 ```
 
 Each call to your binary is one process: launch, read one request,
@@ -371,14 +369,14 @@ away:
 - **Probe is the contract.** Get the probe response right and
   registration "just works"; get it wrong (missing `protocol` field,
   wrong version, slow exit) and your plugin silently doesn't show up
-  in `doctor`.
+  in `pg_hardstorage plugin list`.
 
 ---
 
 ## Next steps
 
 - [Tier-2 plugin reference](../reference/plugins/index.md) — the
-  full method set, param schemas, error codes (Agent F).
+  full method set, param schemas, error codes.
 - [Architecture tour](../explanation/architecture-tour.md) — where
   Tier-1 vs Tier-2 sits in the data plane.
 - [Operator guide](../operations/operator-guide.md) — running with
