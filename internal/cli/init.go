@@ -464,7 +464,7 @@ func (b initResultBody) WriteText(w io.Writer) error {
 		fmt.Fprintln(bw, "")
 		fmt.Fprintf(bw, "  First backup: %s\n", b.FirstBackup.BackupID)
 		fmt.Fprintf(bw, "    logical:    %s\n", humanBytes(b.FirstBackup.LogicalBytes))
-		fmt.Fprintf(bw, "    duration:   %dms\n", b.FirstBackup.DurationMS)
+		fmt.Fprintf(bw, "    duration:   %d ms\n", b.FirstBackup.DurationMS)
 	}
 	fmt.Fprintln(bw, "")
 	fmt.Fprintln(bw, "Next steps:")

@@ -14,6 +14,10 @@ tags:
 
 Per-deployment / per-tenant repository cost
 
+```
+pg_hardstorage cost <report> [flags]
+```
+
 ### Options
 
 ```

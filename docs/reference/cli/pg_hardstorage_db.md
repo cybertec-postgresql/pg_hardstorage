@@ -14,6 +14,10 @@ tags:
 
 In-database integration (SQL views, upsert helpers)
 
+```
+pg_hardstorage db <install-extension|uninstall-extension> [flags]
+```
+
 ### Options
 
 ```

@@ -48,6 +48,7 @@ pg_hardstorage backup delete <deployment> <backup-id> [flags]
       --reason string             free-form reason captured in the tombstone + audit chain
       --repo string               repository URL (required)
       --require-approval string   approval request ID that must be in approved state for backup.delete + this backup ID (n-of-m gate; strongly recommended)
+      --yes                       confirm the tombstone (not needed when --require-approval is given)
 ```
 
 ### Options inherited from parent commands

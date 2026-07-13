@@ -25,6 +25,10 @@ is needed. It targets PostgreSQL you run yourself; fully-managed DBaaS
 and are not supported.
 
 
+```
+pg_hardstorage wal [flags]
+```
+
 ### Options
 
 ```

@@ -14,6 +14,10 @@ tags:
 
 Inspect / shred encrypted LLM conversation transcripts
 
+```
+pg_hardstorage llm history <list|show|shred> [flags]
+```
+
 ### Options
 
 ```

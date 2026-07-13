@@ -19,7 +19,7 @@ import (
 func TestBackupDelete_RequiresFlags(t *testing.T) {
 	// No --repo.
 	_, stderr, exit := runCLI(t,
-		"backup", "delete", "db1", "some-id",
+		"backup", "delete", "db1", "some-id", "--yes",
 		"-o", "json",
 	)
 	if exit != int(output.ExitMisuse) {
@@ -43,7 +43,7 @@ func TestBackupDelete_NotFound(t *testing.T) {
 		t.Fatalf("repo init failed")
 	}
 	_, stderr, exit := runCLI(t,
-		"backup", "delete", "db1", "missing.full.x",
+		"backup", "delete", "db1", "missing.full.x", "--yes",
 		"--repo", repoURL,
 		"-o", "json",
 	)
@@ -85,7 +85,7 @@ func TestBackupDelete_RequireApproval_GateRefusesPending(t *testing.T) {
 	// nonexistent approval ID, expect notfound.backup BEFORE the
 	// gate. This proves the read-first-gate-second ordering.
 	_, stderr, exit := runCLI(t,
-		"backup", "delete", "db1", "missing.full.x",
+		"backup", "delete", "db1", "missing.full.x", "--yes",
 		"--repo", repoURL,
 		"--require-approval", "appr-doesnotexist",
 		"-o", "json",
@@ -147,7 +147,7 @@ func TestBackupDelete_RequireApproval_OpMismatch(t *testing.T) {
 	// — tested at the package boundary so multiple destructive ops
 	// don't have to re-run the same assertion.
 	_, stderr, exit := runCLI(t,
-		"backup", "delete", "db1", "db1.full.x",
+		"backup", "delete", "db1", "db1.full.x", "--yes",
 		"--repo", repoURL,
 		"--require-approval", requestID,
 		"-o", "json",
@@ -221,7 +221,7 @@ func TestBackupDelete_ChainProtection(t *testing.T) {
 	}
 
 	_, stderr, exit := runCLI(t,
-		"backup", "delete", "db1", full.BackupID,
+		"backup", "delete", "db1", full.BackupID, "--yes",
 		"--repo", w.repoURL,
 		"-o", "json",
 	)
@@ -318,7 +318,7 @@ func TestBackupDelete_CascadeDrainsChain(t *testing.T) {
 	}
 
 	stdout, _, exit := runCLI(t,
-		"backup", "delete", "db1", "db1.full.A",
+		"backup", "delete", "db1", "db1.full.A", "--yes",
 		"--repo", w.repoURL,
 		"--cascade",
 		"-o", "json",
@@ -413,7 +413,7 @@ func TestBackupDelete_ChainProtection_RefusalSuggestsCascade(t *testing.T) {
 	}
 
 	_, stderr, exit := runCLI(t,
-		"backup", "delete", "db1", "db1.full.A",
+		"backup", "delete", "db1", "db1.full.A", "--yes",
 		"--repo", w.repoURL,
 		"-o", "json",
 	)
@@ -482,7 +482,7 @@ func TestBackupDelete_ChainProtection_LeafFirstPasses(t *testing.T) {
 
 	// Leaf first: ok.
 	_, stderr, exit := runCLI(t,
-		"backup", "delete", "db1", inc.BackupID,
+		"backup", "delete", "db1", inc.BackupID, "--yes",
 		"--repo", w.repoURL,
 		"-o", "json",
 	)
@@ -491,7 +491,7 @@ func TestBackupDelete_ChainProtection_LeafFirstPasses(t *testing.T) {
 	}
 	// Anchor next: ok now that no live descendants remain.
 	_, stderr, exit = runCLI(t,
-		"backup", "delete", "db1", full.BackupID,
+		"backup", "delete", "db1", full.BackupID, "--yes",
 		"--repo", w.repoURL,
 		"-o", "json",
 	)

@@ -26,6 +26,10 @@ Every command is a real implementation (no scaffolding stubs).
 The advanced surfaces — gRPC, OIDC + RBAC, advise+execute LLM mode,
 sandbox-PG runtime — extend per docs/SPEC.md.
 
+```
+pg_hardstorage [flags]
+```
+
 ### Options
 
 ```

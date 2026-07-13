@@ -14,6 +14,10 @@ tags:
 
 Air-gap export/import of repo state (manifests + chunks + WAL)
 
+```
+pg_hardstorage repo bundle <export|import> [flags]
+```
+
 ### Options
 
 ```

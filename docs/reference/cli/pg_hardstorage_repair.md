@@ -23,6 +23,10 @@ match the rest of the system: nothing destructive happens without
 the operator typing --apply (and, for the most destructive paths,
 --yes).
 
+```
+pg_hardstorage repair [flags]
+```
+
 ### Options
 
 ```

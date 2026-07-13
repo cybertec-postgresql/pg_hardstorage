@@ -349,7 +349,12 @@ func (b statusBody) WriteText(w io.Writer) error {
 			// they exist.
 			lifecycle := lifecycleSummary(dep)
 			if lifecycle != "" {
-				fmt.Fprintf(tw, "    └─ %s\t\t\t\t\t\t\t\n", lifecycle)
+				// NO tab characters here: a tab-free line is a single
+				// trailing cell, which tabwriter excludes from column
+				// sizing. With the trailing tabs this 60+-char note
+				// became column 1's width and blew the whole table
+				// ~50 columns wide (plus a line of trailing spaces).
+				fmt.Fprintf(tw, "    └─ %s\n", lifecycle)
 			}
 		}
 		if err := tw.Flush(); err != nil {

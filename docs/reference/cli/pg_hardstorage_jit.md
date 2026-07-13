@@ -37,14 +37,18 @@ Operationally:
 
     # operator consumes (future commit will wire --jit-token
     # into kms shred + other destructive commands)
-    pg_hardstorage kms shred --tenant T \
-        --jit-token <encoded-token> --repo s3://acme
+    pg_hardstorage kms shred --repo s3://acme \
+        --confirm-keyring <keyring-dir> --require-approval <id> --yes
 
     # admin lists current tokens
     pg_hardstorage jit list --repo s3://acme
 
     # admin revokes if needed
     pg_hardstorage jit revoke <token-id> --reason "..."
+
+```
+pg_hardstorage jit [flags]
+```
 
 ### Options
 

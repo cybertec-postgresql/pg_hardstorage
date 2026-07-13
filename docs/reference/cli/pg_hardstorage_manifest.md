@@ -23,6 +23,10 @@ the repository's manifests/ prefix.
 `manifest show` is the same operation as the top-level
 `show` command.
 
+```
+pg_hardstorage manifest [flags]
+```
+
 ### Options
 
 ```

@@ -285,7 +285,7 @@ func TestRepoAudit_TombstonedDeployment(t *testing.T) {
 	commitVerifiableBackup(t, w, "db1", 0, []byte("alive"))
 	dead := commitVerifiableBackup(t, w, "db1", 1, []byte("dead"))
 
-	_, _, exit := runCLI(t, "backup", "delete", "db1", dead,
+	_, _, exit := runCLI(t, "backup", "delete", "db1", dead, "--yes",
 		"--repo", w.repoURL, "--reason", "test", "-o", "json")
 	if exit != int(output.ExitOK) {
 		t.Fatalf("backup delete exit = %d", exit)

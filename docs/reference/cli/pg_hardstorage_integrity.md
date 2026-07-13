@@ -38,6 +38,10 @@ Exit codes:
      code matches the "verify-failed" namespace; cron will alert.
   6  notfound (run id or strategy target absent)
 
+```
+pg_hardstorage integrity [flags]
+```
+
 ### Options
 
 ```

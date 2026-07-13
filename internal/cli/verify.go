@@ -89,6 +89,9 @@ Backup ID:
 			if len(args) == 2 {
 				backupID = args[1]
 			}
+			if err := requireBackupIDArg("verify", backupID); err != nil {
+				return err
+			}
 			full, _ := cmd.Flags().GetBool("full")
 			pgMajor, _ := cmd.Flags().GetString("pg-major")
 			if dispatch.controlPlane != "" {
@@ -577,10 +580,10 @@ func (b verifyBody) WriteText(w io.Writer) error {
 		b.ChunksReferenced, b.ChunksUnique, b.ChunksSampled)
 	if b.ChunksMismatched == 0 {
 		if b.ExistenceOnly {
-			fmt.Fprintf(bw, "  ✓ %d chunk(s) present (no integrity check) in %dms\n",
+			fmt.Fprintf(bw, "  ✓ %d chunk(s) present (no integrity check) in %d ms\n",
 				b.ChunksVerified, b.DurationMS)
 		} else {
-			fmt.Fprintf(bw, "  ✓ %d chunk(s) verified — %s in %dms\n",
+			fmt.Fprintf(bw, "  ✓ %d chunk(s) verified — %s in %d ms\n",
 				b.ChunksVerified, humanBytes(b.BytesVerified), b.DurationMS)
 		}
 	} else {

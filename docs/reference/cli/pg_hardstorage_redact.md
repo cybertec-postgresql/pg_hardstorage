@@ -14,6 +14,10 @@ tags:
 
 Post-restore PII redaction (rules-driven UPDATE statements)
 
+```
+pg_hardstorage redact <apply|preview> [flags]
+```
+
 ### Options
 
 ```

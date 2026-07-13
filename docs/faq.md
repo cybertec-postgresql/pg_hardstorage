@@ -218,9 +218,11 @@ pgBackRest's incremental chain; see
 
 #### How do I delete an old backup?
 
-`pg_hardstorage backup delete <deployment> <backup-id>`.
-The manifest soft-deletes immediately; chunks stay until
-the next `repo gc` decides nothing else references them.
+`pg_hardstorage backup delete <deployment> <backup-id> --yes`
+(the `--yes` confirmation gate is required; an approved
+`--require-approval` also satisfies it). The manifest soft-deletes
+immediately; chunks stay until the next `repo gc` decides nothing
+else references them.
 See [`backup delete` reference](reference/cli/pg_hardstorage_backup_delete.md)
 for `--undelete` (within the trash TTL) and `--force` (skip
 confirmation prompt).  Retention can run this for you

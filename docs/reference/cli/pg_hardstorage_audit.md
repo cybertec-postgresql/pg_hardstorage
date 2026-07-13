@@ -23,6 +23,10 @@ event's prev_hash; `audit verify-chain` walks the chain and
 reports both kinds of finding (hash mismatch on an event, or chain
 break between events).
 
+```
+pg_hardstorage audit [flags]
+```
+
 ### Options
 
 ```

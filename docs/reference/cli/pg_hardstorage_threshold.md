@@ -50,6 +50,10 @@ Operationally:
         backup_manifest db1.full.20260501T120000Z \
         --repo s3://acme
 
+```
+pg_hardstorage threshold [flags]
+```
+
 ### Options
 
 ```

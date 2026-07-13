@@ -396,8 +396,14 @@ func Restore(ctx context.Context, opts Options) (res *Result, err error) {
 			fmt.Sprintf("restore: checkpoint at %s belongs to backup %q, not %q",
 				opts.TargetDir, cp.BackupID, m.BackupID)).
 			WithSuggestion(&output.Suggestion{
-				Human:   "remove the target dir entirely if you want a fresh restore, or pass --backup matching the existing checkpoint",
-				Command: "rm -rf " + opts.TargetDir,
+				// The safe default is RESUMING the interrupted restore
+				// (its backup ID is the positional argument) — never
+				// steer an operator or automation toward `rm -rf` of a
+				// directory that may hold their partially-restored data.
+				Human: fmt.Sprintf("to resume the interrupted restore, re-run with its backup ID: `pg_hardstorage restore %s %s --target %s`; only if you deliberately want a FRESH restore of a different backup, remove the target directory first",
+					m.Deployment, cp.BackupID, opts.TargetDir),
+				Command: fmt.Sprintf("pg_hardstorage restore %s %s --target %s",
+					m.Deployment, cp.BackupID, opts.TargetDir),
 			})
 	}
 	completed := map[string]struct{}{}

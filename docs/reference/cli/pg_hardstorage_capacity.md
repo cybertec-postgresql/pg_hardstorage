@@ -14,6 +14,10 @@ tags:
 
 Projected repository size, WAL volume, and pre-flight free-space checks
 
+```
+pg_hardstorage capacity <report|preflight> [flags]
+```
+
 ### Options
 
 ```

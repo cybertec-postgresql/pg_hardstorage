@@ -21,6 +21,10 @@ commands pre-filled with the deployment's actual configuration
 (repo URL, deployment name, keyring path). They map to the
 disaster scenarios documented in docs/SPEC.md (R1–R7).
 
+```
+pg_hardstorage runbook [flags]
+```
+
 ### Options
 
 ```

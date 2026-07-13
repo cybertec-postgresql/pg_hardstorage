@@ -24,6 +24,10 @@ so it survives agent restarts and is visible across operators.
 Removing a hold is the explicit `hold remove` operation; nothing
 else clears it.
 
+```
+pg_hardstorage hold [flags]
+```
+
 ### Options
 
 ```

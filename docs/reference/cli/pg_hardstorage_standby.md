@@ -29,6 +29,10 @@ or pg_ctl. The Result body emits the recommended invocation.
 The state file lives under paths.State()/standbys.json — same
 back-compat commitment (24-month) as the manifest schema.
 
+```
+pg_hardstorage standby <create|list|destroy> [flags]
+```
+
 ### Options
 
 ```

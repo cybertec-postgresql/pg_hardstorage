@@ -38,9 +38,9 @@ pg_hardstorage list db1
 ```console
 Backups for db1 (3):
   BACKUP ID                  TYPE  WHEN              FILES  SIZE      DEDUP  DURATION
-  db1.full.20260427T020000Z  full  2026-04-27 02:00  1284   12.3 GiB  1.42x  38210ms
-  db1.full.20260420T020000Z  full  2026-04-20 02:00  1281   12.1 GiB  1.41x  37544ms
-  db1.full.20260413T020000Z  full  2026-04-13 02:00  1279   11.9 GiB  1.40x  36988ms
+  db1.full.20260427T020000Z  full  2026-04-27 02:00  1284   12.3 GiB  1.42x  38210 ms
+  db1.full.20260420T020000Z  full  2026-04-20 02:00  1281   12.1 GiB  1.41x  37544 ms
+  db1.full.20260413T020000Z  full  2026-04-13 02:00  1279   11.9 GiB  1.40x  36988 ms
 ```
 
 ### 2. Place an indefinite hold

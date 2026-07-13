@@ -14,6 +14,10 @@ tags:
 
 Generate scheduling SQL for pg_timetable
 
+```
+pg_hardstorage timetable <emit> [flags]
+```
+
 ### Options
 
 ```

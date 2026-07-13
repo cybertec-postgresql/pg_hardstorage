@@ -120,7 +120,7 @@ pg_hardstorage list db1 --repo file:///tmp/hs-tutorial-repo
 ```console
 Backups for db1 (1):
   BACKUP ID                       TYPE  WHEN              FILES  SIZE      DEDUP  DURATION
-  db1.full.20260504T120000Z.a1b2  full  2026-05-04 12:00  967    22.2 MiB  2.56x  1617ms
+  db1.full.20260504T120000Z.a1b2  full  2026-05-04 12:00  967    22.2 MiB  2.56x  1617 ms
 ```
 
 The backup ID has the shape `db1.full.YYYYMMDDThhmmssZ.<hash>` —

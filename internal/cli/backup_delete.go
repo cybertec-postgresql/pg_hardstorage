@@ -47,6 +47,7 @@ func newBackupDeleteCmd() *cobra.Command {
 		reason          string
 		requireApproval string
 		cascade         bool
+		yes             bool
 	)
 	c := &cobra.Command{
 		Use:   "delete <deployment> <backup-id>",
@@ -73,6 +74,17 @@ soft-delete plan from the configured policy.`,
 		Args:         cobra.ExactArgs(2),
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// Confirmation gate: the most destructive verb in the CLI
+			// must not be WEAKER-guarded than the config-only
+			// `deployment remove` (which refuses without --yes). An
+			// approved n-of-m gate also counts as confirmation.
+			if !yes && requireApproval == "" {
+				return output.NewError("aborted.confirmation_required",
+					fmt.Sprintf("backup delete: refusing to tombstone %s/%s without --yes (or an approval via --require-approval)", args[0], args[1])).
+					WithSuggestion(&output.Suggestion{
+						Human: "re-run with --yes to confirm; the backup stays recoverable via `backup undelete` until the next `repo gc --apply`",
+					})
+			}
 			return runBackupDelete(cmd, args[0], args[1], repoURL, reason, requireApproval, cascade)
 		},
 	}
@@ -85,6 +97,8 @@ soft-delete plan from the configured policy.`,
 		"approval request ID that must be in approved state for backup.delete + this backup ID (n-of-m gate; strongly recommended)")
 	c.Flags().BoolVar(&cascade, "cascade", false,
 		"also delete every incremental descendant of this backup, leaf-first")
+	c.Flags().BoolVar(&yes, "yes", false,
+		"confirm the tombstone (not needed when --require-approval is given)")
 	return c
 }
 

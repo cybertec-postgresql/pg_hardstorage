@@ -23,6 +23,10 @@ operate on that name. Adding a sink validates the configuration via
 the same SinkRegistry the agent uses at start-up, so a typo'd
 webhook URL or a missing key is rejected before it lands on disk.
 
+```
+pg_hardstorage notify [flags]
+```
+
 ### Options
 
 ```

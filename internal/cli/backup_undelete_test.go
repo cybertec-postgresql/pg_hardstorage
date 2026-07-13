@@ -54,7 +54,7 @@ func TestBackupUndelete_RestoresAfterDelete(t *testing.T) {
 
 	// Delete first.
 	if _, _, exit := runCLI(t,
-		"backup", "delete", "db1", "db1.full.A",
+		"backup", "delete", "db1", "db1.full.A", "--yes",
 		"--repo", w.repoURL,
 		"--reason", "test",
 	); exit != int(output.ExitOK) {
@@ -161,7 +161,7 @@ func TestBackupUndelete_MultipleIDs_UnwindsCascade(t *testing.T) {
 
 	// Cascade delete.
 	if _, _, exit := runCLI(t,
-		"backup", "delete", "db1", "db1.full.A",
+		"backup", "delete", "db1", "db1.full.A", "--yes",
 		"--repo", w.repoURL,
 		"--cascade",
 	); exit != int(output.ExitOK) {

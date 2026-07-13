@@ -66,6 +66,9 @@ binary's wal-fetch shim.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			opts.deployment = args[0]
 			opts.backupID = args[1]
+			if err := requireBackupIDArg("restore", opts.backupID); err != nil {
+				return err
+			}
 			return runRestore(cmd, opts)
 		},
 	}

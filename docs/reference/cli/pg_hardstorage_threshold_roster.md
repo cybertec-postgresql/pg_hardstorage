@@ -14,6 +14,10 @@ tags:
 
 Create / list / show rosters
 
+```
+pg_hardstorage threshold roster [flags]
+```
+
 ### Options
 
 ```

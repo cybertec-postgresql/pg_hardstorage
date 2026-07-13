@@ -32,6 +32,10 @@ Authentication: Patroni's REST is HTTP basic-auth or no auth.
 Read endpoints are typically open; pass --user/--password if your
 deployment locks them down.
 
+```
+pg_hardstorage patroni <status|history> [flags]
+```
+
 ### Options
 
 ```

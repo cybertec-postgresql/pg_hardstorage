@@ -42,7 +42,7 @@ pg_hardstorage verify db1 latest
 verify db1/db1.full.20260427T020000Z (full)
   manifest signature: valid
   chunks: 3245 referenced, 3245 unique, 3245 sampled
-  ✓ 3245 chunk(s) verified — 12.3 GiB in 9412ms
+  ✓ 3245 chunk(s) verified — 12.3 GiB in 9412 ms
 ```
 
 `--repo <url>` overrides the deployment's configured repo for

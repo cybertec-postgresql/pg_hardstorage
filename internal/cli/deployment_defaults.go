@@ -10,9 +10,12 @@
 package cli
 
 import (
+	"strings"
+
 	"github.com/spf13/cobra"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/config"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/output"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/paths"
 )
 
@@ -73,9 +76,6 @@ func deploymentDefaults(deployment, pgConn, repoURL string) (string, string) {
 // exactly as before. Path/config-load failures are non-fatal — Cobra's
 // required-flag check then fires just as it did previously.
 func resolveDeploymentDefaultsPreRun(cmd *cobra.Command, args []string) error {
-	if len(args) == 0 {
-		return nil
-	}
 	fl := cmd.Flags()
 	repoF := fl.Lookup("repo")
 	pgF := fl.Lookup("pg-connection")
@@ -92,6 +92,21 @@ func resolveDeploymentDefaultsPreRun(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return nil
 	}
+	if len(args) == 0 {
+		// All-deployments mode (bare `status`, `rotate`, `audit
+		// anchor`, ...): there is no positional to key on, but when
+		// every configured deployment points at the SAME repository
+		// the answer is unambiguous — use it. `status db1` already
+		// worked flag-free; bare `status` demanding --repo the config
+		// plainly knows was maddening. With multiple distinct repos
+		// we stay hands-off and the required-flag error fires.
+		if repoNeed {
+			if repo, ok := soleConfiguredRepo(loaded.Config.Deployments); ok {
+				_ = fl.Set("repo", repo)
+			}
+		}
+		return nil
+	}
 	dep, ok := loaded.Config.Deployments[args[0]]
 	if !ok {
 		return nil
@@ -101,6 +116,40 @@ func resolveDeploymentDefaultsPreRun(cmd *cobra.Command, args []string) error {
 	}
 	if pgNeed && dep.PGConnection != "" {
 		_ = fl.Set("pg-connection", dep.PGConnection)
+	}
+	return nil
+}
+
+// soleConfiguredRepo returns the repo URL shared by every configured
+// deployment, or ok=false when there are none or they disagree.
+func soleConfiguredRepo(deps map[string]config.DeploymentConfig) (string, bool) {
+	repo := ""
+	for _, d := range deps {
+		if d.Repo == "" {
+			continue
+		}
+		if repo == "" {
+			repo = d.Repo
+			continue
+		}
+		if d.Repo != repo {
+			return "", false
+		}
+	}
+	return repo, repo != ""
+}
+
+// requireBackupIDArg rejects an empty/whitespace backup-ID positional as a
+// usage error. Without it, `verify db1 ""` (the classic unset-shell-variable
+// slip) fell through to the manifest read and was reported as a manifest
+// SIGNATURE failure (exit 9 — the "backup corrupt/tampered" code that pages
+// people), and `show db1 ""` as an internal error (exit 1). An empty
+// argument is operator input, not corruption.
+func requireBackupIDArg(command, id string) error {
+	if strings.TrimSpace(id) == "" {
+		return output.NewError("usage.bad_args",
+			command+": backup ID must not be empty (use `latest` for the newest backup)").
+			Wrap(output.ErrUsage)
 	}
 	return nil
 }
