@@ -78,5 +78,5 @@ pg_hardstorage partial dump <deployment> [flags]
 
 ### SEE ALSO
 
-* [pg_hardstorage partial](pg_hardstorage_partial.md)	 - Table-level inspection (v0.1) and restore
+* [pg_hardstorage partial](pg_hardstorage_partial.md)	 - Table-level inspection and restore
 

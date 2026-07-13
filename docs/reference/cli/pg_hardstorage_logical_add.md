@@ -29,10 +29,10 @@ pg_hardstorage logical add <name> [flags]
 ```
       --deployment string    source deployment (required)
   -h, --help                 help for add
-      --plugin string        output plugin (v0.1: pgoutput) (default "pgoutput")
+      --plugin string        output plugin (currently: pgoutput) (default "pgoutput")
       --publication string   publication name on source PG (required)
       --repo string          repository URL (required)
-      --sink string          sink kind (v0.1: chunked) (default "chunked")
+      --sink string          sink kind (currently: chunked) (default "chunked")
       --slot string          logical slot name (default: pg_hardstorage_logical_<name>)
 ```
 

@@ -106,7 +106,7 @@ Resilience, compliance, simplicity, and scale-spanning (10 GB to 100+ TB)
 are the design north stars. WAL streaming over the replication protocol is
 the central data plane. Apache 2.0.
 
-Every command in v0.2 is a real implementation (no scaffolding stubs).
+Every command is a real implementation (no scaffolding stubs).
 The advanced surfaces — gRPC, OIDC + RBAC, advise+execute LLM mode,
 sandbox-PG runtime — extend per docs/SPEC.md.`,
 		// We render errors ourselves through the dispatcher.

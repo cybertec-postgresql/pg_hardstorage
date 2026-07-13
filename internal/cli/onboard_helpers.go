@@ -3,6 +3,7 @@ package cli
 
 import (
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/output"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/version"
 	"github.com/spf13/cobra"
 )
 
@@ -37,7 +38,8 @@ func newChangelogCmdImpl() *cobra.Command {
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			d := DispatcherFrom(cmd)
 			return d.Result(output.NewResult(cmd.CommandPath()).WithBody(map[string]any{
-				"versions": []map[string]string{{"version": "v0.2.0", "date": "in development"}},
+				"version":   version.Version,
+				"changelog": "https://github.com/cybertec-postgresql/pg_hardstorage/blob/main/CHANGELOG.md",
 			}))
 		},
 	}

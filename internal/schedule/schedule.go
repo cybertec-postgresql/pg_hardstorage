@@ -216,10 +216,24 @@ func (d DailyAt) Description() string {
 }
 
 func (d DailyAt) locName() string {
-	if d.Loc == nil {
-		return "Local"
+	loc := d.Loc
+	if loc == nil {
+		loc = time.Local
 	}
-	return d.Loc.String()
+	if loc == time.Local {
+		// time.Local.String() is just "Local", which tells the
+		// operator nothing — and "which zone does daily_at use?" is
+		// exactly the question they ask when backups fire at the
+		// "wrong" hour. Surface the host's actual zone + offset.
+		abbr, off := time.Now().In(loc).Zone()
+		sign := "+"
+		if off < 0 {
+			sign, off = "-", -off
+		}
+		return fmt.Sprintf("host local time %s, UTC%s%02d:%02d",
+			abbr, sign, off/3600, (off%3600)/60)
+	}
+	return loc.String()
 }
 
 // Once triggers a single time at a specific instant. After it fires,

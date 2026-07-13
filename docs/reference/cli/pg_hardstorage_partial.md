@@ -12,21 +12,21 @@ tags:
 
 ## pg_hardstorage partial
 
-Table-level inspection (v0.1) and restore
+Table-level inspection and restore
 
 ### Synopsis
 
 Partial / table-level operations.
 
-v0.1 ships partial inspect: given a backup and a list of tables, list
-the manifest entries (heap files) that contain the table data. This
+partial inspect: given a backup and a list of tables, list the
+manifest entries (heap files) that contain the table data. This
 answers the operator's "would my partial restore work?" question
 before the extraction path lands.
 
 partial restore — the actual table extraction into a running DB —
-ships alongside the sandbox-PG verifier. The v0.1 fallback
-documented in the structured error is: full restore into a staging
-directory + pg_dump --table=...
+ships alongside the sandbox-PG verifier. The fallback documented
+in the structured error is: full restore into a staging directory
++ pg_dump --table=...
 
 ### Options
 

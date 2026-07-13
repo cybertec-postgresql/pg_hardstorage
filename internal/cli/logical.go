@@ -103,13 +103,13 @@ or will be created lazily by 'logical stream' (slot).`,
 			case "", "pgoutput":
 			default:
 				return output.NewError("usage.bad_plugin",
-					fmt.Sprintf("logical add: --plugin %q: only \"pgoutput\" is supported in v0.1", plugin)).Wrap(output.ErrUsage)
+					fmt.Sprintf("logical add: --plugin %q: only \"pgoutput\" is currently supported", plugin)).Wrap(output.ErrUsage)
 			}
 			switch sinkKind {
 			case "", "chunked":
 			default:
 				return output.NewError("usage.bad_sink",
-					fmt.Sprintf("logical add: --sink %q: only \"chunked\" is supported in v0.1", sinkKind)).Wrap(output.ErrUsage)
+					fmt.Sprintf("logical add: --sink %q: only \"chunked\" is currently supported", sinkKind)).Wrap(output.ErrUsage)
 			}
 			// PG replication-slot and publication names follow the
 			// PG identifier rule: start with letter/underscore, then
@@ -153,10 +153,10 @@ or will be created lazily by 'logical stream' (slot).`,
 	c.Flags().StringVar(&repoURL, "repo", "", "repository URL (required)")
 	_ = c.MarkFlagRequired("repo")
 	c.Flags().StringVar(&slot, "slot", "", "logical slot name (default: pg_hardstorage_logical_<name>)")
-	c.Flags().StringVar(&plugin, "plugin", "pgoutput", "output plugin (v0.1: pgoutput)")
+	c.Flags().StringVar(&plugin, "plugin", "pgoutput", "output plugin (currently: pgoutput)")
 	c.Flags().StringVar(&publication, "publication", "", "publication name on source PG (required)")
 	_ = c.MarkFlagRequired("publication")
-	c.Flags().StringVar(&sinkKind, "sink", "chunked", "sink kind (v0.1: chunked)")
+	c.Flags().StringVar(&sinkKind, "sink", "chunked", "sink kind (currently: chunked)")
 	return c
 }
 

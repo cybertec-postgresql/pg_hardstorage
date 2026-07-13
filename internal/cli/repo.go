@@ -74,13 +74,13 @@ Compression:
 
 Picks the zstd encoder level for new chunks.  Profiling under a
 write-heavy workload (10 GB pgbench seed + sustained UPDATE load)
-showed the v0.1..default ("balanced", ~zstd level 7) burned
+showed the original default ("balanced", ~zstd level 7) burned
 ~40% of pg_hardstorage CPU.
 
   fast     ~zstd level 3.  Halves zstd CPU; ~10-15% larger on disk.
            Recommended for write-heavy clusters where wal-stream
            CPU matters more than disk bytes.
-  balanced ~zstd level 7.  v0.1..default.  Sweet spot for
+  balanced ~zstd level 7.  The default.  Sweet spot for
            the median operator.
   max      ~zstd level 11.  2-3x more CPU than balanced; ~5%
            smaller on disk.  Archive-tier backups read rarely.

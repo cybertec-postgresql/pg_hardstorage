@@ -22,7 +22,7 @@ Resilience, compliance, simplicity, and scale-spanning (10 GB to 100+ TB)
 are the design north stars. WAL streaming over the replication protocol is
 the central data plane. Apache 2.0.
 
-Every command in v0.2 is a real implementation (no scaffolding stubs).
+Every command is a real implementation (no scaffolding stubs).
 The advanced surfaces — gRPC, OIDC + RBAC, advise+execute LLM mode,
 sandbox-PG runtime — extend per docs/SPEC.md.
 
@@ -81,7 +81,7 @@ sandbox-PG runtime — extend per docs/SPEC.md.
 * [pg_hardstorage logs](pg_hardstorage_logs.md)	 - Tail the pg_hardstorage agent's systemd journal
 * [pg_hardstorage manifest](pg_hardstorage_manifest.md)	 - Inspect backup manifests
 * [pg_hardstorage notify](pg_hardstorage_notify.md)	 - Configure event sinks (slack, webhook, syslog, ...)
-* [pg_hardstorage partial](pg_hardstorage_partial.md)	 - Table-level inspection (v0.1) and restore
+* [pg_hardstorage partial](pg_hardstorage_partial.md)	 - Table-level inspection and restore
 * [pg_hardstorage patroni](pg_hardstorage_patroni.md)	 - Read-only view of a Patroni-managed PostgreSQL cluster
 * [pg_hardstorage plugin](pg_hardstorage_plugin.md)	 - Discover and inspect Tier-2 plugins
 * [pg_hardstorage recovery](pg_hardstorage_recovery.md)	 - Recovery-toolkit: readiness scorecard, PITR windows, and more

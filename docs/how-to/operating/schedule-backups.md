@@ -29,14 +29,17 @@ you want:
 | Expression | Meaning |
 | --- | --- |
 | `every 6h` | Every six hours, starting from agent boot. |
-| `daily_at 02:00` | Every day at 02:00 UTC. |
+| `daily_at 02:00` | Every day at 02:00 in the agent host's **local time zone**. |
 | `at 2026-04-28T02:00:00Z` | One-shot at the exact RFC3339 moment. |
 | `off` | Clear the schedule (the task no longer fires). |
 
-Durations accept `s`, `m`, `h`, `d`, `w`. `daily_at` always
-parses in UTC. We deliberately avoid cron syntax — it's a
-bug-magnet and one of the highest-friction surfaces in
-backup tooling.
+Durations accept `s`, `m`, `h`, `d`, `w`. `daily_at` fires in the
+**agent host's local time zone** (including DST shifts) — on a fleet
+spanning time zones, either run the agents with `TZ=UTC` or use
+`every 24h` if you need zone-independent cadence. One-shot `at`
+timestamps carry their own offset (RFC3339). We deliberately avoid
+cron syntax — it's a bug-magnet and one of the highest-friction
+surfaces in backup tooling.
 
 ## Steps
 
@@ -165,7 +168,11 @@ the [`llm` CLI reference](../../reference/cli/pg_hardstorage_llm.md).
 **`usage.bad_schedule`** — the expression didn't parse. The
 error message echoes the failing token. Common causes: cron
 syntax (use `daily_at`), missing duration unit (`6` instead of
-`6h`), local-time `daily_at` (it's UTC).
+`6h`).
+
+**Backups fire at the "wrong" hour** — `daily_at` uses the agent
+host's local time zone, not UTC. Check the host's `TZ` / zoneinfo
+(and remember DST moves the fire time with it).
 
 **Schedule is set but backups aren't firing** — the agent
 isn't running for that deployment. Check:

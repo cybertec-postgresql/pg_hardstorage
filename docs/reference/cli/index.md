@@ -139,7 +139,7 @@ generated from the Cobra command tree on every
 | [`pg_hardstorage notify add`](pg_hardstorage_notify_add.md) | Add a sink to pg_hardstorage.yaml |
 | [`pg_hardstorage notify list`](pg_hardstorage_notify_list.md) | List configured sinks |
 | [`pg_hardstorage notify remove`](pg_hardstorage_notify_remove.md) | Remove a sink by name |
-| [`pg_hardstorage partial`](pg_hardstorage_partial.md) | Table-level inspection (v0.1) and restore |
+| [`pg_hardstorage partial`](pg_hardstorage_partial.md) | Table-level inspection and restore |
 | [`pg_hardstorage partial dump`](pg_hardstorage_partial_dump.md) | Restore + start sandbox PG + pg_dump SQL for selected tables |
 | [`pg_hardstorage partial inspect`](pg_hardstorage_partial_inspect.md) | Report which manifest entries a partial restore would touch |
 | [`pg_hardstorage partial restore`](pg_hardstorage_partial_restore.md) | Extract specific tables' files from a backup into --target |
