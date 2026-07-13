@@ -422,7 +422,7 @@ func runRestore(cmd *cobra.Command, opts restoreOpts) error {
 		if recovery == nil {
 			_ = d.Event(cmd.Context(), output.NewEvent(output.SeverityNotice, "restore", "recovers_to_backup_point").
 				WithBody(map[string]any{
-					"message": "this is a plain restore: the cluster is recovered to the moment backup " + res.BackupID + " was taken (recovery_target='immediate'), not to the latest state. Data created AFTER this backup (e.g. a database added later) is in subsequent WAL and will NOT be present. To recover past this point, use point-in-time recovery (--to-time / --to-lsn to a moment after the change) if WAL is archived, or restore a newer backup.",
+					"message": "this is a plain restore: the cluster is recovered to the moment backup " + res.BackupID + " was taken (recovery_target='immediate'), not to the latest state. Data created AFTER this backup (e.g. a database added later) is in subsequent WAL and will NOT be present. To recover past this point, use point-in-time recovery (--to / --to-lsn to a moment after the change) if WAL is archived, or restore a newer backup.",
 				}))
 		}
 	}

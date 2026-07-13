@@ -643,9 +643,9 @@ func checkOneRepo(ctx context.Context, url string) (repoCheckReport, []doctorIss
 		issues = append(issues, doctorIssue{
 			Severity: output.SeverityWarning,
 			Code:     "audit.anchor_missing",
-			Message:  fmt.Sprintf("doctor: %d audit event(s) at %s but no transparency-log anchor; run `pg_hardstorage audit anchor`", chainKeys, url),
+			Message:  fmt.Sprintf("doctor: %d audit event(s) at %s but no transparency-log anchor; run `pg_hardstorage audit anchor --repo %s`", chainKeys, url, url),
 			Suggestion: &output.Suggestion{
-				Human:   "run `pg_hardstorage audit anchor --repo <url>` (or wire periodic anchoring via the agent's audit_anchor schedule)",
+				Human:   fmt.Sprintf("run `pg_hardstorage audit anchor --repo %s` (or wire periodic anchoring via the agent's audit_anchor schedule)", url),
 				Command: "pg_hardstorage audit anchor --repo " + url,
 			},
 		})
@@ -688,7 +688,7 @@ func checkOneRepo(ctx context.Context, url string) (repoCheckReport, []doctorIss
 		Message: fmt.Sprintf("doctor: anchor for %s is %d event(s) behind (latest anchor at sequence %d, chain head at sequence %d)",
 			url, r.AnchorBehindEvents, latest.HeadSequence, headSeq),
 		Suggestion: &output.Suggestion{
-			Human:   "run `pg_hardstorage audit anchor` to refresh the anchor",
+			Human:   fmt.Sprintf("run `pg_hardstorage audit anchor --repo %s` to refresh the anchor", url),
 			Command: "pg_hardstorage audit anchor --repo " + url,
 		},
 	})

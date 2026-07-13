@@ -7,9 +7,12 @@
 package cli
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
+	"syscall"
 
 	"github.com/spf13/cobra"
 
@@ -44,6 +47,16 @@ func Run(root *cobra.Command) int {
 		return int(output.ExitCodeFor(profErr))
 	}
 	defer stopProfiling(profH)
+
+	// Ctrl-C / SIGTERM cancel the command context instead of killing
+	// the process outright, so RunE returns and deferred cleanup runs
+	// (e.g. `demo` removing its throwaway PostgreSQL container — a
+	// default-disposition SIGINT used to leak it forever). A second
+	// signal falls back to the default disposition (hard kill), so a
+	// wedged command can still be terminated.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	root.SetContext(ctx)
 
 	cmd, err := root.ExecuteC()
 	if err == nil {
@@ -109,6 +122,10 @@ the central data plane. Apache 2.0.
 Every command is a real implementation (no scaffolding stubs).
 The advanced surfaces — gRPC, OIDC + RBAC, advise+execute LLM mode,
 sandbox-PG runtime — extend per docs/SPEC.md.`,
+		// `--version` is CLI muscle memory; make it print the same
+		// one-liner as the `version` subcommand's text renderer.
+		Version: fmt.Sprintf("%s%s (%s, built %s)",
+			version.Version, fipsVersionSuffix(), version.Commit, version.Date),
 		// We render errors ourselves through the dispatcher.
 		SilenceErrors: true,
 		// Don't auto-print usage on every RunE error (only on argument errors).
@@ -159,6 +176,9 @@ sandbox-PG runtime — extend per docs/SPEC.md.`,
 		"write a pprof heap profile to this path at command exit. Off when empty.")
 	root.PersistentFlags().Int("profile-port", 0,
 		"if non-zero, expose net/http/pprof on 127.0.0.1:<port> for live profiling of long-running commands (e.g. `go tool pprof http://127.0.0.1:6060/debug/pprof/profile?seconds=30`). Off when zero.")
+
+	// Match the `version` subcommand's text one-liner exactly.
+	root.SetVersionTemplate("pg_hardstorage {{.Version}}\n")
 
 	root.AddCommand(
 		newVersionCmd(),
@@ -245,6 +265,15 @@ func (v versionBody) WriteText(w io.Writer) error {
 	}
 	_, err := fmt.Fprintf(w, "pg_hardstorage %s%s (%s, built %s)", v.Version, suffix, v.Commit, v.Date)
 	return err
+}
+
+// fipsVersionSuffix mirrors versionBody.WriteText's " [FIPS]" marker for
+// the root --version flag.
+func fipsVersionSuffix() string {
+	if fips.Enabled() {
+		return " [FIPS]"
+	}
+	return ""
 }
 
 func newVersionCmd() *cobra.Command {

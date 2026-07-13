@@ -2063,12 +2063,17 @@ func isPermanentStreamSetupError(err error) bool {
 	if !ok {
 		return false
 	}
+	// Every usage.* code is an operator-input error (bad DSN, bad LSN,
+	// bad flag, ...) — retrying can never fix it. Before this blanket
+	// rule, a literal `--pg-connection ...` placeholder pasted from a
+	// hint retried `usage.bad_pg_dsn` forever with backoff instead of
+	// failing fast.
+	if strings.HasPrefix(oe.Code, "usage.") {
+		return true
+	}
 	switch oe.Code {
 	case "wal.start_before_slot_restart_lsn",
-		"wal.slot_no_restart_lsn",
-		"usage.bad_lsn",
-		"usage.unaligned_lsn",
-		"usage.bad_flag":
+		"wal.slot_no_restart_lsn":
 		return true
 	}
 	return false

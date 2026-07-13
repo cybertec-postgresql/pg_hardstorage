@@ -123,7 +123,7 @@ func runInit(cmd *cobra.Command, opts initOpts) error {
 			opts.pgConn = resolveQuickPGConn()
 		}
 		if opts.repoURL == "" {
-			opts.repoURL = "file:///var/backups/pg_hardstorage"
+			opts.repoURL = quickDefaultRepoURL()
 		}
 	}
 
@@ -190,7 +190,10 @@ func runInit(cmd *cobra.Command, opts initOpts) error {
 		repoID = meta.ID
 	default:
 		return output.NewError("init.repo_init_failed",
-			fmt.Sprintf("init: initialise repo: %v", err)).Wrap(err)
+			fmt.Sprintf("init: initialise repo: %v", err)).
+			WithSuggestion(&output.Suggestion{
+				Human: "pick a directory you can write to, e.g. --repo file://$HOME/pg_hardstorage-repo (or fix permissions on the chosen path) and re-run",
+			}).Wrap(err)
 	}
 	emit(output.SeverityNotice, "repo.ready", map[string]any{
 		"url":     repoURL,
@@ -467,9 +470,8 @@ func (b initResultBody) WriteText(w io.Writer) error {
 	fmt.Fprintln(bw, "Next steps:")
 	fmt.Fprintf(bw, "  1. Start the agent (drives scheduled backups + retention):\n")
 	fmt.Fprintf(bw, "       pg_hardstorage agent\n")
-	fmt.Fprintf(bw, "  2. Continuously archive WAL for PITR:\n")
-	fmt.Fprintf(bw, "       pg_hardstorage wal stream %s --pg-connection ... --repo %s\n",
-		b.Deployment, b.RepoURL)
+	fmt.Fprintf(bw, "  2. Continuously archive WAL for PITR (connection + repo come from the config init just wrote):\n")
+	fmt.Fprintf(bw, "       pg_hardstorage wal stream %s\n", b.Deployment)
 	fmt.Fprintf(bw, "  3. Inspect deployment health:\n")
 	fmt.Fprintf(bw, "       pg_hardstorage doctor %s", b.Deployment)
 	_, err := io.WriteString(w, bw.String())
@@ -515,16 +517,36 @@ func (p *prompter) askLine(label, dflt string, validate func(string) error) (str
 		}
 		fmt.Fprintf(p.w, "  ? %s%s: ", label, hint)
 		line, err := p.r.ReadString('\n')
-		if err != nil && !errors.Is(err, io.EOF) {
+		eof := errors.Is(err, io.EOF)
+		if err != nil && !eof {
 			return "", err
 		}
 		line = strings.TrimSpace(line)
+		// EOF with no pending input: stdin is closed (Ctrl-D, or a
+		// script/CI pipe with no answers). Re-prompting would spin a
+		// tight busy-loop forever, flooding the terminal — abort with
+		// a structured error instead.
+		if eof && line == "" && dflt == "" {
+			fmt.Fprintln(p.w)
+			return "", output.NewError("init.stdin_closed",
+				fmt.Sprintf("init: stdin closed while waiting for %q — cannot prompt", label)).
+				WithSuggestion(&output.Suggestion{
+					Human: "run init interactively, or supply the answers via flags (--pg-connection, --repo, --deployment) with --yes for non-interactive use",
+				}).Wrap(output.ErrUsage)
+		}
 		if line == "" {
 			line = dflt
 		}
 		if validate != nil {
 			if err := validate(line); err != nil {
 				fmt.Fprintf(p.w, "    %v\n", err)
+				if eof {
+					// Nothing more will arrive; don't loop on a
+					// failed validation of the same dead input.
+					return "", output.NewError("init.stdin_closed",
+						fmt.Sprintf("init: stdin closed and the last input for %q failed validation", label)).
+						Wrap(output.ErrUsage)
+				}
 				continue
 			}
 		}
@@ -549,6 +571,31 @@ func (p *prompter) askYes(label string, dflt bool) bool {
 		return dflt
 	}
 	return line == "y" || line == "yes"
+}
+
+// quickDefaultRepoURL picks the --quick default repository location.
+// Root gets the traditional system path; everyone else gets a
+// user-writable directory — the previous hardcoded
+// /var/backups/pg_hardstorage made "zero questions" --quick fail with
+// a permission error for every non-root evaluator.
+func quickDefaultRepoURL() string {
+	if os.Geteuid() == 0 {
+		return "file:///var/backups/pg_hardstorage"
+	}
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		return "file://" + filepath.Join(home, ".local", "share", "pg_hardstorage", "repo")
+	}
+	// No resolvable home (rare: stripped env) — fall back to CWD.
+	return "file://" + filepath.Join(mustGetwd(), "pg_hardstorage-repo")
+}
+
+// mustGetwd returns the working directory or "." — never panics; the
+// caller only builds a default suggestion path from it.
+func mustGetwd() string {
+	if wd, err := os.Getwd(); err == nil {
+		return wd
+	}
+	return "."
 }
 
 // validateNonEmpty rejects empty strings.

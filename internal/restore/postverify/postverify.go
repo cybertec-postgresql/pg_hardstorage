@@ -104,9 +104,12 @@ func ParseMode(s string) (Mode, error) {
 	switch strings.ToLower(strings.TrimSpace(s)) {
 	case "", "auto":
 		return ModeAuto, nil
-	case "off", "false", "no", "none":
+	// "skip" is accepted as an alias so the two sibling restore gates
+	// (--verify skip|require, --verify-restore off|required) don't
+	// punish operators for guessing the other flag's vocabulary.
+	case "off", "false", "no", "none", "skip":
 		return ModeOff, nil
-	case "required", "strict":
+	case "required", "strict", "require", "yes":
 		return ModeRequired, nil
 	case "dump":
 		return ModeDump, nil
