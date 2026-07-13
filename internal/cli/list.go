@@ -271,7 +271,7 @@ func (b listBody) WriteText(w io.Writer) error {
 		if r.Tombstoned {
 			typeCol = r.Type + " [DELETED]"
 		}
-		fmt.Fprintf(tw, "  %s\t%s\t%s\t%d\t%s\t%s\t%dms\n",
+		fmt.Fprintf(tw, "  %s\t%s\t%s\t%d\t%s\t%s\t%d ms\n",
 			r.BackupID, typeCol, r.StoppedAt.Format("2006-01-02 15:04"),
 			r.FileCount, humanBytes(r.LogicalBytes), dedup, r.DurationMS)
 		// Tombstone metadata on a continuation line so the

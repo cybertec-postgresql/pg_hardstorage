@@ -24,6 +24,10 @@ StoppedAt), and reports met / missed against the target.
 Durations parse as Go-style ("1h", "30m", "24h", "7d"-shorthand
 also accepted).
 
+```
+pg_hardstorage slo [flags]
+```
+
 ### Options
 
 ```

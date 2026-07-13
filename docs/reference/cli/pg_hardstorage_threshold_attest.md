@@ -14,6 +14,10 @@ tags:
 
 Sign / verify / show k-of-n attestations
 
+```
+pg_hardstorage threshold attest [flags]
+```
+
 ### Options
 
 ```

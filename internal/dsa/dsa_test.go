@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 
@@ -341,7 +342,8 @@ func TestSuggestedActions_Article17_RecommendsKMSShred(t *testing.T) {
 	hasShred := false
 	for _, a := range r.SuggestedActions {
 		if a.Article == dsa.ArticleErasure &&
-			a.Command == "pg_hardstorage kms shred --tenant tenant-a" {
+			strings.HasPrefix(a.Command, "pg_hardstorage kms shred --repo") &&
+			strings.Contains(a.Command, "--require-approval") {
 			hasShred = true
 		}
 	}

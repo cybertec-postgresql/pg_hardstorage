@@ -28,6 +28,10 @@ v0.1 ships pgoutput + chunked sink. The chunked sink writes batched
 XLogData payloads into the same CAS-backed repo as physical WAL,
 under logical/<deployment>/<stream-name>/<start-lsn>.json.
 
+```
+pg_hardstorage logical <add|list|remove|status|stream> [flags]
+```
+
 ### Options
 
 ```

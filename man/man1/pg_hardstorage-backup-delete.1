@@ -58,6 +58,10 @@ soft-delete plan from the configured policy.
 \fB--require-approval\fP=""
 	approval request ID that must be in approved state for backup.delete + this backup ID (n-of-m gate; strongly recommended)
 
+.PP
+\fB--yes\fP[=false]
+	confirm the tombstone (not needed when --require-approval is given)
+
 
 .SH OPTIONS INHERITED FROM PARENT COMMANDS
 .PP

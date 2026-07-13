@@ -20,6 +20,10 @@ A deployment is the unit of "what we back up" — one PostgreSQL
 service. The subcommands here mutate the deployments: block in
 pg_hardstorage.yaml.
 
+```
+pg_hardstorage deployment [flags]
+```
+
 ### Options
 
 ```

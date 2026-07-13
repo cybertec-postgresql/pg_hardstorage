@@ -23,6 +23,10 @@ The tag is informational in v0.1 — surfaced in doctor and stored
 in pg_hardstorage.yaml. wires it to retention floor, allowed
 regions, and required-encryption enforcement.
 
+```
+pg_hardstorage classify [flags]
+```
+
 ### Options
 
 ```

@@ -37,6 +37,10 @@ Exit codes:
   6  notfound (report id absent for show/verify)
   9  verify failure (signature does not validate)
 
+```
+pg_hardstorage dsa [flags]
+```
+
 ### Options
 
 ```

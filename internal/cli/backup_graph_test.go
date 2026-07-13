@@ -370,7 +370,7 @@ func TestBackupGraph_IncludeTombstoned(t *testing.T) {
 		[][]byte{[]byte("b")})
 
 	// Soft-delete via the existing CLI to exercise the real path.
-	_, _, exit := runCLI(t, "backup", "delete", "db1", dead,
+	_, _, exit := runCLI(t, "backup", "delete", "db1", dead, "--yes",
 		"--repo", w.repoURL, "--reason", "test", "-o", "json")
 	if exit != int(output.ExitOK) {
 		t.Fatalf("backup delete exit = %d", exit)

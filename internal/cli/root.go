@@ -12,6 +12,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/spf13/cobra"
@@ -62,6 +63,12 @@ func Run(root *cobra.Command) int {
 	if err == nil {
 		return int(output.ExitOK)
 	}
+	// Cobra's "unknown command" error is a usage error (exit 2), not
+	// the generic exit 1 — scripts distinguish "I called it wrong"
+	// from "it ran and failed".
+	if strings.HasPrefix(err.Error(), "unknown command ") {
+		err = output.NewError("usage.unknown_command", err.Error()).Wrap(output.ErrUsage)
+	}
 	// Rewrite cobra's bare "accepts N arg(s), received M"
 	// into a message that names the expected positionals
 	// and shows a working example.  The original error's
@@ -72,6 +79,10 @@ func Run(root *cobra.Command) int {
 	// declarative path matches the older hand-written "X is required"
 	// checks (same code, same exit).
 	err = enrichRequiredFlagError(cmd, err)
+	// A missing --pg-connection/--repo on a command whose positional
+	// names an UNKNOWN deployment is really a typo'd deployment name —
+	// say so instead of demanding flags the operator never uses.
+	err = enrichUnknownDeploymentError(cmd, err)
 	// Audit+ #3 — `--on-error-llm` auto-launch.  If the
 	// global flag (or env var) is set AND the failure carries a
 	// structured error code AND a loaded skill declares
@@ -241,6 +252,7 @@ sandbox-PG runtime — extend per docs/SPEC.md.`,
 		newCompletionCmd(root),
 		newDumpCmdTreeCmd(),
 	)
+	hardenGroupCommands(root)
 	return root
 }
 
@@ -266,6 +278,47 @@ func (v versionBody) WriteText(w io.Writer) error {
 	_, err := fmt.Fprintf(w, "pg_hardstorage %s%s (%s, built %s)", v.Version, suffix, v.Commit, v.Date)
 	return err
 }
+
+// hardenGroupCommands walks the command tree and gives every pure group
+// command (has subcommands, no Run of its own) a RunE that FAILS on an
+// unknown subcommand instead of printing help and exiting 0.
+//
+// Without this, `pg_hardstorage wal audi` (a typo of the "cron-friendly"
+// `wal audit`), `repo bogus`, `kms nonsense`, ... all printed the group
+// help to stdout and exited 0 — a cron/CI script with a typo'd
+// subcommand stays green forever while the real job never runs. Bare
+// group invocations (`pg_hardstorage wal`) still print help with exit 0,
+// which is the conventional discovery path.
+func hardenGroupCommands(cmd *cobra.Command) {
+	if cmd.HasSubCommands() && cmd.Run == nil && cmd.RunE == nil {
+		// Mark the synthetic handler so introspection (cmdtree, the
+		// LLM command validator) still treats this as a pure group —
+		// its RunE exists only to reject typos, not to accept args.
+		if cmd.Annotations == nil {
+			cmd.Annotations = map[string]string{}
+		}
+		cmd.Annotations[groupGuardAnnotation] = "1"
+		cmd.RunE = func(c *cobra.Command, args []string) error {
+			if len(args) == 0 {
+				return c.Help()
+			}
+			msg := fmt.Sprintf("unknown subcommand %q for %q", args[0], c.CommandPath())
+			if sugg := c.SuggestionsFor(args[0]); len(sugg) > 0 {
+				msg += fmt.Sprintf(" — did you mean %q?", sugg[0])
+			}
+			return output.NewError("usage.unknown_subcommand", msg).Wrap(output.ErrUsage)
+		}
+	}
+	for _, sub := range cmd.Commands() {
+		hardenGroupCommands(sub)
+	}
+}
+
+// groupGuardAnnotation marks a command whose RunE was synthesised by
+// hardenGroupCommands purely to reject unknown subcommands. Introspection
+// (cmdtree / the LLM command validator) treats such commands as
+// NON-runnable groups.
+const groupGuardAnnotation = "pg_hardstorage.group_guard"
 
 // fipsVersionSuffix mirrors versionBody.WriteText's " [FIPS]" marker for
 // the root --version flag.

@@ -14,6 +14,10 @@ tags:
 
 Opt-in chaos automation
 
+```
+pg_hardstorage gameday <list|run|report> [flags]
+```
+
 ### Options
 
 ```

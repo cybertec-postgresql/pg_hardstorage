@@ -34,6 +34,10 @@ Findings flip the exit code to 9 (ExitVerifyFailed) so cron-driven
 checks alarm. An audit-chain entry is written on every flag —
 bit-rot-style: rare enough to be signal, not noise.
 
+```
+pg_hardstorage anomaly <subcommand> [flags]
+```
+
 ### Options
 
 ```

@@ -14,6 +14,10 @@ tags:
 
 Manage the repository
 
+```
+pg_hardstorage repo <init|check|gc|compact|usage|audit|replicate|set-mode|scrub|wipe|bundle> [flags]
+```
+
 ### Options
 
 ```

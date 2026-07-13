@@ -29,6 +29,10 @@ surface live in their own binaries (pg-hardstorage-pgbackrest,
 pg-hardstorage-barman); this subcommand is only for the
 config-translation half of the migration story.
 
+```
+pg_hardstorage compat <translate> [flags]
+```
+
 ### Options
 
 ```

@@ -70,7 +70,7 @@ func TestBackupDelete_RefusesHeldManifest(t *testing.T) {
 	}
 
 	stdout, stderr, exit := runCLI(t,
-		"backup", "delete", "db1", rootID,
+		"backup", "delete", "db1", rootID, "--yes",
 		"--repo", w.repoURL,
 		"-o", "json",
 	)
@@ -111,7 +111,7 @@ func TestBackupDelete_HoldReleased_AllowsDelete(t *testing.T) {
 	}
 	// Refused first.
 	_, _, exit := runCLI(t,
-		"backup", "delete", "db2", leafID,
+		"backup", "delete", "db2", leafID, "--yes",
 		"--repo", w.repoURL,
 	)
 	if exit == int(output.ExitOK) {
@@ -123,7 +123,7 @@ func TestBackupDelete_HoldReleased_AllowsDelete(t *testing.T) {
 	}
 	// Now succeeds.
 	_, _, exit = runCLI(t,
-		"backup", "delete", "db2", leafID,
+		"backup", "delete", "db2", leafID, "--yes",
 		"--repo", w.repoURL,
 	)
 	if exit != int(output.ExitOK) {
@@ -148,7 +148,7 @@ func TestBackupDelete_CascadeRefusesIfAnyLinkHeld(t *testing.T) {
 	}
 
 	stdout, stderr, exit := runCLI(t,
-		"backup", "delete", "db1", rootID,
+		"backup", "delete", "db1", rootID, "--yes",
 		"--repo", w.repoURL,
 		"--cascade",
 		"-o", "json",

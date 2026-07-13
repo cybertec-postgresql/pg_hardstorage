@@ -355,8 +355,8 @@ func suggestedActionsFor(article Article, tenant string) []SuggestedAction {
 		return []SuggestedAction{
 			{
 				Article:     ArticleErasure,
-				Description: "Crypto-shred the tenant's KEK to render every affected backup unrecoverable.  After successful shred, the data is mathematically inaccessible even though the on-disk bytes remain.",
-				Command:     fmt.Sprintf("pg_hardstorage kms shred --tenant %s", tenant),
+				Description: fmt.Sprintf("Crypto-shred the KEK protecting tenant %q's backups to render every affected backup unrecoverable.  After successful shred, the data is mathematically inaccessible even though the on-disk bytes remain.  kms shred destroys the whole keyring KEK (it is not tenant-scoped), so confirm the affected-backup list first with --dry-run.", tenant),
+				Command:     "pg_hardstorage kms shred --repo <repo> --confirm-keyring <keyring-dir> --require-approval <approval-id> --reason \"GDPR Art. 17\" --yes",
 				DocURL:      "https://docs.pghardstorage.org/runbooks/gdpr-art-17-erasure",
 			},
 			{

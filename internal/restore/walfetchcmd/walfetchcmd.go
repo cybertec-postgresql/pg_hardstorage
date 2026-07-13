@@ -104,7 +104,14 @@ const RestoreBinEnv = "PG_HARDSTORAGE_RESTORE_BIN"
 // `%f` / `%p` are emitted as literal placeholders for PG to
 // substitute per the usual restore_command contract.
 func Build(agentBin, deployment, repoURL string) string {
-	return fmt.Sprintf(`%s wal fetch %s %%f %%p --repo %s; ec=$?; [ $ec = 6 ] && exit 1 || exit $ec`,
+	// `-o text -q`: restore_command runs off-TTY, where the global
+	// output default is JSON — every routine "segment not in repo"
+	// probe (normal at end-of-WAL) would otherwise dump a 10-line
+	// pretty-printed JSON document into the PostgreSQL server log,
+	// twice per poll cycle, and restore error reports quoting the log
+	// tail became walls of nested escaped JSON. Text mode keeps it to
+	// a single line.
+	return fmt.Sprintf(`%s wal fetch %s %%f %%p --repo %s -o text -q; ec=$?; [ $ec = 6 ] && exit 1 || exit $ec`,
 		ShellQuote(resolveRestoreBin(agentBin)),
 		ShellQuote(deployment),
 		ShellQuote(repoURL))

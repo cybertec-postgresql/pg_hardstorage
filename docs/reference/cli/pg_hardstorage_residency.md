@@ -29,6 +29,10 @@ non-empty residency check — local-disk repos can't enforce
 residency, and silently treating that as a pass would defeat the
 purpose.
 
+```
+pg_hardstorage residency [flags]
+```
+
 ### Options
 
 ```

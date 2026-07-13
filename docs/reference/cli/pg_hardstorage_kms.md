@@ -21,6 +21,10 @@ verbs (rotate, shred, hsm-status) land alongside the KMS
 plugin tier (gcp-kms, azure-key-vault, vault-transit) and the PKCS#11
 / TPM 2.0 integrations.
 
+```
+pg_hardstorage kms [flags]
+```
+
 ### Options
 
 ```

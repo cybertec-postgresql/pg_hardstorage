@@ -33,6 +33,10 @@ Each scan compares a baseline window (default 30 d) against a target
 window (default 24 h).  Findings carry severity, actor, action, the
 audit event IDs that triggered them, and a human-readable reason.
 
+```
+pg_hardstorage insider [flags]
+```
+
 ### Options
 
 ```

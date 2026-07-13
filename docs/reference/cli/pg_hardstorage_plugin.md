@@ -25,6 +25,10 @@ what the agent will see before relying on a third-party plugin.
 See docs/reference/plugins/tier2-go-plugin-protocol.md for the
 wire contract.
 
+```
+pg_hardstorage plugin [flags]
+```
+
 ### Options
 
 ```

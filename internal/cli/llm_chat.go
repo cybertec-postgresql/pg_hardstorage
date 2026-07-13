@@ -428,7 +428,7 @@ func streamChatTurn(ctx context.Context, w io.Writer, session *chat.Session, pro
 	if reply.Text != "" {
 		renderConfigFindings(w, configcheck.Scrub(reply.Text))
 	}
-	fmt.Fprintf(w, "  — %d prompt + %d completion tokens · %dms\n\n",
+	fmt.Fprintf(w, "  — %d prompt + %d completion tokens · %d ms\n\n",
 		reply.Usage.PromptTokens, reply.Usage.CompletionTokens, took.Milliseconds())
 	return nil
 }

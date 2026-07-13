@@ -195,7 +195,7 @@ func TestBackupDelete_PastExpiredHold(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, _, exit := runCLI(t, "backup", "delete", "db1", id,
+	_, _, exit := runCLI(t, "backup", "delete", "db1", id, "--yes",
 		"--repo", w.repoURL,
 		"--reason", "after-hold-expired")
 	if exit != int(output.ExitOK) {

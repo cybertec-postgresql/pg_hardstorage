@@ -67,6 +67,9 @@ when triaging undelete candidates discovered via
 		Args:         cobra.ExactArgs(2),
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := requireBackupIDArg("show", args[1]); err != nil {
+				return err
+			}
 			return runShow(cmd, args[0], args[1], repoURL, includeDeleted)
 		},
 	}

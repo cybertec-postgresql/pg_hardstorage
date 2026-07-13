@@ -72,7 +72,7 @@ func TestBuild_DifferentialAgainstRealShell(t *testing.T) {
 				t.Fatal(err)
 			}
 			argv := strings.Split(strings.TrimRight(string(raw), "\n"), "\n")
-			want := []string{"wal", "fetch", dep, walName, dest, "--repo", c.repoURL}
+			want := []string{"wal", "fetch", dep, walName, dest, "--repo", c.repoURL, "-o", "text", "-q"}
 			if len(argv) != len(want) {
 				t.Fatalf("agent saw %d args, want %d\n got=%q\nwant=%q\nrestore_command=%s",
 					len(argv), len(want), argv, want, rc)

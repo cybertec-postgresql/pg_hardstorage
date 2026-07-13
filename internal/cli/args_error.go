@@ -4,11 +4,14 @@ package cli
 import (
 	"fmt"
 	"regexp"
+	"sort"
 	"strings"
 
 	"github.com/spf13/cobra"
 
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/config"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/output"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/paths"
 )
 
 // requiredFlagNameRe extracts the quoted flag names from cobra's
@@ -227,4 +230,58 @@ func substituteExampleTokens(s string) string {
 		"<lsn>", "0/3000028",
 	)
 	return repl.Replace(s)
+}
+
+// enrichUnknownDeploymentError rewrites the "--pg-connection, --repo are
+// required" class of failure into a "deployment not found" error when the
+// evidence says that's what actually happened: the command was invoked
+// with a positional deployment name, a config with deployments exists,
+// and the name isn't in it.
+//
+// Operators with a configured catalogue never pass those flags — when
+// they typo the deployment (`backup db2` vs `db1`) the missing-flag
+// message sends them hunting for connection strings instead of at the
+// actual problem. URL-ish positionals (repo verbs) are left alone.
+func enrichUnknownDeploymentError(cmd *cobra.Command, err error) error {
+	if cmd == nil || err == nil {
+		return err
+	}
+	oe, ok := output.AsOutputError(err)
+	if !ok || oe.Code != "usage.missing_flag" {
+		return err
+	}
+	if !strings.Contains(oe.Message, "--pg-connection") && !strings.Contains(oe.Message, "--repo") {
+		return err
+	}
+	args := cmd.Flags().Args()
+	if len(args) == 0 {
+		return err
+	}
+	name := args[0]
+	if strings.Contains(name, "://") || strings.Contains(name, "/") {
+		return err // a URL/path positional, not a deployment name
+	}
+	p, perr := paths.Resolve(paths.DefaultOptions())
+	if perr != nil {
+		return err
+	}
+	loaded, lerr := config.Load(p)
+	if lerr != nil || len(loaded.Config.Deployments) == 0 {
+		return err
+	}
+	if _, exists := loaded.Config.Deployments[name]; exists {
+		return err // known deployment; the flags really are missing
+	}
+	known := make([]string, 0, len(loaded.Config.Deployments))
+	for n := range loaded.Config.Deployments {
+		known = append(known, n)
+	}
+	sort.Strings(known)
+	return output.NewError("notfound.deployment",
+		fmt.Sprintf("%s: deployment %q is not in pg_hardstorage.yaml (configured: %s)",
+			cmd.Name(), name, strings.Join(known, ", "))).
+		WithSuggestion(&output.Suggestion{
+			Human:   "check the name with `pg_hardstorage deployment list`, or pass --pg-connection/--repo explicitly for an unconfigured database",
+			Command: "pg_hardstorage deployment list",
+		})
 }

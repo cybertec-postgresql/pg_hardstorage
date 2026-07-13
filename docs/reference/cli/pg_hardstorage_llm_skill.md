@@ -14,6 +14,10 @@ tags:
 
 Manage LLM skill files
 
+```
+pg_hardstorage llm skill <list|show|lint|install|rollback|history> [flags]
+```
+
 ### Options
 
 ```

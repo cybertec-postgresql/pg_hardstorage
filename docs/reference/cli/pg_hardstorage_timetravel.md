@@ -27,6 +27,10 @@ forgotten sessions are reapable via 'timetravel cleanup'.
 The data dir lives at --target; the operator starts PG separately
 (systemd, pg_ctl, container — same posture as 'standby create').
 
+```
+pg_hardstorage timetravel <create|list|destroy|cleanup> [flags]
+```
+
 ### Options
 
 ```

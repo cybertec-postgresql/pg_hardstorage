@@ -22,6 +22,10 @@ v0.1 ships fleet search — point at a repository, give a key:value
 query, and get back every matching backup. Multi-repo aggregation
 arrives with the control plane.
 
+```
+pg_hardstorage fleet <search> [flags]
+```
+
 ### Options
 
 ```

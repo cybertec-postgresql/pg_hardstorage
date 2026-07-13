@@ -32,6 +32,10 @@ recovery answers "can we recover", "how long would it take", and
 
 Read-only by construction; safe at any cadence.
 
+```
+pg_hardstorage recovery [flags]
+```
+
 ### Options
 
 ```

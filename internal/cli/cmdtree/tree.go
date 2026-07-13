@@ -256,13 +256,17 @@ func walk(c *cobra.Command, parentPath string) *Node {
 		path = parentPath + " " + c.Name()
 	}
 	n := &Node{
-		Name:     c.Name(),
-		Path:     path,
-		Use:      c.Use,
-		Short:    c.Short,
-		Long:     c.Long,
-		Hidden:   c.Hidden,
-		Runnable: c.Runnable(),
+		Name:   c.Name(),
+		Path:   path,
+		Use:    c.Use,
+		Short:  c.Short,
+		Long:   c.Long,
+		Hidden: c.Hidden,
+		// A group whose RunE was synthesised purely to reject unknown
+		// subcommands (hardenGroupCommands) is NOT runnable for
+		// validation purposes — `deployment create` must still be
+		// classified as unknown_command, not as positional args.
+		Runnable: c.Runnable() && c.Annotations["pg_hardstorage.group_guard"] != "1",
 		Aliases:  append([]string(nil), c.Aliases...),
 		Flags:    collectFlags(c),
 	}

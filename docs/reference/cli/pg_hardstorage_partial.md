@@ -28,6 +28,10 @@ ships alongside the sandbox-PG verifier. The fallback documented
 in the structured error is: full restore into a staging directory
 + pg_dump --table=...
 
+```
+pg_hardstorage partial <inspect|restore> [flags]
+```
+
 ### Options
 
 ```

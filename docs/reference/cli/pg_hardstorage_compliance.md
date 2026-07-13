@@ -25,6 +25,10 @@ Today the only subcommand is `compliance report`; the namespace is
 reserved for additional reports without disturbing the v1 contract
 on the existing one.
 
+```
+pg_hardstorage compliance [flags]
+```
+
 ### Options
 
 ```

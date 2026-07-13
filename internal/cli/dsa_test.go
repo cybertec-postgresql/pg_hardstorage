@@ -201,7 +201,8 @@ func TestDSALocate_HappyArticle17_RecommendsKMSShred(t *testing.T) {
 	hasShred := false
 	for _, a := range v.SuggestedActions {
 		if a.Article == "art_17_erasure" &&
-			a.Command == "pg_hardstorage kms shred --tenant tenant-a" {
+			strings.HasPrefix(a.Command, "pg_hardstorage kms shred --repo") &&
+			strings.Contains(a.Command, "--require-approval") {
 			hasShred = true
 		}
 	}

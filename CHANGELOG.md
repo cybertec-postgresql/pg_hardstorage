@@ -11,6 +11,68 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ## [Unreleased]
 
+## [1.0.9] — 2026-07-13
+
+Twenty operator-annoyance fixes, found by systematically exercising the
+user-facing surface (first-run flows, error hints, exit codes, output
+consistency) and each covered by a regression test.
+
+### Fix: first-run experience
+
+- `init` no longer busy-loops forever (flooding the terminal) when
+  stdin is closed — a CI pipe or Ctrl-D now aborts with a structured
+  error pointing at flags + `--yes`.
+- `init --quick` defaults to a user-writable repository path for
+  non-root users instead of failing on `/var/backups/pg_hardstorage`
+  with a permission error.
+- init's "Next steps" suggests the flagless `wal stream <deployment>`
+  (the config it just wrote makes it work) instead of a literal
+  `--pg-connection ...` placeholder that retried an unparseable DSN
+  forever; operator-input (`usage.*`) errors now fail the stream
+  setup fast instead of retrying.
+- Ctrl-C / SIGTERM now cancel the command context so deferred cleanup
+  runs — interrupting `demo` no longer leaks its throwaway PostgreSQL
+  container.
+
+### Fix: hints and error classification
+
+- Every remediation hint is copy-pasteable: doctor's audit-anchor
+  hints include `--repo <url>`; the checkpoint-mismatch suggestion
+  gives the resume command (it previously steered operators — and
+  automation reading its `command` field — toward `rm -rf` of the
+  partially-restored target, and referenced a flag that doesn't
+  exist); the GDPR erasure report and `jit` help no longer recommend
+  the nonexistent `kms shred --tenant`; the plain-restore notice
+  names the real `--to` flag.
+- A typo'd subcommand under a group (`wal audi`, `repo bogus`) now
+  fails with exit 2 and a "did you mean" instead of printing help and
+  exiting 0 (a cron job with a typo stayed green forever); unknown
+  top-level commands also exit 2.
+- An empty backup-ID argument (unset shell variable) is a usage error
+  (exit 2) — `verify` previously reported it as a manifest SIGNATURE
+  failure (exit 9, the pager-worthy "corrupt/tampered" code).
+- A typo'd deployment name yields `notfound.deployment` listing the
+  configured names instead of demanding `--pg-connection`/`--repo`.
+
+### Fix: consistency and safety
+
+- `--version` works (CLI muscle memory); the help banner no longer
+  claims "v0.2"; `changelog` reports the real binary version.
+- `daily_at` schedules are documented as host-local time (they always
+  were) and the schedule display shows the actual zone + UTC offset.
+- `backup delete` — the most destructive verb — now requires `--yes`
+  (or an approval), matching every other gated verb.
+- Bare `status` / `rotate` / `audit anchor` resolve `--repo` from the
+  config when every deployment shares one repository.
+- `--verify` and `--verify-restore` accept each other's vocabulary
+  (`skip`≡`off`, `require`≡`required`).
+- Durations render as `N ms` everywhere (list/init/verify matched
+  show/backup/restore); the `status` tombstone footnote no longer
+  blows the table fifty columns wide.
+- The generated `restore_command` runs `wal fetch` with `-o text -q`,
+  so routine end-of-WAL probes log one line instead of ten-line JSON
+  documents in the PostgreSQL server log.
+
 ## [1.0.8] — 2026-07-06
 
 ### Fix: post-restore verification failed on every base-only restore

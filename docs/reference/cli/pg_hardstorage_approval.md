@@ -29,6 +29,10 @@ Approvals are signed with each approver's ed25519 keypair (the same
 shape as the manifest-signing keys we already use). Tampering with
 the request invalidates every existing signature.
 
+```
+pg_hardstorage approval [flags]
+```
+
 ### Options
 
 ```
