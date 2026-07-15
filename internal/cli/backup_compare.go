@@ -110,8 +110,8 @@ func runBackupCompare(cmd *cobra.Command, deployment, idA, idB, repoURL string, 
 	}
 
 	return d.Result(output.NewResult(cmd.CommandPath()).WithBody(backupCompareBody{
-		Deployment: deployment,
-		Result:     res,
+		Deployment:       deployment,
+		ComparisonResult: res,
 	}))
 }
 
@@ -140,18 +140,20 @@ func mapCompareReadError(side, deployment, backupID string, err error) error {
 		fmt.Sprintf("backup compare: %s side: %v", side, err)).Wrap(err)
 }
 
-// backupCompareBody is the v1-stable result shape. Embeds the
-// ComparisonResult plus the deployment name (since the result
-// itself only carries per-side BackupID).
+// backupCompareBody is the v1-stable result shape: the
+// ComparisonResult's fields inlined (via embedding) alongside the
+// deployment name. It previously wrapped the result under a nested
+// "result" key, so JSON consumers saw the body at `.result.result.*`
+// — double-nested relative to every sibling command.
 type backupCompareBody struct {
-	Deployment string                   `json:"deployment"`
-	Result     *backup.ComparisonResult `json:"result"`
+	Deployment string `json:"deployment"`
+	*backup.ComparisonResult
 }
 
 // WriteText renders the comparison as compact tables: per-side
 // summary, file-class counts, chunk-class counts, top-N deltas.
 func (b backupCompareBody) WriteText(w io.Writer) error {
-	r := b.Result
+	r := b.ComparisonResult
 	bw := &strings.Builder{}
 	fmt.Fprintf(bw, "compare %s/%s ↔ %s\n", b.Deployment, r.A.BackupID, r.B.BackupID)
 

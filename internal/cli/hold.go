@@ -444,12 +444,26 @@ func runHoldRemove(cmd *cobra.Command, deployment, backupID, repoURL string, yes
 	defer sp.Close()
 
 	store := backup.NewManifestStore(sp)
-	// Capture the hold's holder/reason BEFORE removing it so the audit
-	// record can say whose hold was released and why.
-	var prevHolder, prevReason string
-	if h, gerr := store.GetHold(cmd.Context(), deployment, backupID); gerr == nil && h != nil {
-		prevHolder, prevReason = h.Holder, h.Reason
+	// Read the hold BEFORE removing it — both to stamp the audit record
+	// with whose hold was released and why, and to refuse a release of a
+	// hold that does not exist. The storage-layer RemoveHold is
+	// deliberately idempotent, so without this check a typo'd backup ID
+	// printed "✓ Hold released" with exit 0 while the real hold silently
+	// kept blocking retention — a false success on the legal-hold path.
+	h, gerr := store.GetHold(cmd.Context(), deployment, backupID)
+	switch {
+	case errors.Is(gerr, storage.ErrNotFound):
+		return output.NewError("notfound.hold",
+			fmt.Sprintf("hold remove: no hold exists on %s/%s", deployment, backupID)).
+			WithSuggestion(&output.Suggestion{
+				Human:   "check the exact backup ID with `pg_hardstorage hold list " + deployment + "`",
+				Command: "pg_hardstorage hold list " + deployment + " --repo " + repoURL,
+			})
+	case gerr != nil:
+		return output.NewError("hold.read_failed",
+			fmt.Sprintf("hold remove: read hold %s/%s: %v", deployment, backupID, gerr)).Wrap(gerr)
 	}
+	prevHolder, prevReason := h.Holder, h.Reason
 	if err := store.RemoveHold(cmd.Context(), deployment, backupID); err != nil {
 		return output.NewError("hold.remove_failed",
 			fmt.Sprintf("hold remove: %v", err)).Wrap(err)
