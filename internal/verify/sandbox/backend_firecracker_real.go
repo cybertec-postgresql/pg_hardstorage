@@ -13,7 +13,8 @@
 // reused) must contain an init script that:
 //
 //  1. Mounts /dev/vdb (read-only) at /mnt/pgdata
-//  2. Runs `pg_verifybackup /mnt/pgdata`
+//  2. Runs `pg_verifybackup -n /mnt/pgdata` (-n: WAL lives in the
+//     repo, not the base backup — see verifyBackupArgs)
 //  3. Prints exactly one line on /dev/console with the
 //     magic prefix:
 //

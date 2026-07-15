@@ -348,3 +348,22 @@ func isMissingManifestError(stderr string) bool {
 	return strings.Contains(s, "backup_manifest") &&
 		(strings.Contains(s, "no such file") || strings.Contains(s, "could not open"))
 }
+
+// sandboxDataDir is where every backend mounts the restored data
+// directory before running pg_verifybackup against it.
+const sandboxDataDir = "/var/lib/postgresql/data"
+
+// verifyBackupArgs builds the pg_verifybackup argv for the sandbox.
+//
+// `-n` / `--no-parse-wal` is REQUIRED here, exactly as in the restore
+// path's --verify gate: pg_hardstorage stores WAL in the repository,
+// not inside the base backup, so the restored data dir legitimately
+// has an empty pg_wal/ — the WAL needed to reach consistency is
+// fetched at recovery time via the restore_command. Without -n,
+// pg_verifybackup fails every structurally-valid WAL-streaming backup
+// with "could not find any WAL file", making `recovery drill` (and
+// `verify --full`) report verdict:fail for provably-good backups
+// (issue #26; same defect class as the v1.0.8 restore --verify fix).
+func verifyBackupArgs(binPath string) []string {
+	return []string{binPath, "-n", sandboxDataDir}
+}

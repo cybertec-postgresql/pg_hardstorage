@@ -83,9 +83,9 @@ func (dockerBackend) Verify(ctx context.Context, opts Options) (*Result, error) 
 	// PATH.
 	binPath := "/usr/lib/postgresql/" + opts.PGMajor + "/bin/pg_verifybackup"
 
-	rc, reader, err := cnt.Exec(ctx, []string{binPath, "/var/lib/postgresql/data"})
+	rc, reader, err := cnt.Exec(ctx, verifyBackupArgs(binPath))
 	if err != nil {
-		rc, reader, err = cnt.Exec(ctx, []string{"pg_verifybackup", "/var/lib/postgresql/data"})
+		rc, reader, err = cnt.Exec(ctx, verifyBackupArgs("pg_verifybackup"))
 		if err != nil {
 			return res, fmt.Errorf("sandbox/docker: exec pg_verifybackup: %w", err)
 		}
