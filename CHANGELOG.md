@@ -11,6 +11,38 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ## [Unreleased]
 
+## [1.0.10] — 2026-07-15
+
+### Fix: `recovery drill` failed every WAL-streaming backup (#26)
+
+The verify sandbox that `recovery drill` and `verify --full` use ran
+`pg_verifybackup` without `-n`/`--no-parse-wal`. pg_hardstorage stores
+WAL in the repository rather than inside the base backup, so the
+restored data directory legitimately has an empty `pg_wal/` — the
+WAL-parse step therefore failed every structurally-valid WAL-streaming
+backup with `could not find any WAL file`, and the drill reported
+`verdict: fail` for backups that restore, recover, and serve data
+correctly. The sandbox now verifies the manifest and file checksums
+with `-n`, matching the restore path's `--verify` gate (the same
+defect was fixed there in 1.0.8).
+
+### Fix: `hold remove` reported success for holds that don't exist
+
+Releasing a hold with a typo'd backup ID printed `✓ Hold released`
+and exited 0 while the real hold silently kept blocking retention — a
+false success on the legal-hold path. Removal of a nonexistent hold
+now fails with `notfound.hold` (exit 6) and points at `hold list`;
+releasing an existing hold is unchanged.
+
+### Fix: JSON output shape papercuts
+
+- `backup compare -o json` double-nested its payload under
+  `.result.result.*`; the comparison fields now sit at `.result.*`
+  like every other command.
+- `list` on a deployment with no backups emitted `"backups": null`;
+  it now emits `[]`, so `jq '.result.backups[]'` and every other
+  iterator handle the empty case.
+
 ## [1.0.9] — 2026-07-13
 
 Twenty operator-annoyance fixes, found by systematically exercising the

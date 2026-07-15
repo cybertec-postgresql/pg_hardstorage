@@ -132,6 +132,12 @@ func runList(cmd *cobra.Command, deployment, repoURL string, includeDeleted, onl
 	sort.Slice(summaries, func(i, j int) bool {
 		return summaries[i].StoppedAt.After(summaries[j].StoppedAt)
 	})
+	// A nil slice marshals as JSON null, and `"backups": null` breaks
+	// every consumer iterating `.result.backups[]` — precisely on the
+	// empty-deployment case scripts probe first. Always emit [].
+	if summaries == nil {
+		summaries = []backupSummary{}
+	}
 
 	body := listBody{
 		Deployment:          deployment,

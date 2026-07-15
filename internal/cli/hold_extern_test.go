@@ -67,14 +67,21 @@ func TestHold_Remove_RequiresYes(t *testing.T) {
 	}
 }
 
-func TestHold_Remove_Idempotent(t *testing.T) {
+func TestHold_Remove_AbsentHoldFails(t *testing.T) {
 	w := newReadWorld(t)
 	id := commitVerifiableBackup(t, w, "db1", 0, []byte("body"))
-	// No hold placed; removing should still succeed (idempotent).
-	_, _, exit := runCLI(t, "hold", "remove", "db1", id,
+	// No hold placed; removal must FAIL with notfound.hold. The old
+	// contract (exit 0, "✓ Hold released") was a false success on the
+	// legal-hold path — a typo'd backup ID confirmed a release while
+	// the real hold silently kept blocking retention. Idempotency
+	// lives at the storage layer, not in the operator-facing verb.
+	stdout, stderr, exit := runCLI(t, "hold", "remove", "db1", id,
 		"--repo", w.repoURL, "--yes", "-o", "json")
-	if exit != int(output.ExitOK) {
-		t.Errorf("remove of absent hold should be idempotent (exit 0); got %d", exit)
+	if exit != int(output.ExitNotFound) {
+		t.Errorf("remove of absent hold: exit = %d, want %d (notfound)", exit, output.ExitNotFound)
+	}
+	if !strings.Contains(stdout+stderr, "notfound.hold") {
+		t.Errorf("expected notfound.hold in output:\n%s%s", stdout, stderr)
 	}
 }
 
