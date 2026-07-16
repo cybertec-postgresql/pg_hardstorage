@@ -87,11 +87,12 @@ The `fips` build tag flips the constant in
 the audit log stamps every backup taken by this binary with
 `fips: true` for compliance auditors.
 
-The official `pg-hardstorage-fips` distribution artifact
-also bakes in `-tags pkcs11` so HSM-backed envelopes —
-the canonical FIPS posture — are available out of the
-box.  Operators rolling their own FIPS build add the tag
-explicitly: `go build -tags 'fips pkcs11' …`.
+There is no official `pg-hardstorage-fips` distribution
+artifact today — the FIPS `.deb`/`.rpm` (which will bake in
+`-tags pkcs11` so HSM-backed envelopes, the canonical FIPS
+posture, work out of the box) is roadmap; see the FIPS
+variant how-to. Until it ships, build FIPS yourself and add
+the tag explicitly: `go build -tags 'fips pkcs11' …`.
 
 ---
 
@@ -154,7 +155,7 @@ default file; operators vendor it into their fork once.
 ```
 default    →  no FIPS, no HSM, Docker sandbox
 fips       →  FIPS, no HSM, Docker sandbox      (linux/amd64)
-fips+pkcs11→  FIPS, HSM, Docker sandbox         (linux/amd64; the official FIPS artifact)
+fips+pkcs11→  FIPS, HSM, Docker sandbox         (linux/amd64; the planned official FIPS artifact)
 firecracker→  no FIPS, no HSM, microVM sandbox  (linux + KVM)
 ```
 

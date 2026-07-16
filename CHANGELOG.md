@@ -11,6 +11,38 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ## [Unreleased]
 
+## [1.0.12] — 2026-07-16
+
+### Docs: remove false-capability claims (managed DBaaS + unshipped features)
+
+An audit for the "documents a capability that doesn't actually work"
+class of bug, prompted by finding that several places claimed support
+for fully-managed DBaaS.
+
+- **Managed DBaaS**: the LLM-embedded README, SPEC, and the Kubernetes
+  sidecar chart (Chart.yaml + README) stated or implied pg_hardstorage
+  works against Amazon RDS/Aurora, GCP Cloud SQL, Azure Database, and
+  similar — while the rest of the docs correctly explain it cannot:
+  managed services do not expose `BASE_BACKUP` / physical replication
+  to customers. All corrected to the accurate "self-managed PostgreSQL
+  only" framing. The replication-protocol data plane removes the
+  *host-access* barrier — not the `BASE_BACKUP` barrier.
+- **Rekor**: a `TransparencyLog` code comment claimed a `rekor.Log`
+  implementation ships; only the self-hosted `StorageBackedLog` exists.
+  External Rekor is post-v1.0 roadmap (now stated as such).
+- **PCI-DSS evidence bundle**: the QSA runbook instructed verifying an
+  image-level SLSA attestation that isn't produced (container image
+  unpublished; image SLSA is roadmap). Added the caveat and a working
+  blob/tarball `slsa-verifier` alternative.
+- **FIPS artifact**: build-flavours described an "official
+  pg-hardstorage-fips distribution artifact… out of the box"; no such
+  artifact ships (it's roadmap). Reworded to build-from-source + a
+  planned-artifact note.
+- **SPEC packaging**: Scoop and the `-fips`/`-pg-ext` container image
+  variants were listed as shipped; marked planned/gated.
+
+No behaviour change.
+
 ## [1.0.11] — 2026-07-16
 
 Twelve operator-inconvenience fixes found by exercising the CLI surface,

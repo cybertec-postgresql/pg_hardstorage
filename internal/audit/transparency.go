@@ -30,9 +30,12 @@ import (
 //     who can't reach a public log a tamper-evident-but-self-hosted
 //     trust story.
 //
-//   - rekor.Log: real Rekor + cosign attestation, behind the
-//     same interface so the chain anchor flow doesn't change shape
-//     as the trust model grows.
+//   - A future rekor.Log (real Rekor + cosign attestation) is the
+//     PLANNED second implementation behind the same interface, so the
+//     chain-anchor flow won't change shape as the trust model grows.
+//     It does not exist yet — external Rekor anchoring is post-v1.0
+//     roadmap (see docs/explanation/audit-chain.md); only the
+//     self-hosted StorageBackedLog ships today.
 //
 // This is deliberately a small interface — Put / Get / Latest. The
 // Sigstore-Rekor public API is much larger; we cover only what the
