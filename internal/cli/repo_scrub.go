@@ -12,7 +12,6 @@ import (
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/audit"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/output"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo"
-	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo/casdefault"
 )
 
 // newRepoScrubCmd implements `pg_hardstorage repo scrub <url>`. The
@@ -107,8 +106,8 @@ func runRepoScrub(cmd *cobra.Command, urlArg string, samplePercent int, fullScan
 			fmt.Sprintf("repo scrub: collect references: %v", err)).Wrap(err)
 	}
 
-	// Convert sample-percent to the existing repo.Scrub's limit
-	// argument. limit=0 means "everything" — what --full requests.
+	// Convert sample-percent to a chunk-count limit. limit=0 means
+	// "everything" — what --full requests.
 	limit := 0
 	if samplePercent < 100 {
 		limit = refs.Len() * samplePercent / 100
@@ -117,9 +116,15 @@ func runRepoScrub(cmd *cobra.Command, urlArg string, samplePercent int, fullScan
 		}
 	}
 
-	cas := casdefault.New(sp)
+	// Scrub manifest-aware: build the per-manifest CAS so ENCRYPTED
+	// chunks decrypt with the right DEK before the plaintext-hash
+	// round-trip. The previous bare casdefault.New(sp) had no
+	// decryptor, so every encrypted chunk failed to decrypt and was
+	// bucketed as a "mismatch" — repo scrub reported 100% corruption
+	// on any encrypted repo (the default after `init`) and exited 9.
+	// This is the same machinery `repair scrub` uses.
 	startedAt := time.Now().UTC()
-	res, err := repo.Scrub(cmd.Context(), cas, refs, limit)
+	agg, refsTotal, err := scrubManifestAware(cmd.Context(), sp, limit)
 	stoppedAt := time.Now().UTC()
 	if err != nil {
 		return output.NewError("repo.scrub.failed",
@@ -127,21 +132,21 @@ func runRepoScrub(cmd *cobra.Command, urlArg string, samplePercent int, fullScan
 	}
 
 	body := repoScrubBody{
-		ReferencedTotal: refs.Len(),
-		Sampled:         res.Sampled,
-		OK:              res.OK,
-		MismatchCount:   len(res.Mismatches),
-		BytesScanned:    res.Bytes,
+		ReferencedTotal: refsTotal,
+		Sampled:         agg.Sampled,
+		OK:              agg.OK,
+		MismatchCount:   len(agg.Mismatches),
+		BytesScanned:    agg.Bytes,
 		SamplePercent:   samplePercent,
 		StartedAt:       startedAt,
 		StoppedAt:       stoppedAt,
 		DurationMS:      stoppedAt.Sub(startedAt).Milliseconds(),
 	}
-	for _, h := range res.Mismatches {
+	for _, h := range agg.Mismatches {
 		body.Mismatches = append(body.Mismatches, h.String())
 	}
 
-	if len(res.Mismatches) > 0 {
+	if len(agg.Mismatches) > 0 {
 		// Audit emission for mismatches. Bit-rot is rare enough
 		// that the chain entry is signal — operators investigating
 		// "when did we first see corruption?" can walk the chain
@@ -152,17 +157,17 @@ func runRepoScrub(cmd *cobra.Command, urlArg string, samplePercent int, fullScan
 			Timestamp: time.Now().UTC(),
 			Body: map[string]any{
 				"sample_percent":   samplePercent,
-				"sampled":          res.Sampled,
+				"sampled":          agg.Sampled,
 				"referenced_total": refs.Len(),
-				"mismatch_count":   len(res.Mismatches),
+				"mismatch_count":   len(agg.Mismatches),
 				"first_mismatch":   body.Mismatches[0],
-				"bytes_scanned":    res.Bytes,
+				"bytes_scanned":    agg.Bytes,
 				"duration_ms":      body.DurationMS,
 			},
 		})
 		return output.NewError("verify.scrub_mismatch",
 			fmt.Sprintf("repo scrub: %d chunk(s) failed verification (sampled %d of %d referenced)",
-				len(res.Mismatches), res.Sampled, refs.Len())).
+				len(agg.Mismatches), agg.Sampled, refsTotal)).
 			WithSuggestion(&output.Suggestion{
 				Human:   "the storage backend has corrupted bytes for the listed chunks. Heal from a replica with `pg_hardstorage repair scrub --heal --replica <replica-url>`.",
 				Command: fmt.Sprintf("pg_hardstorage repair scrub --repo %s --heal --replica <replica-url>", urlArg),

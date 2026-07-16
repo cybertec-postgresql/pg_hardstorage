@@ -166,7 +166,7 @@ func runRotate(cmd *cobra.Command, opts rotateOpts) error {
 			Deleted:    len(filteredDelete),
 			Held:       len(heldIDs),
 			HeldIDs:    heldIDs,
-			Decisions:  shapeDecisions(decision),
+			Decisions:  shapeDecisions(decision, heldIDs),
 		}
 
 		if opts.apply {
@@ -296,11 +296,15 @@ func loadDeploymentManifests(ctx context.Context, store *backup.ManifestStore, d
 }
 
 // shapeDecisions flattens the Decision into a JSON-friendly slice
-// suitable for the Result body.
-func shapeDecisions(d retention.Decision) []rotationDecision {
-	keptIDs := map[string]bool{}
-	for _, m := range d.Keep {
-		keptIDs[m.BackupID] = true
+// suitable for the Result body. heldIDs are backups the retention
+// policy chose to delete but a legal hold protects — they must render
+// as "held", NOT "delete", so the per-backup listing agrees with the
+// summary's `held: N (excluded from delete)` line instead of stamping
+// a legally-held manifest `[del ]`.
+func shapeDecisions(d retention.Decision, heldIDs []string) []rotationDecision {
+	held := map[string]bool{}
+	for _, id := range heldIDs {
+		held[id] = true
 	}
 	out := []rotationDecision{}
 	for _, m := range d.Keep {
@@ -312,9 +316,13 @@ func shapeDecisions(d retention.Decision) []rotationDecision {
 		})
 	}
 	for _, m := range d.Delete {
+		action := "delete"
+		if held[m.BackupID] {
+			action = "held"
+		}
 		out = append(out, rotationDecision{
 			BackupID:  m.BackupID,
-			Action:    "delete",
+			Action:    action,
 			StoppedAt: m.StoppedAt.UTC().Format(time.RFC3339),
 		})
 	}
@@ -375,8 +383,11 @@ func (b rotateResultBody) WriteText(w io.Writer) error {
 		}
 		for _, d := range dep.Decisions {
 			label := "keep"
-			if d.Action == "delete" {
+			switch d.Action {
+			case "delete":
 				label = "del "
+			case "held":
+				label = "held"
 			}
 			reasons := strings.Join(d.Reasons, ",")
 			if reasons != "" {

@@ -329,9 +329,9 @@ func writeReadinessSummary(w io.Writer, r *recovery.ReadinessReport) error {
 			}
 			descr = fmt.Sprintf(" (%s target %ds)", ic, r.RTO.TargetSeconds)
 		}
-		fmt.Fprintf(bw, "  RTO estimate: %ds%s at %s\n",
+		fmt.Fprintf(bw, "  RTO estimate: %ds%s at %s/s\n",
 			r.RTO.EstimatedSeconds, descr,
-			(time.Duration(r.RTO.AssumedThroughputBytes) * time.Second).String())
+			humanBytes(r.RTO.AssumedThroughputBytes))
 	}
 	if r.Encryption != nil && r.Encryption.Encrypted {
 		ic := "✓"

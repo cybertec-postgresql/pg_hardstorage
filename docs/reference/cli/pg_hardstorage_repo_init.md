@@ -70,6 +70,7 @@ pg_hardstorage repo init <url> [flags]
 ```
       --compression string      zstd encoder level: fast | balanced | max (default: balanced)
   -h, --help                    help for init
+      --repo string             repository URL to create (alternative to the positional <url>)
       --worm-mode string        WORM retention mode: compliance | governance (set with --worm-retention)
       --worm-retention string   WORM retention duration: e.g. 7y, 30d, 8760h (required with --worm-mode)
 ```

@@ -8,9 +8,12 @@ import (
 	"sort"
 	"time"
 
+	"github.com/jackc/pglogrepl"
+
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/wal/gapstate"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/wal/inventory"
 )
 
 // WindowsSchema is the on-disk version tag for WindowsReport bodies.
@@ -186,6 +189,25 @@ func Windows(ctx context.Context, sp storage.StoragePlugin, deployment string, o
 		if hi != "" {
 			w.LatestRestoreLSN = hi
 			w.HasArchivedWAL = true
+			// Contiguity cap: hi is only the HIGHEST archived segment —
+			// it does not mean every segment between the backup and hi
+			// is present. If there's an archive hole in that range,
+			// replay HALTS at the hole, so the real latest-reachable LSN
+			// is the hole's start, not hi. Without this the window
+			// advertised a PITR range straight across a gap that
+			// `wal list --gaps-only` plainly detects.
+			fromLSN, ferr := pglogrepl.ParseLSN(m.StopLSN)
+			toLSN, terr := pglogrepl.ParseLSN(hi)
+			if ferr == nil && terr == nil && toLSN > fromLSN {
+				if hole, found, herr := inventory.FirstWALHoleInRange(ctx, sp, deployment, m.Timeline, fromLSN, toLSN); herr == nil && found {
+					w.LatestRestoreLSN = hole.String()
+					w.Gaps = append(w.Gaps, WindowGap{
+						StartLSN: hole.String(),
+						EndLSN:   hi,
+						Source:   "archive_scan",
+					})
+				}
+			}
 		}
 		// Manifest-embedded gaps survive gapstate GC.
 		for _, g := range m.WALGaps {

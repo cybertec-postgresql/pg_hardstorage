@@ -605,9 +605,16 @@ func Take(ctx context.Context, opts TakeOptions) (*Result, error) {
 	// can chain-walk correctly.
 	backupType := backup.BackupTypeFull
 	if opts.Incremental != nil && len(opts.Incremental.ParentPGManifest) > 0 {
-		// Refuse incremental against pre-PG-17 servers up front.
+		// Refuse incremental against pre-PG-17 servers up front. This
+		// is an environment precondition (the operator's server is too
+		// old), NOT a tool bug — classify it as a structured usage-class
+		// error, not the generic "internal" (file-a-bug) code.
 		if pgVersion.Major < 17 {
-			return nil, fmt.Errorf("backup: incremental backups require PG 17+; source is PG %d", pgVersion.Major)
+			return nil, output.NewError("backup.incremental_unsupported",
+				fmt.Sprintf("backup: incremental backups require PostgreSQL 17+; source is PG %d", pgVersion.Major)).
+				WithSuggestion(&output.Suggestion{
+					Human: "upgrade the source server to PostgreSQL 17+ (and enable summarize_wal), or take a full backup by omitting --incremental-from",
+				}).Wrap(output.ErrUsage)
 		}
 		backupType = backup.BackupTypeIncremental
 	}
