@@ -94,7 +94,7 @@ PG 15+. WAL transport prefers the **PostgreSQL replication protocol over a datab
    Same binary, same UX, same config file from a 10 GB single-host PG to a 100+ TB Patroni cluster on Kubernetes. Big-database features (parallel chunk pipeline, snapshot base backups, multiple WAL streams from replicas) are *automatic upgrades* the system picks based on database size and topology — the operator does not have to opt into them manually.
 
 5. **WAL via the replication protocol, not URLs.**
-   Default WAL transport is `START_REPLICATION` over libpq. It works on managed PostgreSQL where you can't install an archive library. It survives network blips because of the persistent slot. The C archive-library extension is an *optional* secondary path for environments where pulling can't keep up.
+   Default WAL transport is `START_REPLICATION` over libpq. It works against any self-managed PostgreSQL that exposes physical replication — including locked-down hosts where you can't (or won't) install an archive library, since it needs no OS access. (Fully-managed DBaaS like RDS still withhold physical replication from customers, so they remain unsupported — the libpq transport removes the host-access barrier, not the `BASE_BACKUP`/replication barrier.) It survives network blips because of the persistent slot. The C archive-library extension is an *optional* secondary path for environments where pulling can't keep up.
 
 6. **No magic strings, no jargon.**
    We say *deployment* and *backup* and *restore*. Not "stanza", not "repo node", not "diff backup". The command tree reads like English.
@@ -1302,8 +1302,8 @@ pg_hardstorage/
 - Static `pg_hardstorage` for `linux/{amd64,arm64}`, `darwin/arm64`, `windows/amd64` (CLI-only on Windows).
 - Default `CGO_ENABLED=0`. FIPS variant `pg-hardstorage-fips` (`GOEXPERIMENT=boringcrypto CGO_ENABLED=1`).
 - Reproducible builds (`-trimpath -buildvcs=false`, pinned toolchain).
-- goreleaser: tarballs + `.deb` + `.rpm` + Homebrew tap + Scoop.
-- Container images (distroless): `ghcr.io/cybertec-postgresql/pg_hardstorage:<ver>`, `-fips:<ver>`, `-pg-ext:<pgver>-<hsver>`.
+- goreleaser: tarballs + `.deb` + `.rpm` + Homebrew tap (Scoop: planned).
+- Container images (distroless): `ghcr.io/cybertec-postgresql/pg_hardstorage:<ver>` (publishing gated on GHCR enablement); `-fips:<ver>` and `-pg-ext:<pgver>-<hsver>` variants: planned.
 - All artifacts cosign-signed; SBOM via syft; attestations via `cosign attest`.
 - Apache 2.0; CLA via DCO sign-off; public plugin registry post-v1.0.
 

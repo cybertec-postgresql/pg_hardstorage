@@ -143,7 +143,7 @@ audit period plus the cosign signatures on the running
 binary:
 
 ```sh
-VERSION=1.0.11   # the release / image tag you're attesting
+VERSION=1.0.12   # the release / image tag you're attesting
 
 # 1. Audit chain bundle
 pg_hardstorage audit export-bundle \
@@ -161,6 +161,19 @@ pg_hardstorage compliance report \
     > ./qsa-q1-2026-controls.md
 
 # 3. Build provenance attestation
+#
+# NOTE: image-level SLSA provenance attestation is roadmap and gated on
+# GHCR container publishing being enabled (the container image is not
+# published by default). Only blob/tarball SLSA provenance ships today —
+# for a QSA evidence bundle, verify the RELEASE TARBALL instead:
+#
+#   slsa-verifier verify-artifact \
+#       pg_hardstorage_${VERSION}_linux_amd64.tar.gz \
+#       --provenance-path multiple.intoto.jsonl \
+#       --source-uri github.com/cybertec-postgresql/pg_hardstorage
+#
+# The image-based command below applies ONLY once container images and
+# their SLSA attestations are published (see slsa-l3-provenance.md):
 cosign verify-attestation \
     --type slsaprovenance \
     "ghcr.io/cybertec-postgresql/pg_hardstorage:v${VERSION}" \
