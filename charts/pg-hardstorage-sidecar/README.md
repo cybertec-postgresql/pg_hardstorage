@@ -1,11 +1,13 @@
 # pg-hardstorage-sidecar Helm chart
 
 Deploys the `pg_hardstorage` host agent into Kubernetes as a
-single-replica **StatefulSet** that backs up an *external*
-PostgreSQL cluster reachable over the cluster network — managed
-RDS / Cloud SQL, bare metal, or VMs. Use it when Postgres lives
-outside Kubernetes but you want backups, WAL streaming, and PITR
-driven from a Kubernetes-native workload.
+single-replica **StatefulSet** that backs up an *external*,
+self-managed PostgreSQL cluster reachable over the cluster network —
+bare metal or VMs. Use it when Postgres lives outside Kubernetes but
+you want backups, WAL streaming, and PITR driven from a
+Kubernetes-native workload. (Fully-managed DBaaS such as RDS / Cloud
+SQL are **not supported** — they do not expose `BASE_BACKUP` /
+physical replication to customers.)
 
 > The "sidecar" name is historic: the v0.1 chart packages a
 > standalone agent. True per-pod sidecar injection lands with the

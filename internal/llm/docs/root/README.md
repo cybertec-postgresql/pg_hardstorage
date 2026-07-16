@@ -35,9 +35,11 @@ the anchor that the stream rolls forward from.  Daily backup +
 
 - Data plane is the **PostgreSQL replication protocol over a libpq
   connection** — the agent never needs OS access to the database host
-- Works against **managed PostgreSQL** (RDS, Cloud SQL, Azure Database,
-  Aiven, Supabase, Neon) the same way it runs against **bare-metal
-  Patroni** clusters
+- Runs against **PostgreSQL you operate yourself** — bare-metal, VMs,
+  Patroni clusters, and Kubernetes (CNPG). Fully-managed DBaaS (Amazon
+  RDS/Aurora, GCP Cloud SQL, Azure Database, Aiven, Supabase, Neon) are
+  **not supported**: they do not expose `BASE_BACKUP` / physical
+  replication to customers, so a physical base backup is impossible
 - One binary scales **laptop → 100 TB production fleet**
 - Schema-versioned wire formats with a **24-month backward-compatibility**
   commitment
@@ -111,8 +113,8 @@ bucket, click through.
 - **Patroni clusters**
     - [Tutorial](docs/tutorials/patroni-cluster.md) — three-node cluster from scratch
     - [Failover deep-dive](docs/explanation/patroni-failover-deep-dive.md) — slot continuity, timelines, gap detection
-- **Managed PG (RDS / Cloud SQL / Aiven / Supabase / Neon)**
-    - [Getting started](docs/tutorials/getting-started.md) — the replication-protocol data plane works without host access
+- **Self-managed PostgreSQL (bare-metal / VM / single node)**
+    - [Getting started](docs/tutorials/getting-started.md) — the replication-protocol data plane needs no host access (but the server must expose `BASE_BACKUP`, which fully-managed DBaaS such as RDS/Aurora/Cloud SQL do not)
 
 ---
 

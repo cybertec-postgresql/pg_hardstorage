@@ -75,7 +75,7 @@ If health is not clear the line ends with the most actionable next step, e.g. `�
 
 Greenfield Go project at `/Users/hs/projects/vibe/pg_hardstorage` (empty). The user wants a backup tool that is **resilient first, compliant second, easy to use third, and works from a 10 GB toy database to a 100+ TB production fleet without changing tools**. Not a pgBackRest clone. Cooler, better, nicer — and specifically built for the *3am tired operator* who is the realistic restore-time persona.
 
-PG 15+. WAL transport prefers the **PostgreSQL replication protocol over a database connection** (works on managed services like RDS, doesn't need OS access on the host) — file-system archive paths are belt-and-suspenders, never primary.
+PG 15+. WAL transport prefers the **PostgreSQL replication protocol over a database connection** (no OS access needed on the host) — file-system archive paths are belt-and-suspenders, never primary. This removes the *host-access* barrier but NOT the `BASE_BACKUP` barrier: fully-managed DBaaS (RDS, Aurora, Cloud SQL, Azure Database, ...) withhold physical replication / `BASE_BACKUP` from customers and are therefore **not supported** — pg_hardstorage targets PostgreSQL you run yourself.
 
 ---
 
@@ -166,7 +166,7 @@ PG 15+. WAL transport prefers the **PostgreSQL replication protocol over a datab
 
 | Term | Meaning |
 | --- | --- |
-| **Deployment** | A logical PostgreSQL service we back up. One Patroni cluster, one RDS instance, one CNPG `Cluster` — all called `deployment`. Replaces the word *stanza*. |
+| **Deployment** | A logical PostgreSQL service we back up. One Patroni cluster, one self-managed standalone server, one CNPG `Cluster` — all called `deployment`. Replaces the word *stanza*. |
 | **Backup** | One point-in-time recoverable artifact for a deployment. |
 | **Restore** | The act of recreating a database from a backup (+ optional WAL replay for PITR). |
 | **Repository** (or `repo`) | The destination where chunks, manifests, and WAL live (e.g. `s3://acme-pg-backups/`). One repo can hold many deployments. |
@@ -2310,7 +2310,7 @@ reflects what is actually implemented today vs what remains.
 - **Compliance demo**: WORM-locked bucket + per-tenant KEK; `pg_hardstorage kms shred --tenant T` makes T's backups unrecoverable; cosign signature on attestation; audit log entry written and signed.
 - **Verifier demo**: scheduled job restores yesterday's backup in a Docker sandbox, runs `pg_amcheck` and a `SELECT count(*)`, posts `verification.json` back.
 - **End-to-end demo on bare-metal**: `scripts/devcluster.sh` brings up a 3-node Patroni + MinIO + agents; `pg_hardstorage init`; `pg_hardstorage backup` + `pg_hardstorage restore --to "5 minutes ago"`; both pass.
-- **Managed-DB demo**: backup an AWS RDS instance over the replication protocol (no host access). Demonstrates "WAL via DB connection, not URL" works in practice.
+- **Self-managed-DB demo**: backup a self-hosted PostgreSQL over the replication protocol (no host access — libpq only). Demonstrates "WAL via DB connection, not URL" works in practice. (Fully-managed DBaaS such as RDS/Aurora/Cloud SQL are NOT a target: they withhold `BASE_BACKUP` / physical replication from customers, so a physical base backup is impossible there.)
 
 ---
 
