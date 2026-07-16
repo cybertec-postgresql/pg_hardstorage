@@ -38,6 +38,7 @@ func newRealRepoCmd() *cobra.Command {
 
 func newRepoInitCmd() *cobra.Command {
 	var (
+		repoURL       string
 		wormMode      string
 		wormRetention string
 		compression   string
@@ -89,12 +90,34 @@ Set at init time and not changed after.  A repo holding a mix of
 levels still reads back fine — the decoder handles every level —
 but the operator's "what does my CPU/disk trade-off look like?"
 answer is more legible when the level is stable across the repo.`,
-		Args:         cobra.ExactArgs(1),
+		// Accept the URL as a positional OR via --repo, so it matches
+		// every other repo verb (repo check/usage/gc/scrub all take
+		// --repo). Previously only a bare positional was accepted and
+		// `repo init --repo <url>` failed with "unknown flag".
+		Args:         cobra.MaximumNArgs(1),
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runRepoInit(cmd, args[0], wormMode, wormRetention, compression)
+			url := repoURL
+			if len(args) == 1 {
+				if url != "" && url != args[0] {
+					return output.NewError("usage.bad_args",
+						"repo init: URL given both as positional and --repo; pass it once").Wrap(output.ErrUsage)
+				}
+				url = args[0]
+			}
+			if url == "" {
+				return output.NewError("usage.missing_arg",
+					"repo init: repository URL is required (positional <url> or --repo <url>)").
+					WithSuggestion(&output.Suggestion{
+						Human:   "example: pg_hardstorage repo init file:///srv/pg_hardstorage/repo",
+						Command: "pg_hardstorage repo init --repo file:///srv/pg_hardstorage/repo",
+					}).Wrap(output.ErrUsage)
+			}
+			return runRepoInit(cmd, url, wormMode, wormRetention, compression)
 		},
 	}
+	c.Flags().StringVar(&repoURL, "repo", "",
+		"repository URL to create (alternative to the positional <url>)")
 	c.Flags().StringVar(&wormMode, "worm-mode", "",
 		"WORM retention mode: compliance | governance (set with --worm-retention)")
 	c.Flags().StringVar(&wormRetention, "worm-retention", "",

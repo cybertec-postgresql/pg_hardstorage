@@ -14,6 +14,7 @@ import (
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/output"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/wal/inventory"
 )
 
 // Plan describes what a Restore call would do, without touching disk.
@@ -58,6 +59,13 @@ type Plan struct {
 	// operator can fix them before the real restore.
 	PreflightOK     bool     `json:"preflight_ok"`
 	PreflightIssues []string `json:"preflight_issues,omitempty"`
+
+	// WALArchiveHoleLSN, when non-empty, is the first LSN of a WAL
+	// segment that is MISSING from the archive between this backup's
+	// stop LSN and the requested PITR target — recovery would HALT
+	// there. Surfaced so --preview matches the real restore's
+	// restore.wal_archive_hole warning instead of reporting "✓ ready".
+	WALArchiveHoleLSN string `json:"wal_archive_hole_lsn,omitempty"`
 
 	// EstimatedRTO is a crude estimate based on TotalBytes divided by
 	// a fixed throughput baseline. Documented as approximate; the real
@@ -176,6 +184,22 @@ func Preview(ctx context.Context, opts PlanOptions) (*Plan, error) {
 	// Pre-flight: peek at the target dir without creating anything.
 	// Plan reports the check; it does NOT refuse to plan.
 	preflightSnapshot(opts.TargetDir, p)
+
+	// WAL-contiguity peek: the real restore path warns (restore.
+	// wal_archive_hole) when a WAL segment needed to replay from this
+	// backup to the target LSN is MISSING from the archive — recovery
+	// would HALT at the hole. --preview must surface the same finding
+	// so the dry-run doesn't say "✓ ready" for a target the real
+	// restore knows is unreachable.
+	if opts.Recovery != nil && opts.Recovery.Enable && !opts.Recovery.SkipGapCheck && opts.Recovery.TargetLSN != "" {
+		if target, terr := pglogrepl.ParseLSN(opts.Recovery.TargetLSN); terr == nil {
+			if stop, serr := pglogrepl.ParseLSN(m.StopLSN); serr == nil && target >= stop {
+				if hole, found, herr := inventory.FirstWALHoleInRange(ctx, sp, opts.Deployment, m.Timeline, stop, target); herr == nil && found {
+					p.WALArchiveHoleLSN = hole.String()
+				}
+			}
+		}
+	}
 
 	if p.AssumedThroughput > 0 {
 		secs := float64(p.TotalBytes) / float64(p.AssumedThroughput)

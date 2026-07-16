@@ -5,6 +5,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
+
+	"github.com/spf13/cobra"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/config"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/fsutil"
@@ -16,7 +19,27 @@ import (
 // Same lookup as the rest of the CLI: paths.Resolve handles the
 // XDG / FHS / env / --config precedence; we just append the
 // well-known filename here.
+// captureConfigFlag forwards the global -c/--config flag to the paths
+// layer via PG_HARDSTORAGE_CONFIG_FILE, so every config.Load call in
+// this process (all 40-odd, plus write-back) honours it uniformly.
+// Must run BEFORE installDispatcher / resolveDeploymentDefaults, which
+// both load config. The flag was previously registered but read
+// nowhere — a silent no-op.
+func captureConfigFlag(cmd *cobra.Command, _ []string) error {
+	cfgFile, _ := cmd.Flags().GetString("config")
+	if strings.TrimSpace(cfgFile) != "" {
+		_ = os.Setenv("PG_HARDSTORAGE_CONFIG_FILE", cfgFile)
+	}
+	return nil
+}
+
 func configFilePath(p *paths.Paths) string {
+	// Honour an explicit -c/--config file for write-back too, so
+	// `deployment edit -c staging.yaml` mutates staging.yaml rather
+	// than silently rewriting the XDG/FHS default.
+	if override := p.ConfigFileOverride; override != "" {
+		return override
+	}
 	return filepath.Join(p.Config.Value, "pg_hardstorage.yaml")
 }
 

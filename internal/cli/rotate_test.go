@@ -79,7 +79,7 @@ func TestShapeDecisions_KeepBeforeDeleteWhenSameStoppedAt(t *testing.T) {
 		Delete:     []*backup.Manifest{del},
 		Reasons:    map[string][]string{"k1": {"newest"}},
 	}
-	got := shapeDecisions(d)
+	got := shapeDecisions(d, nil)
 	if len(got) != 2 {
 		t.Fatalf("got %d decisions, want 2", len(got))
 	}
@@ -140,5 +140,26 @@ func TestRotateResultBody_WriteText_Applied(t *testing.T) {
 	}
 	if !strings.Contains(sb.String(), "applied: 3") {
 		t.Errorf("expected applied count; got %s", sb.String())
+	}
+}
+
+// Regression: a held backup that the policy chose to delete must render
+// action "held", not "delete", so the per-backup listing agrees with the
+// summary's held line instead of stamping a legal-hold manifest [del ].
+func TestShapeDecisions_HeldNotDelete(t *testing.T) {
+	keep := &backup.Manifest{BackupID: "k1", StoppedAt: time.Date(2026, 1, 3, 0, 0, 0, 0, time.UTC)}
+	del := &backup.Manifest{BackupID: "d1", StoppedAt: time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC)}
+	held := &backup.Manifest{BackupID: "h1", StoppedAt: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)}
+	d := retention.Decision{Keep: []*backup.Manifest{keep}, Delete: []*backup.Manifest{del, held}}
+	got := shapeDecisions(d, []string{"h1"})
+	byID := map[string]string{}
+	for _, r := range got {
+		byID[r.BackupID] = r.Action
+	}
+	if byID["h1"] != "held" {
+		t.Errorf("held backup h1 action = %q, want held", byID["h1"])
+	}
+	if byID["d1"] != "delete" {
+		t.Errorf("d1 action = %q, want delete", byID["d1"])
 	}
 }

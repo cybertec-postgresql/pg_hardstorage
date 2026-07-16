@@ -471,6 +471,26 @@ func Load(p *paths.Paths) (*LoadResult, error) {
 		}
 	}
 
+	// An explicit -c/--config file (via PG_HARDSTORAGE_CONFIG_FILE) is
+	// authoritative: read exactly that file and skip the well-known
+	// path + drop-in dir, so `-c staging.yaml` operates on staging.yaml
+	// and nothing else. Previously the flag was silently ignored and
+	// the tool always read <Config>/pg_hardstorage.yaml.
+	if override := strings.TrimSpace(p.ConfigFileOverride); override != "" {
+		cfg, sf, err := loadFile(override, "config_flag")
+		if err != nil {
+			return nil, err
+		}
+		res.SourceFiles = append(res.SourceFiles, sf)
+		if sf.ReadOK {
+			res.Config = mergeConfig(res.Config, cfg)
+		}
+		if err := validate(res.Config); err != nil {
+			return nil, err
+		}
+		return res, nil
+	}
+
 	mainPath := filepath.Join(p.Config.Value, "pg_hardstorage.yaml")
 	mainCfg, mainSF, err := loadFile(mainPath, "main")
 	if err != nil {

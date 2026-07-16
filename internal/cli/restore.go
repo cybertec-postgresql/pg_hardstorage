@@ -890,9 +890,16 @@ func (b planBody) WriteText(w io.Writer) error {
 	}
 	fmt.Fprintf(bw, "  Estimated RTO:    %d ms (assuming %s/s)\n",
 		p.EstimatedRTO.Milliseconds(), humanBytes(p.AssumedThroughput))
-	if p.PreflightOK {
+	if p.WALArchiveHoleLSN != "" {
+		fmt.Fprintf(bw, "  WAL archive hole: ✗ segment missing at %s — recovery would HALT before the target\n", p.WALArchiveHoleLSN)
+		fmt.Fprintf(bw, "                    (inspect with `pg_hardstorage wal list %s`; restore from a later backup or pick a target before the hole)\n", p.Deployment)
+	}
+	switch {
+	case p.WALArchiveHoleLSN != "":
+		fmt.Fprintf(bw, "  Pre-flight:       ✗ WAL archive hole (target unreachable)")
+	case p.PreflightOK:
 		fmt.Fprintf(bw, "  Pre-flight:       ✓ ready")
-	} else {
+	default:
 		fmt.Fprintf(bw, "  Pre-flight:       ✗ %d issue(s)\n", len(p.PreflightIssues))
 		for _, issue := range p.PreflightIssues {
 			fmt.Fprintf(bw, "                    - %s\n", issue)

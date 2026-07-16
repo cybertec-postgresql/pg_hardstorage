@@ -11,6 +11,60 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ## [Unreleased]
 
+## [1.0.11] — 2026-07-16
+
+Twelve operator-inconvenience fixes found by exercising the CLI surface,
+each covered by a regression test.
+
+### Fix: false alarms and silent wrong-target
+
+- `repo scrub` reported 100% chunk corruption (exit 9) on every
+  ENCRYPTED repository — the default posture after `init` — because it
+  built a CAS with no decryptor. It now scrubs manifest-aware (the same
+  per-manifest CAS `repair scrub` uses), so encrypted chunks decrypt
+  and verify. Scheduled scrubs no longer page on every run.
+- The global `-c`/`--config` flag was advertised everywhere but read
+  nowhere; the tool always loaded the XDG/FHS default. It is now honored
+  for both reads and write-back, so `-c staging.yaml` operates on that
+  file.
+- `lint` always returned `{"status":"valid"}` without reading anything.
+  It now validates the resolved config with the real loader (strict
+  KnownFields + validation) and fails, with the reason, on a broken one.
+
+### Fix: dry-run / advisory tools no longer give false confidence
+
+- `recovery windows` advertised a PITR range straight across a WAL
+  archive hole; it now caps `latest_restore_lsn` at the first hole and
+  records the gap.
+- `restore --preview` reported "Pre-flight: ✓ ready" for a target past a
+  WAL hole that the real restore warns will HALT recovery; preview now
+  surfaces the same `wal_archive_hole` finding.
+- `capacity report` extrapolated a seconds-long sampling window into
+  absurd per-day growth labeled "medium confidence"; confidence now
+  requires a real observation window (≥1 day for medium, ≥1 week for
+  high) and a sub-day window carries an explicit caveat.
+- `rotate` stamped legally-HELD backups `[del ]` in its per-backup
+  listing while the summary said `held: N (excluded from delete)`; held
+  backups now render `[held]`.
+
+### Fix: wrong error class, hollow stubs, muscle memory
+
+- `recovery readiness` printed the RTO throughput as a nonsensical
+  duration (`46603h22m40s`) instead of a byte-rate (`160.0 MiB/s`).
+- `--incremental-from` against a PostgreSQL < 17 server was reported as
+  the generic `internal` (file-a-bug) code; it is now the structured
+  `backup.incremental_unsupported` usage error with a hint.
+- `repo init` accepts the repository URL via `--repo` (matching every
+  other `repo` verb), not only as a bare positional.
+- `explain <command>` now returns the command's real summary, usage, and
+  description instead of echoing the argument back.
+- `glossary <term>` now returns the term's definition (an unknown term
+  is `notfound.term`) instead of dropping the description.
+
+Also: the renderer integer-fidelity fix (YAML/CSV scientific-notation)
+was extended to a shared `jsonshape` helper covering tap/junit/pdf/
+template.
+
 ## [1.0.10] — 2026-07-15
 
 ### Fix: `recovery drill` failed every WAL-streaming backup (#26)

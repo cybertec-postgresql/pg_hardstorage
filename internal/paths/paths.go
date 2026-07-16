@@ -106,17 +106,21 @@ const (
 
 // Paths is the result of Resolve. Each field carries its Source.
 type Paths struct {
-	Mode         Mode `json:"-"`
-	ModeName     string
-	Config       Path
-	ConfigDropIn Path // <Config>/conf.d
-	Deployments  Path // <Config>/deployments
-	Sinks        Path // <Config>/sinks
-	Skills       Path // <Config>/skills (operator-overrides; user dirs handled separately)
-	Keyring      Path // <Config>/keyring (must be mode 0700)
-	State        Path
-	Inflight     Path // <State>/inflight
-	Crashes      Path // <State>/crashes
+	Mode     Mode `json:"-"`
+	ModeName string
+	Config   Path
+	// ConfigFileOverride, when non-empty, is the explicit config file
+	// named by -c/--config (via PG_HARDSTORAGE_CONFIG_FILE). Empty means
+	// "use the well-known <Config>/pg_hardstorage.yaml".
+	ConfigFileOverride string `json:"-"`
+	ConfigDropIn       Path   // <Config>/conf.d
+	Deployments        Path   // <Config>/deployments
+	Sinks              Path   // <Config>/sinks
+	Skills             Path   // <Config>/skills (operator-overrides; user dirs handled separately)
+	Keyring            Path   // <Config>/keyring (must be mode 0700)
+	State              Path
+	Inflight           Path // <State>/inflight
+	Crashes            Path // <State>/crashes
 	// StateDSN points at the host-local bookkeeping store. Pre-v0.4
 	// this was a path to a SQLite file; we've since collapsed onto
 	// PG / etcd / K8s `Lease` for any persistent state and kept this
@@ -142,17 +146,23 @@ type Options struct {
 	Env       func(string) string // env-var lookup; defaults to os.Getenv
 	Root      string              // when set, overrides everything (paths.root)
 	Overrides map[Domain]string   // per-domain explicit override (e.g. --config-dir)
+	// ConfigFile, when set, names an explicit config FILE (the CLI's
+	// -c/--config flag, forwarded via PG_HARDSTORAGE_CONFIG_FILE). It
+	// overrides the well-known <Config>/pg_hardstorage.yaml lookup for
+	// both reads (config.Load) and write-back (configio).
+	ConfigFile string
 }
 
 // DefaultOptions reads the environment for the running process. Most
 // callers (CLI, agent, server) use this; tests construct Options directly.
 func DefaultOptions() Options {
 	return Options{
-		Mode:    ModeAuto,
-		UID:     os.Geteuid(),
-		HomeDir: getHome(),
-		Env:     os.Getenv,
-		Root:    os.Getenv("PG_HARDSTORAGE_ROOT"),
+		Mode:       ModeAuto,
+		UID:        os.Geteuid(),
+		HomeDir:    getHome(),
+		Env:        os.Getenv,
+		Root:       os.Getenv("PG_HARDSTORAGE_ROOT"),
+		ConfigFile: os.Getenv("PG_HARDSTORAGE_CONFIG_FILE"),
 	}
 }
 
@@ -174,6 +184,7 @@ func Resolve(opts Options) (*Paths, error) {
 	r := &Paths{Mode: mode, ModeName: modeName(mode)}
 
 	r.Config = resolveDomain(DomainConfig, mode, opts)
+	r.ConfigFileOverride = opts.ConfigFile
 	r.State = resolveDomain(DomainState, mode, opts)
 	r.Cache = resolveDomain(DomainCache, mode, opts)
 	r.Logs = resolveDomain(DomainLogs, mode, opts)

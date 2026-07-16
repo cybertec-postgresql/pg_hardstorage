@@ -185,7 +185,12 @@ func Project(ctx context.Context, sp storage.StoragePlugin, repoURL string, opts
 		r.SamplesUsed = len(allSamples)
 		r.ProjectedDeltaBytes = int64(float64(r.BytesPerDay) * horizon.Hours() / 24)
 		r.ProjectedBytes = r.CurrentBytes + r.ProjectedDeltaBytes
-		r.Confidence = confidenceFor(r.RSquared, len(allSamples))
+		windowSeconds := sampleWindowSeconds(allSamples)
+		r.Confidence = confidenceFor(r.RSquared, len(allSamples), windowSeconds)
+		if windowSeconds < 86400 {
+			r.Note = fmt.Sprintf("samples span only %s; a per-day projection from a sub-day window is unreliable — collect backups over several days before trusting the growth rate",
+				time.Duration(windowSeconds*float64(time.Second)).Round(time.Second))
+		}
 	} else {
 		r.SamplesUsed = len(allSamples)
 		r.Confidence = "insufficient"
@@ -203,18 +208,47 @@ func sumDeploymentCurrent(deps []DeploymentProjection) int64 {
 	return s
 }
 
-// confidenceFor maps (R², sample count) to a human-friendly bucket.
-// R² > 0.85 with ≥10 samples = high; > 0.7 with ≥5 = medium; otherwise
-// low. Below 3 samples = insufficient (handled upstream).
-func confidenceFor(r2 float64, n int) string {
+// confidenceFor maps (R², sample count, observation window) to a
+// human-friendly bucket. The observation WINDOW is the load-bearing
+// guard: a per-day projection extrapolated from samples spanning only
+// seconds/minutes is meaningless no matter how tight the R² — e.g. five
+// backups taken within a minute yielded "85 GiB/day, 7.5 TiB projected,
+// confidence: medium". A projection can only be high/medium if the
+// samples actually span a meaningful fraction of the extrapolation unit.
+func confidenceFor(r2 float64, n int, windowSeconds float64) string {
+	const (
+		day  = 86400.0
+		week = 7 * day
+	)
 	switch {
-	case r2 >= 0.85 && n >= 10:
+	case r2 >= 0.85 && n >= 10 && windowSeconds >= week:
 		return "high"
-	case r2 >= 0.70 && n >= 5:
+	case r2 >= 0.70 && n >= 5 && windowSeconds >= day:
 		return "medium"
 	default:
+		// Under a day of observation the per-day slope is not
+		// trustworthy; cap at "low" regardless of fit.
 		return "low"
 	}
+}
+
+// sampleWindowSeconds returns the wall-clock span covered by the
+// samples (last timestamp minus first). Samples are assumed sorted or
+// are min/max-scanned here.
+func sampleWindowSeconds(samples []sample) float64 {
+	if len(samples) < 2 {
+		return 0
+	}
+	min, max := samples[0].at, samples[0].at
+	for _, s := range samples[1:] {
+		if s.at.Before(min) {
+			min = s.at
+		}
+		if s.at.After(max) {
+			max = s.at
+		}
+	}
+	return max.Sub(min).Seconds()
 }
 
 // sample is one (timestamp, cumulative-bytes) point.
