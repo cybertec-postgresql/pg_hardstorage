@@ -22,6 +22,7 @@ import (
 	"sort"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/output"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/renderer/jsonshape"
 )
 
 // Renderer emits CSV. Stateless — every method is safe to call
@@ -70,13 +71,9 @@ func (r *Renderer) RenderResult(w io.Writer, res *output.Result) error {
 	// Round-trip through JSON to normalise to (map[string]any |
 	// []any | scalar). This is the same shape the json renderer
 	// emits, so the on-disk JSON and CSV are perfectly aligned.
-	bs, err := json.Marshal(res.Result)
+	v, err := jsonshape.RoundTrip(res.Result)
 	if err != nil {
 		return fmt.Errorf("csv: marshal body: %w", err)
-	}
-	var v any
-	if err := json.Unmarshal(bs, &v); err != nil {
-		return fmt.Errorf("csv: unmarshal body: %w", err)
 	}
 	return writeAny(cw, v)
 }
@@ -115,11 +112,55 @@ func writeAny(cw *csv.Writer, v any) error {
 	case []any:
 		return writeSlice(cw, x)
 	case map[string]any:
+		// Every list-shaped command wraps its rows in an envelope map
+		// ({deployment, count, backups: [...]}), so without unwrapping
+		// the tabular path was UNREACHABLE from any real command — the
+		// exact use case the package doc names ("pipe list -o csv into
+		// csvkit/excel") produced a 2-column key/value dump with the
+		// row array crammed into one escaped-JSON cell. When the map
+		// is exactly "scalars + one array of objects", the array IS
+		// the table: render it. Anything more ambiguous still falls
+		// back to key/value.
+		if rows, ok := envelopeRows(x); ok {
+			return writeSlice(cw, rows)
+		}
 		return writeKVRows(cw, x)
 	default:
 		// Scalar — single cell.
 		return cw.Write([]string{sanitize(fmt.Sprintf("%v", x))})
 	}
+}
+
+// envelopeRows detects the common list-command envelope: a map whose
+// values are scalars/null plus EXACTLY ONE non-empty []any in which
+// every element is an object. Returns that array. Multiple arrays,
+// arrays of scalars, or nested-map fields disqualify the shape (the
+// caller then uses the key/value fallback).
+func envelopeRows(m map[string]any) ([]any, bool) {
+	var rows []any
+	found := false
+	for _, v := range m {
+		switch x := v.(type) {
+		case []any:
+			if len(x) == 0 {
+				continue // empty list — nothing tabular to prefer
+			}
+			for _, el := range x {
+				if _, isObj := el.(map[string]any); !isObj {
+					return nil, false // array of scalars — not rows
+				}
+			}
+			if found {
+				return nil, false // two candidate tables — ambiguous
+			}
+			rows, found = x, true
+		case map[string]any:
+			return nil, false // nested object — not a plain envelope
+		default:
+			// scalar / null — envelope metadata (count, deployment, …)
+		}
+	}
+	return rows, found
 }
 
 // writeSlice emits a header row + one row per element. Heterogeneous

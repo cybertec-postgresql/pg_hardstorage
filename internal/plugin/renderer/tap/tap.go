@@ -37,6 +37,7 @@ import (
 	"strings"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/output"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/renderer/jsonshape"
 )
 
 // Renderer emits TAP 14.  Stateless.
@@ -143,12 +144,12 @@ func extractPoints(res *output.Result) []point {
 	if res.Result == nil {
 		return nil
 	}
-	bs, err := json.Marshal(res.Result)
+	tree, err := jsonshape.RoundTrip(res.Result)
 	if err != nil {
 		return nil
 	}
-	var v map[string]any
-	if err := json.Unmarshal(bs, &v); err != nil {
+	v, ok := tree.(map[string]any)
+	if !ok {
 		return nil
 	}
 	var points []point

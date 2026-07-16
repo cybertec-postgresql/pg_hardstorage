@@ -21,13 +21,13 @@
 package template
 
 import (
-	stdjson "encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"text/template"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/output"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/renderer/jsonshape"
 )
 
 // Name is the canonical name of this renderer.
@@ -85,13 +85,7 @@ func (r *Renderer) execute(w io.Writer, v any) error {
 }
 
 func jsonRoundTrip(v any) (any, error) {
-	b, err := stdjson.Marshal(v)
-	if err != nil {
-		return nil, err
-	}
-	var out any
-	if err := stdjson.Unmarshal(b, &out); err != nil {
-		return nil, err
-	}
-	return out, nil
+	// Shared helper: preserves integral numbers as int64 so templates
+	// printing byte counts don't emit scientific notation.
+	return jsonshape.RoundTrip(v)
 }

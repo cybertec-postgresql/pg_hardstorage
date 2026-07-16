@@ -41,6 +41,7 @@ import (
 	"time"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/output"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/renderer/jsonshape"
 )
 
 // Renderer emits JUnit XML.  Stateless.
@@ -217,12 +218,12 @@ func buildCasesFromBody(command string, body any) []TestCase {
 	if body == nil {
 		return nil
 	}
-	bs, err := json.Marshal(body)
+	tree, err := jsonshape.RoundTrip(body)
 	if err != nil {
 		return nil
 	}
-	var v map[string]any
-	if err := json.Unmarshal(bs, &v); err != nil {
+	v, ok := tree.(map[string]any)
+	if !ok {
 		return nil
 	}
 	var cases []TestCase

@@ -38,6 +38,7 @@ import (
 	"time"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/output"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/renderer/jsonshape"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/renderer/pdf/pdfwriter"
 )
 
@@ -149,14 +150,9 @@ func renderBody(d *pdfwriter.Doc, body any) {
 	if body == nil {
 		return
 	}
-	bs, err := json.Marshal(body)
+	v, err := jsonshape.RoundTrip(body)
 	if err != nil {
 		d.AddParagraph(fmt.Sprintf("(unable to marshal body: %v)", err))
-		return
-	}
-	var v any
-	if err := json.Unmarshal(bs, &v); err != nil {
-		d.AddParagraph(fmt.Sprintf("(unable to decode body: %v)", err))
 		return
 	}
 	switch x := v.(type) {
