@@ -120,3 +120,53 @@ jobs:
       base64-subjects: "${{ needs.goreleaser.outputs.subject-checksums }}"
       upload-assets: true
       provenance-name: pg_hardstorage.intoto.jsonl
+
+  # End-to-end verification of the real user path: `brew install --cask`
+  # from the public tap on a macOS runner, then run the installed binary.
+  # This is the one thing the local (Linux) release checks can't cover —
+  # Homebrew evaluates the cask's Ruby DSL and symlinks the binary into
+  # $PATH, which only happens on macOS/brew.
+  #
+  # The tap cask is updated either by goreleaser (when HOMEBREW_TAP_TOKEN
+  # is valid) or manually shortly after the release, so this job POLLS
+  # the tap until it serves this release's version before installing. If
+  # the cask hasn't been pushed yet it fails cleanly — re-run just this
+  # job (Actions → this run → "Re-run failed jobs") after the cask lands.
+  homebrew-smoke:
+    name: Homebrew cask install (macOS)
+    needs: [goreleaser]
+    runs-on: macos-latest
+    steps:
+      - name: Derive release version
+        id: v
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+      - name: Wait for the tap cask to reflect this release
+        env:
+          WANT: ${{ steps.v.outputs.version }}
+        run: |
+          url="https://raw.githubusercontent.com/cybertec-postgresql/homebrew-tap/main/Casks/pg_hardstorage.rb"
+          for i in $(seq 1 20); do
+            got=$(curl -fsSL "$url" | sed -n 's/^[[:space:]]*version "\(.*\)"/\1/p' | head -1 || true)
+            echo "attempt $i/20: tap cask version=${got:-<none>} want=$WANT"
+            if [ "$got" = "$WANT" ]; then exit 0; fi
+            sleep 30
+          done
+          echo "::error::tap cask did not reach $WANT within ~10 min — push the cask, then re-run this job"
+          exit 1
+      - name: brew install --cask from the tap
+        run: |
+          brew update --quiet || true
+          brew install --cask cybertec-postgresql/tap/pg_hardstorage
+      - name: Smoke-test the installed binary
+        env:
+          WANT: ${{ steps.v.outputs.version }}
+        run: |
+          set -euo pipefail
+          out=$(pg_hardstorage --version)
+          echo "$out"
+          echo "$out" | grep -q "$WANT" || { echo "::error::--version ($out) does not report $WANT"; exit 1; }
+          pg_hardstorage --help >/dev/null
+          repo="file://$(mktemp -d)/repo"
+          pg_hardstorage repo init "$repo" >/dev/null
+          pg_hardstorage glossary RPO >/dev/null
+          echo "✓ brew-installed pg_hardstorage $WANT runs (version, help, repo init, glossary)"
