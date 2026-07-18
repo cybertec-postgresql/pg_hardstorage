@@ -41,6 +41,9 @@ import (
 	"time"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/compression"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/compression/none"
+	compressionzstd "github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/compression/zstd"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo"
 )
@@ -291,6 +294,11 @@ const (
 // already present are tolerated (Commit returns ErrExists which is
 // downgraded to a no-op here).  Returns the bundle's Manifest.
 func Import(ctx context.Context, r io.Reader, sp storage.StoragePlugin, opts ImportOptions) (*Manifest, error) {
+	mutationLock, err := repo.AcquireMutationLock(ctx, sp, "repository bundle import")
+	if err != nil {
+		return nil, fmt.Errorf("bundle: mutation lock: %w", err)
+	}
+	defer func() { _ = mutationLock.Release(context.Background()) }()
 	tr := tar.NewReader(r)
 
 	maxEntries := opts.MaxEntries
@@ -589,7 +597,30 @@ func verifyChunkPayload(key string, body []byte) error {
 	if err != nil {
 		return fmt.Errorf("bundle: reject chunk %s: not a valid chunk key: %w", key, err)
 	}
-	got := repo.HashOf(body)
+	algo, enc, payload, err := compression.ReadEnvelope(body)
+	if err != nil {
+		return fmt.Errorf("bundle: reject chunk %s: invalid storage envelope: %w", key, err)
+	}
+	// The key addresses plaintext, while bundle entries preserve the raw
+	// compression/encryption envelope. Encrypted payloads cannot be checked
+	// against the plaintext address without the manifest's KEK; AES-GCM will
+	// authenticate them on restore. We can still reject malformed envelopes.
+	if enc.IsEncrypted() {
+		return nil
+	}
+	var plaintext []byte
+	switch algo {
+	case compression.AlgoNone:
+		plaintext, err = (none.Compressor{}).Decompress(payload)
+	case compression.AlgoZstd:
+		plaintext, err = compressionzstd.NewDefault().Decompress(payload)
+	default:
+		err = fmt.Errorf("unsupported compression algorithm %d", algo)
+	}
+	if err != nil {
+		return fmt.Errorf("bundle: reject chunk %s: decode storage envelope: %w", key, err)
+	}
+	got := repo.HashOf(plaintext)
 	if got != want {
 		return fmt.Errorf("bundle: reject chunk %s: payload SHA-256 %s does not match key hash %s",
 			key, got.String(), want.String())

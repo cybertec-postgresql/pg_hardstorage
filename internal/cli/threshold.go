@@ -237,6 +237,9 @@ func runThresholdRosterCreate(cmd *cobra.Command, id string, f thresholdRosterCr
 		return err
 	}
 	defer sp.Close()
+	if err := assertRepoWritable(cmd.Context(), sp, "threshold roster create"); err != nil {
+		return err
+	}
 	// WORM-lock the roster on a compliance repo (it gates restore /
 	// kms-shred quorum, so it must be as immutable as the audit chain),
 	// and anchor its creator to the local key that just signed it.
@@ -420,6 +423,9 @@ func runThresholdAttestSign(cmd *cobra.Command, kind, id string, f thresholdAtte
 		return err
 	}
 	defer sp.Close()
+	if err := assertRepoWritable(cmd.Context(), sp, "threshold attest sign"); err != nil {
+		return err
+	}
 	// Anchor the roster to the local operator key before vouching for a
 	// backup under it — don't lend a signature to a roster this operator
 	// didn't create (a forged roster's attestation is inert at the restore

@@ -39,6 +39,17 @@ import (
 // control-plane restore.
 func runRestoreControlPlane(cmd *cobra.Command, opts restoreOpts) error {
 	d := DispatcherFrom(cmd)
+	if err := rejectChangedDispatchFlags(cmd, "restore",
+		"preview",
+		"force-foreign",
+		"chain-staging-root",
+		"reset-chain-staging",
+		"kms-config",
+		"skip-gap-check",
+		"require-threshold-attestation",
+	); err != nil {
+		return err
+	}
 
 	// Required-field validation. We mirror the server-side checks at
 	// the CLI boundary too so the operator gets a clear local error
@@ -78,6 +89,8 @@ func runRestoreControlPlane(cmd *cobra.Command, opts restoreOpts) error {
 		"backup_id":       opts.backupID, // "latest" is resolved server-side
 		"target_dir":      opts.targetDir,
 		"allow_overwrite": opts.force,
+		"verify_after":    opts.verifyMode,
+		"verify_restore":  opts.verifyRestoreMode,
 	}
 	if opts.repoURL != "" {
 		body["repo"] = opts.repoURL

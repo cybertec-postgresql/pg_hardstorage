@@ -169,6 +169,11 @@ func runBackup(cmd *cobra.Command, opts runOptions) error {
 	if opts.dispatch.controlPlane != "" {
 		return runBackupControlPlane(cmd, opts)
 	}
+	if !finiteFloat(opts.capacitySafetyFactor) || opts.capacitySafetyFactor <= 0 {
+		return output.NewError("usage.bad_flag",
+			fmt.Sprintf("backup: --capacity-safety-factor must be a finite value > 0; got %v", opts.capacitySafetyFactor)).
+			Wrap(output.ErrUsage)
+	}
 
 	// `backup <deployment>` resolves --pg-connection / --repo from the
 	// named deployment in pg_hardstorage.yaml when the operator didn't

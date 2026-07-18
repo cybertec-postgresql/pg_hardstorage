@@ -929,10 +929,10 @@ func deploymentBackupKEKRef(ctx context.Context, sp storage.StoragePlugin, deplo
 // read-side mitigation still covers any cross-posture chunk collision.
 func buildWALEncryption(ctx context.Context, sp storage.StoragePlugin, deployment string, cfg *runner.EncryptionConfig) (encryption.Encryptor, *walsink.EncryptionInfo, error) {
 	if cfg == nil {
-		return nil, nil, nil // no encryption configured → plaintext WAL
-	}
-	if established, ok := deploymentBackupKEKRef(ctx, sp, deployment); ok && established != cfg.KEKRef {
-		return nil, nil, nil // mismatched posture → stay plaintext (avoid divergence)
+		if err := sharedkey.EnsurePlaintextAllowed(ctx, sp); err != nil {
+			return nil, nil, fmt.Errorf("wal: encryption posture: %w", err)
+		}
+		return nil, nil, nil
 	}
 
 	// Custody-specific wrap/unwrap — the only thing that differs between the
@@ -954,26 +954,9 @@ func buildWALEncryption(ctx context.Context, sp storage.StoragePlugin, deploymen
 		wrap = func(dek [encryption.KeyLen]byte) ([]byte, error) { return encryption.Wrap(kek, dek) }
 	}
 
-	res, rerr := sharedkey.Resolve(ctx, sp, cfg.KEKRef, unwrap)
+	dek, rerr := sharedkey.ResolveOrCreate(ctx, sp, cfg.KEKRef, unwrap, wrap)
 	if rerr != nil {
-		return nil, nil, fmt.Errorf("wal: cannot determine the shared DEK; refusing to write WAL that the CAS's plaintext-hash dedup would leave unrestorable: %w", rerr)
-	}
-
-	var dek [encryption.KeyLen]byte
-	switch {
-	case res.DEK != nil:
-		if len(res.DEK) != encryption.KeyLen {
-			return nil, nil, fmt.Errorf("wal: reused shared DEK has wrong length %d", len(res.DEK))
-		}
-		copy(dek[:], res.DEK)
-	case res.SawCandidate:
-		return nil, nil, fmt.Errorf("wal: a prior DEK for KEK %q exists but could not be unwrapped; refusing to write WAL under a fresh DEK that would leave deduped chunks unrestorable (verify the KEK material matches this repo)", cfg.KEKRef)
-	default:
-		fresh, gerr := encryption.GenerateDEK()
-		if gerr != nil {
-			return nil, nil, fmt.Errorf("wal: generate DEK: %w", gerr)
-		}
-		dek = fresh
+		return nil, nil, fmt.Errorf("wal: establish repository encryption domain: %w", rerr)
 	}
 
 	wrapped, werr := wrap(dek)

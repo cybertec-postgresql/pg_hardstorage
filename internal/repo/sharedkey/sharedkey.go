@@ -15,11 +15,14 @@
 package sharedkey
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/encryption"
@@ -28,6 +31,21 @@ import (
 
 // Scheme is the only envelope scheme DEK reuse applies to.
 const Scheme = "aes-256-gcm"
+
+// DomainKey is the repository-wide encryption-domain record.  The CAS key
+// space is global and keyed by plaintext hash, so every encrypted writer in a
+// repository must use the same plaintext DEK.  A conditional create of this
+// record is the serialization point for the first backup/WAL writer.
+const DomainKey = "_encryption/domain.json"
+
+const domainSchema = "pg_hardstorage.encryption_domain.v1"
+
+type domainRecord struct {
+	Schema     string `json:"schema"`
+	Scheme     string `json:"scheme"`
+	KEKRef     string `json:"kek_ref"`
+	WrappedDEK string `json:"wrapped_dek"`
+}
 
 // Unwrapper turns a wrapped-DEK blob into the plaintext DEK. It encapsulates
 // the KEK custody model — local AES-256-GCM unwrap or a cloud-KMS round-trip —
@@ -84,6 +102,7 @@ type manifestEnvelope struct {
 // candidate. This matches the backup-side dek-reuse posture.
 func Resolve(ctx context.Context, sp storage.StoragePlugin, wantKEKRef string, unwrap Unwrapper) (Result, error) {
 	var res Result
+	var resolved []byte
 	for _, prefix := range []string{"manifests/", "wal/"} {
 		for info, err := range sp.List(ctx, prefix) {
 			if err != nil {
@@ -92,18 +111,217 @@ func Resolve(ctx context.Context, sp storage.StoragePlugin, wantKEKRef string, u
 			if !isManifestKey(prefix, info.Key) {
 				continue
 			}
-			wrapped, ok := readWrappedDEK(ctx, sp, info.Key, wantKEKRef)
-			if !ok {
+			env, err := readEnvelope(ctx, sp, info.Key)
+			if err != nil {
+				return Result{}, fmt.Errorf("sharedkey: read %s: %w", info.Key, err)
+			}
+			if env == nil || env.Scheme != Scheme || env.KEKRef != wantKEKRef {
 				continue
 			}
+			wrapped, err := base64.StdEncoding.DecodeString(env.WrappedDEK)
+			if err != nil {
+				return Result{}, fmt.Errorf("sharedkey: decode wrapped DEK in %s: %w", info.Key, err)
+			}
+			ok := len(wrapped) > 0
+			if !ok {
+				return Result{}, fmt.Errorf("sharedkey: empty wrapped DEK in %s", info.Key)
+			}
 			res.SawCandidate = true
-			if dek, uerr := unwrap(wrapped); uerr == nil && len(dek) == encryption.KeyLen {
-				res.DEK = dek
-				return res, nil
+			dek, uerr := unwrap(wrapped)
+			if uerr != nil || len(dek) != encryption.KeyLen {
+				continue
+			}
+			if resolved == nil {
+				resolved = append([]byte(nil), dek...)
+				continue
+			}
+			if !bytes.Equal(resolved, dek) {
+				return Result{}, fmt.Errorf("sharedkey: manifests under KEK %q contain divergent DEKs; refusing to choose one for a plaintext-addressed CAS", wantKEKRef)
 			}
 		}
 	}
+	res.DEK = resolved
 	return res, nil
+}
+
+// ResolveOrCreate returns the one repository-wide plaintext DEK.  The first
+// writer publishes DomainKey with IfNotExists; a concurrent loser reads and
+// adopts the winner's record.  Repositories bootstrapped before DomainKey was
+// introduced are migrated from their manifests, but only when all encrypted
+// manifests use the requested KEKRef and resolve to one DEK.
+func ResolveOrCreate(
+	ctx context.Context,
+	sp storage.StoragePlugin,
+	kekRef string,
+	unwrap Unwrapper,
+	wrap func([encryption.KeyLen]byte) ([]byte, error),
+) ([encryption.KeyLen]byte, error) {
+	if sp == nil || unwrap == nil || wrap == nil || kekRef == "" {
+		return [encryption.KeyLen]byte{}, errors.New("sharedkey: storage, kekRef, wrap and unwrap are required")
+	}
+	if rec, found, err := readDomain(ctx, sp); err != nil {
+		return [encryption.KeyLen]byte{}, err
+	} else if found {
+		return unwrapDomain(rec, kekRef, unwrap)
+	}
+
+	refs, err := DiscoverKEKRefs(ctx, sp)
+	if err != nil {
+		return [encryption.KeyLen]byte{}, err
+	}
+	if len(refs) > 1 || len(refs) == 1 && refs[0] != kekRef {
+		return [encryption.KeyLen]byte{}, fmt.Errorf("sharedkey: repository CAS already contains encrypted artifacts under KEKRef(s) %v; requested %q would create an undecryptable dedup collision", refs, kekRef)
+	}
+
+	res, err := Resolve(ctx, sp, kekRef, unwrap)
+	if err != nil {
+		return [encryption.KeyLen]byte{}, err
+	}
+	var dek [encryption.KeyLen]byte
+	switch {
+	case res.DEK != nil:
+		copy(dek[:], res.DEK)
+	case res.SawCandidate:
+		return dek, fmt.Errorf("sharedkey: prior DEK for KEK %q cannot be unwrapped", kekRef)
+	default:
+		fresh, err := encryption.GenerateDEK()
+		if err != nil {
+			return dek, fmt.Errorf("sharedkey: generate DEK: %w", err)
+		}
+		dek = fresh
+	}
+
+	w, err := wrap(dek)
+	if err != nil {
+		return [encryption.KeyLen]byte{}, fmt.Errorf("sharedkey: wrap domain DEK: %w", err)
+	}
+	rec := domainRecord{Schema: domainSchema, Scheme: Scheme, KEKRef: kekRef, WrappedDEK: base64.StdEncoding.EncodeToString(w)}
+	body, err := json.Marshal(rec)
+	if err != nil {
+		return [encryption.KeyLen]byte{}, fmt.Errorf("sharedkey: marshal domain: %w", err)
+	}
+	_, err = sp.Put(ctx, DomainKey, bytes.NewReader(body), storage.PutOptions{
+		IfNotExists: true, ContentLength: int64(len(body)),
+	})
+	if err == nil {
+		return dek, nil
+	}
+	if !errors.Is(err, storage.ErrAlreadyExists) {
+		return [encryption.KeyLen]byte{}, fmt.Errorf("sharedkey: publish domain: %w", err)
+	}
+	winner, found, err := readDomain(ctx, sp)
+	if err != nil {
+		return [encryption.KeyLen]byte{}, err
+	}
+	if !found {
+		return [encryption.KeyLen]byte{}, errors.New("sharedkey: encryption-domain create lost race but winner is absent")
+	}
+	return unwrapDomain(winner, kekRef, unwrap)
+}
+
+// EnsurePlaintextAllowed refuses a plaintext writer once any encrypted
+// artifact/domain exists.  An encryption-aware CAS can read legacy plaintext
+// envelopes, but a plaintext CAS cannot read an encrypted dedup winner.
+func EnsurePlaintextAllowed(ctx context.Context, sp storage.StoragePlugin) error {
+	if rec, found, err := readDomain(ctx, sp); err != nil {
+		return err
+	} else if found {
+		if rec.Scheme == "none" {
+			return nil
+		}
+		return errors.New("sharedkey: repository encryption domain is established; refusing a plaintext writer that could deduplicate against ciphertext it cannot restore")
+	}
+	refs, err := DiscoverKEKRefs(ctx, sp)
+	if err != nil {
+		return err
+	}
+	if len(refs) > 0 {
+		return fmt.Errorf("sharedkey: repository contains encrypted artifacts under KEKRef(s) %v; refusing plaintext writes", refs)
+	}
+	rec := domainRecord{Schema: domainSchema, Scheme: "none"}
+	body, _ := json.Marshal(rec)
+	_, err = sp.Put(ctx, DomainKey, bytes.NewReader(body), storage.PutOptions{
+		IfNotExists: true, ContentLength: int64(len(body)),
+	})
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, storage.ErrAlreadyExists) {
+		return fmt.Errorf("sharedkey: publish plaintext domain: %w", err)
+	}
+	winner, found, err := readDomain(ctx, sp)
+	if err != nil {
+		return err
+	}
+	if !found || winner.Scheme != "none" {
+		return errors.New("sharedkey: concurrent encrypted writer established the repository domain; refusing plaintext writes")
+	}
+	return nil
+}
+
+// RotateDomain re-wraps the repository DEK after every manifest has been
+// rotated. The caller must hold the repository mutation lock so no writer can
+// observe a half-rotated key posture. Legacy repositories without DomainKey
+// are left alone; their next writer bootstraps the record from rotated
+// manifests.
+func RotateDomain(
+	ctx context.Context,
+	sp storage.StoragePlugin,
+	oldKEKRef, newKEKRef string,
+	unwrapOld Unwrapper,
+	wrapNew func([encryption.KeyLen]byte) ([]byte, error),
+) error {
+	rec, found, err := readDomain(ctx, sp)
+	if err != nil || !found {
+		return err
+	}
+	dek, err := unwrapDomain(rec, oldKEKRef, unwrapOld)
+	if err != nil {
+		return err
+	}
+	w, err := wrapNew(dek)
+	if err != nil {
+		return fmt.Errorf("sharedkey: wrap rotated domain DEK: %w", err)
+	}
+	next := domainRecord{Schema: domainSchema, Scheme: Scheme, KEKRef: newKEKRef, WrappedDEK: base64.StdEncoding.EncodeToString(w)}
+	body, err := json.Marshal(next)
+	if err != nil {
+		return err
+	}
+	if _, err := sp.Put(ctx, DomainKey, bytes.NewReader(body), storage.PutOptions{ContentLength: int64(len(body))}); err != nil {
+		return fmt.Errorf("sharedkey: rewrite encryption domain: %w", err)
+	}
+	return nil
+}
+
+// DiscoverKEKRefs strictly reads every committed manifest and returns the
+// distinct encryption KEKRefs.  Read/parse failures are fatal: treating an
+// unreadable encrypted manifest as "no key exists" can mint a divergent DEK.
+func DiscoverKEKRefs(ctx context.Context, sp storage.StoragePlugin) ([]string, error) {
+	set := map[string]struct{}{}
+	for _, prefix := range []string{"manifests/", "wal/"} {
+		for info, err := range sp.List(ctx, prefix) {
+			if err != nil {
+				return nil, fmt.Errorf("sharedkey: list %s: %w", prefix, err)
+			}
+			if !isManifestKey(prefix, info.Key) {
+				continue
+			}
+			env, err := readEnvelope(ctx, sp, info.Key)
+			if err != nil {
+				return nil, fmt.Errorf("sharedkey: read %s: %w", info.Key, err)
+			}
+			if env != nil && env.Scheme == Scheme && env.KEKRef != "" {
+				set[env.KEKRef] = struct{}{}
+			}
+		}
+	}
+	refs := make([]string, 0, len(set))
+	for ref := range set {
+		refs = append(refs, ref)
+	}
+	sort.Strings(refs)
+	return refs, nil
 }
 
 // isManifestKey reports whether key under prefix is a manifest worth reading
@@ -127,26 +345,60 @@ func isManifestKey(prefix, key string) bool {
 // decoded wrapped-DEK bytes when the envelope is an aes-256-gcm wrap under
 // wantKEKRef. Any read / parse / mismatch yields ok=false so one bad or
 // unrelated object never aborts the scan.
-func readWrappedDEK(ctx context.Context, sp storage.StoragePlugin, key, wantKEKRef string) ([]byte, bool) {
+func readEnvelope(ctx context.Context, sp storage.StoragePlugin, key string) (*envelope, error) {
 	rc, err := sp.Get(ctx, key)
 	if err != nil {
-		return nil, false
+		return nil, err
 	}
 	defer rc.Close()
 	body, err := io.ReadAll(rc)
 	if err != nil {
-		return nil, false
+		return nil, err
 	}
 	var m manifestEnvelope
 	if err := json.Unmarshal(body, &m); err != nil {
-		return nil, false
+		return nil, err
 	}
-	if m.Encryption == nil || m.Encryption.Scheme != Scheme || m.Encryption.KEKRef != wantKEKRef {
-		return nil, false
+	return m.Encryption, nil
+}
+
+func readDomain(ctx context.Context, sp storage.StoragePlugin) (domainRecord, bool, error) {
+	rc, err := sp.Get(ctx, DomainKey)
+	if errors.Is(err, storage.ErrNotFound) {
+		return domainRecord{}, false, nil
 	}
-	wrapped, err := base64.StdEncoding.DecodeString(m.Encryption.WrappedDEK)
 	if err != nil {
-		return nil, false
+		return domainRecord{}, false, fmt.Errorf("sharedkey: read encryption domain: %w", err)
 	}
-	return wrapped, true
+	defer rc.Close()
+	var rec domainRecord
+	if err := json.NewDecoder(io.LimitReader(rc, 1<<20)).Decode(&rec); err != nil {
+		return domainRecord{}, false, fmt.Errorf("sharedkey: decode encryption domain: %w", err)
+	}
+	validPlain := rec.Scheme == "none" && rec.KEKRef == "" && rec.WrappedDEK == ""
+	validEncrypted := rec.Scheme == Scheme && rec.KEKRef != "" && rec.WrappedDEK != ""
+	if rec.Schema != domainSchema || !validPlain && !validEncrypted {
+		return domainRecord{}, false, fmt.Errorf("sharedkey: invalid encryption domain record")
+	}
+	return rec, true, nil
+}
+
+func unwrapDomain(rec domainRecord, wantKEKRef string, unwrap Unwrapper) ([encryption.KeyLen]byte, error) {
+	var out [encryption.KeyLen]byte
+	if rec.KEKRef != wantKEKRef {
+		return out, fmt.Errorf("sharedkey: repository encryption domain uses KEKRef %q; requested %q would create an undecryptable dedup collision", rec.KEKRef, wantKEKRef)
+	}
+	w, err := base64.StdEncoding.DecodeString(rec.WrappedDEK)
+	if err != nil {
+		return out, fmt.Errorf("sharedkey: decode domain wrapped DEK: %w", err)
+	}
+	dek, err := unwrap(w)
+	if err != nil {
+		return out, fmt.Errorf("sharedkey: unwrap domain DEK: %w", err)
+	}
+	if len(dek) != encryption.KeyLen {
+		return out, fmt.Errorf("sharedkey: domain DEK length %d, want %d", len(dek), encryption.KeyLen)
+	}
+	copy(out[:], dek)
+	return out, nil
 }

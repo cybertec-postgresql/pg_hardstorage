@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup"
@@ -208,13 +209,13 @@ func TestWalFetch_EncryptedWithoutKeyringFails(t *testing.T) {
 	}
 }
 
-// TestWalPush_MixedCloudPostureStaysPlaintext guards the divergence hazard: a
+// TestWalPush_MixedCloudPostureIsRefused guards the divergence hazard: a
 // local kek.bin is present, but the deployment's backups are encrypted under a
-// CLOUD KEKRef. Encrypting WAL under the local KEK would diverge from the
-// backup DEK and leave deduped chunks unrestorable, so WAL must stay plaintext
-// (cloud-KMS WAL encryption is tracked in #108). The read-side mitigation
-// still covers any chunk collision.
-func TestWalPush_MixedCloudPostureStaysPlaintext(t *testing.T) {
+// CLOUD KEKRef. Neither encrypting WAL under the local KEK nor falling back to
+// plaintext is safe in a global plaintext-addressed CAS: either posture can
+// deduplicate against bytes the other writer cannot restore. Refuse before a
+// segment manifest is committed.
+func TestWalPush_MixedCloudPostureIsRefused(t *testing.T) {
 	keyringDir := t.TempDir()
 	t.Setenv("PG_HARDSTORAGE_KEYRING_DIR", keyringDir)
 	if _, _, err := keystore.LoadOrGenerateKEK(keyringDir); err != nil {
@@ -244,7 +245,7 @@ func TestWalPush_MixedCloudPostureStaysPlaintext(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Push a WAL segment — it must NOT be encrypted (would diverge).
+	// Push a WAL segment — it must be refused before committing a manifest.
 	segmentName := "000000010000000000000005"
 	segPath := filepath.Join(t.TempDir(), segmentName)
 	body := make([]byte, walsink.SegmentSize)
@@ -255,21 +256,15 @@ func TestWalPush_MixedCloudPostureStaysPlaintext(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, errb, exit := runCLI(t, "wal", "push", "db1", segPath,
-		"--repo", repoURL, "--system-identifier", "7000000000000000001", "-o", "json"); exit != int(output.ExitOK) {
-		t.Fatalf("wal push exit=%d\n%s", exit, errb)
+		"--repo", repoURL, "--system-identifier", "7000000000000000001", "-o", "json"); exit == int(output.ExitOK) {
+		t.Fatalf("wal push unexpectedly accepted a conflicting encryption posture\n%s", errb)
+	} else if !strings.Contains(errb, "undecryptable dedup collision") {
+		t.Fatalf("wal push returned the wrong refusal\n%s", errb)
 	}
 
 	segManifest := filepath.Join(repoRoot, "wal", "db1", "00000001", segmentName+".json")
-	sraw, err := os.ReadFile(segManifest)
-	if err != nil {
-		t.Fatalf("read segment manifest: %v", err)
-	}
-	var sm walsink.SegmentManifest
-	if err := json.Unmarshal(sraw, &sm); err != nil {
-		t.Fatalf("parse segment manifest: %v", err)
-	}
-	if sm.Encryption != nil {
-		t.Errorf("WAL must stay plaintext when backups use a cloud KEKRef (divergence guard); got envelope %+v", sm.Encryption)
+	if _, err := os.Stat(segManifest); !os.IsNotExist(err) {
+		t.Fatalf("conflicting WAL push committed a segment manifest: %v", err)
 	}
 }
 

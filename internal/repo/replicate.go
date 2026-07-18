@@ -212,6 +212,16 @@ func Replicate(ctx context.Context, src, dst storage.StoragePlugin, opts Replica
 		return res, fmt.Errorf("%w: destination repo is WORM-configured (%s) but backend %q does not enforce retention; the replica would be freely deletable. Use a WORM-capable destination or pass AllowUnenforcedWORM to accept the gap",
 			ErrRetentionUnenforceable, opts.DstWORM.Mode, dst.Name())
 	}
+	var mutationLock *MutationLock
+	if !opts.DryRun {
+		var lockErr error
+		mutationLock, lockErr = AcquireMutationLock(ctx, dst, "repository replication")
+		if lockErr != nil {
+			finish()
+			return res, fmt.Errorf("repo replicate: mutation lock: %w", lockErr)
+		}
+		defer func() { _ = mutationLock.Release(context.Background()) }()
+	}
 
 	// Pass 1: collect tombstoned backup IDs at src. A separate pass
 	// (rather than interleaving with the main walk) keeps the logic

@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/compression"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo/bundle"
@@ -47,12 +48,12 @@ func TestImport_RejectsChunkHashMismatch(t *testing.T) {
 	honest := []byte("honest-payload")
 	key := repo.ChunkKey(repo.HashOf(honest))
 	// ... but the bundle ships DIFFERENT bytes at that key.
-	forged := "totally-different-bytes"
+	forged := compression.WriteEnvelope(compression.AlgoNone, compression.EncryptionFields{}, []byte("totally-different-bytes"))
 
 	bundleJSON := `{"schema":"pg_hardstorage.repobundle.v1"}`
 	data := writeTar(t, []struct{ name, body string }{
 		{"bundle.json", bundleJSON},
-		{key, forged},
+		{key, string(forged)},
 	})
 
 	dst := newRepo(t)
@@ -76,10 +77,11 @@ func TestImport_RejectsChunkHashMismatch(t *testing.T) {
 func TestImport_AcceptsMatchingChunkHash(t *testing.T) {
 	honest := "honest-payload"
 	key := repo.ChunkKey(repo.HashOf([]byte(honest)))
+	envelope := compression.WriteEnvelope(compression.AlgoNone, compression.EncryptionFields{}, []byte(honest))
 	bundleJSON := `{"schema":"pg_hardstorage.repobundle.v1"}`
 	data := writeTar(t, []struct{ name, body string }{
 		{"bundle.json", bundleJSON},
-		{key, honest},
+		{key, string(envelope)},
 	})
 
 	dst := newRepo(t)

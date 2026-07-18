@@ -506,6 +506,14 @@ func ParseSegmentName(name string, segmentSize int64) (tli uint32, segNum uint64
 // the push path stays self-contained. The optional WORM policy
 // propagates a per-Put retention deadline.
 func commitManifestStandalone(ctx context.Context, sp storage.StoragePlugin, m *SegmentManifest, worm *repo.WORMPolicy) error {
+	lock, err := repo.AcquireMutationLock(ctx, sp, "WAL push manifest "+m.SegmentName)
+	if err != nil {
+		return fmt.Errorf("walsink push: commit mutation lock: %w", err)
+	}
+	defer func() { _ = lock.Release(context.Background()) }()
+	if err := ensureSegmentChunksPresent(ctx, sp, m); err != nil {
+		return err
+	}
 	body, err := m.MarshalToBytes()
 	if err != nil {
 		return err

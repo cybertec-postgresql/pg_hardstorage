@@ -37,6 +37,7 @@ import (
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo/casdefault"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo/sharedkey"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/wal/gapstate"
 )
 
@@ -477,6 +478,15 @@ func Take(ctx context.Context, opts TakeOptions) (*Result, error) {
 	// fleet-wide audit story coherent (every byte from this backup
 	// retired at the same moment).
 	wormNow := time.Now().UTC()
+	if opts.Encryption == nil {
+		// The CAS namespace is keyed by plaintext hash. Once ciphertext has
+		// won a key, a plaintext writer cannot safely deduplicate against it
+		// because its manifest carries no DEK. Atomically claim/check the
+		// repository's plaintext domain before writing any chunks.
+		if err := sharedkey.EnsurePlaintextAllowed(ctx, sp); err != nil {
+			return nil, fmt.Errorf("backup: encryption posture: %w", err)
+		}
+	}
 
 	// Dedup hints: seed the CAS with the chunk hashes from this
 	// deployment's most recent prior backup. A re-backup of a mostly-
@@ -787,6 +797,7 @@ func Take(ctx context.Context, opts TakeOptions) (*Result, error) {
 	}
 
 	commitOpts := backup.CommitOptions{
+		RequireChunksPresent: true,
 		OnReplicaError: func(rerr error) {
 			// Primary is committed; redundancy copy failed. Surface as
 			// a warning so the operator knows the cross-prefix-survival

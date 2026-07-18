@@ -3,6 +3,7 @@ package capacity_test
 import (
 	"context"
 	"errors"
+	"math"
 	"testing"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/capacity"
@@ -179,5 +180,17 @@ func TestPreflight_CustomSafetyFactor(t *testing.T) {
 	}
 	if res.RequiredBytes != 150 {
 		t.Errorf("RequiredBytes = %d, want 150", res.RequiredBytes)
+	}
+}
+
+func TestPreflightRejectsNonFiniteSafetyFactor(t *testing.T) {
+	sp := &fakeFreeSpaceSP{info: storage.FreeSpaceInfo{AvailableBytes: 1 << 20}}
+	for _, factor := range []float64{math.NaN(), math.Inf(1), math.Inf(-1)} {
+		if _, err := capacity.Preflight(context.Background(), sp, capacity.PreflightOptions{
+			ProjectedBytes: 100,
+			SafetyFactor:   factor,
+		}); err == nil {
+			t.Fatalf("non-finite SafetyFactor %v was accepted", factor)
+		}
 	}
 }

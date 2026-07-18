@@ -128,6 +128,11 @@ func runRotate(cmd *cobra.Command, opts rotateOpts) error {
 		return mapRepoOpenErr(opts.repoURL, err)
 	}
 	defer sp.Close()
+	if opts.apply {
+		if err := assertRepoWritable(cmd.Context(), sp, "rotate --apply"); err != nil {
+			return err
+		}
+	}
 	auditStore := audit.NewStoreWithRetention(sp, repoMeta.WORM)
 
 	store := backup.NewManifestStore(sp)
@@ -227,6 +232,10 @@ func runRotate(cmd *cobra.Command, opts rotateOpts) error {
 func buildPolicy(opts rotateOpts) (retention.Policy, error) {
 	switch strings.ToLower(opts.policy) {
 	case "gfs":
+		if opts.keepDaily < 0 || opts.keepWeekly < 0 || opts.keepMonthly < 0 || opts.keepYearly < 0 {
+			return nil, output.NewError("usage.bad_flag",
+				"rotate: GFS --keep-daily, --keep-weekly, --keep-monthly, and --keep-yearly must all be >= 0").Wrap(output.ErrUsage)
+		}
 		return retention.GFSPolicy{
 			KeepDaily:   opts.keepDaily,
 			KeepWeekly:  opts.keepWeekly,

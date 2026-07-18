@@ -56,8 +56,8 @@ import (
 // contract.
 const SchemaResult = "pg_hardstorage.server.v1"
 
-// Config configures one server. Loaded from the agent config file's
-// top-level `server:` block.
+// Config configures one server. The CLI currently constructs it from
+// explicit server flags; there is no top-level `server:` config-file block.
 type Config struct {
 	// Listen is the bind address. Default: 127.0.0.1:8443. Set to
 	// 0.0.0.0:8443 to expose externally.

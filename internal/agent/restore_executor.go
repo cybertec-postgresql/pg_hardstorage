@@ -17,6 +17,7 @@ import (
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/restore"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/restore/naturaltime"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/restore/postverify"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/restore/walfetchcmd"
 )
 
@@ -164,6 +165,10 @@ func (e *RestoreExecutor) Execute(ctx context.Context, job *ControlPlaneJob, pro
 	}
 
 	allowOverwrite, _ := job.Args["allow_overwrite"].(bool)
+	verifyRestoreMode, _ := job.Args["verify_restore"].(string)
+	if _, err := postverify.ParseMode(verifyRestoreMode); err != nil {
+		return nil, fmt.Errorf("restore-executor: verify_restore: %w", err)
+	}
 
 	rec, err := buildRecoveryFromArgs(job.Args, targetTime)
 	if err != nil {
@@ -220,6 +225,7 @@ func (e *RestoreExecutor) Execute(ctx context.Context, job *ControlPlaneJob, pro
 		TargetDir:       targetDir,
 		Verifier:        e.verifier,
 		AllowOverwrite:  allowOverwrite,
+		VerifyMode:      verifyRestoreMode,
 		Recovery:        rec,
 		TablespaceRemap: tsRemap,
 		KEKForRef:       kekFor,

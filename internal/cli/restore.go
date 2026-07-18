@@ -24,6 +24,7 @@ import (
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/restore"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/restore/naturaltime"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/restore/postverify"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/restore/walfetchcmd"
 )
 
@@ -203,6 +204,13 @@ func runRestore(cmd *cobra.Command, opts restoreOpts) error {
 	if err := validateRestoreTargets(&opts); err != nil {
 		return err
 	}
+	verifyMode, err := restore.ParseVerifyMode(opts.verifyMode)
+	if err != nil {
+		return err
+	}
+	if _, err := postverify.ParseMode(opts.verifyRestoreMode); err != nil {
+		return output.NewError("usage.bad_verify_restore_mode", err.Error()).Wrap(output.ErrUsage)
+	}
 
 	// Control-plane mode short-circuits the local execution path.
 	// The repo / keyring are the agent's concern; the operator only
@@ -224,11 +232,6 @@ func runRestore(cmd *cobra.Command, opts restoreOpts) error {
 	}
 	if len(missing) > 0 {
 		return missingFlagErr(cmd, missing...)
-	}
-
-	verifyMode, err := restore.ParseVerifyMode(opts.verifyMode)
-	if err != nil {
-		return err
 	}
 
 	// Resolve the keyring path the same way the backup command does.

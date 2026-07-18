@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"iter"
 	"net/url"
+	"sync"
 	"testing"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/encryption"
@@ -70,6 +71,57 @@ func mustWrap(t *testing.T, kek, dek [encryption.KeyLen]byte) []byte {
 		t.Fatalf("Wrap: %v", err)
 	}
 	return w
+}
+
+func wrapperFor(kek [encryption.KeyLen]byte) func([encryption.KeyLen]byte) ([]byte, error) {
+	return func(dek [encryption.KeyLen]byte) ([]byte, error) { return encryption.Wrap(kek, dek) }
+}
+
+func TestResolveOrCreate_ConcurrentFirstWritersConverge(t *testing.T) {
+	sp := newSP(t)
+	kek := testKEK(4)
+	var wg sync.WaitGroup
+	deks := make([][encryption.KeyLen]byte, 2)
+	errs := make([]error, 2)
+	for i := range deks {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			deks[i], errs[i] = sharedkey.ResolveOrCreate(context.Background(), sp,
+				"local:default", unwrapperFor(kek), wrapperFor(kek))
+		}(i)
+	}
+	wg.Wait()
+	for _, err := range errs {
+		if err != nil {
+			t.Fatalf("ResolveOrCreate: %v", err)
+		}
+	}
+	if deks[0] != deks[1] {
+		t.Fatalf("concurrent first writers diverged: %x != %x", deks[0], deks[1])
+	}
+}
+
+func TestResolveOrCreate_RejectsDifferentKEKDomain(t *testing.T) {
+	sp := newSP(t)
+	kekA, kekB := testKEK(1), testKEK(9)
+	if _, err := sharedkey.ResolveOrCreate(context.Background(), sp, "tenant:a", unwrapperFor(kekA), wrapperFor(kekA)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sharedkey.ResolveOrCreate(context.Background(), sp, "tenant:b", unwrapperFor(kekB), wrapperFor(kekB)); err == nil {
+		t.Fatal("different KEKRef must not share the plaintext-addressed CAS namespace")
+	}
+}
+
+func TestEncryptionDomain_RejectsPlaintextEncryptedMix(t *testing.T) {
+	sp := newSP(t)
+	if err := sharedkey.EnsurePlaintextAllowed(context.Background(), sp); err != nil {
+		t.Fatal(err)
+	}
+	kek := testKEK(3)
+	if _, err := sharedkey.ResolveOrCreate(context.Background(), sp, "local:default", unwrapperFor(kek), wrapperFor(kek)); err == nil {
+		t.Fatal("encrypted writer must not enter a repository claimed by plaintext writers")
+	}
 }
 
 // TestResolve_FindsInBackupManifest: the classic issue-#28 path — a wrapped

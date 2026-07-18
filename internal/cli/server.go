@@ -68,8 +68,9 @@ Endpoints (all under /v1/):
   GET  /agents [?include_inactive=true]
   POST /agents/heartbeat
 
-The flags below override the config file's server: block. Use
---config to point at a YAML; flag overrides win.`,
+Server runtime settings are currently flag-only. The global --config file
+continues to configure deployments, repositories, sinks, and paths, but it
+does not define a server: block.`,
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			cfg := server.Config{

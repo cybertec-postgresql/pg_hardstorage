@@ -23,6 +23,22 @@ import (
 // wherever they are.
 func runBackupControlPlane(cmd *cobra.Command, opts runOptions) error {
 	d := DispatcherFrom(cmd)
+	if err := rejectChangedDispatchFlags(cmd, "backup",
+		"pg-connection",
+		"tenant",
+		"include-wal",
+		"encrypt",
+		"no-encrypt",
+		"kek",
+		"kms-config",
+		"incremental-from",
+		"ignore-capacity",
+		"capacity-safety-factor",
+		"allow-concurrent",
+		"verbose",
+	); err != nil {
+		return err
+	}
 
 	cli, err := newDispatchClient(&opts.dispatch)
 	if err != nil {
@@ -47,21 +63,8 @@ func runBackupControlPlane(cmd *cobra.Command, opts runOptions) error {
 	if opts.repoURL != "" {
 		body["repo"] = opts.repoURL
 	}
-	// tenant + encrypt/no-encrypt are deployment-config concerns on
-	// the agent side (the agent's local config picks the tenant; the
-	// keyring picks the encryption posture). Passing them through the
-	// API is a+ enhancement once we extend EnqueueOptions; for
-	// now we surface a clear refusal so the operator isn't surprised
-	// when their flag is silently ignored.
-	if opts.tenant != "" && opts.tenant != "default" {
-		return output.NewError("usage.unsupported_flag",
-			"backup --control-plane: --tenant is set by the agent's local config, not the CLI; remove the flag or take the backup locally").
-			Wrap(output.ErrUsage)
-	}
-	if opts.encrypt || opts.noEncrypt {
-		return output.NewError("usage.unsupported_flag",
-			"backup --control-plane: encryption posture is set by the agent's keyring, not --encrypt/--no-encrypt; remove the flag or take the backup locally").
-			Wrap(output.ErrUsage)
+	if opts.stallTimeout != 0 {
+		body["inactivity_timeout"] = opts.stallTimeout.String()
 	}
 
 	id, err := cli.EnqueueBackup(cmd.Context(), opts.deployment, body)

@@ -145,6 +145,9 @@ func newRepoBundleImportCmd() *cobra.Command {
 				return err
 			}
 			defer sp.Close()
+			if err := assertRepoWritable(cmd.Context(), sp, "repo bundle import"); err != nil {
+				return err
+			}
 
 			bm, err := bundle.Import(cmd.Context(), f, sp, bundle.ImportOptions{})
 			if err != nil {

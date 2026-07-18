@@ -63,9 +63,22 @@ func TestRestore_ControlPlane_HappyPath(t *testing.T) {
 	args := []string{
 		"restore", "db1", "latest",
 		"--target", "/tmp/restored",
+		"--verify", "require",
+		"--verify-restore", "required",
 		"-o", "json",
 	}
 	onJob := func(s *server.Server, jobID string) {
+		j, err := s.Jobs().Get(jobID)
+		if err != nil {
+			t.Errorf("get job: %v", err)
+			return
+		}
+		if j.Args["verify_after"] != "require" {
+			t.Errorf("verify_after=%v, want require", j.Args["verify_after"])
+		}
+		if j.Args["verify_restore"] != "required" {
+			t.Errorf("verify_restore=%v, want required", j.Args["verify_restore"])
+		}
 		// Claim — emulates what an agent would do.
 		if _, err := s.Jobs().Claim(server.ClaimOptions{
 			AgentID:     "fake-agent",
@@ -190,5 +203,61 @@ func TestRestore_ControlPlane_ConflictingTargets(t *testing.T) {
 	}
 	if !strings.Contains(errb.String(), "conflicting_targets") {
 		t.Errorf("expected conflicting_targets code; stderr=%s", errb.String())
+	}
+}
+
+func TestRestore_ControlPlane_RefusesLocalOnlySafetyFlags(t *testing.T) {
+	tests := [][]string{
+		{"--preview"},
+		{"--require-threshold-attestation", "prod-admins"},
+		{"--skip-gap-check"},
+		{"--kms-config", "region=eu-central-1"},
+		{"--chain-staging-root", "/tmp/staging"},
+		{"--reset-chain-staging"},
+		{"--force-foreign"},
+	}
+	for _, extra := range tests {
+		t.Run(strings.Join(extra, "_"), func(t *testing.T) {
+			root := cli.NewRoot()
+			var out, errb bytes.Buffer
+			root.SetOut(&out)
+			root.SetErr(&errb)
+			args := []string{
+				"restore", "db1", "latest",
+				"--target", "/tmp/restored",
+				"--control-plane", "http://does-not-matter:8443",
+				"-o", "json",
+			}
+			root.SetArgs(append(args, extra...))
+			exit := cli.Run(root)
+			if exit != int(output.ExitMisuse) {
+				t.Fatalf("exit=%d, want %d; stderr=%s", exit, output.ExitMisuse, errb.String())
+			}
+			if !strings.Contains(errb.String(), "usage.unsupported_flag") {
+				t.Fatalf("missing unsupported-flag error: %s", errb.String())
+			}
+		})
+	}
+}
+
+func TestRestore_ControlPlane_RejectsBadVerificationModesBeforeDispatch(t *testing.T) {
+	for _, extra := range [][]string{
+		{"--verify", "typo"},
+		{"--verify-restore", "typo"},
+	} {
+		t.Run(strings.Join(extra, "_"), func(t *testing.T) {
+			root := cli.NewRoot()
+			var out, errb bytes.Buffer
+			root.SetOut(&out)
+			root.SetErr(&errb)
+			args := []string{
+				"restore", "db1", "latest", "--target", "/tmp/restored",
+				"--control-plane", "http://does-not-matter:8443", "-o", "json",
+			}
+			root.SetArgs(append(args, extra...))
+			if exit := cli.Run(root); exit != int(output.ExitMisuse) {
+				t.Fatalf("exit=%d, want misuse; stderr=%s", exit, errb.String())
+			}
+		})
 	}
 }
