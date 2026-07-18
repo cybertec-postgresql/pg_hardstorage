@@ -854,6 +854,14 @@ func (s *Sink) procErrLoad() error {
 // renames it to the canonical key. RenameIfNotExists makes a re-commit
 // of an existing segment a no-op (idempotent).
 func (s *Sink) commitManifest(ctx context.Context, m *SegmentManifest) error {
+	lock, err := repo.AcquireMutationLock(ctx, s.sp, "WAL manifest "+m.SegmentName)
+	if err != nil {
+		return fmt.Errorf("walsink: commit mutation lock: %w", err)
+	}
+	defer func() { _ = lock.Release(context.Background()) }()
+	if err := ensureSegmentChunksPresent(ctx, s.sp, m); err != nil {
+		return err
+	}
 	body, err := m.MarshalToBytes()
 	if err != nil {
 		return err
@@ -886,6 +894,15 @@ func (s *Sink) commitManifest(ctx context.Context, m *SegmentManifest) error {
 			return verifyExistingManifest(ctx, s.sp, key, m)
 		}
 		return fmt.Errorf("walsink: rename manifest: %w", err)
+	}
+	return nil
+}
+
+func ensureSegmentChunksPresent(ctx context.Context, sp storage.StoragePlugin, m *SegmentManifest) error {
+	for _, ref := range m.Chunks {
+		if _, err := sp.Stat(ctx, repo.ChunkKey(ref.Hash)); err != nil {
+			return fmt.Errorf("walsink: refusing to commit segment %s: referenced chunk %s is unavailable after repository mutation fencing: %w", m.SegmentName, ref.Hash, err)
+		}
 	}
 	return nil
 }

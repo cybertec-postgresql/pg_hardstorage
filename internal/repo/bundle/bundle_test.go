@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/compression"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage/fs"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo"
@@ -58,7 +59,8 @@ func putChunk(t *testing.T, sp storage.StoragePlugin, body []byte) (repo.Hash, i
 	t.Helper()
 	hash := repo.HashOf(body)
 	key := repo.ChunkKey(hash)
-	_, err := sp.Put(context.Background(), key, bytes.NewReader(body), storage.PutOptions{IfNotExists: true})
+	envelope := compression.WriteEnvelope(compression.AlgoNone, compression.EncryptionFields{}, body)
+	_, err := sp.Put(context.Background(), key, bytes.NewReader(envelope), storage.PutOptions{IfNotExists: true})
 	if err != nil {
 		t.Fatalf("put chunk: %v", err)
 	}

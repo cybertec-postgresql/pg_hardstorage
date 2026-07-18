@@ -318,6 +318,21 @@ func registerDispatchFlags(c *cobra.Command, f *dispatchAuthFlags) {
 		"poll cadence (seconds) for /v1/jobs/<id>")
 }
 
+// rejectChangedDispatchFlags prevents a control-plane invocation from
+// accepting command flags that the remote job protocol cannot represent.
+// Silently dropping one of these flags can make an agent execute different
+// work from what the operator requested.
+func rejectChangedDispatchFlags(cmd *cobra.Command, operation string, names ...string) error {
+	for _, name := range names {
+		if cmd.Flags().Changed(name) {
+			return output.NewError("usage.unsupported_flag",
+				fmt.Sprintf("%s --control-plane: --%s is not supported by remote dispatch; remove the flag or run the command locally", operation, name)).
+				Wrap(output.ErrUsage)
+		}
+	}
+	return nil
+}
+
 // newDispatchClient builds a *DispatchClient from the parsed flags.
 // Returns nil + structured error if the control-plane URL is set but
 // some required piece (e.g. token file unreadable) can't be loaded.

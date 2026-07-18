@@ -13,6 +13,8 @@ import (
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/encryption"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo/sharedkey"
 )
 
 // RotateKEKSchema is the on-disk version tag for RotateKEKResult bodies.
@@ -176,6 +178,16 @@ func RotateKEK(ctx context.Context, sp storage.StoragePlugin, opts RotateKEKOpti
 		res.StoppedAt = time.Now().UTC()
 		res.DurationMS = res.StoppedAt.Sub(res.StartedAt).Milliseconds()
 	}
+	var mutationLock *repo.MutationLock
+	if !opts.DryRun {
+		var lockErr error
+		mutationLock, lockErr = repo.AcquireMutationLock(ctx, sp, "KEK rotation")
+		if lockErr != nil {
+			finish()
+			return res, fmt.Errorf("backup rotate-kek: mutation lock: %w", lockErr)
+		}
+		defer func() { _ = mutationLock.Release(context.Background()) }()
+	}
 
 	store := NewManifestStore(sp)
 	deployments, err := store.Deployments(ctx)
@@ -242,6 +254,22 @@ func RotateKEK(ctx context.Context, sp storage.StoragePlugin, opts RotateKEKOpti
 						return "unknown failure"
 					}())
 			}
+		}
+	}
+	if !opts.DryRun && res.Failed == 0 {
+		unwrapOld := func(wrapped []byte) ([]byte, error) {
+			dek, err := encryption.Unwrap(opts.OldKEK, wrapped)
+			if err != nil {
+				return nil, err
+			}
+			return dek[:], nil
+		}
+		wrapNew := func(dek [encryption.KeyLen]byte) ([]byte, error) {
+			return encryption.Wrap(opts.NewKEK, dek)
+		}
+		if err := sharedkey.RotateDomain(ctx, sp, opts.OldKEKRef, opts.NewKEKRef, unwrapOld, wrapNew); err != nil {
+			finish()
+			return res, fmt.Errorf("backup rotate-kek: rotate repository encryption domain: %w", err)
 		}
 	}
 

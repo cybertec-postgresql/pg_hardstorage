@@ -120,6 +120,9 @@ func TestPushSegmentFile_PropagatesWORMRetention(t *testing.T) {
 		t.Fatal("expected at least one Put")
 	}
 	for _, p := range rec.puts {
+		if p.Key == repo.MutationLockKey {
+			continue // ephemeral coordination record, never retained
+		}
 		if p.Opts.RetainUntil.IsZero() {
 			t.Errorf("Put %q has zero RetainUntil despite WORM policy", p.Key)
 		}
@@ -132,6 +135,9 @@ func TestPushSegmentFile_PropagatesWORMRetention(t *testing.T) {
 	// know the manifest path (not just chunks) carries WORM too.
 	var sawManifestTmp bool
 	for _, p := range rec.puts {
+		if p.Key == repo.MutationLockKey {
+			continue // ephemeral coordination record, never retained
+		}
 		if strings.Contains(p.Key, "wal/db1/") && strings.Contains(p.Key, ".json.tmp.") {
 			sawManifestTmp = true
 			break
@@ -230,6 +236,9 @@ func TestSink_PropagatesWORMRetentionToManifest(t *testing.T) {
 	}
 	var sawManifest bool
 	for _, p := range rec.puts {
+		if p.Key == repo.MutationLockKey {
+			continue
+		}
 		if p.Opts.RetainUntil.IsZero() {
 			t.Errorf("streamed Put %q has zero RetainUntil despite WORM policy", p.Key)
 		}

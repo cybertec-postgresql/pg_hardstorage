@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo"
 )
 
 // ManifestStore writes and reads signed manifests against any StoragePlugin.
@@ -178,6 +179,12 @@ type CommitOptions struct {
 	// Governance) when RetainUntil is set. Empty implies
 	// Compliance (regulatory-grade default).
 	RetentionMode storage.WORMMode
+
+	// RequireChunksPresent performs a final fenced existence check before
+	// publishing the manifest. Production backup writers enable it; tests and
+	// forensic importers that intentionally construct manifest-only fixtures
+	// may leave it false.
+	RequireChunksPresent bool
 }
 
 // Commit signs m (if not already signed), writes it atomically to the
@@ -228,9 +235,29 @@ func (ms *ManifestStore) Commit(ctx context.Context, m *Manifest, signer *Signer
 	if err != nil {
 		return fmt.Errorf("backup: marshal manifest %s: %w", m.BackupID, err)
 	}
-
 	primaryKey := PrimaryPath(m.Deployment, m.BackupID)
-	if err := ms.commitAtomic(ctx, primaryKey, body, opts); err != nil {
+	purpose := "backup manifest " + m.Deployment + "/" + m.BackupID
+	lock, err := ms.acquireCommitMutationLock(ctx, purpose)
+	if err != nil {
+		if errors.Is(err, ErrAlreadyCommitted) {
+			return ErrAlreadyCommitted
+		}
+		return fmt.Errorf("backup: commit mutation lock: %w", err)
+	}
+	defer func() { _ = lock.Release(context.Background()) }()
+
+	// GC can run while this backup uploads/deduplicates chunks. Holding the
+	// mutation lock prevents a new GC snapshot, and this final existence gate
+	// catches chunks a preceding GC deleted before we acquired the lock.
+	if opts.RequireChunksPresent {
+		if check, err := CheckChunkExistence(ctx, ms.sp, m); err != nil {
+			return fmt.Errorf("backup: pre-commit chunk check: %w", err)
+		} else if !check.AllPresent() {
+			return fmt.Errorf("backup: refusing to commit %s: %d referenced chunks are missing after repository mutation fencing", m.BackupID, len(check.Missing))
+		}
+	}
+
+	if err := ms.commitAtomic(ctx, primaryKey, body); err != nil {
 		if errors.Is(err, storage.ErrAlreadyExists) {
 			return ErrAlreadyCommitted
 		}
@@ -261,6 +288,10 @@ func (ms *ManifestStore) Commit(ctx context.Context, m *Manifest, signer *Signer
 				ParentBackupID: m.ParentBackupID,
 			})
 		}
+	}
+	if err := ms.applyRetention(ctx, primaryKey, opts); err != nil {
+		return ms.rollbackPrimaryCommit(ctx, primaryKey,
+			fmt.Errorf("backup: commit primary %q: %w", primaryKey, err))
 	}
 
 	// Record the deployment in the index so Deployments() can enumerate
@@ -298,6 +329,42 @@ func (ms *ManifestStore) Commit(ctx context.Context, m *Manifest, signer *Signer
 		}
 	}
 	return nil
+}
+
+const (
+	commitLockRetryInterval = 10 * time.Millisecond
+	commitLockMaxWait       = 5 * time.Second
+)
+
+// acquireCommitMutationLock preserves Commit's documented duplicate-writer
+// semantics while the repository-wide GC fence is held. A competing commit
+// for this exact primary is allowed a bounded wait to publish; unrelated
+// mutations still fail immediately, and abandoned locks remain fail-closed.
+func (ms *ManifestStore) acquireCommitMutationLock(ctx context.Context, purpose string) (*repo.MutationLock, error) {
+	timer := time.NewTimer(commitLockMaxWait)
+	defer timer.Stop()
+
+	for {
+		lock, err := repo.AcquireMutationLock(ctx, ms.sp, purpose)
+		if err == nil {
+			return lock, nil
+		}
+		var held *repo.MutationLockedError
+		if !errors.As(err, &held) || held.Purpose != purpose {
+			return nil, err
+		}
+
+		retry := time.NewTimer(commitLockRetryInterval)
+		select {
+		case <-ctx.Done():
+			retry.Stop()
+			return nil, ctx.Err()
+		case <-timer.C:
+			retry.Stop()
+			return nil, err
+		case <-retry.C:
+		}
+	}
 }
 
 // rollbackPrimaryCommit removes the just-written primary manifest after
@@ -339,7 +406,7 @@ func (ms *ManifestStore) rollbackPrimaryCommit(ctx context.Context, primaryKey s
 // stays an ordinary, deletable staging object (reaped by the rename's
 // source-delete on success, or by `repo gc`'s stale-staging sweep if a
 // crash orphaned it).
-func (ms *ManifestStore) commitAtomic(ctx context.Context, key string, body []byte, opts CommitOptions) error {
+func (ms *ManifestStore) commitAtomic(ctx context.Context, key string, body []byte) error {
 	tmp := key + ".tmp." + randSuffix()
 	_, err := ms.sp.Put(ctx, tmp, bytes.NewReader(body), storage.PutOptions{
 		ContentLength: int64(len(body)),
@@ -348,16 +415,42 @@ func (ms *ManifestStore) commitAtomic(ctx context.Context, key string, body []by
 		return fmt.Errorf("write tmp: %w", err)
 	}
 	if err := ms.sp.RenameIfNotExists(ctx, tmp, key); err != nil {
-		// Best-effort cleanup of the tmp; never propagate a tmp-cleanup
-		// failure (the primary error is what matters).
+		if errors.Is(err, storage.ErrAlreadyExists) {
+			_ = ms.sp.Delete(ctx, tmp)
+			return err
+		}
+		// Copy-based backends can publish dst successfully and then report
+		// an error while deleting src. Confirm the canonical bytes before
+		// treating that ambiguous outcome as a failed publication; otherwise
+		// Commit would return before its parent-liveness checks even though a
+		// visible authoritative manifest already existed.
+		if same, _ := ms.keyEquals(ctx, key, body); same {
+			_ = ms.sp.Delete(ctx, tmp)
+			return nil
+		}
 		_ = ms.sp.Delete(ctx, tmp)
 		return err
 	}
-	// Apply WORM retention to the committed manifest itself.  A backend
-	// without WORM returns ErrUnsupported, which is expected and
-	// ignored ("backends without WORM ignore this"); any other failure
-	// means the operator-requested lock did NOT apply, which must
-	// surface.
+	return nil
+}
+
+func (ms *ManifestStore) keyEquals(ctx context.Context, key string, want []byte) (bool, error) {
+	rc, err := ms.sp.Get(ctx, key)
+	if err != nil {
+		return false, err
+	}
+	defer rc.Close()
+	got, err := stdio.ReadAll(stdio.LimitReader(rc, int64(len(want))+1))
+	if err != nil {
+		return false, err
+	}
+	return bytes.Equal(got, want), nil
+}
+
+// applyRetention runs only after the primary's chain-safety checks. If it
+// fails, Commit rolls the primary back, so a returned error cannot leave an
+// unlocked authoritative manifest behind unnoticed.
+func (ms *ManifestStore) applyRetention(ctx context.Context, key string, opts CommitOptions) error {
 	if !opts.RetainUntil.IsZero() {
 		mode := opts.RetentionMode
 		if mode == "" {
@@ -401,9 +494,13 @@ func (ms *ManifestStore) commitReplica(ctx context.Context, replicaKey string, b
 			case <-time.After(replicaCommitBackoff * time.Duration(attempt)):
 			}
 		}
-		err := ms.commitAtomic(ctx, replicaKey, body, opts)
+		err := ms.commitAtomic(ctx, replicaKey, body)
 		if err == nil || errors.Is(err, storage.ErrAlreadyExists) {
-			return nil
+			if rerr := ms.applyRetention(ctx, replicaKey, opts); rerr == nil {
+				return nil
+			} else {
+				err = rerr
+			}
 		}
 		lastErr = err
 	}
@@ -1522,6 +1619,17 @@ func (ms *ManifestStore) Undelete(ctx context.Context, deployment, backupID stri
 		// no restorability check needed.
 		return false, nil
 	}
+	lock, err := repo.AcquireMutationLock(ctx, ms.sp, "backup undelete "+deployment+"/"+backupID)
+	if err != nil {
+		return false, fmt.Errorf("backup: Undelete: mutation lock: %w", err)
+	}
+	defer func() { _ = lock.Release(context.Background()) }()
+	// The marker may have been removed while we waited for the fence.
+	if dead, err = ms.IsTombstoned(ctx, deployment, backupID); err != nil {
+		return false, fmt.Errorf("backup: Undelete: tombstone re-check: %w", err)
+	} else if !dead {
+		return false, nil
+	}
 	// Read the still-tombstoned body without signature verification
 	// (we only need Files/Chunks, mirroring findLiveDescendants) and
 	// confirm every referenced chunk is still addressable in the repo.
@@ -1556,6 +1664,9 @@ func (ms *ManifestStore) Undelete(ctx context.Context, deployment, backupID stri
 // chunks). The resurrected backup may be un-restorable — that is the
 // caller's explicit, eyes-open choice. Prefer Undelete.
 func (ms *ManifestStore) UndeleteForce(ctx context.Context, deployment, backupID string) (bool, error) {
+	if err := validateRef(deployment, backupID); err != nil {
+		return false, err
+	}
 	if deployment == "" || backupID == "" {
 		return false, errors.New("backup: UndeleteForce requires deployment and backupID")
 	}
@@ -1564,6 +1675,16 @@ func (ms *ManifestStore) UndeleteForce(ctx context.Context, deployment, backupID
 		return false, fmt.Errorf("backup: UndeleteForce: tombstone check: %w", err)
 	}
 	if !dead {
+		return false, nil
+	}
+	lock, err := repo.AcquireMutationLock(ctx, ms.sp, "backup force-undelete "+deployment+"/"+backupID)
+	if err != nil {
+		return false, fmt.Errorf("backup: UndeleteForce: mutation lock: %w", err)
+	}
+	defer func() { _ = lock.Release(context.Background()) }()
+	if dead, err = ms.IsTombstoned(ctx, deployment, backupID); err != nil {
+		return false, fmt.Errorf("backup: UndeleteForce: tombstone re-check: %w", err)
+	} else if !dead {
 		return false, nil
 	}
 	return ms.removeTombstone(ctx, deployment, backupID)

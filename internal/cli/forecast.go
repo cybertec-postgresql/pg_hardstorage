@@ -166,9 +166,9 @@ func runForecast(cmd *cobra.Command, f forecastFlags) error {
 		}
 		horizons = append(horizons, dur)
 	}
-	if f.pricePerGBMonth < 0 {
+	if !finiteFloat(f.pricePerGBMonth) || f.pricePerGBMonth < 0 {
 		return output.NewError("usage.bad_flag",
-			"forecast: --price-per-gb-month must be >= 0").Wrap(output.ErrUsage)
+			"forecast: --price-per-gb-month must be finite and >= 0").Wrap(output.ErrUsage)
 	}
 	switch f.format {
 	case "", "json", "markdown":

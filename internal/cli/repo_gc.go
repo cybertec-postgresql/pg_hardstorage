@@ -145,6 +145,14 @@ func runRepoGC(cmd *cobra.Command, repoURL string, apply bool, approvalID string
 					"hint":        "the gate fires only on --apply; this dry-run does not consult the approval",
 				}))
 	}
+	var mutationLock *repo.MutationLock
+	if apply {
+		mutationLock, err = repo.AcquireMutationLock(cmd.Context(), sp, "repo gc --apply")
+		if err != nil {
+			return output.NewError("repo.gc.mutation_locked", fmt.Sprintf("repo gc: %v", err)).Wrap(err)
+		}
+		defer func() { _ = mutationLock.Release(context.Background()) }()
+	}
 
 	// Tombstone-grace: a 0 flag value means "disable" (caller
 	// explicitly opts out — historical aggressive behaviour); a

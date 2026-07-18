@@ -132,6 +132,11 @@ func runIntegrityRun(cmd *cobra.Command, f integrityRunFlags) error {
 		return err
 	}
 	defer sp.Close()
+	if !f.skipSign {
+		if err := assertRepoWritable(cmd.Context(), sp, "integrity run"); err != nil {
+			return err
+		}
+	}
 	signer, verifier, err := loadSignerForJIT() // shared keystore loader
 	if err != nil {
 		return err
@@ -163,25 +168,28 @@ func runIntegrityRun(cmd *cobra.Command, f integrityRunFlags) error {
 				fmt.Sprintf("integrity run: persist: %v", err)).Wrap(err)
 		}
 	}
-	// Best-effort audit append (failure is not fatal).
-	auditStore := audit.NewStoreWithRetention(sp, repoMeta.WORM)
-	_ = auditStore.Append(cmd.Context(), &audit.Event{
-		Action:    "integrity.run",
-		Timestamp: time.Now().UTC(),
-		Body: map[string]any{
-			"run_id":            run.ID,
-			"status":            string(run.Status),
-			"strategy":          strategy.Mode,
-			"deployment":        f.deployment,
-			"manifests_total":   run.Manifests.Total,
-			"signatures_ok":     run.Manifests.SignaturesOK,
-			"signatures_fail":   run.Manifests.SignaturesFail,
-			"chunks_referenced": run.Chunks.DistinctReferenced,
-			"chunks_missing":    run.Chunks.Missing,
-			"chunks_mismatched": run.Chunks.Mismatched,
-			"chunks_verified":   run.Chunks.Verified,
-		},
-	})
+	// Best-effort audit append (failure is not fatal). --skip-sign is a
+	// genuinely read-only testing mode, so it must not append either.
+	if !f.skipSign {
+		auditStore := audit.NewStoreWithRetention(sp, repoMeta.WORM)
+		_ = auditStore.Append(cmd.Context(), &audit.Event{
+			Action:    "integrity.run",
+			Timestamp: time.Now().UTC(),
+			Body: map[string]any{
+				"run_id":            run.ID,
+				"status":            string(run.Status),
+				"strategy":          strategy.Mode,
+				"deployment":        f.deployment,
+				"manifests_total":   run.Manifests.Total,
+				"signatures_ok":     run.Manifests.SignaturesOK,
+				"signatures_fail":   run.Manifests.SignaturesFail,
+				"chunks_referenced": run.Chunks.DistinctReferenced,
+				"chunks_missing":    run.Chunks.Missing,
+				"chunks_mismatched": run.Chunks.Mismatched,
+				"chunks_verified":   run.Chunks.Verified,
+			},
+		})
+	}
 	body := integrityRunBody{Run: run}
 	// Dual-stream: emit body regardless; on issues, return a verify.*
 	// error to flip the exit code.

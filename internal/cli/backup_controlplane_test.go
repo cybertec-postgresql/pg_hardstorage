@@ -149,6 +149,7 @@ func TestBackup_ControlPlane_FastFlowsThroughArgs(t *testing.T) {
 		"backup", "db1",
 		"--fast",
 		"--label", "before-migration",
+		"--stall-timeout", "45s",
 		"-o", "json",
 	}
 	onJob := func(s *server.Server, jobID string) {
@@ -164,6 +165,9 @@ func TestBackup_ControlPlane_FastFlowsThroughArgs(t *testing.T) {
 		}
 		if j.Args["label"] != "before-migration" {
 			t.Errorf("Args.label = %v", j.Args["label"])
+		}
+		if j.Args["inactivity_timeout"] != "45s" {
+			t.Errorf("Args.inactivity_timeout = %v, want 45s", j.Args["inactivity_timeout"])
 		}
 		// Then drive the job to completion so the test exits.
 		if _, err := s.Jobs().Claim(server.ClaimOptions{
@@ -183,5 +187,36 @@ func TestBackup_ControlPlane_FastFlowsThroughArgs(t *testing.T) {
 	stdout, stderr, exit := runCLIWithControlPlane(t, args, onJob)
 	if exit != int(output.ExitOK) {
 		t.Fatalf("exit=%d\nstdout=%s\nstderr=%s", exit, stdout, stderr)
+	}
+}
+
+func TestBackup_ControlPlane_RefusesUnrepresentableFlags(t *testing.T) {
+	tests := [][]string{
+		{"--pg-connection", "postgres://ignored"},
+		{"--include-wal"},
+		{"--kek", "local:archive"},
+		{"--kms-config", "region=eu-central-1"},
+		{"--incremental-from", "parent-id"},
+		{"--ignore-capacity"},
+		{"--capacity-safety-factor", "1.5"},
+		{"--allow-concurrent"},
+		{"--verbose"},
+	}
+	for _, extra := range tests {
+		t.Run(strings.Join(extra, "_"), func(t *testing.T) {
+			root := cli.NewRoot()
+			var out, errb bytes.Buffer
+			root.SetOut(&out)
+			root.SetErr(&errb)
+			args := []string{"backup", "db1", "--control-plane", "http://does-not-matter:8443", "-o", "json"}
+			root.SetArgs(append(args, extra...))
+			exit := cli.Run(root)
+			if exit != int(output.ExitMisuse) {
+				t.Fatalf("exit=%d, want %d; stderr=%s", exit, output.ExitMisuse, errb.String())
+			}
+			if !strings.Contains(errb.String(), "usage.unsupported_flag") {
+				t.Fatalf("missing unsupported-flag error: %s", errb.String())
+			}
+		})
 	}
 }

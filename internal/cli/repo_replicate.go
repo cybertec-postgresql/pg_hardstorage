@@ -115,9 +115,9 @@ func runRepoReplicate(cmd *cobra.Command, from, to string, includeWAL, dryRun bo
 		return output.NewError("usage.bad_flag",
 			"repo replicate: --from and --to must differ").Wrap(output.ErrUsage)
 	}
-	if maxMbps < 0 {
+	if !finiteFloat(maxMbps) || maxMbps < 0 {
 		return output.NewError("usage.bad_flag",
-			fmt.Sprintf("repo replicate: --max-mbps must be >= 0; got %v", maxMbps)).Wrap(output.ErrUsage)
+			fmt.Sprintf("repo replicate: --max-mbps must be finite and >= 0; got %v", maxMbps)).Wrap(output.ErrUsage)
 	}
 	if maxMbps > 0 && scheduleExpr != "" {
 		return output.NewError("usage.bad_flag",

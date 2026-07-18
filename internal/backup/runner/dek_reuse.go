@@ -33,32 +33,20 @@ import (
 // backup: generating a fresh DEK there yields a backup whose deduped chunks
 // are unrestorable, discovered only at restore time (issue #28).
 func selectDEK(ctx context.Context, sp storage.StoragePlugin, kekRef string, cfg *EncryptionConfig) ([encryption.KeyLen]byte, error) {
-	var dek [encryption.KeyLen]byte
-
-	res, err := sharedkey.Resolve(ctx, sp, kekRef, func(wrapped []byte) ([]byte, error) {
+	unwrap := func(wrapped []byte) ([]byte, error) {
 		return unwrapDEKForReuse(ctx, cfg, wrapped)
-	})
-	if err != nil {
-		return dek, fmt.Errorf("backup: cannot determine whether a DEK already exists for KEK %q; refusing a fresh DEK that the CAS's plaintext-hash dedup would leave unrestorable against existing chunks: %w", kekRef, err)
 	}
-	if res.DEK != nil {
-		if len(res.DEK) != encryption.KeyLen {
-			return dek, fmt.Errorf("backup: reused DEK for KEK %q has wrong length %d (want %d)", kekRef, len(res.DEK), encryption.KeyLen)
+	wrap := func(dek [encryption.KeyLen]byte) ([]byte, error) {
+		if cfg.Provider != nil {
+			return cfg.Provider.WrapDEK(ctx, dek[:])
 		}
-		copy(dek[:], res.DEK)
-		return dek, nil
+		return encryption.Wrap(cfg.KEK, dek)
 	}
-	if res.SawCandidate {
-		return dek, fmt.Errorf("backup: a prior DEK for KEK %q exists but none of its recorded wrapped form(s) could be unwrapped for reuse; refusing a fresh DEK that would leave deduped chunks unrestorable (verify the KEK material matches this ref)", kekRef)
+	dek, err := sharedkey.ResolveOrCreate(ctx, sp, kekRef, unwrap, wrap)
+	if err != nil {
+		return [encryption.KeyLen]byte{}, fmt.Errorf("backup: establish repository encryption domain for KEK %q: %w", kekRef, err)
 	}
-
-	// Positively no prior DEK for this KEK in any backup or WAL manifest —
-	// the first encrypted artifact in this repo. A fresh DEK is correct.
-	fresh, gerr := encryption.GenerateDEK()
-	if gerr != nil {
-		return dek, fmt.Errorf("backup: generate DEK: %w", gerr)
-	}
-	return fresh, nil
+	return dek, nil
 }
 
 // looksLikePrimaryManifest returns true for keys of the shape

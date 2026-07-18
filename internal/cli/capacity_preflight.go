@@ -106,6 +106,10 @@ type capacityPreflightOptions struct {
 
 func runCapacityPreflight(cmd *cobra.Command, opts capacityPreflightOptions) error {
 	d := DispatcherFrom(cmd)
+	if !finiteFloat(opts.safetyFactor) || opts.safetyFactor <= 0 {
+		return output.NewError("usage.bad_flag",
+			fmt.Sprintf("capacity preflight: --safety-factor must be a finite value > 0; got %v", opts.safetyFactor)).Wrap(output.ErrUsage)
+	}
 	// Positional-or-flag: guard the resolved value, not the flag.
 	if opts.repoURL == "" {
 		return missingFlagErr(cmd, "--repo (or a positional <url>)")

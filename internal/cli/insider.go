@@ -112,6 +112,10 @@ type insiderScanFlags struct {
 
 func runInsiderScan(cmd *cobra.Command, f insiderScanFlags) error {
 	d := DispatcherFrom(cmd)
+	if !finiteFloat(f.factor) || f.factor <= 0 {
+		return output.NewError("usage.bad_flag",
+			fmt.Sprintf("insider scan: --spike-factor must be a finite value > 0; got %v", f.factor)).Wrap(output.ErrUsage)
+	}
 	failOn, err := parseFailOnSeverity(f.failOn)
 	if err != nil {
 		return output.NewError("usage.bad_flag",
@@ -122,6 +126,9 @@ func runInsiderScan(cmd *cobra.Command, f insiderScanFlags) error {
 		return err
 	}
 	defer sp.Close()
+	if err := assertRepoWritable(cmd.Context(), sp, "insider scan"); err != nil {
+		return err
+	}
 	auditStore := audit.NewStoreWithRetention(sp, repoMeta.WORM)
 	det := insider.NewDetector(auditStore)
 	scan, err := det.Run(cmd.Context(), insider.Options{

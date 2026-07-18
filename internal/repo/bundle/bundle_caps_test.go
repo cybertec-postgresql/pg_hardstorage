@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/compression"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo/bundle"
 )
@@ -28,15 +29,16 @@ func tarWithChunkEntries(t *testing.T, n, size int) []byte {
 			body = nil
 		}
 		key := repo.ChunkKey(repo.HashOf(body))
+		envelope := compression.WriteEnvelope(compression.AlgoNone, compression.EncryptionFields{}, body)
 		if err := tw.WriteHeader(&tar.Header{
 			Name:     key,
 			Typeflag: tar.TypeReg,
-			Size:     int64(len(body)),
+			Size:     int64(len(envelope)),
 			Mode:     0o644,
 		}); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := tw.Write(body); err != nil {
+		if _, err := tw.Write(envelope); err != nil {
 			t.Fatal(err)
 		}
 	}
