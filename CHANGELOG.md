@@ -11,6 +11,31 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ## [Unreleased]
 
+### Fix: intermittently unrestorable encrypted backups under concurrent WAL streaming (#31)
+
+With `wal stream` running, a concurrently-taken base `backup` could
+commit a manifest that was silently **unrestorable** — `verify` reported
+mass chunk-integrity failures and `restore` failed with
+`encryption: unknown algorithm: 1`, even though `backup` exited 0.
+
+Root cause was a check-then-act race in the shared-DEK coordination. The
+CAS deduplicates chunks by plaintext hash, so every encrypted artifact
+under one KEK must share one DEK. Resolution only scanned *committed*
+manifests, so two writers that both started before either committed each
+minted a **different** DEK. A PostgreSQL full-page image in WAL that
+chunked to the same bytes as a base-backup file then deduped to one CAS
+slot, stored under one writer's DEK while the other's manifest referenced
+it under the other DEK — undecryptable.
+
+The DEK is now minted through an **atomic single-winner PUT** on a
+well-known shared-DEK object (`keys/shared-dek/<kekref-hash>.json`): the
+first writer wins, every concurrent writer reads back and reuses the
+winner's DEK, so streaming and base backups always converge on one DEK.
+Existing repos are seeded transparently from their manifests on first
+write. Covered by a 24-way concurrent regression test and validated
+end-to-end (streaming + racing backups → all verify + restore cleanly;
+exactly one shared-DEK object).
+
 ## [1.0.12] — 2026-07-16
 
 ### Docs: remove false-capability claims (managed DBaaS + unshipped features)

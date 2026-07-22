@@ -15,9 +15,13 @@
 package sharedkey
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -28,6 +32,43 @@ import (
 
 // Scheme is the only envelope scheme DEK reuse applies to.
 const Scheme = "aes-256-gcm"
+
+// sharedDEKPrefix holds the authoritative shared-DEK object — one per
+// KEKRef. It is the serialization point that makes concurrent minting
+// converge: the manifest scan (Resolve) only sees COMMITTED manifests,
+// so two writers (e.g. `wal stream` + `backup`) that both start before
+// either commits would each mint a DIFFERENT fresh DEK. Full-page images
+// in WAL then dedup against base-backup chunks (same plaintext hash) but
+// are stored under one DEK while the other's manifest references them
+// under the other DEK — leaving a "successful" backup unrestorable
+// (issue #31). Minting the DEK via an atomic IfNotExists PUT on this
+// single object serialises the mint so every writer shares one DEK.
+const sharedDEKPrefix = "keys/shared-dek/"
+
+// Wrapper wraps a plaintext DEK under the caller's KEK custody model —
+// local AES-256-GCM wrap or a cloud-KMS round-trip. Mirror of Unwrapper.
+type Wrapper func(dek [encryption.KeyLen]byte) ([]byte, error)
+
+// MintResult is the outcome of ResolveOrMint.
+type MintResult struct {
+	// DEK is the shared plaintext DEK; valid iff Have is true.
+	DEK [encryption.KeyLen]byte
+	// Have reports that DEK is set (resolved, adopted, or minted).
+	Have bool
+	// UnusableCandidate reports that a prior DEK exists for this KEK
+	// (in the shared-DEK object or a manifest) but none of its wrapped
+	// forms unwrap with the caller's KEK. The caller MUST fail rather
+	// than mint a fresh DEK. Mutually exclusive with Have.
+	UnusableCandidate bool
+}
+
+// sharedDEKKey is the storage key for the shared-DEK object of kekRef.
+// The KEKRef is hashed so any scheme (local:default, aws-kms://arn:...,
+// vault-transit://...) maps to a safe, fixed-width key.
+func sharedDEKKey(kekRef string) string {
+	sum := sha256.Sum256([]byte(kekRef))
+	return sharedDEKPrefix + hex.EncodeToString(sum[:]) + ".json"
+}
 
 // Unwrapper turns a wrapped-DEK blob into the plaintext DEK. It encapsulates
 // the KEK custody model — local AES-256-GCM unwrap or a cloud-KMS round-trip —
@@ -104,6 +145,116 @@ func Resolve(ctx context.Context, sp storage.StoragePlugin, wantKEKRef string, u
 		}
 	}
 	return res, nil
+}
+
+// ResolveOrMint returns the one shared DEK every encrypted artifact under
+// (repo, kekRef) must use, minting it atomically the first time so that
+// concurrent writers never diverge (issue #31).
+//
+// Order of resolution:
+//
+//  1. The authoritative shared-DEK object. Present + unwraps -> use it.
+//     Present + won't unwrap -> UnusableCandidate (wrong KEK; caller fails).
+//  2. Legacy repos (written before this object existed): scan committed
+//     manifests via Resolve. A reusable DEK is ADOPTED into the shared-DEK
+//     object (best-effort, IfNotExists) and returned. A manifest DEK that
+//     won't unwrap -> UnusableCandidate.
+//  3. Truly no prior DEK anywhere: generate a fresh DEK, wrap it, and PUT
+//     the shared-DEK object with IfNotExists. If we win, use the fresh DEK.
+//     If we lose (ErrAlreadyExists — a concurrent writer minted first), we
+//     re-read the winner's object and use THAT DEK. This atomic single
+//     winner is the whole fix: the old code had each writer mint its own.
+//
+// A hard storage error is returned as err so the caller fails rather than
+// mistaking "couldn't coordinate" for "no DEK exists".
+func ResolveOrMint(ctx context.Context, sp storage.StoragePlugin, kekRef string, unwrap Unwrapper, wrap Wrapper) (MintResult, error) {
+	key := sharedDEKKey(kekRef)
+
+	// 1. Authoritative object.
+	if wrapped, ok := readWrappedDEK(ctx, sp, key, kekRef); ok {
+		return unwrapInto(wrapped, unwrap)
+	}
+
+	// 2. Legacy seed: adopt an existing manifest DEK.
+	res, err := Resolve(ctx, sp, kekRef, unwrap)
+	if err != nil {
+		return MintResult{}, err
+	}
+	if res.DEK != nil {
+		var out MintResult
+		if len(res.DEK) != encryption.KeyLen {
+			return MintResult{}, fmt.Errorf("sharedkey: adopted DEK has wrong length %d (want %d)", len(res.DEK), encryption.KeyLen)
+		}
+		copy(out.DEK[:], res.DEK)
+		out.Have = true
+		// Best-effort promotion so future writers skip the manifest scan
+		// and, more importantly, so a later concurrent fresh-mint can't
+		// race in a divergent DEK. A conflict here is fine — someone else
+		// adopted the same manifest DEK.
+		if wrapped, werr := wrap(out.DEK); werr == nil {
+			_ = putSharedDEK(ctx, sp, key, kekRef, wrapped)
+		}
+		return out, nil
+	}
+	if res.SawCandidate {
+		return MintResult{UnusableCandidate: true}, nil
+	}
+
+	// 3. Atomic fresh mint.
+	fresh, gerr := encryption.GenerateDEK()
+	if gerr != nil {
+		return MintResult{}, fmt.Errorf("sharedkey: generate DEK: %w", gerr)
+	}
+	wrapped, werr := wrap(fresh)
+	if werr != nil {
+		return MintResult{}, fmt.Errorf("sharedkey: wrap fresh DEK: %w", werr)
+	}
+	perr := putSharedDEK(ctx, sp, key, kekRef, wrapped)
+	if perr == nil {
+		return MintResult{DEK: fresh, Have: true}, nil // we minted it
+	}
+	if !errors.Is(perr, storage.ErrAlreadyExists) {
+		return MintResult{}, fmt.Errorf("sharedkey: commit shared DEK: %w", perr)
+	}
+	// Lost the mint race — adopt the winner's DEK. This is exactly the
+	// path that used to (incorrectly) keep the loser's own fresh DEK.
+	winner, ok := readWrappedDEK(ctx, sp, key, kekRef)
+	if !ok {
+		return MintResult{}, fmt.Errorf("sharedkey: shared DEK object present after IfNotExists conflict but unreadable for KEK %q", kekRef)
+	}
+	return unwrapInto(winner, unwrap)
+}
+
+// unwrapInto unwraps a shared-DEK wrapped form into a MintResult. A wrap
+// that won't authenticate under the caller's KEK yields UnusableCandidate
+// (a prior DEK exists but this KEK can't read it) rather than an error.
+func unwrapInto(wrapped []byte, unwrap Unwrapper) (MintResult, error) {
+	dek, uerr := unwrap(wrapped)
+	if uerr != nil || len(dek) != encryption.KeyLen {
+		return MintResult{UnusableCandidate: true}, nil
+	}
+	var out MintResult
+	copy(out.DEK[:], dek)
+	out.Have = true
+	return out, nil
+}
+
+// putSharedDEK writes the shared-DEK envelope at key with IfNotExists, so
+// only the first writer wins. Returns storage.ErrAlreadyExists on conflict.
+func putSharedDEK(ctx context.Context, sp storage.StoragePlugin, key, kekRef string, wrapped []byte) error {
+	body, err := json.Marshal(manifestEnvelope{Encryption: &envelope{
+		Scheme:     Scheme,
+		KEKRef:     kekRef,
+		WrappedDEK: base64.StdEncoding.EncodeToString(wrapped),
+	}})
+	if err != nil {
+		return err
+	}
+	_, err = sp.Put(ctx, key, bytes.NewReader(body), storage.PutOptions{
+		IfNotExists:   true,
+		ContentLength: int64(len(body)),
+	})
+	return err
 }
 
 // isManifestKey reports whether key under prefix is a manifest worth reading

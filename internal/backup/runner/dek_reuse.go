@@ -22,9 +22,12 @@ import (
 // by an earlier backup OR WAL segment is silently reused (IfNotExists) by
 // this one, and this manifest's DEK has to decrypt it.
 //
-// Resolution scans BOTH base-backup manifests and WAL segment manifests
-// (sharedkey.Resolve), so a backup converges on a DEK that WAL streaming
-// minted first, and vice-versa (issue #106).
+// Resolution goes through sharedkey.ResolveOrMint, which mints the DEK
+// via an atomic single-winner PUT on a well-known shared-DEK object (and
+// seeds that object from existing base-backup / WAL manifests for legacy
+// repos), so a backup converges on the SAME DEK as concurrent WAL
+// streaming even when neither has committed a manifest yet (issues #106,
+// #31) — not just when one committed first.
 //
 // A fresh DEK is correct ONLY when we have positively confirmed there is
 // NO prior DEK for this KEK anywhere. The two failure shapes that must NOT
@@ -35,30 +38,45 @@ import (
 func selectDEK(ctx context.Context, sp storage.StoragePlugin, kekRef string, cfg *EncryptionConfig) ([encryption.KeyLen]byte, error) {
 	var dek [encryption.KeyLen]byte
 
-	res, err := sharedkey.Resolve(ctx, sp, kekRef, func(wrapped []byte) ([]byte, error) {
-		return unwrapDEKForReuse(ctx, cfg, wrapped)
-	})
+	// ResolveOrMint mints the shared DEK atomically (single-winner PUT on
+	// the shared-DEK object), so a backup starting concurrently with `wal
+	// stream` converges on ONE DEK instead of each minting its own — the
+	// old behaviour left deduped WAL/base chunks unrestorable (issue #31).
+	res, err := sharedkey.ResolveOrMint(ctx, sp, kekRef,
+		func(wrapped []byte) ([]byte, error) { return unwrapDEKForReuse(ctx, cfg, wrapped) },
+		func(d [encryption.KeyLen]byte) ([]byte, error) { return wrapDEKForReuse(ctx, cfg, d) },
+	)
 	if err != nil {
-		return dek, fmt.Errorf("backup: cannot determine whether a DEK already exists for KEK %q; refusing a fresh DEK that the CAS's plaintext-hash dedup would leave unrestorable against existing chunks: %w", kekRef, err)
+		return dek, fmt.Errorf("backup: cannot determine or mint the shared DEK for KEK %q; refusing a fresh DEK that the CAS's plaintext-hash dedup would leave unrestorable against existing chunks: %w", kekRef, err)
 	}
-	if res.DEK != nil {
-		if len(res.DEK) != encryption.KeyLen {
-			return dek, fmt.Errorf("backup: reused DEK for KEK %q has wrong length %d (want %d)", kekRef, len(res.DEK), encryption.KeyLen)
-		}
-		copy(dek[:], res.DEK)
-		return dek, nil
-	}
-	if res.SawCandidate {
+	if res.UnusableCandidate {
 		return dek, fmt.Errorf("backup: a prior DEK for KEK %q exists but none of its recorded wrapped form(s) could be unwrapped for reuse; refusing a fresh DEK that would leave deduped chunks unrestorable (verify the KEK material matches this ref)", kekRef)
 	}
-
-	// Positively no prior DEK for this KEK in any backup or WAL manifest —
-	// the first encrypted artifact in this repo. A fresh DEK is correct.
-	fresh, gerr := encryption.GenerateDEK()
-	if gerr != nil {
-		return dek, fmt.Errorf("backup: generate DEK: %w", gerr)
+	if !res.Have {
+		return dek, fmt.Errorf("backup: shared-DEK resolution returned no key for KEK %q", kekRef)
 	}
-	return fresh, nil
+	return res.DEK, nil
+}
+
+// wrapDEKForReuse wraps a plaintext DEK for storage in the shared-DEK
+// object, mirroring unwrapDEKForReuse's custody split (cloud KMS vs local
+// KEK).
+func wrapDEKForReuse(ctx context.Context, cfg *EncryptionConfig, dek [encryption.KeyLen]byte) ([]byte, error) {
+	if cfg == nil {
+		return nil, errors.New("dek-reuse: nil encryption config")
+	}
+	if cfg.Provider != nil {
+		w, err := cfg.Provider.WrapDEK(ctx, dek[:])
+		if err != nil {
+			return nil, fmt.Errorf("dek-reuse: provider wrap: %w", err)
+		}
+		return w, nil
+	}
+	w, err := encryption.Wrap(cfg.KEK, dek)
+	if err != nil {
+		return nil, fmt.Errorf("dek-reuse: local wrap: %w", err)
+	}
+	return w, nil
 }
 
 // looksLikePrimaryManifest returns true for keys of the shape
