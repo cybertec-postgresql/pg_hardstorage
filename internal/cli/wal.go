@@ -917,10 +917,14 @@ func deploymentBackupKEKRef(ctx context.Context, sp storage.StoragePlugin, deplo
 //   - cloud KMS (cfg.Provider set) — wrap/unwrap via the provider.
 //   - cfg == nil — no encryption configured (no keyring, no --kek): plaintext.
 //
-// The shared DEK is resolved across BOTH base-backup AND prior WAL manifests
-// (sharedkey.Resolve), so whichever writer runs first mints it and the other
-// reuses it, in either order; minting happens only when no prior DEK exists
-// anywhere. A prior DEK that cfg can't unwrap FAILS the write rather than
+// The shared DEK is minted via sharedkey.ResolveOrMint, which serialises
+// the mint through an atomic single-winner PUT on a well-known shared-DEK
+// object (seeded from existing base-backup / WAL manifests for legacy
+// repos). This makes concurrent WAL streaming and base backups converge on
+// ONE DEK even when neither has committed a manifest yet — the earlier
+// scan-then-mint could have each writer mint a DIFFERENT DEK, leaving a
+// full-page image that deduped against a base chunk unrestorable (issue
+// #31). A prior DEK that cfg can't unwrap FAILS the write rather than
 // forking a fresh DEK that would leave deduped chunks unrestorable (issue #28).
 //
 // Divergence guard: if the deployment's established backups use a DIFFERENT
@@ -954,27 +958,24 @@ func buildWALEncryption(ctx context.Context, sp storage.StoragePlugin, deploymen
 		wrap = func(dek [encryption.KeyLen]byte) ([]byte, error) { return encryption.Wrap(kek, dek) }
 	}
 
-	res, rerr := sharedkey.Resolve(ctx, sp, cfg.KEKRef, unwrap)
+	// ResolveOrMint mints the shared DEK atomically (single-winner PUT on
+	// the shared-DEK object), so WAL streaming starting concurrently with a
+	// base backup converges on ONE DEK. The old Resolve-then-mint path let
+	// each writer mint its own DEK when neither had committed a manifest
+	// yet, so a WAL full-page image that dedups against a base chunk was
+	// stored under a different DEK than the backup manifest referenced it
+	// by — leaving the backup unrestorable (issue #31).
+	res, rerr := sharedkey.ResolveOrMint(ctx, sp, cfg.KEKRef, unwrap, wrap)
 	if rerr != nil {
-		return nil, nil, fmt.Errorf("wal: cannot determine the shared DEK; refusing to write WAL that the CAS's plaintext-hash dedup would leave unrestorable: %w", rerr)
+		return nil, nil, fmt.Errorf("wal: cannot determine or mint the shared DEK; refusing to write WAL that the CAS's plaintext-hash dedup would leave unrestorable: %w", rerr)
 	}
-
-	var dek [encryption.KeyLen]byte
-	switch {
-	case res.DEK != nil:
-		if len(res.DEK) != encryption.KeyLen {
-			return nil, nil, fmt.Errorf("wal: reused shared DEK has wrong length %d", len(res.DEK))
-		}
-		copy(dek[:], res.DEK)
-	case res.SawCandidate:
+	if res.UnusableCandidate {
 		return nil, nil, fmt.Errorf("wal: a prior DEK for KEK %q exists but could not be unwrapped; refusing to write WAL under a fresh DEK that would leave deduped chunks unrestorable (verify the KEK material matches this repo)", cfg.KEKRef)
-	default:
-		fresh, gerr := encryption.GenerateDEK()
-		if gerr != nil {
-			return nil, nil, fmt.Errorf("wal: generate DEK: %w", gerr)
-		}
-		dek = fresh
 	}
+	if !res.Have {
+		return nil, nil, fmt.Errorf("wal: shared-DEK resolution returned no key for KEK %q", cfg.KEKRef)
+	}
+	dek := res.DEK
 
 	wrapped, werr := wrap(dek)
 	if werr != nil {
