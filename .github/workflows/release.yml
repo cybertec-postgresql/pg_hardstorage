@@ -135,6 +135,12 @@ jobs:
   homebrew-smoke:
     name: Homebrew cask install (macOS)
     needs: [goreleaser]
+    # Run even when goreleaser reports failure: the release artifacts are
+    # published before goreleaser's cask-push step (which fails today on the
+    # tap token, HOMEBREW_TAP_TOKEN), so the tarballs the cask points at DO
+    # exist. Without this the job is always skipped. `!cancelled()` still
+    # skips on a manual workflow cancel.
+    if: ${{ !cancelled() }}
     runs-on: macos-latest
     steps:
       - name: Derive release version
