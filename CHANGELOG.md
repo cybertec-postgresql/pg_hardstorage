@@ -11,6 +11,8 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ## [Unreleased]
 
+## [1.0.13] — 2026-07-22
+
 ### Fix: intermittently unrestorable encrypted backups under concurrent WAL streaming (#31)
 
 With `wal stream` running, a concurrently-taken base `backup` could
