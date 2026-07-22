@@ -15,6 +15,14 @@ name: release
 on:
   push:
     tags: ["v*"]
+  # Manual entry point to run ONLY the Homebrew cask smoke test against an
+  # already-published version (goreleaser/SLSA are skipped). Lets us verify
+  # the tap install on demand without cutting a release.
+  workflow_dispatch:
+    inputs:
+      smoke_version:
+        description: "Version to run the Homebrew smoke test against, e.g. 1.0.13"
+        required: true
 
 permissions:
   contents: write       # create the GitHub Release
@@ -27,6 +35,9 @@ env:
 jobs:
   goreleaser:
     name: goreleaser
+    # Real releases only run on a tag push; a manual workflow_dispatch runs
+    # just the Homebrew smoke test against an existing release.
+    if: ${{ github.event_name == 'push' }}
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -145,7 +156,12 @@ jobs:
     steps:
       - name: Derive release version
         id: v
-        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "version=${{ inputs.smoke_version }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          fi
       - name: Wait for the tap cask to reflect this release
         env:
           WANT: ${{ steps.v.outputs.version }}
