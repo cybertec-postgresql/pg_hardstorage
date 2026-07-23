@@ -326,6 +326,13 @@ type DeploymentSchedule struct {
 	Backup      ScheduleSpec `yaml:"backup,omitempty"`
 	Rotate      ScheduleSpec `yaml:"rotate,omitempty"`
 	AuditAnchor ScheduleSpec `yaml:"audit_anchor,omitempty"`
+	// Drill schedules a periodic recovery drill: restore the latest
+	// backup into a sandbox and verify it, recording the verdict in
+	// the repo's drill history. A backup that has never been restored
+	// is unproven — the scheduled drill turns "backup succeeded" into
+	// "backup is restorable", continuously. `doctor` alarms when the
+	// last successful drill is stale.
+	Drill ScheduleSpec `yaml:"drill,omitempty"`
 }
 
 // ScheduleSpec mirrors internal/schedule.Spec exactly; we redeclare
@@ -809,6 +816,9 @@ func mergeDeployment(existing, overlay DeploymentConfig) DeploymentConfig {
 	}
 	if overlay.Schedule.Rotate.Every != "" || overlay.Schedule.Rotate.DailyAt != "" || overlay.Schedule.Rotate.At != "" {
 		existing.Schedule.Rotate = overlay.Schedule.Rotate
+	}
+	if overlay.Schedule.Drill.Every != "" || overlay.Schedule.Drill.DailyAt != "" || overlay.Schedule.Drill.At != "" {
+		existing.Schedule.Drill = overlay.Schedule.Drill
 	}
 	if overlay.Patroni.URL != "" {
 		existing.Patroni.URL = overlay.Patroni.URL

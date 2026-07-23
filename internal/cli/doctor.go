@@ -24,6 +24,7 @@ import (
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/paths"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/pg"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/recovery"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/wal/gapstate"
 )
@@ -52,6 +53,8 @@ func newRealDoctorCmd() *cobra.Command {
 	c.Flags().Bool("exit-on-issues", false,
 		"exit with code 10 (ExitDoctorIssues) when the report contains issues at warning+ severity; "+
 			"useful for cron / k8s liveness probes")
+	c.Flags().Duration("drill-max-age", defaultDrillMaxAge,
+		"maximum age of the last SUCCESSFUL recovery drill before doctor escalates recovery.drill_stale (CRITICAL)")
 	return c
 }
 
@@ -96,6 +99,8 @@ func runDoctor(cmd *cobra.Command, _ []string) error {
 		report.ExpiredHolds, report.Issues = appendExpiredHoldChecks(cmd.Context(), cfg, report.Issues)
 		report.PGVersions, report.Issues = appendPGVersionChecks(cmd.Context(), cfg, report.Issues)
 		report.ManifestSig, report.Issues = appendManifestSignatureChecks(cmd.Context(), cfg, report.Issues)
+		drillMaxAge, _ := cmd.Flags().GetDuration("drill-max-age")
+		report.Drills, report.Issues = appendDrillChecks(cmd.Context(), cfg, drillMaxAge, report.Issues)
 	}
 
 	// Recompute Healthy from the FINAL issue set. buildDoctorReport
@@ -569,6 +574,123 @@ func appendRepoChecks(ctx context.Context, cfg *config.LoadResult, issues []doct
 	return out, issues
 }
 
+// drillStatusReport summarises one deployment's recovery-drill
+// freshness — the continuous "is the latest backup provably
+// restorable?" probe. A backup that has never been restored is
+// unproven; drills turn exit-0 backups into demonstrated restores,
+// and this report is how an operator sees that proof go stale.
+type drillStatusReport struct {
+	Deployment  string `json:"deployment"`
+	Repo        string `json:"repo"`
+	LastVerdict string `json:"last_verdict,omitempty"`
+	LastAt      string `json:"last_at,omitempty"`
+	LastPassAt  string `json:"last_pass_at,omitempty"`
+	Fresh       bool   `json:"fresh"`
+}
+
+// defaultDrillMaxAge is how old the last SUCCESSFUL drill may be
+// before doctor escalates. One week matches a weekly drill schedule
+// with a day of slack.
+const defaultDrillMaxAge = 7 * 24 * time.Hour
+
+// appendDrillChecks reads each deployment's drill history
+// (recovery/drills/ in its repo) and flags:
+//
+//   - recovery.drill_never_run  (notice)  — no drill has ever run;
+//     the backups are unproven. Suggests scheduling one.
+//   - recovery.drill_failing    (CRITICAL) — the most recent drill
+//     did not pass: the latest backup could not be proven restorable.
+//   - recovery.drill_stale      (CRITICAL) — the last PASSING drill
+//     is older than maxAge: restorability is no longer being proven.
+func appendDrillChecks(ctx context.Context, cfg *config.LoadResult, maxAge time.Duration, issues []doctorIssue) ([]drillStatusReport, []doctorIssue) {
+	if maxAge <= 0 {
+		maxAge = defaultDrillMaxAge
+	}
+	names := make([]string, 0, len(cfg.Config.Deployments))
+	for name := range cfg.Config.Deployments {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	var out []drillStatusReport
+	now := time.Now().UTC()
+	for _, name := range names {
+		dep := cfg.Config.Deployments[name]
+		if dep.Repo == "" {
+			continue
+		}
+		_, sp, err := repo.Open(ctx, dep.Repo)
+		if err != nil {
+			continue // repo.unreachable already surfaced by appendRepoChecks
+		}
+		entries, herr := recovery.NewHistoryStore(sp).List(ctx, recovery.HistoryFilter{
+			Deployment: name,
+			Reverse:    true,
+			Limit:      50,
+		})
+		sp.Close()
+		if herr != nil {
+			continue // best-effort, like the other doctor probes
+		}
+		rep := drillStatusReport{Deployment: name, Repo: dep.Repo}
+		if len(entries) == 0 {
+			out = append(out, rep)
+			issues = append(issues, doctorIssue{
+				Severity: output.SeverityNotice,
+				Code:     "recovery.drill_never_run",
+				Message:  fmt.Sprintf("doctor: deployment %q has never run a recovery drill — its backups are unproven (a backup that has never been restored is not known to be restorable)", name),
+				Suggestion: &output.Suggestion{
+					Human:   fmt.Sprintf("schedule a periodic drill: `pg_hardstorage schedule %s \"daily_at 03:00\" --task drill` (the agent runs it), or run one now with `pg_hardstorage recovery drill %s --repo %s`", name, name, dep.Repo),
+					Command: fmt.Sprintf("pg_hardstorage recovery drill %s --repo %s", name, dep.Repo),
+				},
+			})
+			continue
+		}
+		latest := entries[0]
+		rep.LastVerdict = string(latest.Verdict)
+		rep.LastAt = latest.GeneratedAt.UTC().Format(time.RFC3339)
+		var lastPass *recovery.DrillHistoryEntry
+		for _, e := range entries {
+			if e.Verdict == recovery.DrillVerdictPass {
+				lastPass = e
+				break
+			}
+		}
+		if lastPass != nil {
+			rep.LastPassAt = lastPass.GeneratedAt.UTC().Format(time.RFC3339)
+		}
+		if latest.Verdict != recovery.DrillVerdictPass {
+			issues = append(issues, doctorIssue{
+				Severity: output.SeverityCritical,
+				Code:     "recovery.drill_failing",
+				Message:  fmt.Sprintf("doctor: the most recent recovery drill for %q FAILED (verdict %q at %s, backup %s) — the latest backup could not be proven restorable", name, latest.Verdict, rep.LastAt, latest.BackupID),
+				Suggestion: &output.Suggestion{
+					Human:   "investigate immediately: run the drill by hand with --keep-target-dir and inspect; a failing drill means a restore during a real incident would likely fail the same way",
+					Command: fmt.Sprintf("pg_hardstorage recovery drill %s --repo %s", name, dep.Repo),
+				},
+			})
+			out = append(out, rep)
+			continue
+		}
+		if now.Sub(lastPass.GeneratedAt) > maxAge {
+			issues = append(issues, doctorIssue{
+				Severity: output.SeverityCritical,
+				Code:     "recovery.drill_stale",
+				Message:  fmt.Sprintf("doctor: last successful recovery drill for %q was %s (> %s ago) — restorability is no longer being proven", name, rep.LastPassAt, maxAge),
+				Suggestion: &output.Suggestion{
+					Human:   fmt.Sprintf("check the agent's drill schedule (`pg_hardstorage schedule %s --task drill`) and the agent's health; or run a drill now", name),
+					Command: fmt.Sprintf("pg_hardstorage recovery drill %s --repo %s", name, dep.Repo),
+				},
+			})
+			out = append(out, rep)
+			continue
+		}
+		rep.Fresh = true
+		out = append(out, rep)
+	}
+	return out, issues
+}
+
 // checkOneRepo runs the read-only health probes against one
 // repo URL. Errors at any stage are captured in the report's
 // fields + surfaced via doctorIssue entries; the function never
@@ -731,6 +853,7 @@ type doctorReport struct {
 	ExpiredHolds []expiredHoldReport `json:"expired_holds,omitempty"`
 	PGVersions   []pgVersionReport   `json:"pg_versions,omitempty"`
 	ManifestSig  []manifestSigReport `json:"manifest_signatures,omitempty"`
+	Drills       []drillStatusReport `json:"drills,omitempty"`
 	Issues       []doctorIssue       `json:"issues,omitempty"`
 	Healthy      bool                `json:"healthy"`
 }

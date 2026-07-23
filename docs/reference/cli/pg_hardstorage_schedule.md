@@ -38,7 +38,7 @@ pg_hardstorage schedule [<deployment> [<expression>]] [flags]
 
 ```
   -h, --help          help for schedule
-      --task string   which task's schedule to inspect/modify: backup | rotate (default "backup")
+      --task string   which task's schedule to inspect/modify: backup | rotate | drill (default "backup")
 ```
 
 ### Options inherited from parent commands

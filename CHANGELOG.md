@@ -11,6 +11,59 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ## [Unreleased]
 
+### Integrity program: scheduled drills, contract enforcement, chaos soak
+
+Three layers landed to keep "backup that won't restore" in the class of
+bugs machines catch first (see the new
+[Integrity testing](https://pghardstorage.org/operations/integrity-testing/)
+page):
+
+- **Scheduled recovery drills.** Deployments can now declare a
+  `schedule.drill` alongside `backup` and `rotate`
+  (`pg_hardstorage schedule db1 'daily_at 03:00' --task drill`); the
+  agent restores the latest backup into a scratch dir and verifies it on
+  that cadence, recording every verdict in the repo's drill history.
+  `doctor` gained drill-freshness checks — `recovery.drill_never_run`
+  (notice), `recovery.drill_failing` (critical), and
+  `recovery.drill_stale` (critical, tunable via `--drill-max-age`,
+  default 7d) — plus a `drills` report section for dashboards.
+- **Storage-contract concurrency cases are now mandatory.** Every
+  backend runs `ParallelPuts_SingleWinner` and
+  `ParallelOverwrites_NoTornContent`; a backend claiming
+  `ConditionalPut: true` that loses the race is red, while an honest
+  `false` skips and its callers degrade loudly instead: the backup
+  runner emits a `lease_unenforceable` warning event and the audit
+  chain read-back-verifies every slot it wins. The scp backend is now
+  contract-tested against a real `sshd`, which surfaced (and fixed) a
+  session-open retry needed under `MaxSessions` backpressure. A
+  dedicated CI job runs these with the `DEMAND` env vars so the fixtures
+  can never silently skip.
+- **Nightly chaos soak with a restore-proof gate.** A seeded random
+  fault loop (Patroni switchovers, leader pauses, concurrent-backup
+  bursts) over a real 3-node cluster with an encrypted repo and a
+  continuous — never restarted — `wal stream`. Pass requires every
+  committed backup to `verify --full` AND restore, a gap-free
+  `wal audit`, and exactly one shared-DEK object; the seed is logged so
+  any failure replays deterministically.
+
+The very first soak run caught a real bug, now fixed: **`verify --full`
+(and the agent's scheduled verify) ran the wrong-major sandbox for every
+backup.** Manifests store the plain PostgreSQL major (`pg_version: 17`),
+but the sandbox-major helper expected `server_version_num` form and
+divided by 10000 — every backup fell back to the PG18 default sandbox,
+whose `pg_verifybackup` rejects a PG17 `pg_control` with "CRC is
+incorrect". Healthy, fully-restorable backups were reported as
+corrupt. The helper now recognises plain majors; the failure path also
+gained the actual pg_verifybackup output in its error message (it
+previously pointed at a `tool_stdout` body field that error results
+don't carry, and dropped stderr — where pg_verifybackup writes its
+findings — entirely).
+
+Also fixed while validating: agent-scheduled drills against an
+encrypted repo failed instantly because the drill task did not wire the
+keystore KEK resolver the way the `recovery drill` CLI does — it now
+does.
+
 ## [1.0.15] — 2026-07-23
 
 ### Fix: Patroni switchover hang — the real cause (#34, supersedes 1.0.14)

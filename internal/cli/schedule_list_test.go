@@ -57,11 +57,11 @@ func TestScheduleList_FleetView_JSON(t *testing.T) {
 			t.Errorf("missing %q in:\n%s", want, stdout)
 		}
 	}
-	// db2's rotate task is unset — the row exists but
-	// without a description.
-	// Expect "db2" appears twice (backup + rotate rows).
-	if strings.Count(stdout, `"deployment": "db2"`) != 2 {
-		t.Errorf("expected 2 db2 rows (backup + rotate); got:\n%s", stdout)
+	// db2's rotate and drill tasks are unset — the rows exist
+	// but without a description.
+	// Expect "db2" appears three times (backup + rotate + drill rows).
+	if strings.Count(stdout, `"deployment": "db2"`) != 3 {
+		t.Errorf("expected 3 db2 rows (backup + rotate + drill); got:\n%s", stdout)
 	}
 }
 

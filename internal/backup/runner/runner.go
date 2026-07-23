@@ -446,6 +446,17 @@ func Take(ctx context.Context, opts TakeOptions) (*Result, error) {
 	//     holder's lease expires and is reclaimed automatically; a
 	//     long backup is kept alive by the Maintain goroutine below.
 	if !opts.SkipLease {
+		// Loud degradation on backends without an atomic conditional
+		// put (honest ConditionalPut=false): the lease's mutual
+		// exclusion is not guaranteed there, and the operator should
+		// know rather than discover it as two overlapping backups.
+		if !sp.Capabilities().ConditionalPut {
+			emit(output.NewEvent(output.SeverityWarning, "backup", "lease_unenforceable").
+				WithSubject(output.Subject{Deployment: opts.Deployment}).
+				WithBody(map[string]any{
+					"message": "this storage backend cannot perform an atomic conditional write, so the backup lease cannot strictly guarantee a single concurrent backup; avoid running overlapping backups of this deployment from multiple hosts",
+				}))
+		}
 		lease, lerr := backup.AcquireBackupLease(ctx, sp, opts.Deployment, backup.LeaseOptions{Owner: opts.LeaseOwner})
 		if lerr != nil {
 			if errors.Is(lerr, backup.ErrBackupInProgress) {

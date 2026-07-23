@@ -453,6 +453,20 @@ func (s *Store) Append(ctx context.Context, ev *Event) error {
 			putOpts.RetentionMode = storage.WORMMode(s.worm.Mode)
 		}
 		_, err = s.sp.Put(ctx, key, bytes.NewReader(body), putOpts)
+		if err == nil && !s.sp.Capabilities().ConditionalPut {
+			// The backend makes NO single-winner promise (honest
+			// ConditionalPut=false — e.g. an sftp server without the
+			// hardlink extension): two concurrent Appends can both
+			// "win" the slot, and the later write silently replaces
+			// the earlier event — invisible loss in a tamper-evident
+			// log, since the surviving chain stays self-consistent
+			// (concurrency audit). Read the slot back; if the stored
+			// bytes aren't ours we actually lost — take the
+			// lost-the-race path and relink onto the winner.
+			if stored, rerr := s.readSlotRaw(ctx, key); rerr != nil || !bytes.Equal(stored, body) {
+				err = storage.ErrAlreadyExists
+			}
+		}
 		if err == nil {
 			// Won the slot. Update the head pointer. A failure here is
 			// non-fatal — the event itself is committed; the next Append
@@ -1153,3 +1167,15 @@ func realRandomBytes(n int) []byte {
 // pulling crypto/rand into them. Variable is overridden via the
 // test_hooks file.
 var randRead = cryptoRandRead
+
+// readSlotRaw fetches the raw bytes at an event-slot key. Used by the
+// no-ConditionalPut read-back verification in Append.
+func (s *Store) readSlotRaw(ctx context.Context, key string) ([]byte, error) {
+	rc, err := s.sp.Get(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	defer rc.Close()
+	// Events are small JSON docs; 1 MiB is far above any legitimate size.
+	return stdio.ReadAll(stdio.LimitReader(rc, 1<<20))
+}

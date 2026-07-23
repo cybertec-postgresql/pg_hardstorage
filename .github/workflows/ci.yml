@@ -338,6 +338,37 @@ jobs:
           cache: true
       - run: go test -race -count=1 -timeout=10m ./...
 
+  # Storage-backend CONTRACT gate against REAL servers — the
+  # zero-tolerated-failures policy (integrity program #2). The suite
+  # includes the mandatory ParallelPuts single-winner case: a backend
+  # that claims ConditionalPut and loses it is the scp `mv -T` class of
+  # data-loss bug (forked shared DEK, silently destroyed audit events).
+  # The DEMAND vars turn "server unavailable → skip" into a hard
+  # failure, so this gate can never silently stop testing.
+  storage-contract:
+    name: storage contract (real sftp/scp servers)
+    runs-on: ubuntu-24.04
+    needs: [vet]
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - name: Ensure sshd is installed (scp contract fixture)
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq openssh-server
+      - name: Contract suites (docker sftp + host-sshd scp; skips forbidden)
+        env:
+          PG_HARDSTORAGE_DEMAND_DOCKER: "1"
+          PG_HARDSTORAGE_DEMAND_SSHD: "1"
+        run: |
+          go test -race -count=1 -timeout=12m \
+            ./internal/plugin/storage/sftp/ \
+            ./internal/plugin/storage/scp/ \
+            ./internal/plugin/storage/fs/ \
+            ./internal/plugin/storage/contract/
+
   restore-correctness:
     # L6 of the restore-correctness defence stack — a fast
     # per-PR end-to-end gate that exercises the full
