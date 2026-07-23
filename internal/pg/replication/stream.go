@@ -56,6 +56,31 @@ const defaultStatusInterval = 10 * time.Second
 // stop rather than an error to retry. See issue #101.
 var ErrServerClosedStream = errors.New("replication: server closed the stream (CopyDone)")
 
+// ErrPrimaryDraining is returned when the primary is shutting down and
+// its walsender busy-loops keepalives waiting for our FLUSH to confirm a
+// WAL position it will never reach — the shutdown checkpoint lands in a
+// partial segment, and the sink only advances SyncedLSN (flush) when a
+// full 16 MiB segment commits, so our reported flush never catches up.
+// PG then spins reply-requested keepalives forever, blocking its own
+// fast-shutdown and, in a Patroni cluster, the demoting node's restart
+// (issue #34 — verified to hang a real 3-node switchover). We end the
+// stream so the walsender can exit; the reconnect routes to the new
+// primary and resumes from our real flush position, gap-free (the
+// unflushed partial segment is re-received from the new timeline).
+var ErrPrimaryDraining = errors.New("replication: primary draining (shutdown keepalive spin); reconnecting")
+
+var (
+	// drainSpinKeepalives / drainSpinWindow define the shutdown-spin
+	// signature: this many reply-requested keepalives while fully caught
+	// up (nothing new to receive), within this window, with NO
+	// intervening XLogData. A healthy primary sends keepalives on a
+	// wal_sender_timeout/2 cadence (tens of seconds apart) and
+	// interleaves XLogData, so it can never hit this; the shutdown spin
+	// produces thousands per second (measured: ~1.26M in ~2.5 min).
+	drainSpinKeepalives = 200
+	drainSpinWindow     = 2 * time.Second
+)
+
 // XLogRecord is one chunk of WAL bytes delivered by Stream.
 type XLogRecord struct {
 	WALStart   pglogrepl.LSN // starting LSN of these bytes
@@ -210,6 +235,10 @@ func runReceiveLoop(ctx context.Context, reader *streaming.Reader, sink WALSink,
 		}
 	}()
 
+	var (
+		drainKeepalives  int       // consecutive caught-up keepalives with no XLogData between
+		drainWindowStart time.Time // when the current keepalive burst began
+	)
 	for {
 		msg, err := reader.Receive(recvCtx)
 		if err != nil {
@@ -264,10 +293,29 @@ func runReceiveLoop(ctx context.Context, reader *streaming.Reader, sink WALSink,
 					break
 				}
 			}
+			drainKeepalives = 0 // real WAL progress — not a shutdown spin
 		case pglogrepl.PrimaryKeepaliveMessageByteID:
 			pk, err := pglogrepl.ParsePrimaryKeepaliveMessage(cd.Data[1:])
 			if err != nil {
 				return fmt.Errorf("replication: parse keepalive: %w", err)
+			}
+			// Shutdown-drain detection (issue #34): when we are fully
+			// caught up (the keepalive reports no WAL beyond what we've
+			// received) yet PG keeps firing keepalives in a tight burst
+			// with no XLogData between them, the primary is shutting down
+			// and spinning while it waits for a flush we cannot advance.
+			// Bail so its walsender can exit — reconnect resumes from our
+			// real flush position on the new primary.
+			if uint64(pk.ServerWALEnd) <= written.Load() {
+				if drainKeepalives == 0 {
+					drainWindowStart = time.Now()
+				}
+				drainKeepalives++
+				if drainKeepalives >= drainSpinKeepalives && time.Since(drainWindowStart) <= drainSpinWindow {
+					return ErrPrimaryDraining
+				}
+			} else {
+				drainKeepalives = 0
 			}
 			// If PG asks for a reply, send one right away so it
 			// doesn't time us out.
