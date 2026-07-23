@@ -11,6 +11,8 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ## [Unreleased]
 
+## [1.0.15] — 2026-07-23
+
 ### Fix: Patroni switchover hang — the real cause (#34, supersedes 1.0.14)
 
 1.0.14 shipped an INCOMPLETE fix for #34 based on a wrong root cause
