@@ -11,6 +11,8 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ## [Unreleased]
 
+## [1.0.16] — 2026-07-24
+
 ### Integrity program: scheduled drills, contract enforcement, chaos soak
 
 Three layers landed to keep "backup that won't restore" in the class of

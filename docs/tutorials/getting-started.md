@@ -35,7 +35,7 @@ tarballs (Windows is CLI-only). Grab the matching one from
 verify the cosign signature, and drop the binary on your `$PATH`:
 
 ```sh
-VERSION=1.0.15   # latest release: https://github.com/cybertec-postgresql/pg_hardstorage/releases/latest
+VERSION=1.0.16   # latest release: https://github.com/cybertec-postgresql/pg_hardstorage/releases/latest
 curl -LO "https://github.com/cybertec-postgresql/pg_hardstorage/releases/download/v${VERSION}/pg_hardstorage_${VERSION}_linux_amd64.tar.gz"
 tar xzf "pg_hardstorage_${VERSION}_linux_amd64.tar.gz"
 sudo install -m 0755 pg_hardstorage /usr/local/bin/
@@ -45,7 +45,7 @@ pg_hardstorage version
 ### `.deb` (Debian / Ubuntu)
 
 ```sh
-VERSION=1.0.15   # the release you downloaded
+VERSION=1.0.16   # the release you downloaded
 sudo dpkg -i "pg-hardstorage_${VERSION}_amd64.deb"
 ```
 
@@ -57,7 +57,7 @@ creates `/etc/pg_hardstorage/`, `/var/lib/pg_hardstorage/`,
 ### `.rpm` (Fedora / RHEL / Rocky / Alma)
 
 ```sh
-VERSION=1.0.15   # the release you downloaded
+VERSION=1.0.16   # the release you downloaded
 sudo rpm -i "pg-hardstorage-${VERSION}-1.x86_64.rpm"
 ```
 
@@ -259,7 +259,7 @@ you are doing — exit 9 means the verifier said no.
 
 ```sh
 $ pg_hardstorage version
-pg_hardstorage v1.0.15 (abc1234, built 2026-04-29T12:00:00Z)
+pg_hardstorage v1.0.16 (abc1234, built 2026-04-29T12:00:00Z)
 ```
 
 `doctor` is the single-command "is anything wrong" check. It prints a
