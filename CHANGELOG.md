@@ -11,6 +11,55 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ## [Unreleased]
 
+## [1.0.14] — 2026-07-23
+
+### Fix: Patroni switchover hang (#34)
+
+`wal stream` prevented an old leader from restarting during a Patroni
+switchover. When the demoting primary's walsender ended the COPY
+(`CopyDone`), the stream reconnected on its 1-second floor — but during
+`demote in progress` the old node is still a read-write primary, so
+`target_session_attrs=primary` routed the reconnect straight back to it
+and re-armed a walsender that blocked the very fast-shutdown in
+progress. Server-initiated stream ends now reconnect with an escalating
+grace delay (≥ 10 s), giving the node walsender-free windows to finish
+the demote; the next reconnect then routes to the new primary.
+
+### Fix: concurrency audit — ten bugs (three demonstrated under `-race`)
+
+A three-way review (WAL pipeline, backup/CAS/storage, daemons/audit):
+
+- **Backup lease mutual exclusion** was breakable: a stale-reclaim race
+  let two backups hold the same deployment lease, and the runner only
+  logged lease loss instead of aborting. Reclaim/renew rewritten to
+  recheck → overwrite-in-place → settle-verify; lease loss now aborts
+  the backup.
+- **scp / sftp fake `IfNotExists`**: the `stat` + `mv -T` emulation let
+  two writers both "win" (rename overwrites), silently forking the
+  shared DEK (the #31 data-loss class) and destroying committed audit
+  events on those backends. Commit is now atomic `ln -T` (link(2)
+  EEXIST); sftp advertises `ConditionalPut` only with the hardlink
+  extension; the shared-DEK mint reads back for defense in depth.
+- **`wal stream` could hang forever** after a status-tick send failure
+  on a quiet stream (the receive now unblocks on the per-call context).
+- **System-identifier continuity** is rechecked on every reconnect, so
+  a failover onto a different cluster can no longer interleave foreign
+  WAL into the deployment's lineage.
+- The **first Ctrl-C** no longer kills the graceful WAL stop before
+  `pg_switch_wal` runs, and `clean_stop` is reported honestly.
+- **WAL-gap records** are persisted via a detached context on shutdown
+  and the CRITICAL escalation fires on every unpersisted exit path.
+- The **agent registry** no longer shares a mutable slice with in-flight
+  `/v1/agents` responses; the **syslog sink** no longer closes a
+  connection out from under a concurrent emit.
+
+### Fix: restore verification false failure
+
+The post-restore `SELECT 1` probe rejected psql stderr diagnostics
+(e.g. the collation-version `WARNING` when a cluster built against one
+glibc starts on another) mixed into combined output; it now checks only
+the final result row.
+
 ## [1.0.13] — 2026-07-22
 
 ### Fix: intermittently unrestorable encrypted backups under concurrent WAL streaming (#31)
