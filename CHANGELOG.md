@@ -11,6 +11,31 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ## [Unreleased]
 
+### Fix: Patroni switchover hang — the real cause (#34, supersedes 1.0.14)
+
+1.0.14 shipped an INCOMPLETE fix for #34 based on a wrong root cause
+(reconnect backoff after a server `CopyDone`). Reproducing the bug on a
+real 3-node Patroni cluster proved that theory wrong — the old leader
+still hung — and revealed the actual mechanism:
+
+When the demoting primary shuts down, its physical walsender waits for
+our client to FLUSH-confirm the shutdown-checkpoint LSN before it will
+exit. But the checkpoint lands in a *partial* WAL segment, and the WAL
+sink only advances its flush position (`SyncedLSN`) when a full 16 MiB
+segment commits — so our reported flush never reaches the checkpoint.
+PG then spins reply-requested keepalives forever (measured ~1.26M in
+~2.5 min), the postmaster can't finish its fast-shutdown, and the
+Patroni demote hangs until the streamer is restarted.
+
+The streamer now detects that spin (a burst of caught-up keepalives
+with no new WAL) and ends the stream so the walsender can exit; the
+reconnect routes to the new primary and resumes gap-free from the real
+flush position. The ineffective 1.0.14 reconnect-backoff change is
+reverted. Verified end-to-end against a real 3-node Patroni switchover
+(old leader now rejoins as a streaming replica in ~90 s; without the
+fix it stays stuck at `stopping` indefinitely) plus a unit regression
+for the spin detector.
+
 ## [1.0.14] — 2026-07-23
 
 ### Fix: Patroni switchover hang (#34)

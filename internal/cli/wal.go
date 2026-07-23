@@ -1663,24 +1663,16 @@ func runWalStream(cmd *cobra.Command, opts walStreamOptions) error {
 		// failing stream can't spin us in a tight full-setup reconnect
 		// loop (CPU-pathology audit #1).
 		reason := "stream_break"
-		if errors.Is(streamErr, replication.ErrServerClosedStream) {
-			// The SERVER ended the COPY (CopyDone) — the walsender is
-			// going away, which during a Patroni switchover means the
-			// primary is shutting down to demote. Reconnecting on the
-			// usual 1s floor lands right back on the still-up, still-
-			// read-write demoting node (target_session_attrs=primary
-			// matches it until pg_ctl stop finishes), re-arming a
-			// walsender that BLOCKS the very fast-shutdown in progress —
-			// the demote then hangs until this process is restarted
-			// (issue #34). Back off with an escalating grace floor
-			// instead, so the node gets windows with zero walsenders to
-			// complete its shutdown; the next reconnect then routes to
-			// the new primary.
-			backoff = serverClosedBackoff(backoff, opts.maxReconnectBackoff)
-			reason = "server_closed_stream"
-		} else {
-			backoff = nextStreamBreakBackoff(time.Since(attemptWallStart), backoff, initialBackoff, opts.maxReconnectBackoff)
+		if errors.Is(streamErr, replication.ErrPrimaryDraining) {
+			// The primary is shutting down and its walsender was busy-
+			// looping keepalives waiting for a flush we can't advance
+			// (issue #34); we bailed so it can exit. Reconnect PROMPTLY
+			// — target_session_attrs=primary routes to the new primary
+			// once the old one finishes demoting; resume is gap-free
+			// from our real flush position.
+			reason = "primary_draining"
 		}
+		backoff = nextStreamBreakBackoff(time.Since(attemptWallStart), backoff, initialBackoff, opts.maxReconnectBackoff)
 		emit(output.NewEvent(output.SeverityWarning, "wal.stream", "reconnecting").
 			WithBody(map[string]any{
 				"attempt":    attempt,
@@ -2088,28 +2080,6 @@ func nextBackoff(cur, max time.Duration) time.Duration {
 // take well under a second, so a connection that lasts at least this
 // long actually streamed; one that breaks faster is flapping.
 const minHealthyStreamDuration = 5 * time.Second
-
-// serverClosedGrace is the minimum delay before reconnecting after the
-// SERVER ended the COPY (CopyDone). It must be long enough that a
-// demoting primary gets a walsender-free window to finish its
-// fast-shutdown before we reconnect and re-arm one (issue #34).
-const serverClosedGrace = 10 * time.Second
-
-// serverClosedBackoff computes the reconnect delay after a server-
-// initiated CopyDone: an escalating backoff that NEVER resets to the
-// 1s floor and never drops below serverClosedGrace, so repeated
-// re-arms during a slow demote back off increasingly instead of
-// hammering the shutting-down node once per second.
-func serverClosedBackoff(prev, max time.Duration) time.Duration {
-	next := nextBackoff(prev, max)
-	if next < serverClosedGrace {
-		next = serverClosedGrace
-	}
-	if max > 0 && next > max {
-		next = max
-	}
-	return next
-}
 
 // nextStreamBreakBackoff decides the reconnect backoff after a stream
 // attempt that CONNECTED and then broke. A connection that stayed up
