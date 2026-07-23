@@ -1447,7 +1447,17 @@ func runWalStream(cmd *cobra.Command, opts walStreamOptions) error {
 
 	// 1. Open repo first — fail fast on misconfiguration before we
 	//    touch PostgreSQL.
-	repoCtx := cmd.Context()
+	//
+	// DETACHED from the root signal context (values preserved): the
+	// root command installs signal.NotifyContext, whose FIRST SIGINT
+	// would cancel this ctx — and with it streamCtx — before the wal
+	// handler below could run pg_switch_wal, killing the documented
+	// graceful drain on every real Ctrl-C and letting the sink take
+	// the hard-abort branch with repoCtx already cancelled
+	// (concurrency audit). installSignalCancel is the SOLE
+	// signal-to-cancel authority for the stream: first signal =
+	// graceful (switch + flush, self-bounded ~10s), second = hard.
+	repoCtx := context.WithoutCancel(cmd.Context())
 	repoMeta, sp, err := repo.Open(repoCtx, opts.repoURL)
 	if err != nil {
 		return mapRepoOpenErr(opts.repoURL, err)
@@ -1527,7 +1537,7 @@ func runWalStream(cmd *cobra.Command, opts walStreamOptions) error {
 	//    target the most recent operator-visible LSN.
 	streamCtx, cancel := context.WithCancel(repoCtx)
 	defer cancel()
-	shutdown := &walShutdown{}
+	shutdown := &walShutdown{gracefulDone: make(chan struct{})}
 	dsnCopy := opts.pgConn
 	shutdown.dsn.Store(&dsnCopy)
 	installSignalCancel(streamCtx, cancel, shutdown)
@@ -1569,6 +1579,7 @@ func runWalStream(cmd *cobra.Command, opts walStreamOptions) error {
 		latestTimeline uint32
 		attempt        int
 		lastStreamErr  error // streamErr of the final attempt, for the honest clean_stop
+		streamSysID    string
 	)
 	for {
 		if streamCtx.Err() != nil {
@@ -1577,6 +1588,20 @@ func runWalStream(cmd *cobra.Command, opts walStreamOptions) error {
 		attempt++
 		attemptWallStart := time.Now()
 		streamErr, syncedAtExit, bufferedAtExit, attemptStart, attemptTLI, attemptInfo, attemptErr := streamAttempt(streamCtx, repoCtx, sp, cas, repoMeta, opts, d, emit, attempt, shutdown, walEncInfo)
+		// System-identifier continuity across reconnects: the startup
+		// guardSystemIdentifier check runs ONCE, but the retry loop
+		// exists to survive failovers — and a failover/VIP repoint can
+		// land the DSN on a DIFFERENT cluster (restored clone, wrongly
+		// re-initialized standby). Without this recheck the next attempt
+		// would archive the foreign cluster's WAL into the same
+		// deployment lineage — exactly the corruption the startup
+		// refusal prevents (concurrency audit). A sysid change is a
+		// permanent, operator-actionable condition: stop, don't retry.
+		if attemptInfo != "" {
+			if perr := checkSysIDContinuity(&streamSysID, attemptInfo, opts.deployment, opts.allowSysIDChange); perr != nil {
+				return perr
+			}
+		}
 		if attemptErr != nil {
 			// Pre-Stream setup error (preflight, ensureSlot,
 			// resolveStartLSN, connect).  Treat as a connection-
@@ -1637,14 +1662,32 @@ func runWalStream(cmd *cobra.Command, opts walStreamOptions) error {
 		// almost immediately keeps escalating, so a flapping/instantly-
 		// failing stream can't spin us in a tight full-setup reconnect
 		// loop (CPU-pathology audit #1).
-		backoff = nextStreamBreakBackoff(time.Since(attemptWallStart), backoff, initialBackoff, opts.maxReconnectBackoff)
+		reason := "stream_break"
+		if errors.Is(streamErr, replication.ErrServerClosedStream) {
+			// The SERVER ended the COPY (CopyDone) — the walsender is
+			// going away, which during a Patroni switchover means the
+			// primary is shutting down to demote. Reconnecting on the
+			// usual 1s floor lands right back on the still-up, still-
+			// read-write demoting node (target_session_attrs=primary
+			// matches it until pg_ctl stop finishes), re-arming a
+			// walsender that BLOCKS the very fast-shutdown in progress —
+			// the demote then hangs until this process is restarted
+			// (issue #34). Back off with an escalating grace floor
+			// instead, so the node gets windows with zero walsenders to
+			// complete its shutdown; the next reconnect then routes to
+			// the new primary.
+			backoff = serverClosedBackoff(backoff, opts.maxReconnectBackoff)
+			reason = "server_closed_stream"
+		} else {
+			backoff = nextStreamBreakBackoff(time.Since(attemptWallStart), backoff, initialBackoff, opts.maxReconnectBackoff)
+		}
 		emit(output.NewEvent(output.SeverityWarning, "wal.stream", "reconnecting").
 			WithBody(map[string]any{
 				"attempt":    attempt,
 				"error":      streamErr.Error(),
 				"backoff":    backoff.String(),
 				"synced_lsn": syncedAtExit.String(),
-				"reason":     "stream_break",
+				"reason":     reason,
 			}))
 		if !sleepBackoff(streamCtx, backoff) {
 			break
@@ -1652,6 +1695,19 @@ func runWalStream(cmd *cobra.Command, opts walStreamOptions) error {
 	}
 
 	stoppedAt := time.Now().UTC()
+	// If a graceful stop is in flight, WAIT for it before judging the
+	// stop: gracefulStopAndCancel stores switchLSN up to ~10s after the
+	// signal (connect + pg_switch_wal + flush-wait), and reading it
+	// mid-flight frequently saw 0 → a falsely optimistic clean_stop
+	// with no stopped_with_unarchived_wal warning (concurrency audit).
+	// Self-bounded: the goroutine's own timeouts cap this wait; the
+	// extra timer is a belt-and-suspenders backstop only.
+	if shutdown.gracefulStarted.Load() {
+		select {
+		case <-shutdown.gracefulDone:
+		case <-time.After(15 * time.Second):
+		}
+	}
 	// clean_stop must be honest: the streamer stopped cleanly only if
 	// it exited without a hard error AND archived all WAL up to the
 	// point a graceful stop's pg_switch_wal fixed. A streamer that
@@ -2033,6 +2089,28 @@ func nextBackoff(cur, max time.Duration) time.Duration {
 // long actually streamed; one that breaks faster is flapping.
 const minHealthyStreamDuration = 5 * time.Second
 
+// serverClosedGrace is the minimum delay before reconnecting after the
+// SERVER ended the COPY (CopyDone). It must be long enough that a
+// demoting primary gets a walsender-free window to finish its
+// fast-shutdown before we reconnect and re-arm one (issue #34).
+const serverClosedGrace = 10 * time.Second
+
+// serverClosedBackoff computes the reconnect delay after a server-
+// initiated CopyDone: an escalating backoff that NEVER resets to the
+// 1s floor and never drops below serverClosedGrace, so repeated
+// re-arms during a slow demote back off increasingly instead of
+// hammering the shutting-down node once per second.
+func serverClosedBackoff(prev, max time.Duration) time.Duration {
+	next := nextBackoff(prev, max)
+	if next < serverClosedGrace {
+		next = serverClosedGrace
+	}
+	if max > 0 && next > max {
+		next = max
+	}
+	return next
+}
+
 // nextStreamBreakBackoff decides the reconnect backoff after a stream
 // attempt that CONNECTED and then broke. A connection that stayed up
 // for at least minHealthyStreamDuration is a real reconnect — reset to
@@ -2059,6 +2137,27 @@ func nextStreamBreakBackoff(streamDuration, prevBackoff, initial, max time.Durat
 // whose remediation requires operator action are listed.  Transient
 // classes (connect.replication, pg.identify_failed) stay on the retry
 // path because a Patroni failover legitimately surfaces as those.
+// checkSysIDContinuity pins the stream's system identifier to the first
+// attempt's value and refuses any later attempt that reports a
+// different one (unless the operator passed --allow-sysid-change). See
+// the retry-loop comment: without this, a reconnect after a DSN
+// repoint to a different cluster interleaves foreign WAL into the
+// deployment's lineage.
+func checkSysIDContinuity(pinned *string, observed, deployment string, allowChange bool) error {
+	if *pinned == "" {
+		*pinned = observed
+		return nil
+	}
+	if observed == *pinned || allowChange {
+		return nil
+	}
+	return output.NewError("wal.system_identifier_changed",
+		fmt.Sprintf("wal stream: system identifier changed across reconnect for %q: streaming began against cluster %s but the connection now reaches cluster %s — refusing to interleave a different cluster's WAL into this deployment's lineage", deployment, *pinned, observed)).
+		WithSuggestion(&output.Suggestion{
+			Human: "the DSN now resolves to a different PostgreSQL cluster (restored clone, re-initialized standby, or a repointed VIP/DNS entry). Point the DSN back at the original cluster, or — if the change is intentional — archive the new cluster under a NEW deployment name (or pass --allow-system-identifier-change after reading the pg_upgrade runbook).",
+		})
+}
+
 func isPermanentStreamSetupError(err error) bool {
 	oe, ok := output.AsOutputError(err)
 	if !ok {
@@ -2459,10 +2558,20 @@ func installSignalCancel(ctx context.Context, cancel context.CancelFunc, shutdow
 		select {
 		case <-sig:
 		case <-ctx.Done():
+			// The stream ended on its own (error, --once). Mark the
+			// graceful path as never-started so nobody waits on it.
+			close(shutdown.gracefulDone)
 			return
 		}
-		// First signal: graceful.
-		go gracefulStopAndCancel(shutdown, cancel)
+		// First signal: graceful. gracefulStarted lets the result
+		// path know it must WAIT for gracefulDone before reading
+		// switchLSN — reading it mid-flight produced a racy, falsely
+		// optimistic clean_stop (concurrency audit).
+		shutdown.gracefulStarted.Store(true)
+		go func() {
+			defer close(shutdown.gracefulDone)
+			gracefulStopAndCancel(shutdown, cancel)
+		}()
 		// Second signal: cancel immediately without waiting for
 		// the flush.  The graceful goroutine above is already
 		// racing to finish; whichever wins, cancel is idempotent.
@@ -2485,6 +2594,13 @@ type walShutdown struct {
 	// stream error). When non-zero it is the bar the streamer's
 	// SyncedLSN must have reached for the stop to count as clean.
 	switchLSN atomic.Uint64
+	// gracefulStarted flips when the first signal launches the
+	// graceful-stop goroutine; gracefulDone closes when that goroutine
+	// (or the no-signal exit path) finishes. The result path waits on
+	// it so clean_stop/switchLSN are read only after pg_switch_wal had
+	// its chance to record the bar — not mid-flight.
+	gracefulStarted atomic.Bool
+	gracefulDone    chan struct{}
 }
 
 // gracefulStopAndCancel implements the signal-driven graceful stop

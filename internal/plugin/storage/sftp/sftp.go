@@ -95,9 +95,21 @@ type Plugin struct {
 func (p *Plugin) Name() string { return "sftp" }
 
 // Capabilities implements storage.StoragePlugin.
+//
+// ConditionalPut is only claimed when the server advertises the
+// hardlink@openssh.com extension — that path maps to POSIX link(2)
+// and is genuinely atomic. The legacy stat-then-rename fallback is
+// NOT (rename overwrites; two concurrent writers can both "win"), so
+// advertising ConditionalPut for it let single-winner consumers
+// (shared-DEK mint, backup lease, audit-chain slots) silently lose
+// writes (concurrency audit).
 func (p *Plugin) Capabilities() storage.Capabilities {
+	cond := true
+	if p.client != nil {
+		_, cond = p.client.HasExtension("hardlink@openssh.com")
+	}
 	return storage.Capabilities{
-		ConditionalPut: true, // emulated; see top-of-file
+		ConditionalPut: cond,
 	}
 }
 

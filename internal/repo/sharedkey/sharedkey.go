@@ -211,7 +211,22 @@ func ResolveOrMint(ctx context.Context, sp storage.StoragePlugin, kekRef string,
 	}
 	perr := putSharedDEK(ctx, sp, key, kekRef, wrapped)
 	if perr == nil {
-		return MintResult{DEK: fresh, Have: true}, nil // we minted it
+		// We won the conditional PUT — but do not TRUST it blindly:
+		// read back the stored object and adopt whatever is there. On
+		// honest backends this returns our own wrap (no-op). On a
+		// backend whose IfNotExists emulation is last-writer-wins
+		// (historically scp before its ln-based fix, and sftp servers
+		// without the hardlink extension), two "winners" can both see
+		// perr == nil; adopting the stored content instead of our own
+		// candidate makes writers whose read-back runs after the last
+		// write converge. Defense in depth only — it narrows but
+		// cannot fully close the window; the true guarantee comes
+		// from an atomic ConditionalPut (concurrency audit).
+		stored, ok := readWrappedDEK(ctx, sp, key, kekRef)
+		if !ok {
+			return MintResult{}, fmt.Errorf("sharedkey: shared DEK object unreadable immediately after commit for KEK %q", kekRef)
+		}
+		return unwrapInto(stored, unwrap)
 	}
 	if !errors.Is(perr, storage.ErrAlreadyExists) {
 		return MintResult{}, fmt.Errorf("sharedkey: commit shared DEK: %w", perr)

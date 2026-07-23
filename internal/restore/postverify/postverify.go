@@ -674,7 +674,15 @@ func probeSelect1(ctx context.Context, psql, dsn string) error {
 	if err != nil {
 		return fmt.Errorf("%w (output: %s)", err, truncate(out, 256))
 	}
-	if strings.TrimSpace(string(out)) != "1" {
+	// CombinedOutput interleaves psql's stderr NOTICEs/WARNINGs (e.g.
+	// the collation-version mismatch warning when a cluster built
+	// against one glibc is started on another — routine when restoring
+	// a container-created backup onto a host) with the query result.
+	// The probe's question is only "did the server answer the query?",
+	// so accept any output whose LAST non-empty line is the result row;
+	// diagnostics above it are informational, not failures.
+	lines := strings.Fields(strings.TrimSpace(string(out)))
+	if len(lines) == 0 || lines[len(lines)-1] != "1" {
 		return fmt.Errorf("unexpected output %q", string(out))
 	}
 	return nil

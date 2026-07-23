@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/output"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/encryption"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo/sharedkey"
@@ -56,6 +57,29 @@ func selectDEK(ctx context.Context, sp storage.StoragePlugin, kekRef string, cfg
 		return dek, fmt.Errorf("backup: shared-DEK resolution returned no key for KEK %q", kekRef)
 	}
 	return res.DEK, nil
+}
+
+// leaseLossAborter builds the Maintain callback: lease LOSS aborts the
+// backup via cancelBackup (another holder owns the deployment — running
+// both to completion is exactly what the lease prevents), while
+// transient renew errors only emit a warning. Factored out so the abort
+// contract is unit-testable.
+func leaseLossAborter(deployment string, emit func(*output.Event), cancelBackup func(error)) func(error) {
+	return func(rerr error) {
+		if errors.Is(rerr, backup.ErrLeaseLost) {
+			emit(output.NewEvent(output.SeverityCritical, "backup", "lease_lost").
+				WithSubject(output.Subject{Deployment: deployment}).
+				WithBody(map[string]any{
+					"error":  rerr.Error(),
+					"action": "aborting this backup: another holder owns the deployment lease",
+				}))
+			cancelBackup(fmt.Errorf("backup lease lost: %w", rerr))
+			return
+		}
+		emit(output.NewEvent(output.SeverityWarning, "backup", "lease_renew_failed").
+			WithSubject(output.Subject{Deployment: deployment}).
+			WithBody(map[string]any{"error": rerr.Error()}))
+	}
 }
 
 // wrapDEKForReuse wraps a plaintext DEK for storage in the shared-DEK
