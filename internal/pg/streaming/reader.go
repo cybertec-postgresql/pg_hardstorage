@@ -313,7 +313,23 @@ func (r *Reader) Receive(ctx context.Context) (pgproto3.BackendMessage, error) {
 			}
 		}
 
+		// Unblock on the CALLER's ctx, not just the constructor ctx:
+		// the watcher goroutine above is bound to the ctx passed at
+		// New() time, so cancelling a per-Receive ctx (the status-tick
+		// failure path stores tickErr and cancels recvCtx expecting an
+		// immediate unblock) did NOT interrupt a Receive parked in
+		// netConn.Read — with a negative InactivityTimeout the stream
+		// hung forever (concurrency audit, demonstrated under -race).
+		// AfterFunc is registered AFTER the deadline set so a cancel
+		// landing between the loop-top ctx check and the set cannot be
+		// missed (an already-cancelled ctx runs the callback
+		// immediately, re-poking the deadline).
+		stopPoke := context.AfterFunc(ctx, func() {
+			_ = r.netConn.SetReadDeadline(time.Unix(1, 0))
+		})
+
 		msg, err := r.frontend.Receive()
+		stopPoke()
 		if err != nil {
 			return nil, r.classifyReadError(ctx, err)
 		}

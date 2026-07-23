@@ -78,10 +78,35 @@ func (r *AgentRegistry) Heartbeat(req HeartbeatRequest) (*Agent, error) {
 	}
 	a.Host = req.Host
 	a.Version = req.Version
-	a.Deployments = append(a.Deployments[:0], req.Deployments...)
+	// Allocate a fresh backing array on every heartbeat instead of
+	// reusing the old one (append(a.Deployments[:0], ...)): snapshots
+	// handed out by Heartbeat/List/Get share the slice header they were
+	// copied from, and rewriting the old array in place raced with
+	// readers iterating those snapshots after the lock was released
+	// (concurrency audit, bug A).
+	a.Deployments = cloneDeployments(req.Deployments)
 	a.LastHeartbeat = now
-	out := *a
+	out := snapshotAgent(a)
 	return &out, nil
+}
+
+// snapshotAgent returns a copy of a that shares no mutable state with
+// the registry-owned record. Caller must hold r.mu (read or write).
+// The Deployments deep copy is defense in depth on top of Heartbeat's
+// fresh-slice allocation: no snapshot ever aliases registry memory.
+func snapshotAgent(a *Agent) Agent {
+	out := *a
+	out.Deployments = cloneDeployments(a.Deployments)
+	return out
+}
+
+// cloneDeployments deep-copies a deployments slice. Empty input maps
+// to nil so the JSON omitempty semantics are preserved.
+func cloneDeployments(d []string) []string {
+	if len(d) == 0 {
+		return nil
+	}
+	return append([]string(nil), d...)
 }
 
 // List returns every registered agent. includeInactive=false omits
@@ -96,7 +121,7 @@ func (r *AgentRegistry) List(includeInactive bool) []Agent {
 		if !includeInactive && !a.IsActive(r.timeout, now) {
 			continue
 		}
-		out = append(out, *a)
+		out = append(out, snapshotAgent(a))
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out
@@ -110,7 +135,7 @@ func (r *AgentRegistry) Get(id string) *Agent {
 	if !ok {
 		return nil
 	}
-	out := *a
+	out := snapshotAgent(a)
 	return &out
 }
 

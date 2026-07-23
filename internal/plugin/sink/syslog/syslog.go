@@ -109,7 +109,12 @@ type Sink struct {
 
 	mu     sync.Mutex
 	conn   net.Conn
+	gen    int // increments on every successful dial; see dial()
 	closed bool
+
+	// dialConn is a test seam: when non-nil it replaces the real
+	// network dial inside dial(). Production code leaves it nil.
+	dialConn func(ctx context.Context) (net.Conn, error)
 }
 
 // NewFromSpec is the SinkBuilder.
@@ -283,41 +288,67 @@ func (s *Sink) Name() string { return s.name }
 // For UDP this is connect-less; for TCP/TLS we dial here and reuse
 // the connection across emits.
 func (s *Sink) Open(ctx context.Context, _ map[string]any) error {
-	return s.dial(ctx)
+	s.mu.Lock()
+	gen := s.gen
+	s.mu.Unlock()
+	return s.dial(ctx, gen)
 }
 
-// dial (re-)establishes the network connection. Caller must hold s.mu.
-func (s *Sink) dial(ctx context.Context) error {
+// dial (re-)establishes the network connection, but only if the
+// connection generation is still failedGen. Emit runs concurrently
+// (the dispatcher fans events out without per-sink serialization), so
+// an unconditional close-and-redial here could yank a connection out
+// from under another Emit that was mid-write, and a burst of failures
+// on one dead connection could trigger a reconnect stampede. The
+// generation counter — incremented on every successful dial — pins
+// each failure to the exact connection it happened on: if s.gen has
+// moved past failedGen, another Emit already reconnected and we
+// simply reuse the fresh connection (concurrency audit, bug B).
+func (s *Sink) dial(ctx context.Context, failedGen int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.dialLocked(ctx, failedGen)
+}
+
+// dialLocked is dial's body. Caller must hold s.mu.
+func (s *Sink) dialLocked(ctx context.Context, failedGen int) error {
 	if s.closed {
 		return errors.New("syslog: sink closed")
+	}
+	if s.gen != failedGen && s.conn != nil {
+		// Someone else already replaced the failed connection.
+		return nil
 	}
 	if s.conn != nil {
 		_ = s.conn.Close()
 		s.conn = nil
 	}
 
-	dialer := &net.Dialer{Timeout: s.timeout}
 	var conn net.Conn
 	var err error
-	switch s.protocol {
-	case "udp":
-		conn, err = dialer.DialContext(ctx, "udp", s.address)
-	case "tcp":
-		conn, err = dialer.DialContext(ctx, "tcp", s.address)
-	case "tls":
-		// tlsCfg was built eagerly at NewFromSpec time so any
-		// CA / cert misconfiguration fails before Open. Clone
-		// it per-dial — tls.DialWithDialer mutates ServerName
-		// when it doesn't have one, and we want the original
-		// preserved for the next dial attempt.
-		conn, err = tls.DialWithDialer(dialer, "tcp", s.address, s.tlsCfg.Clone())
+	if s.dialConn != nil {
+		conn, err = s.dialConn(ctx)
+	} else {
+		dialer := &net.Dialer{Timeout: s.timeout}
+		switch s.protocol {
+		case "udp":
+			conn, err = dialer.DialContext(ctx, "udp", s.address)
+		case "tcp":
+			conn, err = dialer.DialContext(ctx, "tcp", s.address)
+		case "tls":
+			// tlsCfg was built eagerly at NewFromSpec time so any
+			// CA / cert misconfiguration fails before Open. Clone
+			// it per-dial — tls.DialWithDialer mutates ServerName
+			// when it doesn't have one, and we want the original
+			// preserved for the next dial attempt.
+			conn, err = tls.DialWithDialer(dialer, "tcp", s.address, s.tlsCfg.Clone())
+		}
 	}
 	if err != nil {
 		return fmt.Errorf("syslog: dial %s/%s: %w", s.protocol, s.address, err)
 	}
 	s.conn = conn
+	s.gen++
 	return nil
 }
 
@@ -334,51 +365,55 @@ func (s *Sink) Emit(ctx context.Context, ev *output.Event) error {
 		return err
 	}
 
-	if err := s.write(ctx, frame); err == nil {
+	gen, err := s.write(ctx, frame)
+	if err == nil {
 		return nil
 	}
 
-	// Try a reconnect-and-retry once.
-	if err := s.dial(ctx); err != nil {
+	// Try a reconnect-and-retry once. dial is generation-aware: it
+	// only tears down the connection our write actually failed on; if
+	// a concurrent Emit already reconnected, we retry on its fresh
+	// connection instead of dialing again.
+	if err := s.dial(ctx, gen); err != nil {
 		return err
 	}
-	return s.write(ctx, frame)
+	_, err = s.write(ctx, frame)
+	return err
 }
 
 // write sends the formatted frame on the active conn, dialing if
-// necessary.
-func (s *Sink) write(ctx context.Context, frame []byte) error {
+// necessary. It returns the generation of the connection the write
+// used so a failure can be pinned to exactly that connection (see
+// Emit / dial). The mutex is held across deadline-set + Write —
+// mirroring the CEF sink — so a concurrent Emit can neither stomp
+// our write deadline nor close the connection out from under us.
+func (s *Sink) write(ctx context.Context, frame []byte) (int, error) {
 	// External review pass: SetWriteDeadline reads ctx.Deadline()
 	// but plain ctx.Cancel() (no deadline, just cancellation) was
 	// silently honoured only if we happened to have a deadline.
 	// An explicit ctx.Err() check at the top covers the
 	// cancellation-without-deadline case.
 	if err := ctx.Err(); err != nil {
-		return err
+		return 0, err
 	}
 	s.mu.Lock()
-	conn := s.conn
-	closed := s.closed
-	s.mu.Unlock()
-	if closed {
-		return errors.New("syslog: sink closed")
+	defer s.mu.Unlock()
+	if s.closed {
+		return s.gen, errors.New("syslog: sink closed")
 	}
-	if conn == nil {
-		if err := s.dial(ctx); err != nil {
-			return err
+	if s.conn == nil {
+		if err := s.dialLocked(ctx, s.gen); err != nil {
+			return s.gen, err
 		}
-		s.mu.Lock()
-		conn = s.conn
-		s.mu.Unlock()
 	}
 
 	if deadline, ok := ctx.Deadline(); ok {
-		_ = conn.SetWriteDeadline(deadline)
+		_ = s.conn.SetWriteDeadline(deadline)
 	} else {
-		_ = conn.SetWriteDeadline(time.Now().Add(s.timeout))
+		_ = s.conn.SetWriteDeadline(time.Now().Add(s.timeout))
 	}
-	_, err := conn.Write(frame)
-	return err
+	_, err := s.conn.Write(frame)
+	return s.gen, err
 }
 
 // Close implements output.Sink.

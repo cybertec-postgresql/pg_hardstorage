@@ -76,6 +76,13 @@ type leaseBody struct {
 	ExpiresAt  time.Time `json:"expires_at"`
 }
 
+// defaultLeaseSettle is the post-write verification window used by the
+// stale-break and renew paths (see the settle-verify comments below).
+// Long enough to cover a competing writer whose write raced ours by a
+// scheduling quantum; short enough to be irrelevant next to a backup's
+// runtime.
+const defaultLeaseSettle = 400 * time.Millisecond
+
 // LeaseOptions tunes AcquireBackupLease.  The zero value uses
 // DefaultLeaseTTL, time.Now, and a "<hostname>/pid-<pid>" owner.
 type LeaseOptions struct {
@@ -86,7 +93,16 @@ type LeaseOptions struct {
 	TTL time.Duration
 	// now is the clock, injected by tests.  Zero means time.Now.
 	now func() time.Time
+	// settle overrides defaultLeaseSettle, injected by tests.
+	settle time.Duration
 }
+
+// Test hooks: gate specific interleavings deterministically in race
+// tests.  Always nil in production.
+var (
+	leaseHookAfterStaleRecheck func() // between the stale recheck and the overwrite
+	leaseHookBeforeRenewPut    func() // between Renew's expiry check and its put
+)
 
 // Lease is a held per-deployment backup lease.  Renew extends it,
 // Maintain keeps it alive in the background, Release frees it.
@@ -95,6 +111,7 @@ type Lease struct {
 	deployment string
 	ttl        time.Duration
 	now        func() time.Time
+	settle     time.Duration
 
 	mu   sync.Mutex
 	body leaseBody // the document we last wrote (our fencing token)
@@ -137,8 +154,12 @@ func AcquireBackupLease(ctx context.Context, sp storage.StoragePlugin, deploymen
 	if owner == "" {
 		owner = defaultLeaseOwner()
 	}
+	settle := opts.settle
+	if settle <= 0 {
+		settle = defaultLeaseSettle
+	}
 
-	l := &Lease{sp: sp, deployment: deployment, ttl: ttl, now: now}
+	l := &Lease{sp: sp, deployment: deployment, ttl: ttl, now: now, settle: settle}
 
 	// Fast path: atomic create-if-absent.
 	body := l.freshBody(owner)
@@ -173,20 +194,91 @@ func AcquireBackupLease(ctx context.Context, sp storage.StoragePlugin, deploymen
 			existing.AcquiredAt.Format(time.RFC3339), existing.ExpiresAt.Format(time.RFC3339))
 	}
 
-	// Stale: break and retake.  Delete then create-if-absent so exactly
-	// one of several concurrent reclaimers wins.
-	if derr := sp.Delete(ctx, backupLeaseKey(deployment)); derr != nil && !errors.Is(derr, storage.ErrNotFound) {
-		return nil, fmt.Errorf("backup: break stale lease for %q: %w", deployment, derr)
+	// Stale: break and retake.
+	//
+	// The earlier design here (Delete, then create-if-absent) was racy:
+	// two reclaimers could both judge the lease stale, reclaimer A could
+	// complete Delete+create — holding a LIVE lease — and reclaimer B's
+	// still-pending unconditional Delete then destroyed A's fresh lease,
+	// after which B's create succeeded too. Both returned held, and two
+	// backups of the same deployment ran concurrently (concurrency audit,
+	// demonstrated under -race).
+	//
+	// The rewrite never deletes. Sequence:
+	//
+	//  1. RECHECK: re-read immediately before acting. Only proceed if the
+	//     stored lease is still the exact stale body we first observed —
+	//     a reclaimer that already broke it (fresh token) or a lease that
+	//     changed in any way sends us to ErrBackupInProgress instead.
+	//  2. OVERWRITE in place (no delete): concurrent reclaimers can only
+	//     overwrite each other; nobody can destroy a winner's lease.
+	//  3. SETTLE-VERIFY: wait `settle`, re-read, and only return held if
+	//     the stored fencing token is OURS. Competing reclaimers whose
+	//     writes land within the settle window are detected here — the
+	//     LAST writer wins, everyone else gets ErrBackupInProgress.
+	//
+	// Residual window: a reclaimer that stalls longer than `settle`
+	// between its recheck (step 1) and write (step 2) can still clobber a
+	// winner that has already settle-verified. That requires a multi-
+	// hundred-ms stall between adjacent statements; if it ever happens,
+	// the loser's next Renew fences on the stored token and the runner
+	// aborts on ErrLeaseLost, bounding the overlap to one renew interval.
+	recheck, rcerr := l.read(ctx)
+	if rcerr != nil {
+		if errors.Is(rcerr, storage.ErrNotFound) {
+			// Released/broken since we judged it stale — plain create.
+			body = l.freshBody(owner)
+			if err := l.put(ctx, body, true); err != nil {
+				if errors.Is(err, storage.ErrAlreadyExists) {
+					return nil, ErrBackupInProgress
+				}
+				return nil, fmt.Errorf("backup: retake stale lease for %q: %w", deployment, err)
+			}
+			l.setBody(body)
+			return l, nil
+		}
+		return nil, fmt.Errorf("backup: recheck stale lease for %q: %w", deployment, rcerr)
+	}
+	if recheck.Owner != existing.Owner || !recheck.AcquiredAt.Equal(existing.AcquiredAt) ||
+		now().Before(recheck.ExpiresAt) {
+		// Someone else already broke + retook it (or the holder revived).
+		return nil, ErrBackupInProgress
+	}
+	if leaseHookAfterStaleRecheck != nil {
+		leaseHookAfterStaleRecheck()
 	}
 	body = l.freshBody(owner)
-	if err := l.put(ctx, body, true); err != nil {
-		if errors.Is(err, storage.ErrAlreadyExists) {
-			return nil, ErrBackupInProgress
-		}
+	if err := l.put(ctx, body, false); err != nil {
 		return nil, fmt.Errorf("backup: retake stale lease for %q: %w", deployment, err)
+	}
+	if err := l.settleVerify(ctx, body); err != nil {
+		return nil, err
 	}
 	l.setBody(body)
 	return l, nil
+}
+
+// settleVerify waits the settle window and confirms the stored lease
+// still carries our fencing token. Returns ErrBackupInProgress when a
+// competing writer won.
+func (l *Lease) settleVerify(ctx context.Context, mine leaseBody) error {
+	if l.settle > 0 {
+		t := time.NewTimer(l.settle)
+		defer t.Stop()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-t.C:
+		}
+	}
+	cur, err := l.read(ctx)
+	if err != nil {
+		return fmt.Errorf("backup: verify lease for %q after write: %w", l.deployment, err)
+	}
+	if cur.Owner != mine.Owner || !cur.AcquiredAt.Equal(mine.AcquiredAt) {
+		return ErrBackupInProgress
+	}
+	return nil
 }
 
 // Renew extends the lease's expiry by its TTL.  It first confirms we
@@ -218,10 +310,31 @@ func (l *Lease) Renew(ctx context.Context) error {
 	if !l.now().UTC().Before(cur.ExpiresAt) {
 		return ErrLeaseLost
 	}
+	// Same posture, one step earlier: if expiry is INSIDE the settle
+	// margin, a reclaimer may pass its own staleness check before our
+	// overwrite lands. Don't write into that window — treat the lease
+	// as lost and let the caller abort (a healthy holder renews at
+	// TTL/3 and never gets this close to expiry).
+	if !l.now().UTC().Add(2 * l.settle).Before(cur.ExpiresAt) {
+		return ErrLeaseLost
+	}
+	if leaseHookBeforeRenewPut != nil {
+		leaseHookBeforeRenewPut()
+	}
 	next := mine
 	next.ExpiresAt = l.now().UTC().Add(l.ttl)
 	if err := l.put(ctx, next, false); err != nil {
 		return fmt.Errorf("backup: renew lease for %q: %w", l.deployment, err)
+	}
+	// Settle-verify: if a reclaimer's overwrite raced ours, only the
+	// last writer's token survives — anyone else must abort. (The
+	// reclaimer performs the same verify, so exactly one side keeps
+	// the lease for any interleaving within the settle window.)
+	if err := l.settleVerify(ctx, next); err != nil {
+		if errors.Is(err, ErrBackupInProgress) {
+			return ErrLeaseLost
+		}
+		return err
 	}
 	l.setBody(next)
 	return nil

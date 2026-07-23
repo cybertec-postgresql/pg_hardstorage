@@ -56,6 +56,12 @@ import (
 const (
 	gapPersistAttempts = 4
 	gapPersistBackoff  = 250 * time.Millisecond
+	// gapPersistFinalTimeout bounds the ONE extra Put attempt made on a
+	// detached context when the caller's ctx is cancelled mid-persist
+	// (agent shutdown racing failover handling). Short on purpose: it
+	// delays shutdown only when storage is slow, and a healthy repo
+	// answers well within it.
+	gapPersistFinalTimeout = 5 * time.Second
 )
 
 // SlotRole names which Patroni cluster member a SlotSpec is
@@ -571,10 +577,11 @@ func (c *Coordinator) reconcileOneSlot(ctx context.Context, dsn string, endpoint
 }
 
 // persistGap writes a gapstate.Record for the just-detected
-// gap. Best-effort: failures emit a warning event but don't
-// propagate. The same wal_gap_detected event already fired
-// before this call, so the operator's alerting pipeline has
-// the signal regardless.
+// gap. Failures don't propagate, but they are NOT silent: every
+// exit path that leaves the record unpersisted emits a CRITICAL
+// gap_persist_failed event. The same wal_gap_detected event
+// already fired before this call, so the operator's alerting
+// pipeline has the detection signal regardless.
 func (c *Coordinator) persistGap(ctx context.Context, endpoint patroni.LeaderEndpoint, slot SlotSpec, cont *replication.SlotContinuityResult) {
 	if c.opts.GapStore == nil {
 		return // store not wired (tests, library-only callers)
@@ -603,6 +610,11 @@ func (c *Coordinator) persistGap(ctx context.Context, endpoint patroni.LeaderEnd
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
+				// Shutdown raced the retry loop. Bailing out here would
+				// silently drop the once-only record, so make ONE final
+				// attempt on a short context detached from the cancelled
+				// ctx — when storage is healthy the record still lands.
+				c.persistGapFinal(ctx, endpoint, slot, rec, lastErr)
 				return
 			case <-time.After(gapPersistBackoff * time.Duration(attempt)):
 			}
@@ -612,7 +624,45 @@ func (c *Coordinator) persistGap(ctx context.Context, endpoint patroni.LeaderEnd
 			return // persisted (already-exists ⇒ a prior attempt's write landed)
 		}
 		lastErr = err
+		if ctx.Err() != nil {
+			// The attempt itself failed under an already-cancelled ctx —
+			// a ctx-aware store fails every further retry the same way,
+			// including the very FIRST attempt when shutdown races the
+			// failover handling. Same detached final attempt as the
+			// backoff-select path above.
+			c.persistGapFinal(ctx, endpoint, slot, rec, lastErr)
+			return
+		}
 	}
+	c.emitGapPersistFailed(endpoint, slot, rec, lastErr)
+}
+
+// persistGapFinal is persistGap's shutdown path: the retry loop's ctx was
+// cancelled while the record was still unpersisted. A WAL gap is detected
+// exactly once — at slot recreation — so agent shutdown must not lose the
+// record when storage is actually healthy. Make ONE final Put attempt on a
+// short context detached from the cancelled ctx (values retained,
+// cancellation dropped); if even that fails, the record really is lost and
+// we escalate CRITICAL exactly like the exhausted-retries path.
+func (c *Coordinator) persistGapFinal(ctx context.Context, endpoint patroni.LeaderEndpoint, slot SlotSpec, rec gapstate.Record, lastErr error) {
+	fctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), gapPersistFinalTimeout)
+	defer cancel()
+	_, err := c.opts.GapStore.Put(fctx, rec)
+	if err == nil || errors.Is(err, storage.ErrAlreadyExists) {
+		return // persisted (already-exists ⇒ a prior attempt's write landed)
+	}
+	if lastErr != nil {
+		err = fmt.Errorf("final attempt on detached context: %w (last error before shutdown: %v)", err, lastErr)
+	}
+	// emit is synchronous and does not consult any context, so the
+	// CRITICAL escalation is delivered even though ctx is cancelled.
+	c.emitGapPersistFailed(endpoint, slot, rec, err)
+}
+
+// emitGapPersistFailed emits the CRITICAL escalation for a gap record that
+// could not be persisted. Fired on BOTH unpersisted exit paths — retries
+// exhausted, and shutdown with the detached final attempt also failing.
+func (c *Coordinator) emitGapPersistFailed(endpoint patroni.LeaderEndpoint, slot SlotSpec, rec gapstate.Record, lastErr error) {
 	c.emit(output.NewEvent(output.SeverityCritical, "wal.follower", "gap_persist_failed").
 		WithSubject(output.Subject{Deployment: c.opts.Deployment}).
 		WithBody(map[string]any{

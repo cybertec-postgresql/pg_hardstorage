@@ -46,17 +46,21 @@
 //
 // # Atomicity
 //
-// Same model as the sftp backend:
+// Same model as the sftp backend's hardlink path:
 //
-//  1. Stat the destination — if present, return ErrAlreadyExists.
+//  1. Stat the destination — if present, return ErrAlreadyExists
+//     (cheap fast path only; NOT the correctness gate).
 //  2. Write to "<dst>.hstmp-<rand>".
-//  3. mv -T tmp dst (atomic via rename(2) on the same fs).
+//  3. IfNotExists commit: `ln -T tmp dst` — link(2) fails with
+//     EEXIST when dst is present, so exactly one concurrent
+//     writer wins (single-winner consumers — the shared-DEK
+//     object, the backup lease, audit-chain slots — depend on
+//     this). Plain overwrite puts use `mv -T` (rename(2)),
+//     which is last-writer-wins by design.
 //
-// `mv -T` is atomic on every POSIX system when source + dest are
-// on the same filesystem — the standard guarantee for our
-// content-addressed chunk store.  CAS chunks are content-keyed
-// so a duplicate write is harmless; manifest commits use
-// RenameIfNotExists which has the same posture.
+// Both `ln -T` and `mv -T` are atomic on every POSIX system when
+// source + dest are on the same filesystem; manifest commits use
+// RenameIfNotExists, which commits via the same `ln -T`.
 package scp
 
 import (
@@ -108,7 +112,7 @@ func (p *Plugin) Name() string { return "scp" }
 // Capabilities implements storage.StoragePlugin.
 func (p *Plugin) Capabilities() storage.Capabilities {
 	return storage.Capabilities{
-		ConditionalPut: true, // emulated; see top-of-file
+		ConditionalPut: true, // atomic: ln -T (link(2) EEXIST) commits IfNotExists puts
 	}
 }
 
@@ -262,21 +266,32 @@ func (p *Plugin) Put(ctx context.Context, key string, r io.Reader, opts storage.
 	}
 
 	if opts.IfNotExists {
-		// Re-check race window: stat may have raced; if dst
-		// exists, drop the tmp and surface ErrAlreadyExists.
-		if exists, err := p.exists(ctx, full); err != nil {
+		// ATOMIC commit via link(2): `ln -T tmp full` fails with
+		// EEXIST when full is already present, so exactly ONE of
+		// several concurrent writers wins — the loser is told so.
+		//
+		// The previous stat → mv -T pattern was a TOCTOU: rename(2)
+		// silently REPLACES an existing destination, so two writers
+		// that both passed the stat re-check both "succeeded" and the
+		// second overwrote the first. For content-addressed chunks
+		// that is harmless, but for mutable single-key objects that
+		// rely on single-winner semantics — the shared-DEK object
+		// (issue #31's fix), the backup lease, audit-chain event
+		// slots — it silently broke the contract this backend
+		// advertises via ConditionalPut (concurrency audit).
+		if _, lerr := p.runShell(ctx, "ln -T "+shellQuote(tmp)+" "+shellQuote(full)); lerr != nil {
 			_, _ = p.runShell(ctx, "rm -f "+shellQuote(tmp))
-			return storage.PutResult{}, err
-		} else if exists {
-			_, _ = p.runShell(ctx, "rm -f "+shellQuote(tmp))
-			return storage.PutResult{}, storage.ErrAlreadyExists
+			if strings.Contains(lerr.Error(), "File exists") {
+				return storage.PutResult{}, storage.ErrAlreadyExists
+			}
+			return storage.PutResult{}, fmt.Errorf("scp: ln %s -> %s: %w", tmp, full, lerr)
 		}
+		_, _ = p.runShell(ctx, "rm -f "+shellQuote(tmp))
+		return storage.PutResult{Key: key, Size: written}, nil
 	}
 
-	// `mv -T` (rename(2)) is atomic on the same filesystem.
-	// We rely on this for both same-fs writes (the common case
-	// when the repo is one mount) and refuse to operate across
-	// filesystems silently — the rm-of-tmp on error covers it.
+	// `mv -T` (rename(2)) is atomic on the same filesystem — correct
+	// for the last-writer-wins (IfNotExists=false) path only.
 	if _, err := p.runShell(ctx, "mv -T "+shellQuote(tmp)+" "+shellQuote(full)); err != nil {
 		_, _ = p.runShell(ctx, "rm -f "+shellQuote(tmp))
 		return storage.PutResult{}, fmt.Errorf("scp: mv %s -> %s: %w", tmp, full, err)
@@ -433,10 +448,11 @@ func (p *Plugin) Delete(ctx context.Context, key string) error {
 	return nil
 }
 
-// RenameIfNotExists is the manifest-commit primitive.  Uses the
-// same TOCTOU-aware stat-then-rename pattern as the sftp
-// backend; the chunk store's content-addressing absorbs any
-// duplicate writes.
+// RenameIfNotExists is the manifest-commit primitive.  Commits via
+// atomic link(2) (`ln -T` fails EEXIST) + unlink of src, so exactly
+// one concurrent committer wins — the previous stat-then-`mv -T`
+// pattern let a second committer silently replace the first
+// (rename(2) overwrites an existing destination).
 func (p *Plugin) RenameIfNotExists(ctx context.Context, src, dst string) error {
 	if err := p.assertOpen(); err != nil {
 		return err
@@ -449,14 +465,19 @@ func (p *Plugin) RenameIfNotExists(ctx context.Context, src, dst string) error {
 	if err != nil {
 		return err
 	}
+	// Cheap fast path — the atomic gate is the ln below.
 	if exists, err := p.exists(ctx, dstFull); err != nil {
 		return err
 	} else if exists {
 		return storage.ErrAlreadyExists
 	}
-	if _, err := p.runShell(ctx, "mv -T "+shellQuote(srcFull)+" "+shellQuote(dstFull)); err != nil {
-		return fmt.Errorf("scp: mv %s -> %s: %w", srcFull, dstFull, err)
+	if _, lerr := p.runShell(ctx, "ln -T "+shellQuote(srcFull)+" "+shellQuote(dstFull)); lerr != nil {
+		if strings.Contains(lerr.Error(), "File exists") {
+			return storage.ErrAlreadyExists
+		}
+		return fmt.Errorf("scp: ln %s -> %s: %w", srcFull, dstFull, lerr)
 	}
+	_, _ = p.runShell(ctx, "rm -f "+shellQuote(srcFull))
 	return nil
 }
 

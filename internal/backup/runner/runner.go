@@ -460,13 +460,18 @@ func Take(ctx context.Context, opts TakeOptions) (*Result, error) {
 		// Release with a background context so it still runs when the
 		// backup's own ctx was cancelled (timeout / Ctrl-C).
 		defer func() { _ = lease.Release(context.Background()) }()
+		// Lease loss must ABORT the backup, not just log: at that point
+		// another backup believes it owns the deployment, and running
+		// both to completion is exactly what the lease exists to prevent
+		// (the old callback only emitted a warning — concurrency audit).
+		// Rebind ctx so everything downstream is cancelled on loss;
+		// transient renew errors stay warning-only.
+		bctx, cancelBackup := context.WithCancelCause(ctx)
+		defer cancelBackup(nil)
+		ctx = bctx
 		leaseCtx, leaseStop := context.WithCancel(ctx)
 		defer leaseStop()
-		go lease.Maintain(leaseCtx, func(rerr error) {
-			emit(output.NewEvent(output.SeverityWarning, "backup", "lease_renew_failed").
-				WithSubject(output.Subject{Deployment: opts.Deployment}).
-				WithBody(map[string]any{"error": rerr.Error()}))
-		})
+		go lease.Maintain(leaseCtx, leaseLossAborter(opts.Deployment, emit, cancelBackup))
 	}
 
 	// Build the CAS with optional encryption + WORM retention. Per-
