@@ -6,13 +6,15 @@ tags:
   - schedule
   - backup
   - rotate
+  - drill
 ---
 
 # Schedule backups
 
-> Each deployment declares a `backup` and a `rotate` schedule.
-> The agent runs both at the configured cadence; the
-> `pg_hardstorage schedule` subcommand reads and writes them.
+> Each deployment declares a `backup`, a `rotate`, and
+> (optionally) a `drill` schedule. The agent runs them at the
+> configured cadence; the `pg_hardstorage schedule` subcommand
+> reads and writes them.
 
 ## What you need
 
@@ -55,10 +57,13 @@ Schedules for 3 deployment(s):
   DEPLOYMENT  TASK    WHEN
   db1         backup  every 6h0m0s
   db1         rotate  daily at 04:00 (Local)
+  db1         drill   daily at 03:00 (Local)
   db2         backup  daily at 02:00 (Local)
   db2         rotate  daily at 03:30 (Local)
+  db2         drill   off
   db3         backup  off
   db3         rotate  off
+  db3         drill   off
 ```
 
 The fleet listing surfaces both tasks — useful for spotting
@@ -104,7 +109,21 @@ Convention: rotate **after** the typical backup window so a
 just-completed backup doesn't get classified as a candidate by
 a sweep that started before it committed.
 
-### 5. Clear a schedule
+### 5. Set the drill schedule
+
+```bash
+pg_hardstorage schedule db1 'daily_at 03:00' --task=drill
+```
+
+A scheduled drill restores the latest backup into a scratch
+directory and verifies it — the continuous proof that the
+backup you just took actually restores. Convention: drill
+**after** the backup window (backup at 02:00 → drill at 03:00)
+so each drill proves the freshest backup. `doctor` alarms when
+drills are missing, failing, or stale — see
+[Integrity testing](../../operations/integrity-testing.md).
+
+### 6. Clear a schedule
 
 ```bash
 pg_hardstorage schedule db1 off
@@ -124,10 +143,13 @@ deployments:
     schedule:
       backup: { every: "6h" }
       rotate: { daily_at: "04:00" }
+      drill:  { daily_at: "03:00" }
 ```
 
 Three keys per task: `every:`, `daily_at:`, or `at:`. Setting
-more than one is a config error.
+more than one is a config error. `drill:` is optional — but a
+deployment without it never proves restorability, and `doctor`
+raises `recovery.drill_never_run`.
 
 ## Coordination across deployments
 
@@ -192,4 +214,6 @@ when the box can handle the parallelism.
   schedule
 - [Verify backups](verify-fast-vs-full.md) — schedule periodic
   verification
+- [Integrity testing](../../operations/integrity-testing.md) —
+  scheduled drills, doctor freshness, and the chaos soak
 - [`schedule` CLI reference](../../reference/cli/pg_hardstorage_schedule.md)

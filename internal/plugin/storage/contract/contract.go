@@ -108,6 +108,20 @@ func Run(t *testing.T, open PluginOpener) {
 			c.fn(t, p)
 		})
 	}
+
+	// Concurrency cases are part of the CORE suite: a backend that
+	// advertises ConditionalPut but loses the single-winner race is a
+	// data-loss bug (the scp `mv -T` emulation silently forked the
+	// shared DEK and destroyed committed audit events — concurrency
+	// audit / issue #31 class). No backend gets to "not yet meet"
+	// these; the only accepted out is HONESTY (ConditionalPut=false),
+	// which ParallelPuts skips-with-reason on.
+	t.Run("ParallelPuts_SingleWinner", func(t *testing.T) {
+		ParallelPuts(t, open, 8)
+	})
+	t.Run("ParallelOverwrites_NoTornContent", func(t *testing.T) {
+		ParallelOverwrites(t, open, 8)
+	})
 }
 
 // putString is a tiny helper — ~80% of contract cases do
@@ -289,18 +303,26 @@ func caseRenameDstPresent(t *testing.T, p storage.StoragePlugin) {
 	}
 }
 
-// ParallelPuts is an extra-stress contract case kept
-// separate so plugins that don't yet meet it don't fail
-// the core suite.  Exercises N concurrent IfNotExists
-// Puts to the same key — exactly ONE must win.  Backends
-// that emulate IfNotExists by check-then-write under
-// concurrent access often fail this.
+// ParallelPuts exercises N concurrent IfNotExists Puts to the same key
+// — exactly ONE must win. This is a MANDATORY case (wired into Run):
+// single-winner consumers (the shared-DEK mint, the backup lease,
+// audit-chain event slots) silently lose data over a backend that
+// claims ConditionalPut but emulates it with check-then-write.
+//
+// The only accepted out is honesty: a backend whose
+// Capabilities().ConditionalPut is FALSE is skipped with a reason —
+// it makes no single-winner promise and the callers that need one
+// degrade loudly at runtime. Claiming true and failing is a red build,
+// never a tolerated known-failure.
 func ParallelPuts(t *testing.T, open PluginOpener, n int) {
 	t.Helper()
 	if n < 2 {
 		n = 8
 	}
 	p := open(t)
+	if !p.Capabilities().ConditionalPut {
+		t.Skipf("backend %q honestly reports ConditionalPut=false — single-winner semantics not claimed (callers degrade loudly)", p.Name())
+	}
 	const key = "parallel/k"
 	var (
 		wg       sync.WaitGroup

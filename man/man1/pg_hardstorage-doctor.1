@@ -18,6 +18,10 @@ Reports resolved filesystem paths, configuration status, and health checks.
 
 .SH OPTIONS
 .PP
+\fB--drill-max-age\fP=168h0m0s
+	maximum age of the last SUCCESSFUL recovery drill before doctor escalates recovery.drill_stale (CRITICAL)
+
+.PP
 \fB--exit-on-issues\fP[=false]
 	exit with code 10 (ExitDoctorIssues) when the report contains issues at warning+ severity; useful for cron / k8s liveness probes
 

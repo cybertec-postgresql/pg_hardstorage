@@ -25,8 +25,9 @@ pg_hardstorage doctor [<deployment>] [flags]
 ### Options
 
 ```
-      --exit-on-issues   exit with code 10 (ExitDoctorIssues) when the report contains issues at warning+ severity; useful for cron / k8s liveness probes
-  -h, --help             help for doctor
+      --drill-max-age duration   maximum age of the last SUCCESSFUL recovery drill before doctor escalates recovery.drill_stale (CRITICAL) (default 168h0m0s)
+      --exit-on-issues           exit with code 10 (ExitDoctorIssues) when the report contains issues at warning+ severity; useful for cron / k8s liveness probes
+  -h, --help                     help for doctor
 ```
 
 ### Options inherited from parent commands

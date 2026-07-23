@@ -65,12 +65,12 @@ deployments without a schedule configured.`,
 		},
 	}
 	c.Flags().StringVar(&task, "task", "backup",
-		"which task's schedule to inspect/modify: backup | rotate")
+		"which task's schedule to inspect/modify: backup | rotate | drill")
 	return c
 }
 
 // runScheduleList walks every deployment in the loaded config and
-// emits one row per (deployment, task) pair — both backup and
+// emits one row per (deployment, task) pair — backup, drill, and
 // rotate, even when one or both are unset. An unset slot shows
 // "off" so an operator immediately sees deployments without a
 // schedule.
@@ -92,7 +92,7 @@ func runScheduleList(cmd *cobra.Command) error {
 	rows := make([]scheduleListRow, 0, 2*len(names))
 	for _, name := range names {
 		dep := cfg.Deployments[name]
-		for _, task := range []string{"backup", "rotate"} {
+		for _, task := range []string{"backup", "rotate", "drill"} {
 			spec, _ := selectScheduleSpec(dep, task)
 			row := scheduleListRow{
 				Deployment: name,
@@ -135,7 +135,14 @@ func (b scheduleListBody) WriteText(w io.Writer) error {
 		_, err := io.WriteString(w, strings.TrimRight(bw.String(), "\n"))
 		return err
 	}
-	fmt.Fprintf(bw, "Schedules for %d deployment(s):\n", len(b.Schedules)/2)
+	// Count distinct deployments — never divide by a per-deployment
+	// row constant (that broke silently when the drill task added a
+	// third row per deployment).
+	seen := make(map[string]struct{}, len(b.Schedules))
+	for _, r := range b.Schedules {
+		seen[r.Deployment] = struct{}{}
+	}
+	fmt.Fprintf(bw, "Schedules for %d deployment(s):\n", len(seen))
 	tw := tabwriter.NewWriter(bw, 0, 4, 2, ' ', 0)
 	fmt.Fprintln(tw, "  DEPLOYMENT\tTASK\tWHEN")
 	for _, r := range b.Schedules {
@@ -225,9 +232,11 @@ func selectScheduleSpec(dep config.DeploymentConfig, task string) (config.Schedu
 		return dep.Schedule.Backup, nil
 	case "rotate":
 		return dep.Schedule.Rotate, nil
+	case "drill":
+		return dep.Schedule.Drill, nil
 	default:
 		return config.ScheduleSpec{}, output.NewError("usage.bad_task",
-			fmt.Sprintf("schedule: unknown --task %q (allowed: backup, rotate)", task)).
+			fmt.Sprintf("schedule: unknown --task %q (allowed: backup, rotate, drill)", task)).
 			Wrap(output.ErrUsage)
 	}
 }
@@ -240,9 +249,11 @@ func setScheduleSpec(dep *config.DeploymentConfig, task string, spec config.Sche
 		dep.Schedule.Backup = spec
 	case "rotate":
 		dep.Schedule.Rotate = spec
+	case "drill":
+		dep.Schedule.Drill = spec
 	default:
 		return output.NewError("usage.bad_task",
-			fmt.Sprintf("schedule: unknown --task %q (allowed: backup, rotate)", task)).
+			fmt.Sprintf("schedule: unknown --task %q (allowed: backup, rotate, drill)", task)).
 			Wrap(output.ErrUsage)
 	}
 	return nil

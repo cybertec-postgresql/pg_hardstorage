@@ -1,0 +1,60 @@
+# chaos-soak.yml — nightly randomized chaos soak with a restore-proof
+# gate (integrity program #1; see docs/operations/integrity-testing.md).
+#
+# Runs the production model — encrypted repo, continuous `wal stream`,
+# concurrent backups, constant churn — over a real 3-node Patroni
+# cluster while injecting a seeded random fault schedule (switchovers,
+# leader pauses, concurrent-backup bursts). Pass criterion is never
+# "exit 0": every committed backup must verify --full AND restore, the
+# WAL lineage must be gap-free, and exactly one shared-DEK object may
+# exist. This is the harness class that would have caught #31 and #34
+# before users did.
+#
+# A failure log always includes the seed; re-run the identical fault
+# schedule with:  workflow_dispatch → seed=<seed>.
+name: chaos-soak
+
+on:
+  schedule:
+    - cron: "17 3 * * *" # nightly, 03:17 UTC
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: "Soak budget in minutes"
+        default: "45"
+      seed:
+        description: "Fault-schedule seed (empty = random)"
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: "1.26.4"
+
+jobs:
+  chaos-soak:
+    name: chaos soak (restore-proof gate)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - name: Build the binary under test
+        run: go build -o /tmp/pghs-chaos ./cmd/pg_hardstorage
+      - name: Pre-pull cluster images
+        run: |
+          docker pull -q ghcr.io/zalando/spilo-17:4.0-p1
+          docker pull -q quay.io/coreos/etcd:v3.5.13
+      - name: Run the soak
+        env:
+          PGHS_CHAOS_BIN: /tmp/pghs-chaos
+          PGHS_CHAOS_MINUTES: ${{ github.event.inputs.minutes || '45' }}
+          PGHS_CHAOS_SEED: ${{ github.event.inputs.seed || '' }}
+        run: |
+          go test -count=1 -timeout 110m -v \
+            -run TestChaosSoak_RestoreProof \
+            ./internal/testkit/topology/

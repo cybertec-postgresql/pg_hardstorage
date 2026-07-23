@@ -237,6 +237,14 @@ func pgMajorFromManifestVersion(v int) string {
 	if v <= 0 {
 		return fallback
 	}
+	// The runner stores the plain major (pg_version=17); the MMmmpp
+	// division applies only to the numeric server_version_num form.
+	// Without this, 17/10000=0 routed every scheduled verify into a
+	// pg.DefaultSandboxMajor sandbox whose pg_verifybackup rejects
+	// older majors' pg_control ("CRC is incorrect").
+	if v < 100 {
+		return fmt.Sprintf("%d", v)
+	}
 	major := v / 10000
 	if major <= 0 {
 		return fallback

@@ -496,8 +496,34 @@ func (p *Plugin) SetRetention(ctx context.Context, key string, until time.Time, 
 //
 // Keep the command line as the sole argument; never interpolate
 // user-controlled keys without `shellQuote()`.
+
+// newSession opens an SSH session with a small bounded retry on
+// channel-open rejection. sshd's default MaxSessions is 10; a burst of
+// concurrent Puts (each using short-lived sessions for upload + commit
+// + cleanup) can transiently exceed it, and the server answers
+// "rejected: connect failed (open failed)". That is backpressure, not
+// failure — retrying after a short jittered pause keeps the plugin
+// correct against DEFAULT sshd configs (the contract suite's
+// ParallelPuts runs against one).
+func (p *Plugin) newSession() (*ssh.Session, error) {
+	var lastErr error
+	for attempt := 0; attempt < 5; attempt++ {
+		sess, err := p.ssh.NewSession()
+		if err == nil {
+			return sess, nil
+		}
+		lastErr = err
+		msg := err.Error()
+		if !strings.Contains(msg, "rejected") && !strings.Contains(msg, "open failed") {
+			return nil, err
+		}
+		time.Sleep(time.Duration(20*(attempt+1)) * time.Millisecond)
+	}
+	return nil, lastErr
+}
+
 func (p *Plugin) runShell(ctx context.Context, command string) (string, error) {
-	sess, err := p.ssh.NewSession()
+	sess, err := p.newSession()
 	if err != nil {
 		return "", fmt.Errorf("scp: new session: %w", err)
 	}
@@ -523,7 +549,7 @@ func (p *Plugin) runShell(ctx context.Context, command string) (string, error) {
 // uploadVia opens a session for command (typically `cat > path`)
 // and streams r to its stdin.  Returns the byte count.
 func (p *Plugin) uploadVia(ctx context.Context, command string, r io.Reader) (int64, error) {
-	sess, err := p.ssh.NewSession()
+	sess, err := p.newSession()
 	if err != nil {
 		return 0, fmt.Errorf("scp: new session: %w", err)
 	}
@@ -576,7 +602,7 @@ func (p *Plugin) uploadVia(ctx context.Context, command string, r io.Reader) (in
 // and returns a ReadCloser that drains stdout.  Closing the
 // reader closes the session.
 func (p *Plugin) streamRead(ctx context.Context, command string) (io.ReadCloser, error) {
-	sess, err := p.ssh.NewSession()
+	sess, err := p.newSession()
 	if err != nil {
 		return nil, fmt.Errorf("scp: new session: %w", err)
 	}

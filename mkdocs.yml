@@ -298,6 +298,7 @@ nav:
       - Scaling to large fleets: operations/scaling-large-fleets.md
       - Cost reporting: operations/cost-reporting.md
       - SLO as code: operations/slo-as-code.md
+      - Integrity testing: operations/integrity-testing.md
   - Compliance:
       - compliance/index.md
       - GDPR Art. 17 — crypto-shred: compliance/gdpr-art-17-crypto-shred.md

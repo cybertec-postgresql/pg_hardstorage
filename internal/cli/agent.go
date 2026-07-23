@@ -30,6 +30,7 @@ import (
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/paths"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/patroni"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/recovery"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/schedule"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/version"
@@ -462,8 +463,59 @@ func buildAgentTasks(engine *schedule.Engine, deps map[string]config.DeploymentC
 				count++
 			}
 		}
+		if !dep.Schedule.Drill.IsZero() {
+			task, err := buildDrillTask(name, dep, verifier)
+			if err != nil {
+				errs = append(errs, agentTaskAddError{Deployment: name, Task: "drill", Err: err})
+			} else if err := engine.Add(task); err != nil {
+				errs = append(errs, agentTaskAddError{Deployment: name, Task: "drill", Err: err})
+			} else {
+				count++
+			}
+		}
 	}
 	return count, errs
+}
+
+// buildDrillTask produces a schedule.Task that runs a full recovery
+// drill (restore the latest backup into a temp dir + sandbox verify)
+// and records the verdict in the repo's drill history. This is the
+// continuous restorability probe: a backup that has never been
+// restored is unproven, and `doctor` alarms when the last successful
+// drill goes stale. Drill() appends its history entry on every run
+// (pass/partial/fail), so even a failing drill leaves evidence for
+// doctor to surface; a non-pass verdict also errors the task so the
+// agent emits its task-failure event.
+func buildDrillTask(name string, dep config.DeploymentConfig, verifier *backup.Verifier) (*schedule.Task, error) {
+	if dep.Repo == "" {
+		return nil, errors.New("missing repo")
+	}
+	sched, err := schedule.Parse(schedule.Spec(dep.Schedule.Drill))
+	if err != nil {
+		return nil, err
+	}
+	return &schedule.Task{
+		Name:     "drill:" + name,
+		Schedule: sched,
+		Run: func(ctx context.Context) error {
+			opts := recovery.DrillOptions{Verifier: verifier}
+			// Wire the keystore exactly like the CLI drill command does —
+			// without a KEKResolver/DEKUnwrapper every drill against an
+			// encrypted repo fails instantly at the restore phase.
+			if p, perr := paths.Resolve(paths.DefaultOptions()); perr == nil {
+				opts.KEKResolver = recovery.KeystoreKEKResolver(p.Keyring.Value)
+				opts.DEKUnwrapper = recovery.KeystoreDEKResolver(p.Keyring.Value)
+			}
+			report, err := recovery.Drill(ctx, dep.Repo, name, opts)
+			if err != nil {
+				return fmt.Errorf("drill: %w", err)
+			}
+			if report.Verdict != recovery.DrillVerdictPass {
+				return fmt.Errorf("drill verdict %q for %s — latest backup did not prove restorable", report.Verdict, name)
+			}
+			return nil
+		},
+	}, nil
 }
 
 // buildBackupTask produces a schedule.Task that runs runner.Take.

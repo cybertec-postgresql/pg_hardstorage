@@ -187,11 +187,21 @@ func runVerifyFull(cmd *cobra.Command, deployment, backupID, repoURL, pgMajorOve
 	})
 
 	if !res.Passed && !res.Skipped {
-		// Treat as exit code 9 (verify failure).
-		return output.NewError("verify.failed",
-			fmt.Sprintf("verify --full: pg_verifybackup reported failure (see tool_stdout in body)")).
+		// Treat as exit code 9 (verify failure). The tool output must
+		// ride in the message itself — an error Result carries no body,
+		// so pointing the operator at a tool_stdout field that only
+		// exists on success left failures undiagnosable.
+		msg := "verify --full: pg_verifybackup reported failure"
+		// pg_verifybackup writes its findings to stderr, not stdout.
+		if tool := strings.TrimSpace(strings.TrimSpace(res.Stdout) + "\n" + strings.TrimSpace(res.Stderr)); tool != "" {
+			if len(tool) > 2000 {
+				tool = tool[:2000] + " …[truncated]"
+			}
+			msg += ": " + tool
+		}
+		return output.NewError("verify.failed", msg).
 			WithSuggestion(&output.Suggestion{
-				Human: "the backup's bytes are intact (fast verify passed) but pg_verifybackup found a discrepancy. Re-run with --output json to capture the full tool output for triage.",
+				Human: "the backup's bytes are intact (fast verify passed) but pg_verifybackup found a discrepancy in the restored data directory — triage from the tool output above.",
 			})
 	}
 	return d.Result(output.NewResult(cmd.CommandPath()).WithBody(body))
@@ -229,10 +239,18 @@ func resolveDEKForVerify(ctx context.Context, kekRef string, wrapped []byte) ([]
 	return keystore.UnwrapDEK(ctx, kekRef, wrapped, keystore.UnwrapOpts{KeyringDir: keyringDir})
 }
 
-// pgMajorFromManifestVersion extracts the major from PG's
-// numeric_version: PG_VERSION_NUM convention is `MMmmpp` where MM is
-// the major (e.g. 17), mm the minor, pp the patch. PG 10+ collapsed
-// the second digit.
+// pgMajorFromManifestVersion maps a manifest's pg_version to the
+// sandbox major.
+//
+// The runner stores the PLAIN MAJOR (manifest pg_version=17, from
+// probeVersion().Major) — values < 100 are therefore the major
+// itself. The `MMmmpp` PG_VERSION_NUM division only applies to the
+// numeric form (e.g. 170004), kept for manifests written by tools
+// that recorded server_version_num. Before this distinction, 17
+// divided to 0 and EVERY verify --full fell back to
+// pg.DefaultSandboxMajor — a PG18 pg_verifybackup rejecting every
+// healthy PG17 backup with "pg_control: CRC is incorrect" (caught by
+// the chaos soak's restore-proof gate).
 //
 // Falls back to pg.DefaultSandboxMajor (the current upstream-stable
 // major) when v is zero or otherwise unparseable. Single source of
@@ -242,6 +260,9 @@ func pgMajorFromManifestVersion(v int) string {
 	fallback := strconv.Itoa(pg.DefaultSandboxMajor)
 	if v <= 0 {
 		return fallback
+	}
+	if v < 100 {
+		return strconv.Itoa(v)
 	}
 	major := v / 10000
 	if major <= 0 {
