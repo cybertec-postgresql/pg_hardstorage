@@ -888,9 +888,33 @@ func runRepairChunks(cmd *cobra.Command, repoURL string, orphans, apply bool, mi
 			body.Chunks = append(body.Chunks, h.String())
 		}
 		if apply {
+			// Same dedup-vs-GC guards as `repo gc --apply` (which see):
+			// the age floor cannot protect chunks an in-flight backup
+			// DEDUPLICATED against — those are old by definition — so
+			// refuse under a live backup lease, and re-collect
+			// references so a backup committed since the snapshot
+			// keeps its chunks.
+			if live, lerr := findLiveBackupLeases(cmd.Context(), sp, time.Now().UTC()); lerr != nil {
+				return output.NewError("repair.lease_scan_failed",
+					fmt.Sprintf("repair chunks: scan backup leases: %v", lerr)).Wrap(lerr)
+			} else if len(live) > 0 {
+				return output.NewError("repair.live_backup_lease",
+					fmt.Sprintf("repair chunks: refusing --apply while backups are in flight for: %s", strings.Join(live, ", "))).
+					WithSuggestion(&output.Suggestion{
+						Human: "an in-flight backup may have deduplicated against chunks this sweep would delete — re-run after the backups finish (a crashed holder's lease expires within its TTL, 15 minutes by default)",
+					})
+			}
+			refsAtDelete, rerr := repo.CollectReferences(cmd.Context(), sp)
+			if rerr != nil {
+				return output.NewError("repair.collect_refs_failed",
+					fmt.Sprintf("repair chunks: re-collect references before delete: %v", rerr)).Wrap(rerr)
+			}
 			cas := casdefault.New(sp)
 			deleted := 0
 			for _, h := range hashes {
+				if refsAtDelete.Has(h) {
+					continue // referenced by a manifest committed since the snapshot
+				}
 				if err := cas.DeleteChunk(cmd.Context(), h); err != nil {
 					return output.NewError("repair.delete_failed",
 						fmt.Sprintf("repair chunks: delete %s: %v", h, err)).Wrap(err)

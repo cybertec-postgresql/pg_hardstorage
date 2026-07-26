@@ -381,7 +381,14 @@ func buildStatusUpdate(write, flush pglogrepl.LSN) ([]byte, error) {
 	out = append(out, standbyStatusUpdateByteID)
 	out = appendUint64BE(out, uint64(write)) // write LSN
 	out = appendUint64BE(out, uint64(flush)) // flush LSN
-	out = appendUint64BE(out, uint64(write)) // apply LSN (caught-up)
+	// apply MUST track flush, never write. An archiver "applies"
+	// nothing, and inflating apply to the RAM-buffered receive
+	// position would let a primary running synchronous_commit=
+	// remote_apply ACK commits whose WAL exists only in our volatile
+	// buffers — acknowledged transactions lost if this host dies.
+	// The shutdown-drain path (issue #101) only needs Max(write,
+	// flush), which the write field above already satisfies.
+	out = appendUint64BE(out, uint64(flush)) // apply LSN (= durable)
 	// PG epoch for timestamps is 2000-01-01 UTC; microseconds since.
 	now := time.Now().UTC()
 	pgEpoch := time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)

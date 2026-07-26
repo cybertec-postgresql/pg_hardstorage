@@ -3,6 +3,8 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"sort"
@@ -240,11 +242,48 @@ func runRepoGC(cmd *cobra.Command, repoURL string, apply bool, approvalID string
 	// emitted so a partial sweep still reports what it reclaimed.
 	var partialErr error
 	if apply {
+		// Live-lease guard (dedup-vs-GC race, part 1). The chunk-age
+		// floor only protects chunks an in-flight backup WROTE (young
+		// mtime); chunks it DEDUPLICATED against are old by definition
+		// — an orphan from a failed run yesterday whose content
+		// reappears in today's data gets a dedup hit that never
+		// touches the object. Deleting it here corrupts a backup that
+		// commits successfully minutes later. A live lease means such
+		// a backup may be in flight, so refuse; leases expire within
+		// their TTL (15 min default), so a crashed holder never blocks
+		// gc for long.
+		if live, lerr := findLiveBackupLeases(cmd.Context(), sp, time.Now().UTC()); lerr != nil {
+			return output.NewError("repo.gc.lease_scan_failed",
+				fmt.Sprintf("repo gc: scan backup leases: %v", lerr)).Wrap(lerr)
+		} else if len(live) > 0 {
+			return output.NewError("repo.gc.live_backup_lease",
+				fmt.Sprintf("repo gc: refusing --apply while backups are in flight for: %s", strings.Join(live, ", "))).
+				WithSuggestion(&output.Suggestion{
+					Human: "an in-flight backup may have deduplicated against chunks this sweep would delete — re-run after the backups finish (a crashed holder's lease expires within its TTL, 15 minutes by default)",
+				})
+		}
+
+		// Re-collect references (dedup-vs-GC race, part 2): the first
+		// snapshot may be minutes old by now, and a backup that
+		// committed since then can reference chunks the snapshot saw
+		// as orphans. Deletion decisions use the FRESH set.
+		refsAtDelete, rerr := repo.CollectReferencesWithOptions(cmd.Context(), sp,
+			repo.CollectReferencesOptions{TombstoneGrace: graceForCall})
+		if rerr != nil {
+			return output.NewError("repo.gc.collect_refs_failed",
+				fmt.Sprintf("repo gc: re-collect references before delete: %v", rerr)).Wrap(rerr)
+		}
+
 		cas := casdefault.New(sp)
 		var deleted int
 		var deletedBytes int64
 		var failures []string
 		for _, h := range hashes {
+			if refsAtDelete.Has(h) {
+				// Referenced by a manifest committed after the first
+				// snapshot — not an orphan anymore.
+				continue
+			}
 			// Stat-then-delete so a race-induced miss doesn't blow the
 			// whole sweep — we account only what we actually removed.
 			info, statErr := sp.Stat(cmd.Context(), repo.ChunkKey(h))
@@ -425,4 +464,51 @@ func (b repoGCBody) WriteText(w io.Writer) error {
 	}
 	_, err := io.WriteString(w, strings.TrimRight(bw.String(), "\n"))
 	return err
+}
+
+// findLiveBackupLeases scans leases/ for backup leases whose
+// ExpiresAt is still in the future and returns the deployments that
+// hold them. `repo gc --apply` refuses to sweep while any exist: an
+// in-flight backup may have deduplicated against exactly the old,
+// unreferenced chunks the sweep is about to delete, and neither the
+// chunk-age floor nor the reference snapshot can see that reuse.
+func findLiveBackupLeases(ctx context.Context, sp storage.StoragePlugin, now time.Time) ([]string, error) {
+	var live []string
+	for info, err := range sp.List(ctx, "leases/") {
+		if err != nil {
+			return nil, err
+		}
+		if !strings.HasSuffix(info.Key, "/backup.json") {
+			continue
+		}
+		rc, gerr := sp.Get(ctx, info.Key)
+		if gerr != nil {
+			if errors.Is(gerr, storage.ErrNotFound) {
+				continue // released between List and Get
+			}
+			return nil, gerr
+		}
+		var lease struct {
+			Deployment string    `json:"deployment"`
+			ExpiresAt  time.Time `json:"expires_at"`
+		}
+		derr := json.NewDecoder(io.LimitReader(rc, 1<<20)).Decode(&lease)
+		_ = rc.Close()
+		if derr != nil {
+			// An unreadable lease is treated as LIVE, not ignored:
+			// gc deleting chunks because it couldn't parse the very
+			// object that says "backup in flight" is the wrong
+			// failure direction.
+			return nil, fmt.Errorf("parse lease %s: %w", info.Key, derr)
+		}
+		if now.Before(lease.ExpiresAt) {
+			name := lease.Deployment
+			if name == "" {
+				name = strings.TrimSuffix(strings.TrimPrefix(info.Key, "leases/"), "/backup.json")
+			}
+			live = append(live, name)
+		}
+	}
+	sort.Strings(live)
+	return live, nil
 }

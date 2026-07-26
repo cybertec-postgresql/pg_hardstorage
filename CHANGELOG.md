@@ -11,6 +11,56 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ## [Unreleased]
 
+### Corruption hunt: five fixes for silent data-corruption and backup-availability bugs
+
+A three-way audit of the write path, the WAL pipeline, and the
+encryption/agent layers found and fixed five bugs, each with a
+regression test:
+
+- **Agent-scheduled backups were silently unencrypted.** Neither the
+  agent's schedule engine nor the control-plane executor ever consulted
+  the keystore, so every scheduled backup wrote plaintext even in a repo
+  initialised with `--encrypt` — and plaintext-hash dedup then welded
+  plaintext and encrypted backups onto the same chunks (manifests
+  claiming aes-256-gcm referencing cleartext chunks, breaking the
+  crypto-shred guarantee; unencrypted manifests referencing GCM
+  envelopes they can never decrypt). Both paths now resolve encryption
+  exactly like the interactive CLI, and a corrupt KEK fails the backup
+  loudly instead of silently falling back to plaintext.
+- **One wedged task starved the agent's scheduler forever.** Tasks fire
+  serially with no deadline, so a single hung Run (wedged docker daemon
+  during a drill, D-state I/O during a backup) silently stopped every
+  scheduled backup on the agent while the process looked healthy. Every
+  task now runs under a wall-clock ceiling (per-task override, default
+  2× its own cadence clamped to [1h, 48h]); at the ceiling its context
+  is cancelled and — if it still won't return — the task is abandoned
+  with a loud error so the other tasks keep firing.
+- **`repo gc --apply` (and `repair chunks --orphans --apply`) could
+  delete chunks an in-flight backup had deduplicated against.** The
+  chunk-age floor only protects chunks a running backup *wrote*; chunks
+  it *deduplicated against* are old by definition, so a sweep could
+  reap them and a signed, committed backup would reference deleted
+  chunks. Both sweeps now refuse while any unexpired backup lease
+  exists (an unreadable lease refuses too — never "couldn't check,
+  deleting anyway") and re-collect references immediately before
+  deleting so backups committed since the first snapshot keep their
+  chunks. Dry-runs are unaffected.
+- **The WAL sink missed gaps that landed exactly on a segment
+  boundary.** Right after a segment hand-off there is no current
+  segment, so both per-segment guards went blind and a skip to a later
+  segment's first byte would commit past an unrecorded hole — PG then
+  recycles the missing WAL and the gap becomes permanent. The sink now
+  enforces strict stream-level contiguity: every record must start
+  exactly where the previous one ended.
+- **The streamer reported the apply LSN as the RAM-buffered receive
+  position.** Under `synchronous_commit=remote_apply` (reachable via
+  `--skip-preflight` or a post-start GUC change) the primary would ACK
+  commits whose WAL existed only in the streamer's volatile buffers —
+  acknowledged transactions lost if the host died. The standby status
+  update now reports apply = flush (the durably-synced position); the
+  fast-shutdown drain (issue #101) is unaffected because it only needs
+  the write field.
+
 ## [1.0.16] — 2026-07-24
 
 ### Integrity program: scheduled drills, contract enforcement, chaos soak

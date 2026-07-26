@@ -23,6 +23,17 @@ type Task struct {
 	// Run is what the task does. Errors are reported but do not
 	// stop the engine. Run must respect ctx.
 	Run func(ctx context.Context) error
+
+	// Timeout bounds one execution of Run. Zero means the engine
+	// derives a default from the task's own cadence (twice the
+	// schedule interval, clamped to [1h, 48h]). When the deadline
+	// passes, the engine cancels Run's ctx and — crucially — moves
+	// on even if Run never returns: tasks fire serially, so a
+	// single wedged Run (hung docker daemon, D-state I/O) would
+	// otherwise stop EVERY scheduled task on the agent forever,
+	// silently. An abandoned Run keeps its goroutine until it
+	// honors the cancelled ctx; its eventual result is discarded.
+	Timeout time.Duration
 }
 
 // Engine is the scheduler runtime. It walks Tasks, sleeps until the
@@ -279,7 +290,7 @@ func (e *Engine) runOne(ctx context.Context, st *scheduledTask, dueAt time.Time)
 		e.onStart(st.t.Name, dueAt)
 	}
 	start := e.clock.Now()
-	err := safeRun(ctx, st.t.Run)
+	err := e.runBounded(ctx, st)
 	dur := e.clock.Now().Sub(start)
 	if e.onFinish != nil {
 		e.onFinish(st.t.Name, dueAt, dur, err)
@@ -312,6 +323,82 @@ func (e *Engine) runOne(ctx context.Context, st *scheduledTask, dueAt time.Time)
 	st.lastErr = err
 	st.nextDue = next
 	e.mu.Unlock()
+}
+
+// runBounded executes the task's Run with a wall-clock ceiling. The
+// task runs on its own goroutine; when the ceiling passes, Run's ctx
+// is cancelled and runBounded returns a timeout error WITHOUT waiting
+// for Run — the engine's serial loop must never be held hostage by
+// one wedged task (a hung docker daemon or D-state I/O would
+// otherwise silently stop every scheduled backup on this agent,
+// forever, while the process looks healthy). A well-behaved Run sees
+// the cancellation and exits; a truly wedged one is abandoned and its
+// eventual result discarded (done is buffered so it never blocks).
+func (e *Engine) runBounded(ctx context.Context, st *scheduledTask) error {
+	timeout := st.t.Timeout
+	if timeout <= 0 {
+		timeout = defaultTaskTimeout(st.t.Schedule, e.clock.Now())
+	}
+	// gracePeriod is real time (not e.clock): it exists to let an
+	// already-cancelled Run deliver its own error, which is a
+	// runtime property, not schedule time.
+	const gracePeriod = 5 * time.Second
+
+	tctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() { done <- safeRun(tctx, st.t.Run) }()
+
+	select {
+	case err := <-done:
+		return err
+	case <-e.clock.After(timeout):
+		cancel()
+		// Give a ctx-respecting Run a short grace to surface its own
+		// (usually more informative) error before we abandon it.
+		select {
+		case err := <-done:
+			return err
+		case <-time.After(gracePeriod):
+			return fmt.Errorf("schedule: task %q exceeded its %s run ceiling and did not stop on cancel — abandoned so other tasks keep firing", st.t.Name, timeout)
+		}
+	case <-ctx.Done():
+		cancel()
+		select {
+		case err := <-done:
+			return err
+		case <-time.After(gracePeriod):
+			return ctx.Err()
+		}
+	}
+}
+
+// defaultTaskTimeout derives a run ceiling from the task's own
+// cadence: twice the schedule interval, clamped to [1h, 48h]. A
+// schedule whose interval can't be derived (one-shots) gets the 48h
+// ceiling — generous for any real backup, but finite.
+func defaultTaskTimeout(s Schedule, now time.Time) time.Duration {
+	const (
+		floor   = 1 * time.Hour
+		ceiling = 48 * time.Hour
+	)
+	n1 := s.Next(now)
+	if n1.IsZero() {
+		return ceiling
+	}
+	n2 := s.Next(n1)
+	if n2.IsZero() || !n2.After(n1) {
+		return ceiling
+	}
+	d := 2 * n2.Sub(n1)
+	if d < floor {
+		return floor
+	}
+	if d > ceiling {
+		return ceiling
+	}
+	return d
 }
 
 // safeRun runs fn under a panic-recovery shim so the engine survives

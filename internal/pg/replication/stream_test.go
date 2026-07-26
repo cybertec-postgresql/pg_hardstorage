@@ -295,8 +295,11 @@ func TestBuildStatusUpdate_Shape(t *testing.T) {
 	if got := be64(body[9:17]); got != uint64(flush) {
 		t.Errorf("flush LSN = %x, want %x", got, uint64(flush))
 	}
-	if got := be64(body[17:25]); got != uint64(write) {
-		t.Errorf("apply LSN = %x, want %x (write)", got, uint64(write))
+	// apply must equal FLUSH, never write: inflating apply to the
+	// RAM-buffered receive position would let synchronous_commit=
+	// remote_apply ACK commits whose WAL is not durable anywhere.
+	if got := be64(body[17:25]); got != uint64(flush) {
+		t.Errorf("apply LSN = %x, want %x (flush — apply must never exceed the durable position)", got, uint64(flush))
 	}
 }
 

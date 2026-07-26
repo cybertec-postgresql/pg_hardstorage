@@ -537,6 +537,20 @@ func buildBackupTask(name string, dep config.DeploymentConfig, signer *backup.Si
 		Name:     "backup:" + name,
 		Schedule: sched,
 		Run: func(ctx context.Context) error {
+			// Resolve encryption exactly like the interactive CLI:
+			// KEK on the keyring ⇒ encrypt. Resolved per run (not at
+			// task build) so a KEK installed after agent start takes
+			// effect without a restart. Without this every scheduled
+			// backup was silently plaintext — and plaintext-hash dedup
+			// welds those manifests onto encrypted chunks.
+			var enc *runner.EncryptionConfig
+			if p, perr := paths.Resolve(paths.DefaultOptions()); perr == nil {
+				var eerr error
+				enc, eerr = runner.LocalEncryptionFromKeyring(p.Keyring.Value)
+				if eerr != nil {
+					return fmt.Errorf("agent backup %s: %w", name, eerr)
+				}
+			}
 			_, err := runner.Take(ctx, runner.TakeOptions{
 				PGConnString: dep.PGConnection,
 				RepoURL:      dep.Repo,
@@ -544,6 +558,7 @@ func buildBackupTask(name string, dep config.DeploymentConfig, signer *backup.Si
 				Tenant:       dep.Tenant,
 				Signer:       signer,
 				Verifier:     verifier,
+				Encryption:   enc,
 			})
 			return err
 		},

@@ -211,6 +211,16 @@ type Sink struct {
 	curStartLSN pglogrepl.LSN
 	haveSeg     bool
 
+	// expectedNext is the absolute WAL position the next record MUST
+	// start at (end of the last buffered byte). Zero until the first
+	// record arrives. Physical replication delivers strictly
+	// contiguous bytes, so any jump is an upstream fault — this check
+	// subsumes the per-segment guards below, which both go blind when
+	// a skip lands exactly on a segment boundary (haveSeg is false
+	// right after a hand-off, so the segNum/offset checks never run
+	// and a hole-spanning segment would commit silently).
+	expectedNext uint64
+
 	// Pipeline plumbing.
 	bufPool  chan []byte   // free 16 MiB segment buffers
 	pending  chan *segJob  // filled segments handed receive -> processor
@@ -461,6 +471,17 @@ func (s *Sink) OnRecord(ctx context.Context, rec replication.XLogRecord) error {
 	pos := uint64(rec.WALStart)
 	data := rec.Data
 
+	// Strict contiguity at the stream level: after the first record,
+	// every record must start exactly where the previous one ended.
+	// The in-loop segment/offset guards cannot catch a skip that
+	// lands on a segment boundary (no current segment right after a
+	// hand-off), which would otherwise commit a segment past an
+	// unrecorded hole and let PG recycle the missing WAL for good.
+	if s.expectedNext != 0 && pos != s.expectedNext {
+		return fmt.Errorf("walsink: gap detected: expected next WAL byte at %s, got record starting at %s",
+			pglogrepl.LSN(s.expectedNext), rec.WALStart)
+	}
+
 	for len(data) > 0 {
 		segSize := uint64(s.segSize)
 		segNum := pos / segSize
@@ -503,6 +524,7 @@ func (s *Sink) OnRecord(ctx context.Context, rec replication.XLogRecord) error {
 		// Publish the new receive frontier for diagnostic readers
 		// (BufferedLSN).  Monotonic because the loop only advances pos.
 		s.bufferedLSN.Store(pos)
+		s.expectedNext = pos
 
 		if s.curFilled == int(s.segSize) {
 			if err := s.handOff(ctx); err != nil {
