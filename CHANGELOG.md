@@ -11,6 +11,8 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ## [Unreleased]
 
+## [1.0.17] — 2026-07-27
+
 ### Failure-class test harnesses
 
 Five new test harnesses target the failure *classes* the corruption
