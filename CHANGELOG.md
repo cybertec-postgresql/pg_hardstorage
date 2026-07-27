@@ -11,6 +11,38 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ## [Unreleased]
 
+### Failure-class test harnesses
+
+Five new test harnesses target the failure *classes* the corruption
+audits kept finding, so the next bug of each shape is caught
+structurally instead of by the next audit:
+
+- **Repo model checker** (`TestModelCheck_*`): seeded random operation
+  sequences (plant/delete/undelete/gc/rotate/hold/replicate) through
+  the real CLI paths, with global invariants checked after every step
+  — every live manifest restorable, every live incremental's chain
+  live, the audit chain verifying, the replica never lying. Fixed
+  seeds run in CI; a 2000-op randomized run joins the nightly
+  chaos-soak workflow, logging its seed for exact replay.
+- **Idempotency sweep** (`TestIdempotencySweep`): every maintenance
+  command run twice; the second run must succeed and leave durable
+  repo bytes unchanged. Already caught (and this change fixes) a
+  wart in the shared-DEK rotation migration: re-runs rewrote the
+  key slots with fresh nonces on every invocation.
+- **Fault sweep** (`TestFaultSweep`): one injected storage failure at
+  every call position of each maintenance command; a faulted run must
+  fail loudly, and a clean re-run must converge to the fault-free
+  reference state.
+- **Golden repo** (`TestGoldenRepo_StillReadable`): a frozen
+  miniature repo committed under testdata/ (manifests, encrypted
+  chunks, shared-DEK object, audit chain) that every future build
+  must open, verify, decrypt, and restore byte-exact — the
+  format-drift class (verify-sandbox major, verify-anchor indexing)
+  caught before release instead of in the field.
+- **Encryption path parity**
+  (`TestEncryptionResolutionParity_CLIvsAgent`): the CLI and agent
+  must resolve backup encryption identically for every keyring state.
+
 ### Internal invariant assertions (fail-closed)
 
 New `internal/invariant` package: `invariant.Assert` panics with a

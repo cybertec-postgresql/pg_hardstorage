@@ -391,7 +391,12 @@ func putSharedDEKOverwrite(ctx context.Context, sp storage.StoragePlugin, key, k
 // slot is published — pass false when aliasing the same DEK to an
 // additional ref (e.g. keeping "local:default" resolvable after a
 // local rotation) so the source slot survives.
-func Rewrap(ctx context.Context, sp storage.StoragePlugin, oldRef, newRef string, unwrapOld Unwrapper, wrapNew Wrapper, removeOld bool) (bool, error) {
+//
+// unwrapNew (the NEW KEK's unwrapper) makes re-runs byte-idempotent:
+// when the destination slot already unwraps to the SAME DEK under the
+// new KEK, nothing is rewritten (a rewrap emits a fresh random nonce,
+// so blind rewrites change repo bytes on every resume run).
+func Rewrap(ctx context.Context, sp storage.StoragePlugin, oldRef, newRef string, unwrapOld, unwrapNew Unwrapper, wrapNew Wrapper, removeOld bool) (bool, error) {
 	wrapped, ok := readWrappedDEK(ctx, sp, sharedDEKKey(oldRef), oldRef)
 	if !ok {
 		return false, nil
@@ -411,6 +416,18 @@ func Rewrap(ctx context.Context, sp storage.StoragePlugin, oldRef, newRef string
 		return false, fmt.Errorf("sharedkey rewrap: wrap under new KEK: %w", err)
 	}
 	newKey := sharedDEKKey(newRef)
+	// Idempotency: if the destination slot already holds THIS DEK
+	// under the new KEK, leave it untouched — a rewrap carries a
+	// fresh random nonce, so rewriting on every resume run would
+	// change repo bytes without changing meaning.
+	if existing, ok := readWrappedDEK(ctx, sp, newKey, newRef); ok && unwrapNew != nil && unwrapsToSame(existing, unwrapNew, dek) {
+		if removeOld {
+			if oldKey := sharedDEKKey(oldRef); oldKey != newKey {
+				_ = sp.Delete(ctx, oldKey)
+			}
+		}
+		return true, nil
+	}
 	// Overwrite semantics: rotation is an operator-driven maintenance
 	// action and the new slot may hold a stale leftover from an
 	// earlier partial rotation; the DEK content is the invariant
