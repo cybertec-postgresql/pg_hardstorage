@@ -181,28 +181,45 @@ func Open(ctx context.Context, url string) (*Metadata, storage.StoragePlugin, er
 	// as RepoFormatV1_0 (the only format this binary writes today).
 	// The check is the load-bearing part of the test scenario at
 	// test/scenarios/L4_repo_format_forward_check.scenario.yaml.
-	if rvc, rvErr := sp.Get(ctx, RepoVersionFilename); rvErr == nil {
-		rvBody, _ := stdio.ReadAll(rvc)
-		_ = rvc.Close()
-		var rv RepoVersion
-		if err := json.Unmarshal(rvBody, &rv); err != nil {
-			_ = sp.Close()
-			return nil, nil, fmt.Errorf("repo: parse %s: %w", RepoVersionFilename, err)
-		}
-		known := false
-		for _, f := range SupportedRepoFormats {
-			if rv.Format == f {
-				known = true
-				break
-			}
-		}
-		if !known {
-			_ = sp.Close()
-			return nil, nil, &ErrRepoFormatUnsupported{Format: rv.Format, Supported: SupportedRepoFormats}
-		}
+	if err := checkRepoFormat(ctx, sp); err != nil {
+		_ = sp.Close()
+		return nil, nil, err
 	}
 
 	return &meta, sp, nil
+}
+
+// checkRepoFormat enforces the forward-format gate. FAIL-CLOSED error
+// handling: only a definitive ErrNotFound may take the "no marker =
+// v1.0" path. Any other Get failure (throttling, IAM denial,
+// partition) must fail Open — treating it like absence let an old
+// binary skip the gate on a FUTURE-format repo and mutate it under
+// stale assumptions (its lenient readers skip unparseable v2
+// manifests as "malformed", so a `repo gc --apply` would reap chunks
+// those manifests still reference).
+func checkRepoFormat(ctx context.Context, sp storage.StoragePlugin) error {
+	rvc, rvErr := sp.Get(ctx, RepoVersionFilename)
+	if rvErr != nil {
+		if errors.Is(rvErr, storage.ErrNotFound) {
+			return nil // pre-v0.10 repo: no marker, implicitly v1.0
+		}
+		return fmt.Errorf("repo: read %s (refusing to assume the repo format): %w", RepoVersionFilename, rvErr)
+	}
+	rvBody, readErr := stdio.ReadAll(rvc)
+	_ = rvc.Close()
+	if readErr != nil {
+		return fmt.Errorf("repo: read %s body: %w", RepoVersionFilename, readErr)
+	}
+	var rv RepoVersion
+	if err := json.Unmarshal(rvBody, &rv); err != nil {
+		return fmt.Errorf("repo: parse %s: %w", RepoVersionFilename, err)
+	}
+	for _, f := range SupportedRepoFormats {
+		if rv.Format == f {
+			return nil
+		}
+	}
+	return &ErrRepoFormatUnsupported{Format: rv.Format, Supported: SupportedRepoFormats}
 }
 
 // ErrRepoFormatUnsupported is returned by Open when the repo's

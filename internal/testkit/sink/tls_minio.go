@@ -310,7 +310,7 @@ func (m *tlsMinioRuntime) Down(ctx context.Context) error {
 // the SDK upgrades to TLS automatically when the scheme is
 // https.
 func (m *tlsMinioRuntime) URL() string {
-	return fmt.Sprintf("s3://%s?endpoint=https://127.0.0.1:%d&path_style=true&region=us-east-1",
+	return fmt.Sprintf("s3://%s?endpoint=https://127.0.0.1:%d&path_style=true&region=us-east-1&conditional_put=native",
 		m.bucket, m.port)
 }
 

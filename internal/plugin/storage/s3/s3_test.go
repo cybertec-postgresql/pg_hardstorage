@@ -424,8 +424,15 @@ func TestS3_PluginName(t *testing.T) {
 func TestS3_Capabilities(t *testing.T) {
 	p := &s3.Plugin{}
 	c := p.Capabilities()
-	if !c.WORM || !c.ConditionalPut || !c.Multipart {
-		t.Errorf("expected capabilities to advertise WORM/ConditionalPut/Multipart; got %+v", c)
+	if !c.WORM || !c.Multipart {
+		t.Errorf("expected capabilities to advertise WORM/Multipart; got %+v", c)
+	}
+	// ConditionalPut is endpoint-dependent since the honesty fix:
+	// true for AWS proper, false for unvouched ?endpoint= overrides.
+	// See TestCapabilities_ConditionalPutHonesty for the full matrix;
+	// an unopened plugin reports false (fail-safe).
+	if c.ConditionalPut {
+		t.Errorf("unopened plugin must not claim ConditionalPut; got %+v", c)
 	}
 }
 

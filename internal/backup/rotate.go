@@ -11,8 +11,11 @@ import (
 	"sort"
 	"time"
 
+	"strings"
+
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/encryption"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo/sharedkey"
 )
 
 // RotateKEKSchema is the on-disk version tag for RotateKEKResult bodies.
@@ -134,6 +137,13 @@ type RotateKEKResult struct {
 	SkippedDifferentKEK int `json:"skipped_different_kek"`
 	Failed              int `json:"failed"`
 
+	// SharedDEKMigrated reports whether the authoritative
+	// keys/shared-dek/ object was rewrapped to the new (ref, KEK) as
+	// part of this pass. False on dry-runs, on legacy repos that
+	// never had the object, and when Failed > 0 (migration only runs
+	// after a clean manifest pass).
+	SharedDEKMigrated bool `json:"shared_dek_migrated,omitempty"`
+
 	// ReplicaFailures counts manifests where the primary rewrite
 	// succeeded but the replica copy update failed. The primary is
 	// authoritative; the replica is best-effort redundancy. Each
@@ -245,9 +255,61 @@ func RotateKEK(ctx context.Context, sp storage.StoragePlugin, opts RotateKEKOpti
 		}
 	}
 
+	// Migrate the authoritative shared-DEK object (keys/shared-dek/)
+	// across the rotation. Manifests alone are not enough: the next
+	// backup's ResolveOrMint consults this object FIRST, and a wrap
+	// left under the retired KEK bricks every future backup and
+	// `wal stream` for this ref (they refuse — correctly — to mint a
+	// divergent DEK). Same-DEK invariant: only the wrapping changes.
+	if !opts.DryRun && res.Failed == 0 {
+		unwrapOld := func(w []byte) ([]byte, error) {
+			d, err := encryption.Unwrap(opts.OldKEK, w)
+			if err != nil {
+				return nil, err
+			}
+			return d[:], nil
+		}
+		wrapNew := func(d [encryption.KeyLen]byte) ([]byte, error) {
+			return encryption.Wrap(opts.NewKEK, d)
+		}
+		migrated, rerr := sharedkey.Rewrap(ctx, sp, opts.OldKEKRef, opts.NewKEKRef, unwrapOld, wrapNew, true)
+		if rerr != nil {
+			finish()
+			return res, fmt.Errorf("backup rotate-kek: migrate shared-DEK object: %w", rerr)
+		}
+		res.SharedDEKMigrated = migrated
+
+		// Local-custody alias: the CLI and agent stamp the FIXED ref
+		// "local:default" (keystore.KEKRefLocal) on every local-KEK
+		// backup, regardless of what ref the rotation introduced. If
+		// that slot stops resolving, the next local backup mints a
+		// FRESH DEK — and content-addressed dedup then welds new
+		// manifests onto chunks sealed with the old DEK (unrestorable,
+		// issue #28 class). Keep the alias slot on the SAME DEK,
+		// wrapped under the new KEK.
+		if migrated && strings.HasPrefix(opts.NewKEKRef, "local:") && opts.NewKEKRef != localDefaultKEKRef {
+			unwrapNew := func(w []byte) ([]byte, error) {
+				d, err := encryption.Unwrap(opts.NewKEK, w)
+				if err != nil {
+					return nil, err
+				}
+				return d[:], nil
+			}
+			if _, aerr := sharedkey.Rewrap(ctx, sp, opts.NewKEKRef, localDefaultKEKRef, unwrapNew, wrapNew, false); aerr != nil {
+				finish()
+				return res, fmt.Errorf("backup rotate-kek: refresh local-default shared-DEK alias: %w", aerr)
+			}
+		}
+	}
+
 	finish()
 	return res, nil
 }
+
+// localDefaultKEKRef mirrors keystore.KEKRefLocal ("local:default").
+// Duplicated because keystore imports this package; a cross-check
+// test in keystore pins the two constants together.
+const localDefaultKEKRef = "local:default"
 
 type rotateOutcome int
 
@@ -390,22 +452,26 @@ func healStaleReplica(ctx context.Context, sp storage.StoragePlugin, m *Manifest
 // maintenance window; the rotation primitive's contract surfaces
 // this in the package docs.
 func overwriteManifest(ctx context.Context, sp storage.StoragePlugin, key string, body []byte, retainUntil time.Time, mode storage.WORMMode) error {
-	tmp := key + ".rotate." + randSuffix()
-	if _, err := sp.Put(ctx, tmp, bytes.NewReader(body), storage.PutOptions{
+	// Direct overwriting Put. Every backend's Put replaces the key
+	// atomically (fs/sftp: tmp + POSIX rename; object stores: PUT is
+	// last-writer-wins on the whole object), so there is never a
+	// moment without a valid manifest body at key.
+	//
+	// The previous shape — Put tmp, DELETE the original, then
+	// RenameIfNotExists(tmp→key) — had a fatal failure mode: after
+	// the delete, a transient rename failure took the "cleanup" path
+	// and deleted the tmp too, destroying the only manifest copy at
+	// the primary key. The backup then vanished from List/retention
+	// AND from GC's reference walk (which reads only .../manifest.json),
+	// so the next `repo gc --apply` reaped all of its chunks —
+	// permanent, silent backup loss triggered by one flaky rename
+	// during routine key rotation. A crash between the delete and the
+	// rename stranded the manifest under a name nothing reads, with
+	// the same GC outcome.
+	if _, err := sp.Put(ctx, key, bytes.NewReader(body), storage.PutOptions{
 		ContentLength: int64(len(body)),
 	}); err != nil {
-		return fmt.Errorf("write tmp: %w", err)
-	}
-	if err := sp.Delete(ctx, key); err != nil {
-		// Best-effort cleanup of tmp; the original-delete error is
-		// what matters.
-		_ = sp.Delete(ctx, tmp)
-		return fmt.Errorf("delete original: %w", err)
-	}
-	if err := sp.RenameIfNotExists(ctx, tmp, key); err != nil {
-		// Cleanup attempt, then surface.
-		_ = sp.Delete(ctx, tmp)
-		return fmt.Errorf("rename tmp -> original: %w", err)
+		return fmt.Errorf("overwrite manifest: %w", err)
 	}
 	// Re-apply the repo's WORM lock to the rewritten manifest so a rotation
 	// on a compliance repo doesn't leave it deletable. Empty mode →
@@ -445,3 +511,8 @@ func recordRotateFailure(res *RotateKEKResult, deployment, backupID string, err 
 		Err:        err.Error(),
 	})
 }
+
+// LocalDefaultKEKRefForTest exposes localDefaultKEKRef so the
+// keystore package (which this package cannot import) can pin it
+// against keystore.KEKRefLocal in a test.
+func LocalDefaultKEKRefForTest() string { return localDefaultKEKRef }

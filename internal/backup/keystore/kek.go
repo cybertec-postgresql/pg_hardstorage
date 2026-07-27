@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/encryption"
 )
@@ -202,6 +203,16 @@ var ErrKEKAlreadyShred = errors.New("keystore: KEK already shred (no kek.bin in 
 func KEKResolver(keyringDir string) func(ref string) ([encryption.KeyLen]byte, error) {
 	return func(ref string) ([encryption.KeyLen]byte, error) {
 		var zero [encryption.KeyLen]byte
+		// Any local:* ref resolves to the keyring file: `kms rotate`
+		// refuses old==new refs, so a local rotation necessarily
+		// stamps a NEW local ref (e.g. "local:v2") on every rotated
+		// manifest — and the operator's keyring holds the matching
+		// key material. Restricting this resolver to exactly
+		// "local:default" made every rotated backup unrestorable by
+		// any shipped code path.
+		if strings.HasPrefix(ref, "local:") {
+			ref = KEKRefLocal
+		}
 		switch ref {
 		case "", KEKRefLocal:
 			path := filepath.Join(keyringDir, KEKFileName)

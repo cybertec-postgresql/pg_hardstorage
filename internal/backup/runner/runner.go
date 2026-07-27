@@ -516,6 +516,23 @@ func Take(ctx context.Context, opts TakeOptions) (*Result, error) {
 	// Chunks are written DurabilityDeferred — no per-chunk fsync —
 	// and made crash-durable by a single cas.Barrier after
 	// BASE_BACKUP completes, before the manifest is committed.
+	//
+	// That invariant only holds when the backend can actually enforce
+	// durability somewhere: either Barrier is real (DurabilityBarrier)
+	// or every Put is durable on return (InlineDurable). A backend
+	// with NEITHER (sftp/scp: tmp+rename into the remote page cache,
+	// NopBarrier) silently voids the "chunks durable before manifest
+	// commit" guarantee — after a remote power loss the manifest can
+	// survive while chunk keys hold torn bytes, and existence-based
+	// dedup then propagates the torn chunk into every future backup.
+	// We cannot conjure remote fsync, but we can refuse to be silent.
+	if caps := sp.Capabilities(); !caps.InlineDurable && !caps.DurabilityBarrier {
+		emit(output.NewEvent(output.SeverityWarning, "backup", "durability_unenforceable").
+			WithSubject(output.Subject{Deployment: opts.Deployment}).
+			WithBody(map[string]any{
+				"message": "this storage backend can neither fsync on demand (no durability barrier) nor guarantee durable writes (no inline durability): a power loss on the storage host can leave a committed manifest whose chunks are torn or missing. Prefer a backend with real durability (file/s3) for primary backups, or accept the risk knowingly.",
+			}))
+	}
 	casOpts := []casdefault.Option{
 		casdefault.WithCompressionLevel(repoMeta.Compression),
 		casdefault.WithChunkDurability(storage.DurabilityDeferred),

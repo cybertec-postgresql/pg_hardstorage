@@ -175,6 +175,16 @@ type Options struct {
 	// result if it doesn't.
 	DataDir string
 
+	// ManifestCaptured tells the backend the caller ACTUALLY wrote
+	// backup_manifest into DataDir. When true, a pg_verifybackup
+	// "could not open .../backup_manifest" failure is a REAL failure
+	// (bad bind-mount, remote DOCKER_HOST seeing a different
+	// filesystem, permissions), never a benign skip — classifying it
+	// as "manifest was not captured" fabricated an exit-0 "verified"
+	// out of an environment fault and let verification cadence rot
+	// silently behind green dashboards.
+	ManifestCaptured bool
+
 	// PGMajor is the major version of the source PG ("15",
 	// "16", "17").  The Docker image / Firecracker rootfs
 	// must match so the pg_verifybackup binary's protocol
@@ -337,6 +347,17 @@ func Verify(ctx context.Context, opts Options) (*Result, error) {
 	}
 
 	return b.Verify(ctx, resolved)
+}
+
+// classifySkip decides whether a non-zero pg_verifybackup exit is a
+// benign "no manifest was ever captured" skip. It is a skip ONLY
+// when the stderr matches the missing-manifest pattern AND the
+// caller did not capture a manifest — when the caller wrote
+// backup_manifest into the datadir, the same stderr means the
+// sandbox could not see the caller's files (bad mount, remote
+// docker daemon, permissions), which must fail, not skip.
+func classifySkip(stderr string, manifestCaptured bool) bool {
+	return isMissingManifestError(stderr) && !manifestCaptured
 }
 
 // isMissingManifestError detects the specific stderr pattern

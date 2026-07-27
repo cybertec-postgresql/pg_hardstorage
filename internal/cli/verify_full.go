@@ -150,6 +150,10 @@ func runVerifyFull(cmd *cobra.Command, deployment, backupID, repoURL, pgMajorOve
 	res, err := sandbox.Verify(cmd.Context(), sandbox.Options{
 		DataDir: tmp,
 		PGMajor: major,
+		// The restore above writes backup_manifest whenever the
+		// manifest carries it — so a "could not open backup_manifest"
+		// from pg_verifybackup is an environment fault, not a skip.
+		ManifestCaptured: len(m.PGBackupManifest) > 0,
 	})
 	if err != nil {
 		return output.NewError("verify.sandbox_failed",

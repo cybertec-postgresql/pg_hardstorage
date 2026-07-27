@@ -1545,7 +1545,50 @@ func (ms *ManifestStore) Undelete(ctx context.Context, deployment, backupID stri
 			Missing:     missing,
 		}
 	}
+	// Parent-chain pre-flight: resurrecting an incremental whose
+	// ancestors stay tombstoned hands back a healthy-LOOKING backup
+	// that every restore refuses (chain.broken_tombstoned) — and once
+	// the parent's tombstone ages past GC grace, its chunks and WAL
+	// are reaped and the resurrected leaf becomes PERMANENTLY
+	// unrestorable while still listing as live. Walk the chain and
+	// fail closed, naming the first dead ancestor; UndeleteForce
+	// remains the eyes-open override.
+	cur := m
+	for cur.ParentBackupID != "" {
+		parentDead, perr := ms.IsTombstoned(ctx, deployment, cur.ParentBackupID)
+		if perr != nil {
+			return false, fmt.Errorf("backup: Undelete: tombstone check on ancestor %s: %w", cur.ParentBackupID, perr)
+		}
+		if parentDead {
+			return false, &UndeleteParentTombstonedError{
+				Deployment: deployment,
+				BackupID:   backupID,
+				Ancestor:   cur.ParentBackupID,
+			}
+		}
+		parent, perr2 := ms.readManifestUnverified(ctx, deployment, cur.ParentBackupID)
+		if perr2 != nil {
+			return false, fmt.Errorf("backup: Undelete: read ancestor %s: %w", cur.ParentBackupID, perr2)
+		}
+		cur = parent
+	}
 	return ms.removeTombstone(ctx, deployment, backupID)
+}
+
+// UndeleteParentTombstonedError is returned by Undelete when the
+// manifest being resurrected is an incremental whose ancestor is
+// still tombstoned — restoring the chain requires undeleting the
+// ancestor(s) first (oldest-first), or UndeleteForce for the
+// metadata-only forensic case.
+type UndeleteParentTombstonedError struct {
+	Deployment string
+	BackupID   string
+	Ancestor   string
+}
+
+func (e *UndeleteParentTombstonedError) Error() string {
+	return fmt.Sprintf("backup: refusing to undelete %s/%s: its ancestor %s is still tombstoned — the resurrected incremental would be unrestorable (and permanently so once GC grace expires). Undelete the ancestor first, or use the force mode for metadata-only resurrection",
+		e.Deployment, e.BackupID, e.Ancestor)
 }
 
 // UndeleteForce removes a backup's tombstone WITHOUT the chunk

@@ -7,6 +7,7 @@ import (
 	"crypto/cipher"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/kms"
@@ -97,7 +98,12 @@ func UnwrapDEK(ctx context.Context, kekRef string, wrappedDEK []byte, opts Unwra
 		metrics.ObserveKMSUnwrap(scheme, result, time.Since(start).Seconds())
 	}()
 
-	if kekRef == "" || kekRef == KEKRefLocal {
+	// Any local:* ref routes to the keyring (see KEKResolver: local
+	// rotation stamps refs like "local:v2" on rotated manifests, and
+	// the KMS registry has no "local" provider — routing those refs
+	// there returned ErrUnknownScheme and made rotated backups
+	// unrestorable).
+	if kekRef == "" || strings.HasPrefix(kekRef, "local:") {
 		if opts.KeyringDir == "" {
 			return nil, errors.New("keystore: UnwrapDEK with local KEKRef requires opts.KeyringDir")
 		}

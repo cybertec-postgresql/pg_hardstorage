@@ -104,7 +104,7 @@ func (dockerBackend) Verify(ctx context.Context, opts Options) (*Result, error) 
 		res.Passed = true
 		return res, nil
 	}
-	if isMissingManifestError(stderr) {
+	if classifySkip(stderr, opts.ManifestCaptured) {
 		res.Skipped = true
 		res.SkipReason = "backup_manifest absent (pg_basebackup-style manifest was not captured)"
 		return res, nil

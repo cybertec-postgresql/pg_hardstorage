@@ -17,6 +17,11 @@
 //	              not host). Required for MinIO/localstack with non-DNS
 //	              bucket names.
 //	storage_class default StorageClass for Put when none is set per-request.
+//	conditional_put "native" vouches that a custom ?endpoint= enforces
+//	              `If-None-Match: *` atomically (MinIO ≥ RELEASE.2024,
+//	              Cloudflare R2). Without the vouch, custom endpoints
+//	              report ConditionalPut=false so single-winner callers
+//	              degrade loudly instead of trusting an unverified claim.
 //
 // Authentication is delegated to the AWS SDK v2 default credential
 // chain (env vars, IRSA, IAM role, profile, SSO). v0.1 does not
@@ -74,6 +79,12 @@ type Plugin struct {
 	prefix       string // includes a trailing "/" or is empty
 	storageClass string
 	region       string // resolved AWS region; reported via Region()
+
+	// conditionalPut records whether this endpoint is trusted to
+	// honour `If-None-Match: *` atomically. True for AWS proper;
+	// false for ?endpoint= overrides unless the operator passes
+	// ?conditional_put=native. See Capabilities.
+	conditionalPut bool
 }
 
 // Name implements storage.StoragePlugin.
@@ -106,6 +117,27 @@ func (p *Plugin) Open(ctx context.Context, cfg storage.StorageConfig) error {
 	endpoint := q.Get("endpoint")
 	pathStyle := q.Get("path_style") == "true"
 	storageClass := q.Get("storage_class")
+
+	// Conditional-put honesty. AWS S3 enforces `If-None-Match: *`
+	// natively and atomically. S3-COMPATIBLE endpoints are a mixed
+	// bag — the contract harness has already caught MinIO silently
+	// IGNORING the same directive on CopyObject (see
+	// RenameIfNotExists below), and a backend that ignores it on
+	// PutObject makes every single-winner assumption in the code
+	// base silently false (shared-DEK mint, backup lease, audit
+	// chain slots, repo-init HSREPO claim) — while the capability
+	// claim simultaneously DISABLES the read-back/warning
+	// mitigations built for honest-false backends. So: with an
+	// ?endpoint= override the plugin reports ConditionalPut=false
+	// unless the operator explicitly vouches for the endpoint with
+	// ?conditional_put=native (MinIO ≥ RELEASE.2024-* and Cloudflare
+	// R2 do enforce it).
+	conditionalPut := endpoint == "" || q.Get("conditional_put") == "native"
+	switch q.Get("conditional_put") {
+	case "", "native":
+	default:
+		return fmt.Errorf("s3: unknown conditional_put=%q (want \"native\" or omit)", q.Get("conditional_put"))
+	}
 
 	// Per-request HTTP timeout. The SDK's default HTTPClient has
 	// no overall timeout; combined with TCP keepalive's
@@ -193,6 +225,7 @@ func (p *Plugin) Open(ctx context.Context, cfg storage.StorageConfig) error {
 	p.prefix = prefix
 	p.storageClass = storageClass
 	p.region = awsCfg.Region
+	p.conditionalPut = conditionalPut
 	return nil
 }
 
@@ -230,7 +263,7 @@ func (p *Plugin) fullKey(key string) string {
 func (p *Plugin) Capabilities() storage.Capabilities {
 	return storage.Capabilities{
 		WORM:                   true,
-		ConditionalPut:         true,
+		ConditionalPut:         p.conditionalPut,
 		Multipart:              true,
 		ServerSideEncryption:   true,
 		CrossRegionReplicate:   true,

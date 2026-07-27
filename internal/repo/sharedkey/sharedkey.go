@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -172,7 +173,18 @@ func ResolveOrMint(ctx context.Context, sp storage.StoragePlugin, kekRef string,
 
 	// 1. Authoritative object.
 	if wrapped, ok := readWrappedDEK(ctx, sp, key, kekRef); ok {
-		return unwrapInto(wrapped, unwrap)
+		out, err := unwrapInto(wrapped, unwrap)
+		if err != nil || out.Have {
+			return out, err
+		}
+		// Present but won't unwrap under this KEK — e.g. a stale
+		// object left behind by a KEK rotation that predated
+		// Rewrap(). Freshly-ROTATED manifests wrap the SAME shared
+		// DEK under the current KEK, so fall through to the manifest
+		// scan and adopt from there instead of hard-failing every
+		// future backup on an internal object the operator has never
+		// heard of. If the scan also finds only unusable candidates,
+		// it returns UnusableCandidate exactly as before.
 	}
 
 	// 2. Legacy seed: adopt an existing manifest DEK.
@@ -190,9 +202,16 @@ func ResolveOrMint(ctx context.Context, sp storage.StoragePlugin, kekRef string,
 		// Best-effort promotion so future writers skip the manifest scan
 		// and, more importantly, so a later concurrent fresh-mint can't
 		// race in a divergent DEK. A conflict here is fine — someone else
-		// adopted the same manifest DEK.
+		// adopted the same manifest DEK. When a STALE object occupies the
+		// slot (rotation leftover that won't unwrap under this KEK),
+		// replace it: the adopted DEK is proven against a committed
+		// manifest, the stale wrap is provably useless to this KEK.
 		if wrapped, werr := wrap(out.DEK); werr == nil {
-			_ = putSharedDEK(ctx, sp, key, kekRef, wrapped)
+			if perr := putSharedDEK(ctx, sp, key, kekRef, wrapped); errors.Is(perr, storage.ErrAlreadyExists) {
+				if existing, ok := readWrappedDEK(ctx, sp, key, kekRef); !ok || !unwrapsToSame(existing, unwrap, out.DEK) {
+					_ = putSharedDEKOverwrite(ctx, sp, key, kekRef, wrapped)
+				}
+			}
 		}
 		return out, nil
 	}
@@ -315,4 +334,87 @@ func readWrappedDEK(ctx context.Context, sp storage.StoragePlugin, key, wantKEKR
 		return nil, false
 	}
 	return wrapped, true
+}
+
+// unwrapsToSame reports whether wrapped unwraps (under the caller's
+// KEK) to exactly dek. Used to decide whether an occupied shared-DEK
+// slot already holds the right key material.
+func unwrapsToSame(wrapped []byte, unwrap Unwrapper, dek [encryption.KeyLen]byte) bool {
+	got, err := unwrap(wrapped)
+	if err != nil || len(got) != encryption.KeyLen {
+		return false
+	}
+	return subtle.ConstantTimeCompare(got, dek[:]) == 1
+}
+
+// putSharedDEKOverwrite unconditionally replaces the shared-DEK
+// envelope at key. Reserved for repairing a slot that holds a wrap
+// PROVEN unusable under the caller's KEK (rotation leftovers) — the
+// normal mint path must keep using the IfNotExists variant so
+// concurrent first-writers still converge on a single winner.
+func putSharedDEKOverwrite(ctx context.Context, sp storage.StoragePlugin, key, kekRef string, wrapped []byte) error {
+	body, err := json.Marshal(manifestEnvelope{Encryption: &envelope{
+		Scheme:     Scheme,
+		KEKRef:     kekRef,
+		WrappedDEK: base64.StdEncoding.EncodeToString(wrapped),
+	}})
+	if err != nil {
+		return err
+	}
+	_, err = sp.Put(ctx, key, bytes.NewReader(body), storage.PutOptions{
+		ContentLength: int64(len(body)),
+	})
+	return err
+}
+
+// Rewrap migrates the authoritative shared-DEK object across a KEK
+// rotation: it unwraps the shared DEK recorded under oldRef, rewraps
+// it under the new KEK, publishes it at newRef's slot, and removes
+// the old slot. Without this, `kms rotate` rewrapped every manifest
+// but left the shared-DEK object under the retired KEK — the next
+// backup's ResolveOrMint found an object it could not unwrap and
+// every subsequent backup and `wal stream` hard-failed until the
+// operator deleted an undocumented internal object.
+//
+// Returns (false, nil) when oldRef has no object to migrate (legacy
+// repo or never-encrypted): the manifest-scan adoption path covers
+// those.
+// removeOld controls whether oldRef's slot is deleted after the new
+// slot is published — pass false when aliasing the same DEK to an
+// additional ref (e.g. keeping "local:default" resolvable after a
+// local rotation) so the source slot survives.
+func Rewrap(ctx context.Context, sp storage.StoragePlugin, oldRef, newRef string, unwrapOld Unwrapper, wrapNew Wrapper, removeOld bool) (bool, error) {
+	wrapped, ok := readWrappedDEK(ctx, sp, sharedDEKKey(oldRef), oldRef)
+	if !ok {
+		return false, nil
+	}
+	dekBytes, err := unwrapOld(wrapped)
+	if err != nil {
+		return false, fmt.Errorf("sharedkey rewrap: unwrap %s object with old KEK: %w", oldRef, err)
+	}
+	if len(dekBytes) != encryption.KeyLen {
+		return false, fmt.Errorf("sharedkey rewrap: unwrapped DEK has length %d (want %d)", len(dekBytes), encryption.KeyLen)
+	}
+	var dek [encryption.KeyLen]byte
+	copy(dek[:], dekBytes)
+
+	newWrapped, err := wrapNew(dek)
+	if err != nil {
+		return false, fmt.Errorf("sharedkey rewrap: wrap under new KEK: %w", err)
+	}
+	newKey := sharedDEKKey(newRef)
+	// Overwrite semantics: rotation is an operator-driven maintenance
+	// action and the new slot may hold a stale leftover from an
+	// earlier partial rotation; the DEK content is the invariant
+	// (same DEK, new wrap), so replacing is always safe here.
+	if err := putSharedDEKOverwrite(ctx, sp, newKey, newRef, newWrapped); err != nil {
+		return false, fmt.Errorf("sharedkey rewrap: publish %s object: %w", newRef, err)
+	}
+	if oldKey := sharedDEKKey(oldRef); removeOld && oldKey != newKey {
+		// Best-effort: a surviving old object is harmless once the new
+		// slot exists (nothing resolves the retired ref), but tidy it
+		// so a future rotation back to this ref can't find a stale wrap.
+		_ = sp.Delete(ctx, oldKey)
+	}
+	return true, nil
 }
