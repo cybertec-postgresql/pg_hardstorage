@@ -272,7 +272,25 @@ func RotateKEK(ctx context.Context, sp storage.StoragePlugin, opts RotateKEKOpti
 		wrapNew := func(d [encryption.KeyLen]byte) ([]byte, error) {
 			return encryption.Wrap(opts.NewKEK, d)
 		}
+		unwrapNew := func(w []byte) ([]byte, error) {
+			d, err := encryption.Unwrap(opts.NewKEK, w)
+			if err != nil {
+				return nil, err
+			}
+			return d[:], nil
+		}
 		migrated, rerr := sharedkey.Rewrap(ctx, sp, opts.OldKEKRef, opts.NewKEKRef, unwrapOld, wrapNew, true)
+		if rerr != nil || !migrated {
+			// Idempotent re-run: a prior rotation already migrated the
+			// slots, so they unwrap under the NEW KEK — "the old KEK
+			// can't open it" is completion, not failure. (Concretely:
+			// after a local rotation the old ref's slot holds the
+			// local:default ALIAS wrapped under the new KEK; a re-run
+			// used to hard-fail on exactly that slot.)
+			if sharedkey.SlotResolves(ctx, sp, opts.NewKEKRef, unwrapNew) {
+				migrated, rerr = true, nil
+			}
+		}
 		if rerr != nil {
 			finish()
 			return res, fmt.Errorf("backup rotate-kek: migrate shared-DEK object: %w", rerr)
@@ -288,13 +306,6 @@ func RotateKEK(ctx context.Context, sp storage.StoragePlugin, opts RotateKEKOpti
 		// issue #28 class). Keep the alias slot on the SAME DEK,
 		// wrapped under the new KEK.
 		if migrated && strings.HasPrefix(opts.NewKEKRef, "local:") && opts.NewKEKRef != localDefaultKEKRef {
-			unwrapNew := func(w []byte) ([]byte, error) {
-				d, err := encryption.Unwrap(opts.NewKEK, w)
-				if err != nil {
-					return nil, err
-				}
-				return d[:], nil
-			}
 			if _, aerr := sharedkey.Rewrap(ctx, sp, opts.NewKEKRef, localDefaultKEKRef, unwrapNew, wrapNew, false); aerr != nil {
 				finish()
 				return res, fmt.Errorf("backup rotate-kek: refresh local-default shared-DEK alias: %w", aerr)

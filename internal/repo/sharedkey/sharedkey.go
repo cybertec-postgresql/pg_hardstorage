@@ -426,3 +426,17 @@ func Rewrap(ctx context.Context, sp storage.StoragePlugin, oldRef, newRef string
 	}
 	return true, nil
 }
+
+// SlotResolves reports whether the shared-DEK slot for ref exists and
+// unwraps under the supplied unwrapper. Rotation uses it to make the
+// object migration idempotent: on a re-run the slots already unwrap
+// under the NEW KEK, so "old KEK can't open it" is completion, not
+// failure.
+func SlotResolves(ctx context.Context, sp storage.StoragePlugin, ref string, unwrap Unwrapper) bool {
+	wrapped, ok := readWrappedDEK(ctx, sp, sharedDEKKey(ref), ref)
+	if !ok {
+		return false
+	}
+	dek, err := unwrap(wrapped)
+	return err == nil && len(dek) == encryption.KeyLen
+}
