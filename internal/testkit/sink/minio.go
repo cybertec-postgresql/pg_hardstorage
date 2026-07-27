@@ -261,7 +261,7 @@ func (m *minioRuntime) Down(ctx context.Context) error {
 // MinIO (and any non-AWS S3 endpoint) — vhost-style addressing
 // would try to dial bucket.127.0.0.1, which doesn't resolve.
 func (m *minioRuntime) URL() string {
-	return fmt.Sprintf("s3://%s?endpoint=http://127.0.0.1:%d&path_style=true&region=us-east-1",
+	return fmt.Sprintf("s3://%s?endpoint=http://127.0.0.1:%d&path_style=true&region=us-east-1&conditional_put=native",
 		m.bucket, m.port)
 }
 

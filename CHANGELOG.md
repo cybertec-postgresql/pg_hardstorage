@@ -11,6 +11,69 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ## [Unreleased]
 
+### Corruption hunt, round two: eight more fixes
+
+A second audit round (restore/rotate/tarsink, S3/init/manifest, plus
+the backlog from round one) fixed eight more corruption and
+backup-availability bugs, each with a regression test:
+
+- **KEK rotation could permanently destroy backups.** The manifest
+  rewrite was Put-tmp → DELETE original → rename, and a rename failure
+  "cleaned up" by deleting the tmp — destroying the only copy at the
+  primary key; the backup vanished from every listing AND from GC's
+  reference walk, so the next sweep reaped its chunks. The rewrite is
+  now a single atomic overwrite: a valid manifest body exists at the
+  key at every instant.
+- **KEK rotation bricked all future backups and made rotated backups
+  unrestorable.** Rotation rewrapped manifests but left the
+  authoritative shared-DEK object under the retired KEK (every
+  subsequent backup and `wal stream` then hard-failed), and the
+  rotated manifests' new `local:v2`-style KEKRef was rejected by every
+  shipped resolver. Rotation now migrates the shared-DEK object (same
+  DEK, new wrap) including the fixed `local:default` alias the
+  CLI/agent stamp; `ResolveOrMint` falls through to the manifest scan
+  when the object won't unwrap; and both resolvers route any `local:*`
+  ref to the keyring.
+- **`backup undelete` could resurrect an incremental whose parent
+  chain stayed tombstoned** — a live-listing backup every restore
+  refuses, hardening into permanent loss once GC grace expired. The
+  chain is now walked and the first dead ancestor named.
+- **`repo.Open`'s forward-format gate failed OPEN on transient read
+  errors** of `_repo_version.json` (throttle, partition, IAM deny were
+  treated like "marker absent = v1.0"), letting an old binary mutate a
+  future-format repo whose manifests it skips as "malformed" — and GC
+  would reap chunks those manifests reference. Now fail-closed; only a
+  definitive not-found takes the legacy path.
+- **`Manifest.Validate` accepted structurally unrestorable chain
+  shapes**: an incremental with no (or a self-referential) parent
+  committed green, skipped the parent-liveness and chain-protection
+  guards, and failed only at restore. Validate now enforces
+  type/parent/timeline invariants at the same gate that already
+  refuses undecryptable encryption shapes.
+- **The S3 plugin claimed `ConditionalPut: true` for every endpoint.**
+  On S3-compatible endpoints the claim was a guess — and it disables
+  the exact mitigations built for honest-false backends (audit-chain
+  read-back, lease warning). Custom `?endpoint=` overrides now report
+  false unless the operator vouches with `?conditional_put=native`
+  (MinIO ≥ 2024, R2); AWS proper stays true.
+- **`verify --full` fabricated "skipped" out of environment
+  failures**: a sandbox that couldn't see the freshly-written
+  `backup_manifest` (bad bind-mount, remote DOCKER_HOST, permissions)
+  was classified as "manifest was not captured" and exited 0. When the
+  caller captured a manifest, that stderr is now a real failure.
+- **Backends with no enforceable durability (sftp/scp) were silent.**
+  The backup runner now emits `backup`/`durability_unenforceable` and
+  `wal stream` emits `wal.durability`/`unenforceable` when a backend
+  has neither a real barrier nor inline-durable writes — a
+  storage-host power loss there can tear chunks under a committed
+  manifest or lose WAL the slot has advanced past.
+
+Documented, not yet fixed (next round): timeline-history archival in
+plain `wal stream`, backup WAL-range coverage validation, restore
+resume re-validation after host crash, legal-hold chain-aware
+retention filtering, type-aware capacity projection, `.deferred-*`
+staging reaper, shared-DEK nonce budget.
+
 ### Corruption hunt: five fixes for silent data-corruption and backup-availability bugs
 
 A three-way audit of the write path, the WAL pipeline, and the

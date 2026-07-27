@@ -181,6 +181,10 @@ func (e *VerifyExecutor) Execute(ctx context.Context, job *ControlPlaneJob, prog
 	res, err := sandbox.Verify(ctx, sandbox.Options{
 		DataDir: tmp,
 		PGMajor: major,
+		// The restore above writes backup_manifest whenever the
+		// manifest carries it — so a "could not open backup_manifest"
+		// from pg_verifybackup is an environment fault, not a skip.
+		ManifestCaptured: len(m.PGBackupManifest) > 0,
 	})
 	if err != nil {
 		// The sandbox itself failed to run (Docker unreachable, image

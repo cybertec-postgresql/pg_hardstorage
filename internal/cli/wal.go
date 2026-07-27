@@ -1863,6 +1863,21 @@ func streamAttempt(
 	timeline = uint32(identity.Timeline)
 	identityID = identity.SystemID
 
+	if attempt == 1 {
+		// Same durability honesty as the backup runner: on a backend
+		// with neither a real Barrier nor inline-durable Puts
+		// (sftp/scp), segment "commits" reach only the remote page
+		// cache — yet the slot's restart_lsn advances past them, so a
+		// storage-host power loss loses WAL that PG has already been
+		// told is safe and has recycled. Warn loudly.
+		if caps := sp.Capabilities(); !caps.InlineDurable && !caps.DurabilityBarrier {
+			_ = d.Event(repoCtx, output.NewEvent(output.SeverityWarning, "wal.durability", "unenforceable").
+				WithBody(map[string]any{
+					"message": "this storage backend can neither fsync on demand nor guarantee durable writes: a storage-host power loss can lose WAL segments the replication slot has already advanced past (PG will have recycled them — unhealable gap). Prefer a backend with real durability (file/s3) for WAL archiving.",
+				}))
+		}
+	}
+
 	var slotInfo *replication.SlotInfo
 	if opts.noSlot {
 		if attempt == 1 {

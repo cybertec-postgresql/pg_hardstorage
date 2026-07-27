@@ -541,6 +541,32 @@ func (m *Manifest) Validate() error {
 	if m.StartLSN == "" || m.StopLSN == "" {
 		return fmt.Errorf("manifest: missing LSN(s) start=%q stop=%q", m.StartLSN, m.StopLSN)
 	}
+	// Chain invariants. An incremental without a parent passes every
+	// other gate, skips Commit's parent-liveness check (which keys on
+	// ParentBackupID != ""), is invisible to soft-delete chain
+	// protection — and is structurally unrestorable from the moment
+	// it commits (pg_combinebackup needs the parent). Refuse at the
+	// same gate that already refuses undecryptable encryption shapes.
+	switch m.Type {
+	case BackupTypeFull, BackupTypeSnapshot:
+		if m.ParentBackupID != "" {
+			return fmt.Errorf("manifest: type %q must not carry parent_backup_id (got %q)", m.Type, m.ParentBackupID)
+		}
+	case BackupTypeIncremental:
+		if m.ParentBackupID == "" {
+			return errors.New("manifest: type incremental_lsn requires parent_backup_id — an incremental without its parent is unrestorable (pg_combinebackup needs the chain)")
+		}
+		if m.ParentBackupID == m.BackupID {
+			return fmt.Errorf("manifest: parent_backup_id equals backup_id (%q) — self-referential chain", m.BackupID)
+		}
+	case "":
+		return errors.New("manifest: type is empty")
+	default:
+		return fmt.Errorf("manifest: unknown type %q", m.Type)
+	}
+	if m.Timeline < 1 {
+		return fmt.Errorf("manifest: timeline=%d (must be ≥1)", m.Timeline)
+	}
 	if m.BackupLabel == "" {
 		return errors.New("manifest: backup_label is empty (required for restore)")
 	}
