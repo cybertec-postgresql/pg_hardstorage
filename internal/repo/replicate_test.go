@@ -311,14 +311,22 @@ func TestReplicate_ChunkMissingAtSource(t *testing.T) {
 	if res.ChunksMissing != 1 {
 		t.Errorf("ChunksMissing=%d, want 1", res.ChunksMissing)
 	}
-	// The manifest still gets copied — broken-at-src is the source's
-	// problem, not ours; at least the replica will tell the same
-	// story.
-	if res.ManifestsCopied != 1 {
-		t.Errorf("ManifestsCopied=%d, want 1", res.ManifestsCopied)
+	// The manifest must be WITHHELD from the replica. The old
+	// posture ("broken-at-src is the source's problem — copy it
+	// anyway") produced a DR replica that lies: a live,
+	// apparently-good backup that fails on the missing chunk at
+	// restore time — and once the src copy is later tombstoned and
+	// GC'd, `repo replicate verify` (which walks src listings) can
+	// never see the broken replica manifest again. A replica
+	// manifest must imply its chunks are all present.
+	if res.ManifestsCopied != 0 {
+		t.Errorf("ManifestsCopied=%d, want 0 (manifest over a missing chunk must not reach the replica)", res.ManifestsCopied)
 	}
-	if len(res.Failures) == 0 {
-		t.Error("expected a Failure entry for the missing chunk")
+	if res.ManifestsFailed != 1 {
+		t.Errorf("ManifestsFailed=%d, want 1", res.ManifestsFailed)
+	}
+	if len(res.Failures) < 2 {
+		t.Errorf("expected Failure entries for both the missing chunk and the withheld manifest; got %v", res.Failures)
 	}
 }
 

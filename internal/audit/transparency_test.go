@@ -279,3 +279,52 @@ func TestSearch_IgnoresAnchorRecords(t *testing.T) {
 			len(events), events)
 	}
 }
+
+// VerifyAnchor used to index lexically-sorted keys BY SEQUENCE
+// (keys[HeadSequence]). WORM retention pruning reaps the oldest
+// events while sequences keep climbing, so on a pruned chain the
+// index was off by the reaped count — "local chain is shorter than
+// the anchor" / hash mismatches on perfectly healthy repos, i.e. the
+// tamper detector crying tamper. The anchored event must be resolved
+// by parsing sequences from the keys.
+func TestVerifyAnchor_SurvivesRetentionPrunedTail(t *testing.T) {
+	store, sp := newAuditStore(t)
+	ctx := context.Background()
+	for i := 0; i < 4; i++ {
+		if err := store.Append(ctx, &audit.Event{Action: "tick"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	log := audit.NewStorageBackedLog(sp)
+	a, err := store.Anchor(ctx, log, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate retention reaping the oldest event (sequence 0).
+	var oldest string
+	for info, lerr := range sp.List(ctx, "audit/") {
+		if lerr != nil {
+			t.Fatal(lerr)
+		}
+		if strings.HasSuffix(info.Key, ".json") && !strings.HasSuffix(info.Key, "_head.json") &&
+			!strings.Contains(info.Key, "_anchors") {
+			oldest = info.Key
+			break
+		}
+	}
+	if oldest == "" {
+		t.Fatal("no event key found")
+	}
+	if err := sp.Delete(ctx, oldest); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := store.VerifyAnchor(ctx, log, a.LogID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.OK {
+		t.Errorf("VerifyAnchor reports tamper on a healthy retention-pruned chain: %+v", res)
+	}
+}

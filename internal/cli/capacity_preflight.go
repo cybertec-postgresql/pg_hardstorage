@@ -133,7 +133,7 @@ func runCapacityPreflight(cmd *cobra.Command, opts capacityPreflightOptions) err
 		if vErr != nil {
 			return vErr
 		}
-		projected, err = projectedBytesFromDeployment(cmd.Context(), sp, opts.fromDeployment, verifier)
+		projected, err = projectedBytesFromDeployment(cmd.Context(), sp, opts.fromDeployment, verifier, false)
 		if err != nil {
 			return err
 		}
@@ -185,30 +185,58 @@ func runCapacityPreflight(cmd *cobra.Command, opts capacityPreflightOptions) err
 	return d.Result(output.NewResult(cmd.CommandPath()).WithBody(body))
 }
 
-// projectedBytesFromDeployment returns the deployment's latest
-// committed manifest's logical bytes — the natural projection
-// for "would the next backup fit?". Empty deployment → error.
-// No backups → error (the operator hasn't set up a baseline
-// yet; explicit --projected-bytes is the right call).
-func projectedBytesFromDeployment(ctx context.Context, sp storage.StoragePlugin, deployment string, verifier *backup.Verifier) (int64, error) {
+// projectedBytesFromDeployment projects the next backup's logical
+// bytes from the deployment's history, TYPE-AWARE: a full run is
+// projected from the most recent NON-incremental manifest, an
+// incremental run from the most recent incremental (falling back to
+// latest-any). Blind latest-by-StoppedAt was wrong in both
+// directions on the standard daily-incremental/weekly-full cadence:
+// the Sunday full was projected at ~2% of its real size (latest =
+// Saturday's incremental) so the ENOSPC guard false-passed and the
+// full aborted mid-run hours later — and Monday's 5 GB incremental
+// was projected at the full 500 GB and could be falsely REFUSED on a
+// repo with ample space, silently blocking scheduled backups.
+//
+// List errors are no longer swallowed: if they prevented finding any
+// manifest, the caller sees the real problem instead of a silently
+// skipped gate.
+func projectedBytesFromDeployment(ctx context.Context, sp storage.StoragePlugin, deployment string, verifier *backup.Verifier, incremental bool) (int64, error) {
 	if deployment == "" {
 		return 0, output.NewError("usage.missing_arg",
 			"capacity preflight: --from-deployment requires a non-empty name").Wrap(output.ErrUsage)
 	}
 	store := backup.NewManifestStore(sp)
-	var latest *backup.Manifest
+	var latestAny, latestKind *backup.Manifest
+	var lastListErr error
 	for m, err := range store.List(ctx, deployment, verifier) {
 		if err != nil {
+			lastListErr = err
 			continue
 		}
 		if m == nil {
 			continue
 		}
-		if latest == nil || m.StoppedAt.After(latest.StoppedAt) {
-			latest = m
+		if latestAny == nil || m.StoppedAt.After(latestAny.StoppedAt) {
+			latestAny = m
+		}
+		matches := (m.Type == backup.BackupTypeIncremental) == incremental
+		if matches && (latestKind == nil || m.StoppedAt.After(latestKind.StoppedAt)) {
+			latestKind = m
 		}
 	}
-	if latest == nil {
+	pick := latestKind
+	if pick == nil {
+		// No same-kind history: fall back to latest-any. For a first
+		// incremental this over-projects (conservative); for a full
+		// in an incrementals-only repo it under-projects, but that
+		// shape cannot occur (incrementals need a full anchor).
+		pick = latestAny
+	}
+	if pick == nil {
+		if lastListErr != nil {
+			return 0, output.NewError("capacity.list_failed",
+				fmt.Sprintf("capacity preflight: could not read %s's manifests for a projection: %v", deployment, lastListErr)).Wrap(lastListErr)
+		}
 		return 0, output.NewError("notfound.backup",
 			fmt.Sprintf("capacity preflight: deployment %q has no committed backups; pass --projected-bytes explicitly", deployment)).
 			WithSuggestion(&output.Suggestion{
@@ -217,7 +245,7 @@ func projectedBytesFromDeployment(ctx context.Context, sp storage.StoragePlugin,
 			})
 	}
 	var total int64
-	for _, f := range latest.Files {
+	for _, f := range pick.Files {
 		total += f.Size
 	}
 	return total, nil

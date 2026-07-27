@@ -491,7 +491,12 @@ func TestRepoReplicate_IncompleteExitsNonZero(t *testing.T) {
 	if exit == int(output.ExitOK) {
 		t.Fatalf("incomplete replication must exit non-zero; got OK\nstdout=%s", stdout)
 	}
-	if !strings.Contains(stdout+stderr, "repo.replicate.incomplete") {
-		t.Errorf("expected repo.replicate.incomplete:\nstdout=%s\nstderr=%s", stdout, stderr)
+	// Since manifests are withheld from the replica when any of their
+	// chunks fail to copy, this single-manifest fixture now surfaces
+	// as all_manifests_failed; either code is a correct non-zero
+	// refusal for an incomplete replication.
+	if !strings.Contains(stdout+stderr, "repo.replicate.incomplete") &&
+		!strings.Contains(stdout+stderr, "repo.replicate.all_manifests_failed") {
+		t.Errorf("expected an incomplete/all_manifests_failed refusal:\nstdout=%s\nstderr=%s", stdout, stderr)
 	}
 }

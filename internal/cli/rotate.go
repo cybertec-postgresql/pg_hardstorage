@@ -153,20 +153,21 @@ func runRotate(cmd *cobra.Command, opts rotateOpts) error {
 		// effective 4." Without the filter, --apply would silently
 		// skip held backups (PutHold guards SoftDelete via the
 		// IsHeld check), but the dry-run number would lie.
-		filteredDelete, heldIDs, err := filterHeld(cmd.Context(), store, dep, decision.Delete)
+		filteredDelete, heldIDs, anchorIDs, err := filterHeld(cmd.Context(), store, dep, decision.Delete, manifests)
 		if err != nil {
 			return output.NewError("rotate.hold_check_failed",
 				fmt.Sprintf("rotate: %v", err)).Wrap(err)
 		}
 
 		report := rotationPerDeployment{
-			Deployment: dep,
-			Policy:     decision.PolicyName,
-			Kept:       len(decision.Keep) + len(heldIDs),
-			Deleted:    len(filteredDelete),
-			Held:       len(heldIDs),
-			HeldIDs:    heldIDs,
-			Decisions:  shapeDecisions(decision, heldIDs),
+			Deployment:      dep,
+			Policy:          decision.PolicyName,
+			Kept:            len(decision.Keep) + len(heldIDs) + len(anchorIDs),
+			Deleted:         len(filteredDelete),
+			Held:            len(heldIDs),
+			HeldIDs:         heldIDs,
+			HeldChainAnchor: anchorIDs,
+			Decisions:       shapeDecisions(decision, append(append([]string{}, heldIDs...), anchorIDs...)),
 		}
 
 		if opts.apply {
@@ -349,6 +350,10 @@ type rotationPerDeployment struct {
 	Deleted     int                `json:"deleted"`
 	Held        int                `json:"held,omitempty"`
 	HeldIDs     []string           `json:"held_ids,omitempty"`
+	// HeldChainAnchor lists backups kept ONLY because a held
+	// descendant depends on them — deleting them would either break
+	// the held chain or (pre-fix) wedge the whole batch.
+	HeldChainAnchor []string `json:"held_chain_anchor_ids,omitempty"`
 	Applied     int                `json:"applied,omitempty"`
 	HeldSkipped int                `json:"held_skipped,omitempty"`
 	Decisions   []rotationDecision `json:"decisions,omitempty"`

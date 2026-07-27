@@ -472,15 +472,31 @@ func Restore(ctx context.Context, opts Options) (res *Result, err error) {
 		// can carry the same relative path, so keying resume on the
 		// bare path would wrongly skip a not-yet-written file.
 		fkey := checkpointKey(f)
-		if _, alreadyDone := completed[fkey]; alreadyDone {
-			continue
-		}
 		destRoot, err := fileDestRoot(opts.TargetDir, tsDests, f.TablespaceOID)
 		if err != nil {
 			matSpan.SetStatus(codes.Error, err.Error())
 			matSpan.End()
 			span.SetStatus(codes.Error, err.Error())
 			return nil, err
+		}
+		if _, alreadyDone := completed[fkey]; alreadyDone {
+			// Cheap on-disk revalidation before trusting the
+			// checkpoint. After an OS crash / power loss the journal
+			// can persist the checkpoint's rename while dropping the
+			// dentries of files fsynced into OTHER directories (their
+			// parents were never dir-fsynced) — the checkpoint then
+			// claims files the filesystem lost. Blindly skipping them
+			// yielded a datadir with missing relation files: silently
+			// corrupt for TDE / pre-manifest sources (their verify leg
+			// is skipped), and a wedged retry loop otherwise (the L2
+			// verify failed but the "completed" file was never
+			// re-materialised). A stat + size compare is O(#files)
+			// and negligible next to chunk fetches.
+			if st, serr := os.Stat(filepath.Join(destRoot, filepath.FromSlash(f.Path))); serr == nil && st.Size() == f.Size {
+				continue
+			}
+			// Missing or wrong size: drop the claim and re-materialise.
+			delete(completed, fkey)
 		}
 		n, k, err := materializeFile(matCtx, cas, destRoot, f)
 		if err != nil {

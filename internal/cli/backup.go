@@ -617,7 +617,7 @@ func backupCapacityPreflight(ctx context.Context, opts runOptions, verifier *bac
 	}
 	defer sp.Close()
 
-	projected, err := projectedBytesFromDeployment(ctx, sp, opts.deployment, verifier)
+	projected, err := projectedBytesFromDeployment(ctx, sp, opts.deployment, verifier, opts.incrementalFrom != "")
 	if err != nil {
 		// "no committed backups" is the fresh-deployment
 		// case — silent pass. Other read failures (signature

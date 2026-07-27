@@ -838,5 +838,33 @@ func mergeDeployment(existing, overlay DeploymentConfig) DeploymentConfig {
 	if len(overlay.Patroni.Slots) > 0 {
 		existing.Patroni.Slots = overlay.Patroni.Slots
 	}
+	if overlay.Patroni.Interval != "" {
+		existing.Patroni.Interval = overlay.Patroni.Interval
+	}
+	// The fields below were previously NOT merged: a drop-in overlay
+	// that re-declared a deployment (the documented conf.d override
+	// pattern) silently DROPPED its retention / TDE / audit-anchor /
+	// SLO / residency / classification settings. Worst case was
+	// retention: the operator's keep_monthly:60 drop-in vanished and
+	// the scheduled rotate pruned with the default GFS policy —
+	// policy-mandated backups soft-deleted years early, silently.
+	if overlay.Schedule.AuditAnchor.Every != "" || overlay.Schedule.AuditAnchor.DailyAt != "" || overlay.Schedule.AuditAnchor.At != "" {
+		existing.Schedule.AuditAnchor = overlay.Schedule.AuditAnchor
+	}
+	if overlay.Retention != (RetentionConfig{}) {
+		existing.Retention = overlay.Retention
+	}
+	if overlay.TDE != (TDEConfig{}) {
+		existing.TDE = overlay.TDE
+	}
+	if overlay.SLO != (SLOConfig{}) {
+		existing.SLO = overlay.SLO
+	}
+	if len(overlay.Residency) > 0 {
+		existing.Residency = overlay.Residency
+	}
+	if overlay.Classification != "" {
+		existing.Classification = overlay.Classification
+	}
 	return existing
 }

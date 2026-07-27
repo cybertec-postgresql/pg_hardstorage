@@ -3,6 +3,9 @@ package audit
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/url"
 	"strings"
@@ -117,4 +120,91 @@ func TestAppend_NoConditionalPut_ReadBackDetectsLostSlot(t *testing.T) {
 	if !strings.Contains(joined, "mine.event") {
 		t.Error("OUR event was silently lost (pre-fix behavior): read-back did not detect the stomped slot")
 	}
+}
+
+// headPointerDropSP drops writes to the head pointer once (crash
+// simulator: the event committed, the pointer update was lost) on an
+// otherwise-overwriting no-conditional-put backend.
+type headPointerDropSP struct {
+	storage.StoragePlugin
+	dropped bool
+}
+
+func (h *headPointerDropSP) Capabilities() storage.Capabilities {
+	return storage.Capabilities{ConditionalPut: false}
+}
+
+func (h *headPointerDropSP) Put(ctx context.Context, key string, r io.Reader, opts storage.PutOptions) (storage.PutResult, error) {
+	if !h.dropped && strings.HasSuffix(key, "_head.json") {
+		h.dropped = true
+		return storage.PutResult{}, errors.New("simulated head-pointer write failure")
+	}
+	opts.IfNotExists = false // last-writer-wins backend
+	return h.StoragePlugin.Put(ctx, key, r, opts)
+}
+
+// Regression: a STALE-but-valid head pointer (event committed, pointer
+// update lost) made the next Append target an occupied slot; on a
+// no-conditional-put backend the Put destroyed the committed event —
+// and the replacement linked PrevHash correctly, so VerifyChain stayed
+// green. Append must probe the slot first and relink instead.
+func TestAppend_NoConditionalPut_StaleHeadDoesNotOverwriteTail(t *testing.T) {
+	dir := t.TempDir()
+	inner := &fs.Plugin{}
+	if err := inner.Open(context.Background(), storage.StorageConfig{URL: &url.URL{Scheme: "file", Path: dir}}); err != nil {
+		t.Fatal(err)
+	}
+	defer inner.Close()
+	sp := &headPointerDropSP{StoragePlugin: inner}
+	store := NewStore(sp)
+	ctx := context.Background()
+
+	append1 := func(action string) {
+		t.Helper()
+		if err := store.Append(ctx, &Event{Action: action, Subject: Subject{Deployment: "db1"}}); err != nil {
+			t.Fatalf("append %s: %v", action, err)
+		}
+	}
+	append1("backup.committed") // seq 0
+	append1("backup.delete")    // seq 1 — head-pointer write DROPPED (stale at seq 0)
+	append1("kms.rotate")       // pre-fix: overwrote seq 1's committed event
+
+	actions := map[string]bool{}
+	count := 0
+	var shapes []string
+	for info, lerr := range inner.List(ctx, "audit/") {
+		if lerr != nil {
+			t.Fatal(lerr)
+		}
+		if !strings.HasSuffix(info.Key, ".json") || strings.HasSuffix(info.Key, "_head.json") {
+			continue
+		}
+		ev, gerr := readEventForTest(ctx, inner, info.Key)
+		if gerr != nil {
+			t.Fatalf("read %s: %v", info.Key, gerr)
+		}
+		actions[ev.Action] = true
+		shapes = append(shapes, fmt.Sprintf("%d:%s", ev.Sequence, ev.Action))
+		count++
+	}
+	if count != 3 || !actions["backup.delete"] {
+		t.Fatalf("committed event destroyed by stale-head Append: have %v, want 3 events incl. backup.delete", shapes)
+	}
+	if res, err := store.VerifyChain(ctx); err != nil || !res.OK {
+		t.Fatalf("chain verify after stale-head appends: res=%+v err=%v", res, err)
+	}
+}
+
+// readEventForTest decodes one event object.
+func readEventForTest(ctx context.Context, sp storage.StoragePlugin, key string) (*Event, error) {
+	rc, err := sp.Get(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	defer rc.Close()
+	var ev Event
+	if err := json.NewDecoder(rc).Decode(&ev); err != nil {
+		return nil, err
+	}
+	return &ev, nil
 }
