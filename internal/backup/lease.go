@@ -27,6 +27,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/invariant"
 	stdio "io"
 	"os"
 	"sync"
@@ -323,6 +324,14 @@ func (l *Lease) Renew(ctx context.Context) error {
 	}
 	next := mine
 	next.ExpiresAt = l.now().UTC().Add(l.ttl)
+	// Fencing monotonicity: a renewal must strictly EXTEND the lease.
+	// Writing an expiry at-or-before the stored one would shrink the
+	// mutual-exclusion window mid-backup and invite a second writer —
+	// impossible unless the TTL/clock plumbing in this file is broken,
+	// which is exactly when we must not keep going.
+	invariant.Assert(next.ExpiresAt.After(cur.ExpiresAt),
+		"lease renewal for %q does not extend expiry (cur %s, next %s, ttl %s)",
+		l.deployment, cur.ExpiresAt.Format(time.RFC3339Nano), next.ExpiresAt.Format(time.RFC3339Nano), l.ttl)
 	if err := l.put(ctx, next, false); err != nil {
 		return fmt.Errorf("backup: renew lease for %q: %w", l.deployment, err)
 	}

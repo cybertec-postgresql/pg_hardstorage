@@ -24,6 +24,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/invariant"
 	"io"
 	"strings"
 
@@ -269,6 +270,13 @@ func unwrapInto(wrapped []byte, unwrap Unwrapper) (MintResult, error) {
 	}
 	var out MintResult
 	copy(out.DEK[:], dek)
+	// An all-zero DEK cannot come from a healthy mint (crypto/rand)
+	// or a successful AEAD unwrap of one — it means a zero-value
+	// struct leaked through the plumbing. Encrypting a repo's chunks
+	// under a zero key is unrecoverable-by-design confidentiality
+	// loss, so die before a single byte is sealed with it.
+	invariant.Assert(out.DEK != [encryption.KeyLen]byte{},
+		"shared DEK resolved to the all-zero key")
 	out.Have = true
 	return out, nil
 }

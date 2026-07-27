@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/invariant"
 	stdio "io"
 	"iter"
 	"log"
@@ -223,6 +224,12 @@ func (ms *ManifestStore) Commit(ctx context.Context, m *Manifest, signer *Signer
 			return fmt.Errorf("backup: sign manifest %s: %w", m.BackupID, err)
 		}
 	}
+	// Post-condition of the block above, not of the caller's input: a
+	// nil attestation past this point means Sign() returned success
+	// without attaching one — a signer bug that would commit an
+	// unverifiable manifest every restore then refuses.
+	invariant.Assert(m.Attestation != nil,
+		"manifest %s reached commit without an attestation after signing", m.BackupID)
 
 	body, err := m.MarshalToBytes()
 	if err != nil {

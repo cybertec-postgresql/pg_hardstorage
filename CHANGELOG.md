@@ -11,6 +11,30 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ## [Unreleased]
 
+### Internal invariant assertions (fail-closed)
+
+New `internal/invariant` package: `invariant.Assert` panics with a
+greppable "invariant violation:" prefix when an internal assumption —
+a condition that can only be false if the BINARY has a bug — is
+violated. Deliberately fail-closed with no production off-switch:
+for a backup tool, crashing one run is always cheaper than letting
+corrupted internal state flow into a committed artifact; the agent's
+schedule engine already converts task panics into task failures, so
+one impossible state aborts that task without killing the fleet.
+Environmental conditions (storage errors, hostile data, races) remain
+ordinary error handling.
+
+Assertions added where the corruption hunts showed invariant-shaped
+failure modes: WAL sink hand-off (only exactly-full, segment-aligned
+segments may commit), manifest commit (attestation must exist after
+signing), lease renewal (must strictly extend expiry — fencing
+monotonicity), CDC chunker (boundary within (0, max], ≥ min
+mid-stream — a drifting boundary silently regresses dedup repo-wide),
+and shared-DEK resolution (never the all-zero key). Additionally,
+`Manifest.Validate` now refuses an inverted LSN range (stop before
+start), which previously committed green and could never reach
+consistency.
+
 ### Corruption hunt, round three: nine more fixes
 
 Fresh audits of replication/heal/standby/timetravel and the audit

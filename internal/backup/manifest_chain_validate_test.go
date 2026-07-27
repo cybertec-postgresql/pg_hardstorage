@@ -82,3 +82,27 @@ func TestManifestValidate_ChainInvariants(t *testing.T) {
 		t.Errorf("valid incremental refused: %v", err)
 	}
 }
+
+// Recovery replays [StartLSN, StopLSN] forward; an inverted pair
+// describes a backup no recovery can reach consistency from, and it
+// used to commit green.
+func TestManifestValidate_RefusesInvertedLSNRange(t *testing.T) {
+	m := &backup.Manifest{
+		Schema:           backup.Schema,
+		BackupID:         "db1.full.20260430T120000Z.eeee",
+		Deployment:       "db1",
+		Type:             backup.BackupTypeFull,
+		PGVersion:        17,
+		SystemIdentifier: "7000000000000000001",
+		StartLSN:         "0/9000000",
+		StopLSN:          "0/3000028", // before start
+		Timeline:         1,
+		BackupLabel:      "START WAL LOCATION: 0/9000000\n",
+		Tablespaces:      []backup.Tablespace{{OID: 1663, Location: "pg_default"}},
+		Files:            []backup.FileEntry{},
+	}
+	err := m.Validate()
+	if err == nil || !strings.Contains(err.Error(), "precedes start_lsn") {
+		t.Fatalf("inverted LSN range accepted (err=%v) — such a backup commits green and can never reach consistency", err)
+	}
+}
