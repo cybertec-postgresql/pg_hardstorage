@@ -36,6 +36,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/jackc/pglogrepl"
 	"os"
 	"path/filepath"
 	"sort"
@@ -198,7 +199,7 @@ func (m *Manager) Create(ctx context.Context, opts CreateOptions) (*Session, err
 	// We resolve it ourselves: walk manifests, pick the latest with
 	// StoppedAt <= target.
 
-	pickedID, pgVersion, err := m.pickBackupForTarget(ctx, opts.RepoURL, opts.Deployment, atTime, opts.Verifier)
+	pickedID, pgVersion, err := m.pickBackupForTarget(ctx, opts.RepoURL, opts.Deployment, atTime, atLSN, opts.Verifier)
 	if err != nil {
 		return nil, err
 	}
@@ -265,16 +266,32 @@ func (m *Manager) Create(ctx context.Context, opts CreateOptions) (*Session, err
 }
 
 // pickBackupForTarget walks the deployment's manifests and returns
-// the latest committed backup whose StoppedAt is at-or-before the
-// target time. When target is zero (LSN-only mode), we pick the
-// latest committed backup overall and let PG's own recovery decide
-// when to stop.
-func (m *Manager) pickBackupForTarget(ctx context.Context, repoURL, deployment string, target time.Time, verifier *backup.Verifier) (string, int, error) {
+// the latest committed backup at-or-before the target: by StoppedAt
+// for a time target, by StopLSN for an LSN target. PG recovery can
+// only roll FORWARD, so the base backup must end at or before the
+// requested point — the old LSN-mode behaviour ("pick the newest
+// backup, let PG stop") made every historical-LSN session fail at
+// the restore reachability gate (target below the newest backup's
+// stop_lsn = target_unreachable) even though a suitable older
+// backup sat in the repo: the feature's primary use case was
+// inoperative.
+func (m *Manager) pickBackupForTarget(ctx context.Context, repoURL, deployment string, target time.Time, targetLSN string, verifier *backup.Verifier) (string, int, error) {
 	rs, err := openManifestStore(ctx, repoURL)
 	if err != nil {
 		return "", 0, err
 	}
 	defer rs.Close()
+
+	var lsnTarget pglogrepl.LSN
+	haveLSN := false
+	if targetLSN != "" {
+		parsed, perr := pglogrepl.ParseLSN(targetLSN)
+		if perr != nil {
+			return "", 0, fmt.Errorf("timetravel: parse target LSN %q: %w", targetLSN, perr)
+		}
+		lsnTarget = parsed
+		haveLSN = true
+	}
 
 	var bestID string
 	var bestStopped time.Time
@@ -286,6 +303,12 @@ func (m *Manager) pickBackupForTarget(ctx context.Context, repoURL, deployment s
 		if !target.IsZero() && mm.StoppedAt.After(target) {
 			continue
 		}
+		if haveLSN {
+			stop, serr := pglogrepl.ParseLSN(mm.StopLSN)
+			if serr != nil || stop > lsnTarget {
+				continue
+			}
+		}
 		if mm.StoppedAt.After(bestStopped) {
 			bestStopped = mm.StoppedAt
 			bestID = mm.BackupID
@@ -293,11 +316,16 @@ func (m *Manager) pickBackupForTarget(ctx context.Context, repoURL, deployment s
 		}
 	}
 	if bestID == "" {
-		if target.IsZero() {
+		switch {
+		case haveLSN:
+			return "", 0, fmt.Errorf("timetravel: no committed backup of %q stops at-or-before LSN %s — the oldest backup already ends past the requested point",
+				deployment, targetLSN)
+		case target.IsZero():
 			return "", 0, fmt.Errorf("timetravel: no committed backups for deployment %q", deployment)
+		default:
+			return "", 0, fmt.Errorf("timetravel: no committed backup of %q is at-or-before %s",
+				deployment, target.Format(time.RFC3339))
 		}
-		return "", 0, fmt.Errorf("timetravel: no committed backup of %q is at-or-before %s",
-			deployment, target.Format(time.RFC3339))
 	}
 	return bestID, bestVersion, nil
 }

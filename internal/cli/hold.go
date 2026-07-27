@@ -569,11 +569,24 @@ func runHoldList(cmd *cobra.Command, scope, repoURL string) error {
 // without retention itself having to know about them. Returns the
 // kept-after-filter slice plus the deployment+backup-ids that were
 // blocked, so the rotate report can surface them as a separate stat.
-func filterHeld(ctx context.Context, store *backup.ManifestStore, deployment string, decisionDelete []*backup.Manifest) ([]*backup.Manifest, []string, error) {
+// The extra `all` parameter carries every manifest of the deployment
+// so the filter can be CHAIN-AWARE: a hold on an incremental must
+// also protect its ancestors. Without that, the held child stayed
+// out of the batch while its parent stayed IN — SoftDeleteBatch's
+// chain guard then refused the ENTIRE batch (live descendant not in
+// batch), so for the lifetime of the hold every scheduled
+// `rotate --apply` deleted NOTHING for the deployment: unbounded repo
+// and WAL growth that eventually threatens new backups, while the
+// dry-run report kept claiming a normal sweep.
+func filterHeld(ctx context.Context, store *backup.ManifestStore, deployment string, decisionDelete, all []*backup.Manifest) ([]*backup.Manifest, []string, []string, error) {
 	if len(decisionDelete) == 0 {
-		return decisionDelete, nil, nil
+		return decisionDelete, nil, nil, nil
 	}
-	keep := make([]*backup.Manifest, 0, len(decisionDelete))
+	byID := make(map[string]*backup.Manifest, len(all))
+	for _, m := range all {
+		byID[m.BackupID] = m
+	}
+	heldSet := make(map[string]bool)
 	var held []string
 	for _, m := range decisionDelete {
 		// IsActivelyHeld respects ExpiresAt: an expired hold
@@ -582,15 +595,39 @@ func filterHeld(ctx context.Context, store *backup.ManifestStore, deployment str
 		// an operator runs `hold remove` explicitly.
 		ok, err := store.IsActivelyHeld(ctx, deployment, m.BackupID)
 		if err != nil {
-			return nil, nil, fmt.Errorf("hold check %s: %w", m.BackupID, err)
+			return nil, nil, nil, fmt.Errorf("hold check %s: %w", m.BackupID, err)
 		}
 		if ok {
+			heldSet[m.BackupID] = true
 			held = append(held, m.BackupID)
-			continue
 		}
-		keep = append(keep, m)
 	}
-	return keep, held, nil
+	// Transitively protect every ancestor of a held backup so the
+	// remaining batch stays chain-consistent and deletable.
+	anchorSet := make(map[string]bool)
+	for id := range heldSet {
+		cur := byID[id]
+		for cur != nil && cur.ParentBackupID != "" {
+			pid := cur.ParentBackupID
+			if !heldSet[pid] && !anchorSet[pid] {
+				anchorSet[pid] = true
+			}
+			cur = byID[pid]
+		}
+	}
+	keep := make([]*backup.Manifest, 0, len(decisionDelete))
+	var anchors []string
+	for _, m := range decisionDelete {
+		switch {
+		case heldSet[m.BackupID]:
+			// already reported in held
+		case anchorSet[m.BackupID]:
+			anchors = append(anchors, m.BackupID)
+		default:
+			keep = append(keep, m)
+		}
+	}
+	return keep, held, anchors, nil
 }
 
 // Result body shapes — stable per the v1 schema commitment.

@@ -534,8 +534,12 @@ func TestHandleLeaderChange_TimelineCaptureFailureSurfaces(t *testing.T) {
 	if ev == nil {
 		t.Fatalf("expected timeline_capture_failed; ops=%v", rec.ops())
 	}
-	if ev.Severity != output.SeverityError {
-		t.Errorf("severity = %v, want SeverityError", ev.Severity)
+	// Deliberately escalated to CRITICAL: in streaming-only HA the
+	// follower store is the only source of .history files, and a
+	// missed capture silently caps every later PITR at the previous
+	// timeline.
+	if ev.Severity != output.SeverityCritical {
+		t.Errorf("severity = %v, want SeverityCritical", ev.Severity)
 	}
 }
 

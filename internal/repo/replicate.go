@@ -355,12 +355,26 @@ func replicateManifest(ctx context.Context, src, dst storage.StoragePlugin, key,
 	}
 
 	// Chunks first — invariant: never a manifest at dst pointing at
-	// chunks that aren't.
+	// chunks that aren't. The invariant is ENFORCED, not aspirational:
+	// any chunk that failed to land at dst (missing at src, transient
+	// dst error) blocks the manifest Put. Previously the failures only
+	// bumped counters and the manifest committed anyway — a live,
+	// apparently-good backup on the DR replica that is not restorable,
+	// and (once the src copy is later GC'd) permanently invisible to
+	// `repo replicate verify`, which walks src listings only.
+	chunksOK := true
 	for _, h := range hashes {
 		if err := ctx.Err(); err != nil {
 			return
 		}
-		copyChunk(ctx, src, dst, h, opts, res)
+		if !copyChunk(ctx, src, dst, h, opts, res) {
+			chunksOK = false
+		}
+	}
+	if !chunksOK {
+		recordReplicateFailure(res, key, errors.New("manifest withheld from replica: one or more referenced chunks failed to copy (see chunk failures above); re-run replicate after fixing the source"))
+		res.ManifestsFailed++
+		return
 	}
 
 	// Then the manifest body itself.
@@ -396,11 +410,19 @@ func replicateWALManifest(ctx context.Context, src, dst storage.StoragePlugin, k
 		res.WALManifestsFailed++
 		return
 	}
+	chunksOK := true
 	for _, h := range hashes {
 		if err := ctx.Err(); err != nil {
 			return
 		}
-		copyChunk(ctx, src, dst, h, opts, res)
+		if !copyChunk(ctx, src, dst, h, opts, res) {
+			chunksOK = false
+		}
+	}
+	if !chunksOK {
+		recordReplicateFailure(res, key, errors.New("wal manifest withheld from replica: one or more referenced chunks failed to copy"))
+		res.WALManifestsFailed++
+		return
 	}
 	copyKey(ctx, src, dst, key, body, opts, res, walKind, false)
 }
@@ -503,7 +525,12 @@ func bumpKeyFailed(res *ReplicateResult, kind keyKind) {
 
 // copyChunk handles one chunk reference. Stats dst first (cheap),
 // pulls from src + writes to dst on miss. Updates res.
-func copyChunk(ctx context.Context, src, dst storage.StoragePlugin, h Hash, opts ReplicateOptions, res *ReplicateResult) {
+// copyChunk reports whether the chunk is DURABLY PRESENT at dst
+// after the call (copied, already there, or dry-run-would-copy).
+// Callers MUST NOT commit a manifest at dst unless every referenced
+// chunk returned true — a manifest over missing chunks is a DR
+// replica that lies about restorability.
+func copyChunk(ctx context.Context, src, dst storage.StoragePlugin, h Hash, opts ReplicateOptions, res *ReplicateResult) bool {
 	res.ChunksConsidered++
 	chunkKey := ChunkKey(h)
 
@@ -511,13 +538,13 @@ func copyChunk(ctx context.Context, src, dst storage.StoragePlugin, h Hash, opts
 	switch _, err := dst.Stat(ctx, chunkKey); {
 	case err == nil:
 		res.ChunksSkipped++
-		return
+		return true
 	case errors.Is(err, storage.ErrNotFound):
 		// fall through to copy
 	default:
 		recordReplicateFailure(res, chunkKey, fmt.Errorf("stat dst: %w", err))
 		res.ChunksFailed++
-		return
+		return false
 	}
 
 	// Pull from src.
@@ -528,12 +555,12 @@ func copyChunk(ctx context.Context, src, dst storage.StoragePlugin, h Hash, opts
 		// damage report.
 		recordReplicateFailure(res, chunkKey, fmt.Errorf("read src: %w", err))
 		res.ChunksMissing++
-		return
+		return false
 	}
 	if opts.DryRun {
 		res.ChunksCopied++
 		res.BytesCopied += int64(len(cb))
-		return
+		return true
 	}
 	putOpts := storage.PutOptions{IfNotExists: true, ContentLength: int64(len(cb))}
 	putOpts.RetainUntil, putOpts.RetentionMode = opts.retentionPut()
@@ -542,13 +569,16 @@ func copyChunk(ctx context.Context, src, dst storage.StoragePlugin, h Hash, opts
 	case err == nil:
 		res.ChunksCopied++
 		res.BytesCopied += int64(len(cb))
+		return true
 	case errors.Is(err, storage.ErrAlreadyExists):
 		// Race: a concurrent replicate run won the put. Treat as a
 		// skip — both copies have the same bytes (CAS contract).
 		res.ChunksSkipped++
+		return true
 	default:
 		recordReplicateFailure(res, chunkKey, fmt.Errorf("put dst: %w", err))
 		res.ChunksFailed++
+		return false
 	}
 }
 

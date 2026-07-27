@@ -11,6 +11,69 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ## [Unreleased]
 
+### Corruption hunt, round three: nine more fixes
+
+Fresh audits of replication/heal/standby/timetravel and the audit
+chain / control plane / config layers, plus the remaining round-two
+backlog:
+
+- **Audit chain: a stale head pointer could silently destroy a
+  committed event.** The pointer update after an Append is
+  best-effort; a crash left it stale-but-valid, the next Append
+  recomputed the same sequence, and on a no-conditional-put backend
+  its Put overwrote the committed event — with the replacement linking
+  PrevHash correctly, so even `VerifyChain` stayed green. Append now
+  probes the slot first and relinks instead of writing.
+- **`audit verify-anchor` cried tamper on healthy repos.** It resolved
+  the anchored event by list index == sequence, which breaks under
+  mixed key layouts and WORM retention pruning. Resolution is now by
+  parsed sequence.
+- **Config drop-in overlays silently dropped retention, TDE,
+  audit-anchor, SLO, residency, and classification** for any
+  deployment defined in two files — the operator's `keep_monthly: 60`
+  drop-in vanished and rotate pruned with the default policy.
+  `mergeDeployment` now carries every field, with a reflection canary
+  test that fails when a future field lacks a merge arm.
+- **Replication committed manifests to the replica over missing or
+  failed chunks** — a DR replica that lies about restorability,
+  permanently invisible to `replicate verify` once the source copy is
+  GC'd. Manifests (backup and WAL) are now withheld unless every
+  referenced chunk landed.
+- **Timetravel with an LSN target always picked the newest backup**,
+  so every historical-LSN session failed at the restore reachability
+  gate (PG cannot rewind) — the feature's primary use case was
+  inoperative. The picker now selects the latest backup with
+  `StopLSN <= target`.
+- **A hold on an incremental wedged retention for the whole
+  deployment**: the held child left the delete batch, its parent
+  stayed in, and the chain guard refused the entire batch — every
+  scheduled rotate deleted nothing for the hold's lifetime. The hold
+  filter is now chain-aware (ancestors kept as `held_chain_anchor`,
+  the rest of the sweep proceeds).
+- **The pre-backup ENOSPC gate projected from the latest manifest
+  regardless of type**: weekly fulls were projected at the daily
+  incremental's size (gate false-passes, full dies mid-run on ENOSPC)
+  and incrementals at the full's size (cheap scheduled backups falsely
+  refused). Projection is now type-aware.
+- **Restore resume trusted the checkpoint blindly**: after an OS
+  crash the checkpoint can claim files the filesystem lost (parent
+  dirs were never dir-fsynced), yielding a datadir with missing
+  relation files — silent for TDE/pre-manifest sources, a wedged
+  retry loop otherwise. Resume now stats each claimed file against
+  its manifest size and re-materialises on mismatch.
+- **Timeline-history capture on failover was one-shot**: a transient
+  error during the unrepeatable promotion window skipped both the
+  capture and the backfill, silently capping
+  `recovery_target_timeline=latest` at the previous timeline in
+  streaming-only HA. Capture now retries with backoff, escalates to
+  CRITICAL on final failure, and no longer blocks the backfill.
+
+Still documented for a future round: heal's plaintext re-verify
+ordering on partial heals, control-plane job requeue after lost
+claims, backup WAL-range coverage validation, timeline-history
+archival in plain `wal stream`, `.deferred-*` staging reaper,
+shared-DEK nonce budget.
+
 ### Corruption hunt, round two: eight more fixes
 
 A second audit round (restore/rotate/tarsink, S3/init/manifest, plus

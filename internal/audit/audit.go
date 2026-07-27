@@ -443,6 +443,24 @@ func (s *Store) Append(ctx context.Context, ev *Event) error {
 			return err
 		}
 		key := keyFor(ev)
+		if !s.sp.Capabilities().ConditionalPut {
+			// Stale-head defense. The head pointer is best-effort: a
+			// crash after the event Put but before the pointer update
+			// leaves a stale-but-VALID pointer, so the next Append
+			// recomputes the same sequence and targets an occupied
+			// slot. On a no-conditional-put backend that Put would
+			// DESTROY the committed event — and the replacement links
+			// PrevHash correctly, so even VerifyChain stays green
+			// (invisible loss in the tamper-evident log). Probe the
+			// slot first and relink onto its occupant instead of
+			// writing. The post-Put read-back below still covers the
+			// concurrent-writer window between this probe and our Put.
+			if existing, gerr := s.getByKey(ctx, key); gerr == nil {
+				prevHash = existing.Hash
+				seq = existing.Sequence + 1
+				continue
+			}
+		}
 		putOpts := storage.PutOptions{
 			ContentLength: int64(len(body)),
 			IfNotExists:   true,
@@ -1086,14 +1104,38 @@ func (s *Store) VerifyAnchor(ctx context.Context, log TransparencyLog, logID str
 	if err != nil {
 		return res, err
 	}
-	if int64(len(keys)) <= a.HeadSequence {
-		res.Mismatch = fmt.Sprintf("local chain is shorter than the anchor (have %d events, anchor points at sequence %d)",
-			len(keys), a.HeadSequence)
+	// Resolve the anchored event BY SEQUENCE, never by list index.
+	// Index==sequence silently breaks in two documented realities:
+	// mixed key layouts (legacy date-bucketed keys sort lexically
+	// before flat hexSeq keys despite lower sequences) and WORM
+	// retention pruning (oldest events reaped while sequences climb).
+	// Both made VerifyAnchor cry tamper on healthy chains — the one
+	// tool whose job is telling "verified" from "tampered".
+	var anchoredKey string
+	var maxSeq int64 = -1
+	for _, k := range keys {
+		seq, ok := seqFromEventKey(k)
+		if !ok {
+			continue
+		}
+		if seq > maxSeq {
+			maxSeq = seq
+		}
+		if seq == a.HeadSequence {
+			anchoredKey = k
+		}
+	}
+	if anchoredKey == "" {
+		if maxSeq < a.HeadSequence {
+			res.Mismatch = fmt.Sprintf("local chain is shorter than the anchor (highest local sequence %d, anchor points at sequence %d)",
+				maxSeq, a.HeadSequence)
+		} else {
+			res.Mismatch = fmt.Sprintf("event at anchored sequence %d not found locally (chain extends to %d — the anchored event is missing)",
+				a.HeadSequence, maxSeq)
+		}
 		return res, nil
 	}
-	// The global chain's events are sequence-contiguous, and the keys
-	// sort in sequence order, so index = sequence (events are 0-indexed).
-	ev, err := s.getByKey(ctx, keys[a.HeadSequence])
+	ev, err := s.getByKey(ctx, anchoredKey)
 	if err != nil {
 		return res, err
 	}

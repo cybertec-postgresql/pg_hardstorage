@@ -383,27 +383,51 @@ func (c *Coordinator) handleLeaderChange(ctx context.Context, ev patroni.LeaderC
 	// doesn't change this — the replica's TLI is the same as
 	// the leader's (Patroni keeps replicas on the same
 	// timeline).
-	if err := c.captureTimelineHistory(ctx, leaderDSN, ev.New.Timeline); err != nil {
-		if errors.Is(err, pg.ErrNoHistoryForTLI1) {
-			// Fresh cluster on TLI 1 — there's no history file
-			// to capture. Notice-level event so an operator
-			// scanning logs sees we tried.
-			c.emit(output.NewEvent(output.SeverityNotice, "wal.follower", "timeline_no_history").
-				WithSubject(subj).
-				WithBody(map[string]any{"timeline": ev.New.Timeline}))
-			return
+	// Capture with bounded retries (same posture as persistGap):
+	// leader change is a rare, unrepeatable event — the next natural
+	// retry is the NEXT failover — and in streaming-only HA this
+	// store is the ONLY source of .history files. PG discovers
+	// recovery_target_timeline='latest' by probing successive
+	// <tli>.history via restore_command and stops at the first miss,
+	// so one transient blip here (leader still warming up, storage
+	// 503) used to silently cap every later PITR at the previous
+	// timeline. A capture failure also no longer skips the backfill
+	// below — lower TLIs must not be hostage to the current one.
+	var capErr error
+	for attempt := 0; attempt < 4; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(time.Duration(attempt) * 2 * time.Second):
+			}
 		}
-		c.emit(output.NewEvent(output.SeverityError, "wal.follower", "timeline_capture_failed").
+		capErr = c.captureTimelineHistory(ctx, leaderDSN, ev.New.Timeline)
+		if capErr == nil || errors.Is(capErr, pg.ErrNoHistoryForTLI1) {
+			break
+		}
+	}
+	switch {
+	case errors.Is(capErr, pg.ErrNoHistoryForTLI1):
+		// Fresh cluster on TLI 1 — there's no history file
+		// to capture. Notice-level event so an operator
+		// scanning logs sees we tried.
+		c.emit(output.NewEvent(output.SeverityNotice, "wal.follower", "timeline_no_history").
+			WithSubject(subj).
+			WithBody(map[string]any{"timeline": ev.New.Timeline}))
+	case capErr != nil:
+		c.emit(output.NewEvent(output.SeverityCritical, "wal.follower", "timeline_capture_failed").
 			WithSubject(subj).
 			WithBody(map[string]any{
 				"timeline": ev.New.Timeline,
-				"error":    err.Error(),
+				"error":    capErr.Error(),
+				"impact":   "without this .history file, recovery_target_timeline=latest stops at the previous timeline — PITR silently capped until the file is captured (agent restart or next failover retries)",
 			}))
-		return
+	default:
+		c.emit(output.NewEvent(output.SeverityInfo, "wal.follower", "timeline_captured").
+			WithSubject(subj).
+			WithBody(map[string]any{"timeline": ev.New.Timeline}))
 	}
-	c.emit(output.NewEvent(output.SeverityInfo, "wal.follower", "timeline_captured").
-		WithSubject(subj).
-		WithBody(map[string]any{"timeline": ev.New.Timeline}))
 
 	// 3. Backfill any MISSING intermediate timeline-history files below
 	// the new leader's TLI. The follower only observes the CURRENT leader
