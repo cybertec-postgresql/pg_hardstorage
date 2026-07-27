@@ -138,3 +138,54 @@ func TestResolveOrMint_StaleObjectFallsThroughToManifests(t *testing.T) {
 		t.Fatal("expected DEK adopted from the rotated manifest")
 	}
 }
+
+// A RE-RUN of a completed rotation (the documented resume flow for
+// partial failures) used to hard-fail at the shared-DEK migration:
+// the old ref's slot holds the local:default ALIAS wrapped under the
+// NEW KEK, and unwrapping it with the OLD KEK fails. Idempotency:
+// "already migrated" is completion, not an error.
+func TestRotateKEK_RerunIsIdempotent(t *testing.T) {
+	w := setupRotateWorld(t)
+	ctx := context.Background()
+	oldKEK, newKEK := mkKEK(t), mkKEK(t)
+
+	w.commitEncrypted(t, "db1", "db1.full.20260430T120000Z.dddd", oldKEK, "local:default", 0)
+	seedUnwrap := func(wrapped []byte) ([]byte, error) {
+		d, err := encryption.Unwrap(oldKEK, wrapped)
+		if err != nil {
+			return nil, err
+		}
+		return d[:], nil
+	}
+	seedWrap := func(dek [encryption.KeyLen]byte) ([]byte, error) {
+		return encryption.Wrap(oldKEK, dek)
+	}
+	if seed, err := sharedkey.ResolveOrMint(ctx, w.sp, "local:default", seedUnwrap, seedWrap); err != nil || !seed.Have {
+		t.Fatalf("seed: have=%v err=%v", seed.Have, err)
+	}
+
+	rotate := func() *backup.RotateKEKResult {
+		t.Helper()
+		res, err := backup.RotateKEK(ctx, w.sp, backup.RotateKEKOptions{
+			OldKEKRef: "local:default", OldKEK: oldKEK,
+			NewKEKRef: "local:v2", NewKEK: newKEK,
+			Signer: w.signer, Verifier: w.verifier,
+		})
+		if err != nil {
+			t.Fatalf("RotateKEK: %v", err)
+		}
+		return res
+	}
+
+	first := rotate()
+	if !first.SharedDEKMigrated || first.Failed != 0 {
+		t.Fatalf("first run: migrated=%v failed=%d", first.SharedDEKMigrated, first.Failed)
+	}
+	second := rotate() // pre-fix: hard error "unwrap local:default object with old KEK"
+	if !second.SharedDEKMigrated {
+		t.Error("re-run should report the migration as (already) done")
+	}
+	if second.AlreadyRotated != 1 || second.Failed != 0 {
+		t.Errorf("re-run: already=%d failed=%d, want 1/0", second.AlreadyRotated, second.Failed)
+	}
+}

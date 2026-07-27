@@ -93,6 +93,7 @@ import (
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup/chunker"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/obs/metrics"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/invariant"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/pg/replication"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo"
@@ -556,6 +557,14 @@ func (s *Sink) startSegment(ctx context.Context, segNum uint64, startLSN pglogre
 
 // handOff sends the filled current segment to the processor.
 func (s *Sink) handOff(ctx context.Context) error {
+	// A hand-off commits the segment (and ultimately advances the
+	// slot's restart_lsn past it). Anything but an exactly-full,
+	// correctly-aligned segment here is a receive-loop bug that would
+	// archive a wrong-sized object PG can never replay.
+	invariant.Assert(s.curFilled == int(s.segSize),
+		"only exactly-full segments may be handed off: filled %d of %d", s.curFilled, s.segSize)
+	invariant.Assert(uint64(s.curStartLSN) == s.curSegNum*uint64(s.segSize),
+		"segment %d start LSN %s is not segment-aligned", s.curSegNum, s.curStartLSN)
 	job := &segJob{
 		buf:      s.curBuf,
 		n:        s.curFilled,

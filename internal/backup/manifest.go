@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/jackc/pglogrepl"
 	"path"
 	"strings"
 	"time"
@@ -540,6 +541,16 @@ func (m *Manifest) Validate() error {
 	}
 	if m.StartLSN == "" || m.StopLSN == "" {
 		return fmt.Errorf("manifest: missing LSN(s) start=%q stop=%q", m.StartLSN, m.StopLSN)
+	}
+	// LSN ordering: recovery replays [StartLSN, StopLSN] forward, so
+	// a stop before its start describes a backup no recovery can ever
+	// reach consistency from. Parse failures are left to the deeper
+	// consumers (this gate must accept whatever LSN dialects they do)
+	// — only a definitively inverted pair is refused here.
+	if start, serr := pglogrepl.ParseLSN(m.StartLSN); serr == nil {
+		if stop, perr := pglogrepl.ParseLSN(m.StopLSN); perr == nil && stop < start {
+			return fmt.Errorf("manifest: stop_lsn %s precedes start_lsn %s — no recovery can reach consistency from this backup", m.StopLSN, m.StartLSN)
+		}
 	}
 	// Chain invariants. An incremental without a parent passes every
 	// other gate, skips Commit's parent-liveness check (which keys on

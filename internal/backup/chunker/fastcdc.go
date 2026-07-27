@@ -25,6 +25,7 @@ package chunker
 
 import (
 	"errors"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/invariant"
 	"io"
 	"iter"
 	mathrand "math/rand"
@@ -208,6 +209,16 @@ func (c *Chunker) Iter(r io.Reader) iter.Seq2[Chunk, error] {
 			if boundary > len(buf) {
 				boundary = len(buf)
 			}
+			// Boundary contract: 0 < boundary <= max, and >= min while
+			// more input remains. A violation here means the CDC math
+			// is wrong — and because chunk boundaries feed straight
+			// into content hashes and dedup, a drifting boundary
+			// silently regresses dedup repo-wide (or, at 0, loops
+			// forever emitting empty chunks).
+			invariant.Assert(boundary > 0 && boundary <= c.max,
+				"chunk boundary %d outside (0, max=%d]", boundary, c.max)
+			invariant.Assert(eof || boundary >= c.min,
+				"mid-stream chunk boundary %d below min=%d", boundary, c.min)
 
 			// Yield this chunk. Data shares storage with buf; the next
 			// iteration overwrites it, so callers must copy.

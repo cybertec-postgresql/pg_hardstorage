@@ -24,6 +24,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/invariant"
 	"io"
 	"strings"
 
@@ -269,6 +270,13 @@ func unwrapInto(wrapped []byte, unwrap Unwrapper) (MintResult, error) {
 	}
 	var out MintResult
 	copy(out.DEK[:], dek)
+	// An all-zero DEK cannot come from a healthy mint (crypto/rand)
+	// or a successful AEAD unwrap of one — it means a zero-value
+	// struct leaked through the plumbing. Encrypting a repo's chunks
+	// under a zero key is unrecoverable-by-design confidentiality
+	// loss, so die before a single byte is sealed with it.
+	invariant.Assert(out.DEK != [encryption.KeyLen]byte{},
+		"shared DEK resolved to the all-zero key")
 	out.Have = true
 	return out, nil
 }
@@ -417,4 +425,18 @@ func Rewrap(ctx context.Context, sp storage.StoragePlugin, oldRef, newRef string
 		_ = sp.Delete(ctx, oldKey)
 	}
 	return true, nil
+}
+
+// SlotResolves reports whether the shared-DEK slot for ref exists and
+// unwraps under the supplied unwrapper. Rotation uses it to make the
+// object migration idempotent: on a re-run the slots already unwrap
+// under the NEW KEK, so "old KEK can't open it" is completion, not
+// failure.
+func SlotResolves(ctx context.Context, sp storage.StoragePlugin, ref string, unwrap Unwrapper) bool {
+	wrapped, ok := readWrappedDEK(ctx, sp, sharedDEKKey(ref), ref)
+	if !ok {
+		return false
+	}
+	dek, err := unwrap(wrapped)
+	return err == nil && len(dek) == encryption.KeyLen
 }

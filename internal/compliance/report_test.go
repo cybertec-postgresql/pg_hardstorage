@@ -30,6 +30,12 @@ type complianceWorld struct {
 	verifier *backup.Verifier
 	repoURL  string
 	meta     *repo.Metadata
+
+	// lastFull tracks each deployment's most recent full backup ID so
+	// commitBackup can chain incrementals to a real live parent —
+	// Validate refuses anchorless incrementals (they are unrestorable
+	// by construction).
+	lastFull map[string]string
 }
 
 func setupWorld(t *testing.T) *complianceWorld {
@@ -104,12 +110,16 @@ func (w *complianceWorld) commitBackup(t *testing.T, deployment, suffix string, 
 		t.Fatal(err)
 	}
 	id := deployment + "." + string(btype) + "." + suffix + "." + stoppedAt.Format("20060102T150405Z")
-	// Incrementals are committed anchorless (empty parent): these
-	// report tests only count backups by type, and Commit now refuses
-	// an incremental whose parent isn't live. An empty parent is
-	// accepted by Validate and keeps the per-type counts stable
-	// without having to plant (and count) a separate parent full.
+	// Chain incrementals to the deployment's most recent full:
+	// Validate refuses anchorless incrementals, and Commit's
+	// parent-liveness check needs the parent live.
 	parent := ""
+	if btype == backup.BackupTypeIncremental {
+		if w.lastFull == nil || w.lastFull[deployment] == "" {
+			t.Fatalf("commitBackup: incremental %s/%s needs a prior full in this fixture", deployment, suffix)
+		}
+		parent = w.lastFull[deployment]
+	}
 	m := &backup.Manifest{
 		Schema:           backup.Schema,
 		BackupID:         id,
@@ -134,6 +144,12 @@ func (w *complianceWorld) commitBackup(t *testing.T, deployment, suffix string, 
 	}
 	if err := w.store.Commit(context.Background(), m, w.signer, backup.CommitOptions{}); err != nil {
 		t.Fatal(err)
+	}
+	if btype == backup.BackupTypeFull {
+		if w.lastFull == nil {
+			w.lastFull = make(map[string]string)
+		}
+		w.lastFull[deployment] = id
 	}
 	return id
 }
