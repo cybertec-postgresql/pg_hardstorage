@@ -140,6 +140,23 @@ mock), which is how its production session-open retry under
 
 ---
 
+## Failure-class harnesses
+
+Beyond the layers above, four harnesses in the test suite target the
+failure *classes* the corruption audits kept finding, so the next bug
+of each shape is caught structurally:
+
+| Harness | Class it kills | Where |
+| --- | --- | --- |
+| **Repo model checker** — seeded random op sequences (backup/delete/undelete/gc/rotate/hold/replicate) with global invariants checked after every step | Operation-interaction corruption (undelete over dead parents, holds wedging retention, dedup-vs-GC) | `TestModelCheck_*` (fixed seeds in CI, 2000-op randomized run nightly; `PGHS_MODELCHECK_SEED` replays a failure exactly) |
+| **Idempotency sweep** — every maintenance command run twice; second run must succeed and change no durable bytes | Broken resume flows ("nobody ever ran it twice") | `TestIdempotencySweep` |
+| **Fault sweep** — one injected storage failure at every call position; a faulted run must fail loudly, and a clean re-run must converge to the reference state | Fail-open error handling ("success with silently less work done") | `TestFaultSweep` |
+| **Golden repo** — a frozen on-disk repo committed to the tree; every build must open, verify, decrypt, and restore it byte-exact | Format-interpretation drift between writer and reader versions | `TestGoldenRepo_StillReadable` (regenerate only for deliberate format changes via `PGHS_REGEN_GOLDEN=1`) |
+
+A fifth, smaller gate pins **path parity**: the interactive CLI and the
+agent must resolve backup encryption identically for every keyring
+state (`TestEncryptionResolutionParity_CLIvsAgent`).
+
 ## The chaos soak
 
 The nightly `chaos-soak` workflow runs the production model —
