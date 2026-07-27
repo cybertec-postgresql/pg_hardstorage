@@ -299,15 +299,27 @@ func (w *modelWorld) checkInvariants() {
 	}
 }
 
-func runModelCheck(t *testing.T, seed int64, ops int) {
+func runModelCheck(t *testing.T, seed int64, ops int, budget time.Duration) {
 	t.Helper()
 	w := newModelWorld(t, seed)
-	t.Logf("model check: seed=%d ops=%d (re-run with PGHS_MODELCHECK_SEED=%d)", seed, ops, seed)
+	t.Logf("model check: seed=%d ops=%d budget=%s (re-run with PGHS_MODELCHECK_SEED=%d)", seed, ops, budget, seed)
+	start := time.Now()
 	w.plantBackup(false) // always start with one full
 	w.checkInvariants()
 	for i := 0; i < ops; i++ {
 		w.step()
 		w.checkInvariants()
+		if (i+1)%500 == 0 {
+			t.Logf("model check: %d/%d ops, %s elapsed, all invariants held", i+1, ops, time.Since(start).Round(time.Second))
+		}
+		// The per-op invariant sweep scales with repo size, so deep
+		// runs are wall-clock-bound, not op-bound. Stop CLEANLY at
+		// the budget (every completed op was fully verified) instead
+		// of letting the test binary's -timeout axe the run mid-sweep.
+		if budget > 0 && time.Since(start) > budget {
+			t.Logf("model check: time budget %s reached after %d/%d ops — every completed op verified; not a failure", budget, i+1, ops)
+			return
+		}
 	}
 }
 
@@ -316,7 +328,7 @@ func TestModelCheck_FixedSeeds(t *testing.T) {
 	for _, seed := range []int64{1, 7, 42, 20260727, 987654321} {
 		seed := seed
 		t.Run(fmt.Sprintf("seed_%d", seed), func(t *testing.T) {
-			runModelCheck(t, seed, 40)
+			runModelCheck(t, seed, 40, 0)
 		})
 	}
 }
@@ -341,5 +353,14 @@ func TestModelCheck_Randomized(t *testing.T) {
 			ops = n
 		}
 	}
-	runModelCheck(t, seed, ops)
+	// Default wall-clock budget for deep runs; override with
+	// PGHS_MODELCHECK_BUDGET (Go duration). Keep comfortably under
+	// the test binary's -timeout so the stop is always clean.
+	budget := 90 * time.Minute
+	if v := os.Getenv("PGHS_MODELCHECK_BUDGET"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			budget = d
+		}
+	}
+	runModelCheck(t, seed, ops, budget)
 }

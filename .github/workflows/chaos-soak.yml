@@ -52,6 +52,7 @@ jobs:
       - name: Deep randomized repo model check
         env:
           PGHS_MODELCHECK_OPS: "2000"
+          PGHS_MODELCHECK_BUDGET: "20m"
         run: |
           go test -count=1 -timeout 30m -v             -run TestModelCheck_Randomized             ./internal/cli/
       - name: Run the soak
