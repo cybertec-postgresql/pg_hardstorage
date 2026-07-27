@@ -12,6 +12,7 @@ import (
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup/runner"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/config"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/output"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/paths"
 )
 
 // BackupExecutor implements JobExecutor for JobBackup. It wraps the
@@ -122,6 +123,19 @@ func (b *BackupExecutor) runBackup(ctx context.Context, job *ControlPlaneJob, pr
 		progress(body)
 	}
 
+	// Resolve encryption exactly like the interactive CLI: KEK on
+	// the keyring ⇒ encrypt. Without this, control-plane backups were
+	// silently plaintext even in an --encrypt repo, and plaintext-hash
+	// dedup welds those manifests onto encrypted chunks.
+	var enc *runner.EncryptionConfig
+	if p, perr := paths.Resolve(paths.DefaultOptions()); perr == nil {
+		var eerr error
+		enc, eerr = runner.LocalEncryptionFromKeyring(p.Keyring.Value)
+		if eerr != nil {
+			return nil, fmt.Errorf("backup-executor: %w", eerr)
+		}
+	}
+
 	res, err := runner.Take(ctx, runner.TakeOptions{
 		PGConnString:      dep.PGConnection,
 		RepoURL:           repoURL,
@@ -133,6 +147,7 @@ func (b *BackupExecutor) runBackup(ctx context.Context, job *ControlPlaneJob, pr
 		Fast:              fast,
 		InactivityTimeout: inactivity,
 		OnEvent:           emit,
+		Encryption:        enc,
 		// Actor in the audit chain: the dispatch path uses the
 		// agent-id-on-job, distinguishing scheduler-driven backups
 		// from operator-initiated ones.

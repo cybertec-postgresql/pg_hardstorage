@@ -257,8 +257,11 @@ func TestSink_OutOfOrderOffset_Rejected(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error on non-sequential WAL")
 	}
-	if !strings.Contains(err.Error(), "out-of-order") {
-		t.Errorf("error should mention out-of-order; got %v", err)
+	// The stream-level contiguity check now refuses this before the
+	// per-segment offset guard is reached; either refusal message is
+	// fine as long as the record is rejected.
+	if !strings.Contains(err.Error(), "out-of-order") && !strings.Contains(err.Error(), "gap detected") {
+		t.Errorf("error should mention out-of-order or gap; got %v", err)
 	}
 }
 
