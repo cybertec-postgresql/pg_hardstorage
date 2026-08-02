@@ -30,7 +30,7 @@ permissions:
   id-token: write       # cosign keyless via OIDC
 
 env:
-  GO_VERSION: "1.26.4"
+  GO_VERSION: "1.26.5"
 
 jobs:
   goreleaser:

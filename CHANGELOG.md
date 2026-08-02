@@ -19,6 +19,30 @@ in `pg_hardstorage.yaml`, and the `scp://` storage backend goes from
 unusable to working. Existing configurations are unaffected — no
 migration, and nothing changes posture on upgrade.
 
+### Security
+
+- **Three CVEs removed from the release binary.** A pre-tag scan of the
+  built artifact found vulnerable symbols linked into it:
+  `google.golang.org/grpc` 1.80.0 (GO-2026-6061, xDS RBAC + HTTP/2
+  transport — the client-stream symbols are on the GCP KMS path),
+  `golang.org/x/text` 0.37.0 (GO-2026-5970, infinite loop on invalid
+  input in `norm`), and `crypto/tls` from the Go 1.26.3 standard
+  library (GO-2026-5856, Encrypted Client Hello privacy leak). Bumped
+  to grpc 1.82.1 and x/text 0.39.0, and the Go toolchain pin moves
+  1.26.4 → 1.26.5 across every workflow. `go.mod` now carries a
+  `toolchain go1.26.5` directive so a local build gets the same
+  standard library CI does, rather than whatever the developer happens
+  to have installed. The artifact scans clean.
+
+- **The vulnerability gate had been failing open.** `make govulncheck`
+  ran only govulncheck's source mode, which on Go 1.26 panics with
+  `ForEachElement called on type containing *types.TypeParam` — a
+  govulncheck/x-tools generics bug. A panicking gate reported nothing
+  and looked green. The target now also runs binary mode against the
+  built artifact, and *that* is the hard gate: it needs no SSA
+  analysis, so it survives toolchain skew. It is what found all three
+  CVEs above; source mode never got far enough to see them.
+
 ### Added
 
 - **Cloud KMS is configurable in `pg_hardstorage.yaml`** ([#44]). The

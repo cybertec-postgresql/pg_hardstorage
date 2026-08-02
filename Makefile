@@ -477,16 +477,35 @@ lint:
 	@command -v golangci-lint >/dev/null 2>&1 || { echo "install golangci-lint: https://golangci-lint.run"; exit 1; }
 	golangci-lint run
 
-# govulncheck — hard gate in CI from v0.4+. Reports only on reachable
-# vulnerable code paths via the call-graph walk. Run locally before
-# every release to catch CVEs in transitive deps that we actually
-# touch.
+# govulncheck — release gate. Run before every tag to catch CVEs in
+# transitive deps we actually link.
 #
-# $(GO_PKGS) for the same reason as `test` / `vet` — see above.
-govulncheck:
+# TWO modes, deliberately:
+#
+#   source mode  — walks the call graph, so it reports only reachable
+#                  vulnerable code. The most precise answer when it
+#                  works.
+#   binary mode  — inspects the built binary's symbol table instead.
+#                  Less precise (symbol present != reached at runtime)
+#                  but it does no SSA analysis, so it survives
+#                  toolchain/tooling skew.
+#
+# Binary mode is NOT redundant. On Go 1.26 the source walk panics with
+# "ForEachElement called on type containing *types.TypeParam" (a
+# govulncheck/x-tools generics bug, not ours) — and a target that only
+# ran source mode failed OPEN: the gate looked green while reporting
+# nothing. Binary mode caught three CVEs the source walk never got far
+# enough to see, one of them a crypto/tls issue in the stdlib itself.
+#
+# Source mode is therefore best-effort (|| true, with a loud note);
+# binary mode is the hard gate.
+govulncheck: build
 	@command -v govulncheck >/dev/null 2>&1 || { echo "install: go install golang.org/x/vuln/cmd/govulncheck@latest"; exit 1; }
-	govulncheck -show=verbose $(GO_PKGS)
-	govulncheck -show=verbose -tags=integration $(GO_PKGS)
+	@echo "--- source mode (best-effort; panics on some toolchains) ---"
+	-govulncheck -show=verbose $(GO_PKGS)
+	-govulncheck -show=verbose -tags=integration $(GO_PKGS)
+	@echo "--- binary mode (hard gate: scans the artifact we ship) ---"
+	govulncheck -mode=binary $(BIN_DIR)/$(BINARY)
 
 clean:
 	rm -rf $(BIN_DIR)/ coverage.out coverage.html
