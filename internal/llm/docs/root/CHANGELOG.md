@@ -11,6 +11,947 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ## [Unreleased]
 
+## [1.1.0] — 2026-08-02
+
+A minor bump rather than a patch: this release **adds configuration
+surface**. `kms.providers[]` and per-deployment `kek_ref` are new keys
+in `pg_hardstorage.yaml`, and the `scp://` storage backend goes from
+unusable to working. Existing configurations are unaffected — no
+migration, and nothing changes posture on upgrade.
+
+### Added
+
+- **Cloud KMS is configurable in `pg_hardstorage.yaml`** ([#44]). The
+  top-level `kms.providers[]` block and per-deployment `kek_ref` that
+  every KMS how-to documented now exist in the config schema; following
+  those pages previously failed the strict loader outright
+  (`field kms not found in type config.Config`).
+- `doctor` reports `config.kek_ref_unknown_scheme` when a deployment's
+  `kek_ref` names a scheme no provider in the running build claims.
+
+### Fixed
+
+- **Agent-driven backups can use a cloud KEK** ([#44]). A cloud KEK was
+  selectable only through `--kek` / `--kms-config` on an individual
+  command, so the scheduler and the control-plane executor — neither of
+  which has a command line — always fell back to the local `kek.bin`.
+  Both now resolve the deployment's `kek_ref` through the same resolver
+  `backup` uses (`runner.ResolveEncryption`), as do `wal push`,
+  `wal stream`, `restore`, `verify`, `partial restore` / `partial dump`,
+  and recovery drills. A declared `kek_ref` whose provider fails to open
+  now fails the run instead of silently downgrading custody.
+- **Recovery drills of a cloud-KMS deployment could never pass.** A drill
+  builds its restore internally and takes no KMS flags, and its DEK
+  resolver hardcoded a nil provider config — so any deployment whose
+  provider needs an explicit region or credential failed every drill, and
+  `doctor` reported its backups as unproven (CRITICAL).
+- `helm-sidecar-chart.md` documented a third, non-existent config shape
+  (`kms.<name>.type` / `key_id`); corrected to the real schema.
+- **`azure-key-vault://` was never a valid KEKRef scheme.** The
+  encryption tutorial and `kms --help` both advertised it; the provider
+  registers `azure-kv`. Following either produced
+  `kms: unknown KEKRef scheme` on the first encrypted backup.
+- **Three more families of unloadable documented config**, found by the
+  new schema meta-test and each the same defect as [#44] — the loader is
+  strict, so these did not degrade, they refused the whole file:
+  - `sinks[].filter` (7 sink how-tos + the operator guide). Sink plugins
+    read `min_severity` from `config:`; the `components` allowlist was
+    never implemented by any sink and has been removed from the docs.
+  - `deployments[].worm` / `worm_retention` (`pci-dss.md`). WORM is a
+    repository property set by `repo init --worm-mode/--worm-retention`,
+    deliberately init-time only.
+  - `deployments[].extras` (`repository-scp.md`, `repository-sftp.md`) —
+    see the known issue below.
+
+- **The `scp://` storage backend was unusable and now works.** It reads
+  its credentials from a storage-plugin `extras` map, but nothing
+  populates that map in production — `storage.Open` builds the config
+  from the URL alone — and unlike `sftp://`, `scp://` had no
+  environment fallback. Every operation failed at open with
+  `scp: extras.known_hosts is required`, so the backend could not be
+  used at all. It now reads `PG_HARDSTORAGE_SCP_KNOWN_HOSTS`,
+  `…_IDENTITY_FILE`, `…_IDENTITY_PASSPHRASE`, and `…_PASSWORD`,
+  matching the sftp plugin's precedence exactly.
+
+  The defect survived a full contract suite because every storage
+  suite constructs `StorageConfig` by hand *with* `Extras` populated,
+  which the real caller never does. New container-backed tests
+  (`internal/plugin/storage/wiring_e2e_test.go`) drive `storage.Open`
+  — the production entry point — for `scp://`, `sftp://` and `s3://`,
+  so a backend reachable only from a test harness now fails CI.
+
+- **`RenameIfNotExists` disagreed across backends.** `fs://` created the
+  destination's parent directory (`os.MkdirAll`) and `s3://` has no
+  directories at all, but `scp://` and `sftp://` failed with a bare
+  "No such file or directory" when the destination prefix did not exist
+  yet. Same documented operation, four backends, two answers. Current
+  callers rename within a single directory — a manifest's staging file
+  sits beside its final key — so nothing broke in practice, but a caller
+  that renamed across prefixes would have worked on a local repo and
+  failed on an SSH one. Both SSH plugins now create the parent, matching
+  the `fs` reference.
+
+  The contract suite could not have caught this: every rename case used
+  `ren/src` → `ren/dst`, one prefix, so the destination directory always
+  already existed. A `RenameIfNotExists_AcrossPrefix` case now covers it
+  for every backend.
+
+- **The storage contract contradicted itself on `ContentSHA256`.**
+  `PutOptions.ContentSHA256` documented an unconditional "the plugin
+  MUST verify after writing and return `ErrChecksumMismatch`", while
+  `Capabilities.VerifiesContentSHA256` — twenty lines above it in the
+  same file — documented the verification as opt-in, advertised only by
+  `fs`. S3, Azure, GCS, SFTP and SCP deliberately ignore the field and
+  rely on transport-layer integrity, and `internal/repo.CAS` correctly
+  gates on the capability (computing the hash unconditionally cost ~9%
+  of wal-stream CPU). The behaviour was right; the contract text was
+  not, and a caller who trusted it would set `ContentSHA256` against S3
+  believing they had post-write verification while nothing checked
+  anything. The MUST is now explicitly conditional on the capability.
+
+  A `ContentSHA256_MatchesAdvertisedCapability` contract case now pins
+  the two together in whichever direction a backend claims, so a plugin
+  that advertises the capability without implementing it fails.
+
+### Known issues
+
+- **`scp://` and `sftp://` are configurable only through
+  `PG_HARDSTORAGE_SCP_*` / `PG_HARDSTORAGE_SFTP_*` environment
+  variables**, not through `pg_hardstorage.yaml`. The plugins read a
+  storage-plugin `extras` map that nothing populates; wiring a config
+  surface to it is follow-up work.
+
+- **The LLM helper's bundled runbooks were stale.** The corpus the
+  assistant serves mid-incident is a `go:embed` copy refreshed by
+  `make sync-llm-docs`; it was never re-run after the CLI-example
+  corrections, so R2 still told operators to use `audit append --type
+  kms.shred --kek-ref`, flags that no longer parse. Re-synced, and now
+  enforced by a test.
+
+### Testing
+
+- A meta-test validates every config snippet in `docs/` against the real
+  `config.Config` schema, so a page can't advertise an invented key
+  again. It records (and requires the removal of) three pre-existing
+  drift families it found: `sinks[].filter`, `deployments[].extras`, and
+  `deployments[].worm`/`worm_retention`.
+- `TestBundledCorpusMatchesCanonicalDocs` fails whenever a bundled LLM
+  doc drifts from its canonical source. The Makefile claimed CI checked
+  this; it didn't.
+- `TestDocsKEKRefSchemesAreRegistered` checks every KEKRef scheme the
+  docs teach against `kms.DefaultRegistry` — the check that would have
+  caught `azure-key-vault://`.
+
+[#44]: https://github.com/cybertec-postgresql/pg_hardstorage/issues/44
+
+## [1.0.17] — 2026-07-27
+
+### Failure-class test harnesses
+
+Five new test harnesses target the failure *classes* the corruption
+audits kept finding, so the next bug of each shape is caught
+structurally instead of by the next audit:
+
+- **Repo model checker** (`TestModelCheck_*`): seeded random operation
+  sequences (plant/delete/undelete/gc/rotate/hold/replicate) through
+  the real CLI paths, with global invariants checked after every step
+  — every live manifest restorable, every live incremental's chain
+  live, the audit chain verifying, the replica never lying. Fixed
+  seeds run in CI; a 2000-op randomized run joins the nightly
+  chaos-soak workflow, logging its seed for exact replay.
+- **Idempotency sweep** (`TestIdempotencySweep`): every maintenance
+  command run twice; the second run must succeed and leave durable
+  repo bytes unchanged. Already caught (and this change fixes) a
+  wart in the shared-DEK rotation migration: re-runs rewrote the
+  key slots with fresh nonces on every invocation.
+- **Fault sweep** (`TestFaultSweep`): one injected storage failure at
+  every call position of each maintenance command; a faulted run must
+  fail loudly, and a clean re-run must converge to the fault-free
+  reference state.
+- **Golden repo** (`TestGoldenRepo_StillReadable`): a frozen
+  miniature repo committed under testdata/ (manifests, encrypted
+  chunks, shared-DEK object, audit chain) that every future build
+  must open, verify, decrypt, and restore byte-exact — the
+  format-drift class (verify-sandbox major, verify-anchor indexing)
+  caught before release instead of in the field.
+- **Encryption path parity**
+  (`TestEncryptionResolutionParity_CLIvsAgent`): the CLI and agent
+  must resolve backup encryption identically for every keyring state.
+
+### Internal invariant assertions (fail-closed)
+
+New `internal/invariant` package: `invariant.Assert` panics with a
+greppable "invariant violation:" prefix when an internal assumption —
+a condition that can only be false if the BINARY has a bug — is
+violated. Deliberately fail-closed with no production off-switch:
+for a backup tool, crashing one run is always cheaper than letting
+corrupted internal state flow into a committed artifact; the agent's
+schedule engine already converts task panics into task failures, so
+one impossible state aborts that task without killing the fleet.
+Environmental conditions (storage errors, hostile data, races) remain
+ordinary error handling.
+
+Assertions added where the corruption hunts showed invariant-shaped
+failure modes: WAL sink hand-off (only exactly-full, segment-aligned
+segments may commit), manifest commit (attestation must exist after
+signing), lease renewal (must strictly extend expiry — fencing
+monotonicity), CDC chunker (boundary within (0, max], ≥ min
+mid-stream — a drifting boundary silently regresses dedup repo-wide),
+and shared-DEK resolution (never the all-zero key). Additionally,
+`Manifest.Validate` now refuses an inverted LSN range (stop before
+start), which previously committed green and could never reach
+consistency.
+
+### Corruption hunt, round three: nine more fixes
+
+Fresh audits of replication/heal/standby/timetravel and the audit
+chain / control plane / config layers, plus the remaining round-two
+backlog:
+
+- **Audit chain: a stale head pointer could silently destroy a
+  committed event.** The pointer update after an Append is
+  best-effort; a crash left it stale-but-valid, the next Append
+  recomputed the same sequence, and on a no-conditional-put backend
+  its Put overwrote the committed event — with the replacement linking
+  PrevHash correctly, so even `VerifyChain` stayed green. Append now
+  probes the slot first and relinks instead of writing.
+- **`audit verify-anchor` cried tamper on healthy repos.** It resolved
+  the anchored event by list index == sequence, which breaks under
+  mixed key layouts and WORM retention pruning. Resolution is now by
+  parsed sequence.
+- **Config drop-in overlays silently dropped retention, TDE,
+  audit-anchor, SLO, residency, and classification** for any
+  deployment defined in two files — the operator's `keep_monthly: 60`
+  drop-in vanished and rotate pruned with the default policy.
+  `mergeDeployment` now carries every field, with a reflection canary
+  test that fails when a future field lacks a merge arm.
+- **Replication committed manifests to the replica over missing or
+  failed chunks** — a DR replica that lies about restorability,
+  permanently invisible to `replicate verify` once the source copy is
+  GC'd. Manifests (backup and WAL) are now withheld unless every
+  referenced chunk landed.
+- **Timetravel with an LSN target always picked the newest backup**,
+  so every historical-LSN session failed at the restore reachability
+  gate (PG cannot rewind) — the feature's primary use case was
+  inoperative. The picker now selects the latest backup with
+  `StopLSN <= target`.
+- **A hold on an incremental wedged retention for the whole
+  deployment**: the held child left the delete batch, its parent
+  stayed in, and the chain guard refused the entire batch — every
+  scheduled rotate deleted nothing for the hold's lifetime. The hold
+  filter is now chain-aware (ancestors kept as `held_chain_anchor`,
+  the rest of the sweep proceeds).
+- **The pre-backup ENOSPC gate projected from the latest manifest
+  regardless of type**: weekly fulls were projected at the daily
+  incremental's size (gate false-passes, full dies mid-run on ENOSPC)
+  and incrementals at the full's size (cheap scheduled backups falsely
+  refused). Projection is now type-aware.
+- **Restore resume trusted the checkpoint blindly**: after an OS
+  crash the checkpoint can claim files the filesystem lost (parent
+  dirs were never dir-fsynced), yielding a datadir with missing
+  relation files — silent for TDE/pre-manifest sources, a wedged
+  retry loop otherwise. Resume now stats each claimed file against
+  its manifest size and re-materialises on mismatch.
+- **Timeline-history capture on failover was one-shot**: a transient
+  error during the unrepeatable promotion window skipped both the
+  capture and the backfill, silently capping
+  `recovery_target_timeline=latest` at the previous timeline in
+  streaming-only HA. Capture now retries with backoff, escalates to
+  CRITICAL on final failure, and no longer blocks the backfill.
+
+Still documented for a future round: heal's plaintext re-verify
+ordering on partial heals, control-plane job requeue after lost
+claims, backup WAL-range coverage validation, timeline-history
+archival in plain `wal stream`, `.deferred-*` staging reaper,
+shared-DEK nonce budget.
+
+### Corruption hunt, round two: eight more fixes
+
+A second audit round (restore/rotate/tarsink, S3/init/manifest, plus
+the backlog from round one) fixed eight more corruption and
+backup-availability bugs, each with a regression test:
+
+- **KEK rotation could permanently destroy backups.** The manifest
+  rewrite was Put-tmp → DELETE original → rename, and a rename failure
+  "cleaned up" by deleting the tmp — destroying the only copy at the
+  primary key; the backup vanished from every listing AND from GC's
+  reference walk, so the next sweep reaped its chunks. The rewrite is
+  now a single atomic overwrite: a valid manifest body exists at the
+  key at every instant.
+- **KEK rotation bricked all future backups and made rotated backups
+  unrestorable.** Rotation rewrapped manifests but left the
+  authoritative shared-DEK object under the retired KEK (every
+  subsequent backup and `wal stream` then hard-failed), and the
+  rotated manifests' new `local:v2`-style KEKRef was rejected by every
+  shipped resolver. Rotation now migrates the shared-DEK object (same
+  DEK, new wrap) including the fixed `local:default` alias the
+  CLI/agent stamp; `ResolveOrMint` falls through to the manifest scan
+  when the object won't unwrap; and both resolvers route any `local:*`
+  ref to the keyring.
+- **`backup undelete` could resurrect an incremental whose parent
+  chain stayed tombstoned** — a live-listing backup every restore
+  refuses, hardening into permanent loss once GC grace expired. The
+  chain is now walked and the first dead ancestor named.
+- **`repo.Open`'s forward-format gate failed OPEN on transient read
+  errors** of `_repo_version.json` (throttle, partition, IAM deny were
+  treated like "marker absent = v1.0"), letting an old binary mutate a
+  future-format repo whose manifests it skips as "malformed" — and GC
+  would reap chunks those manifests reference. Now fail-closed; only a
+  definitive not-found takes the legacy path.
+- **`Manifest.Validate` accepted structurally unrestorable chain
+  shapes**: an incremental with no (or a self-referential) parent
+  committed green, skipped the parent-liveness and chain-protection
+  guards, and failed only at restore. Validate now enforces
+  type/parent/timeline invariants at the same gate that already
+  refuses undecryptable encryption shapes.
+- **The S3 plugin claimed `ConditionalPut: true` for every endpoint.**
+  On S3-compatible endpoints the claim was a guess — and it disables
+  the exact mitigations built for honest-false backends (audit-chain
+  read-back, lease warning). Custom `?endpoint=` overrides now report
+  false unless the operator vouches with `?conditional_put=native`
+  (MinIO ≥ 2024, R2); AWS proper stays true.
+- **`verify --full` fabricated "skipped" out of environment
+  failures**: a sandbox that couldn't see the freshly-written
+  `backup_manifest` (bad bind-mount, remote DOCKER_HOST, permissions)
+  was classified as "manifest was not captured" and exited 0. When the
+  caller captured a manifest, that stderr is now a real failure.
+- **Backends with no enforceable durability (sftp/scp) were silent.**
+  The backup runner now emits `backup`/`durability_unenforceable` and
+  `wal stream` emits `wal.durability`/`unenforceable` when a backend
+  has neither a real barrier nor inline-durable writes — a
+  storage-host power loss there can tear chunks under a committed
+  manifest or lose WAL the slot has advanced past.
+
+Documented, not yet fixed (next round): timeline-history archival in
+plain `wal stream`, backup WAL-range coverage validation, restore
+resume re-validation after host crash, legal-hold chain-aware
+retention filtering, type-aware capacity projection, `.deferred-*`
+staging reaper, shared-DEK nonce budget.
+
+### Corruption hunt: five fixes for silent data-corruption and backup-availability bugs
+
+A three-way audit of the write path, the WAL pipeline, and the
+encryption/agent layers found and fixed five bugs, each with a
+regression test:
+
+- **Agent-scheduled backups were silently unencrypted.** Neither the
+  agent's schedule engine nor the control-plane executor ever consulted
+  the keystore, so every scheduled backup wrote plaintext even in a repo
+  initialised with `--encrypt` — and plaintext-hash dedup then welded
+  plaintext and encrypted backups onto the same chunks (manifests
+  claiming aes-256-gcm referencing cleartext chunks, breaking the
+  crypto-shred guarantee; unencrypted manifests referencing GCM
+  envelopes they can never decrypt). Both paths now resolve encryption
+  exactly like the interactive CLI, and a corrupt KEK fails the backup
+  loudly instead of silently falling back to plaintext.
+- **One wedged task starved the agent's scheduler forever.** Tasks fire
+  serially with no deadline, so a single hung Run (wedged docker daemon
+  during a drill, D-state I/O during a backup) silently stopped every
+  scheduled backup on the agent while the process looked healthy. Every
+  task now runs under a wall-clock ceiling (per-task override, default
+  2× its own cadence clamped to [1h, 48h]); at the ceiling its context
+  is cancelled and — if it still won't return — the task is abandoned
+  with a loud error so the other tasks keep firing.
+- **`repo gc --apply` (and `repair chunks --orphans --apply`) could
+  delete chunks an in-flight backup had deduplicated against.** The
+  chunk-age floor only protects chunks a running backup *wrote*; chunks
+  it *deduplicated against* are old by definition, so a sweep could
+  reap them and a signed, committed backup would reference deleted
+  chunks. Both sweeps now refuse while any unexpired backup lease
+  exists (an unreadable lease refuses too — never "couldn't check,
+  deleting anyway") and re-collect references immediately before
+  deleting so backups committed since the first snapshot keep their
+  chunks. Dry-runs are unaffected.
+- **The WAL sink missed gaps that landed exactly on a segment
+  boundary.** Right after a segment hand-off there is no current
+  segment, so both per-segment guards went blind and a skip to a later
+  segment's first byte would commit past an unrecorded hole — PG then
+  recycles the missing WAL and the gap becomes permanent. The sink now
+  enforces strict stream-level contiguity: every record must start
+  exactly where the previous one ended.
+- **The streamer reported the apply LSN as the RAM-buffered receive
+  position.** Under `synchronous_commit=remote_apply` (reachable via
+  `--skip-preflight` or a post-start GUC change) the primary would ACK
+  commits whose WAL existed only in the streamer's volatile buffers —
+  acknowledged transactions lost if the host died. The standby status
+  update now reports apply = flush (the durably-synced position); the
+  fast-shutdown drain (issue #101) is unaffected because it only needs
+  the write field.
+
+## [1.0.16] — 2026-07-24
+
+### Integrity program: scheduled drills, contract enforcement, chaos soak
+
+Three layers landed to keep "backup that won't restore" in the class of
+bugs machines catch first (see the new
+[Integrity testing](https://pghardstorage.org/operations/integrity-testing/)
+page):
+
+- **Scheduled recovery drills.** Deployments can now declare a
+  `schedule.drill` alongside `backup` and `rotate`
+  (`pg_hardstorage schedule db1 'daily_at 03:00' --task drill`); the
+  agent restores the latest backup into a scratch dir and verifies it on
+  that cadence, recording every verdict in the repo's drill history.
+  `doctor` gained drill-freshness checks — `recovery.drill_never_run`
+  (notice), `recovery.drill_failing` (critical), and
+  `recovery.drill_stale` (critical, tunable via `--drill-max-age`,
+  default 7d) — plus a `drills` report section for dashboards.
+- **Storage-contract concurrency cases are now mandatory.** Every
+  backend runs `ParallelPuts_SingleWinner` and
+  `ParallelOverwrites_NoTornContent`; a backend claiming
+  `ConditionalPut: true` that loses the race is red, while an honest
+  `false` skips and its callers degrade loudly instead: the backup
+  runner emits a `lease_unenforceable` warning event and the audit
+  chain read-back-verifies every slot it wins. The scp backend is now
+  contract-tested against a real `sshd`, which surfaced (and fixed) a
+  session-open retry needed under `MaxSessions` backpressure. A
+  dedicated CI job runs these with the `DEMAND` env vars so the fixtures
+  can never silently skip.
+- **Nightly chaos soak with a restore-proof gate.** A seeded random
+  fault loop (Patroni switchovers, leader pauses, concurrent-backup
+  bursts) over a real 3-node cluster with an encrypted repo and a
+  continuous — never restarted — `wal stream`. Pass requires every
+  committed backup to `verify --full` AND restore, a gap-free
+  `wal audit`, and exactly one shared-DEK object; the seed is logged so
+  any failure replays deterministically.
+
+The very first soak run caught a real bug, now fixed: **`verify --full`
+(and the agent's scheduled verify) ran the wrong-major sandbox for every
+backup.** Manifests store the plain PostgreSQL major (`pg_version: 17`),
+but the sandbox-major helper expected `server_version_num` form and
+divided by 10000 — every backup fell back to the PG18 default sandbox,
+whose `pg_verifybackup` rejects a PG17 `pg_control` with "CRC is
+incorrect". Healthy, fully-restorable backups were reported as
+corrupt. The helper now recognises plain majors; the failure path also
+gained the actual pg_verifybackup output in its error message (it
+previously pointed at a `tool_stdout` body field that error results
+don't carry, and dropped stderr — where pg_verifybackup writes its
+findings — entirely).
+
+Also fixed while validating: agent-scheduled drills against an
+encrypted repo failed instantly because the drill task did not wire the
+keystore KEK resolver the way the `recovery drill` CLI does — it now
+does.
+
+## [1.0.15] — 2026-07-23
+
+### Fix: Patroni switchover hang — the real cause (#34, supersedes 1.0.14)
+
+1.0.14 shipped an INCOMPLETE fix for #34 based on a wrong root cause
+(reconnect backoff after a server `CopyDone`). Reproducing the bug on a
+real 3-node Patroni cluster proved that theory wrong — the old leader
+still hung — and revealed the actual mechanism:
+
+When the demoting primary shuts down, its physical walsender waits for
+our client to FLUSH-confirm the shutdown-checkpoint LSN before it will
+exit. But the checkpoint lands in a *partial* WAL segment, and the WAL
+sink only advances its flush position (`SyncedLSN`) when a full 16 MiB
+segment commits — so our reported flush never reaches the checkpoint.
+PG then spins reply-requested keepalives forever (measured ~1.26M in
+~2.5 min), the postmaster can't finish its fast-shutdown, and the
+Patroni demote hangs until the streamer is restarted.
+
+The streamer now detects that spin (a burst of caught-up keepalives
+with no new WAL) and ends the stream so the walsender can exit; the
+reconnect routes to the new primary and resumes gap-free from the real
+flush position. The ineffective 1.0.14 reconnect-backoff change is
+reverted. Verified end-to-end against a real 3-node Patroni switchover
+(old leader now rejoins as a streaming replica in ~90 s; without the
+fix it stays stuck at `stopping` indefinitely) plus a unit regression
+for the spin detector.
+
+## [1.0.14] — 2026-07-23
+
+### Fix: Patroni switchover hang (#34)
+
+`wal stream` prevented an old leader from restarting during a Patroni
+switchover. When the demoting primary's walsender ended the COPY
+(`CopyDone`), the stream reconnected on its 1-second floor — but during
+`demote in progress` the old node is still a read-write primary, so
+`target_session_attrs=primary` routed the reconnect straight back to it
+and re-armed a walsender that blocked the very fast-shutdown in
+progress. Server-initiated stream ends now reconnect with an escalating
+grace delay (≥ 10 s), giving the node walsender-free windows to finish
+the demote; the next reconnect then routes to the new primary.
+
+### Fix: concurrency audit — ten bugs (three demonstrated under `-race`)
+
+A three-way review (WAL pipeline, backup/CAS/storage, daemons/audit):
+
+- **Backup lease mutual exclusion** was breakable: a stale-reclaim race
+  let two backups hold the same deployment lease, and the runner only
+  logged lease loss instead of aborting. Reclaim/renew rewritten to
+  recheck → overwrite-in-place → settle-verify; lease loss now aborts
+  the backup.
+- **scp / sftp fake `IfNotExists`**: the `stat` + `mv -T` emulation let
+  two writers both "win" (rename overwrites), silently forking the
+  shared DEK (the #31 data-loss class) and destroying committed audit
+  events on those backends. Commit is now atomic `ln -T` (link(2)
+  EEXIST); sftp advertises `ConditionalPut` only with the hardlink
+  extension; the shared-DEK mint reads back for defense in depth.
+- **`wal stream` could hang forever** after a status-tick send failure
+  on a quiet stream (the receive now unblocks on the per-call context).
+- **System-identifier continuity** is rechecked on every reconnect, so
+  a failover onto a different cluster can no longer interleave foreign
+  WAL into the deployment's lineage.
+- The **first Ctrl-C** no longer kills the graceful WAL stop before
+  `pg_switch_wal` runs, and `clean_stop` is reported honestly.
+- **WAL-gap records** are persisted via a detached context on shutdown
+  and the CRITICAL escalation fires on every unpersisted exit path.
+- The **agent registry** no longer shares a mutable slice with in-flight
+  `/v1/agents` responses; the **syslog sink** no longer closes a
+  connection out from under a concurrent emit.
+
+### Fix: restore verification false failure
+
+The post-restore `SELECT 1` probe rejected psql stderr diagnostics
+(e.g. the collation-version `WARNING` when a cluster built against one
+glibc starts on another) mixed into combined output; it now checks only
+the final result row.
+
+## [1.0.13] — 2026-07-22
+
+### Fix: intermittently unrestorable encrypted backups under concurrent WAL streaming (#31)
+
+With `wal stream` running, a concurrently-taken base `backup` could
+commit a manifest that was silently **unrestorable** — `verify` reported
+mass chunk-integrity failures and `restore` failed with
+`encryption: unknown algorithm: 1`, even though `backup` exited 0.
+
+Root cause was a check-then-act race in the shared-DEK coordination. The
+CAS deduplicates chunks by plaintext hash, so every encrypted artifact
+under one KEK must share one DEK. Resolution only scanned *committed*
+manifests, so two writers that both started before either committed each
+minted a **different** DEK. A PostgreSQL full-page image in WAL that
+chunked to the same bytes as a base-backup file then deduped to one CAS
+slot, stored under one writer's DEK while the other's manifest referenced
+it under the other DEK — undecryptable.
+
+The DEK is now minted through an **atomic single-winner PUT** on a
+well-known shared-DEK object (`keys/shared-dek/<kekref-hash>.json`): the
+first writer wins, every concurrent writer reads back and reuses the
+winner's DEK, so streaming and base backups always converge on one DEK.
+Existing repos are seeded transparently from their manifests on first
+write. Covered by a 24-way concurrent regression test and validated
+end-to-end (streaming + racing backups → all verify + restore cleanly;
+exactly one shared-DEK object).
+
+## [1.0.12] — 2026-07-16
+
+### Docs: remove false-capability claims (managed DBaaS + unshipped features)
+
+An audit for the "documents a capability that doesn't actually work"
+class of bug, prompted by finding that several places claimed support
+for fully-managed DBaaS.
+
+- **Managed DBaaS**: the LLM-embedded README, SPEC, and the Kubernetes
+  sidecar chart (Chart.yaml + README) stated or implied pg_hardstorage
+  works against Amazon RDS/Aurora, GCP Cloud SQL, Azure Database, and
+  similar — while the rest of the docs correctly explain it cannot:
+  managed services do not expose `BASE_BACKUP` / physical replication
+  to customers. All corrected to the accurate "self-managed PostgreSQL
+  only" framing. The replication-protocol data plane removes the
+  *host-access* barrier — not the `BASE_BACKUP` barrier.
+- **Rekor**: a `TransparencyLog` code comment claimed a `rekor.Log`
+  implementation ships; only the self-hosted `StorageBackedLog` exists.
+  External Rekor is post-v1.0 roadmap (now stated as such).
+- **PCI-DSS evidence bundle**: the QSA runbook instructed verifying an
+  image-level SLSA attestation that isn't produced (container image
+  unpublished; image SLSA is roadmap). Added the caveat and a working
+  blob/tarball `slsa-verifier` alternative.
+- **FIPS artifact**: build-flavours described an "official
+  pg-hardstorage-fips distribution artifact… out of the box"; no such
+  artifact ships (it's roadmap). Reworded to build-from-source + a
+  planned-artifact note.
+- **SPEC packaging**: Scoop and the `-fips`/`-pg-ext` container image
+  variants were listed as shipped; marked planned/gated.
+
+No behaviour change.
+
+## [1.0.11] — 2026-07-16
+
+Twelve operator-inconvenience fixes found by exercising the CLI surface,
+each covered by a regression test.
+
+### Fix: false alarms and silent wrong-target
+
+- `repo scrub` reported 100% chunk corruption (exit 9) on every
+  ENCRYPTED repository — the default posture after `init` — because it
+  built a CAS with no decryptor. It now scrubs manifest-aware (the same
+  per-manifest CAS `repair scrub` uses), so encrypted chunks decrypt
+  and verify. Scheduled scrubs no longer page on every run.
+- The global `-c`/`--config` flag was advertised everywhere but read
+  nowhere; the tool always loaded the XDG/FHS default. It is now honored
+  for both reads and write-back, so `-c staging.yaml` operates on that
+  file.
+- `lint` always returned `{"status":"valid"}` without reading anything.
+  It now validates the resolved config with the real loader (strict
+  KnownFields + validation) and fails, with the reason, on a broken one.
+
+### Fix: dry-run / advisory tools no longer give false confidence
+
+- `recovery windows` advertised a PITR range straight across a WAL
+  archive hole; it now caps `latest_restore_lsn` at the first hole and
+  records the gap.
+- `restore --preview` reported "Pre-flight: ✓ ready" for a target past a
+  WAL hole that the real restore warns will HALT recovery; preview now
+  surfaces the same `wal_archive_hole` finding.
+- `capacity report` extrapolated a seconds-long sampling window into
+  absurd per-day growth labeled "medium confidence"; confidence now
+  requires a real observation window (≥1 day for medium, ≥1 week for
+  high) and a sub-day window carries an explicit caveat.
+- `rotate` stamped legally-HELD backups `[del ]` in its per-backup
+  listing while the summary said `held: N (excluded from delete)`; held
+  backups now render `[held]`.
+
+### Fix: wrong error class, hollow stubs, muscle memory
+
+- `recovery readiness` printed the RTO throughput as a nonsensical
+  duration (`46603h22m40s`) instead of a byte-rate (`160.0 MiB/s`).
+- `--incremental-from` against a PostgreSQL < 17 server was reported as
+  the generic `internal` (file-a-bug) code; it is now the structured
+  `backup.incremental_unsupported` usage error with a hint.
+- `repo init` accepts the repository URL via `--repo` (matching every
+  other `repo` verb), not only as a bare positional.
+- `explain <command>` now returns the command's real summary, usage, and
+  description instead of echoing the argument back.
+- `glossary <term>` now returns the term's definition (an unknown term
+  is `notfound.term`) instead of dropping the description.
+
+Also: the renderer integer-fidelity fix (YAML/CSV scientific-notation)
+was extended to a shared `jsonshape` helper covering tap/junit/pdf/
+template.
+
+## [1.0.10] — 2026-07-15
+
+### Fix: `recovery drill` failed every WAL-streaming backup (#26)
+
+The verify sandbox that `recovery drill` and `verify --full` use ran
+`pg_verifybackup` without `-n`/`--no-parse-wal`. pg_hardstorage stores
+WAL in the repository rather than inside the base backup, so the
+restored data directory legitimately has an empty `pg_wal/` — the
+WAL-parse step therefore failed every structurally-valid WAL-streaming
+backup with `could not find any WAL file`, and the drill reported
+`verdict: fail` for backups that restore, recover, and serve data
+correctly. The sandbox now verifies the manifest and file checksums
+with `-n`, matching the restore path's `--verify` gate (the same
+defect was fixed there in 1.0.8).
+
+### Fix: `hold remove` reported success for holds that don't exist
+
+Releasing a hold with a typo'd backup ID printed `✓ Hold released`
+and exited 0 while the real hold silently kept blocking retention — a
+false success on the legal-hold path. Removal of a nonexistent hold
+now fails with `notfound.hold` (exit 6) and points at `hold list`;
+releasing an existing hold is unchanged.
+
+### Fix: JSON output shape papercuts
+
+- `backup compare -o json` double-nested its payload under
+  `.result.result.*`; the comparison fields now sit at `.result.*`
+  like every other command.
+- `list` on a deployment with no backups emitted `"backups": null`;
+  it now emits `[]`, so `jq '.result.backups[]'` and every other
+  iterator handle the empty case.
+
+## [1.0.9] — 2026-07-13
+
+Twenty operator-annoyance fixes, found by systematically exercising the
+user-facing surface (first-run flows, error hints, exit codes, output
+consistency) and each covered by a regression test.
+
+### Fix: first-run experience
+
+- `init` no longer busy-loops forever (flooding the terminal) when
+  stdin is closed — a CI pipe or Ctrl-D now aborts with a structured
+  error pointing at flags + `--yes`.
+- `init --quick` defaults to a user-writable repository path for
+  non-root users instead of failing on `/var/backups/pg_hardstorage`
+  with a permission error.
+- init's "Next steps" suggests the flagless `wal stream <deployment>`
+  (the config it just wrote makes it work) instead of a literal
+  `--pg-connection ...` placeholder that retried an unparseable DSN
+  forever; operator-input (`usage.*`) errors now fail the stream
+  setup fast instead of retrying.
+- Ctrl-C / SIGTERM now cancel the command context so deferred cleanup
+  runs — interrupting `demo` no longer leaks its throwaway PostgreSQL
+  container.
+
+### Fix: hints and error classification
+
+- Every remediation hint is copy-pasteable: doctor's audit-anchor
+  hints include `--repo <url>`; the checkpoint-mismatch suggestion
+  gives the resume command (it previously steered operators — and
+  automation reading its `command` field — toward `rm -rf` of the
+  partially-restored target, and referenced a flag that doesn't
+  exist); the GDPR erasure report and `jit` help no longer recommend
+  the nonexistent `kms shred --tenant`; the plain-restore notice
+  names the real `--to` flag.
+- A typo'd subcommand under a group (`wal audi`, `repo bogus`) now
+  fails with exit 2 and a "did you mean" instead of printing help and
+  exiting 0 (a cron job with a typo stayed green forever); unknown
+  top-level commands also exit 2.
+- An empty backup-ID argument (unset shell variable) is a usage error
+  (exit 2) — `verify` previously reported it as a manifest SIGNATURE
+  failure (exit 9, the pager-worthy "corrupt/tampered" code).
+- A typo'd deployment name yields `notfound.deployment` listing the
+  configured names instead of demanding `--pg-connection`/`--repo`.
+
+### Fix: consistency and safety
+
+- `--version` works (CLI muscle memory); the help banner no longer
+  claims "v0.2"; `changelog` reports the real binary version.
+- `daily_at` schedules are documented as host-local time (they always
+  were) and the schedule display shows the actual zone + UTC offset.
+- `backup delete` — the most destructive verb — now requires `--yes`
+  (or an approval), matching every other gated verb.
+- Bare `status` / `rotate` / `audit anchor` resolve `--repo` from the
+  config when every deployment shares one repository.
+- `--verify` and `--verify-restore` accept each other's vocabulary
+  (`skip`≡`off`, `require`≡`required`).
+- Durations render as `N ms` everywhere (list/init/verify matched
+  show/backup/restore); the `status` tombstone footnote no longer
+  blows the table fifty columns wide.
+- The generated `restore_command` runs `wal fetch` with `-o text -q`,
+  so routine end-of-WAL probes log one line instead of ten-line JSON
+  documents in the PostgreSQL server log.
+
+## [1.0.8] — 2026-07-06
+
+### Fix: post-restore verification failed on every base-only restore
+
+The `restore --verify` gate ran `pg_verifybackup` without `-n`, so it
+tried to parse WAL. A pg_hardstorage restore lays down the base backup
+only — the WAL needed to reach consistency is fetched at recovery time
+via the `restore_command` — so the restored data directory has no
+`pg_wal` segments yet, and `pg_verifybackup` failed every normal restore
+with `could not find any WAL file`, reporting `Verification: failed`. It
+now passes `-n` (`--no-parse-wal`), verifying the manifest and file
+checksums; a clean restore reports `Verification: passed`.
+
+### Fix: the interactive `simple` helper accepted the wrong repo schemes
+
+`pg_hardstorage_simple` validated `gs://` and `azure://` — schemes with
+no registered backend — and rejected the real `gcs://` and `azblob://`.
+It now accepts exactly the schemes the storage registry provides
+(`file` / `s3` / `gcs` / `azblob` / `sftp` / `scp`).
+
+### Documentation: full accuracy pass against the code
+
+Validated the README and the entire documentation tree against the
+shipped binary — capturing real command output where examples are shown
+— and corrected everything that did not match: nonexistent commands and
+flags, wrong error codes and config keys, stale "roadmap/v0.5" framing
+for shipped features, an incorrect Tier-2 plugin-protocol description
+(the shipped transport is stdio JSON-RPC), unpublished-artifact
+references, and roughly thirty fabricated sample-output blocks. Link
+integrity was verified (no dead links).
+
+## [1.0.7] — 2026-07-02
+
+A broad code-review pass fixed 79 correctness bugs across the codebase,
+each with a regression test. The whole suite — unit, race, integration
+(against real PostgreSQL), and the Patroni failover / data-integrity
+lane — is green. Highlights, grouped by blast radius:
+
+### Fix: data-integrity and durability
+
+- Restore placed non-default tablespace contents under the data
+  directory root instead of their real tablespace location (while
+  `tablespace_map` pointed at an empty directory). Files now carry
+  their owning tablespace and restore to the correct path.
+- The local-filesystem barrier could, on a retried commit after an
+  fsync error, drop already-staged chunks — leaving a committed
+  manifest that referenced objects never published (an unrestorable
+  backup). Retries now preserve every staged write.
+- The Azure backend's rename deleted the source before its async copy
+  completed, so a manifest commit could report success with the
+  destination absent; it now waits for copy completion.
+- Air-gap bundle import now verifies each chunk's SHA-256 against its
+  content-addressed key, so a corrupt or tampered bundle can't plant a
+  wrong-content chunk that later backups dedup against.
+- A WAL slot that Patroni re-created at promotion, ahead of the agent's
+  last archived byte, silently masked a real WAL hole; the gap is now
+  detected and surfaced so restore pre-flight can refuse a PITR into
+  the missing range.
+
+### Fix: security and privacy
+
+- The PKCS#11 KMS reference stamped into every manifest could carry an
+  inline HSM PIN in cleartext; the PIN is now stripped from the
+  persisted reference.
+- `llm ask` / `llm explain` silently ignored a configured `strict` /
+  `local-only` privacy mode, and the chat privacy gate ignored an
+  endpoint set via environment — either could let a local-only session
+  reach a public endpoint. Both now enforce the resolved endpoint.
+- Chain-restore staging moved off a predictable, world-writable temp
+  path to a private per-restore directory.
+
+### Fix: retention, holds, and the control plane
+
+- Concurrent retention sweeps could orphan a live backup chain or
+  defeat a legal hold placed mid-sweep; both delete paths now re-check
+  and roll back.
+- Agents advertised only `backup`, so restore and verify jobs enqueued
+  through the control plane sat queued forever; agents now claim every
+  job kind they can execute, and job execution no longer blocks
+  heartbeats.
+
+### Fix: compatibility shims
+
+- The Barman, WAL-G, and pgBackRest compatibility layers emitted
+  command-line arguments and generated configuration the native CLI
+  rejected; the affected `recover` / `check` / `backup-fetch` /
+  recovery-target / config-translation paths now work.
+
+### Fix: reporting
+
+- `duration_ms` fields in backup, restore, gameday, and verification
+  JSON emitted nanoseconds under a millisecond key (values inflated a
+  million-fold); they now emit milliseconds. The JSON keys are
+  unchanged.
+
+Also fixed: numerous CLI verb correctness issues (`repo scrub` /
+`repo gc` / `repo check` / `status` / `doctor` / `repair` / `audit` /
+`list` / `logs`), storage-backend listing/temp-file hygiene, logical-
+receiver shutdown and flush correctness, and post-restore verification
+cleanup. See the commit history for the full itemised list.
+
+## [1.0.6] — 2026-06-27
+
+### Fix: backups with a non-default tablespace (#17)
+
+A backup of a cluster that has any user tablespace failed to commit with
+`backup.manifest_invalid: backup_label is empty (required for restore)`.
+PG streams the base/default tablespace archive — the one carrying
+`backup_label` and `tablespace_map` — *last* when user tablespaces exist,
+but the tar sink only looked for those files in the first archive. It now
+captures them from whichever archive holds them, so multi-tablespace
+clusters back up (and restore) correctly.
+
+### Fix: `pg_hardstorage demo` now actually runs (#15)
+
+The `demo` command previously printed a one-line description and exited
+without doing anything. It now runs the real end-to-end flow — start a
+throwaway PostgreSQL in Docker, initialise a repo, back up, restore, and
+verify, then clean up — driving your `docker` CLI so a non-default daemon
+set via `DOCKER_HOST` (Lima, Colima, Podman) is honoured, and reporting a
+clear error if Docker isn't reachable instead of silently succeeding.
+
+## [1.0.5] — 2026-06-26
+
+### Docs: refine product messaging and positioning
+
+More precise product messaging and positioning across the documentation
+and the project spec. Wording-only; no code, CLI/API, or on-disk schema
+changes.
+
+## [1.0.4] — 2026-06-24
+
+### Fix: deployment-scoped commands now read the deployment config (#12)
+
+`pg_hardstorage backup <deployment>` (and `restore`, `verify`, `list`,
+`show`, `status`, `hold`, `rotate`, `recovery`, `repair`, `wal
+preflight/stream/list/audit/prune/gaps`, `partial`, `kms verify/shred`,
+…) used to demand `--pg-connection` / `--repo` even when the named
+deployment already declared them in `pg_hardstorage.yaml`. They now
+resolve those values from the deployment catalogue when the flags are
+omitted (explicit flags still win); a deployment that isn't configured,
+or a genuinely missing flag, still errors as before. Resolution happens
+once, in a shared root pre-run hook, so every deployment-scoped command
+behaves identically.
+
+## [1.0.3] — 2026-06-24
+
+### Documentation: correctness sweep + cloud-support accuracy
+
+Audited the documentation against the codebase and corrected false or
+stale claims. The big one: pg_hardstorage backs up self-managed
+PostgreSQL over the physical replication protocol (`BASE_BACKUP` + a
+physical slot); fully-managed DBaaS — Amazon RDS, Aurora, Cloud SQL,
+Azure Database, Neon, Supabase — do **not** expose `BASE_BACKUP` and are
+out of scope. Every "works on managed PG" claim was removed (web-verified
+against each vendor's replication docs). Also fixed: feature counts (six
+storage backends, one LLM provider), PG-version support (15–18; 15/16/17
+CI-required, 18 allow-failure), nonexistent CLI flags in tutorials / ops
+guides, broken in-repo file paths, stale version strings, and the
+AES-256-GCM-SIV-vs-GCM and cosign-vs-Ed25519 descriptions. CNPG-I, Rekor
+anchoring, skill signing, and the FIPS image are now clearly marked
+roadmap. Download / verify examples use a `VERSION` variable so they no
+longer go stale.
+
+### Documentation: highlight encryption-key custody (#8)
+
+The encryption tutorial and FAQ now state plainly where the local KEK
+lives (`kek.bin` in the keyring directory), that losing it makes every
+backup under it unrecoverable, that the keyring directory must be backed
+up separately from the repository, and that `PG_HARDSTORAGE_KEYRING_DIR`
+overrides its location (with `pg_hardstorage doctor` reporting the
+resolved path). Also corrected a stale "GCP/Azure/Vault KMS slated for
+v0.5+" note (those providers ship today).
+
+### Packaging: wire container-image publishing (GHCR)
+
+The release pipeline can now build and publish multi-arch (amd64/arm64)
+distroless images to GHCR with keyless cosign image signatures. Publishing
+is gated on the `PUBLISH_CONTAINERS` repo variable — set it once the org
+enables Actions package-write on `ghcr.io`; until then the release ships
+binaries / `.deb` / `.rpm` / Homebrew as before. Image-level SLSA
+provenance remains roadmap. A `goreleaser check` step now validates the
+release config in CI.
+
+## [1.0.1] — 2026-06-23
+
+### Packaging: remove the obsolete homebrew-formula.json manifest
+
+Dropped `scripts/homebrew-formula.json`, a leftover hand-maintained tap
+manifest that nothing consumes: the Homebrew artefact is generated and
+pushed to the tap by goreleaser on release. Updated `scripts/README.md`
+accordingly.
+
+### Packaging: publish a Homebrew cask on release
+
+goreleaser now generates and pushes a Homebrew cask to the org-wide tap
+(cybertec-postgresql/homebrew-tap) on each release, so
+`brew install cybertec-postgresql/tap/pg_hardstorage` works on macOS
+(Apple Silicon) and Linux (amd64/arm64). A cask (not a formula) is used
+because goreleaser deprecated the formula pipe in v2.16. The macOS path
+strips the Gatekeeper quarantine xattr on install, since the binaries
+are cosign-signed but not Apple-notarised. No hard PostgreSQL dependency:
+the agent talks to PostgreSQL over the replication protocol, so the
+optional psql client is surfaced as a caveat instead. The push uses a
+dedicated HOMEBREW_TAP_TOKEN secret.
+
+### Installer: fix and harden the curl|sh installer
+
+The `scripts/install.sh` one-liner now works against real releases: it
+builds the versioned goreleaser archive name, resolves `latest` via the
+GitHub release redirect, and parses `--version`/`--bindir`/`--no-verify`
+flags correctly (previously `latest` and the unversioned archive name
+both 404'd, and `--version` was mis-read). The script is strict POSIX
+`sh` so the canonical `curl | sh` works under dash/busybox without a
+bash re-exec. Downloads are verified by SHA-256 against `checksums.txt`,
+and by cosign signature when cosign is installed. Added a Cloudflare
+Worker (`deploy/cloudflare/`) to serve the script at get.pghardstorage.org.
+
+### Docs: brand the documentation site
+
+The documentation site now matches the pghardstorage.org brand: the
+website's navy + cyan palette (light and dark schemes), the wordmark in
+the header and a light/dark home-page hero, favicon, typography tuning,
+a branded footer with CYBERTEC links, and a right-hand mobile navigation
+drawer. The home-page title was de-duplicated and made SEO-friendly, and
+Open Graph + Twitter Card meta tags were added for social share previews.
+All assets are repo-local (air-gapped posture); no new build dependencies.
+
+### Docs: publish the documentation site to GitHub Pages
+
+The docs CI built and validated the site but never published it. A
+push-on-main-gated deploy job now publishes it to GitHub Pages at
+docs.pghardstorage.org. PRs continue to only build + preview.
+
+## [1.0.0] — 2026-06-18
+
 ### Added
 
 - Initial public release.

@@ -51,8 +51,8 @@ pg_hardstorage backup <deployment> [flags]
       --ignore-capacity                    skip the capacity pre-flight (refuse-on-low-free-space gate); use only when the projection is misleading
       --include-wal wal stream             embed every WAL segment needed for recovery into the basebackup tar stream (equivalent to pg_basebackup -X stream).  Default off — production deployments use wal stream for continuous archiving.  Set this for self-contained correctness scenarios where no separate WAL archiver is running.
       --incremental-from string            take a PG 17+ incremental backup against this parent backup ID; requires summarize_wal=on on the source DB
-      --kek string                         KEK reference (default: local:default if a kek.bin is present). Cloud-KMS schemes: aws-kms://<arn-or-alias-or-key-id>. The runner opens the matching kms.Provider and asks it to wrap the per-backup DEK; the manifest stamps the KEKRef so restore can pick the right unwrap path.
-      --kms-config stringToString          per-call config for the cloud-KMS provider (e.g. region=us-east-1,use_fips_endpoint=true). Only consulted when --kek is a cloud scheme. (default [])
+      --kek string                         KEK reference (default: the deployment's kek_ref in pg_hardstorage.yaml, else local:default if a kek.bin is present). Cloud-KMS schemes: aws-kms://<arn-or-alias-or-key-id>. The runner opens the matching kms.Provider and asks it to wrap the per-backup DEK; the manifest stamps the KEKRef so restore can pick the right unwrap path.
+      --kms-config stringToString          per-call config for the cloud-KMS provider (e.g. region=us-east-1,use_fips_endpoint=true). Only consulted for a cloud scheme; replaces the matching kms.providers entry in pg_hardstorage.yaml for this run. (default [])
       --label string                       backup label for backup_label (default: derived from backup ID)
       --no-encrypt                         force unencrypted backup even when a KEK file is present
       --pg-connection string               libpq connection string for the source PostgreSQL (required)

@@ -506,7 +506,12 @@ release-snapshot: build
 # internal/llm/docs/{root,runbooks}/ as the embed source.
 #
 # Run this whenever CHANGELOG.md / README.md / docs/runbooks/*.md
-# change; CI checks that the bundled copies match.
+# change.  TestBundledCorpusMatchesCanonicalDocs
+# (internal/llm/docs/corpus_freshness_test.go) fails the normal test
+# run when a copy is stale, so a forgotten sync can't ship.  That check
+# was previously claimed here but not implemented, and the corpus drifted
+# far enough that the assistant was quoting removed CLI flags to
+# operators mid-incident.
 sync-llm-docs:
 	@mkdir -p internal/llm/docs/runbooks internal/llm/docs/root
 	cp docs/reference/runbooks/*.md internal/llm/docs/runbooks/

@@ -166,6 +166,7 @@ deploys.
 
 ## Next steps
 
+- [KEKRef selection reference](../../reference/kekref-schemes.md#selecting-a-kekref) — precedence, version-pinned refs, drop-in overrides
 - [Rotate the KEK](../operating/rotate-kek.md)
 - [Crypto-shred](../operating/crypto-shred.md)
 - [Add a GCS repository](repository-gcs.md)

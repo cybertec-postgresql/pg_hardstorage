@@ -128,18 +128,32 @@ pg_hardstorage repo init scp://backup@nas.example.com/srv/pg-hardstorage
   Created: 2026-07-06T13:56:34Z
 ```
 
-The plugin reads `identity_file`, `identity_passphrase`, and
-`known_hosts` from the deployment's `extras` map.  Configure
-them in `pg_hardstorage.yaml`:
+Credentials are supplied through the environment, the same way
+[the SFTP backend](repository-sftp.md) takes them:
 
-```yaml
-deployments:
-  db1:
-    repo: scp://backup@nas.example.com/srv/pg-hardstorage
-    extras:
-      identity_file: /etc/pg_hardstorage/keys/scp_id_ed25519
-      known_hosts:   /etc/pg_hardstorage/keys/known_hosts
+```bash
+PG_HARDSTORAGE_SCP_IDENTITY_FILE=/etc/pg_hardstorage/keys/scp_id_ed25519
+PG_HARDSTORAGE_SCP_KNOWN_HOSTS=/etc/pg_hardstorage/keys/known_hosts
+# optional:
+PG_HARDSTORAGE_SCP_IDENTITY_PASSPHRASE=…
+PG_HARDSTORAGE_SCP_PASSWORD=…            # password auth instead of a key
 ```
+
+Under systemd, put these in an `EnvironmentFile=` readable only
+by the agent user — a key *path* is not a secret, but
+`…_PASSPHRASE` and `…_PASSWORD` are.
+
+`known_hosts` is mandatory: the plugin refuses the
+`StrictHostKeyChecking=no` posture outright. Generate it with
+`ssh-keyscan -p <port> <host> > known_hosts`.
+
+!!! note "No config-file equivalent yet"
+
+    The plugin also accepts these from a storage-plugin `extras`
+    map, but nothing populates that map in production —
+    `StorageConfig` is built from the URL alone — so the
+    environment variables above are the only working mechanism
+    for both `scp://` and `sftp://`.
 
 ### 5. Verify
 

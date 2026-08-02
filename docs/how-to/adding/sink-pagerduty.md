@@ -60,7 +60,6 @@ sinks:
       source: "pg_hardstorage@db1"     # default: "pg_hardstorage"
       client: "pg_hardstorage"         # appears in the incident
       client_url: "https://runbooks.acme.com/pg-hardstorage"
-    filter:
       min_severity: error              # default: error
 ```
 

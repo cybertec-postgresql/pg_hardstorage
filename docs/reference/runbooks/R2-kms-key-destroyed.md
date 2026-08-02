@@ -36,6 +36,18 @@ new backups from being written under a missing key.
    mv ~/.config/pg_hardstorage/keyring ~/.config/pg_hardstorage/keyring.lost.$(date +%s)
    ```
 
+   For a **cloud** KEK the keyring is not where the key lived, so
+   that move changes nothing. Clear the deployment's `kek_ref` in
+   `pg_hardstorage.yaml` (or stop its schedule) instead — otherwise
+   the agent keeps opening a destroyed key on every scheduled
+   backup, and each failure is indistinguishable from a transient
+   KMS outage in the logs:
+
+   ```sh
+   grep -n 'kek_ref' /etc/pg_hardstorage/pg_hardstorage.yaml
+   systemctl stop pg_hardstorage-agent
+   ```
+
 2. **Inventory affected backups.** The `KEKRef` lives in each
    manifest under `encryption.kek_ref`:
 

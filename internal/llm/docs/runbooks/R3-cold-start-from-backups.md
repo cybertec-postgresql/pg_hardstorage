@@ -90,8 +90,9 @@ Before touching anything, verify the inputs you have:
    WAL gaps (the preview will refuse if not). Confirm the
    tablespace mapping matches what you expect on this host.
 
-3. **Run the restore.** Same flags, drop `--preview`, add
-   `--confirm` to suppress the second prompt if you're scripting:
+3. **Run the restore.** Same flags, drop `--preview`. Pass
+   `--force` if the target directory is non-empty (the default
+   refuses to overwrite):
 
    ```sh
    pg_hardstorage restore <deployment> <backup-id> \

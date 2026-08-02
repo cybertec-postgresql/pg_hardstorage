@@ -194,6 +194,14 @@ contract.
 - The repo's chunk bytes. They're now ciphertext nobody holds
   the key for. `pg_hardstorage repo gc` reclaims them on the
   next pass.
+- The deployment's `kek_ref` in `pg_hardstorage.yaml`, if it
+  declares one. Shredding destroys the key, not the reference
+  to it — so a still-scheduled deployment keeps trying to open
+  a destroyed KEK and every backup fails. Point it at the
+  replacement KEK, or retire the deployment entry, as part of
+  the same change. `pg_hardstorage doctor` will not catch this
+  one: the scheme is still valid, only the key behind it is
+  gone.
 
 ## Troubleshooting
 

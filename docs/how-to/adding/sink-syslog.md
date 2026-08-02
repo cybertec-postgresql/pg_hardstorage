@@ -98,7 +98,6 @@ sinks:
         server_name: siem.acme.internal  # SNI / cert-name override (optional)
         min_version: tls1.2              # tls1.2 | tls1.3 (default tls1.2)
         insecure_skip_verify: false      # opt-out of cert verification (TEST ONLY)
-    filter:
       min_severity: notice               # default
 ```
 

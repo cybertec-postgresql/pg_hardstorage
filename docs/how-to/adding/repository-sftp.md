@@ -110,14 +110,28 @@ The plugin reads `identity_file`, `identity_passphrase`, and
 `known_hosts` from the deployment's `extras` map. Configure them
 in `pg_hardstorage.yaml`:
 
-```yaml
-deployments:
-  db1:
-    repo: sftp://backup@nas.example.com/srv/pg-hardstorage
-    extras:
-      identity_file: /etc/pg_hardstorage/keys/sftp_id_ed25519
-      known_hosts:   /etc/pg_hardstorage/keys/known_hosts
+Credentials are supplied through the environment, not through
+`pg_hardstorage.yaml`:
+
+```bash
+PG_HARDSTORAGE_SFTP_IDENTITY_FILE=/etc/pg_hardstorage/keys/sftp_id_ed25519
+PG_HARDSTORAGE_SFTP_KNOWN_HOSTS=/etc/pg_hardstorage/keys/known_hosts
+# optional:
+PG_HARDSTORAGE_SFTP_IDENTITY_PASSPHRASE=…
+PG_HARDSTORAGE_SFTP_PASSWORD=…            # password auth instead of a key
 ```
+
+Under systemd, put these in an `EnvironmentFile=` that only the
+agent user can read — a private-key path is not a secret, but
+`…_PASSPHRASE` and `…_PASSWORD` are.
+
+!!! warning "There is no config-file equivalent yet"
+
+    The plugin also accepts these values from a storage-plugin
+    `extras` map, but nothing populates that map in production —
+    `StorageConfig` is constructed from the URL alone. Until a
+    config surface for it lands, the environment variables above
+    are the only working mechanism.
 
 ### 5. Verify
 

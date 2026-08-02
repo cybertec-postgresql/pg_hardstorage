@@ -35,7 +35,7 @@ func newKmsCmd() *cobra.Command {
 		Short: "Manage encryption keys",
 		Long: `The read-only ` + "`kms inspect`" + ` surface. Mutating
 verbs (rotate, shred, hsm-status) land alongside the KMS
-plugin tier (gcp-kms, azure-key-vault, vault-transit) and the PKCS#11
+plugin tier (gcp-kms, azure-kv, vault-transit) and the PKCS#11
 / TPM 2.0 integrations.`,
 	}
 	c.AddCommand(newKmsInspectCmd())

@@ -39,8 +39,12 @@ what isn't.
    pg_hardstorage repair chunks --missing --repo <url> -o json | tee /tmp/missing.json
    ```
 
-2. **If a replica exists, fetch known-good chunks.** Manual today
-   (auto-heal lands in v0.5+). For each corrupt chunk hash, copy
+2. **If a replica exists, auto-heal from it.** The fastest path is
+   `pg_hardstorage repair scrub --heal --replica <replica-url>`,
+   which re-fetches every mismatched chunk from the replica and
+   rewrites it locally (use `--dry-run-heal` first to preview).
+
+   To heal by hand instead, for each corrupt chunk hash copy
    the corresponding object from the replica region's
    `chunks/sha256/aa/bb/aabb<rest>.chk` to the same path under
    the primary region. Fail-safe because writes are CAS — the
@@ -58,16 +62,23 @@ what isn't.
              s3://<primary-bucket>/chunks/sha256/aa/bb/
    ```
 
-3. **If a manifest's primary copy is corrupt** but the replica is
-   intact, repair from the replica:
+3. **If either copy of a manifest is corrupt** — primary or
+   replica — reconcile the two from whichever side is intact:
 
    ```sh
    pg_hardstorage repair manifest <deployment> <backup-id>
    ```
 
-   Verifies the replica's signature, cross-checks identity,
-   atomic-replaces via `.tmp` + rename. Refuses to overwrite a
-   valid primary without `--force`.
+   The command repairs in whichever direction is needed: a
+   corrupt/missing **primary** is re-fetched from a good replica
+   (the classic recovery), and a missing/corrupt **replica** is
+   rebuilt from a good primary (`rebuilt_replica=true` in the
+   result), restoring cross-prefix corruption survivability. It
+   verifies the good copy's signature, cross-checks identity, and
+   atomic-replaces via `.tmp` + rename; it refuses to overwrite a
+   valid copy without `--force`. If neither copy verifies, the
+   manifest is unrecoverable and the backup can no longer be
+   restored.
 
 4. **Clean up orphans** that may have accumulated from partial
    writes:
@@ -85,7 +96,7 @@ what isn't.
    ```sh
    pg_hardstorage hold add <deployment> <backup-id> \
        --holder <oncall> --reason "Corrupt chunks, audit ref <ticket>"
-   pg_hardstorage rotate <deployment> --policy custom --tombstone <backup-id> --apply
+   pg_hardstorage backup delete <deployment> <backup-id>
    ```
 
 6. **Re-run scrub** to confirm clean state:

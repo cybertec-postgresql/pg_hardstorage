@@ -61,7 +61,6 @@ sinks:
       auth_header: "Bearer eyJ..."       # optional Authorization
       content_type: application/json     # default
       timeout: 10s                       # connect + write
-    filter:
       min_severity: warning              # default: notice
 ```
 

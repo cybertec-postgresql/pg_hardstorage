@@ -76,9 +76,7 @@ sinks:
       webhook_url: https://hooks.slack.com/services/T.../B.../...
       channel: "#pg-backups"            # optional; overrides webhook default
       username: "pg_hardstorage"        # optional bot username
-    filter:
       min_severity: warning             # default: notice
-      components: ["backup", "wal.stream", "verify", "kms"]
 ```
 
 | Key | Default | Notes |
@@ -87,7 +85,6 @@ sinks:
 | `channel` | webhook default | Override the default channel pinned to the webhook. |
 | `username` | `pg_hardstorage` | Bot username shown in the message header. |
 | `min_severity` | `notice` | RFC 5424; the sink emits when severity ≤ floor. |
-| `components` | all | Allowlist of components (`backup`, `wal.stream`, `verify`, `kms`, `audit`, …). |
 
 ## Severity floor
 

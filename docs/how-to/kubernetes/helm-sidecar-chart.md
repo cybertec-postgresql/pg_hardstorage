@@ -161,11 +161,19 @@ Example:
 ```yaml
 config: |
   kms:
-    default:
-      type: aws-kms
-      region: eu-central-1
-      key_id: arn:aws:kms:eu-central-1:111122223333:key/abcd-...
+    providers:
+      - kek_ref: aws-kms://arn:aws:kms:eu-central-1:111122223333:key/abcd-...
+        config:
+          region: eu-central-1
+  deployments:
+    db1:
+      repo: s3://acme-pg-backups/
+      kek_ref: aws-kms://arn:aws:kms:eu-central-1:111122223333:key/abcd-...
 ```
+
+The deployment's `kek_ref` is what the sidecar's scheduled
+backups and its WAL archiver resolve against — no `--kek`
+flag is involved, because neither has a command line.
 
 For the AWS path the chart's ServiceAccount carries the
 IRSA annotation:

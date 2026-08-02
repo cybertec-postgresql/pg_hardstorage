@@ -565,9 +565,7 @@ sinks:
     plugin: slack
     config:
       webhook_url: https://hooks.slack.com/services/T/B/X
-    filter:
       min_severity: warning
-      components: ["backup", "wal.stream", "verify", "kms"]
 
   - name: prod-syslog
     plugin: syslog
@@ -575,7 +573,6 @@ sinks:
       protocol: tls               # tls | tcp | udp
       address: siem.example.com:6514
       facility: local6
-    filter:
       min_severity: notice
 
   - name: ops-webhook
@@ -656,7 +653,6 @@ sinks:
     plugin: slack
     config:
       webhook_url: https://hooks.slack.com/services/T/B/X
-    filter:
       min_severity: warning
 ```
 

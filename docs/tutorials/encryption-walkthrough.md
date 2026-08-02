@@ -26,7 +26,7 @@ copy lands in the manifest. There are two KEK schemes shipped today:
   `KMS:Encrypt` / `KMS:Decrypt` against the configured key. Good
   for fleets that already centralise key custody.
 
-GCP KMS (`gcp-kms://`), Azure Key Vault (`azure-key-vault://`), and
+GCP KMS (`gcp-kms://`), Azure Key Vault (`azure-kv://`), and
 HashiCorp Vault Transit (`vault-transit://`) ship as well, and
 `kms shred` (crypto-shred) is available today. PKCS#11 / TPM2 (HSM)
 binding ships in the `pkcs11` / FIPS build flavour.

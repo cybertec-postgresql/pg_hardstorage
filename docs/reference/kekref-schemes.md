@@ -38,6 +38,63 @@ release line.
 
 ---
 
+## Selecting a KEKRef
+
+A deployment declares its KEKRef in `pg_hardstorage.yaml`;
+per-provider settings (region, endpoint, credentials, FIPS
+declaration) live in a top-level `kms.providers` entry keyed
+by the same reference:
+
+```yaml
+kms:
+  providers:
+    - kek_ref: aws-kms://alias/pg-hardstorage-prod
+      config:
+        region: us-east-1
+deployments:
+  db1:
+    repo: s3://acme-pg-backups/
+    kek_ref: aws-kms://alias/pg-hardstorage-prod
+```
+
+Every command accepts `--kek` and `--kms-config key=value`,
+which override the configured values for that run. Config is
+what makes a cloud KEK reachable from the paths that have no
+command line to put them on: the agent's scheduled backups and
+control-plane-dispatched jobs. (`wal push` runs from
+`archive_command`, so it *can* carry flags — but they are then
+pinned in `postgresql.conf`, which is a poor place to rotate a
+credential from.)
+
+Lookup details:
+
+- A version-pinned reference inherits the provider config
+  declared for its base reference, so
+  `azure-kv://vault/key/9f2c` picks up the entry for
+  `azure-kv://vault/key`. (Azure `Shred` requires the pinned
+  form; re-declaring the provider per key version would
+  guarantee drift.)
+- Sibling keys do not: `azure-kv://vault/key-rsa` does not
+  match the entry for `azure-kv://vault/key`.
+- A `conf.d` drop-in that re-declares a reference overrides
+  the base file's config for it.
+- Schemes that carry everything in the reference itself —
+  `pkcs11://…?module=…&pin_source=…` — need no `kms.providers`
+  entry at all.
+- A declared reference whose provider fails to open fails the
+  run. There is no fall-back to the local keyring: a silent
+  downgrade would write local-wrapped manifests into a repo
+  whose other manifests are KMS-wrapped.
+
+Setting `kek_ref` to a cloud scheme makes the deployment's
+backups encrypted without `--encrypt`. `local:default` keeps
+the "a KEK is present ⇒ encrypt" posture — with no `kek.bin`
+on the keyring there is nothing to encrypt with, so the
+backup is plaintext unless `--encrypt` forces the refusal.
+`--no-encrypt` always wins.
+
+---
+
 ## `local:`
 
 ```

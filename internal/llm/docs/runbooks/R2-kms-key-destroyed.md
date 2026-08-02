@@ -36,13 +36,33 @@ new backups from being written under a missing key.
    mv ~/.config/pg_hardstorage/keyring ~/.config/pg_hardstorage/keyring.lost.$(date +%s)
    ```
 
+   For a **cloud** KEK the keyring is not where the key lived, so
+   that move changes nothing. Clear the deployment's `kek_ref` in
+   `pg_hardstorage.yaml` (or stop its schedule) instead — otherwise
+   the agent keeps opening a destroyed key on every scheduled
+   backup, and each failure is indistinguishable from a transient
+   KMS outage in the logs:
+
+   ```sh
+   grep -n 'kek_ref' /etc/pg_hardstorage/pg_hardstorage.yaml
+   systemctl stop pg_hardstorage-agent
+   ```
+
 2. **Inventory affected backups.** The `KEKRef` lives in each
    manifest under `encryption.kek_ref`:
 
+   `list` does not carry the `encryption` block; the per-backup
+   manifest does. Enumerate backups, then read each manifest with
+   `manifest show` (whose body embeds the full manifest, including
+   `encryption.kek_ref` and `backup_id`):
+
    ```sh
    for d in $(pg_hardstorage deployment list -o json | jq -r '.result.body.deployments[].name'); do
-     pg_hardstorage list "$d" -o json | jq -r --arg key "<missing-kek-ref>" \
-       '.result.body.backups[] | select(.encryption.kek_ref == $key) | "\($d) \(.id)"'
+     for b in $(pg_hardstorage list "$d" -o json | jq -r '.result.body.backups[].backup_id'); do
+       pg_hardstorage manifest show "$d" "$b" -o json | jq -r --arg key "<missing-kek-ref>" \
+         'select(.result.body.encryption.kek_ref == $key) | "\(.result.body.backup_id)"' \
+         | sed "s|^|$d |"
+     done
    done
    ```
 
@@ -59,10 +79,9 @@ new backups from being written under a missing key.
 4. **If this was an authorised shred,** append the compliance event:
 
    ```sh
-   pg_hardstorage audit append \
-       --type kms.shred \
-       --kek-ref <missing-kek-ref> \
-       --reason "GDPR Art 17 #<ticket>"
+   pg_hardstorage audit append kms.shred \
+       --repo <repo-url> \
+       --reason "GDPR Art 17 #<ticket>; kek-ref <missing-kek-ref>"
    ```
 
    `audit verify-chain` afterwards must remain clean.

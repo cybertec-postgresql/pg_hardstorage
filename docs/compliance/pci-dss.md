@@ -108,16 +108,28 @@ mitigation if SAD ends up backed up by mistake.
 PCI DSS Req. 10.5 (audit logs cannot be modified) is
 satisfied by:
 
-```yaml
-deployments:
-  pci-prod:
-    repo: 's3://acme-pci-backups/?region=us-east-1'
-    worm: true
-    worm_retention: 365d   # PCI: 1 year minimum
+WORM is a property of the **repository**, set once when it is
+created — not a per-deployment config key. It is deliberately
+init-time only: flipping it on later would leave a repo whose
+older objects are unlocked and newer ones locked, which no
+operator can reason about during an audit.
+
+```bash
+pg_hardstorage repo init 's3://acme-pci-backups/?region=us-east-1' \
+    --worm-mode compliance \
+    --worm-retention 365d          # PCI: 1 year minimum
 ```
 
-The S3 Object Lock policy locks every committed
-manifest + audit event for the configured retention. The
+Use `compliance` mode for PCI: it is the regulatory-grade
+posture where even root credentials cannot delete before the
+deadline. `governance` mode lets an IAM principal holding
+`BypassGovernanceRetention` delete early, which does not meet
+Req. 10.5 on its own.
+
+The policy is recorded in `HSREPO` and propagates to every
+committed object's PUT (chunks, manifests, replicas, audit
+events), so the S3 Object Lock retention covers every
+manifest + audit event for the configured duration. The
 backend reports `worm.active = true` in the compliance
 report.
 

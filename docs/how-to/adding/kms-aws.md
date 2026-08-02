@@ -178,6 +178,7 @@ operating exactly as designed.
 
 ## Next steps
 
+- [KEKRef selection reference](../../reference/kekref-schemes.md#selecting-a-kekref) — precedence, version-pinned refs, drop-in overrides
 - [Rotate the KEK](../operating/rotate-kek.md)
 - [Crypto-shred](../operating/crypto-shred.md)
 - [`kms` CLI reference](../../reference/cli/pg_hardstorage_kms.md)

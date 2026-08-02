@@ -55,7 +55,9 @@ reflectors land (see [`DOC_PLAN.md`](../DOC_PLAN.md)
   error codes, grouped by domain.
 - [KEKRef schemes](kekref-schemes.md) — `local:`,
   `aws-kms://`, `gcp-kms://`, `azure-kv://`,
-  `vault-transit://`, `pkcs11://`.
+  `vault-transit://`, `pkcs11://`, plus
+  [how a deployment selects one](kekref-schemes.md#selecting-a-kekref)
+  via `kek_ref` + `kms.providers` in `pg_hardstorage.yaml`.
 - [Storage URL schemes](storage-url-schemes.md) —
   `file://`, `s3://`, `azblob://`, `gcs://`, `sftp://`,
   `scp://`.

@@ -90,11 +90,11 @@ The repository must already exist — create it with \fBpg_hardstorage repo init
 
 .PP
 \fB--kek\fP=""
-	KEK reference (default: local:default if a kek.bin is present). Cloud-KMS schemes: aws-kms://\&. The runner opens the matching kms.Provider and asks it to wrap the per-backup DEK; the manifest stamps the KEKRef so restore can pick the right unwrap path.
+	KEK reference (default: the deployment's kek_ref in pg_hardstorage.yaml, else local:default if a kek.bin is present). Cloud-KMS schemes: aws-kms://\&. The runner opens the matching kms.Provider and asks it to wrap the per-backup DEK; the manifest stamps the KEKRef so restore can pick the right unwrap path.
 
 .PP
 \fB--kms-config\fP=[]
-	per-call config for the cloud-KMS provider (e.g. region=us-east-1,use_fips_endpoint=true). Only consulted when --kek is a cloud scheme.
+	per-call config for the cloud-KMS provider (e.g. region=us-east-1,use_fips_endpoint=true). Only consulted for a cloud scheme; replaces the matching kms.providers entry in pg_hardstorage.yaml for this run.
 
 .PP
 \fB--label\fP=""

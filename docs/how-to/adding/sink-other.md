@@ -92,7 +92,6 @@ sinks:
       from: backups@example.com
       to: ["dba@example.com"]
       cc: ["ops@example.com"]
-    filter:
       min_severity: error
 ```
 

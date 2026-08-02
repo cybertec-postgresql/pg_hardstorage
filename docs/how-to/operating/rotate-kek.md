@@ -96,6 +96,24 @@ chmod 0600                        /etc/pg_hardstorage/keys/kek.bin
 chown pg_hardstorage:             /etc/pg_hardstorage/keys/kek.bin
 ```
 
+If the deployment names its KEK in `pg_hardstorage.yaml` — the
+usual setup for a cloud KMS, and the only way the agent can
+reach one — update that reference in the same step, or the
+next scheduled backup will wrap under the **old** ref and
+re-create the mixed-KEK state you just rotated away from:
+
+```yaml
+deployments:
+  db1:
+    kek_ref: local://main-2026-q2   # was local://main
+```
+
+Rotating within one reference (new key material, same
+`kek_ref`) needs no config change — only a rotation that
+changes the ref does. Check with `pg_hardstorage lint` before
+restarting; see
+[KEKRef selection](../../reference/kekref-schemes.md#selecting-a-kekref).
+
 Restart the agent so the next backup picks up the new KEK:
 
 ```bash

@@ -230,7 +230,7 @@ field is where the recovery hint lives.
 | `redact.*` | Logical redaction passes |
 | `partial.*` | Partial / table-level restore |
 | `combine.*` | `pg_combinebackup` orchestration |
-| `paths.*`, `init.*`, `config.*` | Bootstrap |
+| `paths.*`, `init.*`, `config.*` | Bootstrap (`config.invalid`, `config.load_failed`, `config.kek_ref_unknown_scheme`) |
 | `compliance.*`, `integrity.*`, `insider.*` | Compliance / integrity scanning |
 | `llm.*` | LLM provider, skill loading, MCP server |
 | `history.*` | Restore-history slice |

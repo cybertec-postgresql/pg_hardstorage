@@ -78,7 +78,6 @@ sinks:
       # bearer_token: <PAT>
       ticket_strategy: dedupe_by_subject  # dedupe_by_subject | always_new
       labels: ["pg-hardstorage", "automation"]
-    filter:
       min_severity: error                 # default: error
 ```
 
