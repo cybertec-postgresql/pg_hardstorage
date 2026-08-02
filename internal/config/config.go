@@ -31,6 +31,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/kms"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/output"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/paths"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/pg"
@@ -91,6 +92,21 @@ type Config struct {
 	//	      min_severity: warning
 	Sinks []output.SinkSpec `yaml:"sinks,omitempty"`
 
+	// KMS declares the cloud-KMS providers a deployment's `kek_ref`
+	// can resolve against. Without it, a cloud KEK could only be
+	// selected per-invocation via `--kek` / `--kms-config`, which
+	// left the agent's scheduled and control-plane backups unable
+	// to use anything but the local keyring (issue #44).
+	//
+	// Example:
+	//
+	//	kms:
+	//	  providers:
+	//	    - kek_ref: aws-kms://alias/pg-hardstorage-prod
+	//	      config:
+	//	        region: us-east-1
+	KMS KMSConfig `yaml:"kms,omitempty"`
+
 	// Deployments declares the PG deployments the agent manages.
 	// Each entry is keyed by deployment name (the same name that
 	// flows into manifest.deployment, repo paths, and slot names).
@@ -105,6 +121,72 @@ type Config struct {
 	//	      backup: { every: "6h" }
 	//	      rotate: { daily_at: "04:00" }
 	Deployments map[string]DeploymentConfig `yaml:"deployments,omitempty"`
+}
+
+// KMSConfig groups the cloud-KMS provider declarations.
+type KMSConfig struct {
+	// Providers is the declared provider list. Entries are matched
+	// to a deployment by KEKRef; see Config.KMSProviderConfig for
+	// the lookup rules.
+	Providers []KMSProvider `yaml:"providers,omitempty" json:"providers,omitempty"`
+}
+
+// KMSProvider is one provider declaration: the KEKRef it serves plus
+// the per-provider configuration map the kms.Builder consumes (AWS
+// reads `region` / `use_fips_endpoint`, Vault reads `role_id` /
+// `secret_id`, and so on — the map stays free-form so a new plugin
+// needs no schema change here).
+type KMSProvider struct {
+	// KEKRef is the reference this entry configures, e.g.
+	// "aws-kms://alias/pg-hardstorage-prod".
+	KEKRef string `yaml:"kek_ref,omitempty" json:"kek_ref,omitempty"`
+
+	// Config is handed verbatim to the provider's builder.
+	Config map[string]any `yaml:"config,omitempty" json:"config,omitempty"`
+}
+
+// KMSProviderConfig is KMSConfig.ProviderConfig on the whole Config.
+func (c Config) KMSProviderConfig(kekRef string) map[string]any {
+	return c.KMS.ProviderConfig(kekRef)
+}
+
+// ProviderConfig returns the configuration declared for kekRef, or nil
+// when nothing matches.
+//
+// nil is not an error: pkcs11 carries its settings in the KEKRef's own
+// query string, and the cloud providers fall back to ambient
+// credentials (IRSA, workload identity, instance profile), so a
+// deployment whose kek_ref has no `kms.providers` entry still works.
+//
+// Matching, in order:
+//
+//  1. Exact KEKRef equality.
+//  2. A declared KEKRef that is a path-prefix of the deployment's ref
+//     ("azure-kv://vault/key" serves "azure-kv://vault/key/<version>").
+//     Version-pinned refs are REQUIRED for Azure shred, so an operator
+//     shouldn't have to re-declare the provider per key version. The
+//     "/" in the prefix test is what stops a sibling key
+//     ("…/key-rsa") from matching.
+//
+// Entries are scanned last-to-first within each pass, so a conf.d
+// drop-in (appended by mergeConfig) overrides the base file's entry
+// for the same ref.
+func (k KMSConfig) ProviderConfig(kekRef string) map[string]any {
+	if kekRef == "" {
+		return nil
+	}
+	ps := k.Providers
+	for i := len(ps) - 1; i >= 0; i-- {
+		if ps[i].KEKRef == kekRef {
+			return ps[i].Config
+		}
+	}
+	for i := len(ps) - 1; i >= 0; i-- {
+		if ref := ps[i].KEKRef; ref != "" && strings.HasPrefix(kekRef, ref+"/") {
+			return ps[i].Config
+		}
+	}
+	return nil
 }
 
 // DeploymentConfig is one deployment's per-deployment settings,
@@ -122,6 +204,30 @@ type DeploymentConfig struct {
 	// Tenant scopes the deployment for multi-tenant deployments.
 	// Empty defaults to "default".
 	Tenant string `yaml:"tenant,omitempty"`
+
+	// KEKRef selects the key-encryption key every backup, WAL
+	// segment, restore and verify for this deployment resolves
+	// against. Schemes come from the KMS registry:
+	// "aws-kms://…", "gcp-kms://…", "azure-kv://…",
+	// "vault-transit://…", "pkcs11://…", or "local:default" for
+	// the on-disk keyring.
+	//
+	// Precedence: an explicit --kek on the command line wins; this
+	// field is the default for every path that would otherwise
+	// need the flag — including the agent's scheduled and
+	// control-plane backups, which have no command line at all.
+	//
+	// Setting this to a cloud scheme makes the deployment's
+	// backups encrypted whether or not --encrypt is passed, and a
+	// provider that won't open fails the run rather than falling
+	// back. "local:default" keeps the existing "a KEK is present
+	// ⇒ encrypt" posture: with no kek.bin on the keyring there is
+	// nothing to encrypt with, and the backup is plaintext unless
+	// --encrypt forces the refusal. --no-encrypt always wins.
+	//
+	// Per-provider settings (region, credentials, …) live under
+	// the top-level `kms.providers` entry with the same ref.
+	KEKRef string `yaml:"kek_ref,omitempty" json:"kek_ref,omitempty"`
 
 	// Schedule declares the recurring tasks for this deployment.
 	Schedule DeploymentSchedule `yaml:"schedule,omitempty"`
@@ -651,6 +757,13 @@ func mergeConfig(a, b Config) Config {
 		// In v0.1 we treat any present `sinks:` key as additive.
 		a.Sinks = append(a.Sinks, b.Sinks...)
 	}
+	if len(b.KMS.Providers) > 0 {
+		// Same additive posture as sinks: a drop-in adds a provider
+		// without erasing the base file's. When two entries declare
+		// the SAME kek_ref, KMSProviderConfig scans last-to-first, so
+		// the drop-in's config wins the lookup.
+		a.KMS.Providers = append(a.KMS.Providers, b.KMS.Providers...)
+	}
 	if len(b.Deployments) > 0 {
 		// Deployments overlay by NAME — drop-in entry under name X
 		// REPLACES the inherited entry under name X. This matches
@@ -682,10 +795,32 @@ func validate(c Config) error {
 	if c.Schema != "" && c.Schema != Schema {
 		return fmt.Errorf("config: schema %q is not supported; expected %q", c.Schema, Schema)
 	}
+	for i, p := range c.KMS.Providers {
+		if p.KEKRef == "" {
+			return fmt.Errorf("config: kms.providers[%d]: kek_ref is required", i)
+		}
+		if err := validKEKRef(p.KEKRef); err != nil {
+			return fmt.Errorf("config: kms.providers[%d]: %w", i, err)
+		}
+	}
 	for name, dep := range c.Deployments {
 		if err := validateDeployment(name, dep); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// validKEKRef rejects a reference with no parseable scheme. We check
+// the shape only, not whether a provider for that scheme is
+// registered: plugin registration happens in the CLI layer and varies
+// by build flavour (see docs/reference/build-flavours.md), so a
+// registry check here would reject a config that the pkcs11 build
+// handles fine. `doctor` does the registry-aware check.
+func validKEKRef(ref string) error {
+	if kms.SchemeOf(ref) == "" {
+		return fmt.Errorf("kek_ref %q has no scheme; expected one of local:default, "+
+			"aws-kms://…, gcp-kms://…, azure-kv://…, vault-transit://…, pkcs11://…", ref)
 	}
 	return nil
 }
@@ -699,6 +834,11 @@ func validate(c Config) error {
 func validateDeployment(name string, dep DeploymentConfig) error {
 	if err := ValidDeploymentName(name); err != nil {
 		return err
+	}
+	if dep.KEKRef != "" {
+		if err := validKEKRef(dep.KEKRef); err != nil {
+			return fmt.Errorf("config: deployment %q: %w", name, err)
+		}
 	}
 	p := dep.Patroni
 	// PatroniConfig is a value type — "no patroni configured"
@@ -810,6 +950,9 @@ func mergeDeployment(existing, overlay DeploymentConfig) DeploymentConfig {
 	}
 	if overlay.Tenant != "" {
 		existing.Tenant = overlay.Tenant
+	}
+	if overlay.KEKRef != "" {
+		existing.KEKRef = overlay.KEKRef
 	}
 	if overlay.Schedule.Backup.Every != "" || overlay.Schedule.Backup.DailyAt != "" || overlay.Schedule.Backup.At != "" {
 		existing.Schedule.Backup = overlay.Schedule.Backup

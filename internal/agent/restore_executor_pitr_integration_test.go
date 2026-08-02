@@ -59,7 +59,7 @@ func TestAgentExecutor_ControlPlanePITR_ArmsRecovery(t *testing.T) {
 
 	exec := agent.NewRestoreExecutor(
 		map[string]config.DeploymentConfig{"db1": {Repo: repoURL}},
-		verifier, "",
+		config.KMSConfig{}, verifier, "",
 	)
 
 	target := filepath.Join(t.TempDir(), "cp_pitr_restored")
@@ -170,7 +170,7 @@ func TestAgentExecutor_ControlPlaneLatestWithTimeTarget_ResolvesEarlierSeed(t *t
 
 	exec := agent.NewRestoreExecutor(
 		map[string]config.DeploymentConfig{"db1": {Repo: repoURL}},
-		verifier, "",
+		config.KMSConfig{}, verifier, "",
 	)
 	out, err := exec.Execute(ctx, &agent.ControlPlaneJob{
 		ID:         "job-latest-time-1",

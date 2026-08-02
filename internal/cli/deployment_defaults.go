@@ -61,6 +61,79 @@ func deploymentDefaults(deployment, pgConn, repoURL string) (string, string) {
 	return resolveDeploymentDefaults(deployment, pgConn, repoURL, loaded.Config.Deployments)
 }
 
+// deploymentKMS resolves the key material for a deployment-scoped
+// command: the KEK reference and the provider config map that opens it.
+//
+// Precedence mirrors deploymentDefaults — an explicit --kek / --kms-config
+// on the command line always wins, and the deployment's `kek_ref` (plus the
+// matching top-level `kms.providers` entry) fills the gap. Without this,
+// cloud KMS could only be driven by repeating the flags on every
+// invocation, which no scheduled path can do (issue #44).
+//
+// Config-load failures are non-fatal for the same reason they are in
+// deploymentDefaults: the caller ends up exactly where it would have been
+// without a config file, rather than failing on an unrelated parse error.
+func deploymentKMS(deployment, kekRef string, kmsCfg map[string]string) (string, map[string]any) {
+	// An explicit --kms-config with no --kek still applies to a
+	// configured kek_ref, so we only short-circuit when the operator
+	// pinned both.
+	if kekRef != "" && len(kmsCfg) > 0 {
+		return kekRef, stringMapToAny(kmsCfg)
+	}
+	p, err := paths.Resolve(paths.DefaultOptions())
+	if err != nil {
+		return kekRef, stringMapToAny(kmsCfg)
+	}
+	loaded, err := config.Load(p)
+	if err != nil || loaded == nil {
+		return kekRef, stringMapToAny(kmsCfg)
+	}
+	return resolveDeploymentKMS(deployment, kekRef, kmsCfg, loaded.Config)
+}
+
+// resolveDeploymentKMS is deploymentKMS's pure core, split out so tests
+// can drive it from an in-memory config.
+func resolveDeploymentKMS(deployment, kekRef string, kmsCfg map[string]string, cfg config.Config) (string, map[string]any) {
+	if kekRef == "" && deployment != "" {
+		if dep, ok := cfg.Deployments[deployment]; ok {
+			kekRef = dep.KEKRef
+		}
+	}
+	if len(kmsCfg) > 0 {
+		// Flag config is authoritative when present — an operator
+		// overriding region on one run shouldn't silently inherit half
+		// the file's settings.
+		return kekRef, stringMapToAny(kmsCfg)
+	}
+	return kekRef, cfg.KMSProviderConfig(kekRef)
+}
+
+// deploymentKMSResolver is the read-side counterpart of deploymentKMS,
+// for restore / verify / partial. Those commands don't choose a KEK —
+// the manifest already names one — so what they need is the provider
+// settings for whatever ref they encounter.
+//
+// The returned func is keyed by KEKRef rather than fixed to one config
+// because a repo can legitimately hold manifests under several refs at
+// once (mid-rotation, or one repo shared by deployments with different
+// KEKs). An explicit --kms-config still overrides everything.
+//
+// The config is loaded once, when the resolver is built; a load failure
+// degrades to flags-only, matching deploymentDefaults.
+func deploymentKMSResolver(kmsCfg map[string]string) func(kekRef string) map[string]any {
+	if len(kmsCfg) > 0 {
+		flags := stringMapToAny(kmsCfg)
+		return func(string) map[string]any { return flags }
+	}
+	var declared config.KMSConfig
+	if p, err := paths.Resolve(paths.DefaultOptions()); err == nil {
+		if loaded, err := config.Load(p); err == nil && loaded != nil {
+			declared = loaded.Config.KMS
+		}
+	}
+	return declared.ProviderConfig
+}
+
 // resolveDeploymentDefaultsPreRun is the root PersistentPreRunE handler
 // (added to the chain in NewRoot) that fills an unset --repo /
 // --pg-connection from the deployment named as the command's first

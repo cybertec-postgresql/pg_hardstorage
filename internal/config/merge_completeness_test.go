@@ -20,12 +20,14 @@ func TestMergeDeployment_CarriesEveryField(t *testing.T) {
 		PGConnection:   "postgres://base@h/db",
 		Repo:           "file:///base",
 		Tenant:         "base",
+		KEKRef:         "local:default",
 		Classification: "internal",
 	}
 	overlay := DeploymentConfig{
 		PGConnection: "postgres://over@h/db",
 		Repo:         "file:///over",
 		Tenant:       "over",
+		KEKRef:       "aws-kms://alias/over",
 		Schedule: DeploymentSchedule{
 			Backup:      ScheduleSpec{Every: "6h"},
 			Rotate:      ScheduleSpec{DailyAt: "04:00"},

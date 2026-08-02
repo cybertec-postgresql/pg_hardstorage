@@ -143,7 +143,7 @@ func TestResolveBackupEncryption_PassesKMSConfigToProvider(t *testing.T) {
 
 	dir := t.TempDir()
 	cfg, err := resolveBackupEncryption(context.Background(), dir, false, false,
-		"cfgrec://my-key", map[string]string{"region": "ap-southeast-2", "tls": "true"})
+		"cfgrec://my-key", stringMapToAny(map[string]string{"region": "ap-southeast-2", "tls": "true"}))
 	if err != nil {
 		t.Fatalf("resolveBackupEncryption: %v", err)
 	}

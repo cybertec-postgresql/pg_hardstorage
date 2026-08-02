@@ -366,6 +366,7 @@ func runRestore(cmd *cobra.Command, opts restoreOpts) error {
 	// Wire OnEvent to the dispatcher; suppress in JSON mode so the
 	// final Result is the only document in the stream.
 	suppressEvents := d.Renderer().Name() == "json"
+	kmsProviderFor := deploymentKMSResolver(opts.kmsConfig)
 	res, err := restore.Restore(cmd.Context(), restore.Options{
 		RepoURL:             opts.repoURL,
 		Deployment:          opts.deployment,
@@ -388,8 +389,12 @@ func runRestore(cmd *cobra.Command, opts restoreOpts) error {
 		// the restore engine only calls this for a cloud KEKRef (issue #102).
 		UnwrapDEK: func(ctx context.Context, kekRef string, wrapped []byte) ([]byte, error) {
 			return keystore.UnwrapDEK(ctx, kekRef, wrapped, keystore.UnwrapOpts{
-				KeyringDir:     p.Keyring.Value,
-				ProviderConfig: stringMapToAny(opts.kmsConfig),
+				KeyringDir: p.Keyring.Value,
+				// Provider settings come from --kms-config, else the
+				// `kms.providers` entry matching the manifest's own
+				// KEKRef — so restoring a config-declared deployment
+				// needs no flags at all (issue #44).
+				ProviderConfig: kmsProviderFor(kekRef),
 			})
 		},
 		OnEvent: func(e *output.Event) {

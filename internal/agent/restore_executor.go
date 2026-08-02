@@ -46,6 +46,7 @@ import (
 // parseable code rather than a half-finished restore.
 type RestoreExecutor struct {
 	deployments map[string]config.DeploymentConfig
+	kms         config.KMSConfig
 	verifier    *backup.Verifier
 	keyringDir  string
 }
@@ -55,12 +56,28 @@ type RestoreExecutor struct {
 // that the restore orchestrator calls when the manifest is encrypted;
 // for unencrypted manifests it's never consulted, so an empty
 // keyringDir doesn't fail unencrypted restores.
-func NewRestoreExecutor(deps map[string]config.DeploymentConfig, verifier *backup.Verifier, keyringDir string) *RestoreExecutor {
+//
+// kmsCfg is the top-level `kms:` section, consulted per manifest
+// KEKRef so a repo holding manifests under several refs (the state a
+// half-finished `kms rotate` leaves behind) resolves each against its
+// own provider settings.
+func NewRestoreExecutor(deps map[string]config.DeploymentConfig, kmsCfg config.KMSConfig, verifier *backup.Verifier, keyringDir string) *RestoreExecutor {
 	return &RestoreExecutor{
 		deployments: deps,
+		kms:         kmsCfg,
 		verifier:    verifier,
 		keyringDir:  keyringDir,
 	}
+}
+
+// unwrapDEK resolves a manifest's wrapped DEK, looking the provider
+// config up by the manifest's own KEKRef rather than assuming a single
+// provider for the whole repo.
+func (e *RestoreExecutor) unwrapDEK(ctx context.Context, kekRef string, wrapped []byte) ([]byte, error) {
+	return keystore.UnwrapDEK(ctx, kekRef, wrapped, keystore.UnwrapOpts{
+		KeyringDir:     e.keyringDir,
+		ProviderConfig: e.kms.ProviderConfig(kekRef),
+	})
 }
 
 // Execute implements JobExecutor.
@@ -223,9 +240,11 @@ func (e *RestoreExecutor) Execute(ctx context.Context, job *ControlPlaneJob, pro
 		Recovery:        rec,
 		TablespaceRemap: tsRemap,
 		KEKForRef:       kekFor,
-		// Cloud-KMS-encrypted backups unwrap the DEK server-side; the agent
-		// relies on the host's ambient cloud credentials (issue #102).
-		UnwrapDEK: keystore.DEKResolver(e.keyringDir, nil),
+		// Cloud-KMS-encrypted backups unwrap the DEK server-side. Provider
+		// settings come from the config's `kms.providers` entry for the
+		// manifest's own KEKRef, falling back to the host's ambient cloud
+		// credentials when nothing is declared (issue #102, #44).
+		UnwrapDEK: e.unwrapDEK,
 		OnEvent:   emit,
 		// Actor in the audit chain: dispatched via control-plane,
 		// tagged with the job ID so a forensic walk of the chain

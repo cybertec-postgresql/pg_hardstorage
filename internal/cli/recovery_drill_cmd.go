@@ -196,7 +196,10 @@ func runRecoveryDrill(cmd *cobra.Command, deployment string, f recoveryDrillFlag
 	}
 	if !f.skipEncryption {
 		opts.KEKResolver = recovery.KeystoreKEKResolver(p.Keyring.Value)
-		opts.DEKUnwrapper = recovery.KeystoreDEKResolver(p.Keyring.Value)
+		// Provider settings come from the manifest's own KEKRef via
+		// `kms.providers`, so a drill of a cloud-KMS deployment needs no
+		// flags (issue #44).
+		opts.DEKUnwrapper = recovery.KeystoreDEKResolver(p.Keyring.Value, deploymentKMSResolver(nil))
 	}
 
 	r, err := recovery.Drill(cmd.Context(), f.repoURL, deployment, opts)

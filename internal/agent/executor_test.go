@@ -15,7 +15,7 @@ import (
 // a misconfigured controller from quietly succeeding against the
 // wrong host.
 func TestExecutor_RejectsUnknownDeployment(t *testing.T) {
-	ex := agent.NewBackupExecutor(map[string]config.DeploymentConfig{}, nil, nil)
+	ex := agent.NewBackupExecutor(map[string]config.DeploymentConfig{}, config.KMSConfig{}, nil, nil)
 	_, err := ex.Execute(context.Background(), &agent.ControlPlaneJob{
 		ID:         "job-1",
 		Kind:       "backup",
@@ -35,7 +35,7 @@ func TestExecutor_RejectsRepoMismatch(t *testing.T) {
 			Repo:         "file:///srv/repo-A",
 		},
 	}
-	ex := agent.NewBackupExecutor(deps, nil, nil)
+	ex := agent.NewBackupExecutor(deps, config.KMSConfig{}, nil, nil)
 	_, err := ex.Execute(context.Background(), &agent.ControlPlaneJob{
 		ID:         "job-1",
 		Kind:       "backup",
@@ -52,7 +52,7 @@ func TestExecutor_RejectsRepoMismatch(t *testing.T) {
 // BackupExecutor itself only handles "backup" and refuses anything
 // else loudly so a wiring bug doesn't half-execute the wrong job.
 func TestExecutor_RejectsNonBackupKind(t *testing.T) {
-	ex := agent.NewBackupExecutor(nil, nil, nil)
+	ex := agent.NewBackupExecutor(nil, config.KMSConfig{}, nil, nil)
 	for _, kind := range []string{"restore", "verify", "nuke-from-orbit"} {
 		_, err := ex.Execute(context.Background(), &agent.ControlPlaneJob{
 			ID:   "job-x",

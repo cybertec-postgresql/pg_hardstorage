@@ -13,7 +13,7 @@ func TestBuildDrillTask(t *testing.T) {
 		Repo:     "file:///tmp/x",
 		Schedule: config.DeploymentSchedule{Drill: config.ScheduleSpec{DailyAt: "03:00"}},
 	}
-	task, err := buildDrillTask("db1", dep, nil)
+	task, err := buildDrillTask("db1", dep, config.KMSConfig{}, nil)
 	if err != nil {
 		t.Fatalf("buildDrillTask: %v", err)
 	}
@@ -23,14 +23,14 @@ func TestBuildDrillTask(t *testing.T) {
 	// Missing repo must refuse at registration, not at fire time.
 	if _, err := buildDrillTask("db1", config.DeploymentConfig{
 		Schedule: config.DeploymentSchedule{Drill: config.ScheduleSpec{Every: "24h"}},
-	}, nil); err == nil {
+	}, config.KMSConfig{}, nil); err == nil {
 		t.Error("missing repo accepted")
 	}
 	// Bad spec refused.
 	if _, err := buildDrillTask("db1", config.DeploymentConfig{
 		Repo:     "file:///tmp/x",
 		Schedule: config.DeploymentSchedule{Drill: config.ScheduleSpec{Every: "not-a-duration"}},
-	}, nil); err == nil {
+	}, config.KMSConfig{}, nil); err == nil {
 		t.Error("bad schedule spec accepted")
 	}
 }

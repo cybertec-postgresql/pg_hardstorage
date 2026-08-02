@@ -73,7 +73,7 @@ func TestRestoreExecutor_TablespaceMapping_IsWiredAndValidated(t *testing.T) {
 
 	e := NewRestoreExecutor(
 		map[string]config.DeploymentConfig{"db1": {Repo: "file:///srv/repo"}},
-		verifier, "",
+		config.KMSConfig{}, verifier, "",
 	)
 	_, err = e.Execute(context.Background(), &ControlPlaneJob{
 		Kind:       "restore",

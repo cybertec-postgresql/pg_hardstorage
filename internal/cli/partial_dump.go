@@ -208,6 +208,7 @@ func runPartialDump(cmd *cobra.Command, f partialDumpFlags) error {
 	// Restore into the staging dir. Suppress events in JSON mode
 	// so the output is one Result document.
 	suppressEvents := d.Renderer().Name() == "json"
+	kmsProviderFor := deploymentKMSResolver(f.kmsConfig)
 	rres, err := restore.Restore(cmd.Context(), restore.Options{
 		RepoURL:        f.repoURL,
 		Deployment:     f.deployment,
@@ -216,7 +217,14 @@ func runPartialDump(cmd *cobra.Command, f partialDumpFlags) error {
 		Verifier:       verifier,
 		AllowOverwrite: true, // staging dir is empty but PG creates a few files at start
 		KEKForRef:      keystore.KEKResolver(p.Keyring.Value),
-		UnwrapDEK:      keystore.DEKResolver(p.Keyring.Value, stringMapToAny(f.kmsConfig)),
+		// --kms-config, else the `kms.providers` entry matching the
+		// manifest's own KEKRef (issue #44).
+		UnwrapDEK: func(ctx context.Context, kekRef string, wrapped []byte) ([]byte, error) {
+			return keystore.UnwrapDEK(ctx, kekRef, wrapped, keystore.UnwrapOpts{
+				KeyringDir:     p.Keyring.Value,
+				ProviderConfig: kmsProviderFor(kekRef),
+			})
+		},
 		OnEvent: func(e *output.Event) {
 			if suppressEvents {
 				return

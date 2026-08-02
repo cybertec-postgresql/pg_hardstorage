@@ -32,15 +32,23 @@ import (
 // RouterExecutor dispatches by Kind.
 type BackupExecutor struct {
 	deployments map[string]config.DeploymentConfig
+	kms         config.KMSConfig
 	signer      *backup.Signer
 	verifier    *backup.Verifier
 }
 
 // NewBackupExecutor constructs an executor with the supplied config
 // + keystore. The maps are not copied — callers retain ownership.
-func NewBackupExecutor(deps map[string]config.DeploymentConfig, signer *backup.Signer, verifier *backup.Verifier) *BackupExecutor {
+//
+// kmsCfg is the top-level `kms:` section: it supplies the provider
+// settings for whatever `kek_ref` a deployment declares, so a
+// control-plane backup can wrap its DEK in a cloud KMS. Zero value =
+// no declared providers, which still works for schemes that carry
+// everything in the KEKRef itself (pkcs11) or need no config at all.
+func NewBackupExecutor(deps map[string]config.DeploymentConfig, kmsCfg config.KMSConfig, signer *backup.Signer, verifier *backup.Verifier) *BackupExecutor {
 	return &BackupExecutor{
 		deployments: deps,
+		kms:         kmsCfg,
 		signer:      signer,
 		verifier:    verifier,
 	}
@@ -123,17 +131,27 @@ func (b *BackupExecutor) runBackup(ctx context.Context, job *ControlPlaneJob, pr
 		progress(body)
 	}
 
-	// Resolve encryption exactly like the interactive CLI: KEK on
-	// the keyring ⇒ encrypt. Without this, control-plane backups were
-	// silently plaintext even in an --encrypt repo, and plaintext-hash
-	// dedup welds those manifests onto encrypted chunks.
+	// Resolve encryption through the same resolver the interactive CLI
+	// uses: the deployment's kek_ref when it declares one, else a KEK
+	// on the keyring ⇒ encrypt. Without this, control-plane backups
+	// were silently plaintext even in an --encrypt repo, and
+	// plaintext-hash dedup welds those manifests onto encrypted chunks.
 	var enc *runner.EncryptionConfig
 	if p, perr := paths.Resolve(paths.DefaultOptions()); perr == nil {
 		var eerr error
-		enc, eerr = runner.LocalEncryptionFromKeyring(p.Keyring.Value)
+		enc, eerr = runner.ResolveEncryption(ctx, runner.EncryptionRequest{
+			KeyringDir: p.Keyring.Value,
+			KEKRef:     dep.KEKRef,
+			KMSConfig:  b.kms.ProviderConfig(dep.KEKRef),
+		})
 		if eerr != nil {
 			return nil, fmt.Errorf("backup-executor: %w", eerr)
 		}
+	}
+	// The provider holds SDK connection state; close it once the
+	// backup has wrapped its DEK.
+	if enc != nil && enc.Provider != nil {
+		defer enc.Provider.Close()
 	}
 
 	res, err := runner.Take(ctx, runner.TakeOptions{

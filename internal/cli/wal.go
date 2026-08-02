@@ -1005,7 +1005,15 @@ func resolveWALEncryption(ctx context.Context, sp storage.StoragePlugin, deploym
 	if pth, perr := paths.Resolve(paths.DefaultOptions()); perr == nil {
 		keyringDir = pth.Keyring.Value
 	}
-	cfg, err := resolveBackupEncryption(ctx, keyringDir, false, false, kekRef, kmsConfig)
+	// WAL must ride the same KEK as the base backups it interleaves
+	// with, so the deployment's kek_ref applies here exactly as it does
+	// to `backup`. archive_command *can* carry --kek, but that pins the
+	// KEK (and any --kms-config credential) in postgresql.conf, where
+	// rotating it means a config reload on the source primary — which
+	// is what made config-side resolution the blocker for cloud-KMS WAL
+	// (issue #44).
+	kekRef, kmsCfg := deploymentKMS(deployment, kekRef, kmsConfig)
+	cfg, err := resolveBackupEncryption(ctx, keyringDir, false, false, kekRef, kmsCfg)
 	if err != nil {
 		return nil, nil, err
 	}

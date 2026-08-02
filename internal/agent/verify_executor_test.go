@@ -15,7 +15,7 @@ import (
 func TestVerifyExecutor_RefusesNonVerifyKind(t *testing.T) {
 	e := agent.NewVerifyExecutor(map[string]config.DeploymentConfig{
 		"db1": {Repo: "file:///srv/repo"},
-	}, nil, "")
+	}, config.KMSConfig{}, nil, "")
 	_, err := e.Execute(context.Background(), &agent.ControlPlaneJob{
 		Kind:       "backup",
 		Deployment: "db1",
@@ -32,7 +32,7 @@ func TestVerifyExecutor_RefusesNonVerifyKind(t *testing.T) {
 func TestVerifyExecutor_RefusesUnknownDeployment(t *testing.T) {
 	e := agent.NewVerifyExecutor(map[string]config.DeploymentConfig{
 		"db1": {Repo: "file:///srv/repo"},
-	}, nil, "")
+	}, config.KMSConfig{}, nil, "")
 	_, err := e.Execute(context.Background(), &agent.ControlPlaneJob{
 		Kind:       "verify",
 		Deployment: "db2",
@@ -51,7 +51,7 @@ func TestVerifyExecutor_RefusesUnknownDeployment(t *testing.T) {
 func TestVerifyExecutor_RefusesCrossRepoDispatch(t *testing.T) {
 	e := agent.NewVerifyExecutor(map[string]config.DeploymentConfig{
 		"db1": {Repo: "file:///srv/repo"},
-	}, nil, "")
+	}, config.KMSConfig{}, nil, "")
 	_, err := e.Execute(context.Background(), &agent.ControlPlaneJob{
 		Kind:       "verify",
 		Deployment: "db1",
@@ -72,7 +72,7 @@ func TestVerifyExecutor_RefusesCrossRepoDispatch(t *testing.T) {
 func TestVerifyExecutor_RequiresBackupIDOrVerifier(t *testing.T) {
 	e := agent.NewVerifyExecutor(map[string]config.DeploymentConfig{
 		"db1": {Repo: "file:///srv/repo"},
-	}, nil, "")
+	}, config.KMSConfig{}, nil, "")
 	_, err := e.Execute(context.Background(), &agent.ControlPlaneJob{
 		Kind:       "verify",
 		Deployment: "db1",

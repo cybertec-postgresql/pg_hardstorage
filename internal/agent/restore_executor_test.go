@@ -17,7 +17,7 @@ import (
 func TestRestoreExecutor_RefusesNonRestoreKind(t *testing.T) {
 	e := agent.NewRestoreExecutor(map[string]config.DeploymentConfig{
 		"db1": {Repo: "file:///srv/repo"},
-	}, nil, "")
+	}, config.KMSConfig{}, nil, "")
 	_, err := e.Execute(context.Background(), &agent.ControlPlaneJob{
 		Kind:       "backup",
 		Deployment: "db1",
@@ -36,7 +36,7 @@ func TestRestoreExecutor_RefusesNonRestoreKind(t *testing.T) {
 func TestRestoreExecutor_RefusesUnknownDeployment(t *testing.T) {
 	e := agent.NewRestoreExecutor(map[string]config.DeploymentConfig{
 		"db1": {Repo: "file:///srv/repo"},
-	}, nil, "")
+	}, config.KMSConfig{}, nil, "")
 	_, err := e.Execute(context.Background(), &agent.ControlPlaneJob{
 		Kind:       "restore",
 		Deployment: "db2",
@@ -55,7 +55,7 @@ func TestRestoreExecutor_RefusesUnknownDeployment(t *testing.T) {
 func TestRestoreExecutor_RefusesCrossRepoDispatch(t *testing.T) {
 	e := agent.NewRestoreExecutor(map[string]config.DeploymentConfig{
 		"db1": {Repo: "file:///srv/repo"},
-	}, nil, "")
+	}, config.KMSConfig{}, nil, "")
 	_, err := e.Execute(context.Background(), &agent.ControlPlaneJob{
 		Kind:       "restore",
 		Deployment: "db1",
@@ -82,7 +82,7 @@ func TestRestoreExecutor_RequiresBackupID(t *testing.T) {
 	// before backup_id; supply nil and assert that error first.
 	e := agent.NewRestoreExecutor(map[string]config.DeploymentConfig{
 		"db1": {Repo: "file:///srv/repo"},
-	}, nil, "")
+	}, config.KMSConfig{}, nil, "")
 	_, err := e.Execute(context.Background(), &agent.ControlPlaneJob{
 		Kind:       "restore",
 		Deployment: "db1",

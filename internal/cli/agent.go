@@ -156,16 +156,18 @@ func runAgentControlPlane(cmd *cobra.Command, baseURL, tokenFile, agentID, metri
 	}
 
 	var deps map[string]config.DeploymentConfig
+	var kmsCfg config.KMSConfig
 	if loaded != nil {
 		deps = loaded.Config.Deployments
+		kmsCfg = loaded.Config.KMS
 	}
 	//: route by Kind. The agent claims any kind it advertises,
 	// and the router dispatches to the per-Kind executor. Backup,
 	// restore, and verify all wired; future kinds (logical
 	// restore, partial restore) drop in via additional map entries.
-	backupExec := agent.NewBackupExecutor(deps, signer, verifier)
-	restoreExec := agent.NewRestoreExecutor(deps, verifier, p.Keyring.Value)
-	verifyExec := agent.NewVerifyExecutor(deps, verifier, p.Keyring.Value)
+	backupExec := agent.NewBackupExecutor(deps, kmsCfg, signer, verifier)
+	restoreExec := agent.NewRestoreExecutor(deps, kmsCfg, verifier, p.Keyring.Value)
+	verifyExec := agent.NewVerifyExecutor(deps, kmsCfg, verifier, p.Keyring.Value)
 	executor := agent.NewRouterExecutor(map[string]agent.JobExecutor{
 		"backup":  backupExec,
 		"restore": restoreExec,
@@ -271,7 +273,7 @@ func runAgent(cmd *cobra.Command, dryRun bool, metricsListen string) error {
 		}),
 	)
 
-	taskCount, addErrs := buildAgentTasks(engine, loaded.Config.Deployments, signer, verifier)
+	taskCount, addErrs := buildAgentTasks(engine, loaded.Config.Deployments, loaded.Config.KMS, signer, verifier)
 	for _, e := range addErrs {
 		_ = d.Event(cmd.Context(), output.NewEvent(output.SeverityWarning, "agent", "task.add_failed").
 			WithBody(map[string]any{
@@ -419,7 +421,7 @@ type agentTaskAddError struct {
 // Each task's Run closure captures its own deployment / task / config.
 // Tasks fire serially within the engine, so two tasks targeting the
 // same repo prefix never race.
-func buildAgentTasks(engine *schedule.Engine, deps map[string]config.DeploymentConfig, signer *backup.Signer, verifier *backup.Verifier) (int, []agentTaskAddError) {
+func buildAgentTasks(engine *schedule.Engine, deps map[string]config.DeploymentConfig, kmsCfg config.KMSConfig, signer *backup.Signer, verifier *backup.Verifier) (int, []agentTaskAddError) {
 	count := 0
 	var errs []agentTaskAddError
 
@@ -434,7 +436,7 @@ func buildAgentTasks(engine *schedule.Engine, deps map[string]config.DeploymentC
 	for _, name := range names {
 		dep := deps[name]
 		if !dep.Schedule.Backup.IsZero() {
-			task, err := buildBackupTask(name, dep, signer, verifier)
+			task, err := buildBackupTask(name, dep, kmsCfg, signer, verifier)
 			if err != nil {
 				errs = append(errs, agentTaskAddError{Deployment: name, Task: "backup", Err: err})
 			} else if err := engine.Add(task); err != nil {
@@ -464,7 +466,7 @@ func buildAgentTasks(engine *schedule.Engine, deps map[string]config.DeploymentC
 			}
 		}
 		if !dep.Schedule.Drill.IsZero() {
-			task, err := buildDrillTask(name, dep, verifier)
+			task, err := buildDrillTask(name, dep, kmsCfg, verifier)
 			if err != nil {
 				errs = append(errs, agentTaskAddError{Deployment: name, Task: "drill", Err: err})
 			} else if err := engine.Add(task); err != nil {
@@ -486,7 +488,7 @@ func buildAgentTasks(engine *schedule.Engine, deps map[string]config.DeploymentC
 // (pass/partial/fail), so even a failing drill leaves evidence for
 // doctor to surface; a non-pass verdict also errors the task so the
 // agent emits its task-failure event.
-func buildDrillTask(name string, dep config.DeploymentConfig, verifier *backup.Verifier) (*schedule.Task, error) {
+func buildDrillTask(name string, dep config.DeploymentConfig, kmsCfg config.KMSConfig, verifier *backup.Verifier) (*schedule.Task, error) {
 	if dep.Repo == "" {
 		return nil, errors.New("missing repo")
 	}
@@ -504,7 +506,7 @@ func buildDrillTask(name string, dep config.DeploymentConfig, verifier *backup.V
 			// encrypted repo fails instantly at the restore phase.
 			if p, perr := paths.Resolve(paths.DefaultOptions()); perr == nil {
 				opts.KEKResolver = recovery.KeystoreKEKResolver(p.Keyring.Value)
-				opts.DEKUnwrapper = recovery.KeystoreDEKResolver(p.Keyring.Value)
+				opts.DEKUnwrapper = recovery.KeystoreDEKResolver(p.Keyring.Value, kmsCfg.ProviderConfig)
 			}
 			report, err := recovery.Drill(ctx, dep.Repo, name, opts)
 			if err != nil {
@@ -522,7 +524,7 @@ func buildDrillTask(name string, dep config.DeploymentConfig, verifier *backup.V
 // Validates required deployment fields (PGConnection, Repo) up
 // front so the engine never registers a task that's guaranteed to
 // fail at firing time.
-func buildBackupTask(name string, dep config.DeploymentConfig, signer *backup.Signer, verifier *backup.Verifier) (*schedule.Task, error) {
+func buildBackupTask(name string, dep config.DeploymentConfig, kmsCfg config.KMSConfig, signer *backup.Signer, verifier *backup.Verifier) (*schedule.Task, error) {
 	if dep.PGConnection == "" {
 		return nil, errors.New("missing pg_connection")
 	}
@@ -537,19 +539,33 @@ func buildBackupTask(name string, dep config.DeploymentConfig, signer *backup.Si
 		Name:     "backup:" + name,
 		Schedule: sched,
 		Run: func(ctx context.Context) error {
-			// Resolve encryption exactly like the interactive CLI:
-			// KEK on the keyring ⇒ encrypt. Resolved per run (not at
-			// task build) so a KEK installed after agent start takes
-			// effect without a restart. Without this every scheduled
-			// backup was silently plaintext — and plaintext-hash dedup
+			// Resolve encryption exactly like the interactive CLI: the
+			// deployment's kek_ref when it declares one, else a KEK on
+			// the keyring ⇒ encrypt. Without this every scheduled
+			// backup was silently plaintext, and plaintext-hash dedup
 			// welds those manifests onto encrypted chunks.
+			//
+			// Resolved per run rather than at task build, so a KEK
+			// dropped on the keyring after agent start takes effect
+			// without a restart, and each run opens a fresh provider
+			// (picking up a rotated ambient credential — an IRSA token,
+			// an instance-profile refresh). The config snapshot itself
+			// is still read once at start: editing kms.providers or
+			// kek_ref needs an agent reload.
 			var enc *runner.EncryptionConfig
 			if p, perr := paths.Resolve(paths.DefaultOptions()); perr == nil {
 				var eerr error
-				enc, eerr = runner.LocalEncryptionFromKeyring(p.Keyring.Value)
+				enc, eerr = runner.ResolveEncryption(ctx, runner.EncryptionRequest{
+					KeyringDir: p.Keyring.Value,
+					KEKRef:     dep.KEKRef,
+					KMSConfig:  kmsCfg.ProviderConfig(dep.KEKRef),
+				})
 				if eerr != nil {
 					return fmt.Errorf("agent backup %s: %w", name, eerr)
 				}
+			}
+			if enc != nil && enc.Provider != nil {
+				defer enc.Provider.Close()
 			}
 			_, err := runner.Take(ctx, runner.TakeOptions{
 				PGConnString: dep.PGConnection,

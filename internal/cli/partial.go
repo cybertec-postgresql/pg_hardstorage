@@ -529,6 +529,7 @@ func runPartialRestore(cmd *cobra.Command, deployment string, f partialRestoreFl
 		rfnMap = m
 	}
 
+	kmsProviderFor := deploymentKMSResolver(f.kmsConfig)
 	res, err := partial.Restore(cmd.Context(), partial.RestoreOptions{
 		RepoURL:        f.repoURL,
 		Deployment:     deployment,
@@ -545,7 +546,14 @@ func runPartialRestore(cmd *cobra.Command, deployment string, f partialRestoreFl
 		// against the local keyring (the same mechanism `restore`
 		// uses).
 		KEKForRef: keystore.KEKResolver(p.Keyring.Value),
-		UnwrapDEK: keystore.DEKResolver(p.Keyring.Value, stringMapToAny(f.kmsConfig)),
+		UnwrapDEK: func(ctx context.Context, kekRef string, wrapped []byte) ([]byte, error) {
+			return keystore.UnwrapDEK(ctx, kekRef, wrapped, keystore.UnwrapOpts{
+				KeyringDir: p.Keyring.Value,
+				// --kms-config, else the `kms.providers` entry for the
+				// manifest's own KEKRef (issue #44).
+				ProviderConfig: kmsProviderFor(kekRef),
+			})
+		},
 	})
 	if err != nil {
 		return output.NewError("partial.restore_failed",

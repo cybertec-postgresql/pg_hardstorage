@@ -189,7 +189,9 @@ func runVerify(cmd *cobra.Command, deployment, backupID, repoURL string, sample 
 		// operator who just wants to know "are the chunks
 		// there?" on a backup whose KEK has been rotated.)
 		kmsCfg, _ := cmd.Flags().GetStringToString("kms-config")
-		cas, err = buildVerifyCAS(cmd.Context(), sp, m, stringMapToAny(kmsCfg))
+		// Falls back to the `kms.providers` entry for this manifest's
+		// KEKRef when no --kms-config was passed (issue #44).
+		cas, err = buildVerifyCAS(cmd.Context(), sp, m, deploymentKMSResolver(kmsCfg)(manifestKEKRef(m)))
 		if err != nil {
 			return err
 		}
@@ -308,6 +310,16 @@ func pickLatestBackup(ctx context.Context, store *backup.ManifestStore, deployme
 			})
 	}
 	return latestID, nil
+}
+
+// manifestKEKRef is the manifest's KEKRef, or "" when the backup is
+// unencrypted. Used to look the provider config up per manifest rather
+// than assuming one provider serves a whole repo.
+func manifestKEKRef(m *backup.Manifest) string {
+	if m == nil || m.Encryption == nil {
+		return ""
+	}
+	return m.Encryption.KEKRef
 }
 
 // buildVerifyCAS constructs the CAS the chunk-walk uses. Encrypted

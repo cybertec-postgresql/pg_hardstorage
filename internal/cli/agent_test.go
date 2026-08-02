@@ -88,7 +88,7 @@ func TestBuildBackupTask_RequiresFields(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			_, err := buildBackupTask("db1", c.dep, nil, nil)
+			_, err := buildBackupTask("db1", c.dep, config.KMSConfig{}, nil, nil)
 			if err == nil || !strings.Contains(err.Error(), c.want) {
 				t.Errorf("err = %v, want one mentioning %q", err, c.want)
 			}
@@ -101,7 +101,7 @@ func TestBuildBackupTask_RejectsBadSchedule(t *testing.T) {
 		PGConnection: "postgres://",
 		Repo:         "file://x",
 		Schedule:     config.DeploymentSchedule{Backup: config.ScheduleSpec{Every: "fortnight"}},
-	}, nil, nil)
+	}, config.KMSConfig{}, nil, nil)
 	if err == nil {
 		t.Fatal("expected schedule parse error")
 	}

@@ -20,6 +20,7 @@ import (
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup/keystore"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/config"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/kms"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/output"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/paths"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/pg"
@@ -94,6 +95,7 @@ func runDoctor(cmd *cobra.Command, _ []string) error {
 	// fail the doctor command — the rest of the report is still
 	// useful.
 	if cfg != nil && cfg.IsConfigured() {
+		report.Issues = appendKEKRefChecks(cfg, report.Issues)
 		report.Repos, report.Issues = appendRepoChecks(cmd.Context(), cfg, report.Issues)
 		report.WALGaps, report.Issues = appendWALGapChecks(cmd.Context(), cfg, report.Issues)
 		report.ExpiredHolds, report.Issues = appendExpiredHoldChecks(cmd.Context(), cfg, report.Issues)
@@ -545,6 +547,58 @@ func appendManifestSignatureChecks(ctx context.Context, cfg *config.LoadResult, 
 		}()
 	}
 	return reports, issues
+}
+
+// appendKEKRefChecks flags a deployment whose `kek_ref` names a scheme
+// no provider in THIS binary claims.
+//
+// Config load can't do this check: plugin registration is a CLI-layer
+// init() and varies by build flavour — pkcs11 is gated behind a build
+// tag, so refusing an unregistered scheme at parse time would make a
+// perfectly good config unloadable on the default build (and would
+// break `lint` on a workstation for a config destined for an HSM host).
+// doctor runs with the real registry populated, which is exactly where
+// the question can be answered honestly.
+//
+// Severity is error, not critical: nothing is corrupt, but every backup
+// of that deployment will fail at the point the provider is opened.
+func appendKEKRefChecks(cfg *config.LoadResult, issues []doctorIssue) []doctorIssue {
+	schemes := kms.DefaultRegistry.Schemes()
+	sort.Strings(schemes) // Schemes() is map-ordered; the suggestion text must be stable
+	known := make(map[string]struct{}, len(schemes)+1)
+	for _, s := range schemes {
+		known[s] = struct{}{}
+	}
+	// The keystore resolves local: itself; it is not in the registry.
+	known["local"] = struct{}{}
+
+	names := make([]string, 0, len(cfg.Config.Deployments))
+	for name := range cfg.Config.Deployments {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	for _, name := range names {
+		ref := cfg.Config.Deployments[name].KEKRef
+		if ref == "" {
+			continue
+		}
+		scheme := kms.SchemeOf(ref)
+		if _, ok := known[scheme]; ok {
+			continue
+		}
+		issues = append(issues, doctorIssue{
+			Severity: output.SeverityError,
+			Code:     "config.kek_ref_unknown_scheme",
+			Message: fmt.Sprintf("deployment %q declares kek_ref %q, but no KMS provider in this build claims scheme %q",
+				name, ref, scheme),
+			Suggestion: &output.Suggestion{
+				Human: "available schemes: local, " + strings.Join(schemes, ", ") +
+					" — check the scheme spelling, or install a build that links the provider (pkcs11 needs the pkcs11 build flavour)",
+			},
+		})
+	}
+	return issues
 }
 
 // appendRepoChecks walks the deployment config's unique repo URLs

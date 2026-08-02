@@ -16,7 +16,6 @@ import (
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup/runner"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup/tarsink"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/capacity"
-	"github.com/cybertec-postgresql/pg_hardstorage/internal/kms"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/output"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/paths"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo"
@@ -70,13 +69,15 @@ The repository must already exist — create it with ` + "`" + `pg_hardstorage r
 	c.Flags().BoolVar(&opts.noEncrypt, "no-encrypt", false,
 		"force unencrypted backup even when a KEK file is present")
 	c.Flags().StringVar(&opts.kekRef, "kek", "",
-		"KEK reference (default: local:default if a kek.bin is present). "+
+		"KEK reference (default: the deployment's kek_ref in pg_hardstorage.yaml, "+
+			"else local:default if a kek.bin is present). "+
 			"Cloud-KMS schemes: aws-kms://<arn-or-alias-or-key-id>. "+
 			"The runner opens the matching kms.Provider and asks it to wrap the per-backup DEK; "+
 			"the manifest stamps the KEKRef so restore can pick the right unwrap path.")
 	c.Flags().StringToStringVar(&opts.kmsConfig, "kms-config", nil,
 		"per-call config for the cloud-KMS provider (e.g. region=us-east-1,use_fips_endpoint=true). "+
-			"Only consulted when --kek is a cloud scheme.")
+			"Only consulted for a cloud scheme; replaces the matching kms.providers entry in "+
+			"pg_hardstorage.yaml for this run.")
 	c.Flags().StringVar(&opts.incrementalFrom, "incremental-from", "",
 		"take a PG 17+ incremental backup against this parent backup ID; "+
 			"requires summarize_wal=on on the source DB")
@@ -175,6 +176,12 @@ func runBackup(cmd *cobra.Command, opts runOptions) error {
 	// pass them on the command line; explicit flags still win (#12).
 	opts.pgConn, opts.repoURL = deploymentDefaults(opts.deployment, opts.pgConn, opts.repoURL)
 
+	// Same treatment for the KEK: a deployment that declares `kek_ref`
+	// encrypts under it without the operator repeating --kek on every
+	// run, and the matching `kms.providers` entry supplies region /
+	// credentials in place of --kms-config.
+	kekRef, kmsConfig := deploymentKMS(opts.deployment, opts.kekRef, opts.kmsConfig)
+
 	// Required-field checks (local mode only — a control-plane dispatch
 	// returned above). Validate the resolved values, not the raw flags:
 	// they may have been filled from the deployment config just above.
@@ -205,7 +212,7 @@ func runBackup(cmd *cobra.Command, opts runOptions) error {
 	// Resolve the encryption posture from --encrypt / --no-encrypt
 	// and from the keyring contents. Auto-detect when neither flag
 	// is set: present KEK ⇒ encrypt; absent KEK ⇒ plaintext.
-	encConfig, err := resolveBackupEncryption(cmd.Context(), p.Keyring.Value, opts.encrypt, opts.noEncrypt, opts.kekRef, opts.kmsConfig)
+	encConfig, err := resolveBackupEncryption(cmd.Context(), p.Keyring.Value, opts.encrypt, opts.noEncrypt, kekRef, kmsConfig)
 	if err != nil {
 		return err
 	}
@@ -402,58 +409,50 @@ var _ = repo.HSREPOFilename
 // and stuff it onto the EncryptionConfig.  The runner branches on
 // Provider != nil and uses Provider.WrapDEK instead of the on-disk
 // KEK.  No kek.bin is required for the cloud path.
-func resolveBackupEncryption(ctx context.Context, keyringDir string, encryptFlag, noEncryptFlag bool, kekRef string, kmsConfig map[string]string) (*runner.EncryptionConfig, error) {
-	if encryptFlag && noEncryptFlag {
+//
+// The decision itself lives in runner.ResolveEncryption so the agent's
+// scheduled and control-plane backups reach the same verdict from the
+// same inputs (issue #44); this function is the CLI's error-taxonomy
+// shim over it.  kekRef / kmsConfig arrive already resolved — flag
+// first, then the deployment's kek_ref via deploymentKMS.
+func resolveBackupEncryption(ctx context.Context, keyringDir string, encryptFlag, noEncryptFlag bool, kekRef string, kmsConfig map[string]any) (*runner.EncryptionConfig, error) {
+	cfg, err := runner.ResolveEncryption(ctx, runner.EncryptionRequest{
+		KeyringDir: keyringDir,
+		KEKRef:     kekRef,
+		KMSConfig:  kmsConfig,
+		Encrypt:    encryptFlag,
+		NoEncrypt:  noEncryptFlag,
+	})
+	if err == nil {
+		return cfg, nil
+	}
+	switch {
+	case errors.Is(err, runner.ErrConflictingEncryptFlags):
 		return nil, output.NewError("usage.conflicting_flags",
 			"backup: --encrypt and --no-encrypt are mutually exclusive").
 			Wrap(output.ErrUsage)
-	}
-	if noEncryptFlag {
-		return nil, nil
-	}
-
-	// Cloud-KMS branch.  Triggered by an explicit --kek with
-	// a non-local scheme.  We open the provider eagerly so an
-	// auth/region misconfig surfaces here rather than mid-
-	// backup; the runner closes it when TakeBackup returns.
-	if kekRef != "" && kekRef != keystore.KEKRefLocal && keystore.SchemeOf(kekRef) != "local" {
-		cfg := stringMapToAny(kmsConfig)
-		provider, err := kms.DefaultRegistry.Open(ctx, kekRef, cfg)
-		if err != nil {
-			// An unreachable KMS endpoint exits 8 (kms.unreachable); a
-			// credential/region/KEKRef misconfig keeps backup.kms_open_failed.
-			return nil, kmsOpError(err,
-				fmt.Sprintf("backup: open cloud KMS for %q", kekRef),
-				"backup.kms_open_failed",
-				&output.Suggestion{
-					Human: "verify the KEKRef + the provider's --kms-config (region / endpoint / credentials)",
-				})
-		}
-		return &runner.EncryptionConfig{
-			Provider: provider,
-			KEKRef:   provider.KEKRef(),
-		}, nil
-	}
-
-	// Local-custody branch (the v0.1..shape).
-	hasKEK := keystore.KEKExists(keyringDir)
-	if encryptFlag && !hasKEK {
+	case errors.Is(err, runner.ErrEncryptNoKEK):
 		return nil, output.NewError("backup.encrypt_no_kek",
 			"backup: --encrypt set but no KEK file found at the keyring").
 			WithSuggestion(&output.Suggestion{
 				Human:   "generate a KEK by running init with --encrypt, or drop a 32-byte key at the keyring path manually",
 				Command: "pg_hardstorage init --yes --encrypt",
 			})
-	}
-	if !hasKEK {
-		return nil, nil
-	}
-	kek, _, err := keystore.LoadOrGenerateKEK(keyringDir)
-	if err != nil {
+	case errors.Is(err, runner.ErrKEKLoad):
 		return nil, output.NewError("backup.kek_load_failed",
-			fmt.Sprintf("backup: load KEK: %v", err)).Wrap(err)
+			fmt.Sprintf("backup: %v", err)).Wrap(err)
+	default:
+		// An unreachable KMS endpoint exits 8 (kms.unreachable); a
+		// credential/region/KEKRef misconfig keeps backup.kms_open_failed.
+		// The wrapped error already names the KEKRef, so the op prefix
+		// stays bare.
+		return nil, kmsOpError(err, "backup",
+			"backup.kms_open_failed",
+			&output.Suggestion{
+				Human: "verify the KEKRef + the provider's config (region / endpoint / credentials) " +
+					"from --kms-config or the kms.providers entry in pg_hardstorage.yaml",
+			})
 	}
-	return &runner.EncryptionConfig{KEK: kek, KEKRef: keystore.KEKRefLocal}, nil
 }
 
 // stringMapToAny converts the cobra StringToStringVar output

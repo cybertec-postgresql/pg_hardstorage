@@ -672,8 +672,25 @@ func KeystoreKEKResolver(keyringDir string) func(ref string) ([encryption.KeyLen
 // DrillOptions.DEKUnwrapper, mirroring KeystoreKEKResolver. Lets a recovery
 // drill restore a backup wrapped with a cloud KMS KEK (the DEK is unwrapped
 // server-side).
-func KeystoreDEKResolver(keyringDir string) func(ctx context.Context, kekRef string, wrapped []byte) ([]byte, error) {
-	return keystore.DEKResolver(keyringDir, nil)
+//
+// providerConfig resolves the `kms.providers` settings for a given
+// manifest KEKRef — pass config.KMSConfig.ProviderConfig. A nil func
+// means "no declared providers", which still works for schemes that
+// need no config or run on ambient cloud credentials. Without it a
+// drill of a deployment whose provider needs an explicit region or
+// credential fails at the restore phase, and `doctor` then reports the
+// deployment's restorability as unproven (issue #44).
+func KeystoreDEKResolver(keyringDir string, providerConfig func(kekRef string) map[string]any) func(ctx context.Context, kekRef string, wrapped []byte) ([]byte, error) {
+	return func(ctx context.Context, kekRef string, wrapped []byte) ([]byte, error) {
+		var cfg map[string]any
+		if providerConfig != nil {
+			cfg = providerConfig(kekRef)
+		}
+		return keystore.UnwrapDEK(ctx, kekRef, wrapped, keystore.UnwrapOpts{
+			KeyringDir:     keyringDir,
+			ProviderConfig: cfg,
+		})
+	}
 }
 
 // metaForRepo is a noop placeholder kept to anchor the package's

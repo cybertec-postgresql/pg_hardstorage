@@ -115,6 +115,7 @@ func runVerifyFull(cmd *cobra.Command, deployment, backupID, repoURL, pgMajorOve
 	}
 	kekResolver := keystore.KEKResolver(p.Keyring.Value)
 	kmsCfg, _ := cmd.Flags().GetStringToString("kms-config")
+	kmsProviderFor := deploymentKMSResolver(kmsCfg)
 
 	if _, err := restore.Restore(cmd.Context(), restore.Options{
 		RepoURL:    repoURL,
@@ -123,7 +124,12 @@ func runVerifyFull(cmd *cobra.Command, deployment, backupID, repoURL, pgMajorOve
 		TargetDir:  tmp,
 		Verifier:   verifier,
 		KEKForRef:  kekResolver,
-		UnwrapDEK:  keystore.DEKResolver(p.Keyring.Value, stringMapToAny(kmsCfg)),
+		UnwrapDEK: func(ctx context.Context, kekRef string, wrapped []byte) ([]byte, error) {
+			return keystore.UnwrapDEK(ctx, kekRef, wrapped, keystore.UnwrapOpts{
+				KeyringDir:     p.Keyring.Value,
+				ProviderConfig: kmsProviderFor(kekRef),
+			})
+		},
 	}); err != nil {
 		// Distinguish a malformed-manifest failure from a generic
 		// restore failure (issue #91).  A manifest.invalid error

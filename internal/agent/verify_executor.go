@@ -46,19 +46,31 @@ import (
 //     stays uncorrupted because we never write to the source repo.
 type VerifyExecutor struct {
 	deployments map[string]config.DeploymentConfig
+	kms         config.KMSConfig
 	verifier    *backup.Verifier
 	keyringDir  string
 }
 
 // NewVerifyExecutor constructs an executor with the supplied config
 // + verifier + keyring path. KEK resolution is identical to the
-// restore executor's: only consulted for encrypted manifests.
-func NewVerifyExecutor(deps map[string]config.DeploymentConfig, verifier *backup.Verifier, keyringDir string) *VerifyExecutor {
+// restore executor's: only consulted for encrypted manifests, and the
+// `kms:` section supplies provider settings per manifest KEKRef.
+func NewVerifyExecutor(deps map[string]config.DeploymentConfig, kmsCfg config.KMSConfig, verifier *backup.Verifier, keyringDir string) *VerifyExecutor {
 	return &VerifyExecutor{
 		deployments: deps,
+		kms:         kmsCfg,
 		verifier:    verifier,
 		keyringDir:  keyringDir,
 	}
+}
+
+// unwrapDEK mirrors RestoreExecutor.unwrapDEK: provider settings are
+// looked up by the manifest's own KEKRef.
+func (e *VerifyExecutor) unwrapDEK(ctx context.Context, kekRef string, wrapped []byte) ([]byte, error) {
+	return keystore.UnwrapDEK(ctx, kekRef, wrapped, keystore.UnwrapOpts{
+		KeyringDir:     e.keyringDir,
+		ProviderConfig: e.kms.ProviderConfig(kekRef),
+	})
 }
 
 // Execute implements JobExecutor.
@@ -161,7 +173,7 @@ func (e *VerifyExecutor) Execute(ctx context.Context, job *ControlPlaneJob, prog
 		TargetDir:  tmp,
 		Verifier:   e.verifier,
 		KEKForRef:  kekFor,
-		UnwrapDEK:  keystore.DEKResolver(e.keyringDir, nil),
+		UnwrapDEK:  e.unwrapDEK,
 		// Audit-chain Actor for the inner restore: tags the
 		// restore.complete event with "verify:job:<id>" so a forensic
 		// walk distinguishes verify-driven sandbox restores from
