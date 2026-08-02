@@ -499,13 +499,25 @@ lint:
 #
 # Source mode is therefore best-effort (|| true, with a loud note);
 # binary mode is the hard gate.
-govulncheck: build
+#
+# The scanned binary is built WITHOUT the release `-ldflags -s -w`.
+# Those flags strip the symbol table, and without symbols govulncheck
+# cannot tell a reachable vulnerability from a merely-linked module —
+# it degrades to module granularity and flags every vulnerable
+# dependency whether or not anything calls it. That is not a usable
+# gate: one current advisory (GO-2026-5932 in x/crypto) has no fix
+# available at all, so a module-level gate would be permanently red and
+# would be ignored within a week. Same toolchain, same module graph,
+# symbols retained — only the reachability evidence differs.
+govulncheck:
 	@command -v govulncheck >/dev/null 2>&1 || { echo "install: go install golang.org/x/vuln/cmd/govulncheck@latest"; exit 1; }
 	@echo "--- source mode (best-effort; panics on some toolchains) ---"
 	-govulncheck -show=verbose $(GO_PKGS)
 	-govulncheck -show=verbose -tags=integration $(GO_PKGS)
 	@echo "--- binary mode (hard gate: scans the artifact we ship) ---"
-	govulncheck -mode=binary $(BIN_DIR)/$(BINARY)
+	@mkdir -p $(BIN_DIR)
+	CGO_ENABLED=$(CGO_ENABLED) go build $(GOFLAGS) -o $(BIN_DIR)/$(BINARY).vulnscan ./cmd/$(BINARY)
+	govulncheck -mode=binary $(BIN_DIR)/$(BINARY).vulnscan
 
 clean:
 	rm -rf $(BIN_DIR)/ coverage.out coverage.html
