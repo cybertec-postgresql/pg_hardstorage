@@ -22,7 +22,12 @@ on:
     inputs:
       smoke_version:
         description: "Version to run the Homebrew smoke test against, e.g. 1.0.13"
-        required: true
+        required: false
+        default: ""
+      provenance_tag:
+        description: "Backfill SLSA provenance for an ALREADY-PUBLISHED tag, e.g. v1.1.0"
+        required: false
+        default: ""
 
 permissions:
   contents: write       # create the GitHub Release
@@ -91,6 +96,16 @@ jobs:
       # dist/artifacts.json by default.
       - name: collect artifact metadata
         id: collect-artifacts
+        # Run even when the goreleaser step reported failure. goreleaser
+        # publishes the release + all artifacts BEFORE its cask-push step,
+        # which fails today on the tap token (HOMEBREW_TAP_TOKEN, 401). With
+        # the default on-success condition this step was skipped, the
+        # subject-checksums output was empty, and the SLSA job below was
+        # skipped with it — so a *cask publishing* failure silently cost the
+        # release its supply-chain attestation. It did exactly that on
+        # v1.0.16, v1.0.17 and v1.1.0. Same reasoning as homebrew-smoke's
+        # `!cancelled()` below.
+        if: ${{ !cancelled() }}
         run: |
           # subject-checksums maps to the SLSA generator's expected
           # input shape: a base64-encoded text blob, one
@@ -121,7 +136,11 @@ jobs:
   slsa-provenance:
     name: SLSA L3 provenance
     needs: [goreleaser]
-    if: needs.goreleaser.outputs.subject-checksums != ''
+    # `!cancelled()` rather than the default on-success: see the
+    # collect-artifact-metadata step. The real guard is the checksum output
+    # being non-empty — if goreleaser died BEFORE building anything there is
+    # nothing to attest and this correctly does not run.
+    if: ${{ !cancelled() && needs.goreleaser.outputs.subject-checksums != '' }}
     permissions:
       actions: read       # required for SLSA L3 isolation
       id-token: write     # OIDC token for keyless signing
@@ -151,7 +170,9 @@ jobs:
     # tap token, HOMEBREW_TAP_TOKEN), so the tarballs the cask points at DO
     # exist. Without this the job is always skipped. `!cancelled()` still
     # skips on a manual workflow cancel.
-    if: ${{ !cancelled() }}
+    # On a manual dispatch, only run when a version was actually supplied —
+    # a provenance-only backfill dispatch must not trip the cask smoke test.
+    if: ${{ !cancelled() && (github.event_name == 'push' || inputs.smoke_version != '') }}
     runs-on: macos-latest
     steps:
       - name: Derive release version
@@ -192,3 +213,72 @@ jobs:
           pg_hardstorage repo init "$repo" >/dev/null
           pg_hardstorage glossary RPO >/dev/null
           echo "✓ brew-installed pg_hardstorage $WANT runs (version, help, repo init, glossary)"
+
+  # ---------------------------------------------------------------------
+  # Provenance backfill for an already-published release.
+  #
+  # Normally provenance is generated in the same run that builds the
+  # artifacts (the slsa-provenance job above). This path exists for
+  # releases that shipped WITHOUT it — v1.0.16, v1.0.17 and v1.1.0 all
+  # lost their attestation because a Homebrew cask-push failure aborted
+  # goreleaser and skipped the SLSA job downstream of it.
+  #
+  # HONEST LIMITATION: the provenance produced here names THIS backfill
+  # run as the builder, not the original release run — a post-hoc
+  # attestation cannot claim to have observed a build it did not perform.
+  # What it does establish is what `slsa-verifier` actually checks:
+  # that this repository, at this tag, vouches for these exact bytes.
+  # The subject hashes are taken from the published assets, so they match
+  # what users download. Prefer the in-line job above; use this only to
+  # repair a release that lost its attestation.
+  backfill-subjects:
+    name: SLSA backfill — hash published assets
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.provenance_tag != '' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Download the published release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.provenance_tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p backfill && cd backfill
+          # Attest the same artifact classes the in-line job does; the
+          # .sig/.pem/.sbom side-files are signatures over these, not
+          # build outputs.
+          gh release download "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --pattern '*.tar.gz' --pattern '*.zip' \
+              --pattern '*.deb'    --pattern '*.rpm'
+          ls -1
+      - name: Compute subject checksums
+        id: subjects
+        run: |
+          set -euo pipefail
+          cd backfill
+          checksums=$(sha256sum *.tar.gz *.zip *.deb *.rpm 2>/dev/null | base64 -w0)
+          if [ -z "$checksums" ]; then
+            echo "::error::no assets found on ${{ inputs.provenance_tag }}"
+            exit 1
+          fi
+          echo "subject-checksums=$checksums" >> "$GITHUB_OUTPUT"
+    outputs:
+      subject-checksums: ${{ steps.subjects.outputs.subject-checksums }}
+
+  backfill-provenance:
+    name: SLSA backfill — generate provenance
+    needs: [backfill-subjects]
+    if: ${{ needs.backfill-subjects.outputs.subject-checksums != '' }}
+    permissions:
+      actions: read
+      id-token: write
+      contents: write
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.0.0
+    with:
+      base64-subjects: "${{ needs.backfill-subjects.outputs.subject-checksums }}"
+      upload-assets: true
+      # Required when uploading to a release we are not triggered by.
+      upload-tag-name: "${{ inputs.provenance_tag }}"
+      provenance-name: pg_hardstorage.intoto.jsonl
