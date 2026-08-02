@@ -55,6 +55,7 @@ package contract
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -97,6 +98,8 @@ func Run(t *testing.T, open PluginOpener) {
 		{"IfNotExists_FirstWins_OthersErr", caseIfNotExists},
 		{"RenameIfNotExists_HappyPath", caseRenameHappy},
 		{"RenameIfNotExists_DstPresent_ErrAlreadyExists", caseRenameDstPresent},
+		{"RenameIfNotExists_AcrossPrefix", caseRenameAcrossPrefix},
+		{"ContentSHA256_MatchesAdvertisedCapability", caseContentSHA256Honesty},
 	}
 	for _, c := range cases {
 		c := c
@@ -285,6 +288,81 @@ func caseRenameHappy(t *testing.T, p storage.StoragePlugin) {
 	}
 	if _, err := p.Stat(context.Background(), "ren/src"); !errors.Is(err, storage.ErrNotFound) {
 		t.Errorf("Stat(src) after rename: err = %v, want ErrNotFound", err)
+	}
+}
+
+// caseRenameAcrossPrefix renames into a prefix that does not exist
+// yet.  Every other rename case keeps src and dst under the SAME
+// prefix, which on a filesystem-backed backend means the destination
+// directory already exists — so the suite could not distinguish a
+// backend that creates the parent from one that requires it.
+//
+// It could not: fs:// created it (os.MkdirAll) and s3:// has no
+// directories at all, while scp:// and sftp:// failed with a bare
+// "No such file or directory".  Same documented operation, four
+// backends, two answers.  Callers today happen to rename within one
+// directory (a manifest's staging file sits beside its final key), so
+// nothing broke — but a caller that did not would work on a local repo
+// and fail on an SSH one.
+func caseRenameAcrossPrefix(t *testing.T, p storage.StoragePlugin) {
+	const body = "moved-across-prefixes"
+	putString(t, p, "renx/staging/obj", body)
+	// "renx/committed/" has never been written to.
+	if err := p.RenameIfNotExists(context.Background(),
+		"renx/staging/obj", "renx/committed/obj"); err != nil {
+		t.Fatalf("RenameIfNotExists into a fresh prefix: %v", err)
+	}
+	if got := getString(t, p, "renx/committed/obj"); got != body {
+		t.Errorf("body at dst: got %q, want %q", got, body)
+	}
+	if _, err := p.Stat(context.Background(), "renx/staging/obj"); !errors.Is(err, storage.ErrNotFound) {
+		t.Errorf("Stat(src) after rename: err = %v, want ErrNotFound", err)
+	}
+}
+
+// caseContentSHA256Honesty pins Capabilities.VerifiesContentSHA256 to
+// actual behaviour.
+//
+// PutOptions.ContentSHA256 is optional-by-capability: only a backend
+// that advertises VerifiesContentSHA256 promises to verify the
+// post-write hash and return ErrChecksumMismatch. Today only fs does;
+// S3 / Azure / GCS / SFTP / SCP deliberately ignore the field and lean
+// on transport-layer integrity, and internal/repo.CAS skips computing
+// the hash for them (it costs a second full SHA-256 pass per chunk).
+//
+// The risk is a plugin that advertises the capability but silently
+// drops the field. Callers gate on the capability, so they would
+// believe they had post-write verification while nothing checked
+// anything. This asserts the two agree, in whichever direction the
+// backend claims.
+func caseContentSHA256Honesty(t *testing.T, p storage.StoragePlugin) {
+	if !p.Capabilities().VerifiesContentSHA256 {
+		t.Skip("backend does not advertise VerifiesContentSHA256; the field is optional for it")
+	}
+	body := []byte("content-sha256-honesty")
+	var wrong [32]byte
+	wrong[0] = 0x01 // cannot be the SHA-256 of anything we just wrote
+
+	_, err := p.Put(context.Background(), "sha/mismatch", bytes.NewReader(body),
+		storage.PutOptions{ContentLength: int64(len(body)), ContentSHA256: wrong})
+	if err == nil {
+		t.Fatal("backend advertises VerifiesContentSHA256 but accepted a mismatched ContentSHA256")
+	}
+	if !errors.Is(err, storage.ErrChecksumMismatch) {
+		t.Errorf("mismatched ContentSHA256: err = %v, want ErrChecksumMismatch", err)
+	}
+	// A rejected write must not leave a readable object behind.
+	if rc, gerr := p.Get(context.Background(), "sha/mismatch"); gerr == nil {
+		_ = rc.Close()
+		t.Error("rejected Put left a readable object at the key")
+	}
+
+	// The matching case must still succeed, so the check is not simply
+	// refusing every ContentSHA256.
+	good := sha256.Sum256(body)
+	if _, err := p.Put(context.Background(), "sha/match", bytes.NewReader(body),
+		storage.PutOptions{ContentLength: int64(len(body)), ContentSHA256: good}); err != nil {
+		t.Errorf("Put with a CORRECT ContentSHA256 failed: %v", err)
 	}
 }
 

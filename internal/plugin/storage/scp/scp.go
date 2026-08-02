@@ -11,12 +11,20 @@
 //	scp://backup@nas.example.com/srv/pg-hardstorage
 //	scp://nas.example.com:2222/data/backups
 //
-// Authentication (same Extras keys as the sftp plugin):
+// Authentication (same keys and same precedence as the sftp
+// plugin — Extras first, then environment):
 //
-//	identity_file: /etc/pg_hardstorage/keys/scp_id_ed25519     # private key
-//	identity_passphrase: ""                                    # if encrypted
-//	known_hosts: /etc/pg_hardstorage/keys/known_hosts          # required
-//	password: ""                                               # discouraged
+//	identity_file        PG_HARDSTORAGE_SCP_IDENTITY_FILE        # private key
+//	identity_passphrase  PG_HARDSTORAGE_SCP_IDENTITY_PASSPHRASE  # if encrypted
+//	known_hosts          PG_HARDSTORAGE_SCP_KNOWN_HOSTS          # required
+//	password             PG_HARDSTORAGE_SCP_PASSWORD             # discouraged
+//
+// The environment fallback is not a convenience — it is the only
+// working path today. Nothing populates StorageConfig.Extras in
+// production (storage.Open builds the config from the URL alone),
+// so without it every scp:// operation failed at open with
+// "extras.known_hosts is required" and the backend could not be
+// used at all.
 //
 // # Why a separate scp:// backend when sftp:// exists?
 //
@@ -145,13 +153,26 @@ func (p *Plugin) Open(_ context.Context, cfg storage.StorageConfig) error {
 	}
 	root := path.Clean(cfg.URL.Path)
 
-	identityFile := cfg.Extras["identity_file"]
-	identityPassphrase := cfg.Extras["identity_passphrase"]
-	password := cfg.Extras["password"]
-	knownHosts := cfg.Extras["known_hosts"]
+	// Extras first, then environment — identical precedence to the
+	// sftp plugin. Extras is currently never populated in production;
+	// see the package doc.
+	identityFile := firstNonEmpty(
+		cfg.Extras["identity_file"],
+		os.Getenv("PG_HARDSTORAGE_SCP_IDENTITY_FILE"))
+	identityPassphrase := firstNonEmpty(
+		cfg.Extras["identity_passphrase"],
+		os.Getenv("PG_HARDSTORAGE_SCP_IDENTITY_PASSPHRASE"))
+	password := firstNonEmpty(
+		cfg.Extras["password"],
+		os.Getenv("PG_HARDSTORAGE_SCP_PASSWORD"))
+	knownHosts := firstNonEmpty(
+		cfg.Extras["known_hosts"],
+		os.Getenv("PG_HARDSTORAGE_SCP_KNOWN_HOSTS"))
 
 	if knownHosts == "" {
-		return errors.New("scp: extras.known_hosts is required (refusing StrictHostKeyChecking=no posture)")
+		return errors.New("scp: known_hosts required " +
+			"(set extras.known_hosts or PG_HARDSTORAGE_SCP_KNOWN_HOSTS env; " +
+			"refusing StrictHostKeyChecking=no posture)")
 	}
 	hk, err := xknownhosts.New(knownHosts)
 	if err != nil {
@@ -178,7 +199,9 @@ func (p *Plugin) Open(_ context.Context, cfg storage.StorageConfig) error {
 	case password != "":
 		auth = append(auth, ssh.Password(password))
 	default:
-		return errors.New("scp: extras.identity_file or extras.password is required")
+		return errors.New("scp: identity_file or password required " +
+			"(set extras.identity_file / extras.password, or " +
+			"PG_HARDSTORAGE_SCP_IDENTITY_FILE / PG_HARDSTORAGE_SCP_PASSWORD env)")
 	}
 
 	cfgssh := &ssh.ClientConfig{
@@ -471,6 +494,16 @@ func (p *Plugin) RenameIfNotExists(ctx context.Context, src, dst string) error {
 	} else if exists {
 		return storage.ErrAlreadyExists
 	}
+	// Create the destination's parent, matching the fs reference
+	// implementation (fs.RenameIfNotExists does os.MkdirAll). Today's
+	// callers rename within one directory — a manifest's staging file
+	// sits beside its final key — so the parent always happened to
+	// exist and the gap was invisible. A cross-prefix rename failed
+	// with a bare "No such file or directory" on scp/sftp while
+	// succeeding on fs:// and s3://.
+	if err := p.mkdirAll(ctx, path.Dir(dstFull)); err != nil {
+		return err
+	}
 	if _, lerr := p.runShell(ctx, "ln -T "+shellQuote(srcFull)+" "+shellQuote(dstFull)); lerr != nil {
 		if strings.Contains(lerr.Error(), "File exists") {
 			return storage.ErrAlreadyExists
@@ -753,4 +786,16 @@ func randomSuffix() string {
 	var b [8]byte
 	_, _ = rand.Read(b[:])
 	return hex.EncodeToString(b[:])
+}
+
+// firstNonEmpty returns the first non-empty argument. Mirrors the
+// sftp plugin's helper of the same name; used to express the
+// Extras-then-environment credential precedence.
+func firstNonEmpty(vs ...string) string {
+	for _, v := range vs {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }

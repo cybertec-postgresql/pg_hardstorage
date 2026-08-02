@@ -520,6 +520,16 @@ func (p *Plugin) RenameIfNotExists(ctx context.Context, src, dst string) error {
 	if _, err := p.client.Stat(dstFull); err == nil {
 		return storage.ErrAlreadyExists
 	}
+	// Create the destination's parent, matching the fs reference
+	// implementation (fs.RenameIfNotExists does os.MkdirAll). Today's
+	// callers rename within one directory — a manifest's staging file
+	// sits beside its final key — so the parent always happened to
+	// exist and the gap was invisible. A cross-prefix rename failed
+	// with a bare "file does not exist" on sftp/scp while succeeding
+	// on fs:// and s3://.
+	if err := p.mkdirAll(path.Dir(dstFull)); err != nil {
+		return err
+	}
 	if err := p.atomicRename(srcFull, dstFull); err != nil {
 		return fmt.Errorf("sftp: rename %s -> %s: %w", srcFull, dstFull, err)
 	}

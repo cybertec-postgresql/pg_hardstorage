@@ -159,10 +159,24 @@ type PutOptions struct {
 	// backends pre-allocate / pick optimal multipart strategy.
 	ContentLength int64
 
-	// ContentSHA256 is the expected SHA-256 of the plaintext. When set
-	// (any non-zero byte), the plugin MUST verify after writing and
-	// return ErrChecksumMismatch on disagreement. Zero value disables
-	// the check.
+	// ContentSHA256 is the expected SHA-256 of the plaintext. Zero
+	// value disables the check.
+	//
+	// The MUST here is CONDITIONAL on the backend advertising
+	// Capabilities.VerifiesContentSHA256: a plugin that advertises it
+	// must verify after writing and return ErrChecksumMismatch on
+	// disagreement; a plugin that does not advertise it is free to
+	// ignore this field entirely, and today only `fs` advertises it
+	// (S3 / Azure / GCS / SFTP / SCP rely on transport-layer integrity
+	// instead — see the capability's own doc for why).
+	//
+	// This comment previously stated the MUST unconditionally, which
+	// contradicted the capability twenty lines above it. A caller who
+	// believed it would set ContentSHA256 against S3 and think they
+	// had post-write verification when nothing checked anything.
+	// Callers must gate on the capability, as internal/repo.CAS does —
+	// it also avoids a second full SHA-256 pass per chunk (~9% of
+	// wal-stream CPU) on backends that would discard the result.
 	ContentSHA256 [32]byte
 
 	// StorageClass is backend-specific (S3: STANDARD / GLACIER / ...).
