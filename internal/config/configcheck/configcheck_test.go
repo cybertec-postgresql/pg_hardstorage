@@ -194,3 +194,27 @@ func TestScrub_ValueShapeNoFalsePositiveOnValid(t *testing.T) {
 		t.Errorf("valid config must stay silent, got: %+v", fs)
 	}
 }
+
+// A bare `kms:` block — the shape every KMS how-to shows in its
+// "configure the provider" step — must be recognised as config.
+// Before issue #44 it wasn't, so a provider block full of invented
+// keys was invisible to both the LLM scrubber and the docs meta-test.
+func TestScrub_RecognisesBareKMSBlock(t *testing.T) {
+	body := "```yaml\nkms:\n  providers:\n    - kek_ref: aws-kms://alias/prod\n      regoin: us-east-1\n```"
+	findings := configcheck.Scrub(body)
+	if len(findings) == 0 {
+		t.Fatal("a kms-only block was skipped; invented provider keys would ship undetected")
+	}
+	if findings[0].Key != "regoin" {
+		t.Errorf("flagged %q, want the misspelled regoin", findings[0].Key)
+	}
+}
+
+// The valid shape must NOT be flagged, or the docs meta-test would
+// fail on every correct page.
+func TestScrub_AcceptsDocumentedKMSConfig(t *testing.T) {
+	body := "```yaml\nkms:\n  providers:\n    - kek_ref: azure-kv://acme-pg-vault/db1-kek\n      config:\n        use_fips_mode: true\ndeployments:\n  db1:\n    repo: azblob://acmebackups/prod\n    kek_ref: azure-kv://acme-pg-vault/db1-kek\n```"
+	if findings := configcheck.Scrub(body); len(findings) != 0 {
+		t.Errorf("documented config flagged: %+v", findings)
+	}
+}

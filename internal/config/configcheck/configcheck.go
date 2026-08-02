@@ -115,6 +115,16 @@ func looksLikeConfig(m map[string]interface{}) bool {
 	if _, ok := m["deployments"]; ok {
 		return true
 	}
+	// A bare `kms:` block is the shape every KMS how-to shows in its
+	// "configure the provider" step. Without this arm those blocks were
+	// invisible to the checker — and to the docs meta-test built on it,
+	// which is how five pages shipped an invented schema (issue #44).
+	if _, ok := m["kms"]; ok {
+		return true
+	}
+	if _, ok := m["sinks"]; ok {
+		return true
+	}
 	if s, ok := m["schema"].(string); ok && strings.HasPrefix(s, "pg_hardstorage.config") {
 		return true
 	}

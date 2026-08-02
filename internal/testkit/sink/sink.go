@@ -129,6 +129,12 @@ var SinkImages = map[string]string{
 	"azurite":   "mcr.microsoft.com/azure-storage/azurite:3.33.0",
 	"gcs-fake":  "fsouza/fake-gcs-server:1.49.0",
 	"sftp":      "atmoz/sftp:alpine-3.7",
+	// ssh-exec is the scp fixture. The value is the BASE image; the
+	// runtime builds the final sshd image from it per-instance,
+	// because that image embeds a throwaway authorized_keys that must
+	// never be baked into anything published. Pre-pulling the base is
+	// what air-gap mode needs.
+	"ssh-exec": "alpine:3.20",
 }
 
 // New builds a Runtime by kind name.  Unknown kinds error
@@ -138,6 +144,8 @@ func New(kind string) (Runtime, error) {
 	switch kind {
 	case "s3-minio":
 		return newMinIO(), nil
+	case "ssh-exec":
+		return newSSHExec(), nil
 	case "tls-minio":
 		return newTLSMinIO(), nil
 	case "azurite":
