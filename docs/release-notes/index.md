@@ -13,10 +13,14 @@ operator deciding whether to upgrade.
 
 ## Releases
 
-- **[Unreleased](unreleased.md)** — changes on `main` since
-  v1.0: fleet-scale improvements (sharded audit chains, a
+- **[v1.1](v1.1.md)** — cloud KMS becomes configurable in
+  `pg_hardstorage.yaml` (`kms.providers[]` + per-deployment
+  `kek_ref`), which is what finally lets the agent's
+  scheduled and control-plane backups use a cloud KEK; the
+  `scp://` backend goes from unusable to working; plus
+  fleet-scale improvements (sharded audit chains, a
   deployment index, agent poll jitter, a job-concurrency cap)
-  plus correctness and WORM-compliance hardening.  Backward
+  and correctness + WORM-compliance hardening.  Backward
   compatible — no migration.
 - **[v1.0](v1.0.md)** — the first stable release.  Five
   Tier-1 KMS providers (AWS / GCP / Azure / Vault / HSM),

@@ -11,6 +11,139 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ## [Unreleased]
 
+## [1.1.0] — 2026-08-02
+
+A minor bump rather than a patch: this release **adds configuration
+surface**. `kms.providers[]` and per-deployment `kek_ref` are new keys
+in `pg_hardstorage.yaml`, and the `scp://` storage backend goes from
+unusable to working. Existing configurations are unaffected — no
+migration, and nothing changes posture on upgrade.
+
+### Added
+
+- **Cloud KMS is configurable in `pg_hardstorage.yaml`** ([#44]). The
+  top-level `kms.providers[]` block and per-deployment `kek_ref` that
+  every KMS how-to documented now exist in the config schema; following
+  those pages previously failed the strict loader outright
+  (`field kms not found in type config.Config`).
+- `doctor` reports `config.kek_ref_unknown_scheme` when a deployment's
+  `kek_ref` names a scheme no provider in the running build claims.
+
+### Fixed
+
+- **Agent-driven backups can use a cloud KEK** ([#44]). A cloud KEK was
+  selectable only through `--kek` / `--kms-config` on an individual
+  command, so the scheduler and the control-plane executor — neither of
+  which has a command line — always fell back to the local `kek.bin`.
+  Both now resolve the deployment's `kek_ref` through the same resolver
+  `backup` uses (`runner.ResolveEncryption`), as do `wal push`,
+  `wal stream`, `restore`, `verify`, `partial restore` / `partial dump`,
+  and recovery drills. A declared `kek_ref` whose provider fails to open
+  now fails the run instead of silently downgrading custody.
+- **Recovery drills of a cloud-KMS deployment could never pass.** A drill
+  builds its restore internally and takes no KMS flags, and its DEK
+  resolver hardcoded a nil provider config — so any deployment whose
+  provider needs an explicit region or credential failed every drill, and
+  `doctor` reported its backups as unproven (CRITICAL).
+- `helm-sidecar-chart.md` documented a third, non-existent config shape
+  (`kms.<name>.type` / `key_id`); corrected to the real schema.
+- **`azure-key-vault://` was never a valid KEKRef scheme.** The
+  encryption tutorial and `kms --help` both advertised it; the provider
+  registers `azure-kv`. Following either produced
+  `kms: unknown KEKRef scheme` on the first encrypted backup.
+- **Three more families of unloadable documented config**, found by the
+  new schema meta-test and each the same defect as [#44] — the loader is
+  strict, so these did not degrade, they refused the whole file:
+  - `sinks[].filter` (7 sink how-tos + the operator guide). Sink plugins
+    read `min_severity` from `config:`; the `components` allowlist was
+    never implemented by any sink and has been removed from the docs.
+  - `deployments[].worm` / `worm_retention` (`pci-dss.md`). WORM is a
+    repository property set by `repo init --worm-mode/--worm-retention`,
+    deliberately init-time only.
+  - `deployments[].extras` (`repository-scp.md`, `repository-sftp.md`) —
+    see the known issue below.
+
+- **The `scp://` storage backend was unusable and now works.** It reads
+  its credentials from a storage-plugin `extras` map, but nothing
+  populates that map in production — `storage.Open` builds the config
+  from the URL alone — and unlike `sftp://`, `scp://` had no
+  environment fallback. Every operation failed at open with
+  `scp: extras.known_hosts is required`, so the backend could not be
+  used at all. It now reads `PG_HARDSTORAGE_SCP_KNOWN_HOSTS`,
+  `…_IDENTITY_FILE`, `…_IDENTITY_PASSPHRASE`, and `…_PASSWORD`,
+  matching the sftp plugin's precedence exactly.
+
+  The defect survived a full contract suite because every storage
+  suite constructs `StorageConfig` by hand *with* `Extras` populated,
+  which the real caller never does. New container-backed tests
+  (`internal/plugin/storage/wiring_e2e_test.go`) drive `storage.Open`
+  — the production entry point — for `scp://`, `sftp://` and `s3://`,
+  so a backend reachable only from a test harness now fails CI.
+
+- **`RenameIfNotExists` disagreed across backends.** `fs://` created the
+  destination's parent directory (`os.MkdirAll`) and `s3://` has no
+  directories at all, but `scp://` and `sftp://` failed with a bare
+  "No such file or directory" when the destination prefix did not exist
+  yet. Same documented operation, four backends, two answers. Current
+  callers rename within a single directory — a manifest's staging file
+  sits beside its final key — so nothing broke in practice, but a caller
+  that renamed across prefixes would have worked on a local repo and
+  failed on an SSH one. Both SSH plugins now create the parent, matching
+  the `fs` reference.
+
+  The contract suite could not have caught this: every rename case used
+  `ren/src` → `ren/dst`, one prefix, so the destination directory always
+  already existed. A `RenameIfNotExists_AcrossPrefix` case now covers it
+  for every backend.
+
+- **The storage contract contradicted itself on `ContentSHA256`.**
+  `PutOptions.ContentSHA256` documented an unconditional "the plugin
+  MUST verify after writing and return `ErrChecksumMismatch`", while
+  `Capabilities.VerifiesContentSHA256` — twenty lines above it in the
+  same file — documented the verification as opt-in, advertised only by
+  `fs`. S3, Azure, GCS, SFTP and SCP deliberately ignore the field and
+  rely on transport-layer integrity, and `internal/repo.CAS` correctly
+  gates on the capability (computing the hash unconditionally cost ~9%
+  of wal-stream CPU). The behaviour was right; the contract text was
+  not, and a caller who trusted it would set `ContentSHA256` against S3
+  believing they had post-write verification while nothing checked
+  anything. The MUST is now explicitly conditional on the capability.
+
+  A `ContentSHA256_MatchesAdvertisedCapability` contract case now pins
+  the two together in whichever direction a backend claims, so a plugin
+  that advertises the capability without implementing it fails.
+
+### Known issues
+
+- **`scp://` and `sftp://` are configurable only through
+  `PG_HARDSTORAGE_SCP_*` / `PG_HARDSTORAGE_SFTP_*` environment
+  variables**, not through `pg_hardstorage.yaml`. The plugins read a
+  storage-plugin `extras` map that nothing populates; wiring a config
+  surface to it is follow-up work.
+
+- **The LLM helper's bundled runbooks were stale.** The corpus the
+  assistant serves mid-incident is a `go:embed` copy refreshed by
+  `make sync-llm-docs`; it was never re-run after the CLI-example
+  corrections, so R2 still told operators to use `audit append --type
+  kms.shred --kek-ref`, flags that no longer parse. Re-synced, and now
+  enforced by a test.
+
+### Testing
+
+- A meta-test validates every config snippet in `docs/` against the real
+  `config.Config` schema, so a page can't advertise an invented key
+  again. It records (and requires the removal of) three pre-existing
+  drift families it found: `sinks[].filter`, `deployments[].extras`, and
+  `deployments[].worm`/`worm_retention`.
+- `TestBundledCorpusMatchesCanonicalDocs` fails whenever a bundled LLM
+  doc drifts from its canonical source. The Makefile claimed CI checked
+  this; it didn't.
+- `TestDocsKEKRefSchemesAreRegistered` checks every KEKRef scheme the
+  docs teach against `kms.DefaultRegistry` — the check that would have
+  caught `azure-key-vault://`.
+
+[#44]: https://github.com/cybertec-postgresql/pg_hardstorage/issues/44
+
 ## [1.0.17] — 2026-07-27
 
 ### Failure-class test harnesses

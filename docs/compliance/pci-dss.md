@@ -155,7 +155,7 @@ audit period plus the cosign signatures on the running
 binary:
 
 ```sh
-VERSION=1.0.17   # the release / image tag you're attesting
+VERSION=1.1.0   # the release / image tag you're attesting
 
 # 1. Audit chain bundle
 pg_hardstorage audit export-bundle \
