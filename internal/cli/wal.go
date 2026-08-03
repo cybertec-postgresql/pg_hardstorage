@@ -863,7 +863,15 @@ func decryptingCASFromEnvelope(ctx context.Context, sp storage.StoragePlugin, sc
 
 	var dek []byte
 	if s := kms.SchemeOf(kekRef); s != "" && s != "local" {
-		d, uerr := keystore.UnwrapDEK(ctx, kekRef, wrapped, keystore.UnwrapOpts{})
+		// Provider settings come from the `kms.providers` entry matching
+		// this manifest's own KEKRef. Passing an empty UnwrapOpts here
+		// meant a provider needing an explicit region or credential could
+		// never be opened — and because this function reports failure as
+		// ok=false so the caller keeps its original error, the operator
+		// saw an unrelated downstream message rather than the KMS one.
+		d, uerr := keystore.UnwrapDEK(ctx, kekRef, wrapped, keystore.UnwrapOpts{
+			ProviderConfig: deploymentKMSResolver(nil)(kekRef),
+		})
 		if uerr != nil {
 			return nil, false
 		}

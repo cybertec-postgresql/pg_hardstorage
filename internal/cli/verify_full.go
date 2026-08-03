@@ -246,7 +246,14 @@ func resolveDEKForVerify(ctx context.Context, kekRef string, wrapped []byte) ([]
 	if p, err := paths.Resolve(paths.DefaultOptions()); err == nil {
 		keyringDir = p.Keyring.Value
 	}
-	return keystore.UnwrapDEK(ctx, kekRef, wrapped, keystore.UnwrapOpts{KeyringDir: keyringDir})
+	return keystore.UnwrapDEK(ctx, kekRef, wrapped, keystore.UnwrapOpts{
+		KeyringDir: keyringDir,
+		// Without this the "cloud-capable" resolver in the comment above
+		// was not: any provider needing an explicit region or credential
+		// failed to open for `verify --full`, standby create and
+		// timetravel restore alike.
+		ProviderConfig: deploymentKMSResolver(nil)(kekRef),
+	})
 }
 
 // pgMajorFromManifestVersion maps a manifest's pg_version to the
