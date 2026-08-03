@@ -24,7 +24,56 @@ import (
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/pg/walsink"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo"
+	"github.com/spf13/cobra"
 )
+
+// walStreamTimeout bounds a `wal stream --once` run from the test side.
+//
+// The streamer blocks until its segment commits, and nothing in these
+// tests could interrupt it: cli.Run binds its own signal-derived
+// context (root.go:58) and overwrites whatever a caller set, so a test
+// cannot hand the command a deadline. The side goroutine that drives
+// WAL has a context, but that context governs only the writer.
+//
+// When the segment never arrived, the run therefore blocked until the
+// PACKAGE timeout. One such hang consumed the entire 10m budget for
+// internal/cli and took several hundred unrelated tests down with it,
+// reported only as `panic: test timed out after 10m0s` — the same
+// package finished in ~220s on every other leg of the matrix.
+//
+// 90s is far above the ~2s these runs take when WAL flows, so it fires
+// only on a genuine stall.
+const walStreamTimeout = 90 * time.Second
+
+// runWalStreamBounded executes root and returns its exit code, failing
+// the test if it has not returned within walStreamTimeout.
+//
+// On timeout the command goroutine is deliberately left running: it is
+// blocked reading the replication connection, and the container
+// teardown that testkit.StartPostgres registers closes that connection
+// moments later, so it unwinds on its own.
+//
+// That is also why the failure does not quote the command's output.
+// The goroutine still holds the bytes.Buffers the root command writes
+// to, and those are not safe for concurrent use — reading them here to
+// enrich the message would trip the race detector and report a data
+// race in the test harness instead of the stall that actually failed.
+func runWalStreamBounded(t *testing.T, root *cobra.Command) int {
+	t.Helper()
+	done := make(chan int, 1)
+	go func() { done <- cli.Run(root) }()
+	select {
+	case exit := <-done:
+		return exit
+	case <-time.After(walStreamTimeout):
+		t.Fatalf("`wal stream` did not return within %s — it was still waiting for the "+
+			"segment that ends a --once run. Unbounded, it would block until the package "+
+			"timeout and take every test after it down with it. Check the preceding "+
+			"`driving WAL failed` error: if the side connection that produces WAL never "+
+			"came up, no segment could ever commit.", walStreamTimeout)
+		return -1
+	}
+}
 
 // TestIntegration_WalStream_OneSegment runs the actual cobra command
 // in --once mode against a real PG: the test generates ~32 MiB of WAL
@@ -60,6 +109,7 @@ func TestIntegration_WalStream_OneSegment(t *testing.T) {
 	// reliable signal to fire.
 	walCtx, walCancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer walCancel()
+	var walDriveErr error
 	var walWG sync.WaitGroup
 	walWG.Add(1)
 	go func() {
@@ -70,6 +120,11 @@ func TestIntegration_WalStream_OneSegment(t *testing.T) {
 		time.Sleep(500 * time.Millisecond)
 		c, err := pg.Connect(walCtx, srv.DSN, pg.ModeRegular)
 		if err != nil {
+			// Recorded, not swallowed. Without this connection no WAL is
+			// produced, so the streamer waits for a segment that will
+			// never commit — a fault in the test's own setup that used
+			// to present as an unexplained hang in the streamer.
+			walDriveErr = err
 			return
 		}
 		defer c.Close(walCtx)
@@ -85,9 +140,13 @@ func TestIntegration_WalStream_OneSegment(t *testing.T) {
 
 	// Run the command. --once should make it exit after the first
 	// segment commits.
-	exit := cli.Run(root)
+	exit := runWalStreamBounded(t, root)
 	walCancel()
 	walWG.Wait()
+	if walDriveErr != nil {
+		t.Fatalf("driving WAL failed: %v — the streamer had no segment to observe, so "+
+			"every assertion below would be about a run that never had input", walDriveErr)
+	}
 
 	if exit != 0 {
 		t.Errorf("exit code = %d; want 0 (clean stop)\nstderr: %s", exit, stderr.String())
@@ -178,7 +237,7 @@ func TestIntegration_WalStream_RefusesSystemIdentifierChange(t *testing.T) {
 		"--once",
 		"--output", "json",
 	})
-	exit := cli.Run(root)
+	exit := runWalStreamBounded(t, root)
 	if exit != int(output.ExitPreflight) {
 		t.Fatalf("exit = %d, want ExitPreflight(%d) on a system-identifier change\nstdout: %s\nstderr: %s",
 			exit, int(output.ExitPreflight), stdout.String(), stderr.String())
@@ -269,6 +328,7 @@ func TestIntegration_WalStream_NonDefaultWalSegSize(t *testing.T) {
 	// has a full segment to commit.
 	walCtx, walCancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer walCancel()
+	var walDriveErr error
 	var walWG sync.WaitGroup
 	walWG.Add(1)
 	go func() {
@@ -276,6 +336,11 @@ func TestIntegration_WalStream_NonDefaultWalSegSize(t *testing.T) {
 		time.Sleep(500 * time.Millisecond)
 		c, err := pg.Connect(walCtx, srv.DSN, pg.ModeRegular)
 		if err != nil {
+			// Recorded, not swallowed. Without this connection no WAL is
+			// produced, so the streamer waits for a segment that will
+			// never commit — a fault in the test's own setup that used
+			// to present as an unexplained hang in the streamer.
+			walDriveErr = err
 			return
 		}
 		defer c.Close(walCtx)
@@ -289,9 +354,13 @@ func TestIntegration_WalStream_NonDefaultWalSegSize(t *testing.T) {
 		_ = c.PgConn().ExecParams(walCtx, "SELECT pg_switch_wal()", nil, nil, nil, nil).Read()
 	}()
 
-	exit := cli.Run(root)
+	exit := runWalStreamBounded(t, root)
 	walCancel()
 	walWG.Wait()
+	if walDriveErr != nil {
+		t.Fatalf("driving WAL failed: %v — the streamer had no segment to observe, so "+
+			"every assertion below would be about a run that never had input", walDriveErr)
+	}
 
 	if exit != 0 {
 		t.Fatalf("exit = %d; want 0 (clean stop streaming a 64 MiB cluster)\nstderr: %s", exit, stderr.String())
@@ -432,7 +501,7 @@ func TestIntegration_WalStream_FreshSlot_NoWALLossUnderLoad(t *testing.T) {
 		"--once",
 		"--output", "json",
 	})
-	exit := cli.Run(root)
+	exit := runWalStreamBounded(t, root)
 	loadCancel()
 	loadWG.Wait()
 
@@ -506,6 +575,7 @@ func TestIntegration_WalStream_VerboseEmitsProgress(t *testing.T) {
 	// fires.  Same shape as TestIntegration_WalStream_OneSegment.
 	walCtx, walCancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer walCancel()
+	var walDriveErr error
 	var walWG sync.WaitGroup
 	walWG.Add(1)
 	go func() {
@@ -513,6 +583,11 @@ func TestIntegration_WalStream_VerboseEmitsProgress(t *testing.T) {
 		time.Sleep(500 * time.Millisecond)
 		c, err := pg.Connect(walCtx, srv.DSN, pg.ModeRegular)
 		if err != nil {
+			// Recorded, not swallowed. Without this connection no WAL is
+			// produced, so the streamer waits for a segment that will
+			// never commit — a fault in the test's own setup that used
+			// to present as an unexplained hang in the streamer.
+			walDriveErr = err
 			return
 		}
 		defer c.Close(walCtx)
@@ -525,9 +600,13 @@ func TestIntegration_WalStream_VerboseEmitsProgress(t *testing.T) {
 		_ = c.PgConn().ExecParams(walCtx, "SELECT pg_switch_wal()", nil, nil, nil, nil).Read()
 	}()
 
-	exit := cli.Run(root)
+	exit := runWalStreamBounded(t, root)
 	walCancel()
 	walWG.Wait()
+	if walDriveErr != nil {
+		t.Fatalf("driving WAL failed: %v — the streamer had no segment to observe, so "+
+			"every assertion below would be about a run that never had input", walDriveErr)
+	}
 
 	if exit != 0 {
 		t.Fatalf("exit = %d; want 0\nstdout: %s\nstderr: %s",
@@ -592,6 +671,7 @@ func TestIntegration_WalStream_NoVerboseNoProgress(t *testing.T) {
 
 	walCtx, walCancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer walCancel()
+	var walDriveErr error
 	var walWG sync.WaitGroup
 	walWG.Add(1)
 	go func() {
@@ -599,6 +679,11 @@ func TestIntegration_WalStream_NoVerboseNoProgress(t *testing.T) {
 		time.Sleep(500 * time.Millisecond)
 		c, err := pg.Connect(walCtx, srv.DSN, pg.ModeRegular)
 		if err != nil {
+			// Recorded, not swallowed. Without this connection no WAL is
+			// produced, so the streamer waits for a segment that will
+			// never commit — a fault in the test's own setup that used
+			// to present as an unexplained hang in the streamer.
+			walDriveErr = err
 			return
 		}
 		defer c.Close(walCtx)
@@ -611,9 +696,13 @@ func TestIntegration_WalStream_NoVerboseNoProgress(t *testing.T) {
 		_ = c.PgConn().ExecParams(walCtx, "SELECT pg_switch_wal()", nil, nil, nil, nil).Read()
 	}()
 
-	exit := cli.Run(root)
+	exit := runWalStreamBounded(t, root)
 	walCancel()
 	walWG.Wait()
+	if walDriveErr != nil {
+		t.Fatalf("driving WAL failed: %v — the streamer had no segment to observe, so "+
+			"every assertion below would be about a run that never had input", walDriveErr)
+	}
 
 	if exit != 0 {
 		t.Fatalf("exit = %d; want 0", exit)
