@@ -96,6 +96,22 @@ var wiredSchemes = []wiredScheme{
 	{scheme: "scp", sinkKind: "ssh-exec"},
 }
 
+// productionSchemes is the registry snapshot taken at package-init
+// time, which is exactly the set of schemes the SHIPPED plugins
+// register.
+//
+// storage.Schemes() cannot be read at test time for this purpose: the
+// registry is process-global, and storage_test.go's own registry unit
+// tests register fakes into it from inside test bodies — "fake-dup-1",
+// "fake-known-2", "file-test-3". Reading it live made this test pass
+// under a -run filter that excluded those tests and fail on a full
+// package run, which is a worse failure mode than not having the test.
+//
+// Imported packages are fully initialised before the importing
+// package's variables, so every plugin's init() has already run here
+// while no test function has. That is precisely the production set.
+var productionSchemes = storage.Schemes()
+
 // TestAllRegisteredSchemesAreWired fails when a plugin registers a
 // scheme that no wiring test covers.
 //
@@ -108,7 +124,7 @@ func TestAllRegisteredSchemesAreWired(t *testing.T) {
 	for _, w := range wiredSchemes {
 		covered[w.scheme] = true
 	}
-	registered := storage.Schemes()
+	registered := productionSchemes
 	if len(registered) == 0 {
 		t.Fatal("no schemes registered — the blank imports above are not taking effect")
 	}
