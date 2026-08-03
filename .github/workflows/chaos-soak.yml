@@ -55,6 +55,19 @@ jobs:
           PGHS_MODELCHECK_BUDGET: "20m"
         run: |
           go test -count=1 -timeout 30m -v             -run TestModelCheck_Randomized             ./internal/cli/
+      # The storage soaks default to a ~15s smoke so the routine
+      # integration job stays inside its budget; length is what finds
+      # resource exhaustion and slow leaks, so the nightly is where it
+      # is actually paid for.
+      - name: Storage backend soaks (long)
+        env:
+          PGHS_STORAGE_SOAK_MINUTES: "20"
+          PGHS_FAULT_SOAK_MINUTES: "10"
+        run: |
+          go test -tags integration -count=1 -timeout 5h -v \
+            -run 'TestBackendSoak|TestFaultSoak' \
+            ./internal/plugin/storage/
+
       - name: Run the soak
         env:
           PGHS_CHAOS_BIN: /tmp/pghs-chaos

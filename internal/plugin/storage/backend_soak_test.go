@@ -27,8 +27,9 @@
 // the workload varies size, key shape and operation mix rather than
 // repeating one uniform round.
 //
-// Duration comes from PGHS_STORAGE_SOAK_MINUTES (default 2, so a plain
-// `go test -tags integration` stays fast):
+// Duration is per backend, defaulting to a 15-second smoke so the
+// routine integration job stays inside its budget. The nightly asks
+// for a real soak:
 //
 //	PGHS_STORAGE_SOAK_MINUTES=180 go test -tags integration \
 //	    -timeout 4h -run TestBackendSoak ./internal/plugin/storage/
@@ -101,15 +102,29 @@ func (s *soakStats) total() int64 {
 		s.overwrites.Load() + s.badChecksum.Load()
 }
 
+// soakDuration is per BACKEND, and the default is deliberately a
+// smoke rather than a soak.
+//
+// This runs in the routine integration job, which has a ~10 minute
+// budget for the whole package. Five container backends at the old
+// two-minute default needed ten minutes for this test alone and blew
+// that budget — the job died with "panic: test timed out", taking the
+// rest of the package's results with it.
+//
+// Fifteen seconds still drives thousands of operations per backend
+// (the measured floor is ~70 ops/s on scp, ~6000 on sftp), which is
+// ample for the invariants — including the contention assertion, which
+// refuses to pass if no IfNotExists race was observed. Length is what
+// finds resource exhaustion and slow leaks, and that belongs in the
+// nightly, which sets PGHS_STORAGE_SOAK_MINUTES explicitly.
 func soakDuration(t *testing.T) time.Duration {
 	t.Helper()
-	mins := 2
 	if v := os.Getenv("PGHS_STORAGE_SOAK_MINUTES"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			mins = n
+			return time.Duration(n) * time.Minute
 		}
 	}
-	return time.Duration(mins) * time.Minute
+	return 15 * time.Second
 }
 
 // soakSchemes are the container-backed schemes the soak drives. It is

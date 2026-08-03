@@ -43,7 +43,8 @@
 //   - the plugin stays usable afterwards (no wedged connection pool or
 //     exhausted SSH session table).
 //
-// Duration comes from PGHS_FAULT_SOAK_MINUTES (default 1).
+// Duration is per backend, defaulting to a 10-second smoke; the
+// nightly sets PGHS_FAULT_SOAK_MINUTES for a real run.
 //
 //go:build integration
 
@@ -95,15 +96,22 @@ func (r *failingReader) Read(p []byte) (int, error) {
 	return n, nil
 }
 
+// faultSoakDuration is per backend. Same reasoning as soakDuration: a
+// short default keeps the routine integration job inside its budget,
+// and the nightly sets PGHS_FAULT_SOAK_MINUTES for a real run.
+//
+// Ten seconds is enough for this test's purpose — it asserts that
+// failures leave nothing behind, and the measured rate produces
+// thousands of injected and mid-body failures per backend in that
+// window. The guards below refuse to pass on zero of either.
 func faultSoakDuration(t *testing.T) time.Duration {
 	t.Helper()
-	mins := 1
 	if v := os.Getenv("PGHS_FAULT_SOAK_MINUTES"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			mins = n
+			return time.Duration(n) * time.Minute
 		}
 	}
-	return time.Duration(mins) * time.Minute
+	return 10 * time.Second
 }
 
 // TestFaultSoak runs the fault workload against every container-backed
