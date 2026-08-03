@@ -68,6 +68,46 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      # Fail in seconds on a wired-but-EMPTY secret instead of six
+      # minutes deep, after every artifact has already been published.
+      #
+      # HOMEBREW_TAP_TOKEN is the standing case: it is correctly wired
+      # to secrets.HOMEBREW_TAP_TOKEN, so no static check can see the
+      # problem — the secret itself is unset or not scoped to this repo,
+      # expands to an empty string, and GitHub answers 401 at the very
+      # last goreleaser step. The release is already live by then, and
+      # the failed job used to take SLSA provenance down with it.
+      #
+      # Non-fatal for the tap token specifically: an empty value means
+      # the cask will not publish, which is survivable and already the
+      # status quo. It is surfaced loudly and early rather than silently
+      # at the end. GITHUB_TOKEN is fatal — nothing can publish without
+      # it.
+      - name: preflight-secrets
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          set -u
+          if [ -z "${GITHUB_TOKEN:-}" ]; then
+            echo "::error title=Missing secret::GITHUB_TOKEN is empty; nothing can be published."
+            exit 1
+          fi
+          if [ -z "${HOMEBREW_TAP_TOKEN:-}" ]; then
+            echo "::warning title=Empty HOMEBREW_TAP_TOKEN::the Homebrew cask will NOT be published (goreleaser will 401 at its cask step). Artifacts, signatures and SLSA provenance are unaffected. Set the secret at repo level with: gh secret set HOMEBREW_TAP_TOKEN --repo ${{ github.repository }}"
+          else
+            # Confirm the token can actually reach the tap repo — the
+            # 401 is a VALUE problem, so only a live call proves it.
+            code=$(curl -sS -o /dev/null -w '%{http_code}' \
+              -H "Authorization: Bearer $HOMEBREW_TAP_TOKEN" \
+              "https://api.github.com/repos/${{ github.repository_owner }}/homebrew-tap" || echo 000)
+            if [ "$code" != "200" ]; then
+              echo "::warning title=HOMEBREW_TAP_TOKEN cannot reach the tap::GET /repos/${{ github.repository_owner }}/homebrew-tap returned $code. The cask push will fail; everything else is unaffected."
+            else
+              echo "HOMEBREW_TAP_TOKEN reaches the tap (200)."
+            fi
+          fi
+
       - name: goreleaser
         id: goreleaser
         uses: goreleaser/goreleaser-action@v6
