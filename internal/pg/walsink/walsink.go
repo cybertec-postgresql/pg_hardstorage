@@ -92,8 +92,8 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup/chunker"
-	"github.com/cybertec-postgresql/pg_hardstorage/internal/obs/metrics"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/invariant"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/obs/metrics"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/pg/replication"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo"

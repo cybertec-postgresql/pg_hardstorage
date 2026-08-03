@@ -344,19 +344,19 @@ type rotateResultBody struct {
 }
 
 type rotationPerDeployment struct {
-	Deployment  string             `json:"deployment"`
-	Policy      string             `json:"policy"`
-	Kept        int                `json:"kept"`
-	Deleted     int                `json:"deleted"`
-	Held        int                `json:"held,omitempty"`
-	HeldIDs     []string           `json:"held_ids,omitempty"`
+	Deployment string   `json:"deployment"`
+	Policy     string   `json:"policy"`
+	Kept       int      `json:"kept"`
+	Deleted    int      `json:"deleted"`
+	Held       int      `json:"held,omitempty"`
+	HeldIDs    []string `json:"held_ids,omitempty"`
 	// HeldChainAnchor lists backups kept ONLY because a held
 	// descendant depends on them — deleting them would either break
 	// the held chain or (pre-fix) wedge the whole batch.
-	HeldChainAnchor []string `json:"held_chain_anchor_ids,omitempty"`
-	Applied     int                `json:"applied,omitempty"`
-	HeldSkipped int                `json:"held_skipped,omitempty"`
-	Decisions   []rotationDecision `json:"decisions,omitempty"`
+	HeldChainAnchor []string           `json:"held_chain_anchor_ids,omitempty"`
+	Applied         int                `json:"applied,omitempty"`
+	HeldSkipped     int                `json:"held_skipped,omitempty"`
+	Decisions       []rotationDecision `json:"decisions,omitempty"`
 }
 
 type rotationDecision struct {
