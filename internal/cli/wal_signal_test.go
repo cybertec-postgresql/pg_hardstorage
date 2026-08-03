@@ -1,3 +1,14 @@
+// This exercises the SIGINT graceful-stop path, which is inherently
+// POSIX: syscall.Kill does not exist on Windows, so without this
+// constraint `GOOS=windows go vet` fails to compile the package and
+// the cross-compile job dies before it builds anything.
+//
+// It went unnoticed because CI's `vet + fmt` gate had been red since
+// 2026-07-27 and every downstream job — including the Windows build —
+// was skipped rather than run.
+
+//go:build !windows
+
 package cli
 
 import (
