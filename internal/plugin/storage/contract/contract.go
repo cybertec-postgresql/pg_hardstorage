@@ -62,6 +62,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
 )
@@ -100,6 +101,10 @@ func Run(t *testing.T, open PluginOpener) {
 		{"RenameIfNotExists_DstPresent_ErrAlreadyExists", caseRenameDstPresent},
 		{"RenameIfNotExists_AcrossPrefix", caseRenameAcrossPrefix},
 		{"ContentSHA256_MatchesAdvertisedCapability", caseContentSHA256Honesty},
+		{"WORM_MatchesAdvertisedCapability", caseWORMHonesty},
+		{"StorageClass_MatchesAdvertisedCapability", caseStorageClassHonesty},
+		{"DurabilityBarrier_MatchesAdvertisedCapability", caseDurabilityBarrierHonesty},
+		{"Multipart_HandlesLargeObject", caseMultipartLargeObject},
 	}
 	for _, c := range cases {
 		c := c
@@ -363,6 +368,174 @@ func caseContentSHA256Honesty(t *testing.T, p storage.StoragePlugin) {
 	if _, err := p.Put(context.Background(), "sha/match", bytes.NewReader(body),
 		storage.PutOptions{ContentLength: int64(len(body)), ContentSHA256: good}); err != nil {
 		t.Errorf("Put with a CORRECT ContentSHA256 failed: %v", err)
+	}
+}
+
+// --- Capability honesty -------------------------------------------------
+//
+// Capabilities is a set of PROMISES the rest of the codebase acts on:
+// cas.go refuses to write a WORM-required repo to a backend without
+// Capabilities().WORM, replicate.go gates cross-region copies the same
+// way, and runner.go warns when a backend can neither fsync on demand
+// nor guarantee inline durability. A backend that advertises a
+// capability it does not deliver turns each of those gates into a
+// silent lie — the caller checks, sees true, and proceeds.
+//
+// Until this block, only two of the nine flags were verified
+// (ConditionalPut and VerifiesContentSHA256). The cases below add the
+// ones that are OBSERVABLE through the plugin interface.
+//
+// Three flags are deliberately NOT asserted, because nothing a client
+// can call distinguishes them:
+//
+//   - ServerSideEncryption — whether the server encrypts at rest is
+//     invisible to a client that only Puts and Gets.
+//   - CrossRegionReplicate — asserting it would need a second region
+//     and a replication-lag wait; it belongs in the replicate suite,
+//     not the per-object contract.
+//   - InlineDurable — "durable the moment Put returns" can only be
+//     falsified by cutting power mid-write.
+//
+// Writing assertions for those would be coverage theatre. They are
+// listed here so the omission is a recorded decision rather than an
+// oversight.
+
+// caseWORMHonesty pins Capabilities().WORM to SetRetention's behaviour.
+// A backend claiming WORM must not answer ErrUnsupported: cas.go and
+// replicate.go both refuse to proceed without the flag, so a false
+// positive here means a regulated repo silently writes unlocked
+// objects while reporting worm.active.
+func caseWORMHonesty(t *testing.T, p storage.StoragePlugin) {
+	putString(t, p, "worm/obj", "retained")
+	until := time.Now().Add(24 * time.Hour)
+	err := p.SetRetention(context.Background(), "worm/obj", until, storage.WORMGovernance)
+
+	if !p.Capabilities().WORM {
+		// Not advertised: ErrUnsupported is the correct answer. Anything
+		// else is fine too (a backend may support retention without
+		// claiming the flag), so only the inverse is a failure.
+		return
+	}
+	if errors.Is(err, storage.ErrUnsupported) {
+		t.Fatal("backend advertises Capabilities().WORM but SetRetention returned ErrUnsupported")
+	}
+	// Any OTHER error is an environment condition, not a broken promise.
+	// Capabilities().WORM says "this plugin implements retention", not
+	// "this bucket has it switched on" — S3 needs the bucket created with
+	// ObjectLockConfiguration, which the shared contract fixture is not.
+	// Asserting err == nil here would make the case fail on bucket setup
+	// and say "capability lie", which is the wrong diagnosis. Enforcement
+	// against a real Object-Lock bucket lives in
+	// internal/backup/worm_objectlock_integration_test.go.
+	if err != nil {
+		t.Logf("SetRetention returned %v — accepted: the capability is implemented, "+
+			"the fixture bucket simply has no Object Lock configured", err)
+	}
+}
+
+// caseStorageClassHonesty pins Capabilities().StorageClassSelectable to
+// PutOptions.StorageClass actually being accepted. When the backend
+// also reports a class back through Stat, the round-trip is checked —
+// a backend that silently drops the requested class would otherwise
+// look identical to one that honoured it.
+func caseStorageClassHonesty(t *testing.T, p storage.StoragePlugin) {
+	if !p.Capabilities().StorageClassSelectable {
+		t.Skip("backend does not advertise StorageClassSelectable")
+	}
+	const key = "sclass/obj"
+	body := "stored-with-a-class"
+	if _, err := p.Put(context.Background(), key, strings.NewReader(body),
+		storage.PutOptions{ContentLength: int64(len(body)), StorageClass: "STANDARD"}); err != nil {
+		t.Fatalf("Put with StorageClass on a backend advertising selectability: %v", err)
+	}
+	if got := getString(t, p, key); got != body {
+		t.Errorf("body = %q, want %q", got, body)
+	}
+	oi, err := p.Stat(context.Background(), key)
+	if err != nil {
+		t.Fatalf("Stat: %v", err)
+	}
+	// Reporting the class back is optional; contradicting it is not.
+	if oi.StorageClass != "" && oi.StorageClass != "STANDARD" {
+		t.Errorf("Stat reports StorageClass %q after writing STANDARD", oi.StorageClass)
+	}
+}
+
+// caseDurabilityBarrierHonesty pins Capabilities().DurabilityBarrier to
+// Barrier actually being implemented. Callers batch DurabilityDeferred
+// writes and pay one barrier for all of them before committing a
+// manifest that references those chunks; a backend that advertises the
+// barrier but inherits the no-op NopBarrier would let that manifest
+// commit over bytes still sitting in a page cache.
+//
+// Barrier itself cannot be proven to fsync from user space, so what is
+// checked is the observable half: it must succeed, and the deferred
+// bytes must be readable afterwards.
+func caseDurabilityBarrierHonesty(t *testing.T, p storage.StoragePlugin) {
+	const key = "durable/deferred"
+	body := "written-deferred-then-barriered"
+	if _, err := p.Put(context.Background(), key, strings.NewReader(body), storage.PutOptions{
+		ContentLength: int64(len(body)),
+		Durability:    storage.DurabilityDeferred,
+	}); err != nil {
+		t.Fatalf("deferred Put: %v", err)
+	}
+
+	err := p.Barrier(context.Background())
+	if p.Capabilities().DurabilityBarrier {
+		if err != nil {
+			t.Fatalf("backend advertises DurabilityBarrier but Barrier failed: %v", err)
+		}
+	} else if err != nil {
+		// A backend without the capability is expected to no-op, not error.
+		t.Errorf("Barrier on a non-barrier backend returned %v, want nil (no-op)", err)
+	}
+
+	if got := getString(t, p, key); got != body {
+		t.Errorf("after Barrier: body = %q, want %q", got, body)
+	}
+}
+
+// caseMultipartLargeObject exercises the functional consequence of
+// Capabilities().Multipart: an object past the point where a backend
+// would switch to a chunked upload strategy must round-trip byte-for-
+// byte. The strategy itself is internal, so this asserts the outcome
+// rather than the mechanism — and it runs everywhere, because a
+// backend that does NOT advertise multipart still has to store a large
+// object correctly, just by another route.
+func caseMultipartLargeObject(t *testing.T, p storage.StoragePlugin) {
+	const size = 6 << 20 // past the common 5 MiB multipart threshold
+	body := make([]byte, size)
+	for i := range body {
+		body[i] = byte(i % 251) // 251 is prime: no alignment with any block size
+	}
+	sum := sha256.Sum256(body)
+
+	if _, err := p.Put(context.Background(), "large/obj", bytes.NewReader(body),
+		storage.PutOptions{ContentLength: size}); err != nil {
+		t.Fatalf("Put of a %d-byte object: %v", size, err)
+	}
+	rc, err := p.Get(context.Background(), "large/obj")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	got, rerr := io.ReadAll(rc)
+	_ = rc.Close()
+	if rerr != nil {
+		t.Fatalf("read: %v", rerr)
+	}
+	if len(got) != size {
+		t.Fatalf("read %d bytes, wrote %d", len(got), size)
+	}
+	if sha256.Sum256(got) != sum {
+		t.Error("large object round-tripped with different content")
+	}
+	oi, err := p.Stat(context.Background(), "large/obj")
+	if err != nil {
+		t.Fatalf("Stat: %v", err)
+	}
+	if oi.Size != size {
+		t.Errorf("Stat.Size = %d, want %d", oi.Size, size)
 	}
 }
 
