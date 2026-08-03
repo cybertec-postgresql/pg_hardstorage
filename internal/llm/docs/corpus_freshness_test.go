@@ -102,3 +102,76 @@ func TestBundledCorpusMatchesCanonicalDocs(t *testing.T) {
 		}
 	}
 }
+
+// TestSyncRecipeIsFullyCovered keeps the check above honest about its
+// own inputs.
+//
+// TestBundledCorpusMatchesCanonicalDocs hardcodes the file list it
+// compares — CHANGELOG.md, README.md, and the runbooks directory. That
+// list was transcribed from `make sync-llm-docs` by hand, so adding a
+// fourth `cp` to the recipe would start shipping a file that nothing
+// ever checks for staleness. The corpus is what the assistant serves
+// operators mid-incident; a silently-unchecked file in it is exactly
+// the failure this suite exists to prevent.
+//
+// So: parse the recipe, and require every destination it copies into to
+// be one the freshness test actually covers.
+func TestSyncRecipeIsFullyCovered(t *testing.T) {
+	root := repoRoot(t)
+	mk, err := os.ReadFile(filepath.Join(root, "Makefile"))
+	if err != nil {
+		t.Fatalf("read Makefile: %v", err)
+	}
+
+	// Pull the sync-llm-docs recipe body.
+	lines := strings.Split(string(mk), "\n")
+	var recipe []string
+	inRecipe := false
+	for _, ln := range lines {
+		if strings.HasPrefix(ln, "sync-llm-docs:") {
+			inRecipe = true
+			continue
+		}
+		if inRecipe {
+			if !strings.HasPrefix(ln, "\t") {
+				break
+			}
+			recipe = append(recipe, strings.TrimSpace(strings.TrimPrefix(ln, "\t")))
+		}
+	}
+	if len(recipe) == 0 {
+		t.Fatal("could not find the sync-llm-docs recipe in the Makefile — " +
+			"this test is no longer reading it")
+	}
+
+	// Destinations the freshness test knows how to verify.
+	covered := map[string]bool{
+		"internal/llm/docs/runbooks/": true,
+		"internal/llm/docs/root/":     true,
+	}
+
+	copies := 0
+	for _, cmd := range recipe {
+		cmd = strings.TrimPrefix(cmd, "@")
+		if !strings.HasPrefix(cmd, "cp ") {
+			continue
+		}
+		fields := strings.Fields(cmd)
+		if len(fields) < 3 {
+			continue
+		}
+		copies++
+		dst := fields[len(fields)-1]
+		if !covered[dst] {
+			t.Errorf("sync-llm-docs copies into %q, which "+
+				"TestBundledCorpusMatchesCanonicalDocs does not verify — that file "+
+				"would ship in the embedded corpus with no staleness check. Extend "+
+				"the pairs map there, then add the destination here.", dst)
+		}
+	}
+	if copies == 0 {
+		t.Fatal("the sync-llm-docs recipe contains no cp commands — either the " +
+			"recipe changed shape or the parse broke")
+	}
+	t.Logf("sync recipe: %d cp command(s), all covered", copies)
+}

@@ -215,6 +215,7 @@ field is where the recovery hint lives.
 | `repo.*` | Repo lifecycle, GC, scrub, replicate (`repo.open_failed`, `repo.gc.*`, `repo.scrub.*`, `repo.check.*`, `repo.replicate.*`, `repo.wal_prune.failed`, `repo.wipe.partial`) |
 | `repo.replicate.incomplete` | `repo replicate` finished but the destination is NOT a complete replica (some manifests/chunks failed or are missing). Non-zero exit so `replicate && rm source` can't trust a partial DR copy — re-run until it exits 0, then `repo replicate verify`. |
 | `repair.*` | Manifest / attestation / chunk repair |
+| `manifest.*` | Manifest parse / validation at restore-plan time (`manifest.invalid`) |
 | `kms.*` | KMS rotate / shred / verify (`kms.rotate_failed`, `kms.shred_failed`, `kms.verify_failed`); `kms.unreachable` is the only leaf that maps to exit 8 |
 | `chain.*` | Backup-chain integrity (`chain.cycle`, `chain.too_deep`, `chain.no_full_anchor`, `chain.broken_tombstoned`, `chain.degenerate`, `chain.missing_pg_manifest`) |
 | `audit.*` | Audit log (`audit.append_failed`, `audit.anchor_failed`, `audit.verify_failed`, `audit.search_failed`, `audit.export_bundle_failed`, `audit.summary_failed`) |
@@ -227,6 +228,7 @@ field is where the recovery hint lives.
 | `db.*` | PG client install / uninstall |
 | `gameday.*`, `recovery.*` | Disaster-recovery drills |
 | `dispatch.*` | Job dispatcher |
+| `demo.*` | `pg_hardstorage demo` sandbox bring-up (`demo.docker_unavailable`, `demo.pg_not_ready`, `demo.port_failed`, `demo.start_failed`, `demo.step_failed`) |
 | `redact.*` | Logical redaction passes |
 | `partial.*` | Partial / table-level restore |
 | `combine.*` | `pg_combinebackup` orchestration |
@@ -242,6 +244,7 @@ field is where the recovery hint lives.
 | `connect.*`, `deployment.*` | Connection probing |
 | `standby.*`, `timetravel.*`, `timetable.*` | Standby / timetravel features |
 | `gameday.*` | Disaster drills |
+| `notimpl.*` | Scaffolded command that is not implemented yet (`notimpl.<command>`, e.g. `notimpl.compact`). Always exit 1; the suggestion points at the design spec. |
 | `internal` | Catch-all for unstructured errors funnelled through `output.ToError` |
 
 ## See also

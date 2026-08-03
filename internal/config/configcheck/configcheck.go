@@ -105,8 +105,101 @@ func yamlBlocks(text string) []string {
 			b = b[nl+1:]
 		}
 		out = append(out, b)
+		// A fenced block may CARRY a pg_hardstorage config rather than
+		// being one — a Helm values file or a k8s ConfigMap embeds it
+		// under a literal scalar. The outer document's top level is
+		// `config:` / `data:`, so looksLikeConfig rejects the whole
+		// block and everything inside it goes unchecked.
+		//
+		// That blind spot was not theoretical: the sidecar chart's
+		// values example carried `schedule.full` / `schedule.incremental`
+		// cron strings for two releases. No such keys exist — the real
+		// schema is schedule.backup/rotate with every/daily_at — so the
+		// strict loader rejected the entire file of anyone who copied it.
+		out = append(out, embeddedConfigScalars(b)...)
 	}
 	return out
+}
+
+// embeddedConfigScalars extracts YAML literal block scalars that carry
+// a nested pg_hardstorage config, e.g.
+//
+//	config: |
+//	  deployments:
+//	    db1: {...}
+//
+// It returns each inner document de-indented so the normal walk can
+// parse it as a standalone config. Only keys known to carry one are
+// followed, so an unrelated literal block (a shell script under
+// `command: |`) is not mistaken for config.
+func embeddedConfigScalars(block string) []string {
+	var out []string
+	lines := strings.Split(block, "\n")
+	for i := 0; i < len(lines); i++ {
+		key, indent, ok := literalScalarHeader(lines[i])
+		if !ok || !embeddingKeys[key] {
+			continue
+		}
+		// Collect the more-indented lines that follow.
+		var body []string
+		minIndent := -1
+		j := i + 1
+		for ; j < len(lines); j++ {
+			ln := lines[j]
+			if strings.TrimSpace(ln) == "" {
+				body = append(body, "")
+				continue
+			}
+			ind := len(ln) - len(strings.TrimLeft(ln, " "))
+			if ind <= indent {
+				break
+			}
+			if minIndent < 0 || ind < minIndent {
+				minIndent = ind
+			}
+			body = append(body, ln)
+		}
+		i = j - 1
+		if minIndent <= 0 || len(body) == 0 {
+			continue
+		}
+		for k, ln := range body {
+			if len(ln) >= minIndent {
+				body[k] = ln[minIndent:]
+			}
+		}
+		out = append(out, strings.Join(body, "\n"))
+	}
+	return out
+}
+
+// embeddingKeys are the mapping keys whose literal-block value is a
+// pg_hardstorage config document. `config` is the Helm chart's values
+// key and the k8s ConfigMap entry name used throughout the docs.
+var embeddingKeys = map[string]bool{
+	"config":              true,
+	"pg_hardstorage.yaml": true,
+}
+
+// literalScalarHeader recognises `  key: |` and `  key: |-` and
+// returns the key plus the indentation of the key itself.
+func literalScalarHeader(line string) (key string, indent int, ok bool) {
+	trimmed := strings.TrimLeft(line, " ")
+	indent = len(line) - len(trimmed)
+	if !strings.HasSuffix(strings.TrimRight(trimmed, " "), "|") &&
+		!strings.HasSuffix(strings.TrimRight(trimmed, " "), "|-") {
+		return "", 0, false
+	}
+	colon := strings.Index(trimmed, ":")
+	if colon <= 0 {
+		return "", 0, false
+	}
+	key = strings.TrimSpace(trimmed[:colon])
+	rest := strings.TrimSpace(trimmed[colon+1:])
+	if rest != "|" && rest != "|-" {
+		return "", 0, false
+	}
+	return key, indent, true
 }
 
 // looksLikeConfig reports whether a parsed YAML map is plausibly a

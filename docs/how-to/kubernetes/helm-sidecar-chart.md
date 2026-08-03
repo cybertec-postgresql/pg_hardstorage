@@ -68,8 +68,10 @@ config: |
         keep_monthly: 12
         keep_yearly: 5
       schedule:
-        full:        "0 2 * * 0"   # Sundays 02:00
-        incremental: "0 2 * * 1-6" # Mon-Sat 02:00
+        backup:
+          daily_at: "02:00"
+        rotate:
+          daily_at: "04:00"
 
 env:
   - name: PG_HARDSTORAGE_KEYRING_PASSPHRASE
