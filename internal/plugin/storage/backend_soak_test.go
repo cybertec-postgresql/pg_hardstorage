@@ -1,5 +1,5 @@
 // backend_soak_test.go — sustained, diversified soak of every
-// container-backed storage plugin (s3://, scp://, sftp://).
+// container-backed storage plugin (s3, gcs, azblob, sftp, scp).
 //
 // The contract suites answer "does each operation obey its clause once,
 // on a quiet server, with one small object?". They run in seconds. That
@@ -54,7 +54,6 @@ import (
 	"time"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
-	"github.com/cybertec-postgresql/pg_hardstorage/internal/testkit/sink"
 )
 
 const soakWorkers = 8
@@ -113,56 +112,62 @@ func soakDuration(t *testing.T) time.Duration {
 	return time.Duration(mins) * time.Minute
 }
 
-func TestBackendSoak_SCP(t *testing.T) {
-	requireDockerE2E(t)
-	rt, err := sink.New("ssh-exec")
-	if err != nil {
-		t.Fatal(err)
+// soakSchemes are the container-backed schemes the soak drives. It is
+// derived from wiredSchemes (wiring_e2e_test.go) rather than written
+// out again, so a backend added there is soaked too — the earlier
+// version listed three by hand and silently left azblob and gcs
+// unexercised even though both already had fixtures.
+//
+// file:// is excluded deliberately: it needs no container, has no
+// network or session limits, and the local filesystem's behaviour under
+// sustained concurrency is not what this soak exists to find.
+func soakSchemes() []wiredScheme {
+	var out []wiredScheme
+	for _, w := range wiredSchemes {
+		if w.sinkKind == "" {
+			continue
+		}
+		out = append(out, w)
 	}
-	if err := rt.Up(context.Background()); err != nil {
-		t.Fatalf("ssh-exec container: %v", err)
-	}
-	defer rt.Down(context.Background())
-	for k, v := range rt.EnvForAgent() {
-		t.Setenv(k, v)
-	}
-	runBackendSoak(t, "scp", rt.URL())
+	return out
 }
 
-func TestBackendSoak_SFTP(t *testing.T) {
-	requireDockerE2E(t)
-	rt, err := sink.New("sftp")
-	if err != nil {
-		t.Fatal(err)
+// TestBackendSoak drives every container-backed scheme through the
+// diversified workload.
+//
+// Sub-tests rather than separate top-level functions so the set cannot
+// drift from wiredSchemes: adding a backend to the wiring table adds it
+// here automatically.
+func TestBackendSoak(t *testing.T) {
+	for _, w := range soakSchemes() {
+		t.Run(w.scheme, func(t *testing.T) {
+			url := wiringURL(t, w)
+			runBackendSoak(t, w.scheme, url)
+		})
 	}
-	if err := rt.Up(context.Background()); err != nil {
-		t.Fatalf("sftp container: %v", err)
-	}
-	defer rt.Down(context.Background())
-	extras := rt.Extras()
-	if kh := extras["known_hosts"]; kh != "" {
-		t.Setenv("PG_HARDSTORAGE_SFTP_KNOWN_HOSTS", kh)
-	}
-	if pw := extras["password"]; pw != "" {
-		t.Setenv("PG_HARDSTORAGE_SFTP_PASSWORD", pw)
-	}
-	runBackendSoak(t, "sftp", rt.URL())
 }
 
-func TestBackendSoak_S3(t *testing.T) {
-	requireDockerE2E(t)
-	rt, err := sink.New("s3-minio")
-	if err != nil {
-		t.Fatal(err)
+// TestBackendSoak_CoversEveryContainerScheme fails when a scheme has a
+// wiring fixture but no soak coverage — the gap that left azblob and
+// gcs out of the first version.
+func TestBackendSoak_CoversEveryContainerScheme(t *testing.T) {
+	var missing []string
+	covered := map[string]bool{}
+	for _, w := range soakSchemes() {
+		covered[w.scheme] = true
 	}
-	if err := rt.Up(context.Background()); err != nil {
-		t.Fatalf("minio container: %v", err)
+	for _, w := range wiredSchemes {
+		if w.sinkKind != "" && !covered[w.scheme] {
+			missing = append(missing, w.scheme)
+		}
 	}
-	defer rt.Down(context.Background())
-	for k, v := range rt.EnvForAgent() {
-		t.Setenv(k, v)
+	if len(missing) > 0 {
+		t.Errorf("scheme(s) %v have a container fixture but are not soaked", missing)
 	}
-	runBackendSoak(t, "s3", rt.URL())
+	if len(covered) < 5 {
+		t.Errorf("only %d container scheme(s) soaked; expected at least 5 "+
+			"(s3, gcs, azblob, sftp, scp)", len(covered))
+	}
 }
 
 func runBackendSoak(t *testing.T, backend, url string) {
