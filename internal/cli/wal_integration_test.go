@@ -9,6 +9,7 @@ package cli_test
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -75,11 +76,65 @@ func runWalStreamBounded(t *testing.T, root *cobra.Command) int {
 	}
 }
 
+// driveWAL produces WAL on a side connection until ctx is cancelled,
+// which the caller does the moment the streamer returns.
+//
+// It loops deliberately. These tests used to write ONE burst after a
+// fixed 500 ms head start, betting the streamer had created its
+// replication slot by then. A slot created after the burst has already
+// landed begins at an LSN past all of it, so `--once` waits for a
+// segment boundary nothing will ever cross: the stream hangs even
+// though every write succeeded and no error is reported anywhere. On a
+// loaded CI runner that bet lost and the whole internal/cli package
+// timed out.
+//
+// Looping removes the race rather than widening the window — whenever
+// the slot appears, WAL is still being produced after it.
+//
+// rowsPerRound sets the per-round volume: 2048 rows of 16 KiB is about
+// one 16 MiB segment's worth, so each round should close at least one
+// segment.
+func driveWAL(ctx context.Context, dsn, table string, rowsPerRound int) error {
+	c, err := pg.Connect(ctx, dsn, pg.ModeRegular)
+	if err != nil {
+		return err
+	}
+	defer c.Close(ctx)
+
+	exec := func(sql string) error {
+		return c.PgConn().ExecParams(ctx, sql, nil, nil, nil, nil).Read().Err
+	}
+	if err := exec("SELECT pg_switch_wal()"); err != nil {
+		return err
+	}
+	if err := exec("CREATE TABLE " + table + " (i int, payload text)"); err != nil {
+		return err
+	}
+	insert := fmt.Sprintf(
+		"INSERT INTO %s SELECT g, repeat('x', 16384) FROM generate_series(1, %d) g",
+		table, rowsPerRound)
+
+	for ctx.Err() == nil {
+		for _, sql := range []string{insert, "CHECKPOINT", "SELECT pg_switch_wal()"} {
+			if err := exec(sql); err != nil {
+				// The caller cancels ctx as soon as the streamer is done,
+				// which aborts whatever statement is in flight. That is
+				// how this loop normally ends, not a failure.
+				if ctx.Err() != nil {
+					return nil
+				}
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 // TestIntegration_WalStream_OneSegment runs the actual cobra command
-// in --once mode against a real PG: the test generates ~32 MiB of WAL
-// in a side goroutine, the command commits its first segment, exits
-// cleanly, and we assert the JSON Result reflects a clean stop with
-// SyncedLSN advanced past the start.
+// in --once mode against a real PG: the test generates WAL in a side
+// goroutine, the command commits its first segment, exits cleanly, and
+// we assert the JSON Result reflects a clean stop with SyncedLSN
+// advanced past the start.
 func TestIntegration_WalStream_OneSegment(t *testing.T) {
 	srv := testkit.StartPostgres(t)
 
@@ -107,35 +162,14 @@ func TestIntegration_WalStream_OneSegment(t *testing.T) {
 	// Generate WAL on a side connection while the command runs. We
 	// produce more than one segment's worth so the --once watcher has
 	// reliable signal to fire.
-	walCtx, walCancel := context.WithTimeout(context.Background(), 60*time.Second)
+	walCtx, walCancel := context.WithTimeout(context.Background(), walStreamTimeout+30*time.Second)
 	defer walCancel()
 	var walDriveErr error
 	var walWG sync.WaitGroup
 	walWG.Add(1)
 	go func() {
 		defer walWG.Done()
-		// Brief delay so the command has time to set up the slot
-		// before we start producing WAL — not required for correctness
-		// (the slot retains anyway) but tightens the test signal.
-		time.Sleep(500 * time.Millisecond)
-		c, err := pg.Connect(walCtx, srv.DSN, pg.ModeRegular)
-		if err != nil {
-			// Recorded, not swallowed. Without this connection no WAL is
-			// produced, so the streamer waits for a segment that will
-			// never commit — a fault in the test's own setup that used
-			// to present as an unexplained hang in the streamer.
-			walDriveErr = err
-			return
-		}
-		defer c.Close(walCtx)
-		_ = c.PgConn().ExecParams(walCtx, "SELECT pg_switch_wal()", nil, nil, nil, nil).Read()
-		_ = c.PgConn().ExecParams(walCtx, "CREATE TABLE wal_test (i int, payload text)", nil, nil, nil, nil).Read()
-		// 16 KiB × 2048 rows ≈ 32 MiB of row data → at least one full segment.
-		_ = c.PgConn().ExecParams(walCtx,
-			"INSERT INTO wal_test SELECT g, repeat('x', 16384) FROM generate_series(1, 2048) g",
-			nil, nil, nil, nil).Read()
-		_ = c.PgConn().ExecParams(walCtx, "CHECKPOINT", nil, nil, nil, nil).Read()
-		_ = c.PgConn().ExecParams(walCtx, "SELECT pg_switch_wal()", nil, nil, nil, nil).Read()
+		walDriveErr = driveWAL(walCtx, srv.DSN, "wal_test", 2048)
 	}()
 
 	// Run the command. --once should make it exit after the first
@@ -333,25 +367,7 @@ func TestIntegration_WalStream_NonDefaultWalSegSize(t *testing.T) {
 	walWG.Add(1)
 	go func() {
 		defer walWG.Done()
-		time.Sleep(500 * time.Millisecond)
-		c, err := pg.Connect(walCtx, srv.DSN, pg.ModeRegular)
-		if err != nil {
-			// Recorded, not swallowed. Without this connection no WAL is
-			// produced, so the streamer waits for a segment that will
-			// never commit — a fault in the test's own setup that used
-			// to present as an unexplained hang in the streamer.
-			walDriveErr = err
-			return
-		}
-		defer c.Close(walCtx)
-		_ = c.PgConn().ExecParams(walCtx, "SELECT pg_switch_wal()", nil, nil, nil, nil).Read()
-		_ = c.PgConn().ExecParams(walCtx, "CREATE TABLE wal_test (i int, payload text)", nil, nil, nil, nil).Read()
-		// 16 KiB × 8192 rows ≈ 128 MiB → at least one full 64 MiB segment.
-		_ = c.PgConn().ExecParams(walCtx,
-			"INSERT INTO wal_test SELECT g, repeat('x', 16384) FROM generate_series(1, 8192) g",
-			nil, nil, nil, nil).Read()
-		_ = c.PgConn().ExecParams(walCtx, "CHECKPOINT", nil, nil, nil, nil).Read()
-		_ = c.PgConn().ExecParams(walCtx, "SELECT pg_switch_wal()", nil, nil, nil, nil).Read()
+		walDriveErr = driveWAL(walCtx, srv.DSN, "wal_test", 8192)
 	}()
 
 	exit := runWalStreamBounded(t, root)
@@ -573,31 +589,14 @@ func TestIntegration_WalStream_VerboseEmitsProgress(t *testing.T) {
 
 	// Drive WAL on the side so a segment commits and --once
 	// fires.  Same shape as TestIntegration_WalStream_OneSegment.
-	walCtx, walCancel := context.WithTimeout(context.Background(), 60*time.Second)
+	walCtx, walCancel := context.WithTimeout(context.Background(), walStreamTimeout+30*time.Second)
 	defer walCancel()
 	var walDriveErr error
 	var walWG sync.WaitGroup
 	walWG.Add(1)
 	go func() {
 		defer walWG.Done()
-		time.Sleep(500 * time.Millisecond)
-		c, err := pg.Connect(walCtx, srv.DSN, pg.ModeRegular)
-		if err != nil {
-			// Recorded, not swallowed. Without this connection no WAL is
-			// produced, so the streamer waits for a segment that will
-			// never commit — a fault in the test's own setup that used
-			// to present as an unexplained hang in the streamer.
-			walDriveErr = err
-			return
-		}
-		defer c.Close(walCtx)
-		_ = c.PgConn().ExecParams(walCtx, "SELECT pg_switch_wal()", nil, nil, nil, nil).Read()
-		_ = c.PgConn().ExecParams(walCtx, "CREATE TABLE vt (i int, payload text)", nil, nil, nil, nil).Read()
-		_ = c.PgConn().ExecParams(walCtx,
-			"INSERT INTO vt SELECT g, repeat('x', 16384) FROM generate_series(1, 2048) g",
-			nil, nil, nil, nil).Read()
-		_ = c.PgConn().ExecParams(walCtx, "CHECKPOINT", nil, nil, nil, nil).Read()
-		_ = c.PgConn().ExecParams(walCtx, "SELECT pg_switch_wal()", nil, nil, nil, nil).Read()
+		walDriveErr = driveWAL(walCtx, srv.DSN, "vt", 2048)
 	}()
 
 	exit := runWalStreamBounded(t, root)
@@ -669,31 +668,14 @@ func TestIntegration_WalStream_NoVerboseNoProgress(t *testing.T) {
 		// no --verbose
 	})
 
-	walCtx, walCancel := context.WithTimeout(context.Background(), 60*time.Second)
+	walCtx, walCancel := context.WithTimeout(context.Background(), walStreamTimeout+30*time.Second)
 	defer walCancel()
 	var walDriveErr error
 	var walWG sync.WaitGroup
 	walWG.Add(1)
 	go func() {
 		defer walWG.Done()
-		time.Sleep(500 * time.Millisecond)
-		c, err := pg.Connect(walCtx, srv.DSN, pg.ModeRegular)
-		if err != nil {
-			// Recorded, not swallowed. Without this connection no WAL is
-			// produced, so the streamer waits for a segment that will
-			// never commit — a fault in the test's own setup that used
-			// to present as an unexplained hang in the streamer.
-			walDriveErr = err
-			return
-		}
-		defer c.Close(walCtx)
-		_ = c.PgConn().ExecParams(walCtx, "SELECT pg_switch_wal()", nil, nil, nil, nil).Read()
-		_ = c.PgConn().ExecParams(walCtx, "CREATE TABLE qt (i int, payload text)", nil, nil, nil, nil).Read()
-		_ = c.PgConn().ExecParams(walCtx,
-			"INSERT INTO qt SELECT g, repeat('x', 16384) FROM generate_series(1, 2048) g",
-			nil, nil, nil, nil).Read()
-		_ = c.PgConn().ExecParams(walCtx, "CHECKPOINT", nil, nil, nil, nil).Read()
-		_ = c.PgConn().ExecParams(walCtx, "SELECT pg_switch_wal()", nil, nil, nil, nil).Read()
+		walDriveErr = driveWAL(walCtx, srv.DSN, "qt", 2048)
 	}()
 
 	exit := runWalStreamBounded(t, root)
