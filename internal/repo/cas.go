@@ -131,6 +131,43 @@ type CAS struct {
 	seenCap   int
 	seenCount atomic.Int64
 	seenMu    sync.Mutex
+
+	// adopt guards the one-shot cross-DEK check. See ensureAdoptable.
+	adopt adoptGuard
+}
+
+// adoptGuard tracks the one-shot verification that chunks ALREADY in
+// the repository are readable with THIS backup's DEK.
+//
+// Dedup adopts an existing chunk by plaintext hash. Chunk keys are
+// global to the repository (chunks/sha256/<hash>.chk), but the shared
+// DEK is per-KEKRef — sharedkey.ResolveOrMint is called with one
+// kekRef and mints for that ref alone. So a backup under KEKRef B that
+// dedups against chunks written under KEKRef A produces a manifest
+// referencing chunks only DEK-A can decrypt: the backup exits 0 and
+// only fails at restore.
+//
+// That is the failure sharedkey.go's own header describes for issue
+// #31, reached through a different door — the existing guard
+// serialises minting WITHIN one KEKRef and nothing considered a
+// second one.
+//
+// Detection rather than prevention is deliberate. Per-tenant KEKs
+// sharing a repository is a documented, compliance-load-bearing
+// configuration (docs/compliance/hipaa.md §164.312(a)(1);
+// rotate-kek.md's multi-tenant section), so refusing every multi-KEK
+// repository would break a supported setup. Tenants whose data does
+// not overlap never produce a dedup hit against each other and are
+// unaffected; only an ACTUAL collision fails.
+//
+// One probe suffices: the check is a property of (repo, DEK), not of
+// any single chunk, so the first adoption answers it for the whole
+// backup. Verifying every hit would read and decrypt each deduplicated
+// chunk, which is precisely the work dedup exists to avoid.
+type adoptGuard struct {
+	mu       sync.Mutex
+	resolved bool
+	err      error
 }
 
 // defaultSeenCacheLimit bounds the positive cache on every CAS unless
@@ -423,6 +460,9 @@ func (c *CAS) PutChunk(ctx context.Context, body []byte) (ChunkInfo, error) {
 	if c.hints != nil {
 		if _, hinted := c.hints[hash]; hinted {
 			if _, statErr := c.sp.Stat(ctx, ChunkKey(hash)); statErr == nil {
+				if err := c.ensureAdoptable(ctx, hash); err != nil {
+					return ChunkInfo{}, err
+				}
 				c.markSeen(hash)
 				c.dedupStorage.Add(1)
 				info.Deduped = true
@@ -491,6 +531,9 @@ func (c *CAS) PutChunk(ctx context.Context, body []byte) (ChunkInfo, error) {
 		c.dedupMiss.Add(1)
 		return info, nil
 	case errors.Is(err, storage.ErrAlreadyExists):
+		if aerr := c.ensureAdoptable(ctx, hash); aerr != nil {
+			return ChunkInfo{}, aerr
+		}
 		c.markSeen(hash)
 		c.dedupStorage.Add(1)
 		info.Deduped = true
@@ -612,6 +655,52 @@ func (c *CAS) GetChunkBytes(ctx context.Context, hash Hash) ([]byte, error) {
 	}
 	c.seen.Store(hash, struct{}{})
 	return body, nil
+}
+
+// ensureAdoptable verifies, once per CAS, that a chunk already present
+// in the repository can be read with this backup's DEK before dedup
+// adopts it.
+//
+// Returns nil when there is no DEK in play (an unencrypted repo cannot
+// have this problem) or when the probe succeeds. A TRANSIENT read
+// failure is not conclusive and leaves the guard unresolved so a later
+// adoption retries; only a decrypt or content-hash failure — which
+// means the stored bytes are not ours — is recorded and fails the
+// backup.
+func (c *CAS) ensureAdoptable(ctx context.Context, hash Hash) error {
+	if c.encWriter == nil {
+		return nil
+	}
+	c.adopt.mu.Lock()
+	defer c.adopt.mu.Unlock()
+	if c.adopt.resolved {
+		return c.adopt.err
+	}
+
+	_, err := c.GetChunkBytes(ctx, hash)
+	if err == nil {
+		c.adopt.resolved = true
+		return nil
+	}
+	if !errors.Is(err, encryption.ErrAuthenticationFailed) &&
+		!errors.Is(err, storage.ErrChecksumMismatch) {
+		// Network blip, throttling, a transient backend error: not
+		// evidence about key custody. Leave unresolved.
+		return nil
+	}
+
+	c.adopt.resolved = true
+	c.adopt.err = fmt.Errorf(
+		"cas: chunk %s is already in this repository but does not decrypt with this "+
+			"backup's data key (%w). Deduplicating against it would commit a manifest "+
+			"referencing chunks it cannot read — a backup that succeeds and then fails "+
+			"at restore. This happens when a repository holds chunks written under a "+
+			"DIFFERENT kek_ref: chunk keys are global to the repository, but the shared "+
+			"DEK is per-KEKRef. Either give this deployment its own repository, or run "+
+			"`pg_hardstorage kms rotate` so every manifest shares one KEK (rotation "+
+			"re-wraps the SAME DEK, so existing chunks stay readable)",
+		hash, err)
+	return c.adopt.err
 }
 
 // HasChunk reports whether the CAS contains the chunk. The in-memory

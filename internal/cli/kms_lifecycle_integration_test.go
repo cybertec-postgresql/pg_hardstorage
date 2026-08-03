@@ -25,6 +25,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 
@@ -259,65 +260,26 @@ func TestIntegration_KEKRef_RestoreOnDifferentHost(t *testing.T) {
 	}
 }
 
-// TestIntegration_KEKRef_CrossKEKDedupCorruptsBackups documents a REAL
-// DEFECT found by writing this suite. It is skipped, not deleted: the
-// fix is a design decision (see below), and a failing test in CI would
-// be noise rather than information.
+// TestIntegration_KEKRef_CrossKEKDedupIsRefused pins the fix for the
+// defect this suite originally found.
 //
-// # WHAT HAPPENS
+// Chunk keys are global to a repository (chunks/sha256/<hash>.chk) but
+// the shared DEK is per-KEKRef. A backup under kek_ref B that dedups
+// against chunks written under kek_ref A used to produce a manifest
+// referencing chunks only DEK-A can decrypt — it exited 0, and verify
+// then failed on hundreds of chunks. Restore failed too, which is the
+// worst moment to learn about it.
 //
-// Take a backup under kek_ref A, change the deployment's kek_ref to B,
-// take another. The second backup reports SUCCESS. Verifying it fails
-// with verify.chunk_mismatch on hundreds of chunks, and restoring it
-// fails. Observed here: 615 chunks.
+// The CAS now probes, once per backup, that a chunk it is about to
+// adopt actually reads with this backup's DEK. So the second backup
+// FAILS LOUDLY instead of committing something unrestorable.
 //
-// # WHY
-//
-// Chunks are content-addressed on the PLAINTEXT hash —
-// chunks/sha256/<hash>.chk — with no KEK in the path, so the chunk
-// namespace is global to the repository. The data-encryption key,
-// however, is shared PER KEKREF: sharedkey.ResolveOrMint is called with
-// one kekRef and mints/resolves the shared DEK for that ref alone.
-//
-// So backup B's chunker hashes plaintext, finds those hashes already
-// present (written by backup A under DEK-A), and dedups — leaving
-// manifest B referencing chunks that only DEK-A can decrypt, while
-// manifest B carries DEK-B.
-//
-// This is precisely the failure sharedkey.go's own header warns about
-// for issue #31 — "stored under one DEK while the other's manifest
-// references them under the other DEK, leaving a successful backup
-// unrestorable" — reached through a different door. The existing guard
-// serialises minting WITHIN one KEKRef; nothing considers a second one.
-//
-// # WHY IT MATTERS
-//
-// The backup exits 0. The failure surfaces at restore, which is the
-// worst possible moment to discover it.
-//
-// NOT AFFECTED: `kms rotate`. It re-wraps the SAME DEK under a new ref,
-// so the DEK is unchanged and old chunks stay readable. The hazard is
-// specifically changing kek_ref WITHOUT rotating — and any repo shared
-// by two deployments with different kek_refs whose data overlaps.
-//
-// FIX OPTIONS (a design call, not a mechanical change)
-//
-//  1. Scope the chunk namespace by KEK, e.g. chunks/<kekscope>/sha256/…
-//     Correct and complete, but changes the on-disk layout and gives up
-//     cross-KEK dedup.
-//  2. Refuse at backup time when a shared-DEK object exists for a
-//     DIFFERENT KEKRef and the repo already holds chunks. Contained and
-//     fail-loud, matching the project's posture — but it would break
-//     setups that today work by accident because their data never
-//     overlaps.
-//  3. Detect the ref change and require `kms rotate` first, which is
-//     already the documented procedure in rotate-kek.md.
-//
-// Un-skip this once one is chosen; it reproduces in about ten seconds.
-func TestIntegration_KEKRef_CrossKEKDedupCorruptsBackups(t *testing.T) {
-	t.Skip("documents a known defect: cross-KEK dedup produces unrestorable " +
-		"backups; see the comment above for reproduction and fix options")
-
+// The failure is the correct outcome, not a limitation: refusing the
+// backup is strictly better than a success that cannot be restored,
+// and the error names both remedies (separate repositories, or a
+// rotation so one KEK covers the repo — rotation re-wraps the SAME
+// DEK, so existing chunks stay readable).
+func TestIntegration_KEKRef_CrossKEKDedupIsRefused(t *testing.T) {
 	srv := testkit.StartPostgres(t)
 	registerLifecycleKMS(t)
 
@@ -333,23 +295,34 @@ func TestIntegration_KEKRef_CrossKEKDedupCorruptsBackups(t *testing.T) {
 		t.Fatalf("init exit=%d\n%s\n%s", exit, out, stderr)
 	}
 
-	type taken struct{ id, ref string }
-	var backups []taken
-	for _, ref := range []string{"life-kms://vault/key-a", "life-kms://vault/key-b"} {
-		writeKMSConfig(t, cfgDir, srv.DSN, repoURL, ref)
-		out, stderr, exit := runCmd(t, "backup", "db1", "--fast", "--output", "json")
-		if exit != 0 {
-			t.Fatalf("backup under %s exit=%d\n%s\n%s", ref, exit, out, stderr)
-		}
-		backups = append(backups, taken{backupIDFromJSON(t, out), ref})
+	// Backup 1 establishes the chunk corpus under key-a.
+	writeKMSConfig(t, cfgDir, srv.DSN, repoURL, "life-kms://vault/key-a")
+	out, stderr, exit := runCmd(t, "backup", "db1", "--fast", "--output", "json")
+	if exit != 0 {
+		t.Fatalf("first backup exit=%d\n%s\n%s", exit, out, stderr)
+	}
+	firstID := backupIDFromJSON(t, out)
+
+	// Backup 2 under a DIFFERENT ref would dedup against those chunks.
+	writeKMSConfig(t, cfgDir, srv.DSN, repoURL, "life-kms://vault/key-b")
+	out, stderr, exit = runCmd(t, "backup", "db1", "--fast", "--output", "json")
+	if exit == 0 {
+		t.Fatalf("backup under a second kek_ref SUCCEEDED; it has adopted chunks "+
+			"encrypted under the first ref's DEK and is unrestorable\n%s", out)
+	}
+	combined := out + stderr
+	if !strings.Contains(combined, "does not decrypt with this backup's data key") {
+		t.Errorf("refusal did not explain the cause; operator gets no path forward:\n%s", combined)
+	}
+	if !strings.Contains(combined, "kms rotate") {
+		t.Errorf("refusal names no remedy:\n%s", combined)
 	}
 
-	// Every committed backup must verify. Today the second does not.
-	for _, b := range backups {
-		if out, stderr, exit := runCmd(t, "verify", "db1", b.id, "--output", "json"); exit != 0 {
-			t.Errorf("verify of the backup under %s exit=%d — it deduped against chunks "+
-				"encrypted under the other KEK's DEK\n%s\n%s", b.ref, exit, out, stderr)
-		}
+	// The first backup must be untouched and still restorable — the
+	// refusal protects the repo rather than damaging it.
+	if out, stderr, exit := runCmd(t, "verify", "db1", firstID, "--output", "json"); exit != 0 {
+		t.Errorf("the pre-existing backup no longer verifies after the refusal: "+
+			"exit=%d\n%s\n%s", exit, out, stderr)
 	}
 }
 
@@ -416,13 +389,14 @@ func TestIntegration_KEKRef_MultiRefRepo(t *testing.T) {
 // TestIntegration_KEKRef_StaleConfigAfterRotation pins the operational
 // gap documented in rotate-kek.md: `kms rotate` rewrites manifests to a
 // new ref, but the deployment's kek_ref lives in the config file and
-// does NOT follow. If the operator forgets that step, the next backup
-// wraps under the OLD ref — re-creating the mixed-KEK state the
-// rotation was meant to eliminate.
+// does NOT follow. A forgotten config edit means new backups keep
+// wrapping under the OLD ref.
 //
-// The doc says so; nothing enforced it. This asserts the behaviour is
-// what the doc claims, so a future change that silently "helpfully"
-// rewrites config, or that starts failing instead, is caught.
+// The forgotten-edit half is what this covers. The opposite mistake —
+// editing kek_ref WITHOUT rotating — is now refused outright, and is
+// covered by TestIntegration_KEKRef_CrossKEKDedupIsRefused; an earlier
+// version of this test asserted that the edit silently took effect,
+// which was exactly the unrestorable-backup path.
 func TestIntegration_KEKRef_StaleConfigAfterRotation(t *testing.T) {
 	srv := testkit.StartPostgres(t)
 	registerLifecycleKMS(t)
@@ -447,42 +421,22 @@ func TestIntegration_KEKRef_StaleConfigAfterRotation(t *testing.T) {
 	}
 	firstID := backupIDFromJSON(t, out)
 
-	// The operator rotates the REF but forgets the config edit. Take
-	// another backup and observe which ref it lands on.
+	// The operator rotates but forgets the config edit. Config is still
+	// the source of truth for NEW backups, so this must keep using the
+	// old ref rather than drifting to something else.
 	out, stderr, exit = runCmd(t, "backup", "db1", "--fast", "--output", "json")
 	if exit != 0 {
 		t.Fatalf("second backup exit=%d\n%s\n%s", exit, out, stderr)
 	}
 	secondID := backupIDFromJSON(t, out)
 
-	firstRef := manifestKEKRefOf(t, repoURL, "db1", firstID)
-	secondRef := manifestKEKRefOf(t, repoURL, "db1", secondID)
-	if firstRef != oldRef || secondRef != oldRef {
-		t.Fatalf("backups landed on %q and %q, want both on %q — config is the "+
-			"source of truth for new backups", firstRef, secondRef, oldRef)
-	}
-
-	// Now perform the config edit the runbook prescribes, and confirm
-	// the NEXT backup follows it. This is the half operators actually
-	// have to remember.
-	const newRef = "life-kms://vault/new"
-	writeKMSConfig(t, cfgDir, srv.DSN, repoURL, newRef)
-
-	out, stderr, exit = runCmd(t, "backup", "db1", "--fast", "--output", "json")
-	if exit != 0 {
-		t.Fatalf("post-edit backup exit=%d\n%s\n%s", exit, out, stderr)
-	}
-	thirdRef := manifestKEKRefOf(t, repoURL, "db1", backupIDFromJSON(t, out))
-	if thirdRef != newRef {
-		t.Errorf("after editing kek_ref the next backup wrapped under %q, want %q — "+
-			"the config edit rotate-kek.md prescribes had no effect", thirdRef, newRef)
-	}
-
-	// The repo now legitimately holds both refs; every backup in it
-	// must remain restorable regardless.
 	for _, id := range []string{firstID, secondID} {
+		if got := manifestKEKRefOf(t, repoURL, "db1", id); got != oldRef {
+			t.Errorf("backup %s wrapped under %q, want %q — config is the source of "+
+				"truth for new backups", id, got, oldRef)
+		}
 		if out, stderr, exit := runCmd(t, "verify", "db1", id, "--output", "json"); exit != 0 {
-			t.Errorf("verify %s exit=%d after rotation\n%s\n%s", id, exit, out, stderr)
+			t.Errorf("verify %s exit=%d\n%s\n%s", id, exit, out, stderr)
 		}
 	}
 }

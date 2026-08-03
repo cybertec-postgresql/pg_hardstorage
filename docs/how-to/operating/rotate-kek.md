@@ -114,6 +114,23 @@ changes the ref does. Check with `pg_hardstorage lint` before
 restarting; see
 [KEKRef selection](../../reference/kekref-schemes.md#selecting-a-kekref).
 
+!!! warning "Edit `kek_ref` only as part of a rotation"
+
+    Pointing a deployment at a different `kek_ref` **without**
+    running `kms rotate` first is refused, and deliberately so.
+
+    Chunk keys are global to a repository, but the data key is
+    shared per KEKRef. A backup under a new ref would deduplicate
+    against chunks written under the old one and commit a manifest
+    it cannot decrypt — a backup that succeeds and then fails at
+    restore. The next backup now stops with
+    `does not decrypt with this backup's data key` instead.
+
+    Rotation is safe precisely because it re-wraps the **same**
+    DEK under the new KEK, so existing chunks stay readable. If you
+    want a genuinely separate key with no shared history, give the
+    deployment its own repository.
+
 Restart the agent so the next backup picks up the new KEK:
 
 ```bash
