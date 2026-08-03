@@ -174,3 +174,96 @@ deployments:
 		t.Fatalf("local:default rejected: %v", err)
 	}
 }
+
+// Drop-ins are applied in lexicographic order, later winning. With a
+// single drop-in that is unobservable — TestLoad_DropInOverridesProviderConfig
+// would pass even if the loader picked "the other one" by luck. Two
+// drop-ins whose ordering is the ONLY thing distinguishing them is what
+// actually pins the documented precedence.
+func TestLoad_DropInPrecedenceIsLexicographic(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "pg_hardstorage.yaml"), `
+kms:
+  providers:
+    - kek_ref: aws-kms://alias/prod
+      config:
+        region: base
+deployments:
+  db1:
+    repo: file:///srv/repo
+    kek_ref: aws-kms://alias/prod
+`)
+	// Deliberately written in the order that would win if the loader
+	// used directory order rather than sorting.
+	writeFile(t, filepath.Join(dir, "conf.d", "90-late.yaml"), `
+kms:
+  providers:
+    - kek_ref: aws-kms://alias/prod
+      config:
+        region: from-90
+`)
+	writeFile(t, filepath.Join(dir, "conf.d", "10-early.yaml"), `
+kms:
+  providers:
+    - kek_ref: aws-kms://alias/prod
+      config:
+        region: from-10
+`)
+
+	res, err := config.Load(pathsForTempDir(t, dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := res.Config.KMSProviderConfig("aws-kms://alias/prod")["region"]; got != "from-90" {
+		t.Errorf("region = %v, want from-90 — 90-late.yaml must beat 10-early.yaml, "+
+			"which is the numeric-prefix convention operators rely on (sysctl.d / sudoers.d)", got)
+	}
+}
+
+// A drop-in overriding a DEPLOYMENT's kek_ref is the operator's path
+// for pointing one deployment at a new key without editing the base
+// file. Deployments merge by name, so this exercises a different merge
+// arm than the provider list (which is additive).
+func TestLoad_DropInOverridesDeploymentKEKRef(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "pg_hardstorage.yaml"), `
+kms:
+  providers:
+    - kek_ref: aws-kms://alias/old
+      config:
+        region: us-east-1
+    - kek_ref: aws-kms://alias/new
+      config:
+        region: eu-central-1
+deployments:
+  db1:
+    pg_connection: postgres://x@h/db
+    repo: file:///srv/repo
+    kek_ref: aws-kms://alias/old
+`)
+	writeFile(t, filepath.Join(dir, "conf.d", "50-rotate.yaml"), `
+deployments:
+  db1:
+    kek_ref: aws-kms://alias/new
+`)
+
+	res, err := config.Load(pathsForTempDir(t, dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dep := res.Config.Deployments["db1"]
+	if dep.KEKRef != "aws-kms://alias/new" {
+		t.Fatalf("kek_ref = %q, want the drop-in's alias/new", dep.KEKRef)
+	}
+	// The rest of the deployment must survive the overlay — a merge arm
+	// that replaced the whole entry would silently drop pg_connection
+	// and repo, and the deployment would fail at first use.
+	if dep.Repo != "file:///srv/repo" || dep.PGConnection == "" {
+		t.Errorf("drop-in overlay dropped sibling fields: repo=%q pg_connection=%q",
+			dep.Repo, dep.PGConnection)
+	}
+	// And the ref must resolve to the NEW provider's settings.
+	if got := res.Config.KMSProviderConfig(dep.KEKRef)["region"]; got != "eu-central-1" {
+		t.Errorf("provider region = %v, want eu-central-1", got)
+	}
+}
