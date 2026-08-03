@@ -22,8 +22,16 @@ CGO_ENABLED ?= 0
 
 # Test timeout for the integration suite. PG container startup +
 # real BASE_BACKUP + WAL streaming can take a couple of minutes on
-# slow runners; 10m is comfortable.
-INTEGRATION_TIMEOUT ?= 10m
+# slow runners.
+#
+# This is the LAST line of defence, not a budget any test should
+# approach: when it fires, go test kills the package and reports only
+# "panic: test timed out", naming whichever test happened to be running
+# and none of the several hundred it took down with it. Individual
+# tests that can block — `wal stream --once` above all — carry their own
+# bounds so they fail by name well before this. 15m leaves room for one
+# or two of those to fire and still be reported properly.
+INTEGRATION_TIMEOUT ?= 15m
 
 # Pin TMPDIR off /tmp.  Why: /tmp is a tmpfs with a fixed inode
 # ceiling (1 M on most distros).  testcontainers' minio sinks bind-

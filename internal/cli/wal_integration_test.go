@@ -42,12 +42,27 @@ import (
 // reported only as `panic: test timed out after 10m0s` — the same
 // package finished in ~220s on every other leg of the matrix.
 //
-// 90s is far above the ~2s these runs take when WAL flows, so it fires
-// only on a genuine stall.
-const walStreamTimeout = 90 * time.Second
+// 3 minutes is far above the few seconds these runs take when WAL
+// flows, so it fires only on a genuine stall. It is deliberately not
+// tuned close to the observed time: the bound exists to stop a hang
+// from consuming the package budget, not to assert performance, and a
+// tight one just converts a slow runner into a red build. Even if one
+// test does stall, the package still finishes well inside its 10m.
+const walStreamTimeout = 3 * time.Minute
+
+// walStreamSegBudget is the bound for a run that must commit a 64 MiB
+// segment instead of the default 16 MiB — four times the data to write,
+// checkpoint and upload.
+//
+// It is generous on purpose. A bound exists to stop a stall from
+// consuming the package budget, not to assert performance; one set
+// close to the observed time turns a slow runner into a red build. The
+// 64 MiB case measured ~61s locally and ~97s on CI, where a shared 90s
+// bound cut it off just short of finishing.
+const walStreamSegBudget = 5 * time.Minute
 
 // runWalStreamBounded executes root and returns its exit code, failing
-// the test if it has not returned within walStreamTimeout.
+// the test if it has not returned within budget.
 //
 // On timeout the command goroutine is deliberately left running: it is
 // blocked reading the replication connection, and the container
@@ -59,19 +74,19 @@ const walStreamTimeout = 90 * time.Second
 // to, and those are not safe for concurrent use — reading them here to
 // enrich the message would trip the race detector and report a data
 // race in the test harness instead of the stall that actually failed.
-func runWalStreamBounded(t *testing.T, root *cobra.Command) int {
+func runWalStreamBounded(t *testing.T, root *cobra.Command, budget time.Duration) int {
 	t.Helper()
 	done := make(chan int, 1)
 	go func() { done <- cli.Run(root) }()
 	select {
 	case exit := <-done:
 		return exit
-	case <-time.After(walStreamTimeout):
+	case <-time.After(budget):
 		t.Fatalf("`wal stream` did not return within %s — it was still waiting for the "+
 			"segment that ends a --once run. Unbounded, it would block until the package "+
 			"timeout and take every test after it down with it. Check the preceding "+
 			"`driving WAL failed` error: if the side connection that produces WAL never "+
-			"came up, no segment could ever commit.", walStreamTimeout)
+			"came up, no segment could ever commit.", budget)
 		return -1
 	}
 }
@@ -174,7 +189,7 @@ func TestIntegration_WalStream_OneSegment(t *testing.T) {
 
 	// Run the command. --once should make it exit after the first
 	// segment commits.
-	exit := runWalStreamBounded(t, root)
+	exit := runWalStreamBounded(t, root, walStreamTimeout)
 	walCancel()
 	walWG.Wait()
 	if walDriveErr != nil {
@@ -271,7 +286,7 @@ func TestIntegration_WalStream_RefusesSystemIdentifierChange(t *testing.T) {
 		"--once",
 		"--output", "json",
 	})
-	exit := runWalStreamBounded(t, root)
+	exit := runWalStreamBounded(t, root, walStreamTimeout)
 	if exit != int(output.ExitPreflight) {
 		t.Fatalf("exit = %d, want ExitPreflight(%d) on a system-identifier change\nstdout: %s\nstderr: %s",
 			exit, int(output.ExitPreflight), stdout.String(), stderr.String())
@@ -359,8 +374,9 @@ func TestIntegration_WalStream_NonDefaultWalSegSize(t *testing.T) {
 	})
 
 	// Generate well over one 64 MiB segment of WAL so the --once watcher
-	// has a full segment to commit.
-	walCtx, walCancel := context.WithTimeout(context.Background(), 120*time.Second)
+	// has a full segment to commit. The writer must outlive the stream's
+	// own budget, or it falls silent while the streamer is still waiting.
+	walCtx, walCancel := context.WithTimeout(context.Background(), walStreamSegBudget+30*time.Second)
 	defer walCancel()
 	var walDriveErr error
 	var walWG sync.WaitGroup
@@ -370,7 +386,7 @@ func TestIntegration_WalStream_NonDefaultWalSegSize(t *testing.T) {
 		walDriveErr = driveWAL(walCtx, srv.DSN, "wal_test", 8192)
 	}()
 
-	exit := runWalStreamBounded(t, root)
+	exit := runWalStreamBounded(t, root, walStreamSegBudget)
 	walCancel()
 	walWG.Wait()
 	if walDriveErr != nil {
@@ -517,7 +533,7 @@ func TestIntegration_WalStream_FreshSlot_NoWALLossUnderLoad(t *testing.T) {
 		"--once",
 		"--output", "json",
 	})
-	exit := runWalStreamBounded(t, root)
+	exit := runWalStreamBounded(t, root, walStreamTimeout)
 	loadCancel()
 	loadWG.Wait()
 
@@ -599,7 +615,7 @@ func TestIntegration_WalStream_VerboseEmitsProgress(t *testing.T) {
 		walDriveErr = driveWAL(walCtx, srv.DSN, "vt", 2048)
 	}()
 
-	exit := runWalStreamBounded(t, root)
+	exit := runWalStreamBounded(t, root, walStreamTimeout)
 	walCancel()
 	walWG.Wait()
 	if walDriveErr != nil {
@@ -678,7 +694,7 @@ func TestIntegration_WalStream_NoVerboseNoProgress(t *testing.T) {
 		walDriveErr = driveWAL(walCtx, srv.DSN, "qt", 2048)
 	}()
 
-	exit := runWalStreamBounded(t, root)
+	exit := runWalStreamBounded(t, root, walStreamTimeout)
 	walCancel()
 	walWG.Wait()
 	if walDriveErr != nil {
