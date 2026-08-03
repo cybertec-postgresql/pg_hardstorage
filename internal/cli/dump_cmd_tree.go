@@ -27,6 +27,17 @@ func newDumpCmdTreeCmd() *cobra.Command {
 				Runnable       bool   `json:"runnable"`
 				HasSubcommands bool   `json:"has_subcommands"`
 				Hidden         bool   `json:"hidden"`
+				// GroupGuard reports that Runnable is TRUE only
+				// because hardenGroupCommands synthesised a RunE to
+				// reject typo'd subcommands. The command itself does
+				// no work: invoked bare it prints help and exits 0.
+				//
+				// Without this, every consumer of the dump has to
+				// guess. The CLI coverage gate guessed wrong and
+				// demanded a scenario for `kms`, `audit`, `repo` and
+				// 30-odd other pure groups — which is why it reported
+				// 41 uncovered leaves and had to be ignored.
+				GroupGuard bool `json:"group_guard,omitempty"`
 			}
 			var nodes []node
 			var walk func(c *cobra.Command, prefix []string)
@@ -40,6 +51,7 @@ func newDumpCmdTreeCmd() *cobra.Command {
 						Runnable:       c.Runnable(),
 						HasSubcommands: c.HasSubCommands(),
 						Hidden:         c.Hidden,
+						GroupGuard:     c.Annotations[groupGuardAnnotation] == "1",
 					})
 				}
 				for _, sub := range c.Commands() {

@@ -53,6 +53,10 @@ type cmdTreeNode struct {
 	Runnable       bool   `json:"runnable"`
 	HasSubcommands bool   `json:"has_subcommands"`
 	Hidden         bool   `json:"hidden"`
+	// GroupGuard marks a command that is Runnable ONLY because
+	// hardenGroupCommands synthesised a RunE to reject typo'd
+	// subcommands. See loadCmdTree.
+	GroupGuard bool `json:"group_guard"`
 }
 
 func newCoverageCLICmd() *cobra.Command {
@@ -177,6 +181,25 @@ func loadCmdTree(agentBin string) ([]string, error) {
 	var leaves []string
 	for _, n := range nodes {
 		if !n.Runnable || n.Hidden {
+			continue
+		}
+		// A pure group (`kms`, `audit`, `repo`, …) is Runnable only
+		// because hardenGroupCommands gave it a synthetic RunE, so a
+		// typo'd subcommand fails instead of silently printing help
+		// and exiting 0. Invoked bare it prints help; there is no
+		// behaviour for a scenario to exercise.
+		//
+		// Demanding coverage for those is what produced "41 leaf
+		// command(s) have no scenario coverage" — every one of the 41
+		// was a group. A gate reporting 41 unfixable failures is not a
+		// gate; it gets ignored, and it was: the job had been red long
+		// enough that nothing downstream of it ran.
+		//
+		// Commands that are BOTH a group and a real action — `backup`,
+		// which takes a deployment and also hosts `backup delete` —
+		// have their own RunE, so they are not annotated and are still
+		// required to be covered.
+		if n.GroupGuard {
 			continue
 		}
 		// Skip pure-passthrough subcommands the user shouldn't need
