@@ -182,15 +182,37 @@ func (p *Plugin) Put(ctx context.Context, key string, r io.Reader, opts storage.
 	if opts.IfNotExists {
 		obj = obj.If(gcs.Conditions{DoesNotExist: true})
 	}
-	w := obj.NewWriter(ctx)
+	// The writer's context is what ABORTS an upload. Close() finalises
+	// the object, so calling it after a failed copy commits whatever
+	// bytes made it across — a body reader that dies half way used to
+	// leave a TRUNCATED object readable at the key.
+	//
+	// That is worse here than a plain failed write. Chunks are
+	// content-addressed and committed with IfNotExists, so a truncated
+	// chunk sitting at hash H makes every later, correct write of the
+	// same content a no-op (ErrAlreadyExists) — the corruption is
+	// sticky, and every manifest referencing H is unrestorable.
+	//
+	// Cancelling is the documented abort path (CloseWithError is
+	// deprecated in favour of it). The other backends already behave
+	// this way: fs, sftp and scp stage to a temporary and rename, and
+	// s3 does not finalise on a failed body.
+	wctx, cancelWrite := context.WithCancel(ctx)
+	defer cancelWrite()
+
+	w := obj.NewWriter(wctx)
 	if p.storageClass != "" {
 		w.StorageClass = p.storageClass
 	}
 	written, err := io.Copy(w, r)
-	if closeErr := w.Close(); err == nil {
-		err = closeErr
-	}
 	if err != nil {
+		// Abort rather than finalise. The deferred cancel would also do
+		// it, but doing it here makes the intent explicit and bounds the
+		// window in which a partial object could be observed.
+		cancelWrite()
+		return storage.PutResult{}, fmt.Errorf("gcs: put %s: %w", key, err)
+	}
+	if err = w.Close(); err != nil {
 		if isPreconditionFailed(err) {
 			return storage.PutResult{}, storage.ErrAlreadyExists
 		}
