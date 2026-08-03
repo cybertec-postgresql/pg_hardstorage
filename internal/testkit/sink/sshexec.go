@@ -13,13 +13,31 @@
 // container-pinned, reproducible footing every other backend has.
 //
 // The image is built locally from alpine rather than pulled
-// pre-baked: it needs a host key, an unlocked account, and an
-// authorized_keys entry generated per-instance, and a throwaway
-// keypair must never be baked into a published image.
+// pre-baked: it needs a host key and an unlocked account, and a
+// throwaway keypair must never be baked into a published image.
+//
+// The authorised key is injected at `docker run` time, NOT baked into
+// the image, and that distinction is load-bearing. The image tag is
+// shared by every instance so docker's layer cache makes repeat runs
+// instant — but `go test` runs packages CONCURRENTLY, and two packages
+// use this sink (internal/plugin/storage's wiring test and
+// .../storage/scp's contract test). When each baked its own key into a
+// build under that one shared tag, the later build re-pointed the tag
+// and the earlier instance's `docker run` started a container
+// authorising the OTHER package's key. Every operation then failed
+// with "unable to authenticate, attempted methods [none publickey]" —
+// intermittently, on whichever package lost the race.
+//
+// So the image holds nothing instance-specific, and its tag carries a
+// hash of the Dockerfile that produced it: concurrent builds converge
+// on identical content, and an edit here can never silently reuse a
+// stale image built by an older revision.
 package sink
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -33,9 +51,9 @@ import (
 const (
 	sshExecUser = "pghs"
 	sshExecRoot = "/srv/repo"
-	// sshExecImage is built on demand; the tag is stable so docker's
-	// layer cache makes repeat runs ~instant.
-	sshExecImage = "pg-hardstorage-testkit-sshexec:alpine-3.20"
+	// sshExecAuthKeyEnv carries the per-instance public key into the
+	// container at run time.
+	sshExecAuthKeyEnv = "PGHS_AUTHORIZED_KEY"
 )
 
 var sshExecCounter atomic.Uint64
@@ -81,7 +99,8 @@ func (s *sshExecRuntime) Up(ctx context.Context) error {
 		s.cleanupDir()
 		return fmt.Errorf("ssh-exec sink: read pubkey: %w", err)
 	}
-	if err := s.buildImage(ctx, dir, pub); err != nil {
+	image, err := s.buildImage(ctx, dir)
+	if err != nil {
 		s.cleanupDir()
 		return err
 	}
@@ -98,7 +117,8 @@ func (s *sshExecRuntime) Up(ctx context.Context) error {
 	out, err := exec.CommandContext(ctx, "docker", "run", "-d",
 		"--name", s.container,
 		"-p", fmt.Sprintf("127.0.0.1:%d:22", s.port),
-		sshExecImage).CombinedOutput()
+		"-e", sshExecAuthKeyEnv+"="+strings.TrimSpace(string(pub)),
+		image).CombinedOutput()
 	if err != nil {
 		name := s.container
 		s.container = ""
@@ -117,17 +137,82 @@ func (s *sshExecRuntime) Up(ctx context.Context) error {
 		_ = s.Down(context.Background())
 		return err
 	}
+	// Prove the instance's own key is accepted before handing the URL
+	// out. Speaking SSH and accepting THIS key are different things,
+	// and when they came apart the symptom was ~20 opaque failures
+	// inside the contract suite rather than one fixture error here.
+	if err := s.probeAuth(ctx, 30*time.Second); err != nil {
+		_ = s.Down(context.Background())
+		return err
+	}
 	return nil
 }
 
-// buildImage writes a Dockerfile authorising pub and builds it.
-func (s *sshExecRuntime) buildImage(ctx context.Context, dir string, pub []byte) error {
+// probeAuth runs a trivial remote command with the instance's key.
+func (s *sshExecRuntime) probeAuth(ctx context.Context, total time.Duration) error {
+	deadline := time.Now().Add(total)
+	var last []byte
+	for {
+		cmd := exec.CommandContext(ctx, "ssh",
+			"-i", s.identityFile,
+			"-o", "IdentitiesOnly=yes",
+			"-o", "BatchMode=yes",
+			"-o", "UserKnownHostsFile="+s.knownHosts,
+			"-o", "StrictHostKeyChecking=yes",
+			"-o", "ConnectTimeout=5",
+			"-p", fmt.Sprint(s.port),
+			sshExecUser+"@127.0.0.1", "true")
+		out, err := cmd.CombinedOutput()
+		if err == nil {
+			return nil
+		}
+		last = out
+		if time.Now().After(deadline) {
+			logs, _ := exec.Command("docker", "logs", s.container).CombinedOutput()
+			return fmt.Errorf("ssh-exec sink: sshd rejected the instance's own key within %s "+
+				"(%s); container logs: %s",
+				total, truncate(last, 200), truncate(logs, 400))
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+}
+
+// sshExecEntrypoint installs the run-time-supplied public key and then
+// becomes sshd. Writing the key here rather than at build time is what
+// keeps the image free of per-instance material; sshd only starts once
+// the key is in place, so a container that answers SSH is a container
+// that will accept its instance's key.
+//
+// StrictModes means sshd ignores an authorized_keys it does not
+// consider safely owned, and does so silently from the client's side,
+// so ownership and mode are set explicitly rather than inherited.
+const sshExecEntrypoint = `set -e
+if [ -z "${` + sshExecAuthKeyEnv + `:-}" ]; then
+  echo "ssh-exec fixture: ` + sshExecAuthKeyEnv + ` is empty; no key would be authorised" >&2
+  exit 1
+fi
+printf '%s\n' "$` + sshExecAuthKeyEnv + `" > /home/` + sshExecUser + `/.ssh/authorized_keys
+chown ` + sshExecUser + ` /home/` + sshExecUser + `/.ssh/authorized_keys
+chmod 600 /home/` + sshExecUser + `/.ssh/authorized_keys
+exec /usr/sbin/sshd -D -e
+`
+
+// buildImage builds the key-free sshd image and returns the tag it was
+// built under. The tag embeds a hash of the Dockerfile, so every
+// instance that would produce identical content converges on one tag
+// (full cache hit, no races) while any edit here lands on a fresh one.
+func (s *sshExecRuntime) buildImage(ctx context.Context, dir string) (string, error) {
 	bctx := filepath.Join(dir, "img")
 	if err := os.MkdirAll(bctx, 0o755); err != nil {
-		return fmt.Errorf("ssh-exec sink: mkdir build ctx: %w", err)
+		return "", fmt.Errorf("ssh-exec sink: mkdir build ctx: %w", err)
 	}
-	if err := os.WriteFile(filepath.Join(bctx, "authorized_keys"), pub, 0o644); err != nil {
-		return fmt.Errorf("ssh-exec sink: write authorized_keys: %w", err)
+	if err := os.WriteFile(filepath.Join(bctx, "entrypoint.sh"),
+		[]byte(sshExecEntrypoint), 0o755); err != nil {
+		return "", fmt.Errorf("ssh-exec sink: write entrypoint: %w", err)
 	}
 	// `passwd -u` matters: Alpine's `adduser -D` leaves the account
 	// with a locked password, and OpenSSH refuses a locked account
@@ -138,21 +223,24 @@ func (s *sshExecRuntime) buildImage(ctx context.Context, dir string, pub []byte)
 		"    ssh-keygen -A && \\\n" +
 		"    adduser -D -s /bin/sh " + sshExecUser + " && passwd -u " + sshExecUser + "\n" +
 		"RUN mkdir -p /home/" + sshExecUser + "/.ssh " + sshExecRoot + " && \\\n" +
-		"    chown -R " + sshExecUser + " /home/" + sshExecUser + " " + sshExecRoot + "\n" +
-		"COPY authorized_keys /home/" + sshExecUser + "/.ssh/authorized_keys\n" +
-		"RUN chown " + sshExecUser + " /home/" + sshExecUser + "/.ssh/authorized_keys && \\\n" +
-		"    chmod 600 /home/" + sshExecUser + "/.ssh/authorized_keys\n" +
+		"    chown -R " + sshExecUser + " /home/" + sshExecUser + " " + sshExecRoot + " && \\\n" +
+		"    chmod 700 /home/" + sshExecUser + "/.ssh\n" +
+		"COPY entrypoint.sh /usr/local/bin/entrypoint.sh\n" +
 		"EXPOSE 22\n" +
-		`CMD ["/usr/sbin/sshd","-D","-e"]` + "\n"
+		`CMD ["/bin/sh","/usr/local/bin/entrypoint.sh"]` + "\n"
 	if err := os.WriteFile(filepath.Join(bctx, "Dockerfile"), []byte(dockerfile), 0o644); err != nil {
-		return fmt.Errorf("ssh-exec sink: write Dockerfile: %w", err)
+		return "", fmt.Errorf("ssh-exec sink: write Dockerfile: %w", err)
 	}
+
+	sum := sha256.Sum256([]byte(dockerfile + "\x00" + sshExecEntrypoint))
+	tag := "pg-hardstorage-testkit-sshexec:" + hex.EncodeToString(sum[:6])
+
 	out, err := exec.CommandContext(ctx, "docker", "build", "-q",
-		"-t", sshExecImage, bctx).CombinedOutput()
+		"-t", tag, bctx).CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("ssh-exec sink: docker build: %w (%s)", err, truncate(out, 400))
+		return "", fmt.Errorf("ssh-exec sink: docker build: %w (%s)", err, truncate(out, 400))
 	}
-	return nil
+	return tag, nil
 }
 
 func (s *sshExecRuntime) writeKnownHosts(ctx context.Context, total time.Duration) error {
