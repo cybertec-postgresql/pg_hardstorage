@@ -101,8 +101,10 @@ func Run(t *testing.T, open PluginOpener) {
 		{"RenameIfNotExists_DstPresent_ErrAlreadyExists", caseRenameDstPresent},
 		{"RenameIfNotExists_AcrossPrefix", caseRenameAcrossPrefix},
 		{"ContentSHA256_MatchesAdvertisedCapability", caseContentSHA256Honesty},
+		{"ContentSHA256_ToleratedWhenUnsupported", caseContentSHA256Tolerated},
 		{"WORM_MatchesAdvertisedCapability", caseWORMHonesty},
 		{"StorageClass_MatchesAdvertisedCapability", caseStorageClassHonesty},
+		{"StorageClass_ToleratedWhenUnsupported", caseStorageClassTolerated},
 		{"DurabilityBarrier_MatchesAdvertisedCapability", caseDurabilityBarrierHonesty},
 		{"Multipart_HandlesLargeObject", caseMultipartLargeObject},
 	}
@@ -405,6 +407,62 @@ func caseContentSHA256Honesty(t *testing.T, p storage.StoragePlugin) {
 // replicate.go both refuse to proceed without the flag, so a false
 // positive here means a regulated repo silently writes unlocked
 // objects while reporting worm.active.
+// caseContentSHA256Tolerated is the other half of the capability, and
+// the half that had no coverage at all.
+//
+// caseContentSHA256Honesty runs only where the capability IS
+// advertised, which today is fs alone — so on s3, gcs, azblob, sftp
+// and scp it skipped, and nothing anywhere established what those
+// backends do when handed the field. "We never assert it" is not the
+// same as "it is ignored".
+//
+// PutOptions documents it as optional for a non-advertising backend,
+// and internal/repo.CAS gates on the capability to avoid a second
+// full SHA-256 pass per chunk. But the gate is a caller's choice, not
+// an enforced one: any other caller — or a future change to that gate
+// — sends the field to a backend that never promised to read it. This
+// pins that doing so is harmless.
+//
+// Exactly one of the two cases runs per backend, so implementing
+// verification means flipping the capability and the coverage moves
+// with it.
+func caseContentSHA256Tolerated(t *testing.T, p storage.StoragePlugin) {
+	if p.Capabilities().VerifiesContentSHA256 {
+		t.Skip("backend advertises VerifiesContentSHA256; caseContentSHA256Honesty covers it")
+	}
+	ctx := context.Background()
+	body := []byte("content-sha256-tolerated")
+
+	// A CORRECT hash must not disturb the write.
+	good := sha256.Sum256(body)
+	if _, err := p.Put(ctx, "shaopt/correct", bytes.NewReader(body),
+		storage.PutOptions{ContentLength: int64(len(body)), ContentSHA256: good}); err != nil {
+		t.Fatalf("Put with a correct ContentSHA256 failed: %v\nThe field is optional for "+
+			"this backend, so supplying it must not break the write", err)
+	}
+	if got := getString(t, p, "shaopt/correct"); got != string(body) {
+		t.Errorf("body = %q, want %q", got, body)
+	}
+
+	// A deliberately WRONG hash must be ignored rather than enforced.
+	// Rejecting here would mean the backend verifies but does not say
+	// so, which is its own kind of dishonesty: callers gate on the
+	// capability to decide whether the check is worth paying for, and
+	// one that under-advertises makes that decision on bad information.
+	var wrong [32]byte
+	wrong[0] = 0x01 // cannot be the SHA-256 of anything
+	if _, err := p.Put(ctx, "shaopt/wrong", bytes.NewReader(body),
+		storage.PutOptions{ContentLength: int64(len(body)), ContentSHA256: wrong}); err != nil {
+		t.Fatalf("Put rejected a mismatched ContentSHA256 on a backend that does not "+
+			"advertise VerifiesContentSHA256: %v\nEither advertise the capability — and let "+
+			"caseContentSHA256Honesty hold it to the promise — or ignore the field", err)
+	}
+	if got := getString(t, p, "shaopt/wrong"); got != string(body) {
+		t.Errorf("body = %q, want %q — the ignored hash must not affect what was stored",
+			got, body)
+	}
+}
+
 func caseWORMHonesty(t *testing.T, p storage.StoragePlugin) {
 	putString(t, p, "worm/obj", "retained")
 	until := time.Now().Add(24 * time.Hour)
@@ -471,6 +529,52 @@ func caseStorageClassHonesty(t *testing.T, p storage.StoragePlugin) {
 // Barrier itself cannot be proven to fsync from user space, so what is
 // checked is the observable half: it must succeed, and the deferred
 // bytes must be readable afterwards.
+// caseStorageClassTolerated mirrors caseContentSHA256Tolerated for
+// StorageClass, which only s3 advertises — so the case that checks it
+// skipped on the other five backends.
+//
+// Two things must hold. Supplying a class a backend cannot select must
+// not fail the write, because a repo policy configured once is applied
+// to whatever backend the deployment happens to use. And Stat must not
+// report the class back: echoing the request would make a caller
+// believe an archive tier was applied when the object sits in hot
+// storage, which is a silent cost and a silent retrieval-latency
+// surprise rather than a loud error.
+//
+// The class asked for is deliberately not a real one anywhere. A
+// backend legitimately reporting its OWN assigned tier is fine and
+// must not fail here; only echoing back this exact value proves the
+// request was reflected rather than observed.
+func caseStorageClassTolerated(t *testing.T, p storage.StoragePlugin) {
+	if p.Capabilities().StorageClassSelectable {
+		t.Skip("backend advertises StorageClassSelectable; caseStorageClassHonesty covers it")
+	}
+	ctx := context.Background()
+	const (
+		key    = "sclassopt/obj"
+		exotic = "PGHS-CONTRACT-NO-SUCH-CLASS"
+		body   = "stored-without-class-selection"
+	)
+	if _, err := p.Put(ctx, key, strings.NewReader(body),
+		storage.PutOptions{ContentLength: int64(len(body)), StorageClass: exotic}); err != nil {
+		t.Fatalf("Put with a StorageClass failed on a backend that does not advertise "+
+			"selectability: %v\nThe field must be ignored, not rejected — one repo policy "+
+			"is applied across backends with different capabilities", err)
+	}
+	if got := getString(t, p, key); got != body {
+		t.Errorf("body = %q, want %q", got, body)
+	}
+	oi, err := p.Stat(ctx, key)
+	if err != nil {
+		t.Fatalf("Stat: %v", err)
+	}
+	if oi.StorageClass == exotic {
+		t.Errorf("Stat reports StorageClass %q — the requested class was echoed back by a "+
+			"backend that cannot select one. A caller would believe an archive tier was "+
+			"applied while the object sits in hot storage", oi.StorageClass)
+	}
+}
+
 func caseDurabilityBarrierHonesty(t *testing.T, p storage.StoragePlugin) {
 	const key = "durable/deferred"
 	body := "written-deferred-then-barriered"
