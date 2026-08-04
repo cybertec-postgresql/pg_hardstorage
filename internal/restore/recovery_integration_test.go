@@ -73,28 +73,51 @@ func TestIntegration_PITR_RestoreToLSN(t *testing.T) {
 	streamCtx, streamCancel := context.WithTimeout(ctx, 60*time.Second)
 	defer streamCancel()
 
-	// Generate WAL on a side connection.
+	// Drive WAL in a LOOP until the streamer is done, rather than in one
+	// burst after a fixed 500ms sleep.
+	//
+	// The sleep was betting that the stream command had created its
+	// replication slot by then. A slot created after the burst has
+	// landed begins at an LSN past all of it, so `--once` waits for a
+	// segment boundary nothing will ever cross — every write succeeds,
+	// nothing errors, and the command simply never returns. Looping
+	// removes the race: whenever the slot appears, WAL is still coming.
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		// Brief delay so the stream command is past the slot setup.
-		time.Sleep(500 * time.Millisecond)
 		c, err := pg.Connect(streamCtx, srv.DSN, pg.ModeRegular)
 		if err != nil {
 			return
 		}
 		defer c.Close(streamCtx)
-		_ = c.PgConn().ExecParams(streamCtx, "SELECT pg_switch_wal()", nil, nil, nil, nil).Read()
-		_ = c.PgConn().ExecParams(streamCtx, "CREATE TABLE pitr_t (i int, payload text)", nil, nil, nil, nil).Read()
-		_ = c.PgConn().ExecParams(streamCtx,
-			"INSERT INTO pitr_t SELECT g, repeat('p', 16384) FROM generate_series(1, 2048) g",
-			nil, nil, nil, nil).Read()
-		_ = c.PgConn().ExecParams(streamCtx, "CHECKPOINT", nil, nil, nil, nil).Read()
-		_ = c.PgConn().ExecParams(streamCtx, "SELECT pg_switch_wal()", nil, nil, nil, nil).Read()
+		exec := func(sql string) error {
+			return c.PgConn().ExecParams(streamCtx, sql, nil, nil, nil, nil).Read().Err
+		}
+		if exec("CREATE TABLE pitr_t (i int, payload text)") != nil {
+			return
+		}
+		for streamCtx.Err() == nil {
+			for _, sql := range []string{
+				"INSERT INTO pitr_t SELECT g, repeat('p', 16384) FROM generate_series(1, 2048) g",
+				"CHECKPOINT",
+				"SELECT pg_switch_wal()",
+			} {
+				if exec(sql) != nil {
+					return // ctx cancelled once the streamer finished
+				}
+			}
+		}
 	}()
 
 	root := cli.NewRoot()
+	// Bind the deadline to the command. cli.Run derives its signal
+	// context from whatever the caller set, so streamCtx now actually
+	// bounds the stream — without this the run is unbounded, and a
+	// stalled `--once` consumes the whole package budget and takes
+	// every other test in internal/restore down with it as an
+	// unexplained "panic: test timed out".
+	root.SetContext(streamCtx)
 	root.SetArgs([]string{
 		"wal", "stream", "db1",
 		"--pg-connection", srv.DSN,
@@ -106,7 +129,7 @@ func TestIntegration_PITR_RestoreToLSN(t *testing.T) {
 	if exit := cli.Run(root); exit != 0 {
 		streamCancel()
 		wg.Wait()
-		t.Fatalf("wal stream --once exit = %d", exit)
+		t.Fatalf("wal stream --once exit = %d (streamCtx err: %v)", exit, streamCtx.Err())
 	}
 	streamCancel()
 	wg.Wait()

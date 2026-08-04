@@ -55,7 +55,26 @@ func Run(root *cobra.Command) int {
 	// default-disposition SIGINT used to leak it forever). A second
 	// signal falls back to the default disposition (hard kill), so a
 	// wedged command can still be terminated.
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	//
+	// The signal context is DERIVED from any context the caller already
+	// set on the root, rather than replacing it. In production nothing
+	// sets one, so this is context.Background() and behaviour is
+	// unchanged — but a caller that does set one now has it honoured.
+	//
+	// That difference matters to tests. `wal stream` blocks until its
+	// segment commits, and a test that wrapped it in a deadline found
+	// the deadline silently discarded here: cli.Run returned only when
+	// the stream ended on its own. When a segment never landed, the run
+	// never returned, consumed its whole package budget, and go test
+	// killed the package — reporting one arbitrary test and hiding the
+	// several hundred it took with it. Discarding a caller's context is
+	// the kind of thing that looks harmless until something needs to
+	// interrupt the command.
+	base := root.Context()
+	if base == nil {
+		base = context.Background()
+	}
+	ctx, stop := signal.NotifyContext(base, os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	root.SetContext(ctx)
 
