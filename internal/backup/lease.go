@@ -64,6 +64,24 @@ var (
 	// LIVE lease for the deployment is already held by someone else.
 	ErrBackupInProgress = errors.New("backup: another backup is already in progress for this deployment")
 
+	// ErrLeaseNotEnforceable is returned by AcquireBackupLease when the
+	// repository's backend cannot create an object atomically, so the
+	// lease cannot actually exclude a second backup.
+	//
+	// The lease is built entirely on Put(IfNotExists): the initial
+	// acquire, and the claim that makes breaking a lapsed lease
+	// exclusive. A backend without ConditionalPut emulates it with
+	// stat-then-write, which is a check followed by an unrelated
+	// action — two runners can pass the check together and both
+	// proceed. The lease would still be WRITTEN, and would still look
+	// correct in the repo; it simply would not exclude anything.
+	//
+	// Refusing mirrors how the CAS treats unenforceable WORM: an
+	// operator who believes they have a guarantee they do not have is
+	// worse off than one whose backup stops with a reason. Set
+	// LeaseOptions.AllowUnenforceable to proceed anyway.
+	ErrLeaseNotEnforceable = errors.New("backup: repository backend cannot enforce the backup lease (no atomic conditional put)")
+
 	// ErrLeaseLost is returned by Renew (and surfaced by Maintain)
 	// when the lease we held has been reclaimed by another holder —
 	// i.e. we let it lapse and someone else took over.  The backup
@@ -123,6 +141,11 @@ type LeaseOptions struct {
 	now func() time.Time
 	// settle overrides defaultLeaseSettle, injected by tests.
 	settle time.Duration
+	// AllowUnenforceable proceeds even when the backend cannot create
+	// objects atomically, accepting that the lease excludes nothing.
+	// Only sensible for a deployment where exactly one backup runner
+	// can possibly exist, and the operator knows it.
+	AllowUnenforceable bool
 }
 
 // Test hooks: gate specific interleavings deterministically in race
@@ -185,6 +208,19 @@ func AcquireBackupLease(ctx context.Context, sp storage.StoragePlugin, deploymen
 	settle := opts.settle
 	if settle <= 0 {
 		settle = defaultLeaseSettle
+	}
+
+	// The whole design rests on Put(IfNotExists) being atomic. A
+	// backend that only emulates it cannot exclude anything, and a
+	// lease that does not exclude is worse than none: it reads as a
+	// guarantee in the repo and in `repo gc`, so nobody looks again.
+	if !opts.AllowUnenforceable && !sp.Capabilities().ConditionalPut {
+		return nil, fmt.Errorf("%w: backend %q emulates IfNotExists with stat-then-write, "+
+			"so two runners can hold this lease at once and back up %q concurrently. "+
+			"For SFTP this means the server does not advertise hardlink@openssh.com; "+
+			"use a server that does, or a different repository backend. Set "+
+			"LeaseOptions.AllowUnenforceable only where exactly one runner can exist",
+			ErrLeaseNotEnforceable, sp.Name(), deployment)
 	}
 
 	l := &Lease{sp: sp, deployment: deployment, ttl: ttl, now: now, settle: settle}
