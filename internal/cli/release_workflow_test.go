@@ -196,6 +196,95 @@ func TestReleaseWorkflowPreflightsRequiredSecrets(t *testing.T) {
 	}
 }
 
+// preflightScript returns the body of the preflight-secrets step.
+func preflightScript(t *testing.T, workflow string) string {
+	t.Helper()
+	i := strings.Index(workflow, "name: preflight-secrets")
+	if i < 0 {
+		t.Fatal("no preflight-secrets step in release.yml")
+	}
+	rest := workflow[i:]
+	// The step ends at the next step in the list.
+	if j := strings.Index(rest, "\n      - name: "); j > 0 {
+		rest = rest[:j]
+	}
+	return rest
+}
+
+// releaseSecrets returns every secret release.yml consumes.
+func releaseSecrets(workflow string) []string {
+	re := regexp.MustCompile(`secrets\.([A-Z_][A-Z0-9_]*)`)
+	seen := map[string]bool{}
+	var out []string
+	for _, m := range re.FindAllStringSubmatch(workflow, -1) {
+		if !seen[m[1]] {
+			seen[m[1]] = true
+			out = append(out, m[1])
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// TestReleaseSecretsAreCheckedAndFatal is the test that would have made
+// the HOMEBREW_TAP_TOKEN failure visible without cutting a release.
+//
+// The secret was never set — not expired, not mis-scoped. goreleaser
+// sent an empty credential, GitHub answered "401 Bad credentials", and
+// that reads like a permissions problem, so four releases were spent
+// examining token scopes for something that did not exist.
+//
+// Two properties would have collapsed that: every secret the workflow
+// consumes is actually CHECKED before anything is built, and a missing
+// one FAILS rather than warns. The old test only asserted the string
+// "preflight-secrets" appeared somewhere, which was true the whole
+// time it was broken.
+func TestReleaseSecretsAreCheckedAndFatal(t *testing.T) {
+	root := repoRootFromCLI(t)
+	workflow := readRepoFile(t, root, ".github", "workflows", "release.yml")
+	pre := preflightScript(t, workflow)
+
+	secrets := releaseSecrets(workflow)
+	if len(secrets) == 0 {
+		t.Fatal("found no secrets.* references in release.yml — the extraction broke, so " +
+			"every assertion below would hold vacuously")
+	}
+
+	for _, name := range secrets {
+		t.Run(name, func(t *testing.T) {
+			// 1. The preflight must be able to see it.
+			if !strings.Contains(pre, name+": ${{ secrets."+name+" }}") {
+				t.Errorf("release.yml consumes %s but the preflight does not map it into "+
+					"env, so it cannot check it. A secret consumed but never verified is "+
+					"one whose absence is discovered by whatever consumes it, at whatever "+
+					"point that happens to be", name)
+			}
+			// 2. It must actually be tested for emptiness.
+			if !strings.Contains(pre, `-z "${`+name+`:-}"`) {
+				t.Errorf("the preflight never tests whether %s is empty", name)
+			}
+			// 3. Being absent must FAIL, not warn. This is the specific
+			//    regression: a ::warning fails nothing, so the run
+			//    continued and the real failure landed minutes later
+			//    wearing a misleading error.
+			for _, line := range strings.Split(pre, "\n") {
+				if strings.Contains(line, "::warning") && strings.Contains(line, name) {
+					t.Errorf("%s is reported with ::warning:\n  %s\nA missing secret is a "+
+						"configuration error and must fail the preflight; warnings fail "+
+						"nothing, which is exactly how this survived four releases",
+						name, strings.TrimSpace(line))
+				}
+			}
+		})
+	}
+
+	// 4. The preflight must have a failure path at all.
+	if !strings.Contains(pre, "exit 1") {
+		t.Error("the preflight cannot fail — it has no exit 1, so it reports problems it " +
+			"then allows to proceed")
+	}
+}
+
 // --- #14: the vulnerability gate must be able to fail --------------
 
 // TestGovulncheckGateFailsClosed asserts the STRUCTURE that makes the

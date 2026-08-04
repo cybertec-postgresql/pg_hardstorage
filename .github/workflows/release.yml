@@ -87,25 +87,37 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          ALLOW_MISSING_TAP_TOKEN: ${{ vars.ALLOW_MISSING_TAP_TOKEN }}
         run: |
           set -u
           if [ -z "${GITHUB_TOKEN:-}" ]; then
             echo "::error title=Missing secret::GITHUB_TOKEN is empty; nothing can be published."
             exit 1
           fi
-          if [ -z "${HOMEBREW_TAP_TOKEN:-}" ]; then
-            echo "::warning title=Empty HOMEBREW_TAP_TOKEN::the Homebrew cask will NOT be published (goreleaser will 401 at its cask step). Artifacts, signatures and SLSA provenance are unaffected. Set the secret at repo level with: gh secret set HOMEBREW_TAP_TOKEN --repo ${{ github.repository }}"
+          # These are ERRORS, not warnings, and they run before anything
+          # is built. HOMEBREW_TAP_TOKEN turned out never to have been
+          # set at all: goreleaser sent an empty credential, GitHub
+          # answered "401 Bad credentials", and that reads like a scope
+          # problem — so four releases were spent looking at token
+          # permissions for a secret that did not exist. A warning was
+          # what let it survive: warnings fail nothing, and the run went
+          # red 6m46s later for a reason that named the wrong cause.
+          if [ "${ALLOW_MISSING_TAP_TOKEN:-}" = "true" ]; then
+            echo "::warning title=Cask publishing disabled::repo variable ALLOW_MISSING_TAP_TOKEN=true, so the tap credential is not checked and this release will publish WITHOUT a Homebrew cask."
+          elif [ -z "${HOMEBREW_TAP_TOKEN:-}" ]; then
+            echo "::error title=Missing secret::HOMEBREW_TAP_TOKEN is not set, so the Homebrew cask cannot be published. Set it with: gh secret set HOMEBREW_TAP_TOKEN --repo ${{ github.repository }} — it needs contents:write on ${{ github.repository_owner }}/homebrew-tap. To cut a release deliberately without a cask, set the repo variable ALLOW_MISSING_TAP_TOKEN=true."
+            exit 1
           else
-            # Confirm the token can actually reach the tap repo — the
-            # 401 is a VALUE problem, so only a live call proves it.
+            # Presence is not enough: the 401 is a VALUE problem, so
+            # only a live call against the tap proves the credential.
             code=$(curl -sS -o /dev/null -w '%{http_code}' \
               -H "Authorization: Bearer $HOMEBREW_TAP_TOKEN" \
               "https://api.github.com/repos/${{ github.repository_owner }}/homebrew-tap" || echo 000)
             if [ "$code" != "200" ]; then
-              echo "::warning title=HOMEBREW_TAP_TOKEN cannot reach the tap::GET /repos/${{ github.repository_owner }}/homebrew-tap returned $code. The cask push will fail; everything else is unaffected."
-            else
-              echo "HOMEBREW_TAP_TOKEN reaches the tap (200)."
+              echo "::error title=Tap credential rejected::GET /repos/${{ github.repository_owner }}/homebrew-tap returned $code, so goreleaser's cask push will fail the same way at the END of the release. Re-issue the token with contents:write on the tap, or set the repo variable ALLOW_MISSING_TAP_TOKEN=true to release without a cask."
+              exit 1
             fi
+            echo "HOMEBREW_TAP_TOKEN reaches the tap (200)."
           fi
 
       - name: goreleaser
