@@ -3,6 +3,7 @@ package backup
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -15,10 +16,11 @@ import (
 // its Delete — then destroyed A's fresh lease and created its own, so
 // BOTH returned held and two backups of the same deployment ran.
 //
-// The rewrite (recheck → overwrite-in-place → settle-verify) must yield
-// exactly ONE holder for this exact interleaving. The hook gates B at
-// the point corresponding to the old exploit: after its stale recheck,
-// before its write.
+// The current design (recheck → atomic break claim → overwrite →
+// settle-verify) must yield exactly ONE holder for this interleaving,
+// and must do so no matter how long the loser stalls. The hook gates B
+// at the point corresponding to the old exploit: after its stale
+// recheck, before it claims the break.
 func TestLease_StaleReclaimRace_SingleWinner(t *testing.T) {
 	sp := newLeaseSP(t)
 	clk := newClock()
@@ -34,99 +36,84 @@ func TestLease_StaleReclaimRace_SingleWinner(t *testing.T) {
 	_ = stale
 	clk.advance(5 * time.Minute) // lapse it
 
-	// The interleaving is driven by the hooks, not by sleeps.
+	// This is the interleaving that used to produce TWO holders, staged
+	// deterministically and at its worst: B is released only after A has
+	// completely finished — written, settled, verified and returned.
 	//
-	// It used to be staged with time.Sleep(100ms) to let B reach its
-	// park point and time.Sleep(20ms) to release B "while A is
-	// mid-flight". Both were bets, and the second one is the one that
-	// matters: the design guarantees a single winner when the competing
-	// writes overlap INSIDE the settle window, and mitigates — rather
-	// than prevents — a write that lands after it (see the residual
-	// window documented in AcquireBackupLease). When a loaded runner
-	// stretched that 20ms past the 50ms settle, B wrote after A had
-	// already verified, both legitimately held, and the test reported a
-	// mutual-exclusion violation. It was reporting the documented
-	// residual window, not a regression — but indistinguishably from
-	// one, which is the worst way for a test to fail.
+	// The old design could not survive it. Its break was
+	// recheck → overwrite → settle-verify with nothing atomic in it, so
+	// a reclaimer stalled past `settle` wrote on top of a winner that
+	// had already verified, and both reported the lease held. `settle`
+	// made that unlikely, not impossible; a loaded CI runner hit it.
 	//
-	// Sequencing it causally pins the property the design actually
-	// claims:
-	//
-	//   1. The first reclaimer to reach the stale recheck PARKS there,
-	//      before its write.
-	//   2. The other one runs on, writes, and parks after ITS write —
-	//      inside its own settle window.
-	//   3. That one releases the parked reclaimer and waits for its
-	//      write to land.
-	//   4. Both settle-verify. Last writer wins; the other must lose.
-	//
-	// Roles are decided by whoever arrives first, not by name, and the
-	// assertions below are symmetric — the property is "exactly one
-	// holder", not "B specifically". The parked reclaimer cannot reach
-	// the after-put hook before the running one, because it is held at
-	// the earlier hook, so "first through after-put" is deterministic
-	// without a second counter.
-	parked := make(chan struct{})    // released once the runner has written
-	lateWrote := make(chan struct{}) // closed once the parked one has written
-	var recheckOnce, putOnce sync.Once
+	// The break claim makes the stall irrelevant. B must win an atomic
+	// create keyed to the lease it is breaking, and A took that key on
+	// its way past this point — so B can be arbitrarily late and still
+	// cannot write. Nothing here is timing-dependent, which is the
+	// property being asserted.
+	parkedAt := make(chan struct{}) // B has reached the park point
+	release := make(chan struct{})  // B may proceed
+	var once sync.Once
 
-	// Bounded so a structural change — one reclaimer no longer reaching
-	// the stale path at all — fails here by name instead of blocking
-	// until the package timeout and taking every later test with it.
+	// Bounded: a structural change that stops a reclaimer reaching the
+	// stale path should fail by name here, not block the package.
 	const handoff = 30 * time.Second
 	waitFor := func(ch <-chan struct{}, what string) {
+		t.Helper()
 		select {
 		case <-ch:
 		case <-time.After(handoff):
-			t.Errorf("timed out after %s waiting for %s; both reclaimers must reach the "+
-				"stale-retake path for this interleaving to exist", handoff, what)
+			t.Fatalf("timed out after %s waiting for %s", handoff, what)
 		}
 	}
 
 	leaseHookAfterStaleRecheck = func() {
-		isParked := false
-		recheckOnce.Do(func() { isParked = true })
-		if isParked {
-			waitFor(parked, "the other reclaimer's write")
+		isFirst := false
+		once.Do(func() { isFirst = true })
+		if isFirst {
+			close(parkedAt)
+			<-release
 		}
 	}
-	leaseHookAfterStalePut = func() {
-		isRunner := false
-		putOnce.Do(func() { isRunner = true })
-		if isRunner {
-			close(parked) // let the other write, still inside this settle window
-			waitFor(lateWrote, "the parked reclaimer's write")
-			return
-		}
-		close(lateWrote)
-	}
-	defer func() {
-		leaseHookAfterStaleRecheck = nil
-		leaseHookAfterStalePut = nil
-	}()
+	defer func() { leaseHookAfterStaleRecheck = nil }()
 
 	type res struct {
 		l   *Lease
 		err error
 	}
-	bCh := make(chan res, 1)
-	go func() {
-		l, err := AcquireBackupLease(ctx, sp, "db1", LeaseOptions{
-			Owner: "B", TTL: time.Minute, now: clk.now, settle: 50 * time.Millisecond,
-		})
-		bCh <- res{l, err}
-	}()
+	acquire := func(owner string) <-chan res {
+		ch := make(chan res, 1)
+		go func() {
+			l, err := AcquireBackupLease(ctx, sp, "db1", LeaseOptions{
+				Owner: owner, TTL: time.Minute, now: clk.now, settle: 50 * time.Millisecond,
+			})
+			ch <- res{l, err}
+		}()
+		return ch
+	}
 
-	aCh := make(chan res, 1)
-	go func() {
-		l, err := AcquireBackupLease(ctx, sp, "db1", LeaseOptions{
-			Owner: "A", TTL: time.Minute, now: clk.now, settle: 50 * time.Millisecond,
-		})
-		aCh <- res{l, err}
-	}()
+	// B first, and we WAIT for it to park rather than sleeping — that is
+	// what makes B, not A, the stalled reclaimer.
+	bCh := acquire("B")
+	waitFor(parkedAt, "B to reach the stale recheck")
 
-	a := <-aCh
-	b := <-bCh
+	// A now runs the whole break uncontended and returns.
+	aCh := acquire("A")
+	var a res
+	select {
+	case a = <-aCh:
+	case <-time.After(handoff):
+		t.Fatalf("A did not finish within %s", handoff)
+	}
+
+	// Only now is B let go: as late as it gets.
+	close(release)
+	var b res
+	select {
+	case b = <-bCh:
+	case <-time.After(handoff):
+		t.Fatalf("B did not finish within %s", handoff)
+	}
 
 	aHeld := a.err == nil
 	bHeld := b.err == nil
@@ -211,5 +198,87 @@ func TestLease_RenewCannotClobberReclaimer(t *testing.T) {
 	}
 	if renewErr != nil && !errors.Is(renewErr, ErrLeaseLost) {
 		t.Errorf("renew error = %v, want ErrLeaseLost", renewErr)
+	}
+}
+
+// TestLease_RepeatedBreaksEachGetTheirOwnClaim guards the obvious way
+// to break the fix: keying the break claim on something that does not
+// vary per lease.
+//
+// Each break must claim a DIFFERENT key, because each breaks a
+// different lease. Key it on the deployment alone — the tempting
+// simplification — and the first crash makes a deployment permanently
+// unreclaimable: every later reclaimer finds the claim present and
+// reports another backup in progress, forever, with no backup running.
+func TestLease_RepeatedBreaksEachGetTheirOwnClaim(t *testing.T) {
+	sp := newLeaseSP(t)
+	clk := newClock()
+	ctx := context.Background()
+
+	// Three successive crashed holders, each reclaimed by the next.
+	for i, owner := range []string{"crashed-1", "crashed-2", "crashed-3"} {
+		if _, err := AcquireBackupLease(ctx, sp, "db1", LeaseOptions{
+			Owner: owner, TTL: time.Minute, now: clk.now, settle: 10 * time.Millisecond,
+		}); err != nil {
+			t.Fatalf("acquire %d (%s): %v\nA lapsed lease must stay reclaimable; if the "+
+				"break claim is not scoped to the lease it breaks, the first crash locks "+
+				"the deployment out permanently", i, owner, err)
+		}
+		clk.advance(5 * time.Minute) // holder dies, lease lapses
+	}
+}
+
+// TestLease_BreakClaimIsNotMistakenForALease pins the boundary with
+// `repo gc`, which lists leases/ to find live leases and refuses to
+// sweep while any exist.
+//
+// Break claims live under that same prefix. If one were ever counted
+// as a live lease, gc would refuse to sweep the repository from the
+// first crash onwards — silently, since a refusal looks like a
+// correctly-detected in-flight backup.
+func TestLease_BreakClaimIsNotMistakenForALease(t *testing.T) {
+	sp := newLeaseSP(t)
+	clk := newClock()
+	ctx := context.Background()
+
+	// Crash a holder and reclaim, so a break claim exists on disk.
+	if _, err := AcquireBackupLease(ctx, sp, "db1", LeaseOptions{
+		Owner: "crashed", TTL: time.Minute, now: clk.now, settle: 10 * time.Millisecond,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	clk.advance(5 * time.Minute)
+	l, err := AcquireBackupLease(ctx, sp, "db1", LeaseOptions{
+		Owner: "reclaimer", TTL: time.Minute, now: clk.now, settle: 10 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("reclaim: %v", err)
+	}
+	if err := l.Release(ctx); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+
+	// The lease is gone; only the claim remains.
+	var leases, claims int
+	for info, lerr := range sp.List(ctx, "leases/") {
+		if lerr != nil {
+			t.Fatal(lerr)
+		}
+		switch {
+		case strings.HasSuffix(info.Key, "/backup.json"):
+			leases++
+		default:
+			claims++
+		}
+	}
+	if leases != 0 {
+		t.Errorf("Release left %d lease object(s) behind", leases)
+	}
+	if claims == 0 {
+		t.Fatal("no break claim was written; the break was not made exclusive")
+	}
+	// The suffix gc filters on must not match a claim.
+	if claims > 0 && leases > 0 {
+		t.Errorf("a break claim is indistinguishable from a lease to a /backup.json filter")
 	}
 }

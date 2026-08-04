@@ -18,12 +18,21 @@
 // manifest / chunk / WAL / audit namespaces so no GC or listing pass
 // ever trips on it:
 //
-//	leases/<deployment>/backup.json
+//	leases/<deployment>/backup.json          the lease itself
+//	leases/<deployment>/breaks/<token>.json  break claims (see below)
+//
+// Breaking a lapsed lease is mutually exclusive through the same
+// atomic create: a reclaimer must first CREATE a claim object named
+// after the lease it intends to break, so of all the reclaimers that
+// judged one lease stale, exactly one may act on that judgement — no
+// matter how their reads and writes interleave.
 package backup
 
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -66,6 +75,24 @@ func backupLeaseKey(deployment string) string {
 	return "leases/" + deployment + "/backup.json"
 }
 
+// breakClaimKey names the object a reclaimer must atomically CREATE
+// before it may overwrite a stale lease.
+//
+// The key is derived from the identity of the lease being broken
+// (Owner + AcquiredAt — the same fencing token Renew and Release use),
+// so every reclaimer that observed the SAME stale lease competes for
+// the SAME key. Create-if-absent is atomic, so exactly one of them can
+// win it, no matter how their reads and writes interleave or how long
+// any of them stalls.
+//
+// It lives under its own sub-prefix so listing the lease itself is
+// unaffected.
+func breakClaimKey(deployment string, victim leaseBody) string {
+	h := sha256.Sum256([]byte(victim.Owner + "\x00" +
+		victim.AcquiredAt.UTC().Format(time.RFC3339Nano)))
+	return "leases/" + deployment + "/breaks/" + hex.EncodeToString(h[:8]) + ".json"
+}
+
 // leaseBody is the persisted lease document.  Owner+AcquiredAt form
 // the fencing token: Renew/Release act only while the stored token
 // still matches the one we wrote.
@@ -102,7 +129,6 @@ type LeaseOptions struct {
 // tests.  Always nil in production.
 var (
 	leaseHookAfterStaleRecheck func() // between the stale recheck and the overwrite
-	leaseHookAfterStalePut     func() // between the overwrite and the settle-verify
 	leaseHookBeforeRenewPut    func() // between Renew's expiry check and its put
 )
 
@@ -214,17 +240,37 @@ func AcquireBackupLease(ctx context.Context, sp storage.StoragePlugin, deploymen
 	//     changed in any way sends us to ErrBackupInProgress instead.
 	//  2. OVERWRITE in place (no delete): concurrent reclaimers can only
 	//     overwrite each other; nobody can destroy a winner's lease.
+	//  2b. BREAK CLAIM: atomically create an object named after the
+	//     lease being broken. Every reclaimer that saw this same stale
+	//     lease races for this same key, and create-if-absent admits
+	//     exactly one of them. This is what makes the break mutually
+	//     exclusive; it does not depend on how the reclaimers'
+	//     reads and writes interleave, or on any of them being prompt.
 	//  3. SETTLE-VERIFY: wait `settle`, re-read, and only return held if
-	//     the stored fencing token is OURS. Competing reclaimers whose
-	//     writes land within the settle window are detected here — the
-	//     LAST writer wins, everyone else gets ErrBackupInProgress.
+	//     the stored fencing token is OURS. With the claim in place no
+	//     other RECLAIMER can be writing, so this now guards only
+	//     against a stalled holder's Renew landing on top of us — the
+	//     case TestLease_RenewCannotClobberReclaimer covers.
 	//
-	// Residual window: a reclaimer that stalls longer than `settle`
-	// between its recheck (step 1) and write (step 2) can still clobber a
-	// winner that has already settle-verified. That requires a multi-
-	// hundred-ms stall between adjacent statements; if it ever happens,
-	// the loser's next Renew fences on the stored token and the runner
-	// aborts on ErrLeaseLost, bounding the overlap to one renew interval.
+	// This previously had a residual window: the sequence was
+	// recheck → overwrite → settle-verify, with nothing atomic in it, so
+	// a reclaimer that stalled longer than `settle` between its recheck
+	// and its write could clobber a winner that had already verified,
+	// and BOTH would report the lease held. Two backups of one
+	// deployment would then run. `settle` made that unlikely rather than
+	// impossible, and the stale-reclaim race test hit it on a loaded CI
+	// runner — reporting a mutual-exclusion violation that was real.
+	//
+	// The break claim closes it. A stalled reclaimer's write can no
+	// longer land at all: it must win the claim first, and the claim was
+	// taken the moment the winner passed this point.
+	//
+	// Claims are never deleted. Removing one would let a reclaimer still
+	// holding that stale token re-win it and overwrite a live lease —
+	// exactly the window being closed. They are only written when a
+	// crashed holder is reclaimed (a released lease leaves none), and
+	// each is a few hundred bytes, so the accumulation is proportional
+	// to crashes rather than to backups.
 	recheck, rcerr := l.read(ctx)
 	if rcerr != nil {
 		if errors.Is(rcerr, storage.ErrNotFound) {
@@ -249,15 +295,13 @@ func AcquireBackupLease(ctx context.Context, sp storage.StoragePlugin, deploymen
 	if leaseHookAfterStaleRecheck != nil {
 		leaseHookAfterStaleRecheck()
 	}
+	// Win the right to break THIS lease before touching it.
+	if err := l.claimBreak(ctx, recheck, owner); err != nil {
+		return nil, err
+	}
 	body = l.freshBody(owner)
 	if err := l.put(ctx, body, false); err != nil {
 		return nil, fmt.Errorf("backup: retake stale lease for %q: %w", deployment, err)
-	}
-	// Test seam: lets a test land a competing write INSIDE this
-	// reclaimer's settle window deterministically, instead of timing
-	// the two goroutines with sleeps and hoping.
-	if leaseHookAfterStalePut != nil {
-		leaseHookAfterStalePut()
 	}
 	if err := l.settleVerify(ctx, body); err != nil {
 		return nil, err
@@ -410,6 +454,49 @@ func (l *Lease) Maintain(ctx context.Context, onError func(error)) {
 				}
 			}
 		}
+	}
+}
+
+// breakClaim records who broke which lease. Written once, never
+// rewritten; the object's EXISTENCE is the lock, the body is for a
+// human reading the repo afterwards.
+type breakClaim struct {
+	Schema      string    `json:"schema"`
+	Deployment  string    `json:"deployment"`
+	BrokenOwner string    `json:"broken_owner"`
+	BrokenAt    time.Time `json:"broken_acquired_at"`
+	Breaker     string    `json:"breaker"`
+	ClaimedAt   time.Time `json:"claimed_at"`
+}
+
+// claimBreak takes the exclusive right to break `victim`.
+//
+// Returns ErrBackupInProgress when another reclaimer already holds the
+// claim — it is breaking, or has broken, this same lease, so we must
+// not. Any other error is reported as-is: failing to establish
+// exclusivity must never be read as having established it.
+func (l *Lease) claimBreak(ctx context.Context, victim leaseBody, owner string) error {
+	enc, err := json.Marshal(&breakClaim{
+		Schema:      LeaseSchema,
+		Deployment:  l.deployment,
+		BrokenOwner: victim.Owner,
+		BrokenAt:    victim.AcquiredAt.UTC(),
+		Breaker:     owner,
+		ClaimedAt:   l.now().UTC(),
+	})
+	if err != nil {
+		return fmt.Errorf("backup: encode break claim for %q: %w", l.deployment, err)
+	}
+	_, err = l.sp.Put(ctx, breakClaimKey(l.deployment, victim), bytes.NewReader(enc),
+		storage.PutOptions{ContentLength: int64(len(enc)), IfNotExists: true})
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, storage.ErrAlreadyExists):
+		// Someone else is already breaking this exact lease.
+		return ErrBackupInProgress
+	default:
+		return fmt.Errorf("backup: claim break of stale lease for %q: %w", l.deployment, err)
 	}
 }
 
