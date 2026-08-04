@@ -11,6 +11,74 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ## [Unreleased]
 
+## [1.1.1] — 2026-08-04
+
+### Changed — action may be required
+
+- **A backup now refuses to start when the repository backend cannot
+  enforce the backup lease.** The lease is built on an atomic
+  create-if-absent; a backend that only emulates one (stat, then write)
+  lets two runners pass the check together and both proceed, so the
+  lease is written, looks correct in the repo and to `repo gc`, and
+  excludes nothing.
+
+  In practice this is **SFTP against a server that does not advertise
+  `hardlink@openssh.com`** — every other backend (`file://`, S3, GCS,
+  Azure, `scp://`) advertises a native or `link(2)`-based conditional
+  create and is unaffected. Affected setups now fail at acquire with
+  `backup: repository backend cannot enforce the backup lease`, naming
+  the backend and the extension.
+
+  Move to an SFTP server that offers the extension, or to another
+  backend. `LeaseOptions.AllowUnenforceable` overrides it for the case
+  where exactly one runner can possibly exist — a library option, not a
+  flag, matching how unenforceable WORM is handled.
+
+- **A backup refuses to deduplicate against a chunk its own data key
+  cannot read.** Chunk keys are global to a repository but the shared
+  DEK is per-`kek_ref`, so a deployment pointed at a new `kek_ref`
+  without a rotation used to commit a manifest referencing chunks it
+  could not decrypt — a backup that succeeded and then failed at
+  restore. It now stops with `does not decrypt with this backup's data
+  key` and points at `kms rotate`.
+
+### Fixed
+
+- **Two backups of one deployment could run concurrently.** Breaking a
+  lapsed lease was a recheck, an overwrite and a timed read-back, with
+  nothing atomic in it: a reclaimer that stalled longer than the settle
+  window overwrote a winner that had already verified, and both
+  reported the lease held. Breaking now requires winning an atomic
+  claim keyed to the lease being broken, so a stalled reclaimer cannot
+  write at all. Reachable on every backend, not only in theory.
+- `gcs`: a Put whose body failed mid-stream committed the truncated
+  object instead of aborting it.
+- `wal stream --once` could block indefinitely instead of honouring a
+  caller-supplied deadline: `cli.Run` discarded any context set by its
+  caller rather than deriving its signal context from it.
+- KMS provider configuration was not resolved in two remaining unwrap
+  paths, so a cloud-KMS deployment could fail to restore or verify.
+
+### Added
+
+- `leases/<deployment>/breaks/<token>.json` — break claims, written
+  only when a crashed holder's lease is reclaimed. They accumulate with
+  crashes rather than with backups, are a few hundred bytes each, and
+  are deliberately never deleted: removing one would let a reclaimer
+  still holding that stale token overwrite a live lease. `repo gc`
+  ignores them.
+
+### Internal
+
+- Substantial test additions across the lease (now exercised against
+  every real backend, not only `file://`), the cross-KEK dedup guard,
+  storage capability honesty, SSH credential precedence, config
+  round-tripping, the agent's KMS plumbing and the CLI coverage gate;
+  plus fixes to test infrastructure that was itself unsound — a shared
+  container image tag that raced between packages, host keys pinned by
+  port rather than by container, and several tests whose stop condition
+  was a wall-clock sleep rather than the thing they were waiting for.
+
 ## [1.1.0] — 2026-08-02
 
 A minor bump rather than a patch: this release **adds configuration
