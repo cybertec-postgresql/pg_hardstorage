@@ -78,16 +78,48 @@ func runWalStreamBounded(t *testing.T, root *cobra.Command, budget time.Duration
 	t.Helper()
 	done := make(chan int, 1)
 	go func() { done <- cli.Run(root) }()
-	select {
-	case exit := <-done:
+	exit, returned := awaitBounded(done, budget)
+	switch {
+	case returned:
 		return exit
-	case <-time.After(budget):
+	default:
 		t.Fatalf("`wal stream` did not return within %s — it was still waiting for the "+
 			"segment that ends a --once run. Unbounded, it would block until the package "+
 			"timeout and take every test after it down with it. Check the preceding "+
 			"`driving WAL failed` error: if the side connection that produces WAL never "+
 			"came up, no segment could ever commit.", budget)
 		return -1
+	}
+}
+
+// awaitBounded waits for done to deliver an exit code, or for budget
+// to elapse. It reports (exit, true) when the command returned and
+// (0, false) on timeout.
+//
+// Split out from runWalStreamBounded so the decision itself can be
+// tested. Inline, the timeout arm ends in t.Fatalf, and a helper whose
+// only failure path aborts the test cannot be exercised by one — which
+// is how a bound protecting several hundred tests would end up being
+// the only thing in the package with no coverage.
+func awaitBounded(done <-chan int, budget time.Duration) (int, bool) {
+	timer := time.NewTimer(budget)
+	defer timer.Stop()
+	select {
+	case exit := <-done:
+		return exit, true
+	case <-timer.C:
+		// A select picks at random among cases that are BOTH ready, so
+		// a command finishing just as the budget expires can lose the
+		// draw. Check once more before reporting a stall: "did not
+		// return within 3m" about a command that returned is the most
+		// misleading thing this helper could say, because it sends the
+		// reader looking for a hang that never happened.
+		select {
+		case exit := <-done:
+			return exit, true
+		default:
+			return 0, false
+		}
 	}
 }
 

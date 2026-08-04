@@ -201,6 +201,40 @@ chmod 600 /home/` + sshExecUser + `/.ssh/authorized_keys
 exec /usr/sbin/sshd -D -e
 `
 
+// sshExecDockerfile is the image definition. It is a function rather
+// than a constant so a test can hash it without invoking docker.
+//
+// `passwd -u` matters: Alpine's `adduser -D` leaves the account with a
+// locked password, and OpenSSH refuses a locked account even for
+// publickey auth ("User ... not allowed because account is locked").
+// Without it every connection fails at auth.
+func sshExecDockerfile() string {
+	return "FROM " + SinkImages["ssh-exec"] + "\n" +
+		"RUN apk add --no-cache openssh-server coreutils findutils && \\\n" +
+		"    ssh-keygen -A && \\\n" +
+		"    adduser -D -s /bin/sh " + sshExecUser + " && passwd -u " + sshExecUser + "\n" +
+		"RUN mkdir -p /home/" + sshExecUser + "/.ssh " + sshExecRoot + " && \\\n" +
+		"    chown -R " + sshExecUser + " /home/" + sshExecUser + " " + sshExecRoot + " && \\\n" +
+		"    chmod 700 /home/" + sshExecUser + "/.ssh\n" +
+		"COPY entrypoint.sh /usr/local/bin/entrypoint.sh\n" +
+		"EXPOSE 22\n" +
+		`CMD ["/bin/sh","/usr/local/bin/entrypoint.sh"]` + "\n"
+}
+
+// sshExecImageTag derives the image tag from the content that defines
+// the image. This is what makes concurrent builds safe: instances that
+// would produce identical images converge on one tag, so no instance
+// can re-point a tag another is about to run.
+//
+// Both inputs are hashed. The entrypoint is a separate file in the
+// build context, so a change to it does not alter the Dockerfile text
+// — hash only the Dockerfile and an entrypoint edit would silently
+// reuse the previous image.
+func sshExecImageTag(dockerfile, entrypoint string) string {
+	sum := sha256.Sum256([]byte(dockerfile + "\x00" + entrypoint))
+	return "pg-hardstorage-testkit-sshexec:" + hex.EncodeToString(sum[:6])
+}
+
 // buildImage builds the key-free sshd image and returns the tag it was
 // built under. The tag embeds a hash of the Dockerfile, so every
 // instance that would produce identical content converges on one tag
@@ -214,26 +248,12 @@ func (s *sshExecRuntime) buildImage(ctx context.Context, dir string) (string, er
 		[]byte(sshExecEntrypoint), 0o755); err != nil {
 		return "", fmt.Errorf("ssh-exec sink: write entrypoint: %w", err)
 	}
-	// `passwd -u` matters: Alpine's `adduser -D` leaves the account
-	// with a locked password, and OpenSSH refuses a locked account
-	// even for publickey auth ("User ... not allowed because account
-	// is locked"). Without it every connection fails at auth.
-	dockerfile := "FROM " + SinkImages["ssh-exec"] + "\n" +
-		"RUN apk add --no-cache openssh-server coreutils findutils && \\\n" +
-		"    ssh-keygen -A && \\\n" +
-		"    adduser -D -s /bin/sh " + sshExecUser + " && passwd -u " + sshExecUser + "\n" +
-		"RUN mkdir -p /home/" + sshExecUser + "/.ssh " + sshExecRoot + " && \\\n" +
-		"    chown -R " + sshExecUser + " /home/" + sshExecUser + " " + sshExecRoot + " && \\\n" +
-		"    chmod 700 /home/" + sshExecUser + "/.ssh\n" +
-		"COPY entrypoint.sh /usr/local/bin/entrypoint.sh\n" +
-		"EXPOSE 22\n" +
-		`CMD ["/bin/sh","/usr/local/bin/entrypoint.sh"]` + "\n"
+	dockerfile := sshExecDockerfile()
 	if err := os.WriteFile(filepath.Join(bctx, "Dockerfile"), []byte(dockerfile), 0o644); err != nil {
 		return "", fmt.Errorf("ssh-exec sink: write Dockerfile: %w", err)
 	}
 
-	sum := sha256.Sum256([]byte(dockerfile + "\x00" + sshExecEntrypoint))
-	tag := "pg-hardstorage-testkit-sshexec:" + hex.EncodeToString(sum[:6])
+	tag := sshExecImageTag(dockerfile, sshExecEntrypoint)
 
 	out, err := exec.CommandContext(ctx, "docker", "build", "-q",
 		"-t", tag, bctx).CombinedOutput()
