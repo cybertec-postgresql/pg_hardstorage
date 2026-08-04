@@ -263,23 +263,52 @@ func (s *sshExecRuntime) buildImage(ctx context.Context, dir string) (string, er
 	return tag, nil
 }
 
+// writeKnownHosts pins the host keys of THIS container.
+//
+// It asks the container directly rather than running ssh-keyscan
+// against 127.0.0.1:port, because the port is not a stable identity
+// here. pickFreePort closes its probe listener before docker binds, so
+// the port is briefly claimable by anything else, and a suite that
+// starts and stops containers recycles ports constantly. A scan that
+// captured a NEIGHBOUR's host key produced "knownhosts: key mismatch"
+// at connect time — reported against the scp plugin, since by then the
+// fixture had already declared itself ready.
+//
+// `docker exec <container>` names the container, so the keys can only
+// be the ones this instance will present.
+//
+// Every host key is recorded, not just ed25519: which type is
+// negotiated depends on the client's preferences and the OpenSSH
+// build, and a known_hosts holding only one type fails whenever the
+// other is chosen.
 func (s *sshExecRuntime) writeKnownHosts(ctx context.Context, total time.Duration) error {
 	deadline := time.Now().Add(total)
 	for {
-		out, err := exec.CommandContext(ctx, "ssh-keyscan",
-			"-p", fmt.Sprint(s.port), "127.0.0.1").Output()
-		if err == nil && len(strings.TrimSpace(string(out))) > 0 {
-			kh := filepath.Join(s.dir, "known_hosts")
-			if werr := os.WriteFile(kh, out, 0o600); werr != nil {
-				return fmt.Errorf("ssh-exec sink: write known_hosts: %w", werr)
+		out, err := exec.CommandContext(ctx, "docker", "exec", s.container,
+			"sh", "-c", "cat /etc/ssh/ssh_host_*_key.pub").Output()
+		if err == nil {
+			var b strings.Builder
+			for _, line := range strings.Split(string(out), "\n") {
+				f := strings.Fields(line)
+				if len(f) < 2 {
+					continue
+				}
+				// known_hosts addresses a non-default port as [host]:port.
+				fmt.Fprintf(&b, "[127.0.0.1]:%d %s %s\n", s.port, f[0], f[1])
 			}
-			s.knownHosts = kh
-			return nil
+			if b.Len() > 0 {
+				kh := filepath.Join(s.dir, "known_hosts")
+				if werr := os.WriteFile(kh, []byte(b.String()), 0o600); werr != nil {
+					return fmt.Errorf("ssh-exec sink: write known_hosts: %w", werr)
+				}
+				s.knownHosts = kh
+				return nil
+			}
 		}
 		if time.Now().After(deadline) {
 			logs, _ := exec.Command("docker", "logs", s.container).CombinedOutput()
-			return fmt.Errorf("ssh-exec sink: sshd not answering SSH within %s; logs: %s",
-				total, truncate(logs, 400))
+			return fmt.Errorf("ssh-exec sink: could not read host keys from %s within %s; "+
+				"logs: %s", s.container, total, truncate(logs, 400))
 		}
 		select {
 		case <-ctx.Done():
