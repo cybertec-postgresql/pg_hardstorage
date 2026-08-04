@@ -102,6 +102,7 @@ type LeaseOptions struct {
 // tests.  Always nil in production.
 var (
 	leaseHookAfterStaleRecheck func() // between the stale recheck and the overwrite
+	leaseHookAfterStalePut     func() // between the overwrite and the settle-verify
 	leaseHookBeforeRenewPut    func() // between Renew's expiry check and its put
 )
 
@@ -251,6 +252,12 @@ func AcquireBackupLease(ctx context.Context, sp storage.StoragePlugin, deploymen
 	body = l.freshBody(owner)
 	if err := l.put(ctx, body, false); err != nil {
 		return nil, fmt.Errorf("backup: retake stale lease for %q: %w", deployment, err)
+	}
+	// Test seam: lets a test land a competing write INSIDE this
+	// reclaimer's settle window deterministically, instead of timing
+	// the two goroutines with sleeps and hoping.
+	if leaseHookAfterStalePut != nil {
+		leaseHookAfterStalePut()
 	}
 	if err := l.settleVerify(ctx, body); err != nil {
 		return nil, err

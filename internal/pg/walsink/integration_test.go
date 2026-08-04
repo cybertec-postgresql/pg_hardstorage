@@ -157,9 +157,27 @@ func TestIntegration_Walsink_CommitsSegmentFromRealWAL(t *testing.T) {
 			nil, nil, nil, nil).Read()
 		_ = c.PgConn().ExecParams(ctx, "CHECKPOINT", nil, nil, nil, nil).Read()
 		_ = c.PgConn().ExecParams(ctx, "SELECT pg_switch_wal()", nil, nil, nil, nil).Read()
-		// Wait so segments have time to commit through the sink, then
-		// cancel to terminate Stream cleanly.
-		time.Sleep(8 * time.Second)
+		// Cancel once the sink has actually committed a segment —
+		// the condition every assertion below depends on — rather than
+		// after a fixed sleep.
+		//
+		// The sleep was a bet that 8 seconds is long enough for a
+		// segment to commit AND shorter than every other timeout in
+		// play. On a loaded runner it lost: Stream ended on its own
+		// inactivity watchdog and the test reported "expected
+		// context.Canceled; got inactivity timeout (after 5m0s)",
+		// which points at the streaming code for what was a slow
+		// disk. Waiting on the condition is both faster in the normal
+		// case and immune to that.
+		//
+		// The bound matters as much as the condition. If no segment
+		// ever commits we still cancel, so the failure below is the
+		// honest one — SyncedLSN never advanced — instead of Stream
+		// dying on a watchdog and hiding it.
+		deadline := time.Now().Add(2 * time.Minute)
+		for uint64(sink.SyncedLSN()) < walsink.SegmentSize && time.Now().Before(deadline) {
+			time.Sleep(100 * time.Millisecond)
+		}
 		cancel()
 	}()
 

@@ -34,22 +34,76 @@ func TestLease_StaleReclaimRace_SingleWinner(t *testing.T) {
 	_ = stale
 	clk.advance(5 * time.Minute) // lapse it
 
-	// Gate: the FIRST reclaimer through the hook parks until released;
-	// the second passes straight through. This forces: B (parked after
-	// recheck) … A writes + settle-verifies … B writes late.
-	var mu sync.Mutex
-	first := true
-	park := make(chan struct{})
-	leaseHookAfterStaleRecheck = func() {
-		mu.Lock()
-		wasFirst := first
-		first = false
-		mu.Unlock()
-		if wasFirst {
-			<-park // B parks here; A runs its full break meanwhile
+	// The interleaving is driven by the hooks, not by sleeps.
+	//
+	// It used to be staged with time.Sleep(100ms) to let B reach its
+	// park point and time.Sleep(20ms) to release B "while A is
+	// mid-flight". Both were bets, and the second one is the one that
+	// matters: the design guarantees a single winner when the competing
+	// writes overlap INSIDE the settle window, and mitigates — rather
+	// than prevents — a write that lands after it (see the residual
+	// window documented in AcquireBackupLease). When a loaded runner
+	// stretched that 20ms past the 50ms settle, B wrote after A had
+	// already verified, both legitimately held, and the test reported a
+	// mutual-exclusion violation. It was reporting the documented
+	// residual window, not a regression — but indistinguishably from
+	// one, which is the worst way for a test to fail.
+	//
+	// Sequencing it causally pins the property the design actually
+	// claims:
+	//
+	//   1. The first reclaimer to reach the stale recheck PARKS there,
+	//      before its write.
+	//   2. The other one runs on, writes, and parks after ITS write —
+	//      inside its own settle window.
+	//   3. That one releases the parked reclaimer and waits for its
+	//      write to land.
+	//   4. Both settle-verify. Last writer wins; the other must lose.
+	//
+	// Roles are decided by whoever arrives first, not by name, and the
+	// assertions below are symmetric — the property is "exactly one
+	// holder", not "B specifically". The parked reclaimer cannot reach
+	// the after-put hook before the running one, because it is held at
+	// the earlier hook, so "first through after-put" is deterministic
+	// without a second counter.
+	parked := make(chan struct{})    // released once the runner has written
+	lateWrote := make(chan struct{}) // closed once the parked one has written
+	var recheckOnce, putOnce sync.Once
+
+	// Bounded so a structural change — one reclaimer no longer reaching
+	// the stale path at all — fails here by name instead of blocking
+	// until the package timeout and taking every later test with it.
+	const handoff = 30 * time.Second
+	waitFor := func(ch <-chan struct{}, what string) {
+		select {
+		case <-ch:
+		case <-time.After(handoff):
+			t.Errorf("timed out after %s waiting for %s; both reclaimers must reach the "+
+				"stale-retake path for this interleaving to exist", handoff, what)
 		}
 	}
-	defer func() { leaseHookAfterStaleRecheck = nil }()
+
+	leaseHookAfterStaleRecheck = func() {
+		isParked := false
+		recheckOnce.Do(func() { isParked = true })
+		if isParked {
+			waitFor(parked, "the other reclaimer's write")
+		}
+	}
+	leaseHookAfterStalePut = func() {
+		isRunner := false
+		putOnce.Do(func() { isRunner = true })
+		if isRunner {
+			close(parked) // let the other write, still inside this settle window
+			waitFor(lateWrote, "the parked reclaimer's write")
+			return
+		}
+		close(lateWrote)
+	}
+	defer func() {
+		leaseHookAfterStaleRecheck = nil
+		leaseHookAfterStalePut = nil
+	}()
 
 	type res struct {
 		l   *Lease
@@ -62,8 +116,6 @@ func TestLease_StaleReclaimRace_SingleWinner(t *testing.T) {
 		})
 		bCh <- res{l, err}
 	}()
-	// Let B reach the park point.
-	time.Sleep(100 * time.Millisecond)
 
 	aCh := make(chan res, 1)
 	go func() {
@@ -72,10 +124,6 @@ func TestLease_StaleReclaimRace_SingleWinner(t *testing.T) {
 		})
 		aCh <- res{l, err}
 	}()
-	// Release B while A is mid-flight so their writes overlap inside the
-	// settle window.
-	time.Sleep(20 * time.Millisecond)
-	close(park)
 
 	a := <-aCh
 	b := <-bCh

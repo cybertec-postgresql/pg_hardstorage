@@ -22,6 +22,11 @@ type recordingSink struct {
 	records   []XLogRecord
 	syncedLSN atomic.Uint64
 	onRecErr  error
+
+	// afterRecord runs once each record has been recorded, on the
+	// receive loop's OWN goroutine. It lets a test react to delivery
+	// causally instead of guessing how long delivery takes.
+	afterRecord func()
 }
 
 func (s *recordingSink) OnRecord(_ context.Context, r XLogRecord) error {
@@ -32,6 +37,9 @@ func (s *recordingSink) OnRecord(_ context.Context, r XLogRecord) error {
 	r.Data = cp
 	s.records = append(s.records, r)
 	s.mu.Unlock()
+	if s.afterRecord != nil {
+		s.afterRecord()
+	}
 	return s.onRecErr
 }
 
@@ -55,7 +63,21 @@ func newPipePair(t *testing.T, ctx context.Context) *pipePair {
 	t.Helper()
 	clientConn, serverConn := net.Pipe()
 	r := streaming.NewWithConn(ctx, clientConn, streaming.Options{
-		InactivityTimeout: 5 * time.Second,
+		// Deliberately far above any sleep in this file. No test here
+		// asserts the watchdog — they assert cancellation, EOF and
+		// protocol handling — but every one of them RACES it, because
+		// the watchdog is what ends the loop if the test's own stop
+		// signal is late. At 5s that race was lost on CI: a loaded
+		// runner starved the cancelling goroutine and the loop returned
+		// "inactivity timeout (after 5s)" instead of context.Canceled,
+		// which reads as a streaming bug rather than a slow machine.
+		//
+		// Still finite: a genuinely stuck Receive fails here in a
+		// minute rather than hanging until the package timeout, which
+		// would take every other test in the package down with it.
+		// A test that wants to exercise the watchdog builds its own
+		// reader with a short timeout.
+		InactivityTimeout: time.Minute,
 	})
 	be := pgproto3.NewBackend(serverConn, serverConn)
 	t.Cleanup(func() {
@@ -107,19 +129,30 @@ func TestRunReceiveLoop_DeliversXLogDataToSink(t *testing.T) {
 	defer cancel()
 
 	pp := newPipePair(t, ctx)
+
+	// Cancel the moment the record is delivered, from inside the sink —
+	// which runReceiveLoop calls on its OWN goroutine.
+	//
+	// This used to emit, sleep 50ms on a side goroutine, then cancel,
+	// which made the test a bet that the goroutine would be scheduled
+	// within the reader's inactivity window. On a loaded CI runner it
+	// was not, and the loop returned "inactivity timeout" instead of
+	// context.Canceled — a failure that names the streaming code for
+	// what was only a slow machine.
+	//
+	// Cancelling here removes the bet rather than widening it: there is
+	// no second goroutine to starve and no interval to guess. Delivery
+	// causes the cancellation, which is exactly the ordering the
+	// assertions below describe.
 	sink := &recordingSink{}
+	sink.afterRecord = cancel
 
 	// Start draining the server side BEFORE we touch the receive loop:
 	// net.Pipe is synchronous and the loop's initial status-update
 	// write blocks otherwise.
 	go drainServerWrites(pp.serverConn)
 
-	// Server emits one XLogData; the loop processes it; we cancel.
-	go func() {
-		emitCopyData(t, pp.sendBackend, encodeXLogData(0x1000, 0x2000, 12345, []byte("hello WAL")))
-		time.Sleep(50 * time.Millisecond)
-		cancel()
-	}()
+	go emitCopyData(t, pp.sendBackend, encodeXLogData(0x1000, 0x2000, 12345, []byte("hello WAL")))
 
 	err := runReceiveLoop(ctx, pp.reader, sink, 50*time.Millisecond)
 	if !errors.Is(err, context.Canceled) {
