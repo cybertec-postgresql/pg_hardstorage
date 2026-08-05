@@ -166,7 +166,7 @@ func (g *gcsFakeRuntime) waitBucketReady(ctx context.Context, total time.Duratio
 // tempdir, and clears the recorded port.  Idempotent.
 func (g *gcsFakeRuntime) Down(ctx context.Context) error {
 	if g.container != "" {
-		_ = exec.CommandContext(ctx, "docker", "rm", "-f", g.container).Run()
+		_ = exec.CommandContext(ctx, "docker", "rm", "-fv", g.container).Run()
 		g.container = ""
 	}
 	if g.dataDir != "" {

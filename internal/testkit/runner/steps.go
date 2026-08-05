@@ -578,7 +578,7 @@ func runAssertRestoredMatch(ctx context.Context, st scenario.Step, idx int, stat
 			sandboxName).CombinedOutput()
 		_ = os.WriteFile(logFile, logsOut, 0o644)
 		// Best-effort cleanup of a half-spawned container.
-		_ = exec.Command("docker", "rm", "-f", sandboxName).Run()
+		_ = exec.Command("docker", "rm", "-fv", sandboxName).Run()
 		return StepResult{Index: idx, Kind: st.Kind, Pass: false,
 			Message: fmt.Sprintf("assert_restored_match: sandbox start: %v (logs: %s)",
 				startErr, logFile)}
@@ -962,7 +962,7 @@ func startRestoredSandbox(ctx context.Context, name, datadir, version,
 		// still want the container gone.
 		stopCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		_ = exec.CommandContext(stopCtx, "docker", "rm", "-f", name).Run()
+		_ = exec.CommandContext(stopCtx, "docker", "rm", "-fv", name).Run()
 	}
 	return stop, nil
 }

@@ -234,7 +234,7 @@ func (s *sftpRuntime) writeKnownHosts(ctx context.Context) error {
 // Idempotent.
 func (s *sftpRuntime) Down(ctx context.Context) error {
 	if s.container != "" {
-		_ = exec.CommandContext(ctx, "docker", "rm", "-f", s.container).Run()
+		_ = exec.CommandContext(ctx, "docker", "rm", "-fv", s.container).Run()
 		s.container = ""
 	}
 	if s.knownHosts != "" {

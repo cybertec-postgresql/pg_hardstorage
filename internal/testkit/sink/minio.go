@@ -246,7 +246,7 @@ func (m *minioRuntime) waitReady(ctx context.Context, total time.Duration) error
 // -q --filter name=pg-hs-minio-)` to clean up leaks.
 func (m *minioRuntime) Down(ctx context.Context) error {
 	if m.container != "" {
-		_ = exec.CommandContext(ctx, "docker", "rm", "-f", m.container).Run()
+		_ = exec.CommandContext(ctx, "docker", "rm", "-fv", m.container).Run()
 		m.container = ""
 	}
 	if m.dataDir != "" {

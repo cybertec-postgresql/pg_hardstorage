@@ -291,7 +291,7 @@ func waitTLSReady(ctx context.Context, port int, total time.Duration) error {
 // Idempotent.
 func (m *tlsMinioRuntime) Down(ctx context.Context) error {
 	if m.container != "" {
-		_ = execCommand(ctx, "docker", "rm", "-f", m.container).Run()
+		_ = execCommand(ctx, "docker", "rm", "-fv", m.container).Run()
 		m.container = ""
 	}
 	if m.dataDir != "" {

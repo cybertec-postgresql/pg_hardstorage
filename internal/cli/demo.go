@@ -107,7 +107,7 @@ func runDemo(ctx context.Context, w io.Writer, r commandRunner, self string) err
 	cid = strings.TrimSpace(cid)
 	// Always tear the container down, even on a mid-flow failure.
 	defer func() {
-		_, _ = r.run(context.WithoutCancel(ctx), "docker", "rm", "-f", cid)
+		_, _ = r.run(context.WithoutCancel(ctx), "docker", "rm", "-fv", cid)
 	}()
 
 	// 3. Resolve the published host port for 5432.

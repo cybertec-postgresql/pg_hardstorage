@@ -101,7 +101,7 @@ func runRestoredLoad(ctx context.Context, st scenario.Step, idx int, state *runS
 		// docker logs into the artefact dir before tearing down
 		// so a CI run captures why the sandbox refused to come up.
 		logsOut, _ := exec.Command("docker", "logs", "--tail", "200", sandboxName).CombinedOutput()
-		_ = exec.Command("docker", "rm", "-f", sandboxName).Run()
+		_ = exec.Command("docker", "rm", "-fv", sandboxName).Run()
 		return StepResult{Index: idx, Kind: st.Kind, Pass: false,
 			Message: fmt.Sprintf("restored_load: sandbox start: %v (logs: %s)", err, truncate(logsOut, 384))}
 	}
