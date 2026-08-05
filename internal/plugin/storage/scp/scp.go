@@ -338,7 +338,17 @@ func (p *Plugin) Get(ctx context.Context, key string) (io.ReadCloser, error) {
 	} else if !exists {
 		return nil, storage.ErrNotFound
 	}
-	return p.streamRead(ctx, "cat "+shellQuote(full))
+	// Get is check-then-read, so the object can disappear between the
+	// two — a concurrent Delete is ordinary, not exceptional. `cat`
+	// then exits non-zero, and without this the caller saw an opaque
+	// transport failure for a plain "it is gone". Callers already
+	// handle ErrNotFound; they cannot handle an exit status.
+	return p.streamRead(ctx, "cat "+shellQuote(full), func(err error) error {
+		if ok, eerr := p.exists(ctx, full); eerr == nil && !ok {
+			return storage.ErrNotFound
+		}
+		return err
+	})
 }
 
 // Stat issues `stat -c '%s %Y' <path>` and parses size + mtime.
@@ -634,7 +644,7 @@ func (p *Plugin) uploadVia(ctx context.Context, command string, r io.Reader) (in
 // streamRead opens a session for command (typically `cat path`)
 // and returns a ReadCloser that drains stdout.  Closing the
 // reader closes the session.
-func (p *Plugin) streamRead(ctx context.Context, command string) (io.ReadCloser, error) {
+func (p *Plugin) streamRead(ctx context.Context, command string, classify func(error) error) (io.ReadCloser, error) {
 	sess, err := p.newSession()
 	if err != nil {
 		return nil, fmt.Errorf("scp: new session: %w", err)
@@ -648,7 +658,7 @@ func (p *Plugin) streamRead(ctx context.Context, command string) (io.ReadCloser,
 		_ = sess.Close()
 		return nil, fmt.Errorf("scp: start command: %w", err)
 	}
-	return &sessionReader{sess: sess, stdout: stdout, ctx: ctx}, nil
+	return &sessionReader{sess: sess, stdout: stdout, ctx: ctx, classify: classify}, nil
 }
 
 // sessionReader pairs an ssh.Session with its stdout pipe so
@@ -657,6 +667,15 @@ type sessionReader struct {
 	sess   *ssh.Session
 	stdout io.Reader
 	ctx    context.Context
+
+	// waited guards ssh.Session.Wait, which may be called exactly once.
+	// Read calls it on EOF so a failed remote command surfaces to
+	// io.ReadAll; Close calls it only if Read did not.
+	waited  bool
+	waitErr error
+	// classify turns the remote command's failure into a typed storage
+	// error the caller can act on. Optional.
+	classify func(error) error
 }
 
 // Read implements io.Reader. Returns the context's error before
@@ -666,22 +685,59 @@ func (s *sessionReader) Read(p []byte) (int, error) {
 	if err := s.ctx.Err(); err != nil {
 		return 0, err
 	}
-	return s.stdout.Read(p)
+	n, err := s.stdout.Read(p)
+	if !errors.Is(err, io.EOF) {
+		return n, err
+	}
+	// EOF on stdout means the remote command's output ended — NOT that
+	// it succeeded. `cat` on a file deleted since the existence check,
+	// a broken channel, a remote resource limit: all end the stream
+	// cleanly, and io.ReadAll then reports success on a short or empty
+	// read.
+	//
+	// Every caller in the tree writes `defer rc.Close()` and discards
+	// its error (56 sites, none checking), so a transport failure
+	// arrived as zero bytes and no error — surfacing later as a
+	// "corrupt object" that was nothing of the sort. Reaping the exit
+	// status HERE puts the failure where the reader will see it, which
+	// fixes the class rather than one call site.
+	s.reap()
+	if s.waitErr != nil {
+		return n, s.waitErr
+	}
+	return n, err
+}
+
+// reap collects the remote exit status exactly once.
+func (s *sessionReader) reap() {
+	if s.waited {
+		return
+	}
+	s.waited = true
+	werr := s.sess.Wait()
+	if werr == nil || errors.Is(werr, io.EOF) {
+		return
+	}
+	// Some servers report a clean exit as an error string; that is not
+	// a failure.
+	if strings.Contains(werr.Error(), "status 0") {
+		return
+	}
+	s.waitErr = fmt.Errorf("scp: remote read failed: %w", werr)
+	if s.classify != nil {
+		s.waitErr = s.classify(s.waitErr)
+	}
 }
 
 // Close implements io.Closer. Waits on the remote command first so
 // the exit status surfaces, then tears down the SSH session.
 func (s *sessionReader) Close() error {
-	// Wait first so we surface the remote exit status; ignore
-	// EOF-after-Wait paths.
-	werr := s.sess.Wait()
+	// Reap the exit status if Read has not already (a caller that
+	// closes early, before EOF, still gets the failure reported).
+	s.reap()
 	cerr := s.sess.Close()
-	if werr != nil && werr != io.EOF {
-		// Squelch the noisy "Process exited with status 0"
-		// path some implementations report.
-		if !strings.Contains(werr.Error(), "status 0") {
-			return werr
-		}
+	if s.waitErr != nil {
+		return s.waitErr
 	}
 	return cerr
 }
