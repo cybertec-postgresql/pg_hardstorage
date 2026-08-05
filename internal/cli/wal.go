@@ -1561,7 +1561,17 @@ func runWalStream(cmd *cobra.Command, opts walStreamOptions) error {
 	rendererName := d.Renderer().Name()
 	suppressEvents := rendererName == "json"
 	emit := func(e *output.Event) {
-		if suppressEvents {
+		// Progress chatter is suppressed under --output json: a JSON
+		// consumer parses the final Result, not the event stream.
+		//
+		// A WARNING or ERROR is not chatter. Suppressing those meant a
+		// streamer that could not commit anything reconnected forever
+		// while emitting nothing an operator could see — the slot
+		// active, chunks accumulating, `wal list` empty, and no output
+		// at all (issue #45). JSON is the obvious renderer for a
+		// Kubernetes deployment, so the failure was invisible exactly
+		// where it was most likely to happen.
+		if !shouldEmitEvent(suppressEvents, e.Severity) {
 			return
 		}
 		_ = d.Event(streamCtx, e)
@@ -1588,14 +1598,16 @@ func runWalStream(cmd *cobra.Command, opts walStreamOptions) error {
 	const initialBackoff = time.Second
 	backoff := initialBackoff
 	var (
-		firstStartLSN  pglogrepl.LSN
-		firstStartSet  bool
-		latestSynced   pglogrepl.LSN
-		latestBuffered pglogrepl.LSN
-		latestTimeline uint32
-		attempt        int
-		lastStreamErr  error // streamErr of the final attempt, for the honest clean_stop
-		streamSysID    string
+		firstStartLSN   pglogrepl.LSN
+		firstStartSet   bool
+		latestSynced    pglogrepl.LSN
+		latestBuffered  pglogrepl.LSN
+		latestTimeline  uint32
+		attempt         int
+		lastStreamErr   error // streamErr of the final attempt, for the honest clean_stop
+		noProgress      int   // consecutive failed attempts that synced nothing new
+		lastProgressLSN pglogrepl.LSN
+		streamSysID     string
 	)
 	for {
 		if streamCtx.Err() != nil {
@@ -1670,6 +1682,31 @@ func runWalStream(cmd *cobra.Command, opts walStreamOptions) error {
 		if opts.noReconnect {
 			return output.NewError("wal.stream_error",
 				fmt.Sprintf("wal stream: %v", streamErr)).Wrap(streamErr)
+		}
+		// A mid-stream failure that reconnecting cannot fix must stop
+		// the loop. Only pre-Stream SETUP errors were classified this
+		// way; anything that broke once streaming had begun was retried
+		// forever (issue #45). A repository backend that cannot commit
+		// a manifest fails identically on every attempt, so the loop
+		// re-streamed the same LSN indefinitely: chunks accumulated,
+		// no manifest ever landed, and the process grew until the
+		// kernel killed it.
+
+		// The backstop for permanent failures we have NOT enumerated,
+		// which is the case that actually bit: a raw backend error
+		// ("NotImplemented" from a conditional COPY) carries no code we
+		// could match on. Judge by outcome instead — an attempt that
+		// ends in error having synced nothing made no progress, and a
+		// run of those means retrying is not working, whatever the
+		// cause.
+		if syncedAtExit > lastProgressLSN {
+			lastProgressLSN = syncedAtExit
+			noProgress = 0
+		} else {
+			noProgress++
+		}
+		if code, msg, stop := decideStreamStop(streamErr, noProgress); stop {
+			return output.NewError(code, msg).Wrap(streamErr)
 		}
 		// Per-attempt connection that ended in an error — the most
 		// common shape after a Patroni failover. A connection that
@@ -2157,6 +2194,79 @@ func checkSysIDContinuity(pinned *string, observed, deployment string, allowChan
 		WithSuggestion(&output.Suggestion{
 			Human: "the DSN now resolves to a different PostgreSQL cluster (restored clone, re-initialized standby, or a repointed VIP/DNS entry). Point the DSN back at the original cluster, or — if the change is intentional — archive the new cluster under a NEW deployment name (or pass --allow-system-identifier-change after reading the pg_upgrade runbook).",
 		})
+}
+
+// shouldEmitEvent decides whether an event survives the renderer.
+//
+// Severity is SYSLOG-ordered — LOWER is more severe (Emergency=0,
+// Error=3, Warning=4, Info=6, Debug=7) — so "at least as severe as a
+// warning" is `<=`. Writing it the intuitive way round suppresses
+// errors and keeps progress chatter, which is the inverse of the
+// intent and exactly the mistake this function exists to contain.
+func shouldEmitEvent(suppress bool, sev output.Severity) bool {
+	if !suppress {
+		return true
+	}
+	return sev <= output.SeverityWarning
+}
+
+// decideStreamStop decides whether a failed streaming attempt ends the
+// reconnect loop, and under which code.
+//
+// Split out from the loop so the decision can be tested directly:
+// asserting the classifier in isolation says nothing about whether the
+// loop consults it, and that gap is how a permanent failure was
+// retried forever (issue #45).
+func decideStreamStop(streamErr error, noProgress int) (code, msg string, stop bool) {
+	if isPermanentStreamError(streamErr) {
+		return "wal.stream_permanent",
+			fmt.Sprintf("wal stream stopped: %v", streamErr), true
+	}
+	if noProgress >= maxNoProgressAttempts {
+		return "wal.stream_no_progress",
+			fmt.Sprintf("wal stream made no progress in %d consecutive attempts; "+
+				"last error: %v", noProgress, streamErr), true
+	}
+	return "", "", false
+}
+
+// maxNoProgressAttempts bounds a reconnect loop that is achieving
+// nothing. Five attempts with the escalating backoff is long enough to
+// ride out a failover (the loop's reason for existing) and short
+// enough that a permanently-broken repository stops within minutes
+// instead of running until the kernel intervenes.
+const maxNoProgressAttempts = 5
+
+// isPermanentStreamError reports whether a failure that happened while
+// STREAMING will still be there after a reconnect.
+//
+// Distinct from isPermanentStreamSetupError, which classifies failures
+// before the stream opens. Anything that broke mid-stream used to be
+// retried unconditionally, so a repository backend that could not
+// commit a manifest — the reported case was an S3-compatible store
+// answering NotImplemented to a conditional COPY — produced an endless
+// reconnect loop instead of one actionable failure (issue #45).
+func isPermanentStreamError(err error) bool {
+	// A backend that does not implement an operation will not have
+	// implemented it by the next attempt.
+	if errors.Is(err, storage.ErrUnsupported) {
+		return true
+	}
+	// Split-brain: two clusters archiving into one lineage. Retrying
+	// does not resolve it and every attempt risks interleaving more
+	// foreign WAL, so stopping is the safe direction.
+	if strings.Contains(err.Error(), "splitbrain.") {
+		return true
+	}
+	oe, ok := output.AsOutputError(err)
+	if !ok {
+		return false
+	}
+	// Operator-input errors, same reasoning as the setup path.
+	if strings.HasPrefix(oe.Code, "usage.") {
+		return true
+	}
+	return false
 }
 
 func isPermanentStreamSetupError(err error) bool {
