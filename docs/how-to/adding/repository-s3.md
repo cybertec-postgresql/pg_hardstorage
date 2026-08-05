@@ -27,6 +27,7 @@ Query parameters:
 | --- | --- |
 | `region` | AWS region. Required for AWS S3 if not in env / profile. |
 | `endpoint` | S3-compatible endpoint (MinIO, R2, Wasabi). Omit for AWS. |
+| `conditional_put` | `native` vouches that an `endpoint=` store enforces `If-None-Match: *` on PUT. See below — without it the repository stays on the slower, delete-emitting commit path. Ignored (and unnecessary) on AWS. |
 | `path_style` | `true` forces path-style addressing. Required for MinIO and other endpoints whose bucket names aren't DNS-safe. Implicitly `true` whenever `endpoint` is set. |
 | `storage_class` | Default `StorageClass` for `Put` (`STANDARD`, `STANDARD_IA`, `GLACIER_IR`, etc.). |
 
@@ -98,7 +99,53 @@ R2 access keypair. Region is ignored on R2; the SDK still wants a
 non-empty value, which the plugin defaults to `us-east-1` when
 unset.
 
-### 5. Verify writability
+### 5. Append-only commits on an S3-compatible endpoint
+
+`pg_hardstorage` publishes manifests with a single conditional
+`PUT` (`If-None-Match: *`): the object appears whole or not at
+all, and a second writer is rejected. Nothing is staged, so
+nothing is deleted.
+
+That path is only taken when the store is known to *enforce* the
+precondition. On AWS it is enforced, so it is used automatically.
+Behind `endpoint=` the plugin cannot assume it: a store that
+accepts `If-None-Match` and ignores it would make every
+single-winner guarantee in the system silently false — the shared
+DEK mint, the backup lease, audit-chain slots. Rather than guess,
+it falls back to staging (`<key>.tmp.<rand>` + conditional
+`COPY` + `DELETE`).
+
+If your endpoint enforces conditional PUT — MinIO
+≥ `RELEASE.2024-*` and Cloudflare R2 both do — say so:
+
+```bash
+pg_hardstorage repo init \
+    's3://repo/?endpoint=https://minio.acme.example.com&path_style=true&conditional_put=native'
+```
+
+Two reasons this matters beyond speed:
+
+- **The bucket stays append-only.** The staging path emits a
+  `DeleteObject` per WAL segment and per base backup. On a
+  versioned bucket that is a delete marker per commit, which a
+  repository kept as an anti-ransomware copy of record — with
+  replication that only ever adds objects — will flag as an
+  anomaly.
+- **Some stores implement conditional PUT but not conditional
+  COPY.** The staging path needs the COPY, and answers like
+  `NotImplemented … Copy object not implemented with
+  If-None-Match` mean no manifest can commit at all.
+
+!!! warning "Only set this if the store really enforces it"
+
+    `conditional_put=native` is a promise you are making on the
+    store's behalf. If it accepts `If-None-Match: *` and
+    overwrites anyway, two concurrent writers can both believe
+    they won — and the mitigations that exist for
+    honestly-unsupported backends are disabled by the claim. When
+    unsure, leave it unset and accept the staging path.
+
+### 6. Verify writability
 
 ```bash
 # RUNNABLE

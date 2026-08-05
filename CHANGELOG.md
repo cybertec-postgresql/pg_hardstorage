@@ -11,6 +11,63 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A repository can be append-only.** Manifests, integrity runs, DSA
+  reports, threshold rosters and headers, insider scans, timeline
+  histories, tombstones and pushed auxiliary files were all published
+  by writing `<key>.tmp.<rand>` and renaming it into place — which on
+  S3 is `HeadObject` + `CopyObject` + **`DeleteObject`**. A repository
+  kept as an anti-ransomware copy of record therefore accrued a delete
+  marker per WAL segment and per base backup ([#45]).
+
+  Publishing now uses a single conditional `PUT` where the backend
+  advertises `ConditionalPut`: atomic, so nothing partial is visible,
+  and `If-None-Match: *` rejects a second writer — the two properties
+  staging existed to provide, with no staged object and so no delete.
+  Backends that cannot (SFTP without `hardlink@openssh.com`) stage
+  exactly as before.
+
+  Two paths that deliberately REPLACE an object — rebuilding a corrupt
+  replica, and `repair manifest`'s overwrite — became a direct atomic
+  `Put`. Both previously deleted the key first, leaving a window with
+  no object at all.
+
+- **Manifests commit on stores without a conditional COPY** ([#45]).
+  S3-compatible stores commonly implement a conditional PUT and not a
+  conditional COPY; the staging path needed the COPY, so on those
+  stores no manifest could commit at all. Base backups failed with
+  `NotImplemented`; `wal stream` did not fail visibly at all — see
+  below.
+
+- **`wal stream` stops instead of retrying an unwinnable stream**
+  ([#45]). Only pre-stream *setup* errors were classified as permanent,
+  so a failure once streaming had begun was retried forever. With a
+  repository that could not commit, the reported symptom was the slot
+  active, chunks accumulating, `wal list` empty, memory climbing, and
+  the process OOM-killed and restarted from the same LSN — with nothing
+  logged. The loop now stops on a recognised permanent condition, and
+  on a backstop of five consecutive attempts that synced nothing, which
+  covers permanent failures that carry no matchable error code.
+
+- **`--output json` no longer suppresses warnings and errors** ([#45]).
+  The suppression exists so a JSON consumer parses the final Result
+  rather than a progress stream, but it applied to every severity — so
+  the reconnect warnings above went nowhere under the renderer a
+  Kubernetes deployment would obviously choose.
+
+### Added
+
+- `repo check` reports the repository's **commit mode**
+  (`conditional_put` or `stage_and_rename`), so the difference is
+  visible before it bites rather than after.
+- The S3 backend's `conditional_put=native` parameter is documented.
+  Behind an `endpoint=` override the plugin will not assume the store
+  enforces `If-None-Match` on PUT — assuming wrongly would make every
+  single-winner guarantee silently false — so an operator whose store
+  does enforce it must say so to get the append-only commit path.
+
+
 ## [1.1.1] — 2026-08-04
 
 ### Changed — action may be required
@@ -234,6 +291,7 @@ migration, and nothing changes posture on upgrade.
   docs teach against `kms.DefaultRegistry` — the check that would have
   caught `azure-key-vault://`.
 
+[#45]: https://github.com/cybertec-postgresql/pg_hardstorage/issues/45
 [#44]: https://github.com/cybertec-postgresql/pg_hardstorage/issues/44
 
 ## [1.0.17] — 2026-07-27

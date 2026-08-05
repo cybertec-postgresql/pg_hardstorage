@@ -88,6 +88,11 @@ func runRepoCheck(cmd *cobra.Command, repoURL string) error {
 	}
 	defer sp.Close()
 
+	commitMode := "stage_and_rename"
+	if sp.Capabilities().ConditionalPut {
+		commitMode = "conditional_put"
+	}
+
 	store := backup.NewManifestStore(sp)
 
 	// 1. Walk manifests by deployment, capture per-deployment stats.
@@ -156,6 +161,7 @@ func runRepoCheck(cmd *cobra.Command, repoURL string) error {
 		ChunkRefs:         refs.Len(),
 		MissingChunks:     len(missing),
 		WORM:              meta.WORM,
+		CommitMode:        commitMode,
 	}
 	const maxListedHashes = 64
 	for i, h := range missing {
@@ -278,6 +284,17 @@ type repoCheckBody struct {
 	MissingChunks     int                   `json:"missing_chunks"`
 	MissingHashes     []string              `json:"missing_hashes,omitempty"`
 	Healthy           bool                  `json:"healthy"`
+	// CommitMode reports how this repository publishes manifests:
+	// "conditional_put" (one atomic PUT, nothing deleted) or
+	// "stage_and_rename" (a temporary object, a conditional COPY and a
+	// DELETE per commit).
+	//
+	// Surfaced because the difference is invisible until it bites, and
+	// then bites in two ways an operator cannot easily attribute: a
+	// bucket kept append-only accrues a delete marker per WAL segment,
+	// and a store that implements conditional PUT but not conditional
+	// COPY cannot commit a manifest at all (issue #45).
+	CommitMode string `json:"commit_mode"`
 	// WORM, when non-nil, is the repo's write-once-read-many
 	// policy as recorded in HSREPO. Surfaced here so an operator's
 	// `repo check` confirms the policy is what they expected (a
@@ -303,6 +320,18 @@ func (b repoCheckBody) WriteText(w io.Writer) error {
 	if !b.WORM.IsZero() {
 		fmt.Fprintf(bw, "  WORM policy:     %s, retention %s\n",
 			b.WORM.Mode, b.WORM.Retention)
+	}
+	switch b.CommitMode {
+	case "conditional_put":
+		fmt.Fprintln(bw, "  ✓ Commit mode:    conditional PUT (append-only; nothing deleted)")
+	default:
+		fmt.Fprintln(bw, "  ! Commit mode:    stage + rename — every manifest commit writes a")
+		fmt.Fprintln(bw, "                    temporary, COPYs it into place and DELETEs it.")
+		fmt.Fprintln(bw, "                    On a versioned bucket that is a delete marker per")
+		fmt.Fprintln(bw, "                    WAL segment, and it needs a conditional COPY that")
+		fmt.Fprintln(bw, "                    some S3-compatible stores do not implement.")
+		fmt.Fprintln(bw, "                    If your endpoint enforces If-None-Match on PUT,")
+		fmt.Fprintln(bw, "                    add ?conditional_put=native to the repo URL.")
 	}
 	fmt.Fprintf(bw, "  Chunk references: %d distinct\n", b.ChunkRefs)
 	if b.MissingChunks == 0 {
