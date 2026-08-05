@@ -36,7 +36,6 @@
 package dsa
 
 import (
-	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -544,15 +543,10 @@ func (s *ReportStore) Put(ctx context.Context, r *Report) error {
 		return err
 	}
 	key := reportKey(r.ID)
-	tmp := key + ".tmp." + randHex(8)
-	if _, err := s.sp.Put(ctx, tmp, bytes.NewReader(body), storage.PutOptions{
-		ContentLength: int64(len(body)),
-	}); err != nil {
-		return fmt.Errorf("dsa: put tmp: %w", err)
-	}
-	if err := s.sp.RenameIfNotExists(ctx, tmp, key); err != nil {
-		_ = s.sp.Delete(ctx, tmp)
-		return fmt.Errorf("dsa: rename: %w", err)
+	// Conditional PUT where available, staging where not — the staging
+	// shape deleted on every commit (issue #45).
+	if err := storage.CommitExclusive(ctx, s.sp, key, body, storage.PutOptions{}); err != nil {
+		return fmt.Errorf("dsa: commit report: %w", err)
 	}
 	return nil
 }

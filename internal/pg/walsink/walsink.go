@@ -890,7 +890,6 @@ func (s *Sink) commitManifest(ctx context.Context, m *SegmentManifest) error {
 		return err
 	}
 	key := SegmentPath(m.Deployment, m.Timeline, m.SegmentName)
-	tmp := key + ".tmp." + randSuffix()
 
 	putOpts := storage.PutOptions{ContentLength: int64(len(body))}
 	if !s.opts.WORM.IsZero() {
@@ -898,13 +897,12 @@ func (s *Sink) commitManifest(ctx context.Context, m *SegmentManifest) error {
 		putOpts.RetainUntil = s.opts.WORM.RetainUntil(now)
 		putOpts.RetentionMode = storage.WORMMode(s.opts.WORM.Mode)
 	}
-	if _, err := s.sp.Put(ctx, tmp, bytes.NewReader(body), putOpts); err != nil {
-		return fmt.Errorf("walsink: put tmp manifest: %w", err)
-	}
-	if err := s.sp.RenameIfNotExists(ctx, tmp, key); err != nil {
-		// Best-effort tmp cleanup; never propagate a tmp-cleanup
-		// failure (the rename's failure is what the caller cares about).
-		_ = s.sp.Delete(ctx, tmp)
+	// One conditional PUT where the backend supports it: no staging
+	// object, so no DELETE on the commit path. A repository used as an
+	// append-only copy of record could not previously host WAL
+	// archiving at all, because every segment emitted a delete marker
+	// (issue #45).
+	if err := storage.CommitExclusive(ctx, s.sp, key, body, putOpts); err != nil {
 		if errors.Is(err, storage.ErrAlreadyExists) {
 			// Existing manifest at this key: either a true idempotent
 			// re-commit (prior agent run already got here, chunks
@@ -916,7 +914,7 @@ func (s *Sink) commitManifest(ctx context.Context, m *SegmentManifest) error {
 			// matches; otherwise a splitbrain.* structured error.
 			return verifyExistingManifest(ctx, s.sp, key, m)
 		}
-		return fmt.Errorf("walsink: rename manifest: %w", err)
+		return fmt.Errorf("walsink: commit manifest: %w", err)
 	}
 	return nil
 }

@@ -323,7 +323,10 @@ func (ms *ManifestStore) rollbackPrimaryCommit(ctx context.Context, primaryKey s
 	return cause
 }
 
-// commitAtomic writes body to <key>.tmp and atomically renames it to
+// commitAtomic publishes body at key without overwriting an
+// existing object. On a backend advertising ConditionalPut that is a
+// single conditional PUT; otherwise it stages and renames. Formerly:
+// writes body to <key>.tmp and atomically renames it to
 // key. The intermediate name is unique-per-write so concurrent Commit
 // calls don't collide on the tmp slot.
 //
@@ -347,17 +350,10 @@ func (ms *ManifestStore) rollbackPrimaryCommit(ctx context.Context, primaryKey s
 // source-delete on success, or by `repo gc`'s stale-staging sweep if a
 // crash orphaned it).
 func (ms *ManifestStore) commitAtomic(ctx context.Context, key string, body []byte, opts CommitOptions) error {
-	tmp := key + ".tmp." + randSuffix()
-	_, err := ms.sp.Put(ctx, tmp, bytes.NewReader(body), storage.PutOptions{
-		ContentLength: int64(len(body)),
-	})
-	if err != nil {
-		return fmt.Errorf("write tmp: %w", err)
-	}
-	if err := ms.sp.RenameIfNotExists(ctx, tmp, key); err != nil {
-		// Best-effort cleanup of the tmp; never propagate a tmp-cleanup
-		// failure (the primary error is what matters).
-		_ = ms.sp.Delete(ctx, tmp)
+	// Conditional PUT where the backend supports it, tmp+rename where
+	// it does not. The staging path costs a DELETE per commit, which
+	// an append-only repository cannot accept (issue #45).
+	if err := storage.CommitExclusive(ctx, ms.sp, key, body, storage.PutOptions{}); err != nil {
 		return err
 	}
 	// Apply WORM retention to the committed manifest itself.  A backend
@@ -1464,14 +1460,10 @@ func (ms *ManifestStore) softDeleteUnchecked(ctx context.Context, deployment, ba
 		return false, fmt.Errorf("backup: encode tombstone: %w", err)
 	}
 	key := TombstonePath(deployment, backupID)
-	tmp := key + ".tmp." + randSuffix()
-	if _, err := ms.sp.Put(ctx, tmp, bytes.NewReader(body), storage.PutOptions{
-		ContentLength: int64(len(body)),
-	}); err != nil {
-		return false, fmt.Errorf("backup: put tombstone tmp: %w", err)
-	}
-	if err := ms.sp.RenameIfNotExists(ctx, tmp, key); err != nil {
-		_ = ms.sp.Delete(ctx, tmp)
+	// Exclusive publish: a tombstone must never overwrite an existing
+	// one, and the staging shape it used to take deleted on every
+	// commit (issue #45).
+	if err := storage.CommitExclusive(ctx, ms.sp, key, body, storage.PutOptions{}); err != nil {
 		if errors.Is(err, storage.ErrAlreadyExists) {
 			// Already tombstoned. Nothing to do.
 			return false, nil
@@ -1731,16 +1723,15 @@ func (ms *ManifestStore) EnsureReplica(ctx context.Context, deployment, backupID
 		return false, fmt.Errorf("backup: EnsureReplica: primary identity %s/%s != requested %s/%s", pm.Deployment, pm.BackupID, deployment, backupID)
 	}
 
-	tmp := replicaKey + ".tmp.ensure." + randSuffix()
-	if _, err := ms.sp.Put(ctx, tmp, bytes.NewReader(pb), storage.PutOptions{ContentLength: int64(len(pb))}); err != nil {
-		return false, fmt.Errorf("backup: EnsureReplica: stage replica tmp: %w", err)
-	}
-	_ = ms.sp.Delete(ctx, replicaKey) // idempotent on a missing key; clears a corrupt one
-	if err := ms.sp.RenameIfNotExists(ctx, tmp, replicaKey); err != nil {
-		_ = ms.sp.Delete(ctx, tmp)
-		if errors.Is(err, storage.ErrAlreadyExists) {
-			return false, nil // a concurrent rebuild won the race (it applies the lock)
-		}
+	// A rebuild deliberately REPLACES whatever is at the replica key —
+	// the whole point is to clear a corrupt copy — so this is a direct
+	// overwriting Put rather than CommitExclusive. Put is atomic on
+	// every backend, so the key goes from the corrupt body straight to
+	// the rebuilt one; the previous shape deleted it first and left a
+	// window with no replica at all, and cost three deletes besides
+	// (issue #45).
+	if _, err := ms.sp.Put(ctx, replicaKey, bytes.NewReader(pb),
+		storage.PutOptions{ContentLength: int64(len(pb))}); err != nil {
 		return false, fmt.Errorf("backup: EnsureReplica: install replica: %w", err)
 	}
 

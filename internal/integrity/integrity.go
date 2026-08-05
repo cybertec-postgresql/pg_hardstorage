@@ -34,7 +34,6 @@
 package integrity
 
 import (
-	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/sha256"
@@ -687,13 +686,10 @@ func (s *RunStore) Put(ctx context.Context, r *Run) error {
 	// truncate-then-write tear the other's bytes before the rename installs
 	// them — the torn-overwrite class fixed in fs/timeline and already used
 	// by the dsa/threshold sibling stores.
-	tmp := key + fmt.Sprintf(".tmp.%016x", rand.Uint64())
-	if _, err := s.sp.Put(ctx, tmp, bytes.NewReader(body), storage.PutOptions{
-		ContentLength: int64(len(body)),
-	}); err != nil {
-		return fmt.Errorf("integrity: put tmp: %w", err)
-	}
-	return s.sp.RenameIfNotExists(ctx, tmp, key)
+	// One conditional PUT where the backend supports it; staging only
+	// where it does not. The staging shape cost a DELETE per commit,
+	// which an append-only repository cannot host (issue #45).
+	return storage.CommitExclusive(ctx, s.sp, key, body, storage.PutOptions{})
 }
 
 // Get reads + decodes one run.

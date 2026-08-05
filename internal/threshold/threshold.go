@@ -649,13 +649,8 @@ func (s *RosterStore) Put(ctx context.Context, r *Roster) error {
 	// share a staging path and tear each other's bytes — matching the
 	// AttestationStore sibling in this file (a fixed key+".tmp" was the lone
 	// torn-overwrite-prone path here).
-	tmp := key + ".tmp." + randHex(8)
-	if _, err := s.sp.Put(ctx, tmp, bytes.NewReader(body), storage.PutOptions{
-		ContentLength: int64(len(body)),
-	}); err != nil {
-		return fmt.Errorf("threshold: roster put tmp: %w", err)
-	}
-	if err := s.sp.RenameIfNotExists(ctx, tmp, key); err != nil {
+	// Conditional PUT where available, staging where not (issue #45).
+	if err := storage.CommitExclusive(ctx, s.sp, key, body, storage.PutOptions{}); err != nil {
 		return fmt.Errorf("threshold: roster commit: %w", err)
 	}
 	// Re-lock the committed roster on a WORM repo. The rename above carries
@@ -796,17 +791,11 @@ func (s *AttestationStore) PutHeader(ctx context.Context, h *AttestationHeader) 
 		return conflictErr
 	}
 
-	// First-write path: tmp + RenameIfNotExists.  On rename failure
-	// (concurrent winner), re-read and take the logical-equality
-	// branch.
-	tmp := key + ".tmp." + randHex(8)
-	if _, err := s.sp.Put(ctx, tmp, bytes.NewReader(body), storage.PutOptions{
-		ContentLength: int64(len(body)),
-	}); err != nil {
-		return err
-	}
-	if err := s.sp.RenameIfNotExists(ctx, tmp, key); err != nil {
-		_ = s.sp.Delete(ctx, tmp)
+	// First-write path: an exclusive publish. On a conflict (concurrent
+	// winner) re-read and take the logical-equality branch. Formerly
+	// tmp + RenameIfNotExists, which deleted on every commit and
+	// required a conditional COPY (issue #45).
+	if err := storage.CommitExclusive(ctx, s.sp, key, body, storage.PutOptions{}); err != nil {
 		if existing, gerr := s.GetHeader(ctx, h.Subject.Kind, h.Subject.ID); gerr == nil {
 			if headersLogicallyEqual(existing, h) {
 				return nil
@@ -896,16 +885,9 @@ func commitIfBytesMatch(
 		}
 		return conflictErr
 	}
-	tmp := key + ".tmp." + randHex(8)
-	if _, err := sp.Put(ctx, tmp, bytes.NewReader(body), storage.PutOptions{
-		ContentLength: int64(len(body)),
-	}); err != nil {
-		return err
-	}
-	if err := sp.RenameIfNotExists(ctx, tmp, key); err != nil {
-		// Best-effort tmp cleanup; the rename outcome is what we care
-		// about.
-		_ = sp.Delete(ctx, tmp)
+	// Exclusive publish (issue #45): conditional PUT where available,
+	// staging where not.
+	if err := storage.CommitExclusive(ctx, sp, key, body, storage.PutOptions{}); err != nil {
 		// Race: did a concurrent writer win this slot with byte-equal
 		// content?  Re-Get and compare; treat byte-equal as idempotent.
 		if rd, gerr := sp.Get(ctx, key); gerr == nil {

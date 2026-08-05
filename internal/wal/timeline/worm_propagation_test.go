@@ -5,7 +5,6 @@ import (
 	"io"
 	"iter"
 	"net/url"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -87,19 +86,23 @@ func TestPut_PropagatesWORMRetention(t *testing.T) {
 		t.Fatalf("Put: %v", err)
 	}
 
-	// Find the tmp Put that wrote our content. The tmp suffix is random
-	// (per-writer, to avoid concurrent agents colliding on one tmp), so
-	// match the prefix rather than an exact key.
+	// Find the Put that wrote our content.
+	//
+	// This used to look for a `<key>.tmp.<rand>` staging Put. The
+	// timeline history is now published by a single conditional PUT
+	// (issue #45), so matching the temporary matched nothing — and
+	// what mattered was never the staging key, it was that the
+	// retention reached the object that ends up stored.
 	var found *recordedPut
 	for i := range rec.puts {
-		if strings.HasPrefix(rec.puts[i].Key, "wal/db1/timelines/2.history.tmp.") {
+		if rec.puts[i].Key == "wal/db1/timelines/2.history" {
 			p := rec.puts[i]
 			found = &p
 			break
 		}
 	}
 	if found == nil {
-		t.Fatalf("expected a Put at the tmp key; got: %+v", rec.puts)
+		t.Fatalf("expected a Put at the timeline key; got: %+v", rec.puts)
 	}
 	if found.Opts.RetentionMode != storage.WORMMode("compliance") {
 		t.Errorf("RetentionMode = %q, want compliance", found.Opts.RetentionMode)

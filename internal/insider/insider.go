@@ -33,7 +33,6 @@
 package insider
 
 import (
-	"bytes"
 	"context"
 	stdjson "encoding/json"
 	"errors"
@@ -729,13 +728,10 @@ func (s *ScanStore) Put(ctx context.Context, scan *Scan) error {
 		return err
 	}
 	key := scanKey(scan.ID)
-	tmp := key + ".tmp"
-	if _, err := s.sp.Put(ctx, tmp, bytes.NewReader(body), storage.PutOptions{
-		ContentLength: int64(len(body)),
-	}); err != nil {
-		return fmt.Errorf("insider: put tmp: %w", err)
-	}
-	return s.sp.RenameIfNotExists(ctx, tmp, key)
+	// Conditional PUT where available; staging only where not. The
+	// staging shape deleted on every commit (issue #45), and its fixed
+	// `.tmp` key let two concurrent writers tear each other besides.
+	return storage.CommitExclusive(ctx, s.sp, key, body, storage.PutOptions{})
 }
 
 // Get reads + decodes one scan.

@@ -258,14 +258,16 @@ func runRepairAttestation(cmd *cobra.Command, deployment, backupID, repoURL, act
 // key, so a half-finished prior attempt re-runs cleanly. infix names
 // the caller (e.g. "attest") so a leaked tmp is attributable.
 func installManifestOverwrite(ctx context.Context, sp storage.StoragePlugin, key string, body []byte, infix string, retainUntil time.Time, mode storage.WORMMode) error {
-	tmp := key + ".tmp." + infix + "." + randHex8()
-	if _, err := sp.Put(ctx, tmp, strings.NewReader(string(body)),
+	// A repair deliberately REPLACES the manifest, so this is a direct
+	// overwriting Put rather than CommitExclusive. Every backend's Put
+	// replaces a key atomically, so the object goes from old body to
+	// new with no moment in between — the previous shape deleted the
+	// key first and left a window where the manifest was absent, the
+	// same failure rotate.go and hold.go were changed to avoid. It
+	// also removes two deletes from the path (issue #45).
+	_ = infix
+	if _, err := sp.Put(ctx, key, strings.NewReader(string(body)),
 		storage.PutOptions{ContentLength: int64(len(body))}); err != nil {
-		return fmt.Errorf("stage tmp: %w", err)
-	}
-	_ = sp.Delete(ctx, key)
-	if err := sp.RenameIfNotExists(ctx, tmp, key); err != nil {
-		_ = sp.Delete(ctx, tmp)
 		return fmt.Errorf("install %q: %w", key, err)
 	}
 	// Re-apply the repo's WORM lock to the overwritten manifest so a repair

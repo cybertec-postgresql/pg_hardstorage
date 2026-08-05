@@ -426,18 +426,13 @@ func PushAuxiliaryFile(ctx context.Context, sp storage.StoragePlugin, path strin
 	}
 
 	key := AuxiliaryFilePath(opts.Deployment, base, kind)
-	tmp := key + ".tmp." + randSuffix()
 	putOpts := storage.PutOptions{ContentLength: int64(len(body))}
 	if !opts.WORM.IsZero() {
 		now := time.Now().UTC()
 		putOpts.RetainUntil = opts.WORM.RetainUntil(now)
 		putOpts.RetentionMode = storage.WORMMode(opts.WORM.Mode)
 	}
-	if _, err := sp.Put(ctx, tmp, bytes.NewReader(body), putOpts); err != nil {
-		return "", kind, fmt.Errorf("walsink push: put tmp aux file: %w", err)
-	}
-	if err := sp.RenameIfNotExists(ctx, tmp, key); err != nil {
-		_ = sp.Delete(ctx, tmp)
+	if err := storage.CommitExclusive(ctx, sp, key, body, putOpts); err != nil {
 		if errors.Is(err, storage.ErrAlreadyExists) {
 			// Idempotent: PG retried archive_command after a
 			// previous success; the existing object is the
@@ -511,18 +506,13 @@ func commitManifestStandalone(ctx context.Context, sp storage.StoragePlugin, m *
 		return err
 	}
 	key := SegmentPath(m.Deployment, m.Timeline, m.SegmentName)
-	tmp := key + ".tmp." + randSuffix()
 	putOpts := storage.PutOptions{ContentLength: int64(len(body))}
 	if !worm.IsZero() {
 		now := time.Now().UTC()
 		putOpts.RetainUntil = worm.RetainUntil(now)
 		putOpts.RetentionMode = storage.WORMMode(worm.Mode)
 	}
-	if _, err := sp.Put(ctx, tmp, bytes.NewReader(body), putOpts); err != nil {
-		return fmt.Errorf("walsink push: put tmp manifest: %w", err)
-	}
-	if err := sp.RenameIfNotExists(ctx, tmp, key); err != nil {
-		_ = sp.Delete(ctx, tmp)
+	if err := storage.CommitExclusive(ctx, sp, key, body, putOpts); err != nil {
 		if errors.Is(err, storage.ErrAlreadyExists) {
 			// Existing manifest at this key — could be a
 			// genuine retry (same content, true idempotent

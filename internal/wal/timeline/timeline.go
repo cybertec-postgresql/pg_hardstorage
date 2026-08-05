@@ -136,25 +136,18 @@ func (s *Store) Put(ctx context.Context, deployment string, tli uint32, content 
 		return fmt.Errorf("timeline: stat %s: %w", key, err)
 	}
 
-	// First write. Use the standard tmp + RenameIfNotExists
-	// pattern so concurrent leader-follow loops on two redundant
-	// agents don't double-commit. The tmp suffix is RANDOM per writer:
-	// a shared tmp path would let one agent's truncate-then-write leave
-	// the file partial when another agent renames it, installing a
-	// truncated .history.
-	tmp := key + ".tmp." + tmpSuffix()
+	// First write, published exclusively so concurrent leader-follow
+	// loops on two redundant agents cannot double-commit. Formerly a
+	// tmp + RenameIfNotExists, which cost a DELETE on every commit and
+	// needed a conditional COPY the backend might not implement
+	// (issue #45).
 	putOpts := storage.PutOptions{ContentLength: int64(len(content))}
 	if !s.worm.IsZero() {
 		now := time.Now().UTC()
 		putOpts.RetainUntil = s.worm.RetainUntil(now)
 		putOpts.RetentionMode = storage.WORMMode(s.worm.Mode)
 	}
-	if _, err := s.sp.Put(ctx, tmp, bytes.NewReader(content), putOpts); err != nil {
-		return fmt.Errorf("timeline: write tmp %s: %w", tmp, err)
-	}
-	if err := s.sp.RenameIfNotExists(ctx, tmp, key); err != nil {
-		// Cleanup tmp; surface the rename error.
-		_ = s.sp.Delete(ctx, tmp)
+	if err := storage.CommitExclusive(ctx, s.sp, key, content, putOpts); err != nil {
 		// A racing winner committed the same bytes: re-check via
 		// Stat → read; if it matches, treat as idempotent.
 		if errors.Is(err, storage.ErrAlreadyExists) {

@@ -128,17 +128,23 @@ func TestPushSegmentFile_PropagatesWORMRetention(t *testing.T) {
 		}
 	}
 
-	// Sanity: a manifest tmp must be among the recorded Puts so we
-	// know the manifest path (not just chunks) carries WORM too.
-	var sawManifestTmp bool
+	// Sanity: the manifest itself must be among the recorded Puts, so
+	// we know the manifest path (not just chunks) carries WORM.
+	//
+	// This used to look for a `.json.tmp.` staging key. The commit no
+	// longer stages on a backend with conditional PUT (issue #45), so
+	// asserting the temporary asserted the mechanism rather than the
+	// property — and would now pass or fail on which backend the
+	// fixture happens to be, not on whether retention was applied.
+	var sawManifest bool
 	for _, p := range rec.puts {
-		if strings.Contains(p.Key, "wal/db1/") && strings.Contains(p.Key, ".json.tmp.") {
-			sawManifestTmp = true
+		if strings.Contains(p.Key, "wal/db1/") && strings.HasSuffix(p.Key, ".json") {
+			sawManifest = true
 			break
 		}
 	}
-	if !sawManifestTmp {
-		t.Error("expected a wal manifest tmp Put among the recorded Puts; got keys:")
+	if !sawManifest {
+		t.Error("expected the wal manifest Put among the recorded Puts; got keys:")
 		for _, p := range rec.puts {
 			t.Errorf("  %s", p.Key)
 		}
@@ -236,11 +242,11 @@ func TestSink_PropagatesWORMRetentionToManifest(t *testing.T) {
 		if p.Opts.RetentionMode != storage.WORMMode("compliance") {
 			t.Errorf("streamed Put %q RetentionMode = %q, want compliance", p.Key, p.Opts.RetentionMode)
 		}
-		if strings.Contains(p.Key, "wal/db1/") && strings.Contains(p.Key, ".json.tmp.") {
+		if strings.Contains(p.Key, "wal/db1/") && strings.HasSuffix(p.Key, ".json") {
 			sawManifest = true
 		}
 	}
 	if !sawManifest {
-		t.Error("expected a streamed wal-manifest tmp Put carrying WORM")
+		t.Error("expected the streamed wal-manifest Put to carry WORM")
 	}
 }

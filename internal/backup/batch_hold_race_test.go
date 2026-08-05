@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"io"
-	"strings"
 	"sync"
 	"testing"
 
@@ -22,12 +21,25 @@ type batchHoldInjectSP struct {
 	once         sync.Once
 }
 
+// Injection fires just BEFORE the tombstone becomes visible.
+//
+// It used to hook the `<key>.tmp.<rand>` staging Put, relying on the
+// window between staging and the rename. The tombstone is now
+// published by a single conditional PUT (issue #45), so no such window
+// exists and hooking the temporary stopped injecting anything — the
+// tests passed vacuously with the race never simulated.
+//
+// Hooking the tombstone key itself, before delegating, reproduces the
+// same interleaving: the hold lands while the tombstone is being
+// written but before it is durable, so PutHold's own tombstone guard
+// still sees nothing and the post-tombstone re-check is what must
+// catch it.
+
 func (s *batchHoldInjectSP) Put(ctx context.Context, key string, r io.Reader, opts storage.PutOptions) (storage.PutResult, error) {
-	res, err := s.StoragePlugin.Put(ctx, key, r, opts)
-	if err == nil && strings.HasPrefix(key, s.tombstoneKey+".tmp.") {
+	if key == s.tombstoneKey {
 		s.once.Do(s.inject)
 	}
-	return res, err
+	return s.StoragePlugin.Put(ctx, key, r, opts)
 }
 
 // TestSoftDeleteBatch_HoldPlacedDuringBatchRollsBack pins bug 18 (batch

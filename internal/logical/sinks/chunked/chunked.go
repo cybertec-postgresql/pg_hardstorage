@@ -270,14 +270,8 @@ func (s *Sink) commitManifest(ctx context.Context, m *SegmentManifest) error {
 	}
 	body = append(body, '\n')
 	key := SegmentPath(m.Deployment, m.StreamName, s.startLSN)
-	tmp := key + ".tmp"
-	if _, err := s.sp.Put(ctx, tmp, bytes.NewReader(body), storage.PutOptions{
-		ContentLength: int64(len(body)),
-	}); err != nil {
-		return fmt.Errorf("chunked: put tmp manifest: %w", err)
-	}
-	if err := s.sp.RenameIfNotExists(ctx, tmp, key); err != nil {
-		_ = s.sp.Delete(ctx, tmp)
+	// Conditional PUT where available, staging where not (issue #45).
+	if err := storage.CommitExclusive(ctx, s.sp, key, body, storage.PutOptions{}); err != nil {
 		if errors.Is(err, storage.ErrAlreadyExists) {
 			// Idempotent: a previous flush at this start_lsn
 			// already committed this batch. Chunks deduplicated

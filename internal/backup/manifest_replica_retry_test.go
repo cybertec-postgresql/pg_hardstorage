@@ -17,7 +17,7 @@ import (
 // primary commit succeeds.
 type flakyReplicaSP struct {
 	storage.StoragePlugin
-	tmpPrefix string
+	tmpPrefix string // key prefix whose writes fail
 	failN     int
 	calls     atomic.Int32
 }
@@ -39,8 +39,14 @@ func commitFixture(t *testing.T, failN int) (*backup.ManifestStore, storage.Stor
 	m.ParentBackupID = ""
 	flaky := &flakyReplicaSP{
 		StoragePlugin: sp,
-		tmpPrefix:     backup.ReplicaPath(m.BackupID) + ".tmp.",
-		failN:         failN,
+		// The replica commit no longer stages through a
+		// `<key>.tmp.<rand>` object on backends with conditional PUT
+		// (issue #45), so failing the temporary stopped failing
+		// anything. Fail writes to the replica KEY instead: that is
+		// the operation whose retry is under test, however it is
+		// implemented underneath.
+		tmpPrefix: backup.ReplicaPath(m.BackupID),
+		failN:     failN,
 	}
 	return backup.NewManifestStore(flaky), sp, signer, m, flaky
 }

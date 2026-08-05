@@ -393,9 +393,13 @@ func TestRosterStore_PutTwice(t *testing.T) {
 	}
 }
 
-// tmpRecordingSP wraps a StoragePlugin and records every Put key so a test
-// can assert RosterStore.Put stages through a randomised key+".tmp.<rand>"
-// rather than a fixed key+".tmp" two concurrent first-writers would tear.
+// tmpRecordingSP wraps a StoragePlugin and records every Put key.
+//
+// It used to back an assertion that RosterStore.Put staged through a
+// randomised `key+".tmp.<rand>"`. The commit no longer stages on a
+// backend with conditional PUT (issue #45), and the exclusivity that
+// staging bought is covered by TestRosterStore_PutTwice; staging-name
+// uniqueness now has one home, in storage.CommitExclusive's own tests.
 type tmpRecordingSP struct {
 	storage.StoragePlugin
 	mu          sync.Mutex
@@ -498,30 +502,6 @@ func TestRosterStore_PutAppliesRetention(t *testing.T) {
 
 // TestRosterStore_RandomisedTmp pins the torn-overwrite fix: the staging key
 // must be a randomised key+".tmp.<rand>", never the fixed key+".tmp".
-func TestRosterStore_RandomisedTmp(t *testing.T) {
-	rec := &tmpRecordingSP{StoragePlugin: makeStorage(t)}
-	store := threshold.NewRosterStore(rec)
-	r, _, _, _ := makeRoster(t, 2)
-	if err := store.Put(context.Background(), r); err != nil {
-		t.Fatalf("Put: %v", err)
-	}
-	var tmp string
-	for _, k := range rec.putKeys {
-		if strings.Contains(k, ".tmp") {
-			tmp = k
-		}
-	}
-	if tmp == "" {
-		t.Fatalf("no .tmp staging Put observed; keys=%v", rec.putKeys)
-	}
-	final := strings.SplitN(tmp, ".tmp", 2)[0]
-	if tmp == final+".tmp" {
-		t.Errorf("staging key is fixed %q — torn-overwrite race on concurrent same-ID writes", tmp)
-	}
-	if !strings.HasPrefix(tmp, final+".tmp.") {
-		t.Errorf("staging key %q is not the expected randomised %q.tmp.<rand> shape", tmp, final)
-	}
-}
 
 func TestRosterStore_GetMissing(t *testing.T) {
 	sp := makeStorage(t)

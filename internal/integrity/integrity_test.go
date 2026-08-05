@@ -456,7 +456,7 @@ func (w *tmpRecordingSP) Put(ctx context.Context, key string, r io.Reader, opts 
 // RunStore.Put writes before the atomic rename must be a randomised
 // key+".tmp.<rand>", never the fixed key+".tmp" two concurrent writers
 // would collide on.
-func TestRunStore_RandomisedTmp(t *testing.T) {
+func TestRunStore_CommitIsExclusive(t *testing.T) {
 	f := newFixture(t)
 	f.commitBackup(t, "db1", "x", 2)
 	eng := integrity.NewEngine(integrity.EngineOptions{
@@ -469,25 +469,26 @@ func TestRunStore_RandomisedTmp(t *testing.T) {
 
 	rec := &tmpRecordingSP{StoragePlugin: f.sp}
 	store := integrity.NewRunStore(rec)
-	if err := store.Put(context.Background(), r); err != nil {
+	ctx := context.Background()
+	if err := store.Put(ctx, r); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
 
-	var tmp string
-	for _, k := range rec.putKeys {
-		if strings.Contains(k, ".tmp") {
-			tmp = k
-		}
-	}
-	if tmp == "" {
-		t.Fatalf("no .tmp staging Put observed; keys=%v", rec.putKeys)
-	}
-	final := strings.SplitN(tmp, ".tmp", 2)[0]
-	if tmp == final+".tmp" {
-		t.Errorf("staging key is fixed %q — torn-overwrite race on concurrent same-ID writes", tmp)
-	}
-	if !strings.HasPrefix(tmp, final+".tmp.") {
-		t.Errorf("staging key %q is not the expected randomised %q.tmp.<rand> shape", tmp, final)
+	// This used to assert a randomised `.tmp.<rand>` staging key, which
+	// guarded against two concurrent writers of the same run ID sharing
+	// one staging object and tearing each other's bytes. The commit no
+	// longer stages at all on a backend with conditional PUT (issue
+	// #45), so that assertion tested a mechanism rather than the
+	// property — and the staging-name uniqueness it cared about now
+	// lives in one place, with its own test
+	// (storage.TestCommitExclusive_StagingNamesAreUnique).
+	//
+	// What still has to hold here is what the staging bought: a second
+	// writer of the same run ID must be REJECTED, not allowed to
+	// overwrite.
+	if err := store.Put(ctx, r); err == nil {
+		t.Error("a second Put of the same run ID succeeded; an integrity run is immutable " +
+			"evidence, and silently overwriting one loses the record it exists to keep")
 	}
 }
 
