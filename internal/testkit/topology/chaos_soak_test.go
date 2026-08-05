@@ -35,6 +35,8 @@ import (
 	"math/rand"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -43,10 +45,7 @@ import (
 )
 
 func TestChaosSoak_RestoreProof(t *testing.T) {
-	bin := os.Getenv("PGHS_CHAOS_BIN")
-	if bin == "" {
-		t.Skip("set PGHS_CHAOS_BIN to the pg_hardstorage binary under test")
-	}
+	bin := chaosBinary(t)
 	minutes := 6
 	if v := os.Getenv("PGHS_CHAOS_MINUTES"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
@@ -274,4 +273,56 @@ func TestChaosSoak_RestoreProof(t *testing.T) {
 	if !t.Failed() {
 		t.Logf("✓ chaos soak passed: %d rounds, %d backups all verified+restored, WAL gap-free, single shared DEK (seed=%d)", round, len(ids), seed)
 	}
+}
+
+// chaosBinary resolves the pg_hardstorage binary this soak drives,
+// BUILDING it if necessary.
+//
+// It used to skip when PGHS_CHAOS_BIN was unset. A skip reports PASS,
+// and a harness that greps for pass/fail — including the soak campaign
+// this test was written for — then records a chaos phase that never
+// ran as a chaos phase that succeeded. The 4-hour campaign of
+// 2026-08-05 did exactly that: the phase "passed" in two seconds.
+//
+// A test that needs an artifact it can produce should produce it. The
+// only remaining skip is the genuinely-unavailable case (no Go
+// toolchain to build with), and that one is loud.
+func chaosBinary(t *testing.T) string {
+	t.Helper()
+	if bin := os.Getenv("PGHS_CHAOS_BIN"); bin != "" {
+		if _, err := os.Stat(bin); err != nil {
+			t.Fatalf("PGHS_CHAOS_BIN=%s is not usable: %v — an explicitly-set binary that "+
+				"does not exist is a configuration error, not a reason to skip", bin, err)
+		}
+		return bin
+	}
+
+	// Prefer an already-built binary; fall back to building one.
+	root := repoRootForChaos(t)
+	built := filepath.Join(root, "bin", "pg_hardstorage")
+	if _, err := os.Stat(built); err == nil {
+		return built
+	}
+
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skipf("no pg_hardstorage binary at %s and no Go toolchain to build one: %v",
+			built, err)
+	}
+	out := filepath.Join(t.TempDir(), "pg_hardstorage")
+	cmd := exec.Command("go", "build", "-o", out, "./cmd/pg_hardstorage")
+	cmd.Dir = root
+	if b, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("building the binary under test failed: %v\n%s", err, b)
+	}
+	t.Logf("chaos soak: built %s", out)
+	return out
+}
+
+func repoRootForChaos(t *testing.T) string {
+	t.Helper()
+	_, here, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	return filepath.Clean(filepath.Join(filepath.Dir(here), "..", "..", ".."))
 }

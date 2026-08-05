@@ -338,9 +338,12 @@ func TestModelCheck_FixedSeeds(t *testing.T) {
 func TestModelCheck_Randomized(t *testing.T) {
 	seedEnv := os.Getenv("PGHS_MODELCHECK_SEED")
 	opsEnv := os.Getenv("PGHS_MODELCHECK_OPS")
-	if seedEnv == "" && opsEnv == "" {
-		t.Skip("set PGHS_MODELCHECK_SEED and/or PGHS_MODELCHECK_OPS for a deep randomized run")
-	}
+	// No skip when the env is unset: a skip reports PASS, so a harness
+	// that greps for pass/fail records a run that never happened as a
+	// success. The soak campaign of 2026-08-05 did exactly that with
+	// the chaos phase — "passed" in two seconds having run nothing.
+	// Every other soak in this tree defaults to a short run and lets
+	// the environment deepen it; this one now matches.
 	seed := time.Now().UnixNano()
 	if seedEnv != "" {
 		if n, err := strconv.ParseInt(seedEnv, 10, 64); err == nil {
