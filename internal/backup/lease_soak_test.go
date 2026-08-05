@@ -24,6 +24,7 @@ import (
 	"math/rand"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -99,6 +100,7 @@ func runLeaseSoak(t *testing.T, scheme string, sp storage.StoragePlugin) {
 		renews    atomic.Int64
 		lost      atomic.Int64
 		abandoned atomic.Int64
+		transient atomic.Int64
 		firstFail atomic.Value
 	)
 	fail := func(format string, args ...any) {
@@ -130,6 +132,16 @@ func runLeaseSoak(t *testing.T, scheme string, sp storage.StoragePlugin) {
 				case errors.Is(err, ErrBackupInProgress):
 					blocked.Add(1)
 					time.Sleep(time.Duration(rng.Intn(20)) * time.Millisecond)
+					continue
+				case isTransientBackendErr(err):
+					// A fixture under 150k requests in eight minutes
+					// drops connections; the lease correctly propagates
+					// that. The property under test is mutual exclusion,
+					// not backend availability, so treating a transport
+					// failure as a correctness violation would report
+					// the wrong thing — and did, on the first run.
+					transient.Add(1)
+					time.Sleep(time.Duration(rng.Intn(50)) * time.Millisecond)
 					continue
 				default:
 					fail("%s: acquire returned an unexpected error: %v", scheme, err)
@@ -208,6 +220,35 @@ func runLeaseSoak(t *testing.T, scheme string, sp storage.StoragePlugin) {
 		t.Fatalf("%s: peak concurrent holders = %d", scheme, maxLive.Load())
 	}
 	t.Logf("%s lease soak: %d acquires, %d blocked, %d renews, %d lost, %d abandoned, "+
-		"peak holders %d", scheme, acquires.Load(), blocked.Load(), renews.Load(),
-		lost.Load(), abandoned.Load(), maxLive.Load())
+		"%d transient backend errors, peak holders %d", scheme, acquires.Load(),
+		blocked.Load(), renews.Load(), lost.Load(), abandoned.Load(),
+		transient.Load(), maxLive.Load())
+}
+
+// isTransientBackendErr reports whether err is the fixture or network
+// faltering rather than the lease misbehaving.
+//
+// Deliberately narrow: it must not swallow a correctness failure. A
+// mutual-exclusion violation is detected by the live-holder count, not
+// by an error, so nothing here can hide one.
+func isTransientBackendErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	for _, s := range []string{
+		"request send failed",
+		"exceeded maximum number of attempts",
+		"connection reset",
+		"broken pipe",
+		"eof",
+		"timeout",
+		"no such host",
+		"connection refused",
+	} {
+		if strings.Contains(msg, s) {
+			return true
+		}
+	}
+	return false
 }
