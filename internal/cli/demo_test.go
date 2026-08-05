@@ -86,7 +86,12 @@ func TestRunDemo_HappyPath_RunsFullFlowAndCleansUp(t *testing.T) {
 		}
 	}
 	// The container must always be torn down.
-	if !f.called("docker rm -f container0abc") {
+	// -fv, not -f: without -v the container's anonymous volume survives,
+	// and the postgres image declares one. A demo run per developer per
+	// day accumulated 699 dangling volumes on this host before anyone
+	// noticed, and the disk filling then surfaced as unrelated-looking
+	// plugin failures.
+	if !f.called("docker rm -fv container0abc") {
 		t.Errorf("demo must tear down the container; calls: %v", f.calls)
 	}
 }
@@ -124,7 +129,7 @@ func TestRunDemo_StepFailure_StillCleansUp(t *testing.T) {
 		t.Errorf("error code = %q, want demo.step_failed", code)
 	}
 	// Cleanup must run even though a mid-flow step failed.
-	if !f.called("docker rm -f cidX") {
+	if !f.called("docker rm -fv cidX") {
 		t.Errorf("container must be removed even when a step fails; calls: %v", f.calls)
 	}
 }
