@@ -31,6 +31,8 @@ import (
 	"sort"
 	"strings"
 	"testing"
+
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup/keystore"
 )
 
 const chartDir = "charts/pg-hardstorage-sidecar"
@@ -183,5 +185,60 @@ func forEachChartDoc(t *testing.T, root string, fn func(rel, body string)) {
 			t.Fatalf("read %s: %v", rel, err)
 		}
 		fn(rel, string(body))
+	}
+}
+
+// TestChartKeyringFilenamesMatchTheProduct pins the chart's projected
+// filenames against the constants the agent actually reads.
+//
+// This is the failure the projected mount invites. An operator keys
+// their Secret however they like — `kek`, `private-key`, whatever the
+// external-secrets template produced — and the chart maps it to a
+// filename. If that filename drifts from keystore.KEKFileName or
+// keystore.PrivateKeyFile, the mounted directory looks fully populated
+// and the agent finds nothing: `doctor` reports the signing key absent,
+// backups go unsigned or fail to start, and nothing in the manifest
+// says the cause was a filename.
+//
+// So the chart does NOT take the path from values, and this test holds
+// it to the source of truth rather than to a copy of it.
+func TestChartKeyringFilenamesMatchTheProduct(t *testing.T) {
+	manifests := renderChart(t,
+		"keyring.kek.secretName=kek-secret",
+		"keyring.signingKey.secretName=signing-secret",
+		"keyring.signingPub.secretName=pub-secret",
+	)
+	if !strings.Contains(manifests, "projected:") {
+		t.Fatal("per-file keyring sources did not render a projected volume; three Secrets " +
+			"cannot otherwise share one mount path")
+	}
+	for _, want := range []string{
+		keystore.KEKFileName,
+		keystore.PrivateKeyFile,
+		keystore.PublicKeyFile,
+	} {
+		if !strings.Contains(manifests, "path: "+want) {
+			t.Errorf("the chart never mounts a file named %q.\n\n"+
+				"That is the name the agent opens (from internal/backup/keystore). A "+
+				"projected keyring under any other name gives a directory that looks "+
+				"populated and an agent that finds nothing.", want)
+		}
+	}
+}
+
+// TestChartKeyringPerFileIsOptional: the per-file sources must not
+// disturb the simple paths.
+func TestChartKeyringPerFileIsOptional(t *testing.T) {
+	// existingSecret alone still renders a plain secret volume.
+	m := renderChart(t, "keyring.existingSecret=one-secret")
+	if strings.Contains(m, "projected:") {
+		t.Error("existingSecret rendered a projected volume; the simple case should stay simple")
+	}
+	if !strings.Contains(m, "secretName: one-secret") {
+		t.Error("existingSecret did not render its secret volume")
+	}
+	// And nothing at all by default.
+	if strings.Contains(renderChart(t), "keyring") {
+		t.Error("the default render references a keyring")
 	}
 }

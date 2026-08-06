@@ -109,7 +109,7 @@ spec:
             # short-lived staging files.
             - name: tmp
               mountPath: /tmp
-            {{- if or .Values.keyring.existingSecret .Values.keyring.files }}
+            {{- if include "pg-hardstorage-sidecar.keyringEnabled" . }}
             # The keyring the docs promised and the chart never
             # mounted (issue #46). Read-only: the agent reads the KEK,
             # it never writes here.
@@ -128,11 +128,46 @@ spec:
           emptyDir:
             medium: Memory
             sizeLimit: 64Mi
-        {{- if or .Values.keyring.existingSecret .Values.keyring.files }}
+        {{- if include "pg-hardstorage-sidecar.keyringEnabled" . }}
         - name: keyring
+          {{- if include "pg-hardstorage-sidecar.keyringProjected" . }}
+          # Projected: the three keyring files may come from three
+          # different Secrets, and they must all land in one directory.
+          # Separate `secret` volumes cannot share a mount path.
+          #
+          # `path` is the filename the agent looks for and is NOT taken
+          # from values — a keyring with the right bytes under the wrong
+          # name looks populated and does not work. Pinned against the
+          # product's own constants by TestChartKeyringFilenamesMatchTheProduct.
+          projected:
+            defaultMode: {{ .Values.keyring.defaultMode }}
+            sources:
+              {{- with .Values.keyring.kek.secretName }}
+              - secret:
+                  name: {{ . | quote }}
+                  items:
+                    - key: {{ $.Values.keyring.kek.key | quote }}
+                      path: kek.bin
+              {{- end }}
+              {{- with .Values.keyring.signingKey.secretName }}
+              - secret:
+                  name: {{ . | quote }}
+                  items:
+                    - key: {{ $.Values.keyring.signingKey.key | quote }}
+                      path: manifest_signing.ed25519
+              {{- end }}
+              {{- with .Values.keyring.signingPub.secretName }}
+              - secret:
+                  name: {{ . | quote }}
+                  items:
+                    - key: {{ $.Values.keyring.signingPub.key | quote }}
+                      path: manifest_signing.pub
+              {{- end }}
+          {{- else }}
           secret:
             secretName: {{ .Values.keyring.existingSecret | default (printf "%s-keyring" (include "pg-hardstorage-sidecar.fullname" .)) }}
             defaultMode: {{ .Values.keyring.defaultMode }}
+          {{- end }}
         {{- end }}
         {{- with .Values.extraVolumes }}
         {{- toYaml . | nindent 8 }}

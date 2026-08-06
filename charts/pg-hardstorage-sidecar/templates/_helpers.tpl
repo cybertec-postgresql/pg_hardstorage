@@ -77,3 +77,21 @@ did not pin a tag explicitly.
 {{- $tag := .Values.image.tag | default .Chart.AppVersion -}}
 {{- printf "%s:%s" .Values.image.repository $tag -}}
 {{- end -}}
+
+{{/*
+Whether any per-file keyring source is configured.
+*/}}
+{{- define "pg-hardstorage-sidecar.keyringProjected" -}}
+{{- if or .Values.keyring.kek.secretName .Values.keyring.signingKey.secretName .Values.keyring.signingPub.secretName -}}
+true
+{{- end -}}
+{{- end -}}
+
+{{/*
+Whether the keyring should be mounted at all.
+*/}}
+{{- define "pg-hardstorage-sidecar.keyringEnabled" -}}
+{{- if or .Values.keyring.existingSecret .Values.keyring.files (include "pg-hardstorage-sidecar.keyringProjected" .) -}}
+true
+{{- end -}}
+{{- end -}}

@@ -82,6 +82,31 @@ keyring:
   # existingSecret for anything you would not paste in a ticket.
   files: {}
 
+  # Per-file sources. Use these when the three keyring files live in
+  # DIFFERENT Secrets — the usual shape once the signing key is managed
+  # by sealed-secrets or external-secrets while the KEK comes from
+  # somewhere else.
+  #
+  # Setting any of them switches the mount to a projected volume, which
+  # merges several sources into one directory. Three separate `secret`
+  # volumes cannot be mounted at one path; a projected volume is the
+  # primitive for exactly this.
+  #
+  # `key` is the key WITHIN the Secret. The filename the agent looks for
+  # is fixed by the product and is not configurable here — getting it
+  # wrong produces a keyring that looks populated and does not work, so
+  # the chart writes the correct name regardless of how you key it in
+  # your Secret.
+  kek:
+    secretName: ""
+    key: kek.bin
+  signingKey:
+    secretName: ""
+    key: manifest_signing.ed25519
+  signingPub:
+    secretName: ""
+    key: manifest_signing.pub
+
   # Mode for the mounted files. 0400 (owner read-only) matches the
   # keyring's on-disk expectation; the directory itself is managed by
   # the kubelet.

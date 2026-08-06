@@ -181,9 +181,49 @@ keyring:
 Neither is rendered when both are empty, so a KMS-backed
 deployment mounts nothing extra.
 
-Anything the chart does not model — a second Secret, a
-CSI-mounted key, a CA bundle — goes through `extraVolumes`
-and `extraVolumeMounts`, which are applied verbatim.
+The keyring holds three files, and they must share one
+directory:
+
+| File | Purpose |
+| --- | --- |
+| `kek.bin` | the local KEK |
+| `manifest_signing.ed25519` | manifest signing key (private) |
+| `manifest_signing.pub` | its public half |
+
+When those come from **different** Secrets — the usual
+shape once the signing key is managed by sealed-secrets or
+external-secrets while the KEK comes from elsewhere — name
+them individually. The chart then mounts a projected volume,
+which merges several sources into one directory; three
+separate `secret` volumes cannot share a mount path.
+
+```yaml
+keyring:
+  kek:
+    secretName: pgh-kek
+    key: kek.bin                    # key WITHIN that Secret
+  signingKey:
+    secretName: pgh-signing
+    key: private.pem
+  signingPub:
+    secretName: pgh-signing
+    key: public.pem
+```
+
+`key` is how *you* keyed it; the filename the agent opens is
+fixed by the product and is not configurable. A keyring with
+the right bytes under the wrong name looks fully populated
+and does not work — `doctor` reports the signing key absent
+and nothing says the cause was a filename — so the chart
+writes the correct names regardless of your keying, and a
+test pins them against the product's own constants.
+
+Any subset works: name only `kek` and the other two simply
+are not mounted.
+
+Anything the chart does not model — a CSI-mounted key, a CA
+bundle — goes through `extraVolumes` and `extraVolumeMounts`,
+which are applied verbatim.
 
 ### KMS provider (recommended)
 
