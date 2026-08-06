@@ -105,7 +105,7 @@ into an in-memory `external.Registry`.  See
 | --- | --- | --- |
 | Supply chain | One signed `pg_hardstorage` binary | Each plugin is a separate binary the operator must trust |
 | FIPS build | Inherited from the host binary | Plugin must declare its own FIPS posture; mixed-mode is refused under `--fips-strict` |
-| Crash blast radius | Plugin panic = process exit (we don't recover) | Plugin panic = subprocess exit; host marks plugin failed and surfaces a `plugin.crashed` event |
+| Crash blast radius | Plugin panic = process exit (we don't recover) | Plugin panic = subprocess exit; the host marks the plugin failed and surfaces `plugin.tier2.probe_failed` |
 | Discovery | Compile-time (`_ "…/internal/plugin/x/y"` in `cmd/`) | Runtime (`$HSPLUGIN_PATH` walk + `--probe`) |
 | Versioning | Locked to `pg_hardstorage` SemVer | Plugin declares its own SemVer + protocol version; mismatched protocol = refusal at handshake |
 | Auditing | Linked binary set fixed at build | `pg_hardstorage doctor` lists every loaded plugin with name, version, path, signature |
@@ -124,7 +124,10 @@ shipping bespoke logic against the public protocol.
 - The CLI verbs that surface plugin state:
   `pg_hardstorage doctor`, `pg_hardstorage plugin list`,
   `pg_hardstorage repo capabilities`.
-- The audit-event types the host emits about plugin
-  lifecycle: `plugin.discovered`, `plugin.handshake.ok`,
-  `plugin.handshake.refused`, `plugin.crashed`,
-  `plugin.unloaded` — see the audit-event-schema reference.
+- Plugin-lifecycle events. What ships today are two output
+  events under the `plugin.tier2` component:
+  `plugin.tier2.discovered` and `plugin.tier2.probe_failed`.
+  A dedicated audit-event schema for the fuller lifecycle
+  (handshake accepted/refused, crash, unload) is not yet
+  shipped, and there is no audit-event-schema reference page
+  to link to yet.

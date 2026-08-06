@@ -9,8 +9,11 @@ gap window is now refused.
 
 - `pg_hardstorage doctor` reports `wal_gap_detected` for the
   deployment.
-- `wal stream` logs include a `wal.slot_recreated` notice with
-  non-zero `gap_bytes` or `gap_seconds`.
+- `wal stream` logs include a `wal.follower.wal_gap_detected` event
+  at `critical`, carrying non-zero `gap_bytes` plus `gap_start_lsn`
+  and `gap_end_lsn`. (The reconnect that finds *no* gap emits
+  `wal.follower.slot_reconciled` at `notice` instead — if that is
+  what you see, this runbook does not apply.)
 - An attempted PITR within the gap window fails with
   `restore.target_in_wal_gap` (exit 7).
 - Patroni's REST endpoint shows a recent leader change.

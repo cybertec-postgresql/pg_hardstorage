@@ -68,9 +68,11 @@ in an entry) must match exactly.
 pg_hardstorage doctor
 ```
 
-`doctor` reports the resolved policy in its system section.
-The audit log emits a `config.airgap.applied` event with
-the resolved mode + allowlist size on every startup.
+`doctor` reports the resolved policy in its system section —
+that is where you confirm the mode and allowlist that actually
+took effect. A malformed setting emits `config.airgapped.parse_failed`
+at `warning`. There is no per-startup audit event for the resolved
+policy; `doctor` is the check.
 
 ### 4. (Optional) One-off flag override
 
