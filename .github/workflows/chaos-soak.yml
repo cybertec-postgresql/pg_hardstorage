@@ -32,11 +32,70 @@ permissions:
 env:
   GO_VERSION: "1.26.5"
 
+# Three independent lanes, not three steps in one job.
+#
+# They used to share a single job capped at timeout-minutes: 120 while
+# their own step timeouts summed to 30m + 5h + 110m. The chaos soak ran
+# LAST, so whenever the earlier lanes ran long it was the restore-proof
+# gate — the strongest data-loss guard in the repository — that got cut
+# off. It went that way three nights running (2026-08-04, -05, -06),
+# each capped at ~2h, after finishing in ~1h35m on the three nights
+# before.
+#
+# The status made it easy to miss: a job killed by timeout-minutes is
+# reported as CANCELLED, which reads as "somebody stopped it" rather
+# than "the gate never ran". Separate lanes mean a slow soak can no
+# longer starve the gate, and a timeout now names the lane that
+# overran.
 jobs:
+  model-check:
+    name: repo model check (randomized)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - name: Deep randomized repo model check
+        env:
+          PGHS_MODELCHECK_OPS: "2000"
+          PGHS_MODELCHECK_BUDGET: "20m"
+        run: |
+          go test -count=1 -timeout 30m -v -run TestModelCheck_Randomized ./internal/cli/
+
+  storage-soaks:
+    name: storage backend soaks (long)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      # The storage soaks default to a ~15s smoke so the routine
+      # integration job stays inside its budget; length is what finds
+      # resource exhaustion and slow leaks, so the nightly is where it
+      # is actually paid for.
+      - name: Storage backend soaks (long)
+        env:
+          PGHS_STORAGE_SOAK_MINUTES: "20"
+          PGHS_FAULT_SOAK_MINUTES: "10"
+        run: |
+          go test -tags integration -count=1 -timeout 60m -v \
+            -run 'TestBackendSoak|TestFaultSoak' \
+            ./internal/plugin/storage/
+
   chaos-soak:
     name: chaos soak (restore-proof gate)
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    # The gate is O(backups) and each iteration is a full verify plus a
+    # real restore. 45 minutes of faults produces enough backups that
+    # the gate is the longest phase by far, so it gets its own lane and
+    # a budget that fits both halves.
+    timeout-minutes: 170
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -49,31 +108,12 @@ jobs:
         run: |
           docker pull -q ghcr.io/zalando/spilo-17:4.0-p1
           docker pull -q quay.io/coreos/etcd:v3.5.13
-      - name: Deep randomized repo model check
-        env:
-          PGHS_MODELCHECK_OPS: "2000"
-          PGHS_MODELCHECK_BUDGET: "20m"
-        run: |
-          go test -count=1 -timeout 30m -v             -run TestModelCheck_Randomized             ./internal/cli/
-      # The storage soaks default to a ~15s smoke so the routine
-      # integration job stays inside its budget; length is what finds
-      # resource exhaustion and slow leaks, so the nightly is where it
-      # is actually paid for.
-      - name: Storage backend soaks (long)
-        env:
-          PGHS_STORAGE_SOAK_MINUTES: "20"
-          PGHS_FAULT_SOAK_MINUTES: "10"
-        run: |
-          go test -tags integration -count=1 -timeout 5h -v \
-            -run 'TestBackendSoak|TestFaultSoak' \
-            ./internal/plugin/storage/
-
       - name: Run the soak
         env:
           PGHS_CHAOS_BIN: /tmp/pghs-chaos
           PGHS_CHAOS_MINUTES: ${{ github.event.inputs.minutes || '45' }}
           PGHS_CHAOS_SEED: ${{ github.event.inputs.seed || '' }}
         run: |
-          go test -tags chaos -count=1 -timeout 110m -v \
+          go test -tags chaos -count=1 -timeout 150m -v \
             -run TestChaosSoak_RestoreProof \
             ./internal/testkit/topology/
