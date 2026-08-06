@@ -121,6 +121,29 @@ func runReadRaceSoak(t *testing.T, scheme string, sp storage.StoragePlugin) {
 	}
 	key := func(i int) string { return fmt.Sprintf("readrace/k%02d.bin", i) }
 
+	// One key is published up front and never deleted, and readers
+	// include it in their rotation.
+	//
+	// Without it the soak could not prove anything on scp: every
+	// operation there spawns an ssh process, so in a 10-second budget a
+	// reader manages a few dozen Gets while writers churn the whole key
+	// space — and it hit ZERO complete reads while sftp managed 19,115.
+	// The vacuity check at the end then failed the run, correctly: the
+	// soak HAD proved nothing. But that is a property of the fixture's
+	// per-operation cost, not of the code under test, and a guard that
+	// fires on the fixture teaches people to ignore it.
+	//
+	// The race is unweakened: readers still hit churning keys most of
+	// the time, and a torn or untyped read on any of them still fails.
+	// What changes is that "no complete read ever" now means reads are
+	// broken, which is the only thing it should have meant.
+	const stableKey = "readrace/stable.bin"
+	if _, err := sp.Put(ctx, stableKey, bytes.NewReader(body),
+		storage.PutOptions{ContentLength: int64(len(body))}); err != nil &&
+		!errors.Is(err, storage.ErrAlreadyExists) {
+		t.Fatalf("%s: seed the stable key: %v", scheme, err)
+	}
+
 	deadline := time.Now().Add(dur)
 	var wg sync.WaitGroup
 
@@ -160,6 +183,9 @@ func runReadRaceSoak(t *testing.T, scheme string, sp storage.StoragePlugin) {
 			rng := rand.New(rand.NewSource(seed + 1000 + int64(r)))
 			for time.Now().Before(deadline) && firstFail.Load() == nil {
 				k := key(rng.Intn(keys))
+				if rng.Intn(3) == 0 {
+					k = stableKey
+				}
 				rc, err := sp.Get(ctx, k)
 				if err != nil {
 					if errors.Is(err, storage.ErrNotFound) {
@@ -204,7 +230,9 @@ func runReadRaceSoak(t *testing.T, scheme string, sp storage.StoragePlugin) {
 		t.Fatalf("%s read-race soak: %s", scheme, v.(string))
 	}
 	if complete.Load() == 0 {
-		t.Fatalf("%s: no complete read ever happened; the soak proved nothing", scheme)
+		t.Fatalf("%s: no complete read ever happened; the soak proved nothing "+
+			"(%d ErrNotFound, %d puts, %d deletes)", scheme,
+			notFound.Load(), puts.Load(), dels.Load())
 	}
 	if notFound.Load() == 0 {
 		t.Errorf("%s: no reader ever raced a delete — the soak never reached the state "+

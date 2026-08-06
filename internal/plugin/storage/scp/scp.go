@@ -739,6 +739,20 @@ func (s *sessionReader) Close() error {
 	if s.waitErr != nil {
 		return s.waitErr
 	}
+	// A finished ssh session reports io.EOF from Close. reap() has
+	// already waited for it, so by this point that is the NORMAL case,
+	// not a failure — and io.Closer's contract is that a successful
+	// Close returns nil.
+	//
+	// Returning EOF here made every scp read look failed to any caller
+	// that checks Close, which is the correct way to use an
+	// io.ReadCloser. `defer rc.Close()` hid it; the read-race soak did
+	// not, and reported that not one complete read had happened on scp
+	// while sftp managed 19,115 — the reads were all fine, the verdict
+	// was wrong.
+	if errors.Is(cerr, io.EOF) {
+		return nil
+	}
 	return cerr
 }
 
