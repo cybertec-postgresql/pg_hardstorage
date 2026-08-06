@@ -20,7 +20,7 @@ gap window is now refused.
 - Confirm scope of the gap:
 
   ```sh
-  pg_hardstorage wal list <deployment> --repo <url> -o json | jq '.result.body.gaps'
+  pg_hardstorage wal list <deployment> --repo <url> -o json | jq '.result.gaps'
   ```
 
   Each gap entry has `start_lsn`, `end_lsn`, and the timeline IDs

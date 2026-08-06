@@ -99,8 +99,8 @@ The structured JSON form is suitable for daily monitoring:
 
 ```sh
 pg_hardstorage capacity report --repo s3://acme-backups/ -o json \
-    | jq -e '.result.body.confidence == "high"
-             and .result.body.projected_bytes < 5e12'
+    | jq -e '.result.confidence == "high"
+             and .result.projected_bytes < 5e12'
 ```
 
 Exit code is non-zero (`jq -e`) if the projection breaches

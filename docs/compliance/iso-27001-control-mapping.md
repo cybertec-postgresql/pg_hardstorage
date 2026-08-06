@@ -91,7 +91,7 @@ JSON form:
 ```sh
 pg_hardstorage compliance report \
     --repo s3://acme-backups/ -o json \
-    | jq '.result.body.controls.controls[]
+    | jq '.result.controls.controls[]
           | select(.framework == "iso27001")'
 ```
 

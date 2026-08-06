@@ -99,7 +99,7 @@ pg_hardstorage compliance report \
     --repo s3://acme-backups/ \
     --since 2026-01-01 --until 2026-04-01 \
     -o json \
-    | jq '.result.body.controls.controls[]
+    | jq '.result.controls.controls[]
           | select(.framework == "soc2")'
 ```
 

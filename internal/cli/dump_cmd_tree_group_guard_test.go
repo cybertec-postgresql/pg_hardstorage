@@ -24,11 +24,12 @@ import (
 )
 
 type dumpNode struct {
-	Path           string `json:"path"`
-	Runnable       bool   `json:"runnable"`
-	HasSubcommands bool   `json:"has_subcommands"`
-	Hidden         bool   `json:"hidden"`
-	GroupGuard     bool   `json:"group_guard"`
+	Path           string   `json:"path"`
+	Runnable       bool     `json:"runnable"`
+	HasSubcommands bool     `json:"has_subcommands"`
+	Hidden         bool     `json:"hidden"`
+	GroupGuard     bool     `json:"group_guard"`
+	Flags          []string `json:"flags"`
 }
 
 func dumpTree(t *testing.T) []dumpNode {

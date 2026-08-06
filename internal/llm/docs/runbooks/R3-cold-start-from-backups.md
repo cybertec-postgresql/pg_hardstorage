@@ -71,7 +71,7 @@ Before touching anything, verify the inputs you have:
    restore` does that:
 
    ```sh
-   pg_hardstorage show <deployment> <backup-id> | jq '.result.body.pg_version'
+   pg_hardstorage show <deployment> <backup-id> | jq '.result.pg_version'
    ```
 
 2. **Preview before committing.** This prints the WAL replay range,

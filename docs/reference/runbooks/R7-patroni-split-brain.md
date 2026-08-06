@@ -138,6 +138,8 @@ must be reported per organisational policy.
   software-only fencing relies on cooperative shutdown.
 - Re-enable application traffic only after at least one fresh
   backup has succeeded and the verify gate has passed.
-- Plan a game-day exercise (`pg_hardstorage gameday run
-  --scenario patroni_split_brain` in v0.5+) to confirm the
-  recovery procedure works under realistic conditions.
+- Plan a game-day exercise to confirm the recovery procedure
+  works under realistic conditions. `pg_hardstorage gameday
+  list` shows the registered scenarios; `pg_hardstorage gameday
+  run patroni_failover` is the closest one to this runbook. A
+  dedicated split-brain scenario is not in the registry yet.

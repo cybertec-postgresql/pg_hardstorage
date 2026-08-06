@@ -4,9 +4,11 @@ package cli
 import (
 	"encoding/json"
 	"os"
+	"sort"
 	"strings"
 
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 )
 
 // newDumpCmdTreeCmd emits the entire cobra tree as a flat JSON list,
@@ -38,6 +40,12 @@ func newDumpCmdTreeCmd() *cobra.Command {
 				// 30-odd other pure groups — which is why it reported
 				// 41 uncovered leaves and had to be ignored.
 				GroupGuard bool `json:"group_guard,omitempty"`
+				// Flags is every flag valid on this command, local and
+				// inherited. Emitted so a docs guard can check that a
+				// `--flag` shown in a how-to actually exists on the
+				// command it is shown with — prose is hand-written and
+				// drifts, unlike the generated CLI reference.
+				Flags []string `json:"flags,omitempty"`
 			}
 			var nodes []node
 			var walk func(c *cobra.Command, prefix []string)
@@ -46,12 +54,21 @@ func newDumpCmdTreeCmd() *cobra.Command {
 				// after it (e.g. "wal stream", not "pg_hardstorage
 				// wal stream").
 				if len(prefix) > 0 {
+					var flags []string
+					c.Flags().VisitAll(func(f *pflag.Flag) {
+						flags = append(flags, f.Name)
+					})
+					c.InheritedFlags().VisitAll(func(f *pflag.Flag) {
+						flags = append(flags, f.Name)
+					})
+					sort.Strings(flags)
 					nodes = append(nodes, node{
 						Path:           strings.Join(prefix, " "),
 						Runnable:       c.Runnable(),
 						HasSubcommands: c.HasSubCommands(),
 						Hidden:         c.Hidden,
 						GroupGuard:     c.Annotations[groupGuardAnnotation] == "1",
+						Flags:          flags,
 					})
 				}
 				for _, sub := range c.Commands() {

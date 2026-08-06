@@ -261,7 +261,7 @@ type runbookBody struct {
 }
 
 // WriteText emits the bare Markdown for the text renderer. JSON
-// consumers get the same content under .result.body.markdown.
+// consumers get the same content under .result.markdown.
 func (b runbookBody) WriteText(w io.Writer) error {
 	_, err := io.WriteString(w, strings.TrimRight(b.Markdown, "\n"))
 	return err

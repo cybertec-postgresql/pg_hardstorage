@@ -218,7 +218,7 @@ barnacles.  We say *deployment* and *backup* and *restore*.  Not
 "stanza", not "repo node", not "diff backup".  The command tree
 reads like English: `pg_hardstorage backup db1`,
 `pg_hardstorage restore db1 --to "5 minutes ago"`,
-`pg_hardstorage doctor db1 --fix`.
+`pg_hardstorage doctor db1 --exit-on-issues`.
 
 This sounds like aesthetics; it isn't.  It's a forcing function for
 the design.  When a feature can't be named in plain English, it's a

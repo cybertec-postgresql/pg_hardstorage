@@ -19,11 +19,17 @@ upgrades inside that window. The control plane (when v0.5+ ships
 it) negotiates capabilities at registration time and refuses agents
 outside the window.
 
-You can check what version produced a manifest:
+A manifest records the **schema** it was written against, not the
+version of the binary that produced it:
 
 ```sh
-pg_hardstorage show db1 <backup-id> | jq '.result.body.producer_version'
+pg_hardstorage show db1 <backup-id> | jq '.result.schema'
 ```
+
+There is no producer-version field: neither the manifest nor the
+audit event records which build wrote them. If you need that
+provenance, keep it outside the repository — in the agent's own
+logs or your deployment records.
 
 Mixed-version evidence in the same repo is a normal state. Migrate
 clients before you migrate the central server, or vice versa — the

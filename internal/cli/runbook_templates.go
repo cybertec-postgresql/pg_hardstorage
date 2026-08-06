@@ -85,7 +85,7 @@ will fail at chunk-fetch or SHA-verify time.
 3. **Identify which backups depend on the bad chunks.**
 
        {{ .BinaryName }} list {{ .Deployment }} --repo {{ .RepoURL }} -o json | \
-         jq '.result.body.backups[] | {backup_id, stop_lsn}'
+         jq '.result.backups[] | {backup_id, stop_lsn}'
 
    Cross-reference with the failing-hash list. Backups that
    reference any failing hash are unrecoverable from this repo.
@@ -251,7 +251,7 @@ longer be decrypted.
    unrecoverable. Build the list:
 
        {{ .BinaryName }} list {{ .Deployment }} --repo {{ .RepoURL }} -o json | \
-         jq '.result.body.backups[] | {backup_id}'
+         jq '.result.backups[] | {backup_id}'
 
 3. **Document the loss as an audit event.** The compliance artifact
    IS the record that these bytes can no longer be read — that's

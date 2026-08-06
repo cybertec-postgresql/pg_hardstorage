@@ -125,7 +125,7 @@ chargeback pipeline:
 ```sh
 pg_hardstorage cost report --repo s3://acme-backups/ \
     -o json \
-    | jq -c '.result.body.deployments[] |
+    | jq -c '.result.deployments[] |
         {name, logical_gb: (.logical_bytes / 1e9),
          manifest_bytes, wal_bytes}' \
     | curl --data-binary @- https://billing.acme.example.com/api/v1/usage
@@ -149,7 +149,7 @@ pg_hardstorage repo usage --repo s3://acme-backups/ -o json \
     > usage.json
 pg_hardstorage cost report --repo s3://acme-backups/ -o json \
     > cost.json
-jq -s '.[0].result.body.total_bytes - .[1].result.body.total_physical_bytes' \
+jq -s '.[0].result.total_bytes - .[1].result.total_physical_bytes' \
     usage.json cost.json
 # Expect: 0
 ```

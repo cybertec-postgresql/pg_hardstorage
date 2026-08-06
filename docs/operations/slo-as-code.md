@@ -144,7 +144,7 @@ The structured JSON form is suitable for daily CI:
 
 ```sh
 pg_hardstorage slo report -o json \
-    | jq -e '[.result.body.deployments[]
+    | jq -e '[.result.deployments[]
               | select(.status == "missed")]
              | length == 0'
 ```
@@ -181,7 +181,7 @@ straightforward:
 
 ```sh
 pg_hardstorage slo report -o json \
-    | jq '.result.body.deployments[] |
+    | jq '.result.deployments[] |
           {deployment, target: .rpo_target_seconds,
            actual: .rpo_actual_seconds,
            headroom: (.rpo_target_seconds - .rpo_actual_seconds)}'

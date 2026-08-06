@@ -503,7 +503,7 @@ Override with `-o`:
 -o json       # single object, or array for list commands
 -o ndjson     # newline-delimited; mandatory for streaming commands
 -o yaml       # same schema as JSON, YAML-encoded
--o template   # Go template via --template '{{.result.body.backup_id}}'
+-o template   # Go template via --template '{{.result.backup_id}}'
 ```
 
 Or with the env var:

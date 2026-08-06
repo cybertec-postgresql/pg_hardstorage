@@ -45,16 +45,18 @@ pg_hardstorage kms rotate \
 ```
 
 ```console
-rotation preview
-  manifests scanned:        1247
-  matched (old kek_ref):    1184
-  already_rotated:             0
-  would_rewrite:            1184
-  unrelated_kek_ref:          63
+kms rotate — local://main → local://main-2026-q2
+  (dry-run — nothing rewritten)
+  Considered:           1247
+  would rotate:          1184
+  Skipped different KEK: 63 (other tenants)
+  Duration:             47200 ms
+  ✓ rotation plan is clean — re-run with --apply to commit
 ```
 
-`unrelated_kek_ref` is the multi-tenant safety: manifests
-wrapped under a different KEK ref are skipped, not failed.
+`Skipped different KEK` (`skipped_different_kek` in the JSON
+body) is the multi-tenant safety: manifests wrapped under a
+different KEK ref are skipped, not failed.
 
 ### 2. Apply
 
@@ -69,12 +71,12 @@ pg_hardstorage kms rotate \
 ```
 
 ```console
-rotation applied
-  manifests scanned:        1247
-  rewritten:                1184
-  already_rotated:             0
-  unrelated_kek_ref:          63
-  duration:                 47.2s
+kms rotate — local://main → local://main-2026-q2
+  Considered:           1247
+  rotated:               1184
+  Skipped different KEK: 63 (other tenants)
+  Duration:             47200 ms
+  ✓ rotation clean — old KEK can be retired after the operator's grace window
 ```
 
 The command rewrites each matching manifest atomically: decrypt
@@ -151,7 +153,7 @@ unwraps under the resolved KEK. Mismatches return exit 9.
 Only manifests with `--old-kek-ref` are touched. Manifests
 wrapped under different KEK refs (other tenants) are
 **skipped**, not failed. The result body's
-`unrelated_kek_ref` count tracks them so a 0 there means
+`skipped_different_kek` count tracks them so a 0 there means
 "every manifest in the repo got reconsidered."
 
 Operators rotating per-tenant KEKs run the command once per
@@ -163,11 +165,11 @@ matching that tenant's references.
 A rotation interrupted partway through is safely re-runnable
 with the same args. Manifests already rotated (their
 `kek_ref == --new-kek-ref`) are counted as `already_rotated`
-and skipped. Loop until `would_rewrite == 0`:
+and skipped. Loop until `rotated == 0`:
 
 ```bash
-while pg_hardstorage kms rotate ... --apply --quiet \
-    | jq '.result.body.would_rewrite' | grep -qv '^0$'; do :; done
+while pg_hardstorage kms rotate ... --apply --quiet -o json \
+    | jq '.result.rotated' | grep -qv '^0$'; do :; done
 ```
 
 ## Cloud-KMS rotation
@@ -205,9 +207,12 @@ rotation; nothing about the audit log changes.
 you point at the wrong keyring? Did the keyring change between
 backup and rotate? Compare against `pg_hardstorage kms inspect`.
 
-**`unrelated_kek_ref` is non-zero and unexpected** — the repo
-contains manifests from a tenant you didn't expect. Confirm
-with `pg_hardstorage list --tenant`.
+**`skipped_different_kek` is non-zero and unexpected** — the
+repo contains manifests wrapped under a KEK ref you didn't
+expect: another tenant, or an earlier rotation that didn't
+finish. `pg_hardstorage kms verify --repo <url>` counts every
+manifest whose ref the local resolver doesn't recognise as
+`kek_unknown`; `--kek-ref` narrows a run to a single ref.
 
 **Replica copy out of sync** — `repo check` flags it; re-run
 the rotation against the replica with the same args to bring

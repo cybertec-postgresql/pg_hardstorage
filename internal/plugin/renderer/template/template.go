@@ -4,8 +4,15 @@
 // Use case: monitoring scripts that want to extract one field
 // without piping through `jq`.  Examples:
 //
-//	pg_hardstorage status -o template --template '{{(index .Result.deployments 0).rpo_seconds}}'
-//	pg_hardstorage list db1 -o template --template '{{range .Result.backups}}{{.id}}{{"\n"}}{{end}}'
+//	pg_hardstorage deployment list -o template --template '{{range .result.deployments}}{{.name}}{{"\n"}}{{end}}'
+//	pg_hardstorage list db1 -o template --template '{{range .result.backups}}{{.backup_id}}{{"\n"}}{{end}}'
+//
+// The root key is `result`, lower-case, exactly as `-o json` emits
+// it — the map comes from a JSON round-trip, so text/template's
+// lookup is case-sensitive against the JSON tag. `.Result` finds
+// nothing and renders EMPTY with exit 0, which is why these
+// examples are checked against the binary by
+// TestDocumentedTemplateRootIsTheJSONKey.
 //
 // The template is parsed once per renderer instance.  The data
 // passed in is the JSON shape of the Result (after a stdjson

@@ -92,7 +92,7 @@ pg_hardstorage audit search \
     --since 2026-04-01 --until 2026-04-15 \
     --repo s3://acme-backups/ \
     -o json \
-    | jq '.result.body[] | .subject'
+    | jq '.result.events[] | {timestamp, action, deployment, backup_id}'
 ```
 
 For affected-data scoping, the backup manifest's logical
@@ -108,7 +108,7 @@ pg_hardstorage compliance report \
     --repo s3://acme-backups/ \
     --since 2026-01-01 --until 2026-04-01 \
     -o json \
-    | jq '.result.body.controls.controls[]
+    | jq '.result.controls.controls[]
           | select(.framework == "hipaa")'
 ```
 

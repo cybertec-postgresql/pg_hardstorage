@@ -57,10 +57,10 @@ new backups from being written under a missing key.
    `encryption.kek_ref` and `backup_id`):
 
    ```sh
-   for d in $(pg_hardstorage deployment list -o json | jq -r '.result.body.deployments[].name'); do
-     for b in $(pg_hardstorage list "$d" -o json | jq -r '.result.body.backups[].backup_id'); do
+   for d in $(pg_hardstorage deployment list -o json | jq -r '.result.deployments[].name'); do
+     for b in $(pg_hardstorage list "$d" -o json | jq -r '.result.backups[].backup_id'); do
        pg_hardstorage manifest show "$d" "$b" -o json | jq -r --arg key "<missing-kek-ref>" \
-         'select(.result.body.encryption.kek_ref == $key) | "\(.result.body.backup_id)"' \
+         'select(.result.encryption.kek_ref == $key) | "\(.result.backup_id)"' \
          | sed "s|^|$d |"
      done
    done
