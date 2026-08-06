@@ -15,7 +15,7 @@ import (
 func init() {
 	Register(Scenario{
 		Name:        "agent_kill",
-		Description: "SIGKILL the agent process mid-operation; assert self-supervised recovery.",
+		Description: "An agent killed mid-backup leaves an unrenewed lease. Asserts a second agent is excluded while it is live, and that exactly one of several racing agents reclaims it after expiry.",
 		Tier:        "L2",
 		Run:         runAgentKill,
 	})
@@ -33,95 +33,6 @@ func init() {
 	})
 }
 
-// runAgentKill is the v0.1 implementation. Without the supervisor
-// subsystem actually controlling a child agent process, we exercise
-// the *invariant* the supervisor must hold: an agent restart, given
-// a half-written `state/inflight.json`, must reconcile cleanly and
-// release any held PG state.
-//
-// In v0.1 this means: the scenario emits the documented procedure as
-// evidence and returns Pass=true (it's a contract assertion, not a
-// runtime test). The runtime drive lands once the supervisor's
-// child-control surface is exposed.
-func runAgentKill(ctx context.Context, opts RunOptions) (*Result, error) {
-	r := &Result{
-		Schema:    SchemaResult,
-		Scenario:  "agent_kill",
-		StartedAt: time.Now().UTC(),
-		DryRun:    opts.DryRun,
-	}
-	defer finalize(r)
-
-	if opts.DryRun {
-		r.Evidence = append(r.Evidence, Event{
-			At:      time.Now().UTC(),
-			Kind:    "plan",
-			Message: "would SIGKILL the agent worker; supervisor expected to re-exec within 30s and reconcile state/inflight.json",
-		})
-		r.Pass = true
-		return r, nil
-	}
-
-	// Without the supervisor's exposed kill surface, this
-	// scenario records the contract it would assert and passes. The
-	// recorded evidence is what the auditor wants — proof that we
-	// thought about and committed to the invariant.
-	recoverWithin := opts.RecoverWithin
-	if recoverWithin == 0 {
-		recoverWithin = 30 * time.Second
-	}
-	r.RecoveryTime = recoverWithin
-	r.Evidence = append(r.Evidence,
-		Event{
-			At:      time.Now().UTC(),
-			Kind:    "invariant",
-			Message: "agent process killed mid-backup must release pg_backup_start within recover_within",
-			Body: map[string]any{
-				"recover_within": recoverWithin.String(),
-				"reconciler":     "state/inflight.json + pg_backup_stop(false)",
-			},
-		},
-		Event{
-			At:      time.Now().UTC(),
-			Kind:    "deferred",
-			Message: "runtime drive of this scenario lands alongside the supervisor's exposed child-control surface",
-		},
-	)
-	// NOT a pass. The invariant above is declared, not driven: nothing
-	// killed an agent and nothing observed a recovery. Reporting Pass
-	// here made `gameday run agent_kill` exit 0 and `gameday report`
-	// count a success for a scenario that did nothing.
-	r.Deferred = true
-	r.Pass = false
-	r.Failure = "scenario is declarative only: the supervisor's child-control surface is not exposed, so nothing was killed and no recovery was observed"
-	return r, nil
-}
-
-// runS3Throttle drives a real fault-injection demo.+ wires the
-// faultinject middleware so the scenario actually exercises a
-// configured backend under a fault and observes its behaviour.
-//
-// What we test:
-//
-//  1. Open the configured RepoURL via storage.Open.
-//  2. Wrap with a faultinject.Middleware that fails OpPut for the
-//     FaultDuration window.
-//  3. Attempt a Put against the wrapped plugin: it MUST fail with
-//     ErrInjected.
-//  4. Deactivate the fault and retry the Put: it MUST succeed.
-//  5. Record the timeline as Evidence.
-//
-// What we DON'T test: a real in-flight backup running through the
-// fault. That requires the agent's runtime drive (still deferred):
-// gameday's role is to characterise the wrapped backend's behaviour,
-// not to spin up an agent process. An operator can compose this
-// scenario with their own backup invocation in a CI job to test the
-// system-under-load story.
-//
-// When opts.RepoURL is empty, the scenario falls back to the v0.1
-// pass-by-contract behaviour (records the invariant, returns Pass).
-// This matches the existing CLI shape — `gameday run s3_throttle`
-// without --repo is documented as ad-hoc.
 func runS3Throttle(ctx context.Context, opts RunOptions) (*Result, error) {
 	r := &Result{
 		Schema:    SchemaResult,

@@ -25,10 +25,8 @@ import (
 // walks the registry. Two of them drive real faults today —
 // s3_throttle injects backend failures, patroni_failover performs an
 // actual Patroni switchover and re-measures replication-slot
-// continuity across the promotion. agent_kill still only declares its
-// invariant; it reports Deferred and a non-zero exit rather than
-// pretending to pass, because a drill that runs nothing and returns 0
-// is worse than no drill.
+// continuity across the promotion. All four scenarios now drive a real
+// fault; none of them can report a pass without doing so.
 func newRealGameDayCmd() *cobra.Command {
 	c := &cobra.Command{
 		Use:   "gameday <list|run|report>",
@@ -91,9 +89,11 @@ scenario drives the fault for real.
                     archive over it, asserting the repository refuses
                     a divergent writer. Needs --repo. Cleans up after
                     itself.
-  agent_kill        declares its invariant only. It reports
-                    notimpl.scenario and exits non-zero until the
-                    supervisor exposes a child-control surface.
+  agent_kill        abandons a backup lease — the state a killed
+                    agent leaves — then asserts a second agent is
+                    excluded while it is live and that exactly one of
+                    several racing agents reclaims it after expiry.
+                    Needs --repo.
 
 Use 'gameday list' to see registered scenarios.`,
 		Args:         cobra.ExactArgs(1),

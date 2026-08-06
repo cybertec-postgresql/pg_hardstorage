@@ -10,10 +10,14 @@
 //
 //   - A scenario registry with three scripted scenarios:
 //
-//   - agent_kill — declarative only: it reports Deferred and a
-//     non-zero exit until the supervisor exposes a child-control
-//     surface. It does NOT report a pass for a drill that killed
-//     nothing.
+//   - agent_kill — drills what a killed agent actually leaves behind:
+//     an unrenewed backup lease. Asserts a second agent is excluded
+//     while that lease is live, and that exactly one of several racing
+//     agents reclaims it once it expires. It does NOT signal a
+//     process: there is no supervisor to re-exec one, and the
+//     pg_backup_start leak the old invariant named cannot happen —
+//     BASE_BACKUP runs over a replication connection that PostgreSQL
+//     tears down on disconnect.
 //
 //   - s3_throttle — wrap the storage plugin with a fault-injecting
 //     middleware that returns 503 for `duration` and asserts the
@@ -81,9 +85,10 @@ type Scenario struct {
 // RunOptions configures one Run call. Each scenario consults a subset
 // of these fields; unused ones are ignored.
 type RunOptions struct {
-	// Deployment is the logical deployment to target. Some scenarios
-	// (s3_throttle, patroni_failover) are deployment-scoped; others
-	// (agent_kill) are agent-scoped and ignore this.
+	// Deployment is the logical deployment to target. Scenarios that
+	// drive a cluster (patroni_failover) use it to find the endpoint;
+	// the repository-scoped drills (s3_throttle, patroni_split_brain,
+	// agent_kill) work under their own probe namespace and ignore it.
 	Deployment string
 
 	// RepoURL is the repository under test.

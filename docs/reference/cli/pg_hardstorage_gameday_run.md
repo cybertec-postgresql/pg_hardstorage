@@ -33,9 +33,11 @@ scenario drives the fault for real.
                     archive over it, asserting the repository refuses
                     a divergent writer. Needs --repo. Cleans up after
                     itself.
-  agent_kill        declares its invariant only. It reports
-                    notimpl.scenario and exits non-zero until the
-                    supervisor exposes a child-control surface.
+  agent_kill        abandons a backup lease — the state a killed
+                    agent leaves — then asserts a second agent is
+                    excluded while it is live and that exactly one of
+                    several racing agents reclaims it after expiry.
+                    Needs --repo.
 
 Use 'gameday list' to see registered scenarios.
 
