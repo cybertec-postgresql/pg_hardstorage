@@ -39,8 +39,8 @@ Before touching anything, verify the inputs you have:
    `attestation.public_key` for the backup you intend to restore.
    If the fingerprint doesn't match, you have the wrong keyring;
    find the right one before continuing. A wrong keyring fails fast
-   at restore-time (`kms.key_missing`, exit 8) — but verify now,
-   not after a 4-hour copy.
+   at restore-time (`restore.kek_mismatch`, exit 1) — but verify
+   now, not after a 4-hour copy.
 
 3. **Pick the restore target.**
 

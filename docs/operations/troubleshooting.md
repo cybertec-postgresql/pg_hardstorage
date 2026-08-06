@@ -173,10 +173,15 @@ For filesystem repos:
 
 ## KMS key unreachable
 
-**Symptom.** `restore` or `verify` exits with
-`kms.unreachable` / `kms.key_missing` (exit 8). The body carries the
-manifest's `KEKRef` so you know which key the read path was looking
-for.
+**Symptom.** `restore` or `verify` cannot resolve the manifest's KEK.
+Which code you get says where it broke: a cloud provider that cannot
+be reached raises `kms.unreachable` (exit 8, transient); a keyring
+that cannot resolve the ref at all raises `restore.kek_resolve_failed`
+(exit 1); one that resolves but does not unwrap raises
+`restore.kek_mismatch` (exit 1). Only the `unreachable` leaf routes to
+exit 8 — the others sit in the generic error bucket. The body carries
+the manifest's `KEKRef` so you know which key the read path was
+looking for.
 
 **What it means.** The local keyring file referenced by the
 manifest's `KEKRef` is missing, has wrong permissions, or has been
@@ -332,8 +337,10 @@ and the action it took.
 
 ## Disk full mid-backup
 
-**Symptom.** `backup` exits with `storage.no_space` (exit 8) or the
-filesystem returns ENOSPC during chunk writes.
+**Symptom.** The capacity pre-flight refuses the run with
+`preflight.repo_full` (exit 4), or the filesystem returns ENOSPC
+during chunk writes. A mid-write ENOSPC has no dedicated code and
+surfaces in the generic error bucket (exit 1).
 
 **What it means.** The repository ran out of space. The pre-flight
 capacity check (asserts repo has at least 110% of projected backup

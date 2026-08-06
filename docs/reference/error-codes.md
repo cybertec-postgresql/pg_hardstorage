@@ -211,7 +211,7 @@ field is where the recovery hint lives.
 | --- | --- |
 | `backup.*` | Backup pipeline (`backup.failed`, `backup.encrypt_no_kek`, `backup.kek_load_failed`, `backup.kms_open_failed`, `backup.compare.*`, `backup.delete.*`, `backup.undelete.*`) |
 | `restore.*` | Restore pipeline (`restore.failed`, `restore.kek_mismatch`, `restore.kek_resolve_failed`, `restore.target_in_wal_gap`, `restore.unknown_scheme`) |
-| `wal.*` | WAL streaming / fetch (`wal.slot_missing`, `wal.slot_create_failed`, `wal.slot_repair_failed`, `wal.fetch.*`, `wal.gap_purge_failed`, `wal.push_failed`, `wal.stream_error`) |
+| `wal.*` | WAL streaming / fetch (`wal.slot_missing`, `wal.slot_ensure_failed`, `wal.slot_repair_failed`, `wal.fetch.*`, `wal.gap_purge_failed`, `wal.push_failed`, `wal.stream_error`) |
 | `repo.*` | Repo lifecycle, GC, scrub, replicate (`repo.open_failed`, `repo.gc.*`, `repo.scrub.*`, `repo.check.*`, `repo.replicate.*`, `repo.wal_prune.failed`, `repo.wipe.partial`) |
 | `repo.replicate.incomplete` | `repo replicate` finished but the destination is NOT a complete replica (some manifests/chunks failed or are missing). Non-zero exit so `replicate && rm source` can't trust a partial DR copy — re-run until it exits 0, then `repo replicate verify`. |
 | `repair.*` | Manifest / attestation / chunk repair |

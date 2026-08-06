@@ -7,8 +7,12 @@ new backups from being written under a missing key.
 
 ## Symptoms
 
-- `pg_hardstorage restore` or `verify` exits with `kms.unreachable`
-  or `kms.key_missing` (exit 8). The body carries the manifest's
+- `pg_hardstorage restore` or `verify` fails to resolve the KEK. A
+  cloud provider that cannot be reached gives `kms.unreachable`
+  (exit 8); a keyring that cannot resolve the ref gives
+  `restore.kek_resolve_failed`, and one that resolves but cannot
+  unwrap gives `restore.kek_mismatch` — both exit 1, since only the
+  `unreachable` leaf routes to 8. The body carries the manifest's
   `KEKRef`.
 - `pg_hardstorage kms inspect` shows the keyring file missing,
   truncated, or owned by a different user.

@@ -241,8 +241,9 @@ In addition, the `pg_verifybackup` gate runs automatically after every
 only after acknowledging that exit 9 is the contract.
 
 `--verify=auto` (default) runs `pg_verifybackup` if the binary is on
-`$PATH`. `--verify=require` returns `usage.no_pg_verifybackup` (exit 2)
-when the binary is missing.
+`$PATH`. `--verify=require` returns `verify.missing_tool` (exit 9)
+when the binary is missing — the same exit code as a verification
+that ran and failed, so a cron gate keyed on 9 catches both.
 
 ### Repo scrub
 

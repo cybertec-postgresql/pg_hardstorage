@@ -23,6 +23,9 @@
 package output
 
 import (
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -172,33 +175,112 @@ func TestExitCodes_AllConstantsDocumented(t *testing.T) {
 	}
 }
 
-// TestExitCodes_NoUndocumentedRoutes: every namespace-or-leaf
-// route in codePrefixToExit must be documented.  Tests synthesise
-// a code in every known-routed namespace, route through
-// codePrefixToExit, and assert the result matches some documented
-// route.  Catches a code-side route added without a doc update.
+// routedCases reads codePrefixToExit's own switch statements and
+// returns the namespace cases and the leaf cases it routes.
+//
+// This used to be two hand-written lists with a comment claiming that
+// "adding a case there without adding it here fails this test". It did
+// not, and could not: the loops only ever visited the hand-written
+// names, so a new route was invisible to them. Adding `case
+// "quarantine": return ExitConflict` to the switch left the whole
+// package green — a namespace could ship with an exit code no operator
+// could look up. Reading the switch is the only version of this test
+// that keeps the promise its comment makes.
+func routedCases(t *testing.T) (namespaces, leaves []string) {
+	t.Helper()
+	_, here, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	path := filepath.Join(filepath.Dir(here), "exitcode.go")
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, path, nil, 0)
+	if err != nil {
+		t.Fatalf("parse exitcode.go: %v", err)
+	}
+
+	var fn *ast.FuncDecl
+	for _, d := range file.Decls {
+		if f, ok := d.(*ast.FuncDecl); ok && f.Name.Name == "codePrefixToExit" {
+			fn = f
+			break
+		}
+	}
+	if fn == nil {
+		t.Fatal("codePrefixToExit not found in exitcode.go — this test can no longer " +
+			"read the routing table it exists to check")
+	}
+
+	ast.Inspect(fn, func(n ast.Node) bool {
+		sw, ok := n.(*ast.SwitchStmt)
+		if !ok {
+			return true
+		}
+		// `switch ns` routes namespaces; `switch code` routes whole
+		// leaf codes. Anything else is a shape this test does not
+		// understand, and guessing would be worse than failing.
+		tag, ok := sw.Tag.(*ast.Ident)
+		if !ok {
+			t.Errorf("codePrefixToExit has a switch on %T, which this test cannot classify; "+
+				"teach routedCases about it rather than leaving the routes unchecked", sw.Tag)
+			return true
+		}
+		for _, stmt := range sw.Body.List {
+			cc, ok := stmt.(*ast.CaseClause)
+			if !ok {
+				continue
+			}
+			for _, e := range cc.List {
+				lit, ok := e.(*ast.BasicLit)
+				if !ok || lit.Kind != token.STRING {
+					continue
+				}
+				val, uerr := strconv.Unquote(lit.Value)
+				if uerr != nil {
+					continue
+				}
+				switch tag.Name {
+				case "ns":
+					namespaces = append(namespaces, val)
+				case "code":
+					leaves = append(leaves, val)
+				default:
+					t.Errorf("codePrefixToExit switches on unknown variable %q", tag.Name)
+				}
+			}
+		}
+		return true
+	})
+	sort.Strings(namespaces)
+	sort.Strings(leaves)
+	return namespaces, leaves
+}
+
+// TestExitCodes_NoUndocumentedRoutes: every namespace-or-leaf route in
+// codePrefixToExit must be documented. The routes are read from the
+// switch itself, so a case added in code with no matching doc row fails
+// here — which is what the previous hand-list version only claimed.
 func TestExitCodes_NoUndocumentedRoutes(t *testing.T) {
 	prefixes, leaves := docMapping(t)
-	// Every namespace below is known-routed (i.e. listed in
-	// codePrefixToExit's switch).  Keep this list aligned with
-	// that switch — adding a case there without adding it here
-	// fails this test, which is exactly the safety we want.
-	knownRoutedPrefixes := []string{
-		"auth", "usage", "preflight", "aborted", "notfound",
-		"conflict", "verify", "anomaly", "doctor",
+	routedNS, routedLeaves := routedCases(t)
+
+	if len(routedNS) == 0 || len(routedLeaves) == 0 {
+		t.Fatalf("read %d namespace and %d leaf routes from codePrefixToExit — the AST scan "+
+			"stopped matching, so this test asserts nothing", len(routedNS), len(routedLeaves))
 	}
-	for _, p := range knownRoutedPrefixes {
+
+	for _, p := range routedNS {
 		if _, has := prefixes[p]; !has {
-			t.Errorf("codePrefixToExit routes %s.* but it's not documented", p)
+			t.Errorf("codePrefixToExit routes %s.* but docs/reference/exit-codes.md has no "+
+				"row for it — an operator hitting that exit code cannot look up why", p)
 		}
 	}
-	knownRoutedLeaves := []string{
-		"storage.unreachable", "kms.unreachable",
-		"restore.target_unreachable", "restore.target_in_wal_gap",
-	}
-	for _, l := range knownRoutedLeaves {
+	for _, l := range routedLeaves {
 		if _, has := leaves[l]; !has {
-			t.Errorf("codePrefixToExit routes %q (leaf) but it's not documented", l)
+			t.Errorf("codePrefixToExit routes %q (leaf) but docs/reference/exit-codes.md has "+
+				"no row for it", l)
 		}
 	}
+	t.Logf("checked %d namespace and %d leaf routes read from codePrefixToExit",
+		len(routedNS), len(routedLeaves))
 }
