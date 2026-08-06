@@ -146,10 +146,21 @@ func runGameDayRun(cmd *cobra.Command, name string, opts gameday.RunOptions) err
 
 	body := gameDayRunBody{Result: res}
 	if !res.Pass {
-		// Surface a verify.failed-style error so the exit code reflects
-		// the run not passing. Body still lands as the structured
-		// payload so a JSON consumer sees the evidence list.
-		err := output.NewError("verify.failed",
+		// A deferred scenario is not a failed invariant — it is a
+		// scenario that did not run. Reporting verify.failed (exit 9)
+		// would tell an operator their system is broken; notimpl says
+		// the exercise is not implemented, which is the truth. Either
+		// way it is not a pass: this path used to return Pass=true and
+		// exit 0 for a scenario that killed nothing and measured
+		// nothing.
+		code := "verify.failed"
+		if res.Deferred {
+			code = "notimpl.scenario"
+		}
+		// Surface a structured error so the exit code reflects the run
+		// not passing. Body still lands as the structured payload so a
+		// JSON consumer sees the evidence list.
+		err := output.NewError(code,
 			fmt.Sprintf("gameday run %s: %s", name, res.Failure))
 		_ = d.Result(output.NewResult(cmd.CommandPath()).WithBody(body))
 		return err

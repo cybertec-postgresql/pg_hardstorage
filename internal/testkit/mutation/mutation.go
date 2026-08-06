@@ -58,6 +58,20 @@ type Mutation struct {
 // in the named package — see the package doc.
 var Registry = []Mutation{
 	{
+		Tag: "mutation_exit_route_undocumented",
+		Description: "output.codePrefixToExit gains a namespace route " +
+			"(quarantine.*) and a leaf route (storage.no_space) that " +
+			"docs/reference/exit-codes.md does not list. " +
+			"TestExitCodes_NoUndocumentedRoutes must catch both. This " +
+			"mutation exists because the previous version of that test " +
+			"iterated hand-written route lists and could NOT catch a new " +
+			"case, while its comment claimed it did — a namespace could " +
+			"ship with an exit code no operator could look up.",
+		Packages: []string{
+			"github.com/cybertec-postgresql/pg_hardstorage/internal/output",
+		},
+	},
+	{
 		Tag: "mutation_chunkkey_no_suffix",
 		Description: "repo.ChunkKey drops the .chk suffix; round-trip + " +
 			"ParseChunkKey tests must catch it.",

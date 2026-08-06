@@ -218,11 +218,10 @@ jobs:
   # Windows cross-compile gate — issue #11.  We build the
   # CLI + every operator-facing binary for windows/amd64
   # AND windows/arm64 to catch a regression the moment a
-  # Linux-only syscall slips into a shared package.  Tests
-  # don't run here (the test suite assumes systemd / unix
-  # signals / docker); a smoke-test job under runs-on:
-  # windows-2022 can be added once the operator surface is
-  # stable enough to warrant it.  Vet runs first so a
+  # Linux-only syscall slips into a shared package.  The
+  # FULL suite still can't run here (it assumes systemd /
+  # unix signals / docker) — the curated subset that can
+  # runs in test-windows below.  Vet runs first so a
   # type / import drift surfaces with the same message it
   # would on Linux.
   build-windows:
@@ -282,6 +281,46 @@ jobs:
   # vet is enough to catch unused imports, type errors,
   # and SDK API drift, and skips the linkage step that
   # would need libpkcs11 / KVM headers on the runner.
+  # Windows unit lane.  We ship windows/amd64 + windows/arm64
+  # binaries, and until now nothing executed a single test on
+  # Windows — only cross-compilation and vet.  Path handling,
+  # file locking and permission semantics are exactly where a
+  # Unix-developed binary breaks on Windows, and those are the
+  # packages selected here.
+  #
+  # This is deliberately NOT ./internal/... : the bulk of the
+  # suite needs docker / systemd / unix signals.  Every package
+  # listed below vets clean under GOOS=windows (its tests
+  # compile), and none of them start containers.
+  #
+  # internal/paths already simulates Windows on Linux by
+  # injecting isWindows, which is the right way to test the
+  # resolution RULES.  It cannot test the syscalls underneath
+  # them; that is what this lane adds.
+  test-windows:
+    name: test (windows unit subset)
+    runs-on: windows-2022
+    needs: [vet]
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - name: unit tests (path / fs / codec packages)
+        run: |
+          go test -count=1 `
+            ./internal/paths/... `
+            ./internal/fsutil/... `
+            ./internal/config/... `
+            ./internal/output/... `
+            ./internal/repo/... `
+            ./internal/audit/... `
+            ./internal/kms/... `
+            ./internal/chain/... `
+            ./internal/recovery/...
+
   build-tags:
     name: build-tags (${{ matrix.tag }})
     runs-on: ubuntu-24.04
@@ -346,10 +385,13 @@ jobs:
   # The DEMAND vars turn "server unavailable → skip" into a hard
   # failure, so this gate can never silently stop testing.
   storage-contract:
-    name: storage contract (real sftp/scp servers)
+    name: storage contract (every backend, skips forbidden)
     runs-on: ubuntu-24.04
     needs: [vet]
-    timeout-minutes: 15
+    # Six backends with real fixtures (Azurite, fake-gcs-server, MinIO,
+    # atmoz/sftp, host sshd). Measured ~7.5 min for the three cloud
+    # emulators alone, so 15 was too tight once they joined.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -363,10 +405,13 @@ jobs:
           PG_HARDSTORAGE_DEMAND_DOCKER: "1"
           PG_HARDSTORAGE_DEMAND_SSHD: "1"
         run: |
-          go test -race -count=1 -timeout=12m \
+          go test -race -count=1 -timeout=25m \
             ./internal/plugin/storage/sftp/ \
             ./internal/plugin/storage/scp/ \
             ./internal/plugin/storage/fs/ \
+            ./internal/plugin/storage/azblob/ \
+            ./internal/plugin/storage/gcs/ \
+            ./internal/plugin/storage/s3/ \
             ./internal/plugin/storage/contract/
 
   restore-correctness:

@@ -104,9 +104,26 @@ type RunOptions struct {
 // a raw time.Duration would emit nanoseconds under a _ms key, inflating
 // every consumer's reading 1e6x.
 type Result struct {
-	Schema       string        `json:"schema"`
-	Scenario     string        `json:"scenario"`
-	Pass         bool          `json:"pass"`
+	Schema   string `json:"schema"`
+	Scenario string `json:"scenario"`
+	Pass     bool   `json:"pass"`
+
+	// Deferred marks a scenario that declares an invariant but does not
+	// yet DRIVE it: the runtime fault injection is not implemented.
+	//
+	// It exists because agent_kill and patroni_failover used to return
+	// Pass=true from exactly that state, having just appended evidence
+	// saying "runtime drive ... lands alongside ...". `gameday run`
+	// exited 0, `gameday report` counted a pass, and the result was
+	// indistinguishable from a scenario that ran and held. A tier-L4
+	// exercise that cannot fail is worse than no exercise, because
+	// somebody ticks a compliance box with it.
+	//
+	// A deferred scenario is never a Pass outside --dry-run. Dry-run
+	// still passes: there it is reporting a plan, which is what it
+	// claims to be.
+	Deferred bool `json:"deferred,omitempty"`
+
 	StartedAt    time.Time     `json:"started_at"`
 	StoppedAt    time.Time     `json:"stopped_at"`
 	Duration     time.Duration `json:"-"`

@@ -31,6 +31,7 @@ package output_test
 // page, so lines that tell the reader to append are excluded by rule.
 
 import (
+	stdjson "encoding/json"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -133,6 +134,151 @@ func TestSeverityTableMatchesCode(t *testing.T) {
 				eventSchemaDoc, n, name)
 		}
 	}
+}
+
+// TestEventFieldWireTypesMatchTheDoc pins the TYPE column of the
+// `Event` table against a real marshalled event.
+//
+// TestSeverityTableMatchesCode above checks the severity VALUE table
+// and passed happily while the field table said `severity` was an
+// `int8` carrying "RFC 5424 numeric severity (0 = emergency, 7 =
+// debug)". It is not: Severity implements MarshalText, so encoding/json
+// writes `{"severity": "warning"}` and never `{"severity": 4}`. The
+// page also described `severity_name` as mirroring it "for human
+// consumers", which only reads sensibly if `severity` were the number —
+// on the wire the two fields are byte-identical.
+//
+// A consumer written against that table and comparing `severity <= 4`
+// gets a type error in a strict language and a silently false
+// comparison in a loose one. Checking value tables is not enough; the
+// types have to be pinned to what marshals.
+func TestEventFieldWireTypesMatchTheDoc(t *testing.T) {
+	root := repoRootFromOutput(t)
+	body, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(eventSchemaDoc)))
+	if err != nil {
+		t.Fatalf("read %s: %v", eventSchemaDoc, err)
+	}
+
+	// The page documents several structs, each under its own `## `
+	// heading, and `severity` appears in BOTH the Event and Error
+	// tables. A flat field→type map silently lets one table's row
+	// overwrite the other's — the first version of this test read the
+	// Error row and reported it against the Event fixture. Sections are
+	// kept separate.
+	sections := map[string]string{}
+	var cur string
+	for _, line := range strings.Split(string(body), "\n") {
+		if strings.HasPrefix(line, "## ") {
+			cur = strings.Trim(strings.TrimSpace(strings.TrimPrefix(line, "## ")), "`")
+			continue
+		}
+		if cur != "" {
+			sections[cur] += line + "\n"
+		}
+	}
+
+	rowRe := regexp.MustCompile("(?m)^\\|\\s*`([a-z_]+)`\\s*\\|\\s*([^|]+?)\\s*\\|")
+	fieldsUnder := func(heading string) map[string]string {
+		out := map[string]string{}
+		for _, m := range rowRe.FindAllStringSubmatch(sections[heading], -1) {
+			out[m[1]] = strings.ToLower(strings.TrimSpace(m[2]))
+		}
+		return out
+	}
+
+	// Each documented struct, with a fixture populated enough that
+	// omitempty does not hide the fields under test.
+	fixtures := []struct {
+		heading string
+		value   any
+	}{
+		{"Event", output.NewEvent(output.SeverityWarning, "backup", "started").
+			WithSubject(output.Subject{Deployment: "db1"}).
+			WithBody(map[string]any{"k": "v"}).
+			WithSuggestion(&output.Suggestion{Human: "do the thing"})},
+		{"Error", output.NewError("notfound.repo", "no repository there").
+			WithSeverity(output.SeverityError).
+			WithSuggestion(&output.Suggestion{Human: "create it"})},
+		{"Subject", output.Subject{Tenant: "t", Deployment: "db1", BackupID: "b1",
+			Timeline: 3, LSN: "0/1000000"}},
+		{"Suggestion", output.Suggestion{Human: "h", Command: "c", DocURL: "u"}},
+	}
+
+	// documented type → the JSON kinds that satisfy it.
+	kindOf := func(v stdjson.RawMessage) string {
+		s := strings.TrimSpace(string(v))
+		switch {
+		case s == "" || s == "null":
+			return "null"
+		case strings.HasPrefix(s, `"`):
+			return "string"
+		case strings.HasPrefix(s, "{"):
+			return "object"
+		case strings.HasPrefix(s, "["):
+			return "array"
+		case s == "true" || s == "false":
+			return "bool"
+		default:
+			return "number"
+		}
+	}
+	satisfies := func(doc, got string) bool {
+		switch {
+		case strings.Contains(doc, "any"):
+			return true
+		case strings.Contains(doc, "timestamp"), strings.Contains(doc, "string"):
+			return got == "string"
+		case strings.Contains(doc, "object"):
+			return got == "object"
+		case strings.Contains(doc, "int"), strings.Contains(doc, "uint"),
+			strings.Contains(doc, "float"), strings.Contains(doc, "number"):
+			return got == "number"
+		case strings.Contains(doc, "bool"):
+			return got == "bool"
+		}
+		return true // a type this test does not model; do not guess
+	}
+
+	checked := 0
+	for _, f := range fixtures {
+		documented := fieldsUnder(f.heading)
+		if len(documented) == 0 {
+			t.Errorf("no field rows parsed under the `%s` heading in %s — either the "+
+				"section was renamed or its table shape changed, and it is now unchecked",
+				f.heading, eventSchemaDoc)
+			continue
+		}
+		raw, merr := stdjson.Marshal(f.value)
+		if merr != nil {
+			t.Errorf("marshal %s fixture: %v", f.heading, merr)
+			continue
+		}
+		var wire map[string]stdjson.RawMessage
+		if uerr := stdjson.Unmarshal(raw, &wire); uerr != nil {
+			t.Errorf("%s does not marshal to a JSON object: %v", f.heading, uerr)
+			continue
+		}
+		for field, docType := range documented {
+			v, present := wire[field]
+			if !present {
+				continue // omitempty and not set in this fixture
+			}
+			checked++
+			if got := kindOf(v); !satisfies(docType, got) {
+				t.Errorf("%s.`%s` is documented as %q but marshals as a JSON %s (%s).\n"+
+					"A consumer written against this table gets the wrong type — for "+
+					"`severity` specifically, a numeric comparison against a name never "+
+					"matches and never errors either.",
+					f.heading, field, docType, got, strings.TrimSpace(string(v)))
+			}
+		}
+	}
+	if checked < 10 {
+		t.Fatalf("compared only %d fields against the wire — the fixtures stopped populating "+
+			"their structs, so this test asserts almost nothing", checked)
+	}
+	t.Logf("compared %d documented field type(s) across %d structs against the wire",
+		checked, len(fixtures))
 }
 
 // ---------------------------------------------------------------

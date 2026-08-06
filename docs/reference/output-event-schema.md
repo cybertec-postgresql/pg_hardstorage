@@ -20,13 +20,13 @@ Source: [`internal/output/event.go`](https://github.com/cybertec-postgresql/pg_h
 
 ## `Event`
 
-| Field (JSON) | Go type | Required | Notes |
+| Field (JSON) | JSON type | Required | Notes |
 | --- | --- | --- | --- |
 | `schema` | string | yes | `pg_hardstorage.v1` |
-| `severity` | int8 | yes | RFC 5424 numeric severity (0 = emergency, 7 = debug) |
-| `severity_name` | string | yes | Canonical lowercase name; mirrors `severity` for human consumers |
-| `component` | string | no | Subsystem name (`backup`, `restore`, `wal`, `kms`, `repo`, …) |
-| `op` | string | no | Operation within the component (`backup.start`, `kms.unwrap`, …) |
+| `severity` | string | yes | Canonical lowercase RFC 5424 name (`emergency` … `debug`). **Not a number on the wire.** The Go type is an `int8`-backed `Severity`, but it marshals through `MarshalText`, so a consumer sees `{"severity": "warning"}` and never `{"severity": 4}`. The numeric levels in the table below are the Go constants and the ordering rule — not what you parse. |
+| `severity_name` | string | yes | Byte-identical to `severity`. It exists for consumers that expected the numeric form on `severity`; both carry the name today. |
+| `component` | string | no | Subsystem emitting the event. Components are dotted where a subsystem has several coordinators — `backup`, `restore`, `repo`, `repo.gc`, `agent`, `verify`, `wal.stream`, `wal.follower`, `wal.slot`, `wal.durability`, `patroni`, `config`, `plugin.tier2`, … There is no bare `wal` or `kms` component. |
+| `op` | string | no | Operation within the component. Usually a bare verb (`started`, `stopped`, `leader_change`, `slot_reconciled`), occasionally dotted (`dispatch.enqueued`, `patroni.bad_slot_role`). The full event name operators alert on is `component` + `.` + `op`. |
 | `subject` | object | no (omitzero) | See [`Subject`](#subject) |
 | `body` | any | no | Free-form payload; per-op shape |
 | `suggestion` | object | no | See [`Suggestion`](#suggestion) |
@@ -126,7 +126,7 @@ to derive the [exit code](exit-codes.md).
 | --- | --- | --- | --- |
 | `code` | string | yes | Dotted lowercase code; first segment is the [namespace](error-codes.md) |
 | `message` | string | yes | Operator-readable summary |
-| `severity` | int8 (omitempty) | no | Defaults to `error` (3); upgrade to `critical` / downgrade to `warning` via `WithSeverity` |
+| `severity` | string (omitempty) | no | Same wire form as `Event.severity` — the lowercase name, not the number. Defaults to `error`; upgrade to `critical` / downgrade to `warning` via `WithSeverity` |
 | `subject` | object | no (omitzero) | Same shape as Event.Subject |
 | `suggestion` | object | no | Same shape as Event.Suggestion |
 | `cause` | (not serialised) | no | Wrapped error for `errors.Is` / `errors.As` chains |

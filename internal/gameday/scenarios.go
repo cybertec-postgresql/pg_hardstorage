@@ -87,7 +87,13 @@ func runAgentKill(ctx context.Context, opts RunOptions) (*Result, error) {
 			Message: "runtime drive of this scenario lands alongside the supervisor's exposed child-control surface",
 		},
 	)
-	r.Pass = true
+	// NOT a pass. The invariant above is declared, not driven: nothing
+	// killed an agent and nothing observed a recovery. Reporting Pass
+	// here made `gameday run agent_kill` exit 0 and `gameday report`
+	// count a success for a scenario that did nothing.
+	r.Deferred = true
+	r.Pass = false
+	r.Failure = "scenario is declarative only: the supervisor's child-control surface is not exposed, so nothing was killed and no recovery was observed"
 	return r, nil
 }
 
@@ -267,7 +273,13 @@ func runPatroniFailover(ctx context.Context, opts RunOptions) (*Result, error) {
 			Message: "runtime drive lands alongside the verifier sandbox's owned Patroni cluster",
 		},
 	)
-	r.Pass = true
+	// NOT a pass — see agent_kill. No switchover was performed and no
+	// slot continuity was measured. The real drive exists in
+	// internal/testkit/topology (TestPatroniFailover_*), behind the
+	// `integration,patroni` tags; this scenario is not wired to it yet.
+	r.Deferred = true
+	r.Pass = false
+	r.Failure = "scenario is declarative only: no Patroni switchover was driven and no slot continuity was measured"
 	return r, nil
 }
 

@@ -5,7 +5,6 @@ package output
 
 import (
 	"errors"
-	"strings"
 )
 
 // ExitCode is the stable exit-code contract documented in docs/SPEC.md.
@@ -79,60 +78,6 @@ func ExitCodeFor(err error) ExitCode {
 	}
 	if oe, ok := AsOutputError(err); ok {
 		return codePrefixToExit(oe.Code)
-	}
-	return ExitError
-}
-
-// codePrefixToExit maps an error-code prefix to an exit code.
-//
-// Codes are dotted, lowercase strings: "wal.slot_missing", "auth.denied",
-// "preflight.disk_full", "verify.checksum_mismatch", etc. The first dotted
-// segment is the namespace and drives the mapping.
-//
-// New namespaces should be added as the system grows; until they are,
-// they fall through to ExitError. That's the safe default.
-func codePrefixToExit(code string) ExitCode {
-	ns, _, _ := strings.Cut(code, ".")
-	switch ns {
-	case "auth":
-		return ExitAuth
-	case "usage":
-		return ExitMisuse
-	case "preflight":
-		return ExitPreflight
-	case "aborted":
-		return ExitAborted
-	case "notfound":
-		return ExitNotFound
-	case "conflict":
-		return ExitConflict
-	case "verify":
-		return ExitVerifyFailed
-	case "anomaly":
-		// Same posture as verify: a baseline-shift finding flips the
-		// exit code so cron-driven `anomaly check` alarms. The
-		// finding is not a verification failure per se — the backup
-		// itself is fine — but operationally the operator wants the
-		// same "non-zero exit if something is unusual" cron contract.
-		return ExitVerifyFailed
-	case "doctor":
-		return ExitDoctorIssues
-	}
-	// "storage.*" / "kms.*" only count as Unreachable when the leaf code
-	// is specifically about reachability. Other storage/kms errors stay
-	// in the generic-error bucket.
-	switch code {
-	case "storage.unreachable", "kms.unreachable":
-		return ExitUnreachable
-	// "restore.target_*" leaves are conflict-class — the operator's
-	// chosen PITR target conflicts with the backup's available
-	// range. Cron-driven restores can then distinguish "config
-	// error, fix your --to-lsn" from "transient infrastructure
-	// failure" by exit code alone.  Other restore.* leaves stay
-	// in the generic-error bucket.
-	case "restore.target_unreachable",
-		"restore.target_in_wal_gap":
-		return ExitConflict
 	}
 	return ExitError
 }
