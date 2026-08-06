@@ -321,6 +321,39 @@ jobs:
             ./internal/chain/... `
             ./internal/recovery/...
 
+  # macOS unit lane.  The Homebrew cask ships darwin/amd64 and
+  # darwin/arm64, and — like Windows before test-windows — nothing
+  # ever executed a test on macOS.  Case-insensitive-by-default
+  # filesystems and BSD-flavoured syscalls are where a
+  # Linux-developed binary diverges, so the path / fs packages are
+  # the ones worth running.
+  #
+  # Docker is not available on GitHub macOS runners, so this stays a
+  # unit lane; nothing here starts a container.
+  test-macos:
+    name: test (macos unit subset)
+    runs-on: macos-latest
+    needs: [vet]
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - name: unit tests (path / fs / codec packages)
+        run: |
+          go test -count=1 \
+            ./internal/paths/... \
+            ./internal/fsutil/... \
+            ./internal/config/... \
+            ./internal/output/... \
+            ./internal/repo/... \
+            ./internal/audit/... \
+            ./internal/kms/... \
+            ./internal/chain/... \
+            ./internal/recovery/...
+
   build-tags:
     name: build-tags (${{ matrix.tag }})
     runs-on: ubuntu-24.04
@@ -534,6 +567,40 @@ jobs:
         env:
           PG_HARDSTORAGE_TEST_PG_MAJOR: ${{ matrix.pg }}
         run: make test-integration
+
+      # Resource-leak gate.  testcontainers reaps via Ryuk, but a test
+      # that creates an anonymous volume and removes its container with
+      # `docker rm -f` (no -v) strands the volume.  That is not
+      # theoretical: a local sweep once left 699 dangling volumes, which
+      # eventually fills the runner disk and produces "no space left"
+      # failures in an unrelated job — a fixture problem that reads
+      # exactly like a product bug.
+      #
+      # Runs even when the suite fails, so a leak is still reported
+      # (and a failing suite is not masked: this step only annotates,
+      # the suite's own exit code stands).
+      - name: assert no leaked containers or volumes
+        if: always()
+        run: |
+          set -uo pipefail
+          containers=$(docker ps -aq | wc -l | tr -d ' ')
+          volumes=$(docker volume ls -qf dangling=true | wc -l | tr -d ' ')
+          echo "post-suite: ${containers} container(s), ${volumes} dangling volume(s)"
+          # Dangling volumes are a hard failure.  Measured: a real
+          # integration package run leaves ZERO behind, so a non-zero
+          # count is a `docker rm -f` missing its -v, not noise.
+          if [ "$volumes" -gt 0 ]; then
+            echo "::error::integration suite leaked ${volumes} dangling volume(s) — a container was removed without -v"
+            docker volume ls -qf dangling=true | head -20
+            exit 1
+          fi
+          # Containers are a warning: Ryuk reaps asynchronously and a
+          # slow reap is a timing artefact, not a leak.  If this proves
+          # stable it should become an error too.
+          if [ "$containers" -gt 0 ]; then
+            echo "::warning::integration suite left ${containers} container(s) behind"
+            docker ps -a --format '  container {{.Names}} ({{.Image}}, {{.Status}})' | head -20
+          fi
 
   test-patroni:
     # Heavy Patroni failover / recovery / data-integrity suite: each test

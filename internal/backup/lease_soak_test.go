@@ -70,7 +70,11 @@ func TestLeaseSoak_NeverTwoHolders(t *testing.T) {
 			}
 			t.Cleanup(func() { _ = sp.Close() })
 			if !sp.Capabilities().ConditionalPut {
-				t.Skipf("%s cannot enforce a lease here", b.scheme)
+				// The refusal contract for such a backend is asserted by
+				// TestLease_ExclusionHoldsOnEveryBackend; soaking it here
+				// would prove nothing beyond that.
+				t.Skipf("%s cannot enforce a lease; covered by "+
+					"TestLease_ExclusionHoldsOnEveryBackend", b.scheme)
 			}
 			runLeaseSoak(t, b.scheme, sp)
 		})

@@ -51,7 +51,9 @@ func TestManifestCommit_IssuesNoDeletes(t *testing.T) {
 	rec := &deleteRecordingSP{StoragePlugin: sp}
 	if !rec.Capabilities().ConditionalPut {
 		t.Skip("fixture backend cannot commit conditionally; staging — and its delete — " +
-			"is the only option there")
+			"is the only option there. The fallback path is covered by " +
+			"TestCommitExclusive_FallbackStillWorksWithoutConditionalPut and " +
+			"TestCommitExclusive_FallbackCleansUpItsStagingObject")
 	}
 	store := backup.NewManifestStore(rec)
 
