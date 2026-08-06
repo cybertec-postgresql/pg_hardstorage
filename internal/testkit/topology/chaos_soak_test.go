@@ -266,8 +266,47 @@ func TestChaosSoak_RestoreProof(t *testing.T) {
 	if len(ids) < 2 {
 		t.Fatalf("soak committed only %d backups — not a meaningful proof (list output:\n%s)", len(ids), out)
 	}
-	t.Logf("restore-proof gate: %d backups to verify + restore", len(ids))
-	for _, id := range ids {
+	// The gate is O(backups) and each iteration is a full verify plus a
+	// real restore — tens of seconds each. It is the longest phase of
+	// the soak by far, and it used to print ONE line and then nothing
+	// until it finished.
+	//
+	// That silence cost real time: a 20-minute soak produced 80
+	// backups, the gate could not finish them inside the test timeout,
+	// and the run died with `panic: test timed out` naming only the
+	// test. Telling "stuck" from "still working" needed the goroutine
+	// dump, where the exec watchdog showed the current subprocess had
+	// been running two minutes — i.e. fine, just slow. A nightly job
+	// with a longer fault budget produces MORE backups and is more
+	// likely to hit this, not less.
+	//
+	// So: report progress, and own the deadline rather than letting the
+	// test timeout own it. Running out of budget now says how far it
+	// got, which is actionable; a goroutine dump is not.
+	gateDeadline, hasGateDeadline := t.Context().Deadline()
+	if !hasGateDeadline {
+		gateDeadline = time.Now().Add(30 * time.Minute)
+	}
+	// Leave room for the WAL-audit and shared-DEK checks below, which
+	// are the other half of the proof and must not be skipped.
+	gateDeadline = gateDeadline.Add(-4 * time.Minute)
+
+	t.Logf("restore-proof gate: %d backups to verify + restore (budget until %s)",
+		len(ids), gateDeadline.Format(time.TimeOnly))
+	gateStart := time.Now()
+	proved := 0
+	for i, id := range ids {
+		if time.Now().After(gateDeadline) {
+			t.Errorf("PROOF INCOMPLETE: verified+restored %d of %d backups in %s before "+
+				"running out of budget.\n\n"+
+				"This is not a product failure and not a hang — it is the gate being "+
+				"unable to finish. Either raise -timeout, lower PGHS_CHAOS_MINUTES (fewer "+
+				"backup_burst rounds means fewer backups), or accept a sampled proof. What "+
+				"it must never do is die at the test timeout with no count, which is "+
+				"indistinguishable from a stuck restore.",
+				proved, len(ids), time.Since(gateStart).Truncate(time.Second))
+			break
+		}
 		if out, code := runBin(5*time.Minute, "verify", "db1", id, "--repo", repoURL, "--full"); code != 0 {
 			t.Errorf("PROOF FAILED: verify --full %s exited %d:\n%s", id, code, tail(out, 1200))
 			continue
@@ -278,6 +317,13 @@ func TestChaosSoak_RestoreProof(t *testing.T) {
 			t.Errorf("PROOF FAILED: restore %s exited %d:\n%s", id, code, tail(out, 1200))
 		}
 		_ = os.RemoveAll(target)
+		proved++
+		// Progress every few backups: enough to see it moving, not so
+		// much that the log becomes noise.
+		if (i+1)%5 == 0 || i+1 == len(ids) {
+			t.Logf("  restore-proof: %d/%d verified+restored (%s elapsed)",
+				i+1, len(ids), time.Since(gateStart).Truncate(time.Second))
+		}
 	}
 
 	// 3. The WAL lineage must be gap-free (slot continuity survived
