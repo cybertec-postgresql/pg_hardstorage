@@ -253,34 +253,171 @@ func runPatroniFailover(ctx context.Context, opts RunOptions) (*Result, error) {
 
 	if opts.DryRun {
 		r.Evidence = append(r.Evidence, Event{
-			At:      time.Now().UTC(),
-			Kind:    "plan",
-			Message: "would invoke Patroni REST /switchover and assert physical-WAL gap_bytes_max <= permanent_slots cycle (typically <100MB) per Mechanism 1 of the SPEC",
+			At:   time.Now().UTC(),
+			Kind: "plan",
+			Message: "would read the current leader, POST /switchover, poll until a " +
+				"different member holds the leader lock, and re-measure replication-slot " +
+				"continuity — asserting gap_bytes == 0 across the promotion",
 		})
 		r.Pass = true
 		return r, nil
 	}
 
-	r.Evidence = append(r.Evidence,
-		Event{
-			At:      time.Now().UTC(),
-			Kind:    "invariant",
-			Message: "Patroni leader change preserves replication-slot continuity via permanent_slots (Strategy A) or PG 17+ synced slots (Strategy B), residual gap is typically sub-second",
+	// No cluster to drive is a refusal, not a pass. This is the whole
+	// point of the rewrite: the scenario used to append a "deferred"
+	// note here and return Pass=true, so a tier-L4 drill exited 0
+	// having promoted nothing.
+	if opts.Patroni == nil {
+		r.Failure = "no Patroni endpoint for this drill: pass --patroni-url, or " +
+			"--deployment naming a deployment with patroni.url set in pg_hardstorage.yaml"
+		r.Misconfigured = true
+		r.Pass = false
+		return r, nil
+	}
+
+	recoverWithin := opts.RecoverWithin
+	if recoverWithin == 0 {
+		recoverWithin = 2 * time.Minute
+	}
+
+	oldLeader, oldTimeline, err := opts.Patroni.Leader(ctx)
+	if err != nil {
+		r.Failure = fmt.Sprintf("read current leader: %v", err)
+		r.Pass = false
+		return r, nil
+	}
+	r.Evidence = append(r.Evidence, Event{
+		At:      time.Now().UTC(),
+		Kind:    "observed",
+		Message: "current leader before the drill",
+		Body:    map[string]any{"leader": oldLeader, "timeline": oldTimeline},
+	})
+
+	baseline := observeSlot(ctx, opts, r, "baseline")
+
+	if err := opts.Patroni.Switchover(ctx, oldLeader); err != nil {
+		// A refusal is a FINDING, not an infrastructure error: the
+		// cluster evaluated the request and said no, which usually
+		// means no replica was healthy enough to promote. That is
+		// exactly what a drill is for.
+		r.Failure = fmt.Sprintf("Patroni did not accept the switchover: %v", err)
+		r.Pass = false
+		return r, nil
+	}
+	r.Evidence = append(r.Evidence, Event{
+		At:      time.Now().UTC(),
+		Kind:    "fault",
+		Message: "switchover accepted by Patroni",
+		Body:    map[string]any{"demoting": oldLeader},
+	})
+
+	newLeader, newTimeline, err := awaitNewLeader(ctx, opts.Patroni, oldLeader, recoverWithin)
+	if err != nil {
+		r.Failure = err.Error()
+		r.Pass = false
+		return r, nil
+	}
+	r.RecoveryTime = time.Since(r.StartedAt)
+	r.Evidence = append(r.Evidence, Event{
+		At:      time.Now().UTC(),
+		Kind:    "recovered",
+		Message: "a different member holds the leader lock",
+		Body: map[string]any{
+			"leader":       newLeader,
+			"timeline":     newTimeline,
+			"was":          oldLeader,
+			"recovered_in": r.RecoveryTime.String(),
 		},
-		Event{
-			At:      time.Now().UTC(),
-			Kind:    "deferred",
-			Message: "runtime drive lands alongside the verifier sandbox's owned Patroni cluster",
-		},
-	)
-	// NOT a pass — see agent_kill. No switchover was performed and no
-	// slot continuity was measured. The real drive exists in
-	// internal/testkit/topology (TestPatroniFailover_*), behind the
-	// `integration,patroni` tags; this scenario is not wired to it yet.
-	r.Deferred = true
-	r.Pass = false
-	r.Failure = "scenario is declarative only: no Patroni switchover was driven and no slot continuity was measured"
+	})
+
+	after := observeSlot(ctx, opts, r, "after")
+
+	// The invariant: a planned switchover must not cost us WAL.
+	if after == nil {
+		r.Evidence = append(r.Evidence, Event{
+			At:   time.Now().UTC(),
+			Kind: "unmeasured",
+			Message: "replication-slot continuity was NOT measured (no ObserveSlot seam " +
+				"wired); this run asserts only that the leader moved",
+		})
+		r.Pass = true
+		return r, nil
+	}
+	if after.GapBytes > 0 || after.Outcome == "missing" {
+		r.Failure = fmt.Sprintf("slot continuity broke across the promotion: outcome=%s "+
+			"gap_bytes=%d — WAL in that window cannot be fetched again, so PITR inside it "+
+			"is impossible from this repository", after.Outcome, after.GapBytes)
+		r.Pass = false
+		return r, nil
+	}
+	if baseline != nil && baseline.GapBytes > 0 {
+		r.Evidence = append(r.Evidence, Event{
+			At:   time.Now().UTC(),
+			Kind: "note",
+			Message: "a gap already existed before the drill; the promotion did not widen it, " +
+				"but the pre-existing gap is worth investigating separately",
+			Body: map[string]any{"baseline_gap_bytes": baseline.GapBytes},
+		})
+	}
+	r.Pass = true
 	return r, nil
+}
+
+// observeSlot runs the ObserveSlot seam if wired, recording whatever it
+// finds as evidence. A seam error is recorded and treated as "not
+// measured" rather than failing the drill: the promotion result is
+// still worth reporting.
+func observeSlot(ctx context.Context, opts RunOptions, r *Result, phase string) *SlotObservation {
+	if opts.ObserveSlot == nil {
+		return nil
+	}
+	obs, err := opts.ObserveSlot(ctx)
+	if err != nil {
+		r.Evidence = append(r.Evidence, Event{
+			At:      time.Now().UTC(),
+			Kind:    "unmeasured",
+			Message: fmt.Sprintf("%s slot observation failed: %v", phase, err),
+		})
+		return nil
+	}
+	r.Evidence = append(r.Evidence, Event{
+		At:      time.Now().UTC(),
+		Kind:    "observed",
+		Message: phase + " replication-slot continuity",
+		Body:    map[string]any{"outcome": obs.Outcome, "gap_bytes": obs.GapBytes},
+	})
+	return obs
+}
+
+// awaitNewLeader polls until a member other than old holds the leader
+// lock, or the budget expires.
+func awaitNewLeader(ctx context.Context, drv PatroniDriver, old string, within time.Duration) (string, uint32, error) {
+	deadline := time.Now().Add(within)
+	var lastErr error
+	for {
+		name, tli, err := drv.Leader(ctx)
+		switch {
+		case err == nil && name != "" && name != old:
+			return name, tli, nil
+		case err != nil:
+			// A leaderless window is EXPECTED mid-promotion; keep
+			// polling and only report the last error if we time out.
+			lastErr = err
+		}
+		if time.Now().After(deadline) {
+			if lastErr != nil {
+				return "", 0, fmt.Errorf("no new leader within %s (last error: %v); the "+
+					"cluster did not complete the promotion", within, lastErr)
+			}
+			return "", 0, fmt.Errorf("no new leader within %s: %q still holds the leader "+
+				"lock, so the switchover was accepted but never took effect", within, old)
+		}
+		select {
+		case <-ctx.Done():
+			return "", 0, ctx.Err()
+		case <-time.After(time.Second):
+		}
+	}
 }
 
 // finalize computes Duration and stamps StoppedAt. Called via defer

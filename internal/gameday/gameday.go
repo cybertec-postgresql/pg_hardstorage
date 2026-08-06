@@ -10,16 +10,21 @@
 //
 //   - A scenario registry with three scripted scenarios:
 //
-//   - agent_kill — SIGKILL the local agent process; assert
-//     self-supervised recovery within `recover_within`.
+//   - agent_kill — declarative only: it reports Deferred and a
+//     non-zero exit until the supervisor exposes a child-control
+//     surface. It does NOT report a pass for a drill that killed
+//     nothing.
 //
 //   - s3_throttle — wrap the storage plugin with a fault-injecting
 //     middleware that returns 503 for `duration` and asserts the
 //     operation completes (under the bandwidth/retry budget).
 //
-//   - patroni_failover — declarative-only in v0.1 (we don't
-//     actually drive Patroni in v0.1; the scenario records the
-//     intended invariant + manual steps).
+//   - patroni_failover — drives a real switchover: reads the current
+//     leader, POSTs /switchover, waits for a different member to take
+//     the leader lock, and re-measures replication-slot continuity
+//     across the promotion. Fails if the leader never moves, if
+//     Patroni refuses, or if the slot had to be recreated past our
+//     last confirmed LSN.
 //
 //   - `Run(ctx, scenario, opts)` — runs one scenario, returning a
 //     structured Result with pass/fail and the evidence captured.
@@ -36,9 +41,12 @@
 //
 //   - Scheduled (cron-driven) game days. The scheduler is a separate
 //     subsystem; gameday consumes its trigger but doesn't invent it.
-//   - Real Patroni driver. Calling Patroni's REST `/switchover` from
-//     a chaos test belongs to the verifier sandbox, where the
-//     test owns its own Patroni cluster.
+//   - A cluster of our own. patroni_failover drives the cluster the
+//     OPERATOR points it at (--patroni-url, or a deployment's
+//     patroni.url). Standing one up is a test activity, not an
+//     operator one: internal/testkit/topology owns that, and the
+//     integration suite runs this same scenario against a real 3-node
+//     Spilo cluster through the PatroniDriver seam.
 //   - Cross-region failover simulation. Same reason — needs the
 //     replicate subsystem to be live.
 package gameday
@@ -95,6 +103,58 @@ type RunOptions struct {
 	// fault injection or asserting recovery. Useful for previewing
 	// what `gameday run agent_kill` would do.
 	DryRun bool
+
+	// Patroni drives a real cluster for patroni_failover. When nil the
+	// scenario REFUSES rather than reporting a pass — it used to return
+	// Pass=true from exactly this state, so `gameday run
+	// patroni_failover` exited 0 having promoted nothing.
+	//
+	// It is an interface rather than a *patroni.Client so this package
+	// keeps its dependencies: gameday is compiled into the shipped
+	// binary and has no business importing the pg or replication
+	// layers. The CLI adapts the real client; tests supply a fake; the
+	// integration test drives a real 3-node cluster through the same
+	// seam. Same shape as follower.Coordinator's DSNFor / ReconcileSlot
+	// seams.
+	Patroni PatroniDriver
+
+	// ObserveSlot measures replication-slot continuity against the
+	// CURRENT leader. Called once before the switchover for a baseline
+	// and once after, and the difference is the finding: a slot that
+	// had to be recreated past our last confirmed LSN means WAL we can
+	// never fetch again.
+	//
+	// Optional. Without it the scenario still asserts that the leader
+	// moved, and says in its evidence that continuity was not measured
+	// — which is a weaker claim, honestly labelled, rather than a
+	// silent one.
+	ObserveSlot func(ctx context.Context) (*SlotObservation, error)
+}
+
+// PatroniDriver is the slice of Patroni a failover drill needs.
+type PatroniDriver interface {
+	// Leader returns the current leader's member name and timeline.
+	Leader(ctx context.Context) (name string, timeline uint32, err error)
+
+	// Switchover asks Patroni to promote a replica, naming the leader
+	// it expects to demote. Returning nil means ACCEPTED, not
+	// completed — Patroni promotes asynchronously, so the caller polls
+	// Leader afterwards.
+	Switchover(ctx context.Context, leader string) error
+}
+
+// SlotObservation is one continuity measurement of the replication
+// slot the deployment streams through.
+type SlotObservation struct {
+	// Outcome is the slot's state as the reconciler found it:
+	// "found" (survived), "recreated" (had to be rebuilt), or
+	// "missing".
+	Outcome string
+
+	// GapBytes is how much WAL fell between our last confirmed LSN and
+	// where the slot now starts. Non-zero means unrecoverable loss for
+	// PITR inside that window — the condition R6 exists for.
+	GapBytes uint64
 }
 
 // Result is the structured outcome of one Run.
@@ -124,6 +184,15 @@ type Result struct {
 	// claims to be.
 	Deferred bool `json:"deferred,omitempty"`
 
+	// Misconfigured marks a run that could not start because the
+	// operator has not given it what it needs — a Patroni endpoint, a
+	// repository. It is neither a failed invariant nor an unimplemented
+	// scenario, and conflating it with either sends the operator
+	// looking in the wrong place: verify.failed (exit 9) reads as "your
+	// backups are bad" when the truth is "you did not pass
+	// --deployment".
+	Misconfigured bool `json:"misconfigured,omitempty"`
+
 	StartedAt    time.Time     `json:"started_at"`
 	StoppedAt    time.Time     `json:"stopped_at"`
 	Duration     time.Duration `json:"-"`
@@ -142,24 +211,35 @@ type resultJSON struct {
 	StoppedAt  time.Time `json:"stopped_at"`
 	DurationMS int64     `json:"duration_ms"`
 	DryRun     bool      `json:"dry_run,omitempty"`
-	RecoveryMS int64     `json:"recovery_time_ms,omitempty"`
-	Evidence   []Event   `json:"evidence,omitempty"`
-	Failure    string    `json:"failure,omitempty"`
+	// Deferred and Misconfigured MUST be carried here. They live on
+	// Result but the marshaller is hand-written, so a field added to
+	// the struct is invisible on the wire until it is added here too —
+	// `deferred` was silently absent from every JSON result between
+	// being introduced and this line existing, which meant a consumer
+	// could not tell a scenario that did not run from one that ran and
+	// failed.
+	Deferred      bool    `json:"deferred,omitempty"`
+	Misconfigured bool    `json:"misconfigured,omitempty"`
+	RecoveryMS    int64   `json:"recovery_time_ms,omitempty"`
+	Evidence      []Event `json:"evidence,omitempty"`
+	Failure       string  `json:"failure,omitempty"`
 }
 
 // MarshalJSON emits duration_ms / recovery_time_ms as whole milliseconds.
 func (r Result) MarshalJSON() ([]byte, error) {
 	return json.Marshal(resultJSON{
-		Schema:     r.Schema,
-		Scenario:   r.Scenario,
-		Pass:       r.Pass,
-		StartedAt:  r.StartedAt,
-		StoppedAt:  r.StoppedAt,
-		DurationMS: r.Duration.Milliseconds(),
-		DryRun:     r.DryRun,
-		RecoveryMS: r.RecoveryTime.Milliseconds(),
-		Evidence:   r.Evidence,
-		Failure:    r.Failure,
+		Schema:        r.Schema,
+		Scenario:      r.Scenario,
+		Pass:          r.Pass,
+		StartedAt:     r.StartedAt,
+		StoppedAt:     r.StoppedAt,
+		DurationMS:    r.Duration.Milliseconds(),
+		DryRun:        r.DryRun,
+		Deferred:      r.Deferred,
+		Misconfigured: r.Misconfigured,
+		RecoveryMS:    r.RecoveryTime.Milliseconds(),
+		Evidence:      r.Evidence,
+		Failure:       r.Failure,
 	})
 }
 
@@ -170,16 +250,18 @@ func (r *Result) UnmarshalJSON(b []byte) error {
 		return err
 	}
 	*r = Result{
-		Schema:       j.Schema,
-		Scenario:     j.Scenario,
-		Pass:         j.Pass,
-		StartedAt:    j.StartedAt,
-		StoppedAt:    j.StoppedAt,
-		Duration:     time.Duration(j.DurationMS) * time.Millisecond,
-		DryRun:       j.DryRun,
-		RecoveryTime: time.Duration(j.RecoveryMS) * time.Millisecond,
-		Evidence:     j.Evidence,
-		Failure:      j.Failure,
+		Schema:        j.Schema,
+		Scenario:      j.Scenario,
+		Pass:          j.Pass,
+		StartedAt:     j.StartedAt,
+		StoppedAt:     j.StoppedAt,
+		Duration:      time.Duration(j.DurationMS) * time.Millisecond,
+		DryRun:        j.DryRun,
+		Deferred:      j.Deferred,
+		Misconfigured: j.Misconfigured,
+		RecoveryTime:  time.Duration(j.RecoveryMS) * time.Millisecond,
+		Evidence:      j.Evidence,
+		Failure:       j.Failure,
 	}
 	return nil
 }

@@ -21,17 +21,14 @@ import (
 
 // newRealGameDayCmd implements `pg_hardstorage gameday <list|run|report>`.
 //
-// v0.1 ships the registry-driven shape: scenarios self-register in
-// internal/gameday/scenarios.go, and the CLI walks the registry. The
-// scenarios themselves document their invariants and (in v0.1)
-// pass-by-contract; runtime drive of the fault injection lands when
-// the supervisor's child-control surface and the storage plugin's
-// fault-injection middleware are exposed.
-//
-// The CLI shape is locked so an operator wiring `gameday run
-// agent_kill` into a quarterly cron job today gets the same
-// invocation when lands and the scenarios start actually
-// killing processes.
+// Scenarios self-register in internal/gameday/scenarios.go and the CLI
+// walks the registry. Two of them drive real faults today —
+// s3_throttle injects backend failures, patroni_failover performs an
+// actual Patroni switchover and re-measures replication-slot
+// continuity across the promotion. agent_kill still only declares its
+// invariant; it reports Deferred and a non-zero exit rather than
+// pretending to pass, because a drill that runs nothing and returns 0
+// is worse than no drill.
 func newRealGameDayCmd() *cobra.Command {
 	c := &cobra.Command{
 		Use:   "gameday <list|run|report>",
@@ -69,6 +66,7 @@ func newGameDayRunCmd() *cobra.Command {
 	var (
 		deployment    string
 		repoURL       string
+		patroniURL    string
 		recoverWithin time.Duration
 		faultDuration time.Duration
 		dryRun        bool
@@ -78,25 +76,40 @@ func newGameDayRunCmd() *cobra.Command {
 		Short: "Run one chaos scenario, return structured Pass/Fail",
 		Long: `Run one chaos scenario from the registry.
 
-v0.1 scenarios document the invariant they assert and (when run with
---dry-run) the planned fault injection; runtime drive of the kill
-signal / 503-storm / Patroni switchover lands alongside the
-supervisor's child-control surface and the storage plugin's
-fault-injection middleware.
+--dry-run prints the planned actions and always passes; without it the
+scenario drives the fault for real.
 
-The CLI shape is locked: an operator wiring 'gameday run agent_kill'
-into a quarterly cron today gets the same invocation when lands.
+  s3_throttle       injects backend failures and asserts recovery.
+  patroni_failover  reads the current leader, POSTs /switchover, waits
+                    for a different member to take the leader lock, and
+                    re-measures replication-slot continuity. It needs
+                    --deployment naming a deployment with patroni.url
+                    configured; without one it refuses rather than
+                    reporting a pass.
+  agent_kill        declares its invariant only. It reports
+                    notimpl.scenario and exits non-zero until the
+                    supervisor exposes a child-control surface.
 
 Use 'gameday list' to see registered scenarios.`,
 		Args:         cobra.ExactArgs(1),
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// Resolve the deployment's Patroni endpoint so
+			// patroni_failover has a cluster to drive. A deployment
+			// without one leaves this nil and the scenario refuses,
+			// naming the setting to configure — it does NOT report a
+			// pass, which is what it used to do.
+			drv, derr := gameDayPatroniDriver(deployment, patroniURL)
+			if derr != nil {
+				return output.NewError("usage.bad_flag", derr.Error()).Wrap(output.ErrUsage)
+			}
 			return runGameDayRun(cmd, args[0], gameday.RunOptions{
 				Deployment:    deployment,
 				RepoURL:       repoURL,
 				RecoverWithin: recoverWithin,
 				FaultDuration: faultDuration,
 				DryRun:        dryRun,
+				Patroni:       drv,
 			})
 		},
 	}
@@ -104,6 +117,8 @@ Use 'gameday list' to see registered scenarios.`,
 		"deployment to target (scenario-dependent)")
 	c.Flags().StringVar(&repoURL, "repo", "",
 		"repository URL (scenario-dependent)")
+	c.Flags().StringVar(&patroniURL, "patroni-url", "",
+		"Patroni REST base URL for patroni_failover; overrides the deployment's patroni.url")
 	c.Flags().DurationVar(&recoverWithin, "recover-within", 0,
 		"upper bound for recovery (scenario default applies if 0)")
 	c.Flags().DurationVar(&faultDuration, "fault-duration", 0,
@@ -154,16 +169,22 @@ func runGameDayRun(cmd *cobra.Command, name string, opts gameday.RunOptions) err
 		// exit 0 for a scenario that killed nothing and measured
 		// nothing.
 		code := "verify.failed"
-		if res.Deferred {
+		switch {
+		case res.Deferred:
 			code = "notimpl.scenario"
+		case res.Misconfigured:
+			code = "usage.missing_flag"
 		}
 		// Surface a structured error so the exit code reflects the run
 		// not passing. Body still lands as the structured payload so a
 		// JSON consumer sees the evidence list.
-		err := output.NewError(code,
+		gErr := output.NewError(code,
 			fmt.Sprintf("gameday run %s: %s", name, res.Failure))
+		if res.Misconfigured {
+			gErr = gErr.Wrap(output.ErrUsage)
+		}
 		_ = d.Result(output.NewResult(cmd.CommandPath()).WithBody(body))
-		return err
+		return gErr
 	}
 	return d.Result(output.NewResult(cmd.CommandPath()).WithBody(body))
 }

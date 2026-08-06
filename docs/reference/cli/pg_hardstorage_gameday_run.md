@@ -18,14 +18,19 @@ Run one chaos scenario, return structured Pass/Fail
 
 Run one chaos scenario from the registry.
 
-v0.1 scenarios document the invariant they assert and (when run with
---dry-run) the planned fault injection; runtime drive of the kill
-signal / 503-storm / Patroni switchover lands alongside the
-supervisor's child-control surface and the storage plugin's
-fault-injection middleware.
+--dry-run prints the planned actions and always passes; without it the
+scenario drives the fault for real.
 
-The CLI shape is locked: an operator wiring 'gameday run agent_kill'
-into a quarterly cron today gets the same invocation when lands.
+  s3_throttle       injects backend failures and asserts recovery.
+  patroni_failover  reads the current leader, POSTs /switchover, waits
+                    for a different member to take the leader lock, and
+                    re-measures replication-slot continuity. It needs
+                    --deployment naming a deployment with patroni.url
+                    configured; without one it refuses rather than
+                    reporting a pass.
+  agent_kill        declares its invariant only. It reports
+                    notimpl.scenario and exits non-zero until the
+                    supervisor exposes a child-control surface.
 
 Use 'gameday list' to see registered scenarios.
 
@@ -40,6 +45,7 @@ pg_hardstorage gameday run <scenario> [flags]
       --dry-run                   print the planned action; don't inject the fault
       --fault-duration duration   how long the fault is held active (scenario default applies if 0)
   -h, --help                      help for run
+      --patroni-url string        Patroni REST base URL for patroni_failover; overrides the deployment's patroni.url
       --recover-within duration   upper bound for recovery (scenario default applies if 0)
       --repo string               repository URL (scenario-dependent)
 ```

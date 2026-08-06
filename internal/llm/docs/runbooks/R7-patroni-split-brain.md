@@ -139,7 +139,13 @@ must be reported per organisational policy.
 - Re-enable application traffic only after at least one fresh
   backup has succeeded and the verify gate has passed.
 - Plan a game-day exercise to confirm the recovery procedure
-  works under realistic conditions. `pg_hardstorage gameday
-  list` shows the registered scenarios; `pg_hardstorage gameday
-  run patroni_failover` is the closest one to this runbook. A
-  dedicated split-brain scenario is not in the registry yet.
+  works under realistic conditions. `pg_hardstorage gameday run
+  patroni_failover --deployment <name>` performs a real
+  switchover against the cluster that deployment points at: it
+  reads the current leader, asks Patroni to promote a replica,
+  waits for a different member to take the leader lock, and
+  re-measures replication-slot continuity across the promotion.
+  It fails if the leader never moves, if Patroni refuses (no
+  healthy candidate), or if the slot had to be recreated past
+  the last confirmed LSN. `gameday list` shows the registry; a
+  dedicated split-brain scenario is not in it yet.
