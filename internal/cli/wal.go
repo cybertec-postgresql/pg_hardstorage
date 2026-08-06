@@ -2435,6 +2435,40 @@ func resolveStartLSN(ctx context.Context, sp storage.StoragePlugin, opts walStre
 		return endLSN, "resume-from-repo", nil
 	}
 
+	// Nothing on THIS timeline.  Before calling that a fresh
+	// deployment, look one timeline down: after a promotion the new
+	// primary reports timeline N+1 via IDENTIFY_SYSTEM and nothing has
+	// been archived under N+1 yet, so the lookup above misses for a
+	// deployment that may have months of WAL under N.
+	//
+	// Treating the two alike is a silent data-loss bug.  The fresh
+	// branch below anchors at the slot's restart_lsn — the new
+	// leader's current position — so every byte between the old
+	// timeline's frontier and there is skipped and never requested.
+	// The stream then reports success: resume_strategy is recorded as
+	// "fresh-slot-restart-lsn" and no error is raised anywhere.  A
+	// later PITR through that window reads a hole.
+	//
+	// The previous timeline's frontier is a position the new primary
+	// can still serve, because the lineages share history up to the
+	// branch point.  So resume there and let the ordinary floor check
+	// decide: if the new primary has already recycled past it,
+	// assertStartGEQRestart raises wal.start_before_slot_restart_lsn,
+	// which tells the operator the WAL is unrecoverable and what to do
+	// about it.  Loud and wrong-but-known beats silent and lost.
+	priorLSN, priorTLI, priorFound, err := inventory.HighestArchivedLSNBefore(ctx, sp, opts.deployment, timeline)
+	if err != nil {
+		return 0, "", output.NewError("repo.list_failed",
+			fmt.Sprintf("wal stream: scan prior timelines: %v", err)).Wrap(err)
+	}
+	if priorFound {
+		note := fmt.Sprintf("resume-across-timeline-%d", priorTLI)
+		if err := assertStartGEQRestart(priorLSN, restartLSN, note, segSize); err != nil {
+			return 0, "", err
+		}
+		return priorLSN, note, nil
+	}
+
 	// Fresh deployment: no committed segments yet.  Use the slot's
 	// restart_lsn as the anchor — PG provably retains WAL from
 	// restart_lsn onwards (RESERVE_WAL on slot create), and the
