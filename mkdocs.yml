@@ -254,6 +254,7 @@ nav:
           - Error codes: reference/error-codes.md
           - KEKRef schemes: reference/kekref-schemes.md
           - Storage URL schemes: reference/storage-url-schemes.md
+          - Environment variables: reference/environment.md
           - Build flavours: reference/build-flavours.md
           - Manifest schema: reference/manifest-schema.md
           - Output event schema: reference/output-event-schema.md

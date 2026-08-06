@@ -40,6 +40,7 @@ Query parameters:
 | --- | --- |
 | `access_tier` | `hot`, `cool`, or `archive` for `Put` defaults. |
 | `endpoint` | Override the resolved service URL (Azurite, private endpoint). |
+| `allow_http` | `true` permits an **unencrypted** HTTP endpoint. The Azure SDK refuses to send authenticated requests over HTTP otherwise, because the SharedKey signature would travel in clear. Intended for the Azurite emulator; do **not** set it against a real account. |
 | `account_key` | Base64-encoded shared key. Builds a `SharedKeyCredential` instead of going through the default chain. **Avoid** in production — prefer managed identity. |
 
 ## What you need
