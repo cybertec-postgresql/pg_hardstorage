@@ -59,6 +59,40 @@ persistence:
     - ReadWriteOnce
   annotations: {}
 
+# Keyring — the local KEK (kek.bin) and any signing material,
+# mounted read-only at /etc/pg_hardstorage/keyring/.
+#
+# Only needed for `kek_ref: local:...`. A cloud KMS deployment needs
+# none of this: point `kms:` at the provider and let IRSA / Workload
+# Identity / Pod Identity handle auth (see the chart docs).
+keyring:
+  # Bring your own Secret. This is the recommended path — it works
+  # with sealed-secrets, external-secrets and CSI drivers, and keeps
+  # key material out of your values file and out of Helm history.
+  existingSecret: ""
+
+  # Inline alternative for small deployments. Map of filename ->
+  # BASE64 content, e.g.
+  #
+  #   files:
+  #     kek.bin: "3q2+7w=="     # base64 of the 32 raw bytes
+  #
+  # Values are base64 because kek.bin is binary. Anything here lands
+  # in your values file and in `helm get values`, so prefer
+  # existingSecret for anything you would not paste in a ticket.
+  files: {}
+
+  # Mode for the mounted files. 0400 (owner read-only) matches the
+  # keyring's on-disk expectation; the directory itself is managed by
+  # the kubelet.
+  defaultMode: 0400
+
+# Extra volumes and mounts, applied verbatim. The escape hatch for
+# anything the chart does not model — a second Secret, a CSI-mounted
+# key, a CA bundle.
+extraVolumes: []
+extraVolumeMounts: []
+
 # Pod scheduling controls.
 nodeSelector: {}
 tolerations: []

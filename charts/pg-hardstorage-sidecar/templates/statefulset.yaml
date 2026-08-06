@@ -109,6 +109,17 @@ spec:
             # short-lived staging files.
             - name: tmp
               mountPath: /tmp
+            {{- if or .Values.keyring.existingSecret .Values.keyring.files }}
+            # The keyring the docs promised and the chart never
+            # mounted (issue #46). Read-only: the agent reads the KEK,
+            # it never writes here.
+            - name: keyring
+              mountPath: /etc/pg_hardstorage/keyring
+              readOnly: true
+            {{- end }}
+            {{- with .Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
       volumes:
         - name: config
           configMap:
@@ -117,6 +128,15 @@ spec:
           emptyDir:
             medium: Memory
             sizeLimit: 64Mi
+        {{- if or .Values.keyring.existingSecret .Values.keyring.files }}
+        - name: keyring
+          secret:
+            secretName: {{ .Values.keyring.existingSecret | default (printf "%s-keyring" (include "pg-hardstorage-sidecar.fullname" .)) }}
+            defaultMode: {{ .Values.keyring.defaultMode }}
+        {{- end }}
+        {{- with .Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
         {{- if not .Values.persistence.enabled }}
         - name: state
           emptyDir: {}

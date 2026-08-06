@@ -756,6 +756,17 @@ jobs:
           version: v3.16.4
       - name: helm lint
         run: helm lint charts/pg-hardstorage-sidecar
+      # Renders the chart and checks it against the pages that
+      # describe it.  Issue #46 shipped because nothing did:
+      # helm-sidecar-chart.md said the keyring mounted from the
+      # ConfigMap, no template provided it, and there was no way to
+      # persist a local KEK on the chart at all.
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - name: chart matches its documentation
+        run: go test -tags chart -count=1 -run TestChart ./internal/cli/
 
   api-spec-lint:
     # Validate the OpenAPI 3.1 spec + the .proto definitions are

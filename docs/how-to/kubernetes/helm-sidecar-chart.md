@@ -145,11 +145,45 @@ plane.
 
 Two patterns:
 
-### Inline keyring (small deployments)
+### Local keyring (`kek_ref: local:...`)
 
 The keyring directory `/etc/pg_hardstorage/keyring/` mounts
-as part of the ConfigMap. Useful for plaintext-only setups
-or for a passphrase wrapper backed by a sealed Secret.
+from a **Secret** — never the ConfigMap. Key material in a
+ConfigMap is readable by anyone with `get configmap`, which
+is a lower bar than `get secret` in any cluster that
+separates the two.
+
+Bring your own Secret (recommended). Works with
+sealed-secrets, external-secrets and CSI drivers, and keeps
+the key out of your values file and out of Helm history:
+
+```bash
+kubectl create secret generic pgh-keyring \
+    --from-file=kek.bin=/path/to/kek.bin
+```
+
+```yaml
+keyring:
+  existingSecret: pgh-keyring
+```
+
+Or inline it for a small deployment. Values are base64
+because `kek.bin` is 32 raw bytes and cannot be carried as
+YAML text — and anything here lands in your values file and
+in `helm get values`:
+
+```yaml
+keyring:
+  files:
+    kek.bin: "3q2+7w=="   # base64 of the raw key
+```
+
+Neither is rendered when both are empty, so a KMS-backed
+deployment mounts nothing extra.
+
+Anything the chart does not model — a second Secret, a
+CSI-mounted key, a CA bundle — goes through `extraVolumes`
+and `extraVolumeMounts`, which are applied verbatim.
 
 ### KMS provider (recommended)
 
