@@ -253,6 +253,16 @@ func enrichUnknownDeploymentError(cmd *cobra.Command, err error) error {
 	if !strings.Contains(oe.Message, "--pg-connection") && !strings.Contains(oe.Message, "--repo") {
 		return err
 	}
+	// Only rewrite when the command's FIRST positional really is a
+	// deployment. `gameday run <scenario>` also takes a bare-word
+	// positional and can also report a missing --repo, and rewriting
+	// there told the operator that `patroni_split_brain` "is not in
+	// pg_hardstorage.yaml (configured: db1, ...)" — sending them to
+	// `deployment list` to look for a scenario name. The Use string is
+	// the command's own statement of what its positional is.
+	if !strings.Contains(strings.ToLower(cmd.Use), "<deployment>") {
+		return err
+	}
 	args := cmd.Flags().Args()
 	if len(args) == 0 {
 		return err

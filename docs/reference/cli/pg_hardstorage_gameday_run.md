@@ -28,6 +28,11 @@ scenario drives the fault for real.
                     --deployment naming a deployment with patroni.url
                     configured; without one it refuses rather than
                     reporting a pass.
+  patroni_split_brain
+                    archives a probe segment and then tries to
+                    archive over it, asserting the repository refuses
+                    a divergent writer. Needs --repo. Cleans up after
+                    itself.
   agent_kill        declares its invariant only. It reports
                     notimpl.scenario and exits non-zero until the
                     supervisor exposes a child-control surface.

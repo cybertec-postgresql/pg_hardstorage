@@ -22,11 +22,19 @@ package output_test
 // ~475 leaves to be listed would be inventing a promise the docs never
 // made, and would rot instantly.
 //
-// Scope note: only `output.NewError("literal", …)` is scanned. Codes
-// built from a variable cannot be resolved without type-checking the
-// whole tree, and there are none today; if that changes, the scan
-// silently under-reports rather than failing loudly, so the count
-// assertion at the end is the tripwire.
+// Scope note: `output.NewError("literal", …)` AND
+// `fmt.Errorf("ns.leaf: …")` are scanned. The second form was a blind
+// spot with real consequences — the whole `splitbrain.*` namespace
+// (raised by wal push when another writer already archived a segment)
+// is built with fmt.Errorf, so it shipped undocumented and this guard
+// reported nothing. An operator hitting splitbrain.content_mismatch,
+// which is the archive refusing a divergent writer, had nowhere to look
+// it up.
+//
+// Codes built from a variable still cannot be resolved without
+// type-checking the whole tree, and there are none today; if that
+// changes the scan under-reports rather than failing loudly, so the
+// count assertion at the end is the tripwire.
 
 import (
 	"go/ast"
@@ -131,6 +139,19 @@ func emittedCodes(t *testing.T, root string) map[string]string {
 						}
 						return true
 					})
+
+					// Second pass: fmt.Errorf("ns.leaf: ...") — the
+					// shape splitbrain.* uses. Anchored at the start of
+					// the format string and requiring the trailing
+					// colon, so ordinary prose ("patroni: build %s")
+					// does not match.
+					for _, m := range errorfCodeRe.FindAllStringSubmatch(readFile(fpath), -1) {
+						if _, seen := codes[m[1]]; seen {
+							continue
+						}
+						rel, _ := filepath.Rel(root, fpath)
+						codes[m[1]] = filepath.ToSlash(rel)
+					}
 				}
 			}
 			return nil
@@ -140,6 +161,19 @@ func emittedCodes(t *testing.T, root string) map[string]string {
 		}
 	}
 	return codes
+}
+
+// errorfCodeRe matches a structured code raised through fmt.Errorf.
+var errorfCodeRe = regexp.MustCompile(`fmt\.Errorf\(\s*"([a-z_][a-z0-9_]*\.[a-z0-9_]+):`)
+
+// readFile is a swallow-errors helper: a file that cannot be read is
+// simply not scanned, matching the AST pass's posture.
+func readFile(path string) string {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	return string(b)
 }
 
 func TestErrorCodes_EveryEmittedNamespaceIsDocumented(t *testing.T) {

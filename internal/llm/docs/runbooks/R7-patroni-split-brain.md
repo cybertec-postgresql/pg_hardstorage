@@ -147,5 +147,17 @@ must be reported per organisational policy.
   re-measures replication-slot continuity across the promotion.
   It fails if the leader never moves, if Patroni refuses (no
   healthy candidate), or if the slot had to be recreated past
-  the last confirmed LSN. `gameday list` shows the registry; a
-  dedicated split-brain scenario is not in it yet.
+  the last confirmed LSN. `gameday list` shows the registry.
+- `pg_hardstorage gameday run patroni_split_brain --repo <url>`
+  drills the guarantee this runbook depends on: that a divergent
+  writer cannot archive over a segment already held. It archives a
+  probe segment, then tries to archive over it with different
+  content from the same cluster (expecting
+  `splitbrain.content_mismatch`) and with a different system
+  identifier (expecting `splitbrain.system_identifier_mismatch`),
+  and finally confirms an identical re-push still succeeds so
+  `archive_command` retries are not wedged. Everything it writes
+  lives under a probe deployment name and is deleted afterwards.
+  It does not induce split-brain in Patroni — that is an
+  operator-only situation, and this runbook is how you get out of
+  it.
