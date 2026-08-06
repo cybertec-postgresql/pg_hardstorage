@@ -338,6 +338,35 @@ func (c *Client) BaseURL() string {
 	return u.String()
 }
 
+// httpClient exposes the configured client so a call needing a
+// different per-request deadline can build a variant of it.
+func (c *Client) httpClient() *http.Client { return c.http }
+
+// doRawWithClient is doRaw with an explicit http.Client. Used by
+// Switchover, whose endpoint blocks until the promotion completes and
+// therefore needs a deadline the polling endpoints must not inherit.
+//
+// The client is a PARAMETER rather than a temporarily-swapped field:
+// the follower coordinator polls this same Client from another
+// goroutine, so mutating c.http even briefly would be a data race on a
+// shared object.
+func (c *Client) doRawWithClient(ctx context.Context, hc *http.Client, method, path string, body io.Reader) (*http.Response, error) {
+	target := *c.baseURL
+	target.Path = strings.TrimRight(target.Path, "/") + "/" + strings.TrimLeft(path, "/")
+	req, err := http.NewRequestWithContext(ctx, method, target.String(), body)
+	if err != nil {
+		return nil, fmt.Errorf("patroni: build %s %s: %w", method, path, err)
+	}
+	if c.username != "" {
+		req.SetBasicAuth(c.username, c.password)
+	}
+	resp, err := hc.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("patroni: %s %s: %w: %v", method, path, ErrUnreachable, err)
+	}
+	return resp, nil
+}
+
 func (c *Client) doRaw(ctx context.Context, method, path string, body io.Reader) (*http.Response, error) {
 	target := *c.baseURL
 	target.Path = strings.TrimRight(target.Path, "/") + "/" + strings.TrimLeft(path, "/")

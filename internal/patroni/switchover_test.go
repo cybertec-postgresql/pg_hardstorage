@@ -18,6 +18,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/patroni"
 )
@@ -132,5 +133,70 @@ func TestSwitchover_UnreachableEndpoint(t *testing.T) {
 	err := c.Switchover(context.Background(), patroni.SwitchoverRequest{Leader: "node-1"})
 	if !errors.Is(err, patroni.ErrUnreachable) {
 		t.Fatalf("err = %v, want ErrUnreachable", err)
+	}
+}
+
+// TestSwitchover_OutlivesThePollingTimeout is the regression test for a
+// bug this campaign's own game-day drill surfaced.
+//
+// DefaultTimeout is 5s, sized for /cluster and /leader, which answer
+// immediately. POST /switchover does not: Patroni performs the
+// promotion and only then responds. Inheriting the polling timeout made
+// the call fail with
+//
+//	REST endpoint unreachable ... Client.Timeout exceeded while awaiting headers
+//
+// while the switchover had in fact been accepted and was running. That
+// is the worst shape of wrong answer for a drill: it blames the
+// network, the operator goes looking at connectivity, and the cluster
+// has meanwhile failed over exactly as asked.
+func TestSwitchover_OutlivesThePollingTimeout(t *testing.T) {
+	slow := patroni.DefaultTimeout + 2*time.Second
+	if slow >= patroni.SwitchoverTimeout {
+		t.Fatalf("test needs DefaultTimeout+2s (%s) < SwitchoverTimeout (%s)",
+			slow, patroni.SwitchoverTimeout)
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(slow)
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "Successfully switched over")
+	}))
+	t.Cleanup(srv.Close)
+
+	c, err := patroni.NewClient(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Switchover(context.Background(),
+		patroni.SwitchoverRequest{Leader: "node-1"}); err != nil {
+		t.Fatalf("Switchover failed against a server that took %s to answer: %v\n\n"+
+			"A promotion that takes longer than the polling timeout is normal, not a "+
+			"failure. Reporting it as unreachable sends the operator to the network while "+
+			"the cluster fails over behind them.", slow, err)
+	}
+}
+
+// TestSwitchover_HonoursAShorterCallerDeadline: raising the ceiling
+// must not override a caller who asked for less.
+func TestSwitchover_HonoursAShorterCallerDeadline(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(3 * time.Second)
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+
+	c, _ := patroni.NewClient(srv.URL)
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	err := c.Switchover(ctx, patroni.SwitchoverRequest{Leader: "node-1"})
+	if err == nil {
+		t.Fatal("Switchover ignored a 300ms caller deadline")
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Errorf("took %s to honour a 300ms deadline; the longer ceiling must raise the "+
+			"http.Client limit, not extend the caller's context", elapsed)
 	}
 }

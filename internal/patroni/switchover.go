@@ -22,7 +22,25 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 )
+
+// switchoverHTTPClient returns a client whose per-request timeout is
+// long enough for a blocking promotion, preserving whatever transport
+// the caller configured via WithHTTPClient.
+func switchoverHTTPClient(c *Client) *http.Client {
+	base := c.httpClient()
+	if base != nil && base.Timeout >= SwitchoverTimeout {
+		return base
+	}
+	cp := &http.Client{Timeout: SwitchoverTimeout}
+	if base != nil {
+		cp.Transport = base.Transport
+		cp.CheckRedirect = base.CheckRedirect
+		cp.Jar = base.Jar
+	}
+	return cp
+}
 
 // ErrSwitchoverRefused is returned when Patroni declines the
 // switchover — most often HTTP 412, which it uses for "no candidate
@@ -34,6 +52,21 @@ import (
 // reports an infrastructure problem when the truth is "your cluster
 // has no healthy replica to promote", which is the finding.
 var ErrSwitchoverRefused = errors.New("switchover refused by Patroni")
+
+// SwitchoverTimeout is the deadline for POST /switchover.
+//
+// DefaultTimeout (5s) is sized for the read-only endpoints the follower
+// polls — /cluster and /leader answer immediately. /switchover does
+// not: Patroni performs the promotion and only then responds, which
+// routinely takes tens of seconds on a loaded cluster.
+//
+// Inheriting the polling timeout made the call fail with "REST endpoint
+// unreachable ... Client.Timeout exceeded while awaiting headers" while
+// the switchover was in fact accepted and running. That is the worst
+// shape of wrong answer for a drill: it reports the cluster
+// unreachable, the operator goes looking at the network, and the
+// cluster has meanwhile failed over exactly as asked.
+const SwitchoverTimeout = 60 * time.Second
 
 // SwitchoverRequest names the current leader and, optionally, the
 // candidate to promote.
@@ -66,7 +99,14 @@ func (c *Client) Switchover(ctx context.Context, req SwitchoverRequest) error {
 		return fmt.Errorf("patroni: marshal switchover request: %w", err)
 	}
 
-	resp, err := c.doRaw(ctx, http.MethodPost, "/switchover", bytes.NewReader(body))
+	// A caller with its own shorter deadline still wins: this only
+	// raises the ceiling the http.Client imposes, it does not extend
+	// the caller's context.
+	ctx, cancel := context.WithTimeout(ctx, SwitchoverTimeout)
+	defer cancel()
+
+	resp, err := c.doRawWithClient(ctx, switchoverHTTPClient(c),
+		http.MethodPost, "/switchover", bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
