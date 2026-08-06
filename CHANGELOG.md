@@ -56,6 +56,97 @@ keeps reading that version for at least 24 months after a successor lands.
   the reconnect warnings above went nowhere under the renderer a
   Kubernetes deployment would obviously choose.
 
+- **The Helm chart never mounted the keyring it documented** ([#46]).
+  `helm-sidecar-chart.md` stated that `/etc/pg_hardstorage/keyring/`
+  "mounts as part of the ConfigMap". No template provided it, and the
+  StatefulSet had three fixed mounts with no way to add a fourth — so
+  there was no way at all to persist a keyring for
+  `kek_ref: local:default` on the chart.
+
+  The keyring now mounts from a **Secret**, via `keyring.existingSecret`
+  (bring your own — sealed-secrets, external-secrets, a CSI driver) or
+  `keyring.files` (inline `filename` → base64, for small deployments).
+  `extraVolumes` / `extraVolumeMounts` cover anything the chart does
+  not model. Nothing is rendered when both keyring options are empty,
+  so a cloud-KMS deployment mounts exactly what it did before.
+
+  The page was wrong about the destination as well as the mechanism:
+  key material in a ConfigMap is readable by anyone with
+  `get configmap`, a lower bar than `get secret` wherever RBAC
+  separates the two. It now describes the Secret.
+
+- **`scp`: a successful read reported failure on Close.** `Close`
+  returned `io.EOF` after a complete, correct read — the reader waits
+  for the remote `cat` to finish, and closing an already-finished ssh
+  session yields `io.EOF`, which was passed straight through.
+  `defer rc.Close()` hides this, which is how it survived since
+  v1.0.0. A caller that checks `Close` — the correct way to use an
+  `io.ReadCloser` — discarded perfectly good bytes and reported a
+  fault in the data.
+
+- **`scp`: a failed remote read looked like an empty object**, and a
+  key deleted concurrently surfaced as a transport failure rather than
+  `ErrNotFound`. Both are read-side, on the path a restore takes.
+
+- **Two game-day scenarios could not fail.** `agent_kill` and
+  `patroni_failover` each appended evidence saying the runtime drive
+  was deferred and then returned `pass: true`. `gameday run
+  patroni_failover` — declared tier L4, the tier an auditor reads as
+  "we tested catastrophic failover" — exited 0 having promoted nothing
+  and measured nothing, and `gameday report` counted it a success,
+  indistinguishable from a scenario that ran and held. Both now drive
+  real faults (see Added); a scenario that declares an invariant
+  without driving it reports `deferred: true`, `pass: false` and
+  `notimpl.scenario` — not a failed invariant, but never a pass.
+
+- **`gameday run <scenario>` misdiagnosed a missing `--repo`.** The
+  unknown-deployment hint, which is right for `backup <deployment>`,
+  fired on any `usage.missing_flag` mentioning `--repo` — telling
+  operators that `patroni_split_brain` "is not in pg_hardstorage.yaml
+  (configured: ...)" and pointing them at `deployment list` for a
+  scenario name, moving the exit code from 2 (usage) to 6 (notfound).
+  It is now scoped to commands whose positional really is a deployment.
+
+- **Documentation that described a binary we do not ship.** A sweep of
+  every operator-facing surface; each drift below is now held by a
+  test:
+
+  - `severity` was documented as an `int8` carrying "RFC 5424 numeric
+    severity" in both the `Event` and `Error` tables. It is a
+    **string** on the wire (`{"severity": "warning"}`, never `4`), so
+    a consumer comparing `severity <= 4` never matches and never
+    errors. The `component` and `op` examples named `wal`, `kms`,
+    `backup.start` and `kms.unwrap`; none of those exist.
+  - 19 documented `jq` expressions across 13 pages addressed
+    `.result.body.<field>`. There is no `body` level, so all 19
+    evaluated to `null`: the SLO gates in `slo-as-code.md` are `jq -e`
+    and would fail forever, R2's recovery loop iterates `null`, and
+    `--template` renders a missing key as empty **with exit 0**.
+  - `storage.no_space` and `kms.key_missing` were documented with exit
+    8, which the reference page defines as transient-retry. Neither
+    code exists; the real conditions are `preflight.repo_full`
+    (exit 4) and `restore.kek_resolve_failed` / `restore.kek_mismatch`
+    (exit 1). An `if [ $? -eq 8 ]` retry loop was wrapped around a
+    full disk.
+  - `usage.no_pg_verifybackup` (exit 2) is `verify.missing_tool`
+    (exit 9) — misuse and verification-failed are opposite ends of a
+    cron policy.
+  - The `splitbrain.*` namespace was undocumented entirely: three
+    codes an operator can hit with nowhere to look them up.
+    `wal.slot_create_failed` on the reference page is
+    `wal.slot_ensure_failed`.
+  - R6 described the WAL-gap signal as a `wal.slot_recreated` notice.
+    That name does not exist; a non-zero gap raises
+    `wal.follower.wal_gap_detected` at **critical**, and the notice is
+    the no-gap case. `enable-policy.md` claimed an audit event on
+    every startup that is never emitted, and `plugins/index.md` listed
+    five plugin-lifecycle audit types that do not exist, linking a
+    reference page that is not in this repository.
+  - `doctor --fix`, `list --tenant` and `gameday run --scenario` do
+    not exist. `rotate-kek.md`'s two console blocks were invented, and
+    its resumability loop polled a `would_rewrite` field the output
+    does not carry.
+
 ### Added
 
 - `repo check` reports the repository's **commit mode**
@@ -66,6 +157,90 @@ keeps reading that version for at least 24 months after a successor lands.
   enforces `If-None-Match` on PUT — assuming wrongly would make every
   single-winner guarantee silently false — so an operator whose store
   does enforce it must say so to get the append-only commit path.
+
+- **`gameday` scenarios drive real faults.**
+
+  - `patroni_failover` reads the current leader, POSTs `/switchover`,
+    waits for a different member to take the leader lock, and
+    re-measures replication-slot continuity across the promotion. It
+    fails if the leader never moves, if Patroni refuses (no healthy
+    candidate), or if the slot had to be recreated past the last
+    confirmed LSN. Needs `--deployment` with `patroni.url` set, or the
+    new `--patroni-url`.
+  - `patroni_split_brain` (new) drills the guarantee R7 depends on: a
+    divergent writer must not archive over a segment we already hold.
+    It archives a probe segment, re-archives it with different content
+    from the same cluster and from a different system identifier
+    (expecting `splitbrain.content_mismatch` and
+    `splitbrain.system_identifier_mismatch`), then confirms an
+    identical re-push still succeeds — refusing an `archive_command`
+    retry would wedge WAL archiving for the whole deployment.
+  - `agent_kill` drills what a killed agent actually leaves: an
+    unrenewed backup lease. It asserts a second agent is excluded
+    while the lease is live, and that exactly one of five racing
+    agents reclaims it after expiry. It does not signal a process —
+    there is no supervisor to re-exec one, and the `pg_backup_start`
+    leak its old invariant named cannot happen here, because
+    `BASE_BACKUP` runs over a replication connection PostgreSQL tears
+    down on disconnect.
+
+  The repository-scoped drills write under a probe deployment name and
+  delete it afterwards.
+
+- `patroni.Client.Switchover` — the only mutating Patroni call we
+  make. A 412 refusal is its own error class: the cluster answered and
+  said no, usually because no replica is healthy enough to promote,
+  which is a finding about the cluster rather than a failure to reach
+  it.
+
+- `gameday run --patroni-url`, for drilling a cluster that has no
+  deployment entry yet.
+
+- The `gameday` result body carries `deferred` and `misconfigured`, so
+  a consumer can tell a scenario that did not run from one that ran
+  and failed, and a missing flag from a broken invariant.
+
+### Internal
+
+- **Seven docs-truthfulness guards.** The config-YAML surface already
+  had one (issue #44's outcome); the rest did not. Repository-URL
+  parameters and `PG_HARDSTORAGE_*` variables (both directions), CLI
+  flags shown in prose, `.result` paths resolved against each
+  command's own result body, error codes and exit codes, event names
+  and severities, and — after [#46] — the Helm chart rendered with
+  `helm template` and checked against the pages that describe it.
+
+  Two were rewritten after they cried wolf on correct documentation.
+  One existing guard turned out to be unable to fail:
+  `TestExitCodes_NoUndocumentedRoutes` iterated hand-written lists
+  while its comment claimed a new route would fail it. The routing
+  table is now enumerable data read at run time, pinned by
+  `mutation_exit_route_undocumented`.
+
+- **Windows and macOS unit lanes.** We ship binaries for both and had
+  never executed a test on either.
+
+- **A container/volume leak gate** after the integration suite. A
+  local sweep once left 699 dangling volumes, which fills the runner
+  disk and surfaces as "no space left" in an unrelated job.
+
+- **The Docker soaks moved behind build tags** (`chaos`, `repro34`).
+  Making a soak unable to skip had made it run in the default suite,
+  where a 3-node Patroni chaos soak hit the `-race` timeout.
+  `TestSoaksDoNotSkipOnUnsetEnv` could not see the second one at all:
+  its pattern was `PGHS_[A-Z_]+`, with no digits, so
+  `PGHS_REPRO34_BIN` was unmatchable.
+
+- **Capability-gated skips must name where the weak backend's
+  behaviour is asserted**, and the storage "skips forbidden" lane now
+  covers all six backends rather than four — azblob alone had ten
+  docker-gated skips outside it.
+
+- A randomised read-race soak across all five real backends, which is
+  what found the `scp` Close bug above.
+
+- The release preflight fails on a missing Homebrew tap credential
+  instead of discovering it after the tag.
 
 
 ## [1.1.1] — 2026-08-04
@@ -291,6 +466,7 @@ migration, and nothing changes posture on upgrade.
   docs teach against `kms.DefaultRegistry` — the check that would have
   caught `azure-key-vault://`.
 
+[#46]: https://github.com/cybertec-postgresql/pg_hardstorage/issues/46
 [#45]: https://github.com/cybertec-postgresql/pg_hardstorage/issues/45
 [#44]: https://github.com/cybertec-postgresql/pg_hardstorage/issues/44
 

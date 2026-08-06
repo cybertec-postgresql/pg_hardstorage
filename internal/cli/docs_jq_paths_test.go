@@ -140,6 +140,26 @@ func itoa(n int) string {
 	return string(d)
 }
 
+// isHistoricalRecord reports whether a file describes what PAST
+// versions did rather than what this binary does.
+//
+// A changelog entry explaining that 19 expressions used to address a
+// phantom `.result.body` level has to write that level down to be
+// intelligible. The result-path and error-claim guards already exempt
+// these paths; this one did not, so documenting the fix broke the test
+// that motivated it. The exemption is by path, and it covers the copy
+// `make sync-llm-docs` places under internal/llm/docs/root/.
+func isHistoricalRecord(rel string) bool {
+	switch {
+	case strings.HasPrefix(rel, "docs/changelog.md"),
+		strings.HasPrefix(rel, "docs/release-notes/"),
+		strings.HasSuffix(rel, "llm/docs/root/CHANGELOG.md"),
+		rel == "CHANGELOG.md":
+		return true
+	}
+	return false
+}
+
 // TestDocumentedJQPathsMatchTheEnvelope catches the phantom `body`
 // level.
 func TestDocumentedJQPathsMatchTheEnvelope(t *testing.T) {
@@ -153,7 +173,7 @@ func TestDocumentedJQPathsMatchTheEnvelope(t *testing.T) {
 	var bad []pathLine
 	scanLines(t, repoRootFromTest(t), func(rel string, n int, line string) {
 		// This file quotes the wrong form in its own explanation.
-		if strings.HasSuffix(rel, "docs_jq_paths_test.go") {
+		if strings.HasSuffix(rel, "docs_jq_paths_test.go") || isHistoricalRecord(rel) {
 			return
 		}
 		if phantom.MatchString(line) {
@@ -208,7 +228,7 @@ func TestDocumentedResultFieldsExistSomewhere(t *testing.T) {
 	var bad []pathLine
 	seen := map[string]bool{}
 	scanLines(t, root, func(rel string, n int, line string) {
-		if strings.HasSuffix(rel, "docs_jq_paths_test.go") {
+		if strings.HasSuffix(rel, "docs_jq_paths_test.go") || isHistoricalRecord(rel) {
 			return
 		}
 		if !strings.Contains(line, "{{") && !strings.Contains(line, "jq ") &&
