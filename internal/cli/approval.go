@@ -138,7 +138,7 @@ func runApprovalPurgeExpired(cmd *cobra.Command, repoURL string, dryRun, yes boo
 	if !dryRun && len(expired) > 0 {
 		auditStore := audit.NewStoreWithRetention(sp, repoMeta.WORM)
 		for _, r := range expired {
-			_ = auditStore.Append(cmd.Context(), &audit.Event{
+			auditStore.AppendOrLog(cmd.Context(), &audit.Event{
 				Action: "approval.expire",
 				Subject: audit.Subject{
 					Tenant: r.Tenant,

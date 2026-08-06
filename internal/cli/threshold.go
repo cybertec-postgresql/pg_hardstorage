@@ -263,7 +263,7 @@ func runThresholdRosterCreate(cmd *cobra.Command, id string, f thresholdRosterCr
 	// Best-effort audit append.  Failure does not roll back the
 	// roster — auditors verify the chain periodically.
 	auditStore := audit.NewStoreWithRetention(sp, repoMeta.WORM)
-	_ = auditStore.Append(cmd.Context(), &audit.Event{
+	auditStore.AppendOrLog(cmd.Context(), &audit.Event{
 		Action:    "threshold.roster_create",
 		Actor:     createdBy,
 		Timestamp: time.Now().UTC(),
@@ -480,7 +480,7 @@ func runThresholdAttestSign(cmd *cobra.Command, kind, id string, f thresholdAtte
 			fmt.Sprintf("threshold attest sign: signature: %v", err)).Wrap(err)
 	}
 	auditStore := audit.NewStoreWithRetention(sp, repoMeta.WORM)
-	_ = auditStore.Append(cmd.Context(), &audit.Event{
+	auditStore.AppendOrLog(cmd.Context(), &audit.Event{
 		Action:    "threshold.attest_sign",
 		Actor:     sig.Signer,
 		Timestamp: now,

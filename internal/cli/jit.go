@@ -188,7 +188,7 @@ func runJitIssue(cmd *cobra.Command, principal string, f jitIssueFlags) error {
 	// chain-integrity for issuance run audit verify-chain
 	// periodically).
 	auditStore := audit.NewStoreWithRetention(sp, repoMeta.WORM)
-	_ = auditStore.Append(cmd.Context(), &audit.Event{
+	auditStore.AppendOrLog(cmd.Context(), &audit.Event{
 		Action:    "jit.issue",
 		Subject:   audit.Subject{Tenant: f.tenant},
 		Tenant:    f.tenant,
@@ -471,7 +471,7 @@ func runJitRevoke(cmd *cobra.Command, repoURL, id, by, reason string) error {
 	}
 	// Best-effort audit.
 	auditStore := audit.NewStoreWithRetention(sp, repoMeta.WORM)
-	_ = auditStore.Append(cmd.Context(), &audit.Event{
+	auditStore.AppendOrLog(cmd.Context(), &audit.Event{
 		Action:    "jit.revoke",
 		Actor:     by,
 		Timestamp: now,

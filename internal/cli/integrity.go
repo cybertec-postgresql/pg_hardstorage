@@ -165,7 +165,7 @@ func runIntegrityRun(cmd *cobra.Command, f integrityRunFlags) error {
 	}
 	// Best-effort audit append (failure is not fatal).
 	auditStore := audit.NewStoreWithRetention(sp, repoMeta.WORM)
-	_ = auditStore.Append(cmd.Context(), &audit.Event{
+	auditStore.AppendOrLog(cmd.Context(), &audit.Event{
 		Action:    "integrity.run",
 		Timestamp: time.Now().UTC(),
 		Body: map[string]any{

@@ -144,7 +144,7 @@ func runInsiderScan(cmd *cobra.Command, f insiderScanFlags) error {
 			fmt.Sprintf("insider scan: persist: %v", err)).Wrap(err)
 	}
 	// Best-effort audit append.
-	_ = auditStore.Append(cmd.Context(), &audit.Event{
+	auditStore.AppendOrLog(cmd.Context(), &audit.Event{
 		Action:    "insider.scan",
 		Timestamp: time.Now().UTC(),
 		Body: map[string]any{

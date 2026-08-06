@@ -188,7 +188,7 @@ func runWalGapPurge(cmd *cobra.Command, deployment, repoURL string, orphans, all
 					"detected_at": r.DetectedAt.Format(time.RFC3339),
 				},
 			}
-			_ = auditStore.Append(cmd.Context(), ev)
+			auditStore.AppendOrLog(cmd.Context(), ev)
 		}
 	}
 

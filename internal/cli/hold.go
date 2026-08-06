@@ -186,7 +186,7 @@ func runHoldPurgeExpired(cmd *cobra.Command, scope, repoURL string, dryRun, yes 
 			// Best-effort audit emit — a chain failure
 			// shouldn't undo the removal (the marker is
 			// already gone).
-			_ = auditStore.Append(cmd.Context(), ev)
+			auditStore.AppendOrLog(cmd.Context(), ev)
 		}
 	}
 

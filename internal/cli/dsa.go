@@ -181,7 +181,7 @@ func runDsaLocate(cmd *cobra.Command, f dsaLocateFlags) error {
 		}
 	}
 	auditStore := audit.NewStoreWithRetention(sp, repoMeta.WORM)
-	_ = auditStore.Append(cmd.Context(), &audit.Event{
+	auditStore.AppendOrLog(cmd.Context(), &audit.Event{
 		Action:    "dsa.locate",
 		Tenant:    f.tenant,
 		Timestamp: time.Now().UTC(),
