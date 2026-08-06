@@ -1,3 +1,11 @@
+// Gated by the `repro34` build tag — which this file's own usage
+// example already told operators to pass, while the tag did not exist.
+// Untagged, it ran in the default suite and skipped on an unset
+// PGHS_REPRO34_BIN; the soak guard did not notice because it only reads
+// files named *soak*/*chaos*/*modelcheck*.
+//
+//go:build repro34
+
 package topology
 
 // Reproduction harness for issue #34: a continuously-running `wal stream`
@@ -17,8 +25,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
 	"os"
 	"os/exec"
 	"strings"
@@ -29,7 +35,10 @@ import (
 func TestRepro34_ContinuousStreamerSwitchover(t *testing.T) {
 	bin := os.Getenv("PGHS_REPRO34_BIN")
 	if bin == "" {
-		t.Skip("set PGHS_REPRO34_BIN to the pg_hardstorage binary under test")
+		// You asked for this harness with -tags repro34; a missing
+		// binary is a configuration error, not a reason to report ok.
+		t.Fatal("set PGHS_REPRO34_BIN to the pg_hardstorage binary under test " +
+			"(you built with -tags repro34, so this harness was requested deliberately)")
 	}
 	repoDir, err := os.MkdirTemp("", "repro34-repo-")
 	if err != nil {
@@ -121,52 +130,6 @@ func TestRepro34_ContinuousStreamerSwitchover(t *testing.T) {
 
 // --- helpers (test-only, same package) ---
 
-func (p *patroniLocalDocker) findLeaderName(ctx context.Context) string {
-	for _, n := range p.nodes {
-		body, err := httpGet(fmt.Sprintf("http://127.0.0.1:%d/cluster", n.patroniPort))
-		if err != nil {
-			continue
-		}
-		var cl struct {
-			Members []struct {
-				Name, Role, State string
-			} `json:"members"`
-		}
-		if json.Unmarshal(body, &cl) != nil {
-			continue
-		}
-		for _, m := range cl.Members {
-			if m.Role == "leader" && m.State == "running" {
-				return m.Name
-			}
-		}
-	}
-	return ""
-}
-
-func (p *patroniLocalDocker) switchover(ctx context.Context, leader string) error {
-	// POST /switchover {leader} to any node's REST API; Patroni picks a
-	// candidate. Body-less /failover is rejected, so name the leader.
-	for _, n := range p.nodes {
-		payload := fmt.Sprintf(`{"leader":%q}`, leader)
-		req, _ := http.NewRequest("POST",
-			fmt.Sprintf("http://127.0.0.1:%d/switchover", n.patroniPort),
-			strings.NewReader(payload))
-		req.Header.Set("Content-Type", "application/json")
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			continue
-		}
-		b, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if resp.StatusCode < 300 {
-			return nil
-		}
-		return fmt.Errorf("switchover HTTP %d: %s", resp.StatusCode, string(b))
-	}
-	return fmt.Errorf("no reachable patroni REST endpoint")
-}
-
 // demotedNodeRunning reports the whole cluster's member states and
 // whether the named old leader is now a running (not-leader) member.
 func (p *patroniLocalDocker) demotedNodeRunning(ctx context.Context, oldLeader string) (string, bool) {
@@ -201,16 +164,6 @@ func (p *patroniLocalDocker) demotedNodeRunning(ctx context.Context, oldLeader s
 	return "", false
 }
 
-func httpGet(url string) ([]byte, error) {
-	c := http.Client{Timeout: 4 * time.Second}
-	resp, err := c.Get(url)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	return io.ReadAll(resp.Body)
-}
-
 func run(t *testing.T, bin string, args ...string) {
 	t.Helper()
 	out, err := exec.Command(bin, args...).CombinedOutput()
@@ -226,13 +179,6 @@ func psql(t *testing.T, p *patroniLocalDocker, leader, sql string) {
 	if err != nil {
 		t.Logf("seed psql (non-fatal): %v\n%s", err, out)
 	}
-}
-
-func tail(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return "…" + s[len(s)-n:]
 }
 
 func dockerLogsTail(container string, n int) string {

@@ -34,6 +34,13 @@ import (
 
 // envGatedSkip matches `if os.Getenv("X") == ""` followed closely by a
 // t.Skip — the shape that turns a missing variable into a green tick.
+//
+// The character class includes DIGITS, and that is not cosmetic: it
+// read [A-Z_]+ until PGHS_REPRO34_BIN was found skipping. The "34" made
+// the whole variable unmatchable, so repro34_test.go — a Docker soak —
+// skipped silently and this guard reported nothing. A guard whose
+// pattern cannot express the names in use is a guard that passes for
+// the wrong reason.
 // The window must allow braces: the shape is
 //
 //	bin := os.Getenv("PGHS_X")
@@ -45,7 +52,27 @@ import (
 // nothing and the guard passed on the very code it was written to
 // catch. A guard that cannot fail is worse than none.
 var envGatedSkip = regexp.MustCompile(
-	`(?s)Getenv\("(PGHS_[A-Z_]+)"\)[\s\S]{0,160}?t\.Skip`)
+	`(?s)Getenv\("(PGHS_[A-Z0-9_]+)"\)[\s\S]{0,160}?t\.Skip`)
+
+// stripLineComments removes //-comments before matching.
+//
+// The window above is a proximity heuristic, and a comment between the
+// Getenv and the t.Skip pushes them apart without changing what the
+// code does. That is not hypothetical: explaining in a comment WHY a
+// harness must not skip was enough to hide a reintroduced t.Skip from
+// this guard. Prose must not be able to launder a violation.
+func stripLineComments(src string) string {
+	var b strings.Builder
+	b.Grow(len(src))
+	for _, line := range strings.Split(src, "\n") {
+		if i := strings.Index(line, "//"); i >= 0 {
+			line = line[:i]
+		}
+		b.WriteString(line)
+		b.WriteByte('\n')
+	}
+	return b.String()
+}
 
 func repoRoot(t *testing.T) string {
 	t.Helper()
@@ -82,15 +109,20 @@ func TestSoaksDoNotSkipOnUnsetEnv(t *testing.T) {
 		if base == "soak_not_vacuous_test.go" {
 			return nil
 		}
+		// Filename-scoped on purpose: these are the long-running
+		// harnesses whose whole value is that they RAN. "repro" joined
+		// the list after repro34_test.go was found skipping on an unset
+		// PGHS_REPRO34_BIN, invisible to this guard because its name
+		// matched none of the other three.
 		if !strings.Contains(base, "soak") && !strings.Contains(base, "chaos") &&
-			!strings.Contains(base, "modelcheck") {
+			!strings.Contains(base, "modelcheck") && !strings.Contains(base, "repro") {
 			return nil
 		}
 		src, rerr := os.ReadFile(path)
 		if rerr != nil {
 			return nil
 		}
-		for _, m := range envGatedSkip.FindAllStringSubmatch(string(src), -1) {
+		for _, m := range envGatedSkip.FindAllStringSubmatch(stripLineComments(string(src)), -1) {
 			rel, _ := filepath.Rel(root, path)
 			offenders = append(offenders, rel+": skips when "+m[1]+" is unset")
 		}

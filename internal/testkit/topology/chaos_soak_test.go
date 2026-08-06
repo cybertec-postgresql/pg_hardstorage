@@ -1,3 +1,19 @@
+// This soak needs Docker, the Spilo image and minutes of wall-clock
+// budget, so it is excluded from the default suite by BUILD TAG rather
+// than by a runtime skip.
+//
+// The distinction matters and was got wrong once. Making the soak
+// unable to skip (commit 28dd8cd, "a soak must not report PASS without
+// running") removed its t.Skip and had it build a binary instead — at
+// which point `go test ./internal/...` started running a 3-node Patroni
+// chaos soak, and the -race suite hit its 30-minute timeout in this
+// package. Both properties are wanted: not in the default suite, AND
+// unable to silently skip once you ask for it. A build tag gives the
+// first at compile time; chaosBinary's fatal-on-unusable-binary gives
+// the second.
+//
+//go:build chaos
+
 package topology
 
 // Chaos soak with a RESTORE-PROOF gate (integrity program #1).

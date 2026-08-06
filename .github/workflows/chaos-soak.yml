@@ -74,6 +74,6 @@ jobs:
           PGHS_CHAOS_MINUTES: ${{ github.event.inputs.minutes || '45' }}
           PGHS_CHAOS_SEED: ${{ github.event.inputs.seed || '' }}
         run: |
-          go test -count=1 -timeout 110m -v \
+          go test -tags chaos -count=1 -timeout 110m -v \
             -run TestChaosSoak_RestoreProof \
             ./internal/testkit/topology/
