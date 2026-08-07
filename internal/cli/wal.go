@@ -87,12 +87,13 @@ and are not supported.
 // gives up via archive_timeout / archive_failures.
 func newWalPushCmd() *cobra.Command {
 	var (
-		repoURL      string
-		pgConn       string
-		tde          bool
-		kekRef       string
-		kmsConfig    map[string]string
-		walSegSizeMB int
+		repoURL          string
+		pgConn           string
+		tde              bool
+		kekRef           string
+		kmsConfig        map[string]string
+		walSegSizeMB     int
+		allowSysIDChange bool
 	)
 	c := &cobra.Command{
 		Use:   "push <deployment> <segment-path>",
@@ -150,6 +151,8 @@ Exit codes:
 				kekRef:      kekRef,
 				kmsConfig:   kmsConfig,
 				segSize:     int64(walSegSizeMB) << 20,
+
+				allowSysIDChange: allowSysIDChange,
 			})
 		},
 	}
@@ -168,6 +171,8 @@ Exit codes:
 		"cloud KMS provider config (region/endpoint/credentials); only consulted when --kek is a cloud scheme — the same values base backups use.")
 	c.Flags().IntVar(&walSegSizeMB, "wal-segsize", 16,
 		"cluster wal_segment_size in megabytes (matches initdb --wal-segsize); a segment file whose length differs from this is refused as truncated/corrupt")
+	c.Flags().BoolVar(&allowSysIDChange, "allow-system-identifier-change", false,
+		"continue archiving into this deployment even though the cluster's system_identifier differs from the WAL already archived (i.e. a DIFFERENT cluster — pg_upgrade, restore onto new storage, cloned datadir). Off by default: interleaving two clusters under one lineage corrupts PITR.")
 	return c
 }
 
@@ -181,6 +186,10 @@ type walPushOptions struct {
 	kekRef      string
 	kmsConfig   map[string]string
 	segSize     int64 // declared wal_segment_size in bytes; 0 → 16 MiB
+	// allowSysIDChange lets a deliberate pg_upgrade continue archiving
+	// into an existing deployment. Same escape hatch, same name, as
+	// `wal stream`.
+	allowSysIDChange bool
 }
 
 func runWalPush(cmd *cobra.Command, opts walPushOptions) error {
@@ -285,6 +294,29 @@ func runWalPush(cmd *cobra.Command, opts walPushOptions) error {
 			return err
 		}
 		sysID = id.SystemID
+	}
+
+	// Refuse a segment from a DIFFERENT cluster than the one this
+	// deployment already holds WAL for.
+	//
+	// `wal stream` has guarded this since the pg_upgrade work; push did
+	// not, and the only thing standing in its way was
+	// verifyExistingManifest — which compares identifiers solely when
+	// the SAME segment number is already archived. That is a duplicate
+	// check, not a continuity check, so a foreign cluster whose segment
+	// numbers happened not to collide archived into the deployment
+	// unopposed. Measured before this guard: exit 0.
+	//
+	// The consequence is not merely a polluted archive. Every resume
+	// and gap computation we make reads the archive frontier via
+	// inventory.HighestArchivedLSN, which returns the highest segment's
+	// end LSN WITHOUT regard to which cluster wrote it. A foreign
+	// segment at a higher number therefore drags the frontier forward,
+	// and `wal stream` resumes past WAL the real cluster has not
+	// archived yet — silently, since from the streamer's side the
+	// frontier looks perfectly ordinary.
+	if err := guardSystemIdentifier(cmd.Context(), sp, "wal push", opts.deployment, sysID, opts.allowSysIDChange); err != nil {
+		return err
 	}
 
 	// WORM thread: when the repo carries a retention policy, both
@@ -1323,7 +1355,7 @@ func probeSegmentSize(ctx context.Context, dsn string) (int64, error) {
 // check; a probe/read failure or a deployment with no WAL yet also
 // skips (conservative — never block a valid stream on a flaky
 // preflight, and the first-ever stream establishes the baseline).
-func guardSystemIdentifier(ctx context.Context, sp storage.StoragePlugin, deployment, liveSysID string, allowChange bool) error {
+func guardSystemIdentifier(ctx context.Context, sp storage.StoragePlugin, who, deployment, liveSysID string, allowChange bool) error {
 	if liveSysID == "" || allowChange {
 		return nil
 	}
@@ -1332,11 +1364,11 @@ func guardSystemIdentifier(ctx context.Context, sp storage.StoragePlugin, deploy
 		return nil
 	}
 	return output.NewError("preflight.system_identifier_changed",
-		fmt.Sprintf("wal stream: this cluster's system_identifier is %s, but deployment %q previously "+
+		fmt.Sprintf("%s: this cluster's system_identifier is %s, but deployment %q previously "+
 			"archived WAL under %s. A changed system identifier means a DIFFERENT cluster — typically a "+
 			"pg_upgrade, a restore onto new storage, or a cloned datadir. Streaming the new cluster's WAL "+
 			"into the existing lineage would interleave two incompatible clusters under one timeline and "+
-			"corrupt point-in-time recovery. Refusing.", liveSysID, deployment, recorded)).
+			"corrupt point-in-time recovery. Refusing.", who, liveSysID, deployment, recorded)).
 		WithSuggestion(&output.Suggestion{
 			Human: "back up the new (e.g. pg_upgrade'd) cluster under a FRESH deployment name: the old lineage stays intact for PITR of the pre-upgrade cluster, and a new full backup establishes the new one. Only if you deliberately want to continue THIS deployment onto the new cluster, re-run with --allow-system-identifier-change.",
 		})
@@ -1506,7 +1538,7 @@ func runWalStream(cmd *cobra.Command, opts walStreamOptions) error {
 	// this never trips on normal HA events. Probe failures degrade to
 	// "allow" so a flaky preflight never blocks a valid stream.
 	if liveID, idErr := identifySystem(repoCtx, opts.pgConn); idErr == nil {
-		if err := guardSystemIdentifier(repoCtx, sp, opts.deployment, liveID.SystemID, opts.allowSysIDChange); err != nil {
+		if err := guardSystemIdentifier(repoCtx, sp, "wal stream", opts.deployment, liveID.SystemID, opts.allowSysIDChange); err != nil {
 			return err
 		}
 	}

@@ -61,12 +61,12 @@ func TestGuardSystemIdentifier(t *testing.T) {
 	plantSegmentManifest(t, sp, "db1", oldSys, 1, 5)
 
 	// Same cluster (normal resume, or a promotion that keeps the sysid).
-	if err := guardSystemIdentifier(ctx, sp, "db1", oldSys, false); err != nil {
+	if err := guardSystemIdentifier(ctx, sp, "wal stream", "db1", oldSys, false); err != nil {
 		t.Errorf("matching system identifier must pass: %v", err)
 	}
 
 	// Different cluster (pg_upgrade) → hard refuse.
-	err = guardSystemIdentifier(ctx, sp, "db1", newSys, false)
+	err = guardSystemIdentifier(ctx, sp, "wal stream", "db1", newSys, false)
 	if err == nil {
 		t.Fatal("a changed system identifier must be refused")
 	}
@@ -81,18 +81,18 @@ func TestGuardSystemIdentifier(t *testing.T) {
 	}
 
 	// Deliberate override.
-	if err := guardSystemIdentifier(ctx, sp, "db1", newSys, true); err != nil {
+	if err := guardSystemIdentifier(ctx, sp, "wal stream", "db1", newSys, true); err != nil {
 		t.Errorf("--allow-system-identifier-change must pass: %v", err)
 	}
 
 	// Empty live identifier (couldn't probe) → conservative skip.
-	if err := guardSystemIdentifier(ctx, sp, "db1", "", false); err != nil {
+	if err := guardSystemIdentifier(ctx, sp, "wal stream", "db1", "", false); err != nil {
 		t.Errorf("empty live identifier must skip: %v", err)
 	}
 
 	// Fresh deployment with no archived WAL → first stream establishes
 	// the baseline, nothing to compare against.
-	if err := guardSystemIdentifier(ctx, sp, "fresh", newSys, false); err != nil {
+	if err := guardSystemIdentifier(ctx, sp, "wal stream", "fresh", newSys, false); err != nil {
 		t.Errorf("a deployment with no WAL must skip: %v", err)
 	}
 }
