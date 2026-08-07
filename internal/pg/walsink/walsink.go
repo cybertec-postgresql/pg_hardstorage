@@ -222,6 +222,13 @@ type Sink struct {
 	// and a hole-spanning segment would commit silently).
 	expectedNext uint64
 
+	// expectedFirst is Options.ExpectedFirstLSN, and firstChecked
+	// records whether the opening record has been validated against
+	// it. Tracked separately from expectedNext because "no record yet"
+	// and "expected position is zero" are different states.
+	expectedFirst uint64
+	firstChecked  bool
+
 	// Pipeline plumbing.
 	bufPool  chan []byte   // free 16 MiB segment buffers
 	pending  chan *segJob  // filled segments handed receive -> processor
@@ -313,6 +320,25 @@ type Options struct {
 	// it on every manifest. 0 resolves to the default 16 MiB; the
 	// caller probes the cluster's actual value and passes it here.
 	SegmentSize int64
+
+	// ExpectedFirstLSN is the position the caller asked PG to start
+	// streaming from. Zero disables the check.
+	//
+	// Without it the contiguity guard below has a hole exactly where
+	// it is needed most. expectedNext starts at zero and only becomes
+	// meaningful once a record has arrived, and `wal stream` builds a
+	// NEW Sink on every reconnect attempt — so the first record after
+	// any reconnect was accepted at whatever LSN it happened to carry.
+	// Every subsequent record was then checked against that, meaning a
+	// stream that resumed past a hole looked perfectly contiguous
+	// forever after.
+	//
+	// That is the failure this repository has just spent a campaign
+	// fixing upstream of here (a resume that skipped the previous
+	// timeline's WAL). The strict per-record check was the net beneath
+	// those fixes, and a net that only holds when the thing above it is
+	// already correct is not a net.
+	ExpectedFirstLSN pglogrepl.LSN
 
 	// ChunkerFactory builds a fresh chunker per segment. Defaults to
 	// chunker.New (4 KiB / 64 KiB / 256 KiB FastCDC). Tests override
@@ -419,6 +445,7 @@ func New(cas *repo.CAS, sp storage.StoragePlugin, opts Options) (*Sink, error) {
 		procDone:         make(chan struct{}),
 		procCtx:          procCtx,
 		procStop:         procStop,
+		expectedFirst:    uint64(opts.ExpectedFirstLSN),
 	}
 	if s.chunkerFn == nil {
 		s.chunkerFn = chunker.New
@@ -478,6 +505,26 @@ func (s *Sink) OnRecord(ctx context.Context, rec replication.XLogRecord) error {
 	// lands on a segment boundary (no current segment right after a
 	// hand-off), which would otherwise commit a segment past an
 	// unrecorded hole and let PG recycle the missing WAL for good.
+	// The OPENING record, checked against where the caller asked PG to
+	// start. Only the forward direction is a fault: a record beginning
+	// AFTER the requested position means the bytes in between were
+	// never sent and never will be, so committing from here writes a
+	// segment past a hole that PG is free to recycle.
+	//
+	// Beginning at or before the requested position is not a fault. A
+	// walsender may open on a page or segment boundary at or below what
+	// was asked for, and receiving those extra bytes costs nothing —
+	// refusing them would turn a healthy stream into a crash loop.
+	if !s.firstChecked {
+		s.firstChecked = true
+		if s.expectedFirst != 0 && pos > s.expectedFirst {
+			return fmt.Errorf("walsink: gap detected at stream start: asked PG to resume at %s "+
+				"but the first record begins at %s, so %d byte(s) were skipped and are not "+
+				"coming; refusing to commit a segment past an unrecorded hole",
+				pglogrepl.LSN(s.expectedFirst), rec.WALStart, pos-s.expectedFirst)
+		}
+	}
+
 	if s.expectedNext != 0 && pos != s.expectedNext {
 		return fmt.Errorf("walsink: gap detected: expected next WAL byte at %s, got record starting at %s",
 			pglogrepl.LSN(s.expectedNext), rec.WALStart)

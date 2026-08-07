@@ -2031,6 +2031,13 @@ func streamAttempt(
 		Timeline:         timeline,
 		SystemIdentifier: identityID,
 		SegmentSize:      opts.segmentSize,
+		// Hand the sink the position we are about to ask PG for, so it
+		// can check the OPENING record too. A new Sink is built on every
+		// reconnect attempt, so without this the first record after each
+		// reconnect is accepted at any LSN and every later record is
+		// then measured against that — a stream that resumed past a hole
+		// looks contiguous forever after.
+		ExpectedFirstLSN: startLSN,
 		Durability:       durabilityMode,
 		// WORM thread: the streaming CAS already locks chunks
 		// (casdefault.NewWithRetention above), but the segment MANIFEST

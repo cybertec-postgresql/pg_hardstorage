@@ -13,6 +13,26 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **The WAL sink's contiguity guard now covers the opening record.** The
+  stream-level check compares each record against the end of the
+  previous one, and its baseline was unset until a record arrived. That
+  is sound for one continuous stream, but `wal stream` builds a new sink
+  on every reconnect attempt — so after each reconnect the first record
+  was accepted at whatever position it carried, and every later record
+  was measured against *that*. A stream that resumed past a hole looked
+  perfectly contiguous for the rest of its life.
+
+  The sink is now told the position the streamer asked PostgreSQL to
+  resume from, and refuses an opening record that begins after it. Only
+  that direction is a fault: a walsender may legitimately open at a page
+  or segment boundary at or below the requested position, and refusing
+  those extra bytes would turn a healthy stream into a crash loop — a
+  worse way to lose WAL than the gap being guarded against.
+
+  This is the safety net beneath the resume fixes above rather than a
+  replacement for them; a net that only holds when the thing above it is
+  already correct is not a net.
+
 - **`wal stream` refuses to archive from a demoted node without saying
   so.** The streamer has no Patroni awareness — leader-following is
   delegated to libpq, which only works when `--pg-connection` is a
