@@ -141,26 +141,50 @@ func TestPatroniFailover_FailsWhenLeaderNeverMoves(t *testing.T) {
 	}
 }
 
-// TestPatroniFailover_UnmeasuredIsLabelled: without the ObserveSlot
-// seam the drill still asserts the promotion, but must SAY that
-// continuity went unmeasured rather than implying it checked.
-func TestPatroniFailover_UnmeasuredIsLabelled(t *testing.T) {
+// TestPatroniFailover_UnmeasuredIsDeferredNotAPass: without the
+// ObserveSlot seam the drill has driven a real switchover and watched
+// the leader move — but it has NOT checked the invariant it exists for,
+// which is that the promotion did not cost us WAL.
+//
+// This test previously required the opposite: Pass=true with evidence
+// tagged "unmeasured". That was wrong twice over. It is a hollow pass
+// at tier L4 — the tier an auditor reads as "we tested catastrophic
+// failover" — and the word "unmeasured" is what let it through, because
+// deferred_not_pass_test.go keys on the exact string "deferred". The
+// guard written to catch evidence-of-no-drive alongside Pass=true was
+// sitting right there and could not see a synonym.
+//
+// So: Deferred, Pass=false, with a Failure that names what to configure.
+// The CLI maps Deferred to notimpl.scenario, so an operator reads "not
+// implemented" rather than "invariant violated".
+func TestPatroniFailover_UnmeasuredIsDeferredNotAPass(t *testing.T) {
 	res := run(t, gameday.RunOptions{
 		Patroni:       &fakePatroni{leaders: []string{"node-1", "node-2"}},
 		RecoverWithin: 10 * time.Second,
 	})
-	if !res.Pass {
-		t.Fatalf("promotion-only drill failed: %s", res.Failure)
+	if res.Pass {
+		t.Fatal("the drill reported a pass without measuring slot continuity.\n\n" +
+			"The leader moved, which is not evidence that the promotion kept the WAL. " +
+			"`gameday run patroni_failover` would exit 0 and `gameday report` would count " +
+			"a success, indistinguishable from a run that actually checked the invariant.")
+	}
+	if !res.Deferred {
+		t.Error("Result.Deferred is not set; the CLI cannot tell an unwired seam apart " +
+			"from a genuine invariant failure and would report verify.failed (exit 9)")
+	}
+	if res.Failure == "" {
+		t.Error("deferred with no Failure text: the operator gets a non-zero exit with no " +
+			"explanation of what to configure")
 	}
 	var labelled bool
 	for _, ev := range res.Evidence {
-		if ev.Kind == "unmeasured" {
+		if ev.Kind == "deferred" {
 			labelled = true
 		}
 	}
 	if !labelled {
-		t.Error("no `unmeasured` evidence: the run asserted only that the leader moved, " +
-			"and a reader of the evidence would reasonably assume slot continuity was " +
-			"checked too")
+		t.Error("no evidence tagged `deferred`. That exact string is what " +
+			"TestScenarios_DeferredIsNeverAPass keys on; a synonym here re-opens the hole " +
+			"this test is closing.")
 	}
 }

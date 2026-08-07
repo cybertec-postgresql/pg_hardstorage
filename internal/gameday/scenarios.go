@@ -245,13 +245,30 @@ func runPatroniFailover(ctx context.Context, opts RunOptions) (*Result, error) {
 
 	// The invariant: a planned switchover must not cost us WAL.
 	if after == nil {
+		// The leader moved, but the invariant this scenario declares is
+		// that a planned switchover does not COST us WAL — and that was
+		// not measured. Passing here would be a hollow pass at tier L4,
+		// the tier an auditor reads as "we tested catastrophic
+		// failover".
+		//
+		// Kind is "deferred", not a synonym. deferred_not_pass_test.go
+		// keys on that exact string, and this branch previously said
+		// "unmeasured", which slipped past the one guard written to
+		// catch precisely this: evidence that the drive did not happen,
+		// alongside Pass=true.
 		r.Evidence = append(r.Evidence, Event{
 			At:   time.Now().UTC(),
-			Kind: "unmeasured",
+			Kind: "deferred",
 			Message: "replication-slot continuity was NOT measured (no ObserveSlot seam " +
-				"wired); this run asserts only that the leader moved",
+				"wired); the leader moved, but that is not evidence the promotion kept the WAL",
 		})
-		r.Pass = true
+		r.Failure = "slot continuity was not measured: the drill drove a real switchover and " +
+			"the leader moved, but without a repository and a PG connection for this " +
+			"deployment there is no way to check whether the promotion cost WAL — which is " +
+			"the invariant this scenario exists to prove. Pass --repo and configure " +
+			"deployments.<name>.pg_connection, then re-run."
+		r.Deferred = true
+		r.Pass = false
 		return r, nil
 	}
 	if after.GapBytes > 0 || after.Outcome == "missing" {

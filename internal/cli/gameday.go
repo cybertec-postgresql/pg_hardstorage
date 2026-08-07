@@ -115,6 +115,7 @@ Use 'gameday list' to see registered scenarios.`,
 				FaultDuration: faultDuration,
 				DryRun:        dryRun,
 				Patroni:       drv,
+				ObserveSlot:   gameDayObserveSlot(deployment, repoURL),
 			})
 		},
 	}
