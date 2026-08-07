@@ -306,6 +306,13 @@ func Restore(ctx context.Context, opts Options) (res *Result, err error) {
 	// deletion). Never refuses — it only warns so a false positive can't
 	// block a legitimate restore.
 	preflightWALContiguity(ctx, sp, opts.Deployment, m, opts.Recovery, emit)
+	// Timeline-history reachability: PG probes <N>.history ascending
+	// and stops at the FIRST miss, so a lost history file makes a
+	// --to-latest recovery silently end on an older timeline and
+	// promote. Refuse while the operator can still re-archive it.
+	if err := preflightTimelineHistory(ctx, sp, opts.Deployment, m.Timeline, opts.Recovery, emit); err != nil {
+		return nil, err
+	}
 
 	// 2pre-b. Reachability gate (issue #99).  A --to-lsn target
 	// BEFORE the backup's stop_lsn cannot be reached by forward

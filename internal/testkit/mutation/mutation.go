@@ -58,6 +58,21 @@ type Mutation struct {
 // in the named package — see the package doc.
 var Registry = []Mutation{
 	{
+		Tag: "mutation_history_preflight_absent",
+		Description: "restore has no timeline-history reachability " +
+			"preflight (pre-fix bug #22): PostgreSQL probes <N>.history " +
+			"ascending and stops at the FIRST miss, so one unarchived or " +
+			"lost history file makes a --to-latest recovery silently end " +
+			"on an older timeline and promote — success reported, every " +
+			"newer-timeline segment in the archive ignored. A pinned " +
+			"--timeline N fails the same way without N.history. Caught by " +
+			"TestPreflightTimelineHistory_MissingHistory_Refuses, " +
+			"_IntermediateHoleRefuses, and _PinnedTimeline.",
+		Packages: []string{
+			"github.com/cybertec-postgresql/pg_hardstorage/internal/restore",
+		},
+	},
+	{
 		Tag: "mutation_restore_cmd_lenient_tail",
 		Description: "the one-shot restore_command tail passes " +
 			"infrastructure-fault exit codes through instead of dying by " +

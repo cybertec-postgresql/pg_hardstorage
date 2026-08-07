@@ -120,6 +120,23 @@ keeps reading that version for at least 24 months after a successor lands.
   which monitoring already sees, while a promoted-behind cluster is
   data loss.
 
+- **A restore that cannot reach the newest timeline now refuses
+  instead of silently stopping short.** PostgreSQL discovers the
+  newest timeline by probing `<N>.history` files ascending and stops
+  at the *first miss*: one history file that was never archived (a
+  promotion race, a lost spool) or was lost later makes a
+  `--to-latest` recovery silently end on an older timeline and promote
+  — success reported, every segment archived on the newer timeline(s)
+  ignored. A pinned `--timeline N` fails the same way without
+  `N.history`, which carries the ancestry chain. The new preflight
+  enumerates the timelines the archive holds segments for and refuses
+  (`restore.timeline_history_unreachable`) when a history file needed
+  to reach the requested timeline is in neither location `wal fetch`
+  serves them from (the archive path and the streaming follower's
+  timeline store) — naming the missing file and the `wal push` command
+  that re-archives it. `--skip-gap-check` remains the eyes-open
+  override.
+
 ### Added
 
 - **`restore --to-latest`: end-of-archive recovery.** There was no CLI
