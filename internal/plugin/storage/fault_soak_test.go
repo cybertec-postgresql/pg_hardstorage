@@ -118,17 +118,27 @@ func faultSoakDuration(t *testing.T) time.Duration {
 // scheme, so a leak that only one backend's commit path produces is not
 // hidden by the others.
 func TestFaultSoak(t *testing.T) {
-	for _, w := range soakSchemes() {
+	schemes := soakSchemes()
+	// Same deadline arithmetic as TestBackendSoak: this loop is ALSO
+	// per-backend, and both tests share one binary deadline — the
+	// nightly's uncapped product (5×20m backend + 5×10m fault = 150m
+	// in a 60m -timeout) could never fit anywhere.
+	perBackend := fitSoakBudget(t, len(schemes), faultSoakDuration(t))
+	for _, w := range schemes {
 		t.Run(w.scheme, func(t *testing.T) {
 			url := wiringURL(t, w)
-			runFaultSoak(t, w.scheme, url)
+			runFaultSoakFor(t, w.scheme, url, perBackend)
 		})
 	}
 }
 
 func runFaultSoak(t *testing.T, backend, url string) {
 	t.Helper()
-	dur := faultSoakDuration(t)
+	runFaultSoakFor(t, backend, url, faultSoakDuration(t))
+}
+
+func runFaultSoakFor(t *testing.T, backend, url string, dur time.Duration) {
+	t.Helper()
 	seed := time.Now().UnixNano()
 	if v := os.Getenv("PGHS_STORAGE_SOAK_SEED"); v != "" {
 		if n, err := strconv.ParseInt(v, 10, 64); err == nil {

@@ -154,12 +154,54 @@ func soakSchemes() []wiredScheme {
 // drift from wiredSchemes: adding a backend to the wiring table adds it
 // here automatically.
 func TestBackendSoak(t *testing.T) {
-	for _, w := range soakSchemes() {
+	schemes := soakSchemes()
+	perBackend := fitSoakBudget(t, len(schemes), soakDuration(t))
+	for _, w := range schemes {
 		t.Run(w.scheme, func(t *testing.T) {
 			url := wiringURL(t, w)
-			runBackendSoak(t, w.scheme, url)
+			runBackendSoakFor(t, w.scheme, url, perBackend)
 		})
 	}
+}
+
+// fitSoakBudget caps the per-backend soak duration so n backends fit
+// the test BINARY's deadline, and says so loudly when it cuts.
+//
+// soakDuration is per BACKEND, and nothing used to check the product
+// n*duration against -timeout: the nightly's 20m/backend across five
+// container backends programmed 100 minutes of soak (plus the fault
+// soak's ten) into a 60-minute -timeout — the lane could not fit on
+// ANY hardware, and its inevitable "panic: test timed out" was
+// indistinguishable from a real hang. That disguise cost a day of
+// this campaign: the sftp dead-connection hang (bug #23) hid inside a
+// lane that was going to time out anyway. A capped soak that SAYS it
+// capped is diagnosable; a silently impossible envelope is not.
+func fitSoakBudget(t *testing.T, n int, want time.Duration) time.Duration {
+	t.Helper()
+	if n == 0 {
+		return want
+	}
+	deadline, ok := t.Deadline()
+	if !ok {
+		return want
+	}
+	// Reserve headroom for fixtures + the fault soak that shares this
+	// binary's deadline.
+	const reserve = 4 * time.Minute
+	avail := time.Until(deadline) - reserve
+	if avail <= 0 {
+		t.Fatalf("soak budget: no time left before the binary deadline (%v away) — the "+
+			"-timeout is too small for any soak at all", time.Until(deadline))
+	}
+	perBackend := avail / time.Duration(n) / 2 // half for backends, half for the fault soak
+	if perBackend >= want {
+		return want
+	}
+	t.Logf("SOAK BUDGET CAPPED: %d backends × %v = %v does not fit the binary deadline "+
+		"(%v away, %v reserved) — running %v per backend instead. This run covers LESS "+
+		"than asked; raise -timeout or lower PGHS_STORAGE_SOAK_MINUTES to make the "+
+		"envelope honest.", n, want, time.Duration(n)*want, time.Until(deadline), reserve, perBackend)
+	return perBackend
 }
 
 // TestBackendSoak_CoversEveryContainerScheme fails when a scheme has a
@@ -187,7 +229,11 @@ func TestBackendSoak_CoversEveryContainerScheme(t *testing.T) {
 
 func runBackendSoak(t *testing.T, backend, url string) {
 	t.Helper()
-	dur := soakDuration(t)
+	runBackendSoakFor(t, backend, url, soakDuration(t))
+}
+
+func runBackendSoakFor(t *testing.T, backend, url string, dur time.Duration) {
+	t.Helper()
 	seed := time.Now().UnixNano()
 	if v := os.Getenv("PGHS_STORAGE_SOAK_SEED"); v != "" {
 		if n, err := strconv.ParseInt(v, 10, 64); err == nil {

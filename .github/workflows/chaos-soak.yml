@@ -81,8 +81,13 @@ jobs:
       # is actually paid for.
       - name: Storage backend soaks (long)
         env:
-          PGHS_STORAGE_SOAK_MINUTES: "20"
-          PGHS_FAULT_SOAK_MINUTES: "10"
+          # Honest envelope: BOTH soaks iterate every container backend
+          # (5 today), so the programmed total is 5×(storage+fault)
+          # minutes. 5×(4+2)=30m fits the step's 60m -timeout with the
+          # fixture overhead; the in-test fitSoakBudget cap logs loudly
+          # if a future backend count breaks this arithmetic again.
+          PGHS_STORAGE_SOAK_MINUTES: "4"
+          PGHS_FAULT_SOAK_MINUTES: "2"
         run: |
           go test -tags integration -count=1 -timeout 60m -v \
             -run 'TestBackendSoak|TestFaultSoak' \
