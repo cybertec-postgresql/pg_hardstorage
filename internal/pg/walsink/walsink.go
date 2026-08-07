@@ -931,7 +931,51 @@ func (s *Sink) procErrLoad() error {
 // commitManifest writes the manifest body to <key>.tmp and atomically
 // renames it to the canonical key. RenameIfNotExists makes a re-commit
 // of an existing segment a no-op (idempotent).
+// verifyAdoptedSegmentRefs is the WAL half of the dedup-vs-GC race
+// gate (see internal/backup/runner.verifyAdoptedChunks for the backup
+// half and the full rationale).
+//
+// WAL needs its own copy of the gate because none of gc's timing
+// guards reach it: WAL writers hold no backup lease, so
+// `repo gc --apply`'s live-lease refusal never fires for a streaming
+// agent, and a streamer runs for days — lease-blocking gc on it would
+// mean gc never runs at all. The commit-time check is therefore the
+// ONLY protection for a segment chunk that was adopted rather than
+// written: identical plaintext recurs in WAL (an unchanged page
+// resurfacing as a full-page image), and if the only referents of the
+// matching chunk were expired-tombstone backups, gc legitimately
+// sweeps it mid-stream.
+//
+// Only refs the CAS marked adopted are Statted — a map lookup per ref,
+// a Stat only for the rare adopted ones — so the per-segment cost is
+// near zero. Transient Stat errors pass (the chunk was present at
+// adopt time; failing streaming on a hiccup loses more WAL than it
+// protects).
+func verifyAdoptedSegmentRefs(ctx context.Context, sp storage.StoragePlugin, cas *repo.CAS, m *SegmentManifest) error {
+	if cas == nil {
+		return nil
+	}
+	for _, ref := range m.Chunks {
+		if !cas.WasAdopted(ref.Hash) {
+			continue
+		}
+		if _, err := sp.Stat(ctx, repo.ChunkKey(ref.Hash)); err != nil {
+			if errors.Is(err, storage.ErrNotFound) {
+				return fmt.Errorf("walsink: segment %s references chunk %s which was "+
+					"deduplicated against and has since been deleted (a concurrent "+
+					"`repo gc --apply` swept it as an orphan); refusing to commit a segment "+
+					"manifest that is already unrestorable — the retry re-pushes the chunk "+
+					"fresh", m.SegmentName, ref.Hash)
+			}
+		}
+	}
+	return nil
+}
+
 func (s *Sink) commitManifest(ctx context.Context, m *SegmentManifest) error {
+	if err := verifyAdoptedSegmentRefs(ctx, s.sp, s.cas, m); err != nil {
+		return err
+	}
 	body, err := m.MarshalToBytes()
 	if err != nil {
 		return err

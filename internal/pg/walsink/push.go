@@ -171,6 +171,9 @@ func PushSegmentFile(ctx context.Context, cas *repo.CAS, sp storage.StoragePlugi
 	// without depending on Sink state. WORM (when configured)
 	// flows through here so the manifest gets the same retention
 	// the Sink path applies.
+	if err := verifyAdoptedSegmentRefs(ctx, sp, cas, m); err != nil {
+		return nil, err
+	}
 	if err := commitManifestStandalone(ctx, sp, m, opts.WORM); err != nil {
 		return nil, err
 	}

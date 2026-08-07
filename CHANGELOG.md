@@ -34,6 +34,15 @@ keeps reading that version for at least 24 months after a successor lands.
   large repo), so a backup starting during that walk is noticed before
   the sweep rather than after.
 
+  The same gate protects WAL, where it is the *only* protection: a
+  streamer holds no backup lease, so gc's live-lease refusal never
+  covers it, and identical plaintext genuinely recurs in WAL (an
+  unchanged page resurfacing as a full-page image). Both `wal stream`
+  and `wal push` now verify adopted chunk references before committing
+  a segment manifest — a committed segment referencing a swept chunk is
+  WAL that cannot be fetched at recovery while the archive looks
+  gap-free.
+
 - **A standby built over a holed archive is now warned about.** The WAL
   contiguity preflight ran only for LSN targets, and a standby has no
   target by construction — so it was never checked, while being the

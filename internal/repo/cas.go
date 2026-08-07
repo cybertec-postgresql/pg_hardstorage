@@ -222,6 +222,15 @@ func (d DedupStats) HitRate() float64 {
 // commits a manifest referencing them, because gc's --min-chunk-age
 // floor covers only chunks with a young mtime — i.e. the ones this
 // run wrote. Order is unspecified.
+// WasAdopted reports whether this CAS instance deduplicated against
+// hash without writing it. Commit paths use it to gate exactly the
+// chunks whose durability was trusted rather than produced — see
+// AdoptedHashes.
+func (c *CAS) WasAdopted(h Hash) bool {
+	_, ok := c.adopted.Load(h)
+	return ok
+}
+
 func (c *CAS) AdoptedHashes() []Hash {
 	var out []Hash
 	c.adopted.Range(func(k, _ any) bool {
