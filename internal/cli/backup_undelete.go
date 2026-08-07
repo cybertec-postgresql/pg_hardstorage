@@ -270,13 +270,25 @@ func runBackupUndelete(cmd *cobra.Command, deployment string, ids []string, repo
 			return output.NewError("backup.undelete.failed",
 				fmt.Sprintf("backup undelete: %s/%s: %v", deployment, id, uerr)).Wrap(uerr)
 		}
-		outcomeByID[id] = backupUndeleteOutcome{
+		oc := backupUndeleteOutcome{
 			BackupID: id,
 			Restored: restored,
 		}
 		if restored {
 			restoredIDs = append(restoredIDs, id)
+			// A tombstoned backup does not hold the WAL-prune
+			// frontier, so the janitors may have deleted the archived
+			// WAL right after this backup's stop while it was dead.
+			// Record that window as a gap NOW — at the visibility
+			// point — so the restore preflights refuse a --to-latest /
+			// standby / time-target recovery that would silently
+			// truncate at the pruned hole, instead of a Warning buried
+			// at restore time.
+			if m, _, rerr := store.ReadIncludingTombstoned(cmd.Context(), deployment, id, verifier); rerr == nil {
+				oc.WALGapRecorded = recordResurrectedWALGap(cmd.Context(), d, sp, deployment, id, m)
+			}
 		}
+		outcomeByID[id] = oc
 	}
 
 	// Report rows in the caller's argv order, whatever order processing
@@ -342,6 +354,11 @@ type backupUndeleteOutcome struct {
 	// absent. Distinguished from "already live" so an operator
 	// reading the JSON sees the right reason.
 	ChunksMissing bool `json:"chunks_missing,omitempty"`
+	// WALGapRecorded is the "start..end" LSN window persisted as a
+	// gap record because the archived WAL after this backup's stop
+	// was pruned while it was tombstoned. Empty when forward
+	// coverage is intact. Additive v1 field.
+	WALGapRecorded string `json:"wal_gap_recorded,omitempty"`
 }
 
 // chunkCheckRow surfaces the per-manifest pre-flight result
@@ -401,6 +418,9 @@ func (b backupUndeleteBody) WriteText(w io.Writer) error {
 			state = "skipped (chunks missing)"
 		case !o.Restored:
 			state = "already live (no-op)"
+		case o.WALGapRecorded != "":
+			state = "restored — WAL AFTER ITS STOP WAS PRUNED (gap " + o.WALGapRecorded +
+				" recorded; recovery past its own window will refuse)"
 		}
 		fmt.Fprintf(bw, "  %s %s — %s\n", marker, o.BackupID, state)
 	}

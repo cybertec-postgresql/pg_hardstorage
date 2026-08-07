@@ -58,6 +58,22 @@ type Mutation struct {
 // in the named package — see the package doc.
 var Registry = []Mutation{
 	{
+		Tag: "mutation_undelete_wal_unchecked",
+		Description: "backup undelete verifies chunks but never the WAL " +
+			"(pre-fix bug #19): a tombstoned backup does not hold the " +
+			"prune frontier, so `wal prune` legitimately deletes the " +
+			"archived window after its stop — resurrection then hands " +
+			"back a backup whose --to-latest PROMOTES silently behind at " +
+			"the pruned hole (a standby freezes forever), with no gap " +
+			"record for any preflight to refuse on. Caught by " +
+			"TestRecordResurrectedWALGap_PrunedWindow_Records, " +
+			"_Idempotent, and the command-level wiring test " +
+			"TestBackupUndelete_RecordsPrunedWALGap.",
+		Packages: []string{
+			"github.com/cybertec-postgresql/pg_hardstorage/internal/cli",
+		},
+	},
+	{
 		Tag: "mutation_timetarget_blanket_refusal",
 		Description: "the time/name-target gap preflight refuses on ANY " +
 			"recorded gap, ignoring whether the seed backup's replay can " +

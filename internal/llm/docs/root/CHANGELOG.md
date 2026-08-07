@@ -57,6 +57,27 @@ keeps reading that version for at least 24 months after a successor lands.
   refuse exactly as before, and an unknown stop keeps the conservative
   blanket posture.
 
+- **`backup undelete` re-checks the WAL, not just the chunks.** A
+  tombstoned backup does not hold the WAL-prune frontier — that is the
+  point of retention — so `wal prune --apply` legitimately deletes the
+  archived segments right after a deleted backup's stop. Resurrecting
+  that backup then handed back one that restores and boots perfectly,
+  but whose `--to-latest`, standby, or time-target recovery replays its
+  bundled WAL, asks `restore_command` for the next segment, and finds
+  the pruned hole: PostgreSQL cannot distinguish it from the end of the
+  archive, so a one-shot restore **promotes** silently behind and a
+  standby freezes forever waiting. Pruning leaves no gap record, so
+  none of the restore-side refusals could fire — the only signal was a
+  Warning-severity contiguity event at restore time. Undelete now
+  probes forward WAL coverage at the resurrection point and persists
+  the missing window as a gap record (surfaced in the command's result
+  as `wal_gap_recorded`), which routes the doomed restores into the
+  existing typed `restore.target_in_wal_gap` refusal — with full
+  seed-stop precision, so restores from newer backups are untouched,
+  and `--skip-gap-check` remains the eyes-open override. The backup
+  itself still resurrects: restoring *within* its own window is
+  legitimate and unaffected.
+
 ### Added
 
 - **`restore --to-latest`: end-of-archive recovery.** There was no CLI
