@@ -90,9 +90,22 @@ func TestBackup_InterruptedByAFailover_FailsHonestly(t *testing.T) {
 	// Without this the backup finishes before the switchover lands and
 	// the test proves nothing.
 	execSQL(t, ctx, topo, `CREATE TABLE bulk AS
-		SELECT g AS id, repeat('x', 512) AS pad FROM generate_series(1, 400000) g`)
+		SELECT g AS id, repeat('x', 512) AS pad FROM generate_series(1, 1500000) g`)
 	execSQL(t, ctx, topo, `CHECKPOINT`)
 	t.Logf("seeded a table large enough to slow BASE_BACKUP")
+
+	// Baseline: `init --quick` takes a backup of its own, so "the list
+	// is non-empty" says nothing. What matters is whether the
+	// INTERRUPTED backup adds an entry it cannot honour.
+	baseOut, baseCode := runBin(2*time.Minute, "list", "db1", "--repo", repoURL, "-o", "json")
+	if baseCode != 0 {
+		t.Fatalf("baseline list failed (%d):\n%s", baseCode, lastLines(baseOut, 1200))
+	}
+	baseline := map[string]bool{}
+	for _, bid := range backupIDs(t, baseOut) {
+		baseline[bid] = true
+	}
+	t.Logf("baseline: %d backup(s) already present before the interrupted run", len(baseline))
 
 	// Start the backup, then demote its source out from under it.
 	type backupOutcome struct {
@@ -105,9 +118,27 @@ func TestBackup_InterruptedByAFailover_FailsHonestly(t *testing.T) {
 		done <- backupOutcome{out, code}
 	}()
 
+	backupStart := time.Now()
 	time.Sleep(4 * time.Second)
-	t.Logf("switching over while the backup is in flight")
+
+	// If the backup has already finished, the switchover cannot
+	// interrupt it and this test proves nothing. Say so rather than
+	// reporting a pass — a scenario that did not happen is not evidence
+	// that it is handled.
+	select {
+	case res := <-done:
+		t.Fatalf("the backup finished in %s, before the switchover could interrupt it "+
+			"(exit %d).\n\nThis test only means something if the two overlap. Seed more "+
+			"data so BASE_BACKUP runs longer, or trigger the switchover sooner.",
+			time.Since(backupStart).Truncate(time.Millisecond), res.code)
+	default:
+	}
+
+	t.Logf("switching over while the backup is in flight (%s elapsed)",
+		time.Since(backupStart).Truncate(time.Millisecond))
 	_ = switchover(t, ctx, topo, topo.ConnString())
+	t.Logf("switchover returned at %s into the backup",
+		time.Since(backupStart).Truncate(time.Millisecond))
 
 	var res backupOutcome
 	select {
@@ -115,16 +146,27 @@ func TestBackup_InterruptedByAFailover_FailsHonestly(t *testing.T) {
 	case <-time.After(9 * time.Minute):
 		t.Fatal("the backup neither completed nor failed within 9 minutes")
 	}
-	t.Logf("=== measured: backup exited %d ===", res.code)
+	backupRan := time.Since(backupStart)
+	t.Logf("=== measured: backup exited %d after %s ===", res.code, backupRan.Truncate(time.Millisecond))
 
-	// Whatever it decided, `backup list` is the operator's view of
+	// The demotion has to land mid-transfer for this to mean anything.
+	// If the backup ended within a second of the switchover returning,
+	// it may simply have finished first — say so rather than banking a
+	// pass on a scenario that did not occur.
+	if backupRan < 6*time.Second {
+		t.Errorf("the backup ran only %s; the switchover was triggered at 4s, so the "+
+			"demotion cannot have landed mid-transfer. Seed more data — this test is not "+
+			"exercising the case it describes.", backupRan.Truncate(time.Millisecond))
+	}
+
+	// Whatever it decided, `list` is the operator's view of
 	// reality and must agree with it.
-	listOut, listCode := runBin(2*time.Minute, "backup", "list", "db1", "--repo", repoURL, "-o", "json")
+	listOut, listCode := runBin(2*time.Minute, "list", "db1", "--repo", repoURL, "-o", "json")
 	if listCode != 0 {
-		t.Fatalf("backup list failed (%d):\n%s", listCode, lastLines(listOut, 1200))
+		t.Fatalf("list failed (%d):\n%s", listCode, lastLines(listOut, 1200))
 	}
 	ids := backupIDs(t, listOut)
-	t.Logf("backup list reports %d backup(s): %v", len(ids), ids)
+	t.Logf("list reports %d backup(s): %v", len(ids), ids)
 
 	if res.code != 0 {
 		// The honest outcome. The only thing left to check is that a
@@ -132,22 +174,54 @@ func TestBackup_InterruptedByAFailover_FailsHonestly(t *testing.T) {
 		// retention counts entries, and a phantom restore point is
 		// exactly as misleading as a broken one.
 		t.Logf("backup failed cleanly, as it should have")
-		if len(ids) > 0 {
-			t.Errorf("the backup exited %d but `backup list` still reports %d backup(s): %v\n\n"+
+		var added []string
+		for _, bid := range ids {
+			if !baseline[bid] {
+				added = append(added, bid)
+			}
+		}
+		if len(added) > 0 {
+			t.Errorf("the backup exited %d but `list` gained %d new entry/entries: %v\n\n"+
 				"A failed backup that leaves a listed entry is a phantom restore point. It "+
 				"satisfies retention, it can be selected as a recovery base, and it cannot "+
 				"deliver — which the operator discovers during an incident.",
-				res.code, len(ids), ids)
+				res.code, len(added), added)
+		} else {
+			t.Logf("no phantom entry left behind (list unchanged from the baseline)")
 		}
 		return
 	}
 
 	// It claims success. Then it must actually be a backup.
 	if len(ids) == 0 {
-		t.Fatalf("the backup exited 0 but `backup list` reports nothing:\n%s",
+		t.Fatalf("the backup exited 0 but `list` reports nothing:\n%s",
 			lastLines(res.out, 1500))
 	}
-	id := ids[len(ids)-1]
+	// Take the id from the BACKUP COMMAND'S OWN result, not from the
+	// list.
+	//
+	// `list` is newest-first, so indexing from the end picks the OLDEST
+	// entry — which here is the backup `init --quick` took before the
+	// failover was arranged. An earlier run of this test did exactly
+	// that: it verified and restored the wrong backup, never touched
+	// the interrupted one, and reported a pass.
+	id := backupIDFromResult(t, res.out)
+	if id == "" {
+		t.Fatalf("the backup exited 0 but its result carries no backup_id; there is nothing "+
+			"to verify.\n%s", lastLines(res.out, 1500))
+	}
+	var listed bool
+	for _, got := range ids {
+		if got == id {
+			listed = true
+			break
+		}
+	}
+	if !listed {
+		t.Errorf("the backup reported id %q but `list` does not include it (%v).\n\n"+
+			"An operator cannot restore what they cannot see.", id, ids)
+	}
+	t.Logf("examining the INTERRUPTED backup %s", id)
 
 	if out, code := runBin(5*time.Minute, "verify", "db1", id, "--repo", repoURL); code != 0 {
 		t.Errorf("the backup exited 0 but `verify %s` fails (exit %d):\n%s\n\n"+
@@ -176,7 +250,97 @@ func TestBackup_InterruptedByAFailover_FailsHonestly(t *testing.T) {
 				name, serr)
 		}
 	}
-	t.Logf("backup %s claimed success and holds up: verified and restored", id)
+	// The assertion that can actually see truncation.
+	//
+	// verify checks the manifest against itself: a BASE_BACKUP cut
+	// short produces a SHORTER manifest that is perfectly consistent
+	// with the files it does list, and verifies clean. The only way to
+	// notice is to compare against what a complete capture of the same
+	// cluster looks like — so take one now, with nothing interfering,
+	// and compare file counts.
+	if out, code := runBin(8*time.Minute, "backup", "db1", "--repo", repoURL, "-o", "json"); code != 0 {
+		t.Fatalf("the control backup failed (%d), so there is nothing to compare against:\n%s",
+			code, lastLines(out, 1200))
+	}
+	listOut2, code2 := runBin(2*time.Minute, "list", "db1", "--repo", repoURL, "-o", "json")
+	if code2 != 0 {
+		t.Fatalf("list after the control backup failed (%d):\n%s", code2, lastLines(listOut2, 1200))
+	}
+	counts := backupFileCounts(t, listOut2)
+	interrupted := counts[id]
+	var control int
+	for bid, n := range counts {
+		if bid != id && n > control {
+			control = n
+		}
+	}
+	t.Logf("file_count: interrupted=%d control=%d", interrupted, control)
+	if interrupted == 0 || control == 0 {
+		t.Fatalf("could not read file counts (interrupted=%d control=%d); the comparison "+
+			"below would be vacuous", interrupted, control)
+	}
+	// Same cluster moments apart, so a complete capture lands within a
+	// few files of the control. A materially smaller manifest means the
+	// stream was cut and the shortfall was recorded as success.
+	if interrupted < control*9/10 {
+		t.Errorf("the interrupted backup lists %d files but a clean backup of the same "+
+			"cluster lists %d — roughly %d%% of the data directory is missing, and it "+
+			"reported success and verified clean.\n\n"+
+			"That is the dangerous shape: a truncated capture whose manifest is internally "+
+			"consistent, so verification cannot see it. It counts toward retention and can "+
+			"be selected as a recovery base.",
+			interrupted, control, 100-(interrupted*100/control))
+	}
+
+	if !t.Failed() {
+		t.Logf("backup %s claimed success and holds up: verified, restored, and complete "+
+			"(%d files vs %d in a clean control)", id, interrupted, control)
+	}
+}
+
+// backupFileCounts maps backup id -> file_count from `list -o json`.
+func backupFileCounts(t *testing.T, out string) map[string]int {
+	t.Helper()
+	start := strings.Index(out, "{")
+	if start < 0 {
+		return nil
+	}
+	var env struct {
+		Result struct {
+			Backups []struct {
+				BackupID  string `json:"backup_id"`
+				FileCount int    `json:"file_count"`
+			} `json:"backups"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal([]byte(out[start:]), &env); err != nil {
+		t.Logf("could not parse list JSON: %v", err)
+		return nil
+	}
+	m := map[string]int{}
+	for _, b := range env.Result.Backups {
+		m[b.BackupID] = b.FileCount
+	}
+	return m
+}
+
+// backupIDFromResult reads backup_id out of `backup -o json`.
+func backupIDFromResult(t *testing.T, out string) string {
+	t.Helper()
+	start := strings.Index(out, "{")
+	if start < 0 {
+		return ""
+	}
+	var env struct {
+		Result struct {
+			BackupID string `json:"backup_id"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal([]byte(out[start:]), &env); err != nil {
+		t.Logf("could not parse the backup result JSON (%v); raw:\n%s", err, lastLines(out, 800))
+		return ""
+	}
+	return env.Result.BackupID
 }
 
 // backupIDs pulls the backup IDs out of `backup list -o json`.
@@ -189,7 +353,8 @@ func backupIDs(t *testing.T, out string) []string {
 	var env struct {
 		Result struct {
 			Backups []struct {
-				ID string `json:"id"`
+				BackupID  string `json:"backup_id"`
+				FileCount int    `json:"file_count"`
 			} `json:"backups"`
 		} `json:"result"`
 	}
@@ -199,7 +364,7 @@ func backupIDs(t *testing.T, out string) []string {
 	}
 	var ids []string
 	for _, b := range env.Result.Backups {
-		ids = append(ids, b.ID)
+		ids = append(ids, b.BackupID)
 	}
 	return ids
 }
