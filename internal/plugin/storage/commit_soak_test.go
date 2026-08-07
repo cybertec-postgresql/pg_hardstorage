@@ -112,11 +112,12 @@ func runCommitSoak(t *testing.T, scheme string, sp *deleteCountingSP) {
 
 	ctx := context.Background()
 	var (
-		rounds    atomic.Int64
-		wins      atomic.Int64
-		losses    atomic.Int64
-		oddErrs   atomic.Int64
-		firstFail atomic.Value
+		rounds           atomic.Int64
+		wins             atomic.Int64
+		losses           atomic.Int64
+		oddErrs          atomic.Int64
+		transientRetries atomic.Int64
+		firstFail        atomic.Value
 	)
 	fail := func(format string, args ...any) {
 		if firstFail.Load() == nil {
@@ -146,7 +147,44 @@ func runCommitSoak(t *testing.T, scheme string, sp *deleteCountingSP) {
 					time.Sleep(time.Duration(d) * time.Millisecond)
 				}
 
-				err := storage.CommitExclusive(ctx, sp, key, body, storage.PutOptions{})
+				// A transport failure (connection dropped, EOF, timeout) is
+				// AMBIGUOUS, not a protocol violation: the put may or may
+				// not have landed, and the writer cannot know which. The
+				// product's own callers handle exactly this by retrying —
+				// archive_command re-invokes wal push after any failure,
+				// and the idempotent re-push path exists for that reason —
+				// so the soak retries too, and lets the retry resolve the
+				// ambiguity: success (it had not landed) or
+				// ErrAlreadyExists (someone's had — possibly our own).
+				//
+				// This does NOT defang the soak. A backend that
+				// misclassifies its conditional-put conflict as a generic
+				// error fails on every attempt and still trips the
+				// exhaustion path below, and an atomicity violation is
+				// caught by the readback invariants, which retrying cannot
+				// mask. What changed is only that ONE dropped connection —
+				// a MinIO container under a full-suite disk load, in the
+				// run that motivated this — no longer fails the strongest
+				// exclusion soak we have with a message blaming the
+				// protocol. Verified in the failing direction by mutating
+				// the commit to a constant EOF: the soak goes red after 4
+				// attempts with the exhaustion message.
+				const commitAttempts = 4
+				var err error
+				for attempt := 1; ; attempt++ {
+					err = storage.CommitExclusive(ctx, sp, key, body, storage.PutOptions{})
+					if err == nil || errors.Is(err, storage.ErrAlreadyExists) {
+						break
+					}
+					if attempt >= commitAttempts {
+						break
+					}
+					transientRetries.Add(1)
+					select {
+					case <-time.After(time.Duration(attempt) * 150 * time.Millisecond):
+					case <-ctx.Done():
+					}
+				}
 				switch {
 				case err == nil:
 					wins.Add(1)
@@ -154,8 +192,9 @@ func runCommitSoak(t *testing.T, scheme string, sp *deleteCountingSP) {
 					losses.Add(1)
 				default:
 					oddErrs.Add(1)
-					fail("%s: commit returned neither success nor ErrAlreadyExists: %v",
-						scheme, err)
+					fail("%s: commit failed %d consecutive attempts with neither success nor "+
+						"ErrAlreadyExists (a persistent third outcome, not a transport blip): %v",
+						scheme, commitAttempts, err)
 					return
 				}
 
@@ -209,8 +248,8 @@ func runCommitSoak(t *testing.T, scheme string, sp *deleteCountingSP) {
 		t.Errorf("%s: no writer ever lost a race — the soak never actually contended, so "+
 			"the exclusion it claims to test was not exercised", scheme)
 	}
-	t.Logf("%s commit soak: %d rounds, %d wins, %d ErrAlreadyExists, %d deletes",
-		scheme, rounds.Load(), wins.Load(), losses.Load(), sp.deletes.Load())
+	t.Logf("%s commit soak: %d rounds, %d wins, %d ErrAlreadyExists, %d transient retr(ies), %d deletes",
+		scheme, rounds.Load(), wins.Load(), losses.Load(), transientRetries.Load(), sp.deletes.Load())
 
 	// The append-only claim, measured.
 	if condPut && sp.deletes.Load() != 0 {

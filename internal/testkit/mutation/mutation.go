@@ -58,6 +58,37 @@ type Mutation struct {
 // in the named package — see the package doc.
 var Registry = []Mutation{
 	{
+		Tag: "mutation_gap_timeline_skip",
+		Description: "cli.findGaps regains the pre-59816d8 `continue` on a " +
+			"timeline change, making `wal audit` — and the chaos soak's " +
+			"gap-free gate, which runs it — structurally blind to a WAL " +
+			"hole straddling a failover, the one place an HA deployment " +
+			"is most likely to lose WAL. Caught by " +
+			"TestFindGaps_AcrossATimelineChange and " +
+			"TestWalAudit_HoleStraddlingAPromotionIsDetected. This is the " +
+			"exact code that shipped until 2026-08-07, alongside a test " +
+			"whose data asserted the blindness was correct.",
+		Packages: []string{
+			"github.com/cybertec-postgresql/pg_hardstorage/internal/cli",
+		},
+	},
+	{
+		Tag: "mutation_frontier_no_prior_timeline",
+		Description: "inventory.HighestArchivedLSNBefore never finds a " +
+			"prior timeline — the pre-c2c9aa4 world where nothing looked " +
+			"below the current one. A post-promotion `wal stream` resume " +
+			"then anchors at the new leader's position, silently skipping " +
+			"every byte since the old timeline's frontier, and the " +
+			"agent's coordinator reads the post-promotion frontier as a " +
+			"first-time bootstrap, suppressing the gap calculation on the " +
+			"one event it exists to measure. Caught by " +
+			"TestResolveStartLSN_AfterPromotion* and " +
+			"TestArchiveFrontierForLeader_*.",
+		Packages: []string{
+			"github.com/cybertec-postgresql/pg_hardstorage/internal/cli",
+		},
+	},
+	{
 		Tag: "mutation_exit_route_undocumented",
 		Description: "output.codePrefixToExit gains a namespace route " +
 			"(quarantine.*) and a leaf route (storage.no_space) that " +
