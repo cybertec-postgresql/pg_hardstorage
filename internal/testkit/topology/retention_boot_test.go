@@ -32,6 +32,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/testkit/pgboot"
 )
 
 func TestRetentionThenRecovery_PrunedArchiveStillBoots(t *testing.T) {
@@ -92,17 +94,8 @@ func TestRetentionThenRecovery_PrunedArchiveStillBoots(t *testing.T) {
 		}
 		return strings.TrimSpace(out)
 	}
-	deadline := time.Now().Add(2 * time.Minute)
-	for {
-		if out, err := dockerOut(ctx, "exec", src, "pg_isready", "-U", "postgres"); err == nil &&
-			strings.Contains(out, "accepting") {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("source pg never became ready:\n%s", lastLines(mustLogs(ctx, src), 2000))
-		}
-		time.Sleep(2 * time.Second)
-	}
+	// Entrypoint-restart-safe readiness — see AwaitVanillaReady.
+	pgboot.AwaitVanillaReady(t, ctx, src, 2*time.Minute)
 	portOut, err := dockerOut(ctx, "port", src, "5432/tcp")
 	if err != nil {
 		t.Fatalf("docker port: %v\n%s", err, portOut)

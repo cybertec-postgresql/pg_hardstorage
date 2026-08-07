@@ -34,6 +34,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/testkit/pgboot"
 )
 
 func TestRestoreBootMatrix_ArchiveReplayAcrossMajors(t *testing.T) {
@@ -166,18 +168,12 @@ func runBootMatrixFor(t *testing.T, ctx context.Context, major, image string) {
 		}
 		return strings.TrimSpace(out)
 	}
-	// Readiness: the entrypoint restarts once after initdb.
-	deadline := time.Now().Add(2 * time.Minute)
-	for {
-		if out, err := dockerOut(ctx, "exec", src, "pg_isready", "-U", "postgres"); err == nil &&
-			strings.Contains(out, "accepting") {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("source pg never became ready:\n%s", lastLines(mustLogs(ctx, src), 2000))
-		}
-		time.Sleep(2 * time.Second)
-	}
+	// Readiness: the entrypoint restarts once after initdb, and
+	// pg_isready alone can catch the TEMPORARY init-phase server —
+	// the pg16 leg of the pre-release soak died with "the database
+	// system is shutting down" on exactly that race. The pgboot
+	// helper gates on the entrypoint's init-complete marker first.
+	pgboot.AwaitVanillaReady(t, ctx, src, 2*time.Minute)
 
 	// The host CLI reaches the source via the published port — the
 	// same pattern every other topology test uses. (The first version

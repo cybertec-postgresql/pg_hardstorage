@@ -88,6 +88,7 @@ type Plugin struct {
 	mu     sync.Mutex
 	ssh    *ssh.Client
 	client *sftp.Client
+	kaStop chan struct{}
 	closed bool
 }
 
@@ -203,10 +204,23 @@ func (p *Plugin) Open(_ context.Context, cfg storage.StorageConfig) error {
 		HostKeyCallback: hk,
 		Timeout:         15 * time.Second,
 	}
-	conn, err := ssh.Dial("tcp", host, cfgssh)
+	// Dial the TCP layer ourselves so kernel keepalives are armed
+	// (belt) under the SSH-level keepalive probe (braces, below —
+	// kernel defaults alone take hours to declare a peer dead).
+	raw, err := net.DialTimeout("tcp", host, cfgssh.Timeout)
 	if err != nil {
 		return fmt.Errorf("sftp: dial %s: %w", host, err)
 	}
+	if tc, ok := raw.(*net.TCPConn); ok {
+		_ = tc.SetKeepAlive(true)
+		_ = tc.SetKeepAlivePeriod(30 * time.Second)
+	}
+	sc, chans, reqs, err := ssh.NewClientConn(raw, host, cfgssh)
+	if err != nil {
+		_ = raw.Close()
+		return fmt.Errorf("sftp: dial %s: %w", host, err)
+	}
+	conn := ssh.NewClient(sc, chans, reqs)
 	cli, err := sftp.NewClient(conn)
 	if err != nil {
 		_ = conn.Close()
@@ -216,6 +230,10 @@ func (p *Plugin) Open(_ context.Context, cfg storage.StorageConfig) error {
 	p.ssh = conn
 	p.client = cli
 	p.root = root
+	// A dead connection must become an error, not a hang — see
+	// keepalive.go for the soak-caught 14-minute sendPacket stall.
+	p.kaStop = make(chan struct{})
+	startKeepalive(conn, cli, p.kaStop)
 	return nil
 }
 
@@ -227,6 +245,10 @@ func (p *Plugin) Close() error {
 		return nil
 	}
 	p.closed = true
+	if p.kaStop != nil {
+		close(p.kaStop)
+		p.kaStop = nil
+	}
 	var firstErr error
 	if p.client != nil {
 		if err := p.client.Close(); err != nil {

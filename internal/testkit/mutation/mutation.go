@@ -58,6 +58,24 @@ type Mutation struct {
 // in the named package — see the package doc.
 var Registry = []Mutation{
 	{
+		Tag: "mutation_sftp_no_keepalive",
+		Description: "the SFTP plugin has no connection keepalive " +
+			"(pre-fix bug #23, caught live by the storage fault soak: a " +
+			"worker sat 14 minutes inside pkg/sftp sendPacket): " +
+			"ssh.ClientConfig.Timeout covers only the dial, so a silently " +
+			"dead peer (NAT expiry, power-off, partition) blocks every " +
+			"operation forever — a wal fetch inside restore_command hangs " +
+			"recovery indefinitely, a backup never finishes and never " +
+			"fails, an archiver stalls while pg_wal fills. Caught by " +
+			"TestKeepalive_DeadConnectionErrorsInsteadOfHanging (in-proc " +
+			"SSH server behind a blackhole proxy; the connection must be " +
+			"torn down and the parked Get must error within the miss " +
+			"budget).",
+		Packages: []string{
+			"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage/sftp",
+		},
+	},
+	{
 		Tag: "mutation_history_preflight_absent",
 		Description: "restore has no timeline-history reachability " +
 			"preflight (pre-fix bug #22): PostgreSQL probes <N>.history " +

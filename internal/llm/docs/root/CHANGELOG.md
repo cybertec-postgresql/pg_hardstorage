@@ -120,6 +120,24 @@ keeps reading that version for at least 24 months after a successor lands.
   which monitoring already sees, while a promoted-behind cluster is
   data loss.
 
+- **A dead SFTP connection is now an error, not a forever-hang.**
+  Caught live by the storage fault soak: `ssh.ClientConfig.Timeout`
+  covers only the dial, and `pkg/sftp` sets no deadlines after it, so
+  a peer that went silently away (NAT table expiry, power loss, a
+  network partition) left every operation blocked indefinitely — a
+  `wal fetch` inside `restore_command` hanging recovery (PostgreSQL
+  waits on the command, so not even the signal tail can fire), a
+  backup that never finishes and never fails, an archiver stalled
+  while `pg_wal` fills the disk. The plugin now runs an SSH-level
+  keepalive probe (the `ServerAliveInterval` idea): a reply proves the
+  round-trip, a timeout counts a miss, and enough consecutive misses
+  tear the connection down — transport first, since a graceful SFTP
+  close writes on the same dead connection — which surfaces every
+  parked and future call as a "connection lost" error within ~70
+  seconds. TCP keepalives are armed as well (kernel defaults alone
+  take hours). A healthy connection is never touched: the
+  false-positive direction is covered by its own test.
+
 - **A restore that cannot reach the newest timeline now refuses
   instead of silently stopping short.** PostgreSQL discovers the
   newest timeline by probing `<N>.history` files ascending and stops
