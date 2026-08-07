@@ -51,9 +51,9 @@ making them visible again to ` + "`" + `backup list` + "`" + ` and ` + "`" + `re
 Use this to recover from an over-aggressive delete or cascade
 before chunk-GC runs. The window is bounded: once
 ` + "`" + `repo gc --apply` + "`" + ` has reclaimed the chunks the manifest
-references, undelete will succeed but the resulting backup will
-fail to restore. Run ` + "`" + `backup undelete` + "`" + ` BEFORE the next
-GC cycle.
+references, undelete REFUSES with conflict.chunks_missing (the
+store fails closed) unless --force is passed to recover the
+metadata of a backup that can no longer restore.
 
 Idempotent. An undelete of a manifest that's already live is a
 no-op; no error, no audit entry. Multiple IDs may be passed —
@@ -91,11 +91,11 @@ Restorability pre-flight (--check-chunks):
 	c.Flags().StringVar(&reason, "reason", "",
 		"free-form reason captured in the audit chain (recommended for forensics)")
 	c.Flags().BoolVar(&checkChunks, "check-chunks", false,
-		"refuse to undelete a manifest whose chunks have been GC'd (Stat-only pre-flight; same primitive as `verify --existence-only`)")
+		"run the missing-chunk check as an up-front BATCH pre-pass, so a multi-ID undelete refuses atomically before touching anything (and --skip-missing can select the survivors). The per-ID safety does not depend on this flag: the store fails closed on missing chunks regardless.")
 	c.Flags().BoolVar(&skipMissing, "skip-missing", false,
 		"when --check-chunks fails on some IDs, undelete the rest (default: refuse the whole batch)")
 	c.Flags().BoolVar(&force, "force", false,
-		"override --check-chunks: resurrect even when chunks are gone, to recover the metadata of an un-restorable backup (forensic use). Only meaningful WITH --check-chunks — the pre-flight is opt-in, so plain `undelete` already resurrects regardless of chunk state.")
+		"resurrect even when the manifest's chunks are gone, to recover the metadata of an un-restorable backup (forensic use). Without it, undelete FAILS CLOSED on missing chunks — the store refuses with conflict.chunks_missing whether or not --check-chunks was passed.")
 	return c
 }
 
@@ -152,30 +152,6 @@ func runBackupUndelete(cmd *cobra.Command, deployment string, ids []string, repo
 	// passes (or --skip-missing is set).
 	chunkChecks := make([]chunkCheckRow, 0, len(ids))
 	skipDueToMissing := make(map[string]struct{})
-	// --force without --check-chunks is a no-op, because the pre-flight
-	// it overrides is opt-in. Say so instead of accepting it silently:
-	// an operator reaching for --force believes they are choosing the
-	// permissive behaviour, and needs to know it is already the
-	// default — otherwise they will assume a resurrected backup was
-	// checked and deliberately forced, when nothing checked anything.
-	//
-	// A warning rather than a usage error: --force asks for exactly
-	// what it gets, so refusing would break a defensible invocation to
-	// make a point. (--skip-missing IS a usage error without
-	// --check-chunks, because it changes batch semantics that only
-	// exist under the pre-flight.)
-	if force && !checkChunks {
-		_ = d.Event(cmd.Context(), output.NewEvent(output.SeverityWarning, "backup.undelete", "force_without_check").
-			WithSubject(output.Subject{Deployment: deployment}).
-			WithBody(map[string]any{
-				"message": "--force had no effect: it overrides --check-chunks, which was not requested. " +
-					"undelete does not verify chunk existence by default, so these manifests are being " +
-					"resurrected without any restorability check. If the chunks were already reclaimed by " +
-					"`repo gc --apply`, the backup will reappear in `backup list` and fail at restore. " +
-					"Pass --check-chunks to find out before resurrecting.",
-			}))
-	}
-
 	// --force skips the restorability pre-flight entirely (it
 	// resurrects metadata even when chunks are gone), so the
 	// --check-chunks pre-pass is moot under --force.
