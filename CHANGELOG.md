@@ -13,6 +13,27 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **The timeline-history chain survives a promotion the streamer
+  missed.** `wal stream` captured the history of the timeline it was
+  following, which is enough only when a streamer witnesses every
+  promotion. A failover during an agent restart, a deploy or a crash
+  left no history file for that timeline — and a hole in the middle of
+  the chain does not lose one timeline, it truncates the chain from
+  there on: PostgreSQL discovers the newest timeline by probing
+  `restore_command` for successive history files and stops at the FIRST
+  miss. With `recovery_target_timeline='latest'` that is silent. PG
+  concludes the newest timeline is the one before the hole, recovers
+  along it, and reports success having dropped everything after.
+
+  Measured against a real cluster with two promotions and the streamer
+  absent for the middle one: `00000003.history` present,
+  `00000002.history` missing, and a recovery would have landed on
+  timeline 1. The capture now walks the whole ancestry, skipping files
+  already stored so a caught-up archive costs no round trips, and runs
+  before the resume point is resolved — a streamer that must refuse
+  because its WAL was recycled is exactly the one whose ancestry nobody
+  else is recording.
+
 - **The WAL sink's contiguity guard now covers the opening record.** The
   stream-level check compares each record against the end of the
   previous one, and its baseline was unset until a record arrived. That

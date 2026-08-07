@@ -137,3 +137,66 @@ func captureDispatcher(t *testing.T) (*output.Dispatcher, *strings.Builder) {
 	d := output.NewDispatcher(rendererjson.New(), buf, buf)
 	return d, buf
 }
+
+// TestCaptureStreamTimelineHistory_SkipsWhatIsAlreadyStored: the
+// capture now walks the whole ancestry, so it must not pay for that on
+// every reconnect.
+//
+// With every file already present it must not open a connection at all
+// — the DSN below points at a closed port, so a round trip would surface
+// as the probe-failed warning.
+func TestCaptureStreamTimelineHistory_SkipsWhatIsAlreadyStored(t *testing.T) {
+	sp, _ := newFsRepo(t)
+	const dep = "db1"
+	ts := timeline.New(sp)
+	for tli := uint32(2); tli <= 5; tli++ {
+		if err := ts.Put(context.Background(), dep, tli, []byte("1\t0/3000000\tstored\n")); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	d, buf := captureDispatcher(t)
+	captureStreamTimelineHistory(context.Background(), d, sp,
+		walStreamOptions{deployment: dep, pgConn: "postgres://127.0.0.1:1/x"}, 5)
+
+	if got := buf.String(); strings.Contains(got, "history_not_captured") {
+		t.Errorf("dialled PG even though every history file was already stored:\n%s\n\n"+
+			"A reconnect on a caught-up archive should cost only the existence checks; "+
+			"opening a replication connection per attempt to re-fetch files we hold is "+
+			"waste on the hot path.", got)
+	}
+}
+
+// TestCaptureStreamTimelineHistory_MissingAncestorIsAttempted is the
+// regression test for the chain hole.
+//
+// The store holds timeline 5's history but not 3's, which is what a
+// promotion that happened while the streamer was down leaves behind.
+// The capture must notice the missing ancestor and try to fetch it —
+// PG probes history files in ascending order and stops at the first
+// miss, so a hole at 3 truncates the chain there regardless of what 4
+// and 5 hold.
+func TestCaptureStreamTimelineHistory_MissingAncestorIsAttempted(t *testing.T) {
+	sp, _ := newFsRepo(t)
+	const dep = "db1"
+	ts := timeline.New(sp)
+	for _, tli := range []uint32{2, 4, 5} {
+		if err := ts.Put(context.Background(), dep, tli, []byte("1\t0/3000000\tstored\n")); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	d, buf := captureDispatcher(t)
+	// PG is unreachable, so the attempt fails — and the warning is the
+	// proof that an attempt was made for the gap at all.
+	captureStreamTimelineHistory(context.Background(), d, sp,
+		walStreamOptions{deployment: dep, pgConn: "postgres://127.0.0.1:1/x"}, 5)
+
+	if got := buf.String(); !strings.Contains(got, "history_not_captured") {
+		t.Errorf("timeline 3's history is absent and the capture did not try to fetch it:\n%s\n\n"+
+			"Capturing only the streamed timeline is what left the hole. PostgreSQL stops "+
+			"probing at the first history file it cannot fetch, so a gap at 3 hides 4 and 5 "+
+			"too — with recovery_target_timeline='latest' that recovers along timeline 2 and "+
+			"reports success.", got)
+	}
+}

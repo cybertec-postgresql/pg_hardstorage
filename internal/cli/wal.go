@@ -1964,7 +1964,21 @@ func streamAttempt(
 		return nil, 0, 0, 0, timeline, identityID, err
 	}
 
-	// Capture the timeline-history file for this timeline.
+	// Capture the timeline history BEFORE resolving the resume point,
+	// and deliberately so.
+	//
+	// resolveStartLSN can refuse — a streamer that missed one or more
+	// promotions may find the WAL it needs already recycled, and
+	// wal.start_before_slot_restart_lsn is the correct answer there.
+	// But a streamer that cannot stream is exactly the one whose
+	// ancestry nobody else is recording, and the history files are what
+	// make a PITR from an older backup possible at all. Capturing first
+	// means the refusal costs the operator WAL they had already lost,
+	// not the chain that lets them recover what they still have.
+	//
+	// Measured: after two promotions with the streamer down, it logs
+	// wal.timeline.history_captured for timeline 3 and only then
+	// refuses with wal.start_before_slot_restart_lsn.
 	//
 	// PG asks for `<tli>.history` by its archive name through
 	// restore_command when a PITR needs to walk past a failover, and
@@ -2971,58 +2985,101 @@ func (b walStreamResultBody) WriteText(w io.Writer) error {
 	return err
 }
 
-// captureStreamTimelineHistory stores `<tli>.history` for the timeline
-// the stream is about to follow, so a later PITR can cross the failover
-// that created it.
+// captureStreamTimelineHistory stores the timeline-history files a
+// later PITR needs to walk from the base backup up to `tli`.
+//
+// It captures the WHOLE ancestry, not just `tli`, and that is the point
+// rather than thoroughness for its own sake. PostgreSQL discovers the
+// newest timeline by probing restore_command for successive history
+// files and stopping at the FIRST miss (findNewestTimeLine in
+// xlogrecovery.c). One absent file therefore does not lose one
+// timeline — it truncates the chain from there on. With
+// recovery_target_timeline='latest', our default, that is silent: PG
+// concludes the newest timeline is the one before the hole, recovers
+// along it, and reports success having dropped everything after.
+//
+// A hole is easy to produce. Capturing only the streamed timeline
+// leaves nothing behind for any promotion that happens while the
+// streamer is down — an agent restart, a deploy, a crash. Measured
+// against a real cluster with two promotions and the streamer absent
+// for the middle one: 00000003.history present, 00000002.history
+// missing, and PG would have recovered along timeline 1.
 //
 // Timeline 1 has no parent and therefore no history file; PG reports
 // that as ErrNoHistoryForTLI1 and it is not a problem, so it is not
 // reported as one.
 //
-// Idempotent by construction: the same timeline yields the same bytes,
-// and every reconnect re-runs this. That is deliberate — the capture
-// has to survive an agent that was not running when the promotion
-// happened.
+// Files already in the store are skipped without asking PG, so the
+// steady-state cost of a reconnect is one cheap existence check per
+// timeline rather than a round trip.
+//
+// Best-effort, but never silent. Refusing to stream because a history
+// file could not be stored would trade a PITR limitation for losing
+// all subsequent WAL, which is plainly worse. So a failure warns and
+// streaming continues — the same posture as the audit appends.
 func captureStreamTimelineHistory(ctx context.Context, d *output.Dispatcher, sp storage.StoragePlugin, opts walStreamOptions, tli uint32) {
 	if tli <= 1 || opts.pgConn == "" || sp == nil {
 		return
 	}
-	warn := func(reason string) {
+	warn := func(forTLI uint32, reason string) {
 		_ = d.Event(ctx, output.NewEvent(output.SeverityWarning, "wal.timeline", "history_not_captured").
-			WithSubject(output.Subject{Deployment: opts.deployment, Timeline: tli}).
+			WithSubject(output.Subject{Deployment: opts.deployment, Timeline: forTLI}).
 			WithBody(map[string]any{
 				"error": reason,
 				"message": "could not store the timeline-history file for this timeline. " +
 					"Streaming continues, but a point-in-time restore that needs to cross this " +
-					"failover cannot resolve the branch point: with " +
-					"recovery_target_timeline='latest' PG will silently recover along an " +
+					"failover cannot resolve the branch point: PostgreSQL probes history files " +
+					"in ascending order and stops at the first one it cannot fetch, so with " +
+					"recovery_target_timeline='latest' it will silently recover along an " +
 					"EARLIER timeline instead of failing, promoting a database missing " +
-					"everything written after the promotion.",
+					"everything written after that point.",
 			}))
+	}
+
+	store := timeline.New(sp)
+
+	// Which of the ancestry do we not already hold? Checked before
+	// opening a connection, so an up-to-date archive costs no round
+	// trips at all.
+	var want []uint32
+	for t := tli; t >= 2; t-- {
+		if _, err := store.Get(ctx, opts.deployment, t); err == nil {
+			continue
+		}
+		want = append(want, t)
+	}
+	if len(want) == 0 {
+		return
 	}
 
 	repl, err := pg.Connect(ctx, opts.pgConn, pg.ModeReplication)
 	if err != nil {
-		warn(err.Error())
+		warn(tli, err.Error())
 		return
 	}
 	defer repl.Close(ctx)
 
-	th, err := pg.TimelineHistoryFor(ctx, repl, tli)
-	if err != nil {
-		if errors.Is(err, pg.ErrNoHistoryForTLI1) {
-			return
+	var captured []uint32
+	for _, t := range want {
+		th, terr := pg.TimelineHistoryFor(ctx, repl, t)
+		if terr != nil {
+			if errors.Is(terr, pg.ErrNoHistoryForTLI1) {
+				continue
+			}
+			warn(t, terr.Error())
+			continue
 		}
-		warn(err.Error())
-		return
+		if perr := store.Put(ctx, opts.deployment, t, th.Content); perr != nil {
+			warn(t, perr.Error())
+			continue
+		}
+		captured = append(captured, t)
 	}
-	if err := timeline.New(sp).Put(ctx, opts.deployment, tli, th.Content); err != nil {
-		warn(err.Error())
-		return
+	if len(captured) > 0 {
+		_ = d.Event(ctx, output.NewEvent(output.SeverityInfo, "wal.timeline", "history_captured").
+			WithSubject(output.Subject{Deployment: opts.deployment, Timeline: tli}).
+			WithBody(map[string]any{"timelines": captured}))
 	}
-	_ = d.Event(ctx, output.NewEvent(output.SeverityInfo, "wal.timeline", "history_captured").
-		WithSubject(output.Subject{Deployment: opts.deployment, Timeline: tli}).
-		WithBody(map[string]any{"bytes": len(th.Content)}))
 }
 
 // sourceInRecovery reports whether the server at dsn is a standby.
