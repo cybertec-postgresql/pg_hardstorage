@@ -84,10 +84,15 @@ type HealResult struct {
 
 // Heal repairs locally-corrupted chunks by re-fetching their bytes
 // from a replica region. Use it after `repo scrub` (or
-// `repair scrub`) reports mismatches: the replica's bytes are
-// uncorrupted (chunks are byte-copied verbatim by `repo replicate`),
-// so a successful heal restores the local copy to a state where the
-// CAS's plaintext-SHA round-trip passes again.
+// `repair scrub`) reports mismatches.
+//
+// Note what the replica does and does not guarantee. `repo replicate`
+// byte-copies chunk envelopes verbatim, so the replica's bytes are
+// whatever the source held AT THE TIME — faithful, not verified.
+// Corruption that predates replication is mirrored exactly, and heal
+// cannot see that on its own. Supply VerifyPlaintext to close it;
+// without one, a "healed" count means the bytes were copied, not that
+// the chunk is correct.
 //
 // Per-hash flow:
 //  1. Verify the replica has the chunk (Stat). Missing → NotAtReplica.
@@ -96,8 +101,22 @@ type HealResult struct {
 //     have already healed it). If clean, AlreadyOK.
 //  4. Delete the corrupt local chunk.
 //  5. Put the replica's bytes at dst.
-//  6. Optional post-write verify: read back through the local CAS
-//     and confirm the plaintext SHA matches.
+//  6. Optional post-write verify: re-read the bytes at dst and confirm
+//     they match what was written. This proves the write round-tripped
+//     and NOTHING about whether those bytes were correct — it compares
+//     the readback against the replica's bytes, so it passes by
+//     construction. (It previously claimed to confirm the plaintext
+//     SHA through the local CAS; it does not, and cannot, because Heal
+//     holds no keys.)
+//
+// Distinguishing a genuine repair from a faithful copy of the same
+// corruption therefore CANNOT happen here, and deliberately does not:
+// the caller that holds the keys does it instead. `repair scrub --heal`
+// re-reads every once-mismatched chunk through the per-manifest CAS
+// after this returns (reverifyChunksPlaintext in internal/cli/repair.go)
+// and raises verify.heal_unverified when the plaintext still does not
+// match. Do not remove that pass on the belief that heal already
+// covers it — heal has no DEK and cannot.
 //
 // The replica's chunk-envelope bytes are byte-identical to what was
 // originally written (Replicate doesn't re-encrypt), so writing them
