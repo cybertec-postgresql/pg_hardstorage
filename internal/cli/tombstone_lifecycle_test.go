@@ -389,3 +389,162 @@ func TestCascadeUnwind_RoundTripRestoresTheChain(t *testing.T) {
 		t.Errorf("restored bytes = %q, err=%v", got, err)
 	}
 }
+
+// TestRetentionAcrossAFailover_PruneFrontierIsTimelineLinear pins the
+// retention/failover interaction: the WAL prune frontier is an LSN,
+// not a (timeline, LSN) pair, and that is CORRECT — LSN space is
+// linear across a promotion — but nothing proved the composition, and
+// the failure shape on either side is data loss:
+//
+//   - too eager: pruning pre-branch TLI-1 WAL that a kept TLI-1 backup
+//     still needs to reach the branch point makes a cross-timeline
+//     PITR from it impossible;
+//   - too timid is invisible until the disk fills.
+//
+// The scene after a failover: B_old was taken on timeline 1, the
+// cluster promoted (branch inside segment 7), B_new was taken on
+// timeline 2. The archive holds TLI-1 segments 2..7, TLI-2 segments
+// 7..10, and 2.history — the file PG needs to walk the branch.
+func TestRetentionAcrossAFailover_PruneFrontierIsTimelineLinear(t *testing.T) {
+	w := newReadWorld(t)
+	defer w.cleanup()
+	now := time.Now().UTC()
+
+	commitBackupLSN(t, w, "db1", "b-old-tli1", "0/3000028", "0/30001A0", now.Add(-72*time.Hour))
+	commitBackupLSN(t, w, "db1", "b-new-tli2", "0/9000028", "0/90001A0", now.Add(-1*time.Hour))
+	for i := 2; i <= 7; i++ {
+		plantWALSegmentAtCLI(t, w.repoURL, "db1", 1,
+			fmt.Sprintf("0000000100000000%08X", i), fmt.Sprintf("0/%X000000", i+1), now.Add(-70*time.Hour))
+	}
+	for i := 7; i <= 10; i++ {
+		plantWALSegmentAtCLI(t, w.repoURL, "db1", 2,
+			fmt.Sprintf("0000000200000000%08X", i), fmt.Sprintf("0/%X000000", i+1), now.Add(-2*time.Hour))
+	}
+	root := strings.TrimPrefix(w.repoURL, "file://")
+	if err := os.MkdirAll(filepath.Join(root, "wal", "db1", "timelines"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	histPath := filepath.Join(root, "wal", "db1", "timelines", "2.history")
+	if err := os.WriteFile(histPath, []byte("1\t0/70000A0\tswitchover\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// --- Phase 1: both backups live. Frontier = B_old.start (segment
+	// 3). Only TLI-1 segment 2 is prunable.
+	if _, errb, exit := runCLI(t, "wal", "prune", "db1",
+		"--repo", w.repoURL, "--apply", "-o", "json"); exit != int(output.ExitOK) {
+		t.Fatalf("prune (both live): exit=%d\n%s", exit, errb)
+	}
+	if segPresent(t, w.repoURL, "db1", 1, "000000010000000000000002") {
+		t.Errorf("phase 1: TLI-1 segment 2 survived; it is below every kept backup's start " +
+			"and holds nothing any restore can use")
+	}
+	for i := 3; i <= 7; i++ {
+		if !segPresent(t, w.repoURL, "db1", 1, fmt.Sprintf("0000000100000000%08X", i)) {
+			t.Fatalf("phase 1: TLI-1 segment %d was pruned while b-old-tli1 (start segment 3) "+
+				"is LIVE.\n\nA restore of that backup replays TLI-1 WAL from its start to the "+
+				"branch in segment 7, then crosses to TLI 2 via 2.history. Deleting any of "+
+				"segments 3..7 makes the cross-timeline PITR impossible while the backup "+
+				"that needs them still lists as restorable.", i)
+		}
+	}
+	for i := 7; i <= 10; i++ {
+		if !segPresent(t, w.repoURL, "db1", 2, fmt.Sprintf("0000000200000000%08X", i)) {
+			t.Fatalf("phase 1: TLI-2 segment %d was pruned; everything at/above the branch "+
+				"is needed by the kept lineage", i)
+		}
+	}
+
+	// --- Phase 2: B_old tombstoned and expired. Frontier moves to
+	// B_new.start (segment 9); everything below it goes, on BOTH
+	// timelines — the diverged TLI-1 tail included, because nothing
+	// restorable can reach it any more.
+	if _, errb, exit := runCLI(t, "backup", "delete", "db1", "b-old-tli1",
+		"--repo", w.repoURL, "--reason", "aged out", "--yes", "-o", "json"); exit != int(output.ExitOK) {
+		t.Fatalf("delete b-old-tli1: exit=%d\n%s", exit, errb)
+	}
+	if _, errb, exit := runCLI(t, "wal", "prune", "db1",
+		"--repo", w.repoURL, "--apply", "--tombstone-grace", "0s", "-o", "json"); exit != int(output.ExitOK) {
+		t.Fatalf("prune (b-old expired): exit=%d\n%s", exit, errb)
+	}
+	for i := 3; i <= 7; i++ {
+		if segPresent(t, w.repoURL, "db1", 1, fmt.Sprintf("0000000100000000%08X", i)) {
+			t.Errorf("phase 2: TLI-1 segment %d survived an expired tombstone; no kept backup "+
+				"can replay through it", i)
+		}
+	}
+	for i := 7; i <= 8; i++ {
+		if segPresent(t, w.repoURL, "db1", 2, fmt.Sprintf("0000000200000000%08X", i)) {
+			t.Errorf("phase 2: TLI-2 segment %d is below the kept frontier (segment 9) and "+
+				"survived", i)
+		}
+	}
+	for i := 9; i <= 10; i++ {
+		if !segPresent(t, w.repoURL, "db1", 2, fmt.Sprintf("0000000200000000%08X", i)) {
+			t.Fatalf("phase 2: TLI-2 segment %d was pruned while b-new-tli2 (start segment 9) "+
+				"is LIVE — data loss for the only remaining backup", i)
+		}
+	}
+
+	// The timeline-history file survives BOTH phases. It is the whole
+	// ancestry's map, weighs bytes, and pruning it would cap every
+	// future recovery at timeline 1 silently.
+	if _, err := os.Stat(histPath); err != nil {
+		t.Errorf("2.history did not survive pruning: %v\n\n"+
+			"History files are not segment data; they are the branch map PG probes for "+
+			"with recovery_target_timeline='latest'. Deleting one silently caps recovery "+
+			"at the previous timeline.", err)
+	}
+}
+
+// TestRotateRedeletesUndeleted_AndUndeleteSaysSo pins the churn trap
+// and its signpost.
+//
+// The behaviour itself is policy-correct: rotation deleted the backup
+// as excess, an undelete makes it excess again, the next rotate
+// re-tombstones it. Measured here rather than assumed. What turns a
+// correct behaviour into a trap is silence — an operator who just
+// recovered a backup reasonably believes it stays recovered, and the
+// next cron run undoes them. So undelete's success output names the
+// trap and the remedy (a hold, which rotation respects — pinned by
+// TestRotate_RespectsHold).
+func TestRotateRedeletesUndeleted_AndUndeleteSaysSo(t *testing.T) {
+	w := newReadWorld(t)
+	defer w.cleanup()
+	now := time.Now().UTC()
+	commitBackupLSN(t, w, "db1", "b-old", "0/3000028", "0/30001A0", now.Add(-48*time.Hour))
+	commitBackupLSN(t, w, "db1", "b-new", "0/6000028", "0/60001A0", now.Add(-1*time.Hour))
+
+	rotate := func() string {
+		out, errb, exit := runCLI(t, "rotate", "db1", "--repo", w.repoURL,
+			"--keep-daily", "1", "--keep-weekly", "1", "--keep-monthly", "1",
+			"--keep-yearly", "1", "--apply", "-o", "json")
+		if exit != int(output.ExitOK) {
+			t.Fatalf("rotate: exit=%d\n%s", exit, errb)
+		}
+		return out
+	}
+	if out := rotate(); !strings.Contains(out, `"deleted": 1`) {
+		t.Fatalf("rotate #1 deleted nothing — unstaged, proving nothing:\n%.600s", out)
+	}
+
+	// Text mode, because the signpost is for the human at the keyboard.
+	outText, _, exit := runCLI(t, "backup", "undelete", "db1", "b-old",
+		"--repo", w.repoURL, "-o", "text")
+	if exit != int(output.ExitOK) {
+		t.Fatalf("undelete: exit=%d\n%s", exit, outText)
+	}
+	for _, want := range []string{"re-delete", "hold add"} {
+		if !strings.Contains(outText, want) {
+			t.Errorf("undelete's success output does not mention %q:\n%s\n\n"+
+				"The re-deletion is measured behaviour (below); recovering a backup "+
+				"without being told it is one cron run from vanishing again is the trap.",
+				want, outText)
+		}
+	}
+
+	if out := rotate(); !strings.Contains(out, `"deleted": 1`) {
+		t.Fatalf("rotate #2 did NOT re-delete the undeleted backup — the documented churn "+
+			"behaviour changed, so the guidance this test pins is now stale:\n%.600s", out)
+	}
+}

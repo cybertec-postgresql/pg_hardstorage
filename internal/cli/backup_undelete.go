@@ -64,6 +64,14 @@ incremental under a tombstoned ancestor), so the leaf-first
 cascade_deleted slice works verbatim. Outcomes are reported in
 the order given.
 
+A resurrected backup is NOT protected from the next policy run.
+Rotation deleted it because the policy judged it excess, and the
+policy will judge it excess again: the next ` + "`" + `rotate --apply` + "`" + `
+re-tombstones it, silently undoing the recovery. If the backup
+must stay, place a hold immediately after undeleting —
+` + "`" + `pg_hardstorage hold add <deployment> <backup-id> --holder ...` + "`" + `
+— which both rotation and deletion respect.
+
 Pairs with ` + "`" + `backup delete --cascade` + "`" + `: the cascade response's
 ` + "`" + `cascade_deleted` + "`" + ` slice (or the equivalent audit body
 field) is exactly what you pass back to ` + "`" + `undelete` + "`" + ` to
@@ -441,6 +449,12 @@ func (b backupUndeleteBody) WriteText(w io.Writer) error {
 		}
 	} else {
 		fmt.Fprintf(bw, "✓ %s: %d backup(s) restored\n", b.Deployment, len(b.Restored))
+		// The churn trap, named at the moment it matters: rotation
+		// deleted this backup as policy-excess and will again on its
+		// next run — measured, not assumed. The remedy is a hold,
+		// which rotation respects.
+		fmt.Fprintf(bw, "  note: a policy rotate will re-delete these (they are excess again); if they must stay, add a hold:\n")
+		fmt.Fprintf(bw, "        pg_hardstorage hold add %s <backup-id> --holder <who> --reason <why>\n", b.Deployment)
 	}
 	for i, o := range b.Outcomes {
 		marker := "├─"

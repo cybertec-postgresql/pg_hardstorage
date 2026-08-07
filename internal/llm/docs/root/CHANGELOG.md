@@ -13,6 +13,16 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **`backup undelete` warns that a policy rotate will re-delete the
+  resurrected backup.** Rotation deleted it as policy-excess; an
+  undelete makes it excess again, and the next `rotate --apply`
+  re-tombstones it — measured, and policy-correct. What made it a trap
+  was silence: an operator who just recovered a backup reasonably
+  believes it stays recovered, and the next cron run undoes them. The
+  success output now names the behaviour and the remedy — a hold, which
+  both rotation and deletion respect — and the command help documents
+  it.
+
 - **`backup undelete` re-verifies chunks at the moment of resurrection,
   not just before it.** Undelete's restorability pre-flight ran while
   the manifest was still hidden, and a concurrent `repo gc --apply`
