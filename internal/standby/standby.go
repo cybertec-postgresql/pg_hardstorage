@@ -162,11 +162,14 @@ func (m *Manager) Create(ctx context.Context, opts CreateOptions) (*Standby, err
 
 	// 2. Restore + write standby.signal + restore_command.
 	//
-	// walfetchcmd.Build wraps the underlying `wal fetch` invocation
-	// in `sh -c` with POSIX-safe quoting and the exit-6 → exit-1
-	// mapping PG needs at end-of-archive — see that package's
-	// docstring for the full rationale.
-	rcmd := walfetchcmd.Build(m.binPath, opts.Deployment, opts.RepoURL)
+	// walfetchcmd.BuildStandby wraps the underlying `wal fetch`
+	// invocation with POSIX-safe quoting and the LENIENT exit-code
+	// tail: a standby polls restore_command forever and "not archived
+	// yet" is exit-nonzero by contract, so — unlike the one-shot
+	// recovery paths, which self-terminate by signal on infrastructure
+	// faults — every nonzero here must stay a plain exit or a repo
+	// blip would crash the replica. See that package's docstring.
+	rcmd := walfetchcmd.BuildStandby(m.binPath, opts.Deployment, opts.RepoURL)
 
 	if _, err := restore.Restore(ctx, restore.Options{
 		RepoURL:        opts.RepoURL,

@@ -22,14 +22,25 @@ making them visible again to `backup list` and `restore`.
 Use this to recover from an over-aggressive delete or cascade
 before chunk-GC runs. The window is bounded: once
 `repo gc --apply` has reclaimed the chunks the manifest
-references, undelete will succeed but the resulting backup will
-fail to restore. Run `backup undelete` BEFORE the next
-GC cycle.
+references, undelete REFUSES with conflict.chunks_missing (the
+store fails closed) unless --force is passed to recover the
+metadata of a backup that can no longer restore.
 
 Idempotent. An undelete of a manifest that's already live is a
-no-op; no error, no audit entry. Multiple IDs may be passed —
-the operation walks them in argv order and reports each one's
-outcome.
+no-op; no error, no audit entry. Multiple IDs may be passed in
+ANY order: within the batch, ancestors are resurrected before
+their descendants automatically (the store refuses an
+incremental under a tombstoned ancestor), so the leaf-first
+cascade_deleted slice works verbatim. Outcomes are reported in
+the order given.
+
+A resurrected backup is NOT protected from the next policy run.
+Rotation deleted it because the policy judged it excess, and the
+policy will judge it excess again: the next `rotate --apply`
+re-tombstones it, silently undoing the recovery. If the backup
+must stay, place a hold immediately after undeleting —
+`pg_hardstorage hold add <deployment> <backup-id> --holder ...`
+— which both rotation and deletion respect.
 
 Pairs with `backup delete --cascade`: the cascade response's
 `cascade_deleted` slice (or the equivalent audit body
@@ -56,12 +67,12 @@ pg_hardstorage backup undelete <deployment> <backup-id> [<backup-id>...] [flags]
 ### Options
 
 ```
-      --check-chunks verify --existence-only   refuse to undelete a manifest whose chunks have been GC'd (Stat-only pre-flight; same primitive as verify --existence-only)
-      --force                                  resurrect even when chunks are gone — recover the metadata of an un-restorable backup (skips the restorability pre-flight; forensic use)
-  -h, --help                                   help for undelete
-      --reason string                          free-form reason captured in the audit chain (recommended for forensics)
-      --repo string                            repository URL (required)
-      --skip-missing                           when --check-chunks fails on some IDs, undelete the rest (default: refuse the whole batch)
+      --check-chunks    run the missing-chunk check as an up-front BATCH pre-pass, so a multi-ID undelete refuses atomically before touching anything (and --skip-missing can select the survivors). The per-ID safety does not depend on this flag: the store fails closed on missing chunks regardless.
+      --force           resurrect even when the manifest's chunks are gone, to recover the metadata of an un-restorable backup (forensic use). Without it, undelete FAILS CLOSED on missing chunks — the store refuses with conflict.chunks_missing whether or not --check-chunks was passed.
+  -h, --help            help for undelete
+      --reason string   free-form reason captured in the audit chain (recommended for forensics)
+      --repo string     repository URL (required)
+      --skip-missing    when --check-chunks fails on some IDs, undelete the rest (default: refuse the whole batch)
 ```
 
 ### Options inherited from parent commands

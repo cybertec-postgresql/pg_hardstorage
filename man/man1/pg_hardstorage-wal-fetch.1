@@ -35,14 +35,20 @@ Exit codes:
   >0 - other error (network, repo missing, etc.)
 
 .PP
-IMPORTANT: at end-of-archive this command exits 6, NOT 1. PostgreSQL's
-postmaster treats any restore_command exit other than 0/1 as a crash
-and restarts recovery, which loops forever once the cluster is caught
-up. The canonical restore_command above must therefore map 6 -> 1 (the
-"no more WAL, stop and promote" signal PG expects). The line that
-\fBpg_hardstorage restore\fR writes does this automatically via the
-shim '...; ec=$?; [ $ec = 6 ] && exit 1 || exit $ec'. If you hand-write
-restore_command, you MUST include that 6->1 mapping yourself.
+IMPORTANT: at end-of-archive this command exits 6, NOT 1, and if you
+hand-write a restore_command you must translate the codes yourself.
+PostgreSQL hears only two things from restore_command: a plain nonzero
+exit means "file not available" — which during unbounded recovery
+means END OF ARCHIVE: stop, promote, report success — and a
+termination by signal aborts recovery. So (1) map 6 -> 1, the honest
+"no more WAL" answer, and (2) do NOT let any other failure exit
+plainly: a storage outage or key failure that exits 1..255 reads as a
+clean end-of-archive and PostgreSQL promotes a silently truncated
+cluster. The line \fBpg_hardstorage restore\fR writes does both via the
+shim '...; ec=$?; [ $ec = 0 ] && exit 0; [ $ec = 6 ] && exit 1;
+kill -s ABRT $$' (one-shot recovery; standby restore_commands keep the
+lenient '[ $ec = 6 ] && exit 1 || exit $ec' because a standby polls
+forever and nonzero legitimately means "not archived yet").
 
 
 .SH OPTIONS

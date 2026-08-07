@@ -71,6 +71,10 @@ Exit codes:
 
 .SH OPTIONS
 .PP
+\fB--allow-system-identifier-change\fP[=false]
+	continue archiving into this deployment even though the cluster's system_identifier differs from the WAL already archived (i.e. a DIFFERENT cluster — pg_upgrade, restore onto new storage, cloned datadir). Off by default: interleaving two clusters under one lineage corrupts PITR.
+
+.PP
 \fB-h\fP, \fB--help\fP[=false]
 	help for push
 

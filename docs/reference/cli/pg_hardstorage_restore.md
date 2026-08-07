@@ -33,6 +33,7 @@ PITR (replaying WAL up to a target):
   --to "2026-04-27 09:42 UTC" absolute time, parsed predictably
   --to-lsn 0/3000028          recover up to (and including) this LSN
   --to-name my-restore-point  recover up to a named restore point
+  --to-latest                 recover through ALL archived WAL, then --to-action
   --to-action pause|promote|shutdown   default pause (safest)
   --to-timeline latest|<N>    default 'latest'
 
@@ -69,6 +70,7 @@ pg_hardstorage restore <deployment> <backup-id|latest> [flags]
       --to string                                                                                        recover up to this time (natural language or RFC3339)
       --to-action string                                                                                 action when target reached: pause|promote|shutdown (default "pause")
       --to-exclusive                                                                                     stop recovery just BEFORE the target (default: just after)
+      --to-latest                                                                                        recover through ALL archived WAL (no point-in-time target): restore_command replays every segment the repository holds on the target timeline, then --to-action applies. This is the ordinary disaster-recovery shape — without it, a plain restore boots with only the WAL bundled in the backup and silently ignores everything archived since.
       --to-lsn string                                                                                    recover up to this LSN (e.g. 0/3000028)
       --to-name string                                                                                   recover up to this PostgreSQL named restore point
       --to-timeline string                                                                               target timeline: 'latest' or an explicit TLI number (default "latest")

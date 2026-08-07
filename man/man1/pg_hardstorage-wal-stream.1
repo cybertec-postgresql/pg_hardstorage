@@ -43,6 +43,10 @@ Resume LSN is determined automatically:
 
 .SH OPTIONS
 .PP
+\fB--allow-standby-source\fP[=false]
+	stream from a server that is in recovery (a standby) instead of refusing. Off by default: after a failover a single-host --pg-connection reconnects to the DEMOTED node, and PostgreSQL allows replication from a standby — so the archive silently trails the real primary. Use this only when archiving from a replica is deliberate.
+
+.PP
 \fB--allow-system-identifier-change\fP[=false]
 	proceed even when the cluster's pg_control system identifier differs from the deployment's already-archived WAL (the pg_upgrade / clone / restore signature). By default this is refused to stop two clusters' WAL being interleaved under one lineage; set it only when deliberately continuing the deployment onto a new cluster
 

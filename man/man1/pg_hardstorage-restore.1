@@ -33,6 +33,7 @@ PITR (replaying WAL up to a target):
   --to "2026-04-27 09:42 UTC" absolute time, parsed predictably
   --to-lsn 0/3000028          recover up to (and including) this LSN
   --to-name my-restore-point  recover up to a named restore point
+  --to-latest                 recover through ALL archived WAL, then --to-action
   --to-action pause|promote|shutdown   default pause (safest)
   --to-timeline latest|    default 'latest'
 
@@ -127,6 +128,10 @@ binary's wal-fetch shim.
 .PP
 \fB--to-exclusive\fP[=false]
 	stop recovery just BEFORE the target (default: just after)
+
+.PP
+\fB--to-latest\fP[=false]
+	recover through ALL archived WAL (no point-in-time target): restore_command replays every segment the repository holds on the target timeline, then --to-action applies. This is the ordinary disaster-recovery shape — without it, a plain restore boots with only the WAL bundled in the backup and silently ignores everything archived since.
 
 .PP
 \fB--to-lsn\fP=""

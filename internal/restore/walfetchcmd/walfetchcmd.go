@@ -91,10 +91,15 @@ const RestoreBinEnv = "PG_HARDSTORAGE_RESTORE_BIN"
 // scenarios from the regression sweep).
 //
 // Mapping 6 → 1 lets PG see the "stop & promote" signal it expects
-// at end-of-archive and complete the promote.  Other non-zero codes
-// pass through unchanged so a real failure (e.g. storage.unreachable
-// → exit 8) still surfaces as a crash signal rather than masquerading
-// as end-of-archive.
+// at end-of-archive and complete the promote.  Every OTHER non-zero
+// code is an infrastructure fault, and passing it through would NOT
+// surface as a crash — PG treats every plain nonzero restore_command
+// exit as "file not available" (only a signal-death aborts recovery),
+// so a passed-through storage.unreachable read as a clean
+// end-of-archive and the restore promoted silently behind. The tail
+// therefore self-terminates with SIGABRT on those codes — see
+// oneShotTail. Standby restore_commands keep the lenient pass-through
+// via BuildStandby; a standby's contract is poll-and-retry.
 //
 // The result is the unquoted GUC value: callers wrapping it in PG's
 // SQL single-quote literal (`restore_command = '<this>'`) MUST run
@@ -111,6 +116,29 @@ func Build(agentBin, deployment, repoURL string) string {
 	// twice per poll cycle, and restore error reports quoting the log
 	// tail became walls of nested escaped JSON. Text mode keeps it to
 	// a single line.
+	return fmt.Sprintf(`%s wal fetch %s %%f %%p --repo %s -o text -q; %s`,
+		ShellQuote(resolveRestoreBin(agentBin)),
+		ShellQuote(deployment),
+		ShellQuote(repoURL),
+		oneShotTail())
+}
+
+// BuildStandby is Build for a STANDBY's restore_command, where the
+// exit-code discipline must stay lenient: a standby polls
+// restore_command forever, and "segment not available yet" — the
+// answer it gets all day, every day, while caught up — is exit
+// nonzero by contract. Aborting on infrastructure faults there would
+// turn every transient repo blip into a crashed replica.
+//
+// The trade this keeps (deliberately): a PERSISTENT infrastructure
+// fault leaves the standby up and silently frozen at its last
+// replayed position, indistinguishable to PG from "no new WAL yet".
+// That is the standby's inherent failure shape — surface it with lag
+// monitoring, which every HA deployment already has. The one-shot
+// paths (Build) refuse to make that trade because a one-shot recovery
+// that stops early PROMOTES, and a promoted-behind cluster is data
+// loss, not lag.
+func BuildStandby(agentBin, deployment, repoURL string) string {
 	return fmt.Sprintf(`%s wal fetch %s %%f %%p --repo %s -o text -q; ec=$?; [ $ec = 6 ] && exit 1 || exit $ec`,
 		ShellQuote(resolveRestoreBin(agentBin)),
 		ShellQuote(deployment),

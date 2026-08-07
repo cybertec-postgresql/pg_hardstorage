@@ -64,14 +64,15 @@ pg_hardstorage wal push <deployment> <segment-path> [flags]
 ### Options
 
 ```
-  -h, --help                        help for push
-      --kek string                  KEK reference for WAL encryption under a cloud KMS (e.g. aws-kms://...); MUST match the deployment's base-backup KEKRef. Local-KEK encryption is automatic when a keyring kek.bin is present.
-      --kms-config stringToString   cloud KMS provider config (region/endpoint/credentials); only consulted when --kek is a cloud scheme — the same values base backups use. (default [])
-      --pg-connection string        libpq connection string — used once to fetch the system_identifier
-      --repo string                 repository URL (file://, s3://, ...) — must already exist (required)
-      --system-identifier string    explicit pg_control system_identifier (skip libpq round-trip)
-      --tde                         the source PG has Transparent Data Encryption enabled; skip on-segment header parsing (requires --system-identifier or --pg-connection). See docs/explanation/tde-awareness.md.
-      --wal-segsize int             cluster wal_segment_size in megabytes (matches initdb --wal-segsize); a segment file whose length differs from this is refused as truncated/corrupt (default 16)
+      --allow-system-identifier-change   continue archiving into this deployment even though the cluster's system_identifier differs from the WAL already archived (i.e. a DIFFERENT cluster — pg_upgrade, restore onto new storage, cloned datadir). Off by default: interleaving two clusters under one lineage corrupts PITR.
+  -h, --help                             help for push
+      --kek string                       KEK reference for WAL encryption under a cloud KMS (e.g. aws-kms://...); MUST match the deployment's base-backup KEKRef. Local-KEK encryption is automatic when a keyring kek.bin is present.
+      --kms-config stringToString        cloud KMS provider config (region/endpoint/credentials); only consulted when --kek is a cloud scheme — the same values base backups use. (default [])
+      --pg-connection string             libpq connection string — used once to fetch the system_identifier
+      --repo string                      repository URL (file://, s3://, ...) — must already exist (required)
+      --system-identifier string         explicit pg_control system_identifier (skip libpq round-trip)
+      --tde                              the source PG has Transparent Data Encryption enabled; skip on-segment header parsing (requires --system-identifier or --pg-connection). See docs/explanation/tde-awareness.md.
+      --wal-segsize int                  cluster wal_segment_size in megabytes (matches initdb --wal-segsize); a segment file whose length differs from this is refused as truncated/corrupt (default 16)
 ```
 
 ### Options inherited from parent commands

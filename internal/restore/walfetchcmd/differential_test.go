@@ -5,6 +5,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -113,14 +114,15 @@ func TestBuild_ExitCodeMappingThroughRealShell(t *testing.T) {
 	rc = strings.ReplaceAll(rc, "%f", "seg")
 	rc = strings.ReplaceAll(rc, "%p", "/dest")
 
-	cases := []struct{ agentExit, wantExit int }{
+	// PG's actual contract (xlogarchive.c): every plain nonzero exit
+	// is "file not available" — end-of-archive during unbounded
+	// recovery. Infrastructure faults must therefore leave by SIGNAL,
+	// the only exit PG aborts recovery on.
+	plain := []struct{ agentExit, wantExit int }{
 		{0, 0}, // archived segment found → success
 		{6, 1}, // ExitNotFound (end-of-archive) → PG "stop & promote"
-		{8, 8}, // storage.unreachable → real crash, pass through
-		{1, 1}, // misc failure → pass through
-		{2, 2}, // misuse → pass through
 	}
-	for _, c := range cases {
+	for _, c := range plain {
 		cmd := exec.Command(sh, "-c", rc)
 		cmd.Env = append(os.Environ(), "STUB_EXIT="+itoa(c.agentExit))
 		err := cmd.Run()
@@ -132,6 +134,55 @@ func TestBuild_ExitCodeMappingThroughRealShell(t *testing.T) {
 		}
 		if got != c.wantExit {
 			t.Errorf("agent exit %d → restore_command exit %d, want %d", c.agentExit, got, c.wantExit)
+		}
+	}
+	for _, agentExit := range []int{1, 2, 8, 127} {
+		cmd := exec.Command(sh, "-c", rc)
+		cmd.Env = append(os.Environ(), "STUB_EXIT="+itoa(agentExit))
+		_ = cmd.Run()
+		if cmd.ProcessState == nil {
+			t.Fatalf("agentExit=%d: no ProcessState", agentExit)
+		}
+		ws, ok := cmd.ProcessState.Sys().(syscall.WaitStatus)
+		if !ok || !ws.Signaled() || ws.Signal() != syscall.SIGABRT {
+			t.Errorf("agent exit %d → restore_command exit %d (signaled=%v sig=%v), want "+
+				"death by SIGABRT.\n\nPG treats a plain exit here as END OF ARCHIVE and "+
+				"PROMOTES a silently truncated restore — the signal is the only refusal "+
+				"PG can hear.", agentExit, cmd.ProcessState.ExitCode(), ok && ws.Signaled(),
+				func() any {
+					if ok {
+						return ws.Signal()
+					}
+					return "?"
+				}())
+		}
+	}
+}
+
+// TestBuildStandby_ExitCodesPassThroughRealShell: the standby variant
+// keeps the lenient contract — nonzero means "not archived yet, poll
+// again", and a signal here would crash the replica on every blip.
+func TestBuildStandby_ExitCodesPassThroughRealShell(t *testing.T) {
+	sh, err := exec.LookPath("sh")
+	if err != nil {
+		t.Skip("no /bin/sh available")
+	}
+	dir := t.TempDir()
+	stub := filepath.Join(dir, "agent-stub")
+	if err := os.WriteFile(stub, []byte("#!/bin/sh\nexit ${STUB_EXIT:-0}\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	rc := BuildStandby(stub, "dep", "file:///srv/repo")
+	rc = strings.ReplaceAll(rc, "%f", "seg")
+	rc = strings.ReplaceAll(rc, "%p", "/dest")
+	for _, c := range []struct{ agentExit, wantExit int }{
+		{0, 0}, {6, 1}, {8, 8}, {1, 1},
+	} {
+		cmd := exec.Command(sh, "-c", rc)
+		cmd.Env = append(os.Environ(), "STUB_EXIT="+itoa(c.agentExit))
+		_ = cmd.Run()
+		if got := cmd.ProcessState.ExitCode(); got != c.wantExit {
+			t.Errorf("standby: agent exit %d → %d, want %d", c.agentExit, got, c.wantExit)
 		}
 	}
 }

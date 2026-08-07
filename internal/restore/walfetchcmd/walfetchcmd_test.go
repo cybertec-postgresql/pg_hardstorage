@@ -52,6 +52,25 @@ func TestBuild_ContainsExitCodeMapping(t *testing.T) {
 	if !strings.Contains(got, "ec=$?") || !strings.Contains(got, "[ $ec = 6 ] && exit 1") {
 		t.Errorf("Build output should include the exit-6 → exit-1 mapping:\n%s", got)
 	}
+	if !strings.Contains(got, "kill -s ABRT $$") {
+		t.Errorf("Build output should self-terminate by signal on infrastructure faults — "+
+			"PG treats every plain nonzero exit as end-of-archive, so without the signal a "+
+			"storage outage PROMOTES a truncated restore:\n%s", got)
+	}
+}
+
+// TestBuildStandby_KeepsLenientPassThrough: a standby polls
+// restore_command forever and "not archived yet" is exit-nonzero by
+// contract — the standby variant must NOT carry the signal tail, or
+// every transient repo blip crashes the replica.
+func TestBuildStandby_KeepsLenientPassThrough(t *testing.T) {
+	got := BuildStandby("/p/bin/pg_hardstorage", "db1", "file:///srv/repo")
+	if strings.Contains(got, "ABRT") {
+		t.Errorf("BuildStandby must not self-terminate by signal:\n%s", got)
+	}
+	if !strings.Contains(got, "[ $ec = 6 ] && exit 1 || exit $ec") {
+		t.Errorf("BuildStandby should keep the lenient pass-through tail:\n%s", got)
+	}
 }
 
 // TestBuild_PreservesPGPlaceholders: PG substitutes %f / %p before

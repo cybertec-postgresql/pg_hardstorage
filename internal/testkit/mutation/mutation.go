@@ -58,6 +58,24 @@ type Mutation struct {
 // in the named package — see the package doc.
 var Registry = []Mutation{
 	{
+		Tag: "mutation_restore_cmd_lenient_tail",
+		Description: "the one-shot restore_command tail passes " +
+			"infrastructure-fault exit codes through instead of dying by " +
+			"signal (pre-fix bug #21): PostgreSQL treats EVERY plain " +
+			"nonzero restore_command exit as 'file not available' — " +
+			"end-of-archive during unbounded recovery — so an S3 outage, " +
+			"an expired credential, a keyring refusal, a corrupted " +
+			"manifest, a gc-swept chunk, or a missing agent binary " +
+			"(exit 127) all ended recovery cleanly and PROMOTED silently " +
+			"behind. Only a signal-death aborts recovery. Caught by " +
+			"TestBuild_ExitCodeMappingThroughRealShell (death-by-SIGABRT " +
+			"assertions through a real shell) and " +
+			"TestBuild_ContainsExitCodeMapping.",
+		Packages: []string{
+			"github.com/cybertec-postgresql/pg_hardstorage/internal/restore/walfetchcmd",
+		},
+	},
+	{
 		Tag: "mutation_prestream_gap_ignores_frontier",
 		Description: "the fresh-slot gap recorder never consults the " +
 			"archive frontier (pre-fix bug #20): after a Patroni failover " +

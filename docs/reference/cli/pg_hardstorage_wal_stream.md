@@ -46,6 +46,7 @@ pg_hardstorage wal stream <deployment> [flags]
 ### Options
 
 ```
+      --allow-standby-source             stream from a server that is in recovery (a standby) instead of refusing. Off by default: after a failover a single-host --pg-connection reconnects to the DEMOTED node, and PostgreSQL allows replication from a standby — so the archive silently trails the real primary. Use this only when archiving from a replica is deliberate.
       --allow-system-identifier-change   proceed even when the cluster's pg_control system identifier differs from the deployment's already-archived WAL (the pg_upgrade / clone / restore signature). By default this is refused to stop two clusters' WAL being interleaved under one lineage; set it only when deliberately continuing the deployment onto a new cluster
       --durability string                WAL durability: per-segment (one syncfs per 16 MiB segment, the fast default) | per-chunk (fsync every chunk — slower, the 'fsync every object' opt-in) (default "per-segment")
   -h, --help                             help for stream

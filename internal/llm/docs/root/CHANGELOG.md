@@ -98,6 +98,28 @@ keeps reading that version for at least 24 months after a successor lands.
   which is unchanged. When the archive already reaches the new slot's
   anchor, nothing is recorded at all.
 
+- **Infrastructure failures during recovery no longer masquerade as
+  end-of-archive.** PostgreSQL's `restore_command` contract is
+  narrower than it looks: *every* plain nonzero exit means "that file
+  is not available", and during unbounded recovery that means end of
+  archive — stop, **promote**, report success. Only a termination by
+  signal aborts recovery. The generated command passed non-not-found
+  exit codes through in the belief they would surface as a crash; they
+  never did. An S3 outage, an expired credential, a keyring refused
+  for its file mode, a corrupted segment manifest, a chunk the
+  janitors swept, even the agent binary missing from the recovery
+  environment (shell exit 127) — each one silently ended recovery and
+  promoted a truncated cluster; the verifier's sandbox could
+  false-green the same way. The one-shot tail (PITR, `--to-latest`,
+  time-travel, verify) now maps not-found to PG's expected exit 1 and
+  self-terminates with `SIGABRT` on anything else, so recovery aborts
+  loudly at the fault. Standby restore_commands keep the lenient
+  pass-through (`BuildStandby`): a standby polls forever and "not
+  archived yet" is exit-nonzero by contract — aborting there would
+  crash a replica on every transient blip; a frozen standby is lag,
+  which monitoring already sees, while a promoted-behind cluster is
+  data loss.
+
 ### Added
 
 - **`restore --to-latest`: end-of-archive recovery.** There was no CLI
