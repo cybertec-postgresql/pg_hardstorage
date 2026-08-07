@@ -91,10 +91,29 @@ type walSegment struct {
 // walGap is a contiguous range of missing segments on a single
 // timeline.
 type walGap struct {
-	Timeline     uint32 `json:"timeline"`
+	Timeline uint32 `json:"timeline"`
+	// EndTimeline is set only when the hole straddles a timeline
+	// change, i.e. when the next segment we hold is on a later
+	// timeline than the last one before the hole. Omitted for the
+	// ordinary same-timeline gap so the v1 result shape is unchanged
+	// for everyone who was already reading it.
+	EndTimeline  uint32 `json:"end_timeline,omitempty"`
 	StartSegment uint64 `json:"start_segment"`
 	EndSegment   uint64 `json:"end_segment"`
 	MissingCount uint64 `json:"missing_count"`
+}
+
+// describe renders a gap for text mode. A gap that straddles a timeline
+// change says so: that is a failover boundary, and it points at a
+// different cause (a promotion that resumed past the old frontier) and
+// a different remedy than a hole inside one timeline.
+func (g walGap) describe() string {
+	if g.EndTimeline != 0 && g.EndTimeline != g.Timeline {
+		return fmt.Sprintf("TLI %d->%d: segments #%d..#%d (%d missing, across a timeline change)",
+			g.Timeline, g.EndTimeline, g.StartSegment, g.EndSegment, g.MissingCount)
+	}
+	return fmt.Sprintf("TLI %d: segments #%d..#%d (%d missing)",
+		g.Timeline, g.StartSegment, g.EndSegment, g.MissingCount)
 }
 
 // scanWALSegments lists every segment manifest under wal/<dep>/ and
@@ -194,8 +213,31 @@ func deploymentSegmentSize(ctx context.Context, sp storage.StoragePlugin, anyKey
 	return m.SegmentSize
 }
 
-// findGaps reports contiguous missing-segment ranges per timeline.
+// findGaps reports contiguous missing-segment ranges.
 // The list is sorted by (timeline, start_segment).
+//
+// Timeline changes are INCLUDED. They used to be skipped outright — a
+// `continue` on prev.Timeline != curr.Timeline — which made the check
+// structurally unable to see the one hole an HA deployment is most
+// likely to have. A failover is a timeline change, so a promotion that
+// loses WAL puts the hole exactly where nothing was looking. The chaos
+// soak's "the WAL lineage must be gap-free" gate runs `wal audit`, so
+// it inherited the blind spot and would have passed with an
+// arbitrarily large hole straddling the bump.
+//
+// The same arithmetic is correct across the boundary, which is why the
+// skip was never needed. Segment numbering is continuous across a
+// promotion: the new timeline's first archived segment is the one
+// containing the branch LSN, so it lands at or just after the old
+// timeline's last — `curr <= prev+1`, no gap reported. A new timeline
+// that starts well past prev+1 is a genuine hole.
+//
+// Overlap is not a gap either. The old timeline can hold segments PAST
+// the branch point, written by a primary that kept going before it was
+// fenced; then curr < prev and the condition is simply false. That WAL
+// is diverged history rather than something missing, and reporting it
+// as a gap would send an operator hunting for segments that should not
+// be replayed.
 func findGaps(segs []walSegment) []walGap {
 	if len(segs) < 2 {
 		return nil
@@ -203,16 +245,17 @@ func findGaps(segs []walSegment) []walGap {
 	var gaps []walGap
 	for i := 1; i < len(segs); i++ {
 		prev, curr := segs[i-1], segs[i]
-		if prev.Timeline != curr.Timeline {
-			continue
-		}
 		if curr.SegmentNumber > prev.SegmentNumber+1 {
-			gaps = append(gaps, walGap{
+			g := walGap{
 				Timeline:     prev.Timeline,
 				StartSegment: prev.SegmentNumber + 1,
 				EndSegment:   curr.SegmentNumber - 1,
 				MissingCount: curr.SegmentNumber - prev.SegmentNumber - 1,
-			})
+			}
+			if curr.Timeline != prev.Timeline {
+				g.EndTimeline = curr.Timeline
+			}
+			gaps = append(gaps, g)
 		}
 	}
 	return gaps

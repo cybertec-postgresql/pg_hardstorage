@@ -131,27 +131,75 @@ func TestWalAudit_MultipleGaps(t *testing.T) {
 	}
 }
 
-// TestWalAudit_CrossTimelineNoFalsePositive: a TLI bump is NOT a
-// gap. The detector skips boundaries between different timelines.
+// TestWalAudit_CrossTimelineNoFalsePositive: a TLI bump is NOT a gap.
+//
+// This test used to plant TLI 1 = {0,1,2} and TLI 2 = {5,6,7} and
+// assert gap_count=0, on the rationale that the detector skips
+// boundaries between different timelines. The rationale is right and
+// the data was wrong: segments 3 and 4 were on neither timeline, so
+// that layout is a genuine three-and-four-shaped hole that no PITR can
+// cross. Asserting it was clean is what made `wal audit` — and the
+// chaos soak's gap-free gate, which runs it — structurally blind to
+// the one hole an HA deployment is most likely to have.
+//
+// The real no-false-positive case is a CONTIGUOUS handover, which is
+// what a promotion actually produces: the new timeline's first archived
+// segment is the one containing the branch LSN, so it lands at or just
+// after the old timeline's last. That is what this now plants.
+// Overlap and same-segment handover are covered as unit cases in
+// wal_gaps_timeline_test.go.
 func TestWalAudit_CrossTimelineNoFalsePositive(t *testing.T) {
 	repoURL := initRepoForTest(t)
 	// TLI 1: segments 0,1,2.
 	for _, seg := range []uint64{0, 1, 2} {
 		plantWALSegment(t, repoURL, "db1", 1, seg)
 	}
-	// TLI 2: segments 5,6,7. The "gap" between TLI 1 #2 and TLI 2 #5
-	// is NOT a gap — different timelines.
-	for _, seg := range []uint64{5, 6, 7} {
+	// TLI 2 picks up at #3 — the promotion lost nothing.
+	for _, seg := range []uint64{3, 4, 5} {
 		plantWALSegment(t, repoURL, "db1", 2, seg)
 	}
 	stdout, _, exit := runCmd(t,
 		"wal", "audit", "db1", "--repo", repoURL, "-o", "json")
 	if exit != int(output.ExitOK) {
-		t.Fatalf("cross-TLI boundary is NOT a gap; should exit OK. got %d\n%s",
+		t.Fatalf("a contiguous handover across a TLI bump is NOT a gap; should exit OK. got %d\n%s",
 			exit, stdout)
 	}
 	if !strings.Contains(stdout, `"gap_count": 0`) {
-		t.Errorf("expected gap_count=0 across TLI boundaries:\n%s", stdout)
+		t.Errorf("expected gap_count=0 for a contiguous handover:\n%s", stdout)
+	}
+}
+
+// TestWalAudit_HoleStraddlingAPromotionIsDetected is the case the test
+// above used to assert away.
+//
+// TLI 1 stops at #2, TLI 2 resumes at #5. Segments 3 and 4 are held
+// nowhere. This is precisely the residue of a stream that resumed at
+// the new leader's position instead of the previous timeline's
+// frontier, and `wal audit` is the tool an operator reaches for to find
+// out whether their archive is replayable.
+func TestWalAudit_HoleStraddlingAPromotionIsDetected(t *testing.T) {
+	repoURL := initRepoForTest(t)
+	for _, seg := range []uint64{0, 1, 2} {
+		plantWALSegment(t, repoURL, "db1", 1, seg)
+	}
+	for _, seg := range []uint64{5, 6, 7} {
+		plantWALSegment(t, repoURL, "db1", 2, seg)
+	}
+	stdout, stderr, exit := runCmd(t,
+		"wal", "audit", "db1", "--repo", repoURL, "-o", "json")
+	if exit != int(output.ExitVerifyFailed) {
+		t.Fatalf("segments #3 and #4 are on neither timeline, so this archive cannot be "+
+			"replayed across the promotion — `wal audit` must fail.\ngot exit %d\nstdout=%s\nstderr=%s",
+			exit, stdout, stderr)
+	}
+	if !strings.Contains(stderr, "verify.wal_gap_detected") {
+		t.Errorf("expected verify.wal_gap_detected:\n%s", stderr)
+	}
+	// The straddle must be named: it points at a promotion that lost
+	// WAL, which is a different cause and a different remedy than a
+	// hole inside one timeline.
+	if !strings.Contains(stderr, "1->2") {
+		t.Errorf("the gap report does not name the timeline change:\n%s", stderr)
 	}
 }
 

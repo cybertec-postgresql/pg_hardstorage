@@ -125,8 +125,7 @@ func runWalAudit(cmd *cobra.Command, deployment, repoURL string, tliFilter uint3
 	// JSON body. Shape mirrors anomaly.detected's error.
 	var lines []string
 	for _, g := range gaps {
-		lines = append(lines, fmt.Sprintf("TLI %d: segments #%d..#%d (%d missing)",
-			g.Timeline, g.StartSegment, g.EndSegment, g.MissingCount))
+		lines = append(lines, g.describe())
 	}
 	return output.NewError("verify.wal_gap_detected",
 		fmt.Sprintf("wal audit: %d gap(s) totalling %d missing segment(s)\n%s",
@@ -218,8 +217,7 @@ func (b walAuditBody) WriteText(w io.Writer) error {
 		fmt.Fprintf(bw, "  ✗ %d gap(s), %d total missing segment(s):\n",
 			b.GapCount, b.MissingTotal)
 		for _, g := range b.Gaps {
-			fmt.Fprintf(bw, "    TLI %d: segments #%d..#%d (%d missing)\n",
-				g.Timeline, g.StartSegment, g.EndSegment, g.MissingCount)
+			fmt.Fprintf(bw, "    %s\n", g.describe())
 		}
 	}
 	_, err := io.WriteString(w, strings.TrimRight(bw.String(), "\n"))
