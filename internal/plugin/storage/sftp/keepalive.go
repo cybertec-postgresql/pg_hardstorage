@@ -38,8 +38,12 @@ import (
 // Closing the connection is the point: it is the only lever that
 // unblocks pkg/sftp operations already in flight.
 func startKeepalive(conn *ssh.Client, cli *sftp.Client, stop <-chan struct{}) {
+	// Snapshot the tuning on the CALLER's goroutine: tests shrink and
+	// restore the package variables around each case, and a prober
+	// that read them directly raced the restore (caught by -race).
+	interval, timeout, missBudget := keepaliveInterval, keepaliveTimeout, keepaliveMisses
 	go func() {
-		ticker := time.NewTicker(keepaliveInterval)
+		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		misses := 0
 		for {
@@ -64,12 +68,12 @@ func startKeepalive(conn *ssh.Client, cli *sftp.Client, stop <-chan struct{}) {
 				} else {
 					misses = 0
 				}
-			case <-time.After(keepaliveTimeout):
+			case <-time.After(timeout):
 				misses++
 			case <-stop:
 				return
 			}
-			if misses >= keepaliveMisses {
+			if misses >= missBudget {
 				// Dead peer: fail every parked and future operation
 				// now, loudly, instead of hanging forever. TRANSPORT
 				// FIRST: sftp.Client.Close writes on the same dead
