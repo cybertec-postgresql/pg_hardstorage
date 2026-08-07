@@ -13,6 +13,23 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **A standby built over a holed archive is now warned about.** The WAL
+  contiguity preflight ran only for LSN targets, and a standby has no
+  target by construction — so it was never checked, while being the
+  consumer that suffers most from a hole. For a one-shot restore a
+  missing segment stops recovery loudly; for a standby it is the normal
+  signal for "not archived yet, keep waiting", so PostgreSQL stays up,
+  answers read queries and reports healthy while frozen at the gap.
+  Nothing distinguishes it from a standby that is merely caught up, and
+  an operator holding it for DR finds out at failover.
+
+  The stated limitation — that non-LSN targets cannot be resolved to a
+  segment range before recovery — is true for time and name targets,
+  where only PostgreSQL knows the LSN, and those remain skipped. It was
+  not true for unbounded recovery, whose upper bound is simply the
+  archive frontier. Failovers are the usual source of such holes, which
+  is what makes the standby case worth covering.
+
 - **The timeline-history chain survives a promotion the streamer
   missed.** `wal stream` captured the history of the timeline it was
   following, which is enough only when a streamer witnesses every

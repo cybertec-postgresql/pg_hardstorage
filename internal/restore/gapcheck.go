@@ -30,15 +30,62 @@ import (
 // restore. The warning is a heads-up to investigate before recovery
 // stalls.
 //
-// Scope: LSN targets only — TargetTime/Name/latest can't be resolved to a
-// segment range pre-flight (the same limitation as preflightWALGap).
+// Scope: LSN targets AND unbounded recovery. A TargetTime or
+// TargetName still cannot be resolved to a segment range pre-flight —
+// only PG knows which LSN a timestamp lands on — but "no target at all"
+// can, and that case used to be excluded along with them.
+//
+// The exclusion mattered most exactly where it was least visible. A
+// STANDBY has no target by construction (WriteRecoveryFiles rejects one
+// in standby mode), so it was never checked, and a standby is the
+// consumer that suffers most from a hole: it replays up to the missing
+// segment and then waits. PG does not error — restore_command returning
+// "not found" is how a standby is told to keep waiting for WAL that has
+// not been archived yet — so the process stays up, keeps answering read
+// queries, and reports healthy while its data is frozen at the gap. An
+// operator holding it as a DR copy finds out when they fail over to it.
+//
+// For unbounded recovery the upper bound is simply the archive frontier
+// on the backup's timeline, which inventory.HighestArchivedLSN already
+// computes. Nothing needs resolving.
 func preflightWALContiguity(ctx context.Context, sp storage.StoragePlugin, deployment string, m *backup.Manifest, recovery *Recovery, emit func(*output.Event)) {
-	if recovery == nil || !recovery.Enable || recovery.SkipGapCheck || recovery.TargetLSN == "" || m == nil {
+	if recovery == nil || !recovery.Enable || recovery.SkipGapCheck || m == nil {
 		return
 	}
-	target, err := pglogrepl.ParseLSN(recovery.TargetLSN)
-	if err != nil {
-		return // a malformed target is surfaced by preflightWALGap's refusal path
+
+	var target pglogrepl.LSN
+	targetDesc := recovery.TargetLSN
+	switch {
+	case recovery.TargetLSN != "":
+		parsed, err := pglogrepl.ParseLSN(recovery.TargetLSN)
+		if err != nil {
+			return // a malformed target is surfaced by preflightWALGap's refusal path
+		}
+		target = parsed
+	case !recovery.TargetTime.IsZero() || recovery.TargetName != "":
+		// Genuinely unresolvable without PG: only it knows which LSN a
+		// timestamp or a named restore point lands on.
+		return
+	default:
+		// Unbounded: a standby, or a restore that replays everything
+		// available. The frontier IS the effective target.
+		frontier, found, ferr := inventory.HighestArchivedLSN(ctx, sp, deployment, m.Timeline)
+		if ferr != nil || !found || frontier == 0 {
+			return
+		}
+		// HighestArchivedLSN returns the END LSN of the highest segment,
+		// which is EXCLUSIVE — it is the first byte of the next segment,
+		// the one that has not been archived because it does not exist
+		// yet. FirstWALHoleInRange scans an INCLUSIVE range, so handing
+		// it the frontier asks whether the segment starting exactly
+		// there is present, and the answer is always no.
+		//
+		// That would have fired on every healthy standby creation, and a
+		// warning that is always wrong is worse than no warning: it
+		// teaches operators to skip the one that matters. Step back to
+		// the last byte the archive actually holds.
+		target = frontier - 1
+		targetDesc = "archive frontier " + frontier.String()
 	}
 	stop, err := pglogrepl.ParseLSN(m.StopLSN)
 	if err != nil {
@@ -61,10 +108,10 @@ func preflightWALContiguity(ctx context.Context, sp storage.StoragePlugin, deplo
 			"timeline":         m.Timeline,
 			"missing_from_lsn": hole.String(),
 			"backup_stop_lsn":  m.StopLSN,
-			"target_lsn":       recovery.TargetLSN,
+			"target_lsn":       targetDesc,
 		}).
 		WithSuggestion(&output.Suggestion{
-			Human: "a WAL segment needed to replay from this backup to the target is MISSING from the archive, and no gap record describes it (likely pruning, corruption, or manual deletion). Recovery will HALT at this LSN instead of reaching the target. Inspect with `pg_hardstorage wal list --repo <repo> " + deployment + "`; restore from a later backup, or pick a target before the hole, if the WAL cannot be recovered.",
+			Human: "a WAL segment needed to replay forward from this backup is MISSING from the archive, and no gap record describes it (likely pruning, corruption, or manual deletion). Recovery HALTS at this LSN. For a one-shot restore that means it stops short of the target; for a STANDBY it means the instance stays up and answers queries while frozen at this point, because a standby treats a missing segment as \"not archived yet\" and waits forever. Inspect with `pg_hardstorage wal audit " + deployment + " --repo <repo>`; rebuild from a later backup, or pick a target before the hole, if the WAL cannot be recovered.",
 		}))
 }
 
