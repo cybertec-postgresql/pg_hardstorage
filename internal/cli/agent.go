@@ -995,7 +995,7 @@ func startPatroniFollowers(ctx context.Context, d *output.Dispatcher, deps map[s
 			Interval:      interval,
 			OnEvent:       func(ev *output.Event) { _ = d.Event(ctx, ev) },
 			LastConfirmedLSN: func(leader patroni.LeaderEndpoint) pglogrepl.LSN {
-				lsn, _, err := inventory.HighestArchivedLSN(ctx, spForCoord, deploymentForCoord, leader.Timeline)
+				lsn, err := archiveFrontierForLeader(ctx, spForCoord, deploymentForCoord, leader.Timeline)
 				if err != nil {
 					// Repo unreachable / List error → degrade
 					// to "first-time bootstrap" rather than
@@ -1244,4 +1244,41 @@ func quoteDSNValue(v string) string {
 	}
 	b.WriteByte('\'')
 	return b.String()
+}
+
+// archiveFrontierForLeader returns the WAL position this deployment has
+// safely archived, for use as EnsureSlot's lastConfirmedLSN.
+//
+// The subtlety is the timeline. The Coordinator calls this on
+// leader-change events and passes the NEW leader's timeline, so on the
+// first reconcile after every promotion the scoped lookup finds nothing
+// — the new timeline has no archived segments yet — and the obvious
+// reading of that miss is "first-time bootstrap".
+//
+// It is not. Returning zero suppresses the gap calculation on the one
+// event the calculation exists to measure: populateGap short-circuits
+// at lastConfirmedLSN == 0, so a failover that lost WAL reports
+// GapBytes=0, nothing reaches the GapStore, and restore/gapcheck has no
+// record with which to refuse an unsafe PITR. The failure is silent in
+// both directions — no gap event, and later no refusal.
+//
+// So a miss on the current timeline falls back to the frontier of the
+// timeline we branched from. Zero is returned only when nothing is
+// archived on any timeline, which is a genuine bootstrap.
+func archiveFrontierForLeader(ctx context.Context, sp storage.StoragePlugin, deployment string, timeline uint32) (pglogrepl.LSN, error) {
+	lsn, found, err := inventory.HighestArchivedLSN(ctx, sp, deployment, timeline)
+	if err != nil {
+		return 0, err
+	}
+	if found {
+		return lsn, nil
+	}
+	priorLSN, _, priorFound, err := inventory.HighestArchivedLSNBefore(ctx, sp, deployment, timeline)
+	if err != nil {
+		return 0, err
+	}
+	if priorFound {
+		return priorLSN, nil
+	}
+	return 0, nil
 }
