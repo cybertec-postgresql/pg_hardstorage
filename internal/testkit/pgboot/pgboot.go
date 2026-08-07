@@ -188,3 +188,44 @@ func (b *Booted) AwaitPromoted(tb testing.TB, ctx context.Context, within time.D
 		tb.Fatalf("server %v.\ncontainer log:\n%s", err, b.Logs(ctx))
 	}
 }
+
+// AwaitVanillaReady gates on a freshly created `postgres:<major>`
+// container being PAST its entrypoint's temporary init-phase server.
+//
+// The official entrypoint runs initdb, starts a TEMPORARY server on
+// the unix socket to run init scripts, shuts it down, and only then
+// execs the real server. pg_isready over the socket happily reports
+// the temporary server — a fixture that proceeds on that signal races
+// the restart and its first statement dies with "the database system
+// is shutting down" (observed on the pg16 leg of the boot matrix in
+// the pre-release soak). The entrypoint prints
+// "PostgreSQL init process complete; ready for start up." between the
+// two phases, so THAT is the gate; pg_isready afterwards confirms the
+// real server accepts connections.
+func AwaitVanillaReady(tb testing.TB, ctx context.Context, name string, within time.Duration) {
+	tb.Helper()
+	deadline := time.Now().Add(within)
+	for {
+		logs, _ := Docker(ctx, "logs", name)
+		if strings.Contains(logs, "PostgreSQL init process complete; ready for start up.") {
+			break
+		}
+		if time.Now().After(deadline) {
+			tb.Fatalf("container %s never finished its init phase within %v:\n%s",
+				name, within, Tail(logs, 2000))
+		}
+		time.Sleep(2 * time.Second)
+	}
+	for {
+		if out, err := Docker(ctx, "exec", name, "pg_isready", "-U", "postgres"); err == nil &&
+			strings.Contains(out, "accepting") {
+			return
+		}
+		if time.Now().After(deadline) {
+			logs, _ := Docker(ctx, "logs", name)
+			tb.Fatalf("container %s init phase done but server never accepted connections "+
+				"within %v:\n%s", name, within, Tail(logs, 2000))
+		}
+		time.Sleep(2 * time.Second)
+	}
+}
