@@ -69,11 +69,19 @@ func recordPreStreamGap(ctx context.Context, d *output.Dispatcher, sp storage.St
 	if !found || minStop >= startLSN {
 		return // no backup predates the stream: nothing is uncovered
 	}
+	// The window opens where COVERAGE ends — the archive frontier when
+	// one exists (the Patroni-failover fresh slot: months of WAL are
+	// archived, only [frontier, start) is missing), else the oldest
+	// backup's stop (the first-ever stream: nothing is archived yet).
+	gapStart := preStreamGapStart(ctx, sp, opts.deployment, timeline, minStop)
+	if gapStart >= startLSN {
+		return // the archive reaches the anchor: nothing is uncovered
+	}
 
 	store := gapstate.New(sp)
 	if recs, lerr := store.List(ctx, opts.deployment); lerr == nil {
 		for _, r := range recs {
-			if r.GapStartLSN == minStop.String() && r.GapEndLSN == startLSN.String() {
+			if r.GapStartLSN == gapStart.String() && r.GapEndLSN == startLSN.String() {
 				return // already recorded (agent restart before first commit)
 			}
 		}
@@ -82,9 +90,9 @@ func recordPreStreamGap(ctx context.Context, d *output.Dispatcher, sp storage.St
 		Deployment:  opts.deployment,
 		SlotName:    opts.slotName,
 		Timeline:    timeline,
-		GapStartLSN: minStop.String(),
+		GapStartLSN: gapStart.String(),
 		GapEndLSN:   startLSN.String(),
-		GapBytes:    uint64(startLSN - minStop),
+		GapBytes:    uint64(startLSN - gapStart),
 		DetectedAt:  time.Now().UTC(),
 	}
 	sev := output.SeverityCritical
@@ -98,11 +106,12 @@ func recordPreStreamGap(ctx context.Context, d *output.Dispatcher, sp storage.St
 		"gap_start_lsn": rec.GapStartLSN,
 		"gap_end_lsn":   rec.GapEndLSN,
 		"gap_bytes":     rec.GapBytes,
-		"message": "this stream starts on a FRESH slot at " + startLSN.String() + ", but an " +
-			"existing backup stops at " + minStop.String() + ": the WAL between was never " +
-			"archived and never will be (PG has moved past it). Point-in-time recovery from " +
-			"backups older than this stream start cannot cross the window — restores that " +
-			"would are refused via the recorded gap. Take a fresh backup to re-anchor PITR.",
+		"message": "this stream starts on a FRESH slot at " + startLSN.String() + ", but " +
+			"coverage (archive or backup bundle) ends at " + gapStart.String() + ": the WAL " +
+			"between was never archived and never will be (PG has moved past it). " +
+			"Point-in-time recovery from backups older than this stream start cannot cross " +
+			"the window — restores that would are refused via the recorded gap. Take a " +
+			"fresh backup to re-anchor PITR.",
 	}
 	if persistErr != "" {
 		body["persist_error"] = persistErr

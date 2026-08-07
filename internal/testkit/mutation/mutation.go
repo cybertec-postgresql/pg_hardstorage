@@ -58,6 +58,22 @@ type Mutation struct {
 // in the named package — see the package doc.
 var Registry = []Mutation{
 	{
+		Tag: "mutation_prestream_gap_ignores_frontier",
+		Description: "the fresh-slot gap recorder never consults the " +
+			"archive frontier (pre-fix bug #20): after a Patroni failover " +
+			"destroys the slot, the reconnect records [oldest-backup.stop, " +
+			"new-anchor) — claiming months of successfully archived WAL as " +
+			"a gap — and because gap records are eternal, every unbounded " +
+			"restore from every backup older than the failover refuses " +
+			"forever, training operators to --skip-gap-check past the " +
+			"refusals that are true. Caught by " +
+			"TestRecordPreStreamGap_FrontierBoundsTheWindow, " +
+			"_FrontierOnPriorTimeline, and _FrontierCoversStart_NoRecord.",
+		Packages: []string{
+			"github.com/cybertec-postgresql/pg_hardstorage/internal/cli",
+		},
+	},
+	{
 		Tag: "mutation_undelete_wal_unchecked",
 		Description: "backup undelete verifies chunks but never the WAL " +
 			"(pre-fix bug #19): a tombstoned backup does not hold the " +

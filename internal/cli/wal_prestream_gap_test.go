@@ -19,13 +19,16 @@ import (
 	"github.com/jackc/pglogrepl"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/wal/gapstate"
 )
 
 func prestreamWorld(t *testing.T, stopLSN string) (opts walStreamOptions, deps struct {
-	sp  interface{ Close() error }
-	run func(startLSN pglogrepl.LSN) []gapstate.Record
+	sp    interface{ Close() error }
+	spp   storage.StoragePlugin
+	run   func(startLSN pglogrepl.LSN) []gapstate.Record
+	runOn func(tli uint32, startLSN pglogrepl.LSN) []gapstate.Record
 }) {
 	t.Helper()
 	spp, _ := newFsRepo(t)
@@ -57,14 +60,18 @@ func prestreamWorld(t *testing.T, stopLSN string) (opts walStreamOptions, deps s
 		}
 	}
 	o := walStreamOptions{deployment: "db1", slotName: "s1"}
-	deps.run = func(startLSN pglogrepl.LSN) []gapstate.Record {
+	deps.spp = spp
+	deps.runOn = func(tli uint32, startLSN pglogrepl.LSN) []gapstate.Record {
 		d, _ := captureDispatcher(t)
-		recordPreStreamGap(context.Background(), d, spp, o, 1, startLSN)
+		recordPreStreamGap(context.Background(), d, spp, o, tli, startLSN)
 		recs, lerr := gapstate.New(spp).List(context.Background(), "db1")
 		if lerr != nil {
 			t.Fatal(lerr)
 		}
 		return recs
+	}
+	deps.run = func(startLSN pglogrepl.LSN) []gapstate.Record {
+		return deps.runOn(1, startLSN)
 	}
 	return o, deps
 }
@@ -112,5 +119,66 @@ func TestRecordPreStreamGap_StreamStartsBelowStop_NoRecord(t *testing.T) {
 	_, deps := prestreamWorld(t, "0/30001A0")
 	if recs := deps.run(pglogrepl.LSN(0x3000000)); len(recs) != 0 {
 		t.Fatalf("recorded a gap although the stream starts below the backup's stop: %+v", recs)
+	}
+}
+
+// TestRecordPreStreamGap_FrontierBoundsTheWindow is the Patroni
+// failover shape (bug #20): the deployment has streamed for months —
+// archived segments reach 0/7000000 — a failover destroys the slot on
+// the new leader, and the reconnect creates a FRESH slot at 0/9000000.
+// The uncovered window is [frontier, start), NOT [oldest-backup.stop,
+// start): claiming already-archived WAL as a gap would make every
+// unbounded restore from every older backup refuse forever (gap
+// records are eternal), which trains operators to --skip-gap-check
+// past the refusals that are true.
+func TestRecordPreStreamGap_FrontierBoundsTheWindow(t *testing.T) {
+	_, deps := prestreamWorld(t, "0/30001A0")
+	for seg := uint64(3); seg <= 6; seg++ {
+		plantWALSeg(t, deps.spp, "db1", 1, seg)
+	}
+	recs := deps.run(pglogrepl.LSN(0x9000000))
+	if len(recs) != 1 {
+		t.Fatalf("want 1 gap record, got %d", len(recs))
+	}
+	if recs[0].GapStartLSN != "0/7000000" || recs[0].GapEndLSN != "0/9000000" {
+		t.Errorf("recorded [%s, %s), want [0/7000000, 0/9000000) — the WAL below the "+
+			"frontier IS archived; recording it as missing is a permanent false refusal "+
+			"for every backup older than the failover",
+			recs[0].GapStartLSN, recs[0].GapEndLSN)
+	}
+}
+
+// TestRecordPreStreamGap_FrontierOnPriorTimeline: same failover shape,
+// but the fresh slot is on the NEW timeline (the normal Patroni case —
+// the promoted leader reports TLI 2, everything archived so far is on
+// TLI 1). The frontier lookup must look one timeline down, exactly
+// like the coordinator's (nearest below, never max-across — diverged
+// old-timeline WAL past the branch must not count).
+func TestRecordPreStreamGap_FrontierOnPriorTimeline(t *testing.T) {
+	_, deps := prestreamWorld(t, "0/30001A0")
+	for seg := uint64(3); seg <= 6; seg++ {
+		plantWALSeg(t, deps.spp, "db1", 1, seg)
+	}
+	recs := deps.runOn(2, pglogrepl.LSN(0x9000000))
+	if len(recs) != 1 {
+		t.Fatalf("want 1 gap record, got %d", len(recs))
+	}
+	if recs[0].GapStartLSN != "0/7000000" || recs[0].GapEndLSN != "0/9000000" {
+		t.Errorf("recorded [%s, %s), want [0/7000000, 0/9000000)",
+			recs[0].GapStartLSN, recs[0].GapEndLSN)
+	}
+}
+
+// TestRecordPreStreamGap_FrontierCoversStart_NoRecord: the archive
+// already reaches the fresh slot's anchor (quick slot recreation while
+// archiving was current) — nothing is uncovered, and a record here
+// would be a false alarm on every healthy slot rebuild.
+func TestRecordPreStreamGap_FrontierCoversStart_NoRecord(t *testing.T) {
+	_, deps := prestreamWorld(t, "0/30001A0")
+	for seg := uint64(3); seg <= 9; seg++ {
+		plantWALSeg(t, deps.spp, "db1", 1, seg)
+	}
+	if recs := deps.run(pglogrepl.LSN(0x9000000)); len(recs) != 0 {
+		t.Fatalf("recorded a gap although the archive covers the stream start: %+v", recs)
 	}
 }

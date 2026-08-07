@@ -78,6 +78,26 @@ keeps reading that version for at least 24 months after a successor lands.
   itself still resurrects: restoring *within* its own window is
   legitimate and unaffected.
 
+- **The fresh-slot gap recorder no longer claims archived WAL as
+  missing after a failover.** A Patroni failover destroys the
+  streamer's replication slot on the new leader, so the reconnect
+  creates a fresh slot — the same code path as a first-ever stream
+  start, which records the uncovered window as a WAL gap. But the
+  recorder opened that window at the *oldest live backup's stop*: in a
+  deployment that had streamed for months, one failover recorded a gap
+  spanning months of successfully archived WAL. Gap records are
+  eternal, so every unbounded restore from every backup older than the
+  failover then refused `restore.target_in_wal_gap` forever — a
+  permanent false positive that pushes operators toward a reflexive
+  `--skip-gap-check`, which also bypasses the refusals that are true.
+  The window now opens at the **archive frontier** (current timeline
+  first, then the nearest timeline below — the coordinator's own
+  rule, never max-across, so diverged old-timeline WAL past the branch
+  does not count as coverage), falling back to the oldest backup's
+  stop only when nothing is archived — the original first-stream case,
+  which is unchanged. When the archive already reaches the new slot's
+  anchor, nothing is recorded at all.
+
 ### Added
 
 - **`restore --to-latest`: end-of-archive recovery.** There was no CLI
