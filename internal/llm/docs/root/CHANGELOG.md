@@ -13,6 +13,66 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **`wal stream` no longer skips the old timeline's WAL after a
+  promotion.** The resume point came from a lookup scoped to a single
+  timeline. After a failover the new primary reports timeline N+1 and
+  nothing is archived under it yet, so the lookup missed and the miss
+  fell through to the fresh-deployment branch, which anchors at the
+  slot's `restart_lsn` — the new leader's *current* position. Every
+  byte between the old timeline's archived frontier and there was
+  never requested, and nothing reported it: the slot reconciler ran
+  with `lastConfirmedLSN=0` so no gap was computed, the fresh branch
+  skipped the floor check, and the sink's contiguity guard resets on
+  every reconnect. The stream reported success; the hole surfaced
+  later as a PITR that could not cross the window.
+
+  A miss on the current timeline now falls back to the frontier of the
+  timeline the cluster branched from — a position the new primary can
+  still serve, since the lineages share history up to the branch
+  point. If it has already recycled past it, the run fails with
+  `wal.start_before_slot_restart_lsn`, which carries the remediation
+  for unrecoverable WAL. Loud and known beats silent and lost.
+
+  A deployment running only `wal stream` — the documented
+  streaming-only HA posture — had no other producer of this signal.
+
+- **The agent measures the failover gap instead of reading it as a
+  bootstrap.** The Patroni coordinator asked for the archive frontier
+  using the *new* leader's timeline, so on the first reconcile after
+  every promotion the lookup missed and returned zero — which the slot
+  reconciler reads as "first-time bootstrap" and which short-circuits
+  the gap calculation. On the one event the calculation exists for, it
+  was guaranteed to measure nothing: no gap event, nothing recorded,
+  and later no record with which to refuse an unsafe PITR. A real
+  failover gap and a clean handover produced identical output.
+
+- **`wal audit` detects WAL holes that straddle a timeline change.**
+  Gap detection skipped every timeline transition outright, so it could
+  only find holes *inside* one timeline. A failover is a timeline
+  transition, which put the blind spot exactly where an HA deployment
+  is most likely to lose WAL — and the nightly soak's "the WAL lineage
+  must be gap-free" gate runs `wal audit`, so it inherited the same
+  hole. Segment numbering is continuous across a promotion, so the
+  ordinary arithmetic was already correct at the boundary; the skip was
+  never needed. Overlap, where an old timeline holds segments past the
+  branch point written by a primary that was later fenced, is still not
+  reported — that is diverged history, not missing WAL. Gaps that
+  straddle a change now carry `end_timeline` in the JSON (omitted
+  otherwise, so the result shape is unchanged for existing consumers)
+  and name the transition in text output.
+
+- **`gameday run patroni_failover` measures the invariant it
+  declares.** The slot-observation seam was never wired outside tests,
+  so the shipped tier-L4 drill always took its unmeasured branch and
+  returned a pass on the strength of the leader having moved — which is
+  not evidence that the promotion kept the WAL. It also evaded the
+  guard written for exactly this shape, which keys on evidence tagged
+  `deferred` while this branch said `unmeasured`. The seam is now
+  wired to the same reconciler path the agent uses; when it genuinely
+  cannot be measured the run is deferred rather than passed; and the
+  guard now works from a classified set of kinds, so the next synonym
+  has to be declared rather than slipping through.
+
 - **A repository can be append-only.** Manifests, integrity runs, DSA
   reports, threshold rosters and headers, insider scans, timeline
   histories, tombstones and pushed auxiliary files were all published
