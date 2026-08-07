@@ -13,6 +13,26 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **`wal stream` refuses to archive from a demoted node without saying
+  so.** The streamer has no Patroni awareness — leader-following is
+  delegated to libpq, which only works when `--pg-connection` is a
+  multi-host DSN carrying `target_session_attrs=primary`. A single-host
+  DSN has nothing to route, so after a failover the streamer reconnects
+  to the node it always used, which is now a replica. PostgreSQL permits
+  physical replication from a standby, so nothing failed: measured
+  against a real cluster, the streamer was still running 90 seconds
+  after its node was demoted, having reconnected and resumed, reporting
+  nothing unusual. It archives second-hand WAL from a replica while
+  every health signal says otherwise, and if that replica falls behind
+  or is reinitialised, WAL the primary already recycled never reaches
+  the archive.
+
+  The refusal is retryable rather than fatal, since during a failover
+  every node is briefly in recovery and a leader-aware DSN reaches the
+  new primary within a few attempts. It is not part of the preflight, so
+  `--skip-preflight` cannot waive it. `--allow-standby-source` keeps
+  deliberate archiving from a replica available.
+
 - **`wal push` refuses WAL from a different cluster than the deployment
   already holds.** `wal stream` has guarded this since the pg_upgrade
   work; the archive_command path did not. What made it look covered was
