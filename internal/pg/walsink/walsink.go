@@ -515,14 +515,8 @@ func (s *Sink) OnRecord(ctx context.Context, rec replication.XLogRecord) error {
 	// walsender may open on a page or segment boundary at or below what
 	// was asked for, and receiving those extra bytes costs nothing —
 	// refusing them would turn a healthy stream into a crash loop.
-	if !s.firstChecked {
-		s.firstChecked = true
-		if s.expectedFirst != 0 && pos > s.expectedFirst {
-			return fmt.Errorf("walsink: gap detected at stream start: asked PG to resume at %s "+
-				"but the first record begins at %s, so %d byte(s) were skipped and are not "+
-				"coming; refusing to commit a segment past an unrecorded hole",
-				pglogrepl.LSN(s.expectedFirst), rec.WALStart, pos-s.expectedFirst)
-		}
+	if err := s.checkOpeningRecord(pos, rec.WALStart); err != nil {
+		return err
 	}
 
 	if s.expectedNext != 0 && pos != s.expectedNext {

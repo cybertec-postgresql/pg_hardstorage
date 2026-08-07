@@ -505,7 +505,7 @@ func (c *CAS) PutChunk(ctx context.Context, body []byte) (ChunkInfo, error) {
 					return ChunkInfo{}, err
 				}
 				c.markSeen(hash)
-				c.adopted.Store(hash, struct{}{})
+				c.markAdopted(hash)
 				c.dedupStorage.Add(1)
 				info.Deduped = true
 				return info, nil
@@ -577,7 +577,7 @@ func (c *CAS) PutChunk(ctx context.Context, body []byte) (ChunkInfo, error) {
 			return ChunkInfo{}, aerr
 		}
 		c.markSeen(hash)
-		c.adopted.Store(hash, struct{}{})
+		c.markAdopted(hash)
 		c.dedupStorage.Add(1)
 		info.Deduped = true
 		return info, nil

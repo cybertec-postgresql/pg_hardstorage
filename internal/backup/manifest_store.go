@@ -1595,7 +1595,7 @@ func (ms *ManifestStore) Undelete(ctx context.Context, deployment, backupID stri
 	if undeleteTestHookAfterUnmark != nil {
 		undeleteTestHookAfterUnmark()
 	}
-	recheck, rcErr := CheckChunkExistence(ctx, ms.sp, m)
+	recheck, rcErr := ms.recheckResurrected(ctx, m)
 	if rcErr != nil {
 		// Transient verification failure is not evidence of loss; the
 		// chunks were present moments ago. Leave the manifest live.

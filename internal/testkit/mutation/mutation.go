@@ -58,6 +58,68 @@ type Mutation struct {
 // in the named package — see the package doc.
 var Registry = []Mutation{
 	{
+		Tag: "mutation_stream_first_record_unchecked",
+		Description: "walsink accepts a reconnect's OPENING record at any " +
+			"LSN (pre-20afaf5): a stream that resumed past a hole looks " +
+			"contiguous forever after, and PG recycles the missing WAL. " +
+			"Caught by TestSink_OpeningRecordPastTheResumePoint_Refused.",
+		Packages: []string{
+			"github.com/cybertec-postgresql/pg_hardstorage/internal/pg/walsink",
+		},
+	},
+	{
+		Tag: "mutation_adoption_unrecorded",
+		Description: "the CAS forgets which chunks it ADOPTED rather than " +
+			"wrote (pre-c31688b), so the commit-time dedup-vs-GC gates " +
+			"have nothing to re-Stat: a backup or WAL segment commits a " +
+			"manifest over chunks gc swept mid-flight, born unrestorable " +
+			"while reporting success. Caught in BOTH consumers: " +
+			"backup/runner's verifyAdoptedChunks tests and walsink's " +
+			"AdoptedChunkSweptMidStream test.",
+		Packages: []string{
+			"github.com/cybertec-postgresql/pg_hardstorage/internal/backup/runner",
+			"github.com/cybertec-postgresql/pg_hardstorage/internal/pg/walsink",
+		},
+	},
+	{
+		Tag: "mutation_standby_source_unguarded",
+		Description: "wal stream never asks pg_is_in_recovery (pre-6fc79f8): " +
+			"after a failover a single-host DSN reconnects to the DEMOTED " +
+			"node and silently archives second-hand WAL from a replica — " +
+			"measured at 90s of healthy-looking streaming before the guard " +
+			"existed. Caught by " +
+			"TestGuardSourceIsPrimary_UnreachableFailsOpenButWarns, which " +
+			"demands the probe-failure warning the mutant never emits.",
+		Packages: []string{
+			"github.com/cybertec-postgresql/pg_hardstorage/internal/cli",
+		},
+	},
+	{
+		Tag: "mutation_undelete_argv_order",
+		Description: "batch undelete processes IDs in argv order " +
+			"(pre-3af06d4): cascade_deleted is LEAF-first and the store " +
+			"refuses an incremental under a tombstoned ancestor, so the " +
+			"documented unwind — pass the slice straight back — fails on " +
+			"its first ID. Caught by " +
+			"TestCascadeUnwind_RoundTripRestoresTheChain.",
+		Packages: []string{
+			"github.com/cybertec-postgresql/pg_hardstorage/internal/cli",
+		},
+	},
+	{
+		Tag: "mutation_undelete_no_postflip_check",
+		Description: "undelete skips the chunk re-verification at the " +
+			"VISIBILITY point (pre-983dc4e): the pre-flight ran while the " +
+			"manifest was hidden and gc's sweep uses an older snapshot, so " +
+			"an undelete racing the sweep returns restored=true for a " +
+			"backup whose chunks are gone — a phantom --check-chunks " +
+			"vouched for. Caught by " +
+			"TestUndelete_SweptDuringUndelete_RetombstonesAndRefuses.",
+		Packages: []string{
+			"github.com/cybertec-postgresql/pg_hardstorage/internal/backup",
+		},
+	},
+	{
 		Tag: "mutation_gap_timeline_skip",
 		Description: "cli.findGaps regains the pre-59816d8 `continue` on a " +
 			"timeline change, making `wal audit` — and the chaos soak's " +
