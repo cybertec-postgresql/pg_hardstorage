@@ -342,8 +342,13 @@ func TestUndelete_RestoresChainAfterCascade(t *testing.T) {
 	if len(deleted) != 3 {
 		t.Fatalf("cascade deleted %d, want 3", len(deleted))
 	}
-	// Undelete in any order — there's no chain-protection on the
-	// resurrection direction (un-tombstoning doesn't break invariants).
+	// Anchor-first, which the store REQUIRES: Undelete refuses an
+	// incremental whose ancestor is still tombstoned (see
+	// undeleteAncestorTombstonedMsg). This comment used to claim "any
+	// order — there's no chain-protection on the resurrection
+	// direction", which was false; the loop below only ever passed
+	// because A,B,C happens to be ancestors-first. Order-independent
+	// batches are the CLI's job (orderAncestorsFirst).
 	for _, id := range []string{"A", "B", "C"} {
 		restored, err := store.Undelete(context.Background(), "db1", id)
 		if err != nil {

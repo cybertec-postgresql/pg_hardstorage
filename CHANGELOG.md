@@ -13,6 +13,19 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **The documented cascade unwind now works verbatim.** `backup delete
+  --cascade` returns its `cascade_deleted` slice leaf-first — the
+  correct order for deletion and exactly the wrong one for
+  resurrection, because undelete refuses an incremental whose ancestor
+  is still tombstoned. The docs told operators the slice "is exactly
+  what you pass back to unwind a wrong cascade"; doing precisely that
+  failed on the first ID. Batch undelete now resurrects ancestors
+  before descendants automatically (within the batch; a tombstoned
+  ancestor *outside* the batch still refuses, correctly), so the slice
+  works as returned — the situation where an operator is following
+  instructions verbatim under stress. Outcomes are still reported in
+  the order given.
+
 - **A backup can no longer commit a manifest over chunks a concurrent
   `repo gc --apply` deleted.** Deduplication adopts existing chunks via
   a `Stat` — it touches no object and refreshes no mtime, so gc's

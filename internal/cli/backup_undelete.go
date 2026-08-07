@@ -2,6 +2,7 @@
 package cli
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -56,9 +57,12 @@ store fails closed) unless --force is passed to recover the
 metadata of a backup that can no longer restore.
 
 Idempotent. An undelete of a manifest that's already live is a
-no-op; no error, no audit entry. Multiple IDs may be passed —
-the operation walks them in argv order and reports each one's
-outcome.
+no-op; no error, no audit entry. Multiple IDs may be passed in
+ANY order: within the batch, ancestors are resurrected before
+their descendants automatically (the store refuses an
+incremental under a tombstoned ancestor), so the leaf-first
+cascade_deleted slice works verbatim. Outcomes are reported in
+the order given.
 
 Pairs with ` + "`" + `backup delete --cascade` + "`" + `: the cascade response's
 ` + "`" + `cascade_deleted` + "`" + ` slice (or the equivalent audit body
@@ -97,6 +101,71 @@ Restorability pre-flight (--check-chunks):
 	c.Flags().BoolVar(&force, "force", false,
 		"resurrect even when the manifest's chunks are gone, to recover the metadata of an un-restorable backup (forensic use). Without it, undelete FAILS CLOSED on missing chunks — the store refuses with conflict.chunks_missing whether or not --check-chunks was passed.")
 	return c
+}
+
+// orderAncestorsFirst returns ids reordered so that, within the batch,
+// every backup precedes its descendants. Order among independent ids —
+// and everything else about the sequence — follows the caller's
+// original order, so single-ID and unrelated-ID calls are untouched.
+//
+// The store refuses to resurrect an incremental under a tombstoned
+// ancestor, and `backup delete --cascade` hands back its
+// cascade_deleted slice LEAF-FIRST. This reordering is what makes
+// "pass that slice straight back" — the unwind the documentation
+// promises — actually work.
+//
+// Best-effort by design: a manifest that cannot be read contributes no
+// edge and stays in caller order, and the per-ID loop then surfaces the
+// real error for it. A parent outside the batch contributes no edge
+// either — if that parent is still tombstoned, no order makes the
+// resurrection safe, and the store's refusal stands.
+func orderAncestorsFirst(ctx context.Context, store *backup.ManifestStore, deployment string, ids []string, verifier *backup.Verifier) []string {
+	inBatch := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		inBatch[id] = true
+	}
+	parent := make(map[string]string, len(ids))
+	for _, id := range ids {
+		m, _, err := store.ReadIncludingTombstoned(ctx, deployment, id, verifier)
+		if err != nil || m == nil {
+			continue
+		}
+		if m.ParentBackupID != "" && inBatch[m.ParentBackupID] {
+			parent[id] = m.ParentBackupID
+		}
+	}
+	if len(parent) == 0 {
+		return ids
+	}
+	ordered := make([]string, 0, len(ids))
+	emitted := make(map[string]bool, len(ids))
+	// Stable Kahn walk: each pass emits, in caller order, every id
+	// whose in-batch parent has been emitted. Bounded by len(ids)
+	// passes; anything left after that (a cycle, which commit-time
+	// validation makes impossible) falls back to caller order.
+	for pass := 0; pass < len(ids); pass++ {
+		progressed := false
+		for _, id := range ids {
+			if emitted[id] {
+				continue
+			}
+			if p, has := parent[id]; has && !emitted[p] {
+				continue
+			}
+			ordered = append(ordered, id)
+			emitted[id] = true
+			progressed = true
+		}
+		if !progressed || len(ordered) == len(ids) {
+			break
+		}
+	}
+	for _, id := range ids {
+		if !emitted[id] {
+			ordered = append(ordered, id)
+		}
+	}
+	return ordered
 }
 
 func runBackupUndelete(cmd *cobra.Command, deployment string, ids []string, repoURL, reason string, checkChunks, skipMissing, force bool) error {
@@ -201,15 +270,36 @@ func runBackupUndelete(cmd *cobra.Command, deployment string, ids []string, repo
 		}
 	}
 
-	results := make([]backupUndeleteOutcome, 0, len(ids))
+	// Process ancestors before descendants, whatever order the caller
+	// passed.
+	//
+	// The store refuses to resurrect an incremental whose ancestor is
+	// still tombstoned (a safety added after this command), and
+	// `backup delete --cascade` returns its cascade_deleted slice
+	// LEAF-FIRST — the correct order for deletion is exactly the wrong
+	// order for resurrection. The undelete docs tell the operator that
+	// slice "is exactly what you pass back to unwind a wrong cascade",
+	// and until this reordering existed, doing precisely that failed on
+	// the first ID. An operator unwinding a wrong cascade is following
+	// instructions verbatim under stress; the batch has to work AS
+	// RETURNED.
+	//
+	// Only edges WITHIN the batch are reordered. An ancestor that is
+	// tombstoned but absent from the batch still refuses, correctly —
+	// no order can make that resurrection safe. Results are reported in
+	// the caller's argv order regardless of processing order, so the
+	// output shape does not depend on chain topology.
+	ordered := orderAncestorsFirst(cmd.Context(), store, deployment, ids, verifier)
+
+	outcomeByID := make(map[string]backupUndeleteOutcome, len(ids))
 	restoredIDs := make([]string, 0, len(ids))
-	for _, id := range ids {
+	for _, id := range ordered {
 		if _, skip := skipDueToMissing[id]; skip {
-			results = append(results, backupUndeleteOutcome{
+			outcomeByID[id] = backupUndeleteOutcome{
 				BackupID:      id,
 				Restored:      false,
 				ChunksMissing: true,
-			})
+			}
 			continue
 		}
 		var (
@@ -238,13 +328,20 @@ func runBackupUndelete(cmd *cobra.Command, deployment string, ids []string, repo
 			return output.NewError("backup.undelete.failed",
 				fmt.Sprintf("backup undelete: %s/%s: %v", deployment, id, uerr)).Wrap(uerr)
 		}
-		results = append(results, backupUndeleteOutcome{
+		outcomeByID[id] = backupUndeleteOutcome{
 			BackupID: id,
 			Restored: restored,
-		})
+		}
 		if restored {
 			restoredIDs = append(restoredIDs, id)
 		}
+	}
+
+	// Report rows in the caller's argv order, whatever order processing
+	// used — the result shape must not vary with chain topology.
+	results := make([]backupUndeleteOutcome, 0, len(ids))
+	for _, id := range ids {
+		results = append(results, outcomeByID[id])
 	}
 
 	// Single audit event per call, listing every backup that was

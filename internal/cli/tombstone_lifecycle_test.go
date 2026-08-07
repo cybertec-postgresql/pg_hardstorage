@@ -29,6 +29,7 @@ package cli_test
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -274,5 +275,117 @@ func TestTombstoneWindow_ForceRecoversMetadataOnly(t *testing.T) {
 	if _, errb, exit := runCLI(t, "restore", "db1", "b1",
 		"--repo", w.repoURL, "--target", target, "-o", "json"); exit == int(output.ExitOK) {
 		t.Fatalf("restore of the force-resurrected b1 SUCCEEDED with its chunks gone:\n%s", errb)
+	}
+}
+
+// commitChainLink commits one signed link of an incremental chain.
+// parent == "" makes it the full.
+func commitChainLink(t *testing.T, w *readWorld, deployment, id, parent, startLSN, stopLSN string, when time.Time) {
+	t.Helper()
+	body := []byte("chain-data-of-" + id + "\n")
+	typ := backup.BackupTypeFull
+	if parent != "" {
+		typ = backup.BackupTypeIncremental
+	}
+	m := &backup.Manifest{
+		Schema:           backup.Schema,
+		BackupID:         id,
+		Deployment:       deployment,
+		Tenant:           "default",
+		Type:             typ,
+		ParentBackupID:   parent,
+		PGVersion:        17,
+		SystemIdentifier: "7000000000000000001",
+		StartLSN:         startLSN,
+		StopLSN:          stopLSN,
+		Timeline:         1,
+		StartedAt:        when,
+		StoppedAt:        when.Add(time.Minute),
+		BackupLabel:      "START WAL LOCATION: " + startLSN + "\n",
+		Tablespaces:      []backup.Tablespace{{OID: 1663, Location: "pg_default"}},
+		Files: []backup.FileEntry{
+			{Path: "PG_VERSION", Size: int64(len(body)), Mode: 0o600,
+				Chunks: []backup.ChunkRef{{Hash: repo.HashOf(body), Offset: 0, Len: int64(len(body))}}},
+		},
+	}
+	if _, err := repo.NewCAS(w.sp).PutChunk(context.Background(), body); err != nil {
+		t.Fatalf("seed chunk for %s: %v", id, err)
+	}
+	if err := w.store.Commit(context.Background(), m, w.signer, backup.CommitOptions{}); err != nil {
+		t.Fatalf("commit %s: %v", id, err)
+	}
+}
+
+// TestCascadeUnwind_RoundTripRestoresTheChain composes the promise the
+// delete/undelete pair document but nothing exercises:
+//
+//	backup_delete.go:  "the cascade response's cascade_deleted slice
+//	                    ... is exactly what you pass back to undelete"
+//	backup_undelete.go: "Pairs with `backup delete --cascade` ... to
+//	                    unwind a wrong cascade."
+//
+// A wrong cascade is precisely the situation where the operator is
+// following instructions verbatim under stress, so the slice has to
+// work AS RETURNED — same IDs, same order — with no editing. If the
+// unwind needs the operator to reorder leaf-first or re-derive IDs, the
+// documentation is a trap.
+func TestCascadeUnwind_RoundTripRestoresTheChain(t *testing.T) {
+	w := newReadWorld(t)
+	defer w.cleanup()
+	now := time.Now().UTC()
+	commitChainLink(t, w, "db1", "db1.full.A", "", "0/3000028", "0/30001A0", now.Add(-3*time.Hour))
+	commitChainLink(t, w, "db1", "db1.inc.B", "db1.full.A", "0/30001A0", "0/3000300", now.Add(-2*time.Hour))
+	commitChainLink(t, w, "db1", "db1.inc.C", "db1.inc.B", "0/3000300", "0/3000400", now.Add(-1*time.Hour))
+
+	// The wrong cascade.
+	outb, errb, exit := runCLI(t, "backup", "delete", "db1", "db1.full.A",
+		"--repo", w.repoURL, "--cascade", "--reason", "oops", "--yes", "-o", "json")
+	if exit != int(output.ExitOK) {
+		t.Fatalf("cascade delete: exit=%d\n%s", exit, errb)
+	}
+	var env struct {
+		Result struct {
+			CascadeDeleted []string `json:"cascade_deleted"`
+		} `json:"result"`
+	}
+	start := strings.Index(outb, "{")
+	if start < 0 || json.Unmarshal([]byte(outb[start:]), &env) != nil {
+		t.Fatalf("could not parse the delete result:\n%s", outb)
+	}
+	unwind := env.Result.CascadeDeleted
+	if len(unwind) != 3 {
+		t.Fatalf("cascade_deleted has %d entries, want 3: %v", len(unwind), unwind)
+	}
+
+	// The unwind, verbatim: deployment + the slice as returned.
+	args := append([]string{"backup", "undelete", "db1"}, unwind...)
+	args = append(args, "--repo", w.repoURL, "--check-chunks", "-o", "json")
+	if _, errb, exit := runCLI(t, args...); exit != int(output.ExitOK) {
+		t.Fatalf("undelete of the cascade_deleted slice AS RETURNED failed: exit=%d\n%s\n\n"+
+			"The docs tell the operator this slice is exactly what to pass back. If it "+
+			"needs reordering or editing first, the unwind instructions are a trap sprung "+
+			"during an incident.", exit, errb)
+	}
+
+	// Everything is live again and the chain is whole.
+	listOut, _, listExit := runCLI(t, "list", "db1", "--repo", w.repoURL, "-o", "json")
+	if listExit != int(output.ExitOK) {
+		t.Fatalf("list: exit=%d", listExit)
+	}
+	for _, id := range []string{"db1.full.A", "db1.inc.B", "db1.inc.C"} {
+		if !strings.Contains(listOut, id) {
+			t.Errorf("%s is not live after the unwind:\n%s", id, listOut)
+		}
+	}
+
+	// And the anchor genuinely restores.
+	target := filepath.Join(t.TempDir(), "restored")
+	if _, errb, exit := runCLI(t, "restore", "db1", "db1.full.A",
+		"--repo", w.repoURL, "--target", target, "-o", "json"); exit != int(output.ExitOK) {
+		t.Fatalf("restore of the unwound anchor: exit=%d\n%s", exit, errb)
+	}
+	if got, err := os.ReadFile(filepath.Join(target, "PG_VERSION")); err != nil ||
+		string(got) != "chain-data-of-db1.full.A\n" {
+		t.Errorf("restored bytes = %q, err=%v", got, err)
 	}
 }

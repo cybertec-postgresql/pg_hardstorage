@@ -119,10 +119,17 @@ func TestBackupUndelete_AlreadyLive_NoOp(t *testing.T) {
 }
 
 // TestBackupUndelete_MultipleIDs_UnwindsCascade: cascade-delete
-// a chain (A→B→C), then undelete with all three IDs in one call.
-// Validates the operational pattern: the cascade response gives
-// the operator the deletion-order list; passing it back to
-// undelete restores everything.
+// a chain (A→B→C), then undelete with all three IDs in one call —
+// passed ANCHOR-FIRST here.
+//
+// NOTE this order is hand-picked, and for years the comment above
+// claimed the test validated "passing the deletion-order list back".
+// It never did: cascade_deleted is LEAF-first, and until
+// orderAncestorsFirst existed, passing it back verbatim failed on the
+// first ID (the store refuses an incremental under a tombstoned
+// ancestor). The verbatim round-trip is pinned by
+// TestCascadeUnwind_RoundTripRestoresTheChain; this test keeps the
+// explicit anchor-first order as a valid input shape of its own.
 func TestBackupUndelete_MultipleIDs_UnwindsCascade(t *testing.T) {
 	w := newReadWorld(t)
 	base := time.Date(2026, 4, 30, 12, 0, 0, 0, time.UTC)
