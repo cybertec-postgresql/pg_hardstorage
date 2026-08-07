@@ -37,6 +37,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -110,15 +111,29 @@ func TestWalStream_PinnedToADemotedNode(t *testing.T) {
 	if serr := stream.Start(); serr != nil {
 		t.Fatalf("start streamer: %v", serr)
 	}
-	streamDone := make(chan error, 1)
-	go func() { streamDone <- stream.Wait() }()
-	defer func() { stopStream(); <-streamDone }()
+	// exited is CLOSED when the streamer stops, rather than carrying a
+	// value. The body waits on it twice and teardown waits again; a
+	// buffered channel holding one value would satisfy only the first
+	// receiver and block the rest forever, hanging the test with the
+	// cluster still up. A closed channel is receivable any number of
+	// times, which is what a broadcast signal needs to be.
+	var streamErr error
+	exited := make(chan struct{})
+	go func() { streamErr = stream.Wait(); close(exited) }()
+	var reapOnce sync.Once
+	reapStreamer := func() {
+		reapOnce.Do(func() {
+			stopStream()
+			<-exited
+		})
+	}
+	defer reapStreamer()
 
 	// Let it establish before pulling the node out from under it.
 	select {
-	case err := <-streamDone:
+	case <-exited:
 		body, _ := os.ReadFile(logPath)
-		t.Fatalf("the streamer exited before the failover: %v\n%s", err, lastLines(string(body), 2000))
+		t.Fatalf("the streamer exited before the failover: %v\n%s", streamErr, lastLines(string(body), 2000))
 	case <-time.After(20 * time.Second):
 	}
 
@@ -127,11 +142,11 @@ func TestWalStream_PinnedToADemotedNode(t *testing.T) {
 	t.Logf("switchover complete; the pinned node is now a REPLICA")
 
 	// Give the streamer time to notice, reconnect, and settle.
-	var exited bool
+	var didExit bool
 	select {
-	case err := <-streamDone:
-		exited = true
-		t.Logf("streamer EXITED after the demotion: %v", err)
+	case <-exited:
+		didExit = true
+		t.Logf("streamer EXITED after the demotion: %v", streamErr)
 	case <-time.After(90 * time.Second):
 		t.Logf("streamer is STILL RUNNING 90s after its node was demoted")
 	}
@@ -141,7 +156,7 @@ func TestWalStream_PinnedToADemotedNode(t *testing.T) {
 
 	// Record what actually happened, whatever it was.
 	t.Logf("=== measured behaviour ===")
-	t.Logf("streamer exited: %v", exited)
+	t.Logf("streamer exited: %v", didExit)
 	for _, marker := range []string{
 		"in_recovery", "not a primary", "standby", "replica",
 		"reconnecting", "system_identifier", "wal.stream.starting",
@@ -178,14 +193,14 @@ func TestWalStream_PinnedToADemotedNode(t *testing.T) {
 	// Retrying is the correct posture, so the streamer must NOT have
 	// treated this as fatal: a leader-aware DSN reaches the new primary
 	// within a few attempts, and only the pinned case stays stuck.
-	if exited {
+	if didExit {
 		t.Errorf("the streamer EXITED on a demoted source. During a failover every node is " +
 			"briefly in recovery, so this has to be retryable — exiting turns a transient " +
 			"condition into an outage for operators whose DSN would have found the new " +
 			"leader on the next attempt.")
 	}
 
-	if !exited && !saysStandby {
+	if !didExit && !saysStandby {
 		t.Errorf("the streamer kept running against a DEMOTED node and never reported "+
 			"that its source is in recovery.\n\n"+
 			"PostgreSQL allows physical replication from a standby, so this does not fail "+
