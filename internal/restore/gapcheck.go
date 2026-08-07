@@ -115,6 +115,29 @@ func preflightWALContiguity(ctx context.Context, sp storage.StoragePlugin, deplo
 		}))
 }
 
+// refuseUnboundedOverGap refuses an unbounded (--to-latest / standby)
+// recovery whose replay, starting at the backup's stop, would reach a
+// recorded gap. A gap ENTIRELY below the stop is history this backup
+// never replays and is ignored — refusing on it would block every
+// restore from a newer backup forever.
+func refuseUnboundedOverGap(deployment string, backupStop pglogrepl.LSN, gapStart, gapEnd, source string) error {
+	gs, e1 := pglogrepl.ParseLSN(gapStart)
+	ge, e2 := pglogrepl.ParseLSN(gapEnd)
+	if e1 != nil || e2 != nil || ge <= backupStop {
+		return nil
+	}
+	return output.NewError("restore.target_in_wal_gap",
+		fmt.Sprintf("restore: unbounded recovery (--to-latest / standby) from this backup "+
+			"(stop %s) would cross a recorded WAL gap [%s, %s) (%s record): PostgreSQL "+
+			"cannot distinguish the hole from the end of the archive, so recovery would "+
+			"end there and promote SILENTLY behind the data you asked for",
+			backupStop, gs, ge, source)).
+		WithSuggestion(&output.Suggestion{
+			Human:   "restore from a backup taken AFTER the gap (its replay never touches the window), inspect with `pg_hardstorage wal gaps " + deployment + "`, or pass --skip-gap-check to accept recovery that stops at " + gs.String() + ".",
+			Command: "pg_hardstorage wal gaps " + deployment,
+		})
+}
+
 // preflightWALGap consults the deployment's persisted WAL-gap
 // state and refuses the restore when the operator's PITR
 // target falls within a known gap. The plan calls this out:
@@ -151,7 +174,7 @@ func preflightWALContiguity(ctx context.Context, sp storage.StoragePlugin, deplo
 //     legitimate restore. The operator's pre-flight via
 //     doctor would have caught a persistent corruption.
 //   - LSN parse error: refuse with usage.bad_target_lsn.
-func preflightWALGap(ctx context.Context, sp storage.StoragePlugin, deployment string, recovery *Recovery, manifestGaps []backup.WALGap, emit func(*output.Event)) error {
+func preflightWALGap(ctx context.Context, sp storage.StoragePlugin, deployment, backupStopLSN string, recovery *Recovery, manifestGaps []backup.WALGap, emit func(*output.Event)) error {
 	if recovery == nil || !recovery.Enable {
 		return nil
 	}
@@ -170,6 +193,32 @@ func preflightWALGap(ctx context.Context, sp storage.StoragePlugin, deployment s
 				WithBody(map[string]any{
 					"hint": "the+ WAL-gap pre-flight was bypassed via --skip-gap-check; the operator accepted the risk that the PITR target may land in a known gap",
 				}))
+		}
+		return nil
+	}
+	if recovery.TargetLSN == "" && !recovery.IsTargetSet() {
+		// UNBOUNDED recovery (--to-latest, standby): no target to
+		// compare, but the lower bound is known exactly — replay
+		// starts at the backup's stop — so a recorded gap that begins
+		// at or after that point WILL be crossed. Refusing here is what
+		// turns the silent-truncation failure into a typed error: PG
+		// cannot tell a hole from the genuine end of the archive, so
+		// without this it ends recovery at the hole, PROMOTES, and
+		// reports success arbitrarily far behind — the shape the chaos
+		// gate's first boot-proof caught (a pre-stream window from
+		// `init --quick` before the streamer ever started).
+		if stop, perr := pglogrepl.ParseLSN(backupStopLSN); perr == nil && stop > 0 {
+			liveGaps, _ := gapstate.New(sp).List(ctx, deployment)
+			for _, g := range manifestGaps {
+				if err := refuseUnboundedOverGap(deployment, stop, g.GapStartLSN, g.GapEndLSN, "manifest"); err != nil {
+					return err
+				}
+			}
+			for _, g := range liveGaps {
+				if err := refuseUnboundedOverGap(deployment, stop, g.GapStartLSN, g.GapEndLSN, "live"); err != nil {
+					return err
+				}
+			}
 		}
 		return nil
 	}

@@ -11,6 +11,36 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ## [Unreleased]
 
+### Fixed
+
+- **The window between an existing backup and a stream's first start is
+  now recorded — and a recovery that would cross it refuses.** `init
+  --quick` (or any backup) followed by starting `wal stream` leaves WAL
+  nothing covers: the backup bundles WAL to its own stop, and the fresh
+  replication slot anchors wherever PostgreSQL is *when the slot is
+  created*. A `--to-latest` or standby recovery from that backup replays
+  the bundled WAL, asks `restore_command` for the next segment, gets
+  "not in repo" — and PostgreSQL cannot distinguish a hole from the
+  genuine end of the archive, so it ends recovery, **promotes**, and
+  reports success arbitrarily far behind. `wal audit` is equally blind:
+  it sees holes *between* archived segments, and this hole ends where
+  archived WAL begins. Found by inspection while chasing a boot-proof
+  failure (whose true cause turned out to be a test-workload fault): the
+  common `init --quick`-then-stream flow is usually saved by the slot
+  anchor aligning DOWN into the backup's final segment, but any longer
+  pause before the first `wal stream` — an operator finishing setup, a
+  deploy step between — leaves the window uncovered.
+
+  Two halves, mirroring the Patroni failover-gap machinery: the stream's
+  fresh-slot start persists the uncovered window as a gap record (with a
+  CRITICAL event if persistence fails — a lost record is a restore that
+  silently truncates later), and unbounded recovery (`--to-latest`,
+  standby) now *refuses* with `restore.target_in_wal_gap` when a
+  recorded gap lies at or beyond the backup's stop. Gaps entirely below
+  the stop never refuse — that history is never replayed. Take a fresh
+  backup to re-anchor PITR; `--skip-gap-check` remains the eyes-open
+  override.
+
 ### Added
 
 - **`restore --to-latest`: end-of-archive recovery.** There was no CLI

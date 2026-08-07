@@ -296,11 +296,11 @@ func TestPITR_AcrossAFailover_ArchiveServesEverySegment(t *testing.T) {
 	}, []string{
 		"PG_HARDSTORAGE_KEYRING_DIR=" + bootKeyring,
 	})
-	boot.awaitPromoted(t, ctx, 4*time.Minute)
+	boot.AwaitPromoted(t, ctx, 4*time.Minute)
 
-	rows, qerr := boot.query(ctx, `SELECT note FROM failover_proof ORDER BY id`)
+	rows, qerr := boot.Query(ctx, `SELECT note FROM failover_proof ORDER BY id`)
 	if qerr != nil {
-		t.Fatalf("query after promotion: %v\n%s", qerr, boot.logs(ctx))
+		t.Fatalf("query after promotion: %v\n%s", qerr, boot.Logs(ctx))
 	}
 	if !strings.Contains(rows, "before-failover") {
 		t.Errorf("proof 4: marker A missing — the restore itself is broken: %q", rows)
@@ -311,7 +311,7 @@ func TestPITR_AcrossAFailover_ArchiveServesEverySegment(t *testing.T) {
 			"boundary during replay. Either 2.history was not served when PG probed for it, "+
 			"or the TLI-2 segments did not replay. Every fetch-level proof above passed — "+
 			"which is exactly why this boot exists.\ngot: %q\nboot log:\n%s",
-			rows, lastLines(boot.logs(ctx), 2500))
+			rows, lastLines(boot.Logs(ctx), 2500))
 	}
 	if !t.Failed() {
 		t.Logf("proof 4: BOOTED — PG replayed across timelines %d -> %d and served the "+

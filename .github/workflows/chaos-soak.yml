@@ -88,6 +88,40 @@ jobs:
             -run 'TestBackendSoak|TestFaultSoak' \
             ./internal/plugin/storage/
 
+  boot-proofs:
+    name: boot proofs (PG accepts the archive, majors 16-19)
+    runs-on: ubuntu-24.04
+    # Two go-test steps below carry 35m + 25m of their own -timeout, so
+    # the job budget must exceed 60m — TestCIJobBudgetsOutlastTheirTests
+    # enforces this arithmetic from the YAML. A job killed by
+    # timeout-minutes reports CANCELLED with no stacks and no test name,
+    # which is how the restore-proof gate once starved for three nights
+    # unnoticed.
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      # The strongest assertions the 2026-08 campaign produced: per
+      # PostgreSQL major (16/17/18, plus 19 auto-probed across beta
+      # tags), a full backup → archive → restore --to-latest → BOOT →
+      # promote → query loop, and the retention-then-recovery proof
+      # that the janitors never break what they keep. Object-level
+      # checks cannot see a replay hole; these can.
+      - name: restore-boot matrix + retention-then-recovery
+        run: |
+          go test -tags integration -count=1 -timeout 35m -v             -run 'TestRestoreBootMatrix_ArchiveReplayAcrossMajors|TestRetentionThenRecovery_PrunedArchiveStillBoots'             ./internal/testkit/topology/
+      # The campaign's crown assertion, previously run only by hand: a
+      # real 3-node Patroni cluster, a switchover, and PostgreSQL
+      # itself replaying the ENCRYPTED archive across the timeline
+      # boundary via the captured history file to serve the
+      # post-failover row.
+      - name: cross-timeline PITR boot proof (Patroni)
+        run: |
+          go test -tags 'integration patroni' -count=1 -timeout 25m -v             -run 'TestPITR_AcrossAFailover'             ./internal/testkit/topology/
+
   chaos-soak:
     name: chaos soak (restore-proof gate)
     runs-on: ubuntu-24.04

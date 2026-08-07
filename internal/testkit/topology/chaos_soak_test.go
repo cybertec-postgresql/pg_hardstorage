@@ -55,9 +55,12 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/testkit/pgboot"
 )
 
 func TestChaosSoak_RestoreProof(t *testing.T) {
@@ -78,6 +81,12 @@ func TestChaosSoak_RestoreProof(t *testing.T) {
 	t.Logf("chaos soak: budget=%dm seed=%d (re-run with PGHS_CHAOS_SEED=%d)", minutes, seed, seed)
 
 	scratch, err := os.MkdirTemp("", "chaos-soak-")
+	if err == nil {
+		// Ten multi-GB scratch trees from earlier runs were found
+		// leaked in /tmp: nothing ever removed them. Cleanup runs LAST
+		// (registered first), after pgboot's chown-backs.
+		t.Cleanup(func() { _ = os.RemoveAll(scratch) })
+	}
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -142,6 +151,7 @@ func TestChaosSoak_RestoreProof(t *testing.T) {
 
 	// Constant DB churn: full-page-image-heavy updates on the CURRENT
 	// leader (re-resolved every iteration so churn survives failovers).
+	var churnWrites atomic.Int64
 	churnCtx, stopChurn := context.WithCancel(ctx)
 	defer stopChurn()
 	go func() {
@@ -155,8 +165,20 @@ func TestChaosSoak_RestoreProof(t *testing.T) {
 					continue
 				}
 				sql := fmt.Sprintf("create table if not exists churn(id int primary key, pad text); insert into churn select g, repeat('x',300) from generate_series(%d,%d) g on conflict (id) do update set pad=repeat('y',300); checkpoint;", i*500, i*500+499)
-				_ = exec.CommandContext(churnCtx, "docker", "exec", n.container,
-					"psql", "-U", "postgres", "-h", "127.0.0.1", "-qc", sql).Run()
+				// Unix socket, not -h 127.0.0.1: Spilo's host hba is
+				// md5, and psql without a password exits 2 — which the
+				// original `_ = Run()` swallowed, so the churn workload
+				// had NEVER written a row in any soak. Every content-
+				// free assertion (gap-free lineage, DEK count, restore
+				// exit codes) passed over an empty database for months;
+				// the first boot-proof that SELECTed the data exposed
+				// it. Local socket connections are trust in Spilo, and
+				// PGPASSWORD is the belt to the braces.
+				if err := exec.CommandContext(churnCtx, "docker", "exec",
+					"-e", "PGPASSWORD="+patroniSuperPassword, n.container,
+					"psql", "-U", "postgres", "-qc", sql).Run(); err == nil {
+					churnWrites.Add(1)
+				}
 			}
 			select {
 			case <-churnCtx.Done():
@@ -288,13 +310,93 @@ func TestChaosSoak_RestoreProof(t *testing.T) {
 		gateDeadline = time.Now().Add(30 * time.Minute)
 	}
 	// Leave room for the WAL-audit and shared-DEK checks below, which
-	// are the other half of the proof and must not be skipped.
-	gateDeadline = gateDeadline.Add(-4 * time.Minute)
+	// are the other half of the proof and must not be skipped — and for
+	// the two sampled BOOT proofs, which cost ~90s each.
+	gateDeadline = gateDeadline.Add(-8 * time.Minute)
 
 	t.Logf("restore-proof gate: %d backups to verify + restore (budget until %s)",
 		len(ids), gateDeadline.Format(time.TimeOnly))
 	gateStart := time.Now()
 	proved := 0
+
+	// The workload is part of the proof. A soak whose churn writer
+	// silently failed proves recovery of an EMPTY database — every
+	// object-level assertion still passes, which is precisely how this
+	// went unnoticed until a boot-proof SELECTed the rows.
+	if got := churnWrites.Load(); got == 0 {
+		t.Fatalf("the churn workload wrote NOTHING for the entire fault window — the soak " +
+			"exercised backups of an idle database and every downstream assertion is " +
+			"vacuous")
+	}
+	t.Logf("churn workload: %d successful write batches", churnWrites.Load())
+
+	// Boot-proof sampling. The per-backup loop below proves objects:
+	// verify --full walks every chunk hash, restore materialises every
+	// file. Neither asks PostgreSQL, and the retention campaign showed
+	// exactly what that misses — a repo can hold a kept backup whose
+	// every object checks out while its replay window has a hole, and
+	// only a boot notices. Booting all N backups would blow the budget,
+	// so the OLDEST and NEWEST are booted end-to-end (--to-latest,
+	// promote, query the churn table): oldest exercises the longest
+	// replay over the most faults, newest exercises the freshest
+	// lineage. Object-level proof stays exhaustive; PG-accepts proof is
+	// sampled.
+	sampled := map[int]bool{0: true, len(ids) - 1: true}
+	t.Logf("boot-proof samples: ids[0]=%s ids[%d]=%s", ids[0], len(ids)-1, ids[len(ids)-1])
+	var bootKeyring string
+	bootPrep := func() bool {
+		if bootKeyring != "" {
+			return true
+		}
+		// The boot container (uid 999) must traverse into the repo and
+		// read the KEK. scratch is MkdirTemp-0700; open it up, expose
+		// the repo read-only-wide, and hand the container its OWN 0600
+		// copy of the KEK — the keystore refuses group/world-readable
+		// key files, so a chmod of the original cannot work.
+		if err := os.Chmod(scratch, 0o755); err != nil {
+			t.Errorf("boot-proof prep: chmod scratch: %v", err)
+			return false
+		}
+		if out, err := exec.Command("chmod", "-R", "a+rX", repoDir).CombinedOutput(); err != nil {
+			t.Errorf("boot-proof prep: chmod repo: %v\n%s", err, out)
+			return false
+		}
+		var kek string
+		_ = filepath.Walk(home, func(pth string, info os.FileInfo, err error) error {
+			if err == nil && !info.IsDir() && info.Name() == "kek.bin" {
+				kek = pth
+			}
+			return nil
+		})
+		if kek == "" {
+			t.Error("boot-proof prep: no kek.bin under HOME — the soak repo is encrypted and " +
+				"the boots cannot decrypt WAL without it")
+			return false
+		}
+		dir := scratch + "/boot-keyring"
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Errorf("boot-proof prep: %v", err)
+			return false
+		}
+		raw, rerr := os.ReadFile(kek)
+		if rerr != nil {
+			t.Errorf("boot-proof prep: read kek: %v", rerr)
+			return false
+		}
+		if werr := os.WriteFile(dir+"/kek.bin", raw, 0o600); werr != nil {
+			t.Errorf("boot-proof prep: write kek copy: %v", werr)
+			return false
+		}
+		pgboot.ChownAll(t, context.Background(), dir, "999:999")
+		t.Cleanup(func() {
+			cctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			pgboot.ChownAll(t, cctx, dir, fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid()))
+		})
+		bootKeyring = dir
+		return true
+	}
+
 	for i, id := range ids {
 		if time.Now().After(gateDeadline) {
 			t.Errorf("PROOF INCOMPLETE: verified+restored %d of %d backups in %s before "+
@@ -318,6 +420,52 @@ func TestChaosSoak_RestoreProof(t *testing.T) {
 		}
 		_ = os.RemoveAll(target)
 		proved++
+
+		if sampled[i] && bootPrep() {
+			// Index in the dir name, not an id suffix: two sampled ids
+			// sharing a suffix once reused one target, and the second
+			// restore ran into the first boot's uid-999 residue —
+			// contaminating exactly the forensic evidence a failed
+			// sample exists to provide.
+			bootTarget := fmt.Sprintf("%s/boot-%02d", scratch, i)
+			if out, code := runBin(6*time.Minute, "restore", "db1", id, "--repo", repoURL,
+				"--target", bootTarget, "--to-latest", "--to-action", "promote"); code != 0 {
+				if strings.Contains(out, "target_in_wal_gap") {
+					// The product REFUSED, loudly and typed: this backup
+					// predates a recorded unarchivable window (e.g. it
+					// was taken before the streamer first started). A
+					// loud refusal is the correct outcome — the failure
+					// this gate hunts is SILENCE.
+					t.Logf("  BOOT-PROOF: %s refused with target_in_wal_gap (recorded "+
+						"pre-stream window) — loud refusal is the correct outcome", id)
+				} else {
+					t.Errorf("BOOT-PROOF FAILED: restore --to-latest %s exited %d:\n%s",
+						id, code, tail(out, 1200))
+				}
+			} else {
+				bctx := context.Background()
+				b := pgboot.Boot(t, bctx, "postgres:17", bootTarget, []string{
+					bin + ":" + bin + ":ro",
+					repoDir + ":" + repoDir + ":ro",
+					bootKeyring + ":" + bootKeyring + ":ro",
+				}, []string{"PG_HARDSTORAGE_KEYRING_DIR=" + bootKeyring})
+				if werr := b.WaitPromoted(bctx, 4*time.Minute); werr != nil {
+					t.Errorf("BOOT-PROOF FAILED: %s: %v\nboot log:\n%s",
+						id, werr, tail(b.Logs(bctx), 2500))
+				} else if rows, qerr := b.Query(bctx, "SELECT count(*) FROM churn"); qerr != nil || rows == "0" || rows == "" {
+					t.Errorf("BOOT-PROOF FAILED: %s promoted but the churn table is empty or "+
+						"unreadable (rows=%q err=%v) — the workload the soak spent its fault "+
+						"window writing did not come back.\nboot log:\n%s",
+						id, rows, qerr, tail(b.Logs(bctx), 2500))
+				} else {
+					t.Logf("  BOOT-PROOF ok: %s booted, promoted, churn rows=%s", id, rows)
+				}
+				// Free the container + datadir now rather than at test
+				// end — two live postgres containers during the rest of
+				// the gate would skew its timing.
+				_, _ = pgboot.Docker(bctx, "rm", "-f", b.Name)
+			}
+		}
 		// Progress every few backups: enough to see it moving, not so
 		// much that the log becomes noise.
 		if (i+1)%5 == 0 || i+1 == len(ids) {

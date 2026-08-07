@@ -260,11 +260,11 @@ func runBootMatrixFor(t *testing.T, ctx context.Context, major, image string) {
 		bin + ":" + bin + ":ro",
 		repoDir + ":" + repoDir + ":ro",
 	}, nil)
-	boot.awaitPromoted(t, ctx, 3*time.Minute)
+	boot.AwaitPromoted(t, ctx, 3*time.Minute)
 
-	got, qerr := boot.query(ctx, `SELECT note FROM boot_proof ORDER BY id`)
+	got, qerr := boot.Query(ctx, `SELECT note FROM boot_proof ORDER BY id`)
 	if qerr != nil {
-		t.Fatalf("query after promotion: %v\n%s", qerr, boot.logs(ctx))
+		t.Fatalf("query after promotion: %v\n%s", qerr, boot.Logs(ctx))
 	}
 	if !strings.Contains(got, "in-the-backup") {
 		t.Errorf("pg%s: marker1 missing — the RESTORE itself is broken:\n%q", major, got)
@@ -275,7 +275,7 @@ func runBootMatrixFor(t *testing.T, ctx context.Context, major, image string) {
 			"replay our archive through restore_command to the end. Every upstream proof "+
 			"(segments fetchable, manifests verified) passed while the thing operators "+
 			"actually need — the data — did not come back.\ngot: %q\nboot log:\n%s",
-			major, major, got, lastLines(boot.logs(ctx), 2000))
+			major, major, got, lastLines(boot.Logs(ctx), 2000))
 	}
 	t.Logf("pg%s: booted, promoted, and served both markers (archive replay proven)", major)
 }

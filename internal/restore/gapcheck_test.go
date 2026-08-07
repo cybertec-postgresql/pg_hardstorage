@@ -69,7 +69,7 @@ func TestPreflightWALGap_ManifestEmbeddedGapRefuses(t *testing.T) {
 		DetectedAt:  time.Date(2026, 4, 30, 12, 0, 0, 0, time.UTC),
 	}}
 	rec := &Recovery{Enable: true, TargetLSN: "0/3000080"}
-	err := preflightWALGap(context.Background(), sp, "db1", rec, manifestGaps, nil)
+	err := preflightWALGap(context.Background(), sp, "db1", "", rec, manifestGaps, nil)
 	if err == nil {
 		t.Fatal("expected refusal for in-manifest-gap target")
 	}
@@ -94,7 +94,7 @@ func TestPreflightWALGap_LiveGapAttributesAsLive(t *testing.T) {
 		time.Date(2026, 4, 30, 12, 0, 0, 0, time.UTC))
 
 	rec := &Recovery{Enable: true, TargetLSN: "0/3000080"}
-	err := preflightWALGap(context.Background(), sp, "db1", rec, nil, nil)
+	err := preflightWALGap(context.Background(), sp, "db1", "", rec, nil, nil)
 	if err == nil {
 		t.Fatal("expected refusal")
 	}
@@ -123,7 +123,7 @@ func TestPreflightWALGap_ManifestPrecedesLive(t *testing.T) {
 		DetectedAt: time.Date(2026, 4, 29, 12, 0, 0, 0, time.UTC),
 	}}
 	rec := &Recovery{Enable: true, TargetLSN: "0/150"}
-	err := preflightWALGap(context.Background(), sp, "db1", rec, manifestGaps, nil)
+	err := preflightWALGap(context.Background(), sp, "db1", "", rec, manifestGaps, nil)
 	if err == nil {
 		t.Fatal("expected refusal")
 	}
@@ -148,7 +148,7 @@ func TestPreflightWALGap_SkipGapCheck_BypassesRefusal(t *testing.T) {
 
 	// Without SkipGapCheck: target 0/150 refuses.
 	rec := &Recovery{Enable: true, TargetLSN: "0/150"}
-	if err := preflightWALGap(context.Background(), sp, "db1", rec, nil, emit); err == nil {
+	if err := preflightWALGap(context.Background(), sp, "db1", "", rec, nil, emit); err == nil {
 		t.Fatal("baseline: expected refusal without SkipGapCheck")
 	}
 	captured = nil // reset for the override test
@@ -156,7 +156,7 @@ func TestPreflightWALGap_SkipGapCheck_BypassesRefusal(t *testing.T) {
 	// With SkipGapCheck: same target now allowed; Notice
 	// event fires.
 	rec.SkipGapCheck = true
-	if err := preflightWALGap(context.Background(), sp, "db1", rec, nil, emit); err != nil {
+	if err := preflightWALGap(context.Background(), sp, "db1", "", rec, nil, emit); err != nil {
 		t.Errorf("SkipGapCheck should bypass; got %v", err)
 	}
 	var found *output.Event
@@ -190,7 +190,7 @@ func TestPreflightWALGap_SkipGapCheck_AlsoBypassesAdvisory(t *testing.T) {
 		TargetTime:   time.Now(),
 		SkipGapCheck: true,
 	}
-	if err := preflightWALGap(context.Background(), sp, "db1", rec, nil, emit); err != nil {
+	if err := preflightWALGap(context.Background(), sp, "db1", "", rec, nil, emit); err != nil {
 		t.Errorf("SkipGapCheck + time target should not error; got %v", err)
 	}
 	for _, ev := range captured {
@@ -224,7 +224,7 @@ func TestPreflightWALGap_SkipGapCheck_NoEmit(t *testing.T) {
 		TargetLSN:    "0/150",
 		SkipGapCheck: true,
 	}
-	if err := preflightWALGap(context.Background(), sp, "db1", rec, nil, nil); err != nil {
+	if err := preflightWALGap(context.Background(), sp, "db1", "", rec, nil, nil); err != nil {
 		t.Errorf("SkipGapCheck with nil emit should not error; got %v", err)
 	}
 }
@@ -237,7 +237,7 @@ func TestPreflightWALGap_NoGap_NoRefusal(t *testing.T) {
 		Enable:    true,
 		TargetLSN: "0/3000028",
 	}
-	if err := preflightWALGap(context.Background(), sp, "db1", rec, nil, nil); err != nil {
+	if err := preflightWALGap(context.Background(), sp, "db1", "", rec, nil, nil); err != nil {
 		t.Errorf("no-gap should not refuse; got %v", err)
 	}
 }
@@ -255,7 +255,7 @@ func TestPreflightWALGap_TargetInGapRange_Refuses(t *testing.T) {
 		Enable:    true,
 		TargetLSN: "0/3000080", // mid-gap
 	}
-	err := preflightWALGap(context.Background(), sp, "db1", rec, nil, nil)
+	err := preflightWALGap(context.Background(), sp, "db1", "", rec, nil, nil)
 	if err == nil {
 		t.Fatal("expected refusal for in-gap target")
 	}
@@ -286,7 +286,7 @@ func TestPreflightWALGap_TargetAtGapStart_Refuses(t *testing.T) {
 	putGap(t, sp, "db1", 1, "0/100", "0/200", 256, time.Now().UTC())
 
 	rec := &Recovery{Enable: true, TargetLSN: "0/100"}
-	if err := preflightWALGap(context.Background(), sp, "db1", rec, nil, nil); err == nil {
+	if err := preflightWALGap(context.Background(), sp, "db1", "", rec, nil, nil); err == nil {
 		t.Error("target at gap_start should refuse (closed boundary)")
 	}
 }
@@ -299,7 +299,7 @@ func TestPreflightWALGap_TargetAtGapEnd_Allows(t *testing.T) {
 	putGap(t, sp, "db1", 1, "0/100", "0/200", 256, time.Now().UTC())
 
 	rec := &Recovery{Enable: true, TargetLSN: "0/200"}
-	if err := preflightWALGap(context.Background(), sp, "db1", rec, nil, nil); err != nil {
+	if err := preflightWALGap(context.Background(), sp, "db1", "", rec, nil, nil); err != nil {
 		t.Errorf("target at gap_end should be allowed (exclusive end); got %v", err)
 	}
 }
@@ -312,7 +312,7 @@ func TestPreflightWALGap_TargetBeforeGap_Allows(t *testing.T) {
 	putGap(t, sp, "db1", 1, "0/3000028", "0/30001A0", 420, time.Now().UTC())
 
 	rec := &Recovery{Enable: true, TargetLSN: "0/2000000"}
-	if err := preflightWALGap(context.Background(), sp, "db1", rec, nil, nil); err != nil {
+	if err := preflightWALGap(context.Background(), sp, "db1", "", rec, nil, nil); err != nil {
 		t.Errorf("target before gap should be allowed; got %v", err)
 	}
 }
@@ -325,7 +325,7 @@ func TestPreflightWALGap_TargetAfterGap_Allows(t *testing.T) {
 	putGap(t, sp, "db1", 1, "0/100", "0/200", 256, time.Now().UTC())
 
 	rec := &Recovery{Enable: true, TargetLSN: "0/300"}
-	if err := preflightWALGap(context.Background(), sp, "db1", rec, nil, nil); err != nil {
+	if err := preflightWALGap(context.Background(), sp, "db1", "", rec, nil, nil); err != nil {
 		t.Errorf("target after gap should be allowed; got %v", err)
 	}
 }
@@ -337,7 +337,7 @@ func TestPreflightWALGap_RecoveryDisabled_NoCheck(t *testing.T) {
 	putGap(t, sp, "db1", 1, "0/100", "0/200", 256, time.Now().UTC())
 
 	rec := &Recovery{Enable: false, TargetLSN: "0/150"}
-	if err := preflightWALGap(context.Background(), sp, "db1", rec, nil, nil); err != nil {
+	if err := preflightWALGap(context.Background(), sp, "db1", "", rec, nil, nil); err != nil {
 		t.Errorf("disabled recovery → no check; got %v", err)
 	}
 }
@@ -357,7 +357,7 @@ func TestPreflightWALGap_TimeTarget_GapsExist_Refuses(t *testing.T) {
 	putGap(t, sp, "db1", 1, "0/100", "0/200", 256, at)
 
 	rec := &Recovery{Enable: true, TargetTime: time.Now()}
-	err := preflightWALGap(context.Background(), sp, "db1", rec, nil, func(ev *output.Event) {})
+	err := preflightWALGap(context.Background(), sp, "db1", "", rec, nil, func(ev *output.Event) {})
 	if err == nil {
 		t.Fatal("expected refusal for time-target + recorded gap; got nil")
 	}
@@ -387,7 +387,7 @@ func TestPreflightWALGap_Suggestions_ReferenceRealFlags(t *testing.T) {
 	rec := &Recovery{Enable: true, TargetTime: time.Now()}
 	var captured []*output.Event
 	emit := func(ev *output.Event) { captured = append(captured, ev) }
-	err := preflightWALGap(context.Background(), sp, "db1", rec, nil, emit)
+	err := preflightWALGap(context.Background(), sp, "db1", "", rec, nil, emit)
 	var oerr *output.Error
 	if !errors.As(err, &oerr) || oerr.Suggestion == nil {
 		t.Fatalf("expected structured error with suggestion; got %v", err)
@@ -434,7 +434,7 @@ func TestPreflightWALGap_TimeTarget_NoGaps_NoWarning(t *testing.T) {
 	emit := func(ev *output.Event) { captured = append(captured, ev) }
 
 	rec := &Recovery{Enable: true, TargetTime: time.Now()}
-	if err := preflightWALGap(context.Background(), sp, "db1", rec, nil, emit); err != nil {
+	if err := preflightWALGap(context.Background(), sp, "db1", "", rec, nil, emit); err != nil {
 		t.Errorf("clean + time-target → allow; got %v", err)
 	}
 	for _, ev := range captured {
@@ -460,7 +460,7 @@ func TestPreflightWALGap_TimeTarget_ManifestGapAlsoTriggers(t *testing.T) {
 	}}
 
 	rec := &Recovery{Enable: true, TargetName: "production-snap"}
-	err := preflightWALGap(context.Background(), sp, "db1", rec, manifestGaps, func(ev *output.Event) {})
+	err := preflightWALGap(context.Background(), sp, "db1", "", rec, manifestGaps, func(ev *output.Event) {})
 	if err == nil {
 		t.Fatal("expected refusal for time-target + manifest gaps; got nil")
 	}
@@ -483,7 +483,7 @@ func TestPreflightWALGap_TimeTarget_SkipGapCheck_BypassesRefusal(t *testing.T) {
 	}}
 
 	rec := &Recovery{Enable: true, TargetName: "production-snap", SkipGapCheck: true}
-	if err := preflightWALGap(context.Background(), sp, "db1", rec, manifestGaps, func(ev *output.Event) {}); err != nil {
+	if err := preflightWALGap(context.Background(), sp, "db1", "", rec, manifestGaps, func(ev *output.Event) {}); err != nil {
 		t.Errorf("--skip-gap-check should bypass refusal; got %v", err)
 	}
 }
@@ -496,7 +496,7 @@ func TestPreflightWALGap_NoTarget_StillAllowed(t *testing.T) {
 	sp := newGapTestSP(t)
 	putGap(t, sp, "db1", 1, "0/100", "0/200", 256, time.Now().UTC())
 	rec := &Recovery{Enable: true /* no target */}
-	if err := preflightWALGap(context.Background(), sp, "db1", rec, nil, nil); err != nil {
+	if err := preflightWALGap(context.Background(), sp, "db1", "", rec, nil, nil); err != nil {
 		t.Errorf("no-target restore should allow even with gaps; got %v", err)
 	}
 }
@@ -532,7 +532,7 @@ func TestPreflightWALGap_NoTargetLSN_SkipsCheck(t *testing.T) {
 		{Enable: true /* no target at all */},
 	}
 	for i, rec := range cases {
-		if err := preflightWALGap(context.Background(), sp, "db1", rec, nil, nil); err != nil {
+		if err := preflightWALGap(context.Background(), sp, "db1", "", rec, nil, nil); err != nil {
 			t.Errorf("case %d: clean deployment + non-LSN target should allow; got %v", i, err)
 		}
 	}
@@ -545,7 +545,7 @@ func TestPreflightWALGap_NoTargetLSN_SkipsCheck(t *testing.T) {
 func TestPreflightWALGap_BadLSN_Refuses(t *testing.T) {
 	sp := newGapTestSP(t)
 	rec := &Recovery{Enable: true, TargetLSN: "not-an-lsn"}
-	err := preflightWALGap(context.Background(), sp, "db1", rec, nil, nil)
+	err := preflightWALGap(context.Background(), sp, "db1", "", rec, nil, nil)
 	if err == nil {
 		t.Fatal("expected error for bad LSN")
 	}
@@ -576,7 +576,7 @@ func TestPreflightWALGap_MalformedRecordSkipped(t *testing.T) {
 	}
 
 	rec := &Recovery{Enable: true, TargetLSN: "0/100"}
-	if err := preflightWALGap(context.Background(), sp, "db1", rec, nil, nil); err != nil {
+	if err := preflightWALGap(context.Background(), sp, "db1", "", rec, nil, nil); err != nil {
 		t.Errorf("malformed-record should be skipped; got %v", err)
 	}
 }
@@ -590,7 +590,7 @@ func TestPreflightWALGap_DeploymentScoped(t *testing.T) {
 
 	rec := &Recovery{Enable: true, TargetLSN: "0/150"}
 	// db1 should be unaffected by db2's gap.
-	if err := preflightWALGap(context.Background(), sp, "db1", rec, nil, nil); err != nil {
+	if err := preflightWALGap(context.Background(), sp, "db1", "", rec, nil, nil); err != nil {
 		t.Errorf("db2's gap should not affect db1; got %v", err)
 	}
 }
@@ -611,7 +611,7 @@ func TestPreflightWALGap_MultipleGapsAnyMatchRefuses(t *testing.T) {
 	putGap(t, sp, "db1", 3, "0/500", "0/600", 256, t3)
 
 	rec := &Recovery{Enable: true, TargetLSN: "0/350"} // in gap 2
-	err := preflightWALGap(context.Background(), sp, "db1", rec, nil, nil)
+	err := preflightWALGap(context.Background(), sp, "db1", "", rec, nil, nil)
 	if err == nil {
 		t.Fatal("expected refusal — target falls in middle gap")
 	}
@@ -643,7 +643,7 @@ func TestPreflightWALGap_LSNComparisonIsNumeric(t *testing.T) {
 	putGap(t, sp, "db1", 1, "0/80", "0/100", 0x80, time.Now().UTC())
 
 	rec := &Recovery{Enable: true, TargetLSN: "0/A0"}
-	if err := preflightWALGap(context.Background(), sp, "db1", rec, nil, nil); err == nil {
+	if err := preflightWALGap(context.Background(), sp, "db1", "", rec, nil, nil); err == nil {
 		t.Error("target 0/A0 (160) should refuse — within gap [0/80, 0/100) (128, 256)")
 	}
 }

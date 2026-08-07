@@ -297,7 +297,7 @@ func Restore(ctx context.Context, opts Options) (res *Result, err error) {
 	// transient List error shouldn't tank a legitimate
 	// restore); a target_lsn that's actually in a gap range
 	// surfaces a structured restore.target_in_wal_gap error.
-	if err := preflightWALGap(ctx, sp, opts.Deployment, opts.Recovery, m.WALGaps, emit); err != nil {
+	if err := preflightWALGap(ctx, sp, opts.Deployment, m.StopLSN, opts.Recovery, m.WALGaps, emit); err != nil {
 		return nil, err
 	}
 	// Physical, warning-only backstop for an LSN target: surface a WAL

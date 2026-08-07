@@ -205,11 +205,11 @@ func TestRetentionThenRecovery_PrunedArchiveStillBoots(t *testing.T) {
 		bin + ":" + bin + ":ro",
 		repoDir + ":" + repoDir + ":ro",
 	}, nil)
-	boot.awaitPromoted(t, ctx, 3*time.Minute)
+	boot.AwaitPromoted(t, ctx, 3*time.Minute)
 
-	got, qerr := boot.query(ctx, `SELECT note FROM ret_proof ORDER BY id`)
+	got, qerr := boot.Query(ctx, `SELECT note FROM ret_proof ORDER BY id`)
 	if qerr != nil {
-		t.Fatalf("query after promotion: %v\n%s", qerr, boot.logs(ctx))
+		t.Fatalf("query after promotion: %v\n%s", qerr, boot.Logs(ctx))
 	}
 	for _, want := range []string{"before-old-backup", "between-backups", "after-kept-backup-only-in-wal"} {
 		if !strings.Contains(got, want) {
@@ -217,7 +217,7 @@ func TestRetentionThenRecovery_PrunedArchiveStillBoots(t *testing.T) {
 				"The janitors kept every object the kept backup's manifest names — and the "+
 				"replay still lost data, which is exactly the failure shape object-level "+
 				"retention tests cannot see. got: %q\nboot log:\n%s",
-				want, got, lastLines(boot.logs(ctx), 2000))
+				want, got, lastLines(boot.Logs(ctx), 2000))
 		}
 	}
 	if !t.Failed() {
