@@ -13,6 +13,20 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **`backup undelete` re-verifies chunks at the moment of resurrection,
+  not just before it.** Undelete's restorability pre-flight ran while
+  the manifest was still hidden, and a concurrent `repo gc --apply`
+  sweep works from a reference snapshot taken before the undelete began
+  — so the pre-flight passing guaranteed nothing about the seconds that
+  followed. If gc's delete loop swept the chunks in that window, the
+  undelete reported `restored=true` and the operator held a backup that
+  lists as live and cannot restore. The chunks are now re-checked
+  immediately after the tombstone marker is removed; on a miss the
+  original marker is re-installed byte-for-byte (policy, reason and
+  timestamps intact) and the call fails with the same
+  `conflict.chunks_missing` refusal the pre-flight gives. The residual
+  window shrinks from the duration of gc's delete loop to milliseconds.
+
 - **The documented cascade unwind now works verbatim.** `backup delete
   --cascade` returns its `cascade_deleted` slice leaf-first — the
   correct order for deletion and exactly the wrong one for

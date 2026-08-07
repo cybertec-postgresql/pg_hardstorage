@@ -1571,7 +1571,66 @@ func (ms *ManifestStore) Undelete(ctx context.Context, deployment, backupID stri
 		}
 		cur = parent
 	}
-	return ms.removeTombstone(ctx, deployment, backupID)
+
+	// Everything above ran while the manifest was still HIDDEN — and a
+	// concurrent `repo gc --apply` whose sweep loop is already running
+	// works from a reference snapshot that predates this call, so the
+	// pre-flight passing is no guarantee the chunks survive the next
+	// few seconds. This is the same TOCTOU family as the backup
+	// runner's adopted-chunk gate: the check has to happen at the
+	// VISIBILITY point, not before it.
+	//
+	// So: capture the marker bytes, remove the marker, then re-verify
+	// the chunks. If any vanished in the window, put the exact marker
+	// back and fail with the same loud refusal the pre-flight gives —
+	// the operator retries after gc finishes, instead of holding a
+	// resurrected backup that quietly cannot restore. The residual
+	// window (a sweep landing after this re-check) is milliseconds,
+	// down from the full duration of gc's delete loop.
+	markerBytes, mrdErr := ms.readRaw(ctx, TombstonePath(deployment, backupID))
+	removed, rmErr := ms.removeTombstone(ctx, deployment, backupID)
+	if rmErr != nil || !removed {
+		return removed, rmErr
+	}
+	if undeleteTestHookAfterUnmark != nil {
+		undeleteTestHookAfterUnmark()
+	}
+	recheck, rcErr := CheckChunkExistence(ctx, ms.sp, m)
+	if rcErr != nil {
+		// Transient verification failure is not evidence of loss; the
+		// chunks were present moments ago. Leave the manifest live.
+		return true, nil
+	}
+	if !recheck.AllPresent() {
+		// Restore the prior state with the ORIGINAL marker bytes so
+		// policy/reason/timestamps survive the round trip. Best effort:
+		// if the marker cannot be re-installed, the missing-chunks
+		// error below still tells the operator the backup is broken.
+		if mrdErr == nil && len(markerBytes) > 0 {
+			_ = storage.CommitExclusive(ctx, ms.sp, TombstonePath(deployment, backupID), markerBytes, storage.PutOptions{})
+		}
+		missing := make([]string, 0, len(recheck.Missing))
+		for _, h := range recheck.Missing {
+			missing = append(missing, h.String())
+		}
+		return false, &UndeleteChunksMissingError{
+			Deployment:  deployment,
+			BackupID:    backupID,
+			TotalUnique: recheck.TotalUnique,
+			Missing:     missing,
+		}
+	}
+	return true, nil
+}
+
+// readRaw fetches a key's bytes, for the marker round-trip above.
+func (ms *ManifestStore) readRaw(ctx context.Context, key string) ([]byte, error) {
+	rc, err := ms.sp.Get(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	defer rc.Close()
+	return stdio.ReadAll(rc)
 }
 
 // UndeleteParentTombstonedError is returned by Undelete when the
@@ -1755,6 +1814,12 @@ func (ms *ManifestStore) EnsureReplica(ctx context.Context, deployment, backupID
 // concurrent removal surfaces as ErrNotFound from Delete, which we
 // treat as "already gone" (the caller's intent — the marker should
 // not exist — is satisfied) rather than as an error.
+// undeleteTestHookAfterUnmark, when non-nil, runs immediately after
+// Undelete removes the tombstone marker and before the post-flip chunk
+// re-verification. Test-only seam for staging a concurrent gc sweep at
+// the exact visibility point; nil in production.
+var undeleteTestHookAfterUnmark func()
+
 func (ms *ManifestStore) removeTombstone(ctx context.Context, deployment, backupID string) (bool, error) {
 	if err := ms.sp.Delete(ctx, TombstonePath(deployment, backupID)); err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
