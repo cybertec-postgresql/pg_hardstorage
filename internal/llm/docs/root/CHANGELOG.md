@@ -13,6 +13,24 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **`wal push` refuses WAL from a different cluster than the deployment
+  already holds.** `wal stream` has guarded this since the pg_upgrade
+  work; the archive_command path did not. What made it look covered was
+  the split-brain check, which compares system identifiers only when the
+  *same* segment number is already archived — a duplicate check, not a
+  continuity check. A foreign cluster whose segment numbers happened not
+  to collide (the normal case after a pg_upgrade, which resumes at a
+  higher LSN) archived into the deployment unopposed.
+
+  The consequence reaches past a cluttered archive: the resume and gap
+  computations read the archive frontier as the highest segment's end
+  LSN, without regard to which cluster wrote it, so a foreign segment at
+  a higher number drags the frontier forward and `wal stream` resumes
+  past WAL the real cluster has not archived yet. `wal push` now takes
+  the same `--allow-system-identifier-change` escape hatch as `wal
+  stream`, and the refusal names both that flag and the better answer —
+  a fresh deployment, which keeps the old lineage restorable.
+
 - **`wal stream` now captures the timeline-history file a cross-failover
   PITR needs.** Nothing produced `<tli>.history` in a streaming-only
   deployment: the only writer ran under `agent` with a Patroni URL
