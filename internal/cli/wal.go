@@ -1916,6 +1916,29 @@ func streamAttempt(
 	timeline = uint32(identity.Timeline)
 	identityID = identity.SystemID
 
+	// Capture the timeline-history file for this timeline.
+	//
+	// PG asks for `<tli>.history` by its archive name through
+	// restore_command when a PITR needs to walk past a failover, and
+	// this is the ONLY producer in a `wal stream`-only deployment: the
+	// follower Coordinator that also captures it runs solely under
+	// `agent` with Patroni configured, and a streaming-only HA setup
+	// has no archive_command either. Without it the failure is quiet
+	// in the worst way. Our default recovery_target_timeline is
+	// 'latest', which makes PG follow the highest timeline it can
+	// resolve history FOR — so a missing file does not fail the
+	// restore, it silently recovers along the pre-failover timeline
+	// and promotes a database missing everything written after the
+	// promotion. The operator asked for latest and got less, with no
+	// error anywhere.
+	//
+	// Best-effort, but never silent. Refusing to stream because a
+	// history file could not be stored would trade a PITR limitation
+	// for losing all subsequent WAL, which is plainly worse. So a
+	// failure warns and streaming continues — the same posture as the
+	// audit appends.
+	captureStreamTimelineHistory(repoCtx, d, sp, opts, timeline)
+
 	if attempt == 1 {
 		// Same durability honesty as the backup runner: on a backend
 		// with neither a real Barrier nor inline-durable Puts
@@ -2891,4 +2914,58 @@ func (b walStreamResultBody) WriteText(w io.Writer) error {
 	fmt.Fprintf(bw, "  Duration:     %s", time.Duration(b.DurationMS)*time.Millisecond)
 	_, err := io.WriteString(w, bw.String())
 	return err
+}
+
+// captureStreamTimelineHistory stores `<tli>.history` for the timeline
+// the stream is about to follow, so a later PITR can cross the failover
+// that created it.
+//
+// Timeline 1 has no parent and therefore no history file; PG reports
+// that as ErrNoHistoryForTLI1 and it is not a problem, so it is not
+// reported as one.
+//
+// Idempotent by construction: the same timeline yields the same bytes,
+// and every reconnect re-runs this. That is deliberate — the capture
+// has to survive an agent that was not running when the promotion
+// happened.
+func captureStreamTimelineHistory(ctx context.Context, d *output.Dispatcher, sp storage.StoragePlugin, opts walStreamOptions, tli uint32) {
+	if tli <= 1 || opts.pgConn == "" || sp == nil {
+		return
+	}
+	warn := func(reason string) {
+		_ = d.Event(ctx, output.NewEvent(output.SeverityWarning, "wal.timeline", "history_not_captured").
+			WithSubject(output.Subject{Deployment: opts.deployment, Timeline: tli}).
+			WithBody(map[string]any{
+				"error": reason,
+				"message": "could not store the timeline-history file for this timeline. " +
+					"Streaming continues, but a point-in-time restore that needs to cross this " +
+					"failover cannot resolve the branch point: with " +
+					"recovery_target_timeline='latest' PG will silently recover along an " +
+					"EARLIER timeline instead of failing, promoting a database missing " +
+					"everything written after the promotion.",
+			}))
+	}
+
+	repl, err := pg.Connect(ctx, opts.pgConn, pg.ModeReplication)
+	if err != nil {
+		warn(err.Error())
+		return
+	}
+	defer repl.Close(ctx)
+
+	th, err := pg.TimelineHistoryFor(ctx, repl, tli)
+	if err != nil {
+		if errors.Is(err, pg.ErrNoHistoryForTLI1) {
+			return
+		}
+		warn(err.Error())
+		return
+	}
+	if err := timeline.New(sp).Put(ctx, opts.deployment, tli, th.Content); err != nil {
+		warn(err.Error())
+		return
+	}
+	_ = d.Event(ctx, output.NewEvent(output.SeverityInfo, "wal.timeline", "history_captured").
+		WithSubject(output.Subject{Deployment: opts.deployment, Timeline: tli}).
+		WithBody(map[string]any{"bytes": len(th.Content)}))
 }

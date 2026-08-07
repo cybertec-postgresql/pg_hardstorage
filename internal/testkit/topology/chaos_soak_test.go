@@ -359,16 +359,22 @@ func chaosBinary(t *testing.T) string {
 		return bin
 	}
 
-	// Prefer an already-built binary; fall back to building one.
+	// ALWAYS build from the working tree.
+	//
+	// This used to prefer an existing bin/pg_hardstorage. On CI that is
+	// harmless — a fresh checkout has none, so it builds — but on a
+	// developer machine bin/ holds whatever was last built, and the
+	// soak then spends hours proving things about code that is no
+	// longer in the tree. A sibling test was caught doing exactly that:
+	// it ran a binary from the previous day and reported on a fix it
+	// did not contain.
+	//
+	// PGHS_CHAOS_BIN above remains the explicit override, because
+	// asking for a specific binary is a deliberate act. Silently
+	// picking up a stale one is not.
 	root := repoRootForChaos(t)
-	built := filepath.Join(root, "bin", "pg_hardstorage")
-	if _, err := os.Stat(built); err == nil {
-		return built
-	}
-
 	if _, err := exec.LookPath("go"); err != nil {
-		t.Skipf("no pg_hardstorage binary at %s and no Go toolchain to build one: %v",
-			built, err)
+		t.Skipf("no Go toolchain to build the binary under test: %v", err)
 	}
 	out := filepath.Join(t.TempDir(), "pg_hardstorage")
 	cmd := exec.Command("go", "build", "-o", out, "./cmd/pg_hardstorage")
