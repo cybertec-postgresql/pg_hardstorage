@@ -13,6 +13,27 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **A backup can no longer commit a manifest over chunks a concurrent
+  `repo gc --apply` deleted.** Deduplication adopts existing chunks via
+  a `Stat` — it touches no object and refreshes no mtime, so gc's
+  `--min-chunk-age` floor (which protects chunks a backup *wrote*) never
+  sees it. If a tombstone expired mid-backup, its orphaned chunks could
+  be adopted by the in-flight backup and then swept before the manifest
+  committed: a brand-new backup, born unrestorable, reporting success.
+  gc's guards (live-lease refusal, reference re-collect) are timing
+  guards that shrink the window; none closes it, because the adopt is
+  invisible to gc.
+
+  Closed from the writer's side: the CAS now records every hash it
+  adopted rather than wrote (hint-confirmed Stat hits and lost
+  `IfNotExists` races), and the backup runner re-Stats exactly those
+  immediately before manifest commit — refusing, loudly and retryably,
+  if any is gone. The retry rewrites the chunk with a fresh mtime that
+  the age floor then protects. gc additionally re-scans backup leases
+  *after* its reference re-collect (a full manifest walk, minutes on a
+  large repo), so a backup starting during that walk is noticed before
+  the sweep rather than after.
+
 - **A standby built over a holed archive is now warned about.** The WAL
   contiguity preflight ran only for LSN targets, and a standby has no
   target by construction — so it was never checked, while being the

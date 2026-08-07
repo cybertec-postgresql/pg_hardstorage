@@ -132,6 +132,21 @@ type CAS struct {
 	seenCount atomic.Int64
 	seenMu    sync.Mutex
 
+	// adopted records every hash this CAS instance DEDUPLICATED
+	// AGAINST rather than wrote: a hint-confirmed Stat hit, or an
+	// IfNotExists put lost to a concurrent writer. These are the
+	// chunks whose durability this backup is TRUSTING without having
+	// written them — and therefore the only chunks a concurrent
+	// `repo gc --apply` can pull out from under a committing backup.
+	// gc's --min-chunk-age floor protects everything this run wrote
+	// (young mtime); an adopted chunk is old by definition — an orphan
+	// from an expired tombstone whose content reappears today gets a
+	// dedup hit that touches no object and refreshes no mtime.
+	// AdoptedHashes exposes the set so the backup runner can re-verify
+	// existence at manifest-commit time, closing the sweep race from
+	// the writer's side no matter how gc's own guards are timed.
+	adopted sync.Map // Hash -> struct{}
+
 	// adopt guards the one-shot cross-DEK check. See ensureAdoptable.
 	adopt adoptGuard
 }
@@ -197,6 +212,23 @@ func (d DedupStats) HitRate() float64 {
 		return 0
 	}
 	return float64(d.HitsInMemory+d.HitsStorage) / float64(t)
+}
+
+// AdoptedHashes returns every hash this CAS instance deduplicated
+// against without writing (hint-confirmed Stat hits and lost
+// IfNotExists races). The backup runner re-Stats these at
+// manifest-commit time: they are the only chunks a concurrent
+// `repo gc --apply` can delete out from under a backup that then
+// commits a manifest referencing them, because gc's --min-chunk-age
+// floor covers only chunks with a young mtime — i.e. the ones this
+// run wrote. Order is unspecified.
+func (c *CAS) AdoptedHashes() []Hash {
+	var out []Hash
+	c.adopted.Range(func(k, _ any) bool {
+		out = append(out, k.(Hash))
+		return true
+	})
+	return out
 }
 
 // CASOption configures a CAS at construction.
@@ -464,6 +496,7 @@ func (c *CAS) PutChunk(ctx context.Context, body []byte) (ChunkInfo, error) {
 					return ChunkInfo{}, err
 				}
 				c.markSeen(hash)
+				c.adopted.Store(hash, struct{}{})
 				c.dedupStorage.Add(1)
 				info.Deduped = true
 				return info, nil
@@ -535,6 +568,7 @@ func (c *CAS) PutChunk(ctx context.Context, body []byte) (ChunkInfo, error) {
 			return ChunkInfo{}, aerr
 		}
 		c.markSeen(hash)
+		c.adopted.Store(hash, struct{}{})
 		c.dedupStorage.Add(1)
 		info.Deduped = true
 		return info, nil

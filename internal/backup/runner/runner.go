@@ -847,6 +847,33 @@ func Take(ctx context.Context, opts TakeOptions) (*Result, error) {
 		commitOpts.RetainUntil = repoMeta.WORM.RetainUntil(wormNow)
 		commitOpts.RetentionMode = storage.WORMMode(repoMeta.WORM.Mode)
 	}
+	// Adopted-chunk existence gate (dedup-vs-GC race, the writer's
+	// half). Chunks this backup WROTE are protected from a concurrent
+	// `repo gc --apply` by the --min-chunk-age floor: their mtime is
+	// young. Chunks it DEDUPLICATED AGAINST are not — they are old by
+	// definition, and if their only referent was a tombstone that
+	// expired mid-backup, gc legitimately saw them as orphans and may
+	// have deleted them between our Stat-adopt and this commit. A
+	// manifest committed past that point is a brand-new backup that is
+	// already unrestorable, and it would report success.
+	//
+	// So: immediately before commit, re-Stat every adopted hash. The
+	// set is exactly the chunks whose durability we trusted without
+	// writing them, and is usually tiny relative to the manifest. On a
+	// miss the backup FAILS — loud and retryable beats silent and
+	// broken, and the retry rewrites the chunk (its content is in the
+	// stream) with a fresh mtime that the age floor then protects.
+	//
+	// gc holds the complementary halves: it refuses --apply while a
+	// backup lease is live, and re-collects references before deleting.
+	// Both are timing guards; this one is not — whatever the
+	// interleaving, a manifest only commits over chunks that were
+	// present after the last of them was adopted.
+	if err := verifyAdoptedChunks(ctx, sp, cas); err != nil {
+		span.SetStatus(codes.Error, err.Error())
+		return nil, err
+	}
+
 	commitCtx, commitSpan := tracing.Tracer().Start(ctx, "manifest.commit",
 		trace.WithAttributes(
 			attribute.String("backup_id", backupID),
@@ -1225,6 +1252,45 @@ func summarize(opts TakeOptions, m *backup.Manifest, _ *tarsink.Sink, identity p
 //
 // Empty result + nil error means "no gaps" — return nil so
 // the manifest's omitempty keeps the JSON shape compact.
+
+// verifyAdoptedChunks re-Stats every chunk the CAS deduplicated
+// against (rather than wrote) and fails if any is gone — the
+// commit-time gate for the dedup-vs-GC race. See the call site in
+// Backup for the full rationale. Split out so the gate is testable
+// without a running PostgreSQL: the race it closes is between storage
+// operations, not database ones.
+func verifyAdoptedChunks(ctx context.Context, sp storage.StoragePlugin, cas *repo.CAS) error {
+	adopted := cas.AdoptedHashes()
+	var missing []string
+	for _, h := range adopted {
+		if _, err := sp.Stat(ctx, repo.ChunkKey(h)); err != nil {
+			if errors.Is(err, storage.ErrNotFound) {
+				missing = append(missing, h.String())
+				continue
+			}
+			// A transient Stat error is not evidence of loss; failing
+			// the whole backup on it would trade a possible gap for a
+			// certain one. The chunk was present at adopt time, so
+			// proceed — the post-commit verify and scrub remain the
+			// wider nets.
+			continue
+		}
+	}
+	if len(missing) > 0 {
+		if len(missing) > 8 {
+			missing = append(missing[:8], fmt.Sprintf("… and %d more", len(missing)-8))
+		}
+		return fmt.Errorf("backup: %d chunk(s) this backup deduplicated against were deleted "+
+			"before the manifest could commit (a concurrent `repo gc --apply` swept them as "+
+			"orphans): %s — refusing to commit a manifest that is already unrestorable. "+
+			"Re-run the backup: the retry writes these chunks fresh, and the new mtime puts "+
+			"them under gc's --min-chunk-age protection. Schedule gc away from backup "+
+			"windows, or rely on its live-lease refusal by not disabling leases",
+			len(missing), strings.Join(missing, ", "))
+	}
+	return nil
+}
+
 func readGapsForManifest(ctx context.Context, sp storage.StoragePlugin, deployment string) ([]backup.WALGap, error) {
 	records, err := gapstate.New(sp).List(ctx, deployment)
 	if err != nil {

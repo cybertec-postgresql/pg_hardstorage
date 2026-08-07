@@ -274,6 +274,27 @@ func runRepoGC(cmd *cobra.Command, repoURL string, apply bool, approvalID string
 				fmt.Sprintf("repo gc: re-collect references before delete: %v", rerr)).Wrap(rerr)
 		}
 
+		// Second lease scan (dedup-vs-GC race, part 3). The scan above
+		// ran BEFORE the re-collect, and the re-collect is a full
+		// manifest walk — minutes on a large repository. A backup that
+		// starts during it acquires its lease after the first scan and
+		// can dedup-adopt an orphan this sweep is about to delete. Scan
+		// again now so the unguarded window shrinks from the re-collect
+		// duration to the delete loop itself. The remaining sliver is
+		// closed from the other side: the backup runner re-Stats every
+		// adopted chunk at manifest-commit and refuses to commit over a
+		// hole, whatever the interleaving.
+		if live, lerr := findLiveBackupLeases(cmd.Context(), sp, time.Now().UTC()); lerr != nil {
+			return output.NewError("repo.gc.lease_scan_failed",
+				fmt.Sprintf("repo gc: re-scan backup leases: %v", lerr)).Wrap(lerr)
+		} else if len(live) > 0 {
+			return output.NewError("repo.gc.live_backup_lease",
+				fmt.Sprintf("repo gc: a backup started during the reference re-collect (lease for: %s); refusing to sweep", strings.Join(live, ", "))).
+				WithSuggestion(&output.Suggestion{
+					Human: "the in-flight backup may have deduplicated against chunks this sweep would delete — re-run after it finishes",
+				})
+		}
+
 		cas := casdefault.New(sp)
 		var deleted int
 		var deletedBytes int64
