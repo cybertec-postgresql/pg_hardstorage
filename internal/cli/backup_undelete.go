@@ -95,7 +95,7 @@ Restorability pre-flight (--check-chunks):
 	c.Flags().BoolVar(&skipMissing, "skip-missing", false,
 		"when --check-chunks fails on some IDs, undelete the rest (default: refuse the whole batch)")
 	c.Flags().BoolVar(&force, "force", false,
-		"resurrect even when chunks are gone — recover the metadata of an un-restorable backup (skips the restorability pre-flight; forensic use)")
+		"override --check-chunks: resurrect even when chunks are gone, to recover the metadata of an un-restorable backup (forensic use). Only meaningful WITH --check-chunks — the pre-flight is opt-in, so plain `undelete` already resurrects regardless of chunk state.")
 	return c
 }
 
@@ -152,6 +152,30 @@ func runBackupUndelete(cmd *cobra.Command, deployment string, ids []string, repo
 	// passes (or --skip-missing is set).
 	chunkChecks := make([]chunkCheckRow, 0, len(ids))
 	skipDueToMissing := make(map[string]struct{})
+	// --force without --check-chunks is a no-op, because the pre-flight
+	// it overrides is opt-in. Say so instead of accepting it silently:
+	// an operator reaching for --force believes they are choosing the
+	// permissive behaviour, and needs to know it is already the
+	// default — otherwise they will assume a resurrected backup was
+	// checked and deliberately forced, when nothing checked anything.
+	//
+	// A warning rather than a usage error: --force asks for exactly
+	// what it gets, so refusing would break a defensible invocation to
+	// make a point. (--skip-missing IS a usage error without
+	// --check-chunks, because it changes batch semantics that only
+	// exist under the pre-flight.)
+	if force && !checkChunks {
+		_ = d.Event(cmd.Context(), output.NewEvent(output.SeverityWarning, "backup.undelete", "force_without_check").
+			WithSubject(output.Subject{Deployment: deployment}).
+			WithBody(map[string]any{
+				"message": "--force had no effect: it overrides --check-chunks, which was not requested. " +
+					"undelete does not verify chunk existence by default, so these manifests are being " +
+					"resurrected without any restorability check. If the chunks were already reclaimed by " +
+					"`repo gc --apply`, the backup will reappear in `backup list` and fail at restore. " +
+					"Pass --check-chunks to find out before resurrecting.",
+			}))
+	}
+
 	// --force skips the restorability pre-flight entirely (it
 	// resurrects metadata even when chunks are gone), so the
 	// --check-chunks pre-pass is moot under --force.
