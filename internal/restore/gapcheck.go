@@ -238,11 +238,11 @@ func preflightWALGap(ctx context.Context, sp storage.StoragePlugin, deployment, 
 		// PG's own end-of-WAL semantics handle the gap-tail
 		// scenario correctly even when the agent missed bytes.
 		if recovery.IsTargetSet() {
-			if err := preflightTimeTargetGap(ctx, sp, deployment, recovery, manifestGaps); err != nil {
+			if err := preflightTimeTargetGap(ctx, sp, deployment, backupStopLSN, recovery, manifestGaps); err != nil {
 				return err
 			}
 			if emit != nil {
-				emitTimeTargetGapWarning(ctx, sp, deployment, recovery, manifestGaps, emit)
+				emitTimeTargetGapWarning(ctx, sp, deployment, backupStopLSN, recovery, manifestGaps, emit)
 			}
 		}
 		return nil
@@ -346,9 +346,36 @@ func checkOneGap(target pglogrepl.LSN, startStr, endStr string, bytes uint64, de
 // effort live-gapstate read: a List failure falls back to
 // manifest-only gaps so a transient backend issue doesn't block
 // a legitimate restore.
-func preflightTimeTargetGap(ctx context.Context, sp storage.StoragePlugin, deployment string, recovery *Recovery, manifestGaps []backup.WALGap) error {
+func preflightTimeTargetGap(ctx context.Context, sp storage.StoragePlugin, deployment, backupStopLSN string, recovery *Recovery, manifestGaps []backup.WALGap) error {
 	liveGaps, _ := gapstate.New(sp).List(ctx, deployment) // best-effort
-	totalGaps := len(manifestGaps) + len(liveGaps)
+
+	// Count only gaps the SEED'S REPLAY CAN REACH. The seed for a
+	// time/name target was already resolved (stop_time <= target)
+	// before this preflight, so replay covers [seed.stop, target]: a
+	// gap ending at or below the seed's stop is history this restore
+	// never touches. The original blanket rule — refuse on ANY
+	// recorded gap — predated having the seed's stop available here,
+	// and composed badly with retention: a pre-stream gap record
+	// outlives the backups it described (gapstate is per-deployment),
+	// so once the init-era backup aged out, EVERY --to restore refused
+	// forever over a window no surviving backup can reach. Gaps at or
+	// beyond the stop still refuse, exactly as before: the target's
+	// LSN is unknowable pre-recovery, so reachable-gap = possible
+	// mid-replay bailout.
+	relevant := func(gapEnd string) bool { return gapReachableBySeed(backupStopLSN, gapEnd) }
+	totalGaps := 0
+	for _, g := range manifestGaps {
+		if relevant(g.GapEndLSN) {
+			totalGaps++
+		}
+	}
+	liveRelevant := 0
+	for _, g := range liveGaps {
+		if relevant(g.GapEndLSN) {
+			liveRelevant++
+		}
+	}
+	totalGaps += liveRelevant
 	if totalGaps == 0 {
 		return nil
 	}
@@ -364,7 +391,7 @@ func preflightTimeTargetGap(ctx context.Context, sp storage.StoragePlugin, deplo
 	}
 	return output.NewError("restore.target_in_wal_gap",
 		fmt.Sprintf("restore: %s cannot be statically gap-checked and the deployment has %d recorded WAL gap(s) (%d in manifest, %d live) — refusing rather than risk a PITR that bails out of recovery after PG resolves the target to an LSN inside a gap",
-			targetDescr, totalGaps, len(manifestGaps), len(liveGaps))).
+			targetDescr, totalGaps, totalGaps-liveRelevant, liveRelevant)).
 		WithSuggestion(&output.Suggestion{
 			Human:   "either re-target with --to-lsn (a static check then runs and either passes or refuses precisely), inspect `pg_hardstorage wal gaps <deployment>` to confirm your time/name target falls outside the gap windows, or pass --skip-gap-check to acknowledge the risk and proceed (the post-mortem audit will record the bypass).",
 			Command: "pg_hardstorage wal gaps " + deployment,
@@ -390,16 +417,30 @@ func preflightTimeTargetGap(ctx context.Context, sp storage.StoragePlugin, deplo
 // Best-effort: a gapstate.List failure here is silent (the
 // operator's gap-check is advisory; doctor would have already
 // surfaced a persistent corruption).
-func emitTimeTargetGapWarning(ctx context.Context, sp storage.StoragePlugin, deployment string, recovery *Recovery, manifestGaps []backup.WALGap, emit func(*output.Event)) {
+func emitTimeTargetGapWarning(ctx context.Context, sp storage.StoragePlugin, deployment, backupStopLSN string, recovery *Recovery, manifestGaps []backup.WALGap, emit func(*output.Event)) {
 	liveGaps, _ := gapstate.New(sp).List(ctx, deployment) // best-effort
-	totalGaps := len(manifestGaps) + len(liveGaps)
-	if totalGaps == 0 {
-		return // clean deployment, no signal to surface
+	// Same seed-reachability bound as preflightTimeTargetGap: warning
+	// about gaps this restore's replay can never touch trains the
+	// operator to ignore the warning that matters.
+	relevant := func(gapEnd string) bool { return gapReachableBySeed(backupStopLSN, gapEnd) }
+	mg, lg := 0, 0
+	for _, g := range manifestGaps {
+		if relevant(g.GapEndLSN) {
+			mg++
+		}
+	}
+	for _, g := range liveGaps {
+		if relevant(g.GapEndLSN) {
+			lg++
+		}
+	}
+	if mg+lg == 0 {
+		return // no reachable gap, no signal to surface
 	}
 
 	body := map[string]any{
-		"manifest_gap_count": len(manifestGaps),
-		"live_gap_count":     len(liveGaps),
+		"manifest_gap_count": mg,
+		"live_gap_count":     lg,
 	}
 	switch {
 	case !recovery.TargetTime.IsZero():

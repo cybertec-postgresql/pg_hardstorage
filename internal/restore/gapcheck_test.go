@@ -406,7 +406,7 @@ func TestPreflightWALGap_Suggestions_ReferenceRealFlags(t *testing.T) {
 	// Trigger the advisory via the warning emitter directly: the
 	// refusal path returns before the advisory in the same call, so
 	// exercise emitTimeTargetGapWarning to cover its suggestion text.
-	emitTimeTargetGapWarning(context.Background(), sp, "db1", recSkip, nil, emit)
+	emitTimeTargetGapWarning(context.Background(), sp, "db1", "", recSkip, nil, emit)
 	var advisory *output.Event
 	for _, ev := range captured {
 		if ev.Op == "wal_gap_advisory" {

@@ -41,6 +41,22 @@ keeps reading that version for at least 24 months after a successor lands.
   backup to re-anchor PITR; `--skip-gap-check` remains the eyes-open
   override.
 
+- **Time/name-target PITR no longer refuses over gaps its seed backup
+  can never reach.** The `--to <time>` / named-restore-point gap
+  preflight refused whenever the deployment had *any* recorded WAL gap.
+  That blanket rule predated the seed backup's stop LSN being available
+  at the check, and it composed badly with retention: gap records are
+  per-deployment and outlive the backups they described, so once
+  retention expired the generation a gap belonged to, **every**
+  time-targeted restore of that deployment refused forever — over a
+  window no surviving backup's replay could even enter (found composing
+  the pre-stream-gap fix above with the retention janitors). The refusal
+  and its advisory warning now apply the same bound the unbounded check
+  uses: a gap ending at or below the chosen seed's stop is history the
+  restore never replays and is ignored; gaps at or beyond the stop
+  refuse exactly as before, and an unknown stop keeps the conservative
+  blanket posture.
+
 ### Added
 
 - **`restore --to-latest`: end-of-archive recovery.** There was no CLI

@@ -58,6 +58,22 @@ type Mutation struct {
 // in the named package — see the package doc.
 var Registry = []Mutation{
 	{
+		Tag: "mutation_timetarget_blanket_refusal",
+		Description: "the time/name-target gap preflight refuses on ANY " +
+			"recorded gap, ignoring whether the seed backup's replay can " +
+			"reach it (pre-fix bug #18): gapstate records are eternal, so " +
+			"once retention expires the pre-gap generation, every " +
+			"`--to <time>` restore of the deployment refuses forever — a " +
+			"permanent false positive that trains operators to pass " +
+			"--skip-gap-check, disabling the true refusals too. Caught by " +
+			"TestPreflightTimeTargetGap_GapBelowSeedStop_Allowed, " +
+			"_ManifestGapBelowStop_Allowed, and " +
+			"TestEmitTimeTargetGapWarning_BoundedBySeedStop.",
+		Packages: []string{
+			"github.com/cybertec-postgresql/pg_hardstorage/internal/restore",
+		},
+	},
+	{
 		Tag: "mutation_stream_first_record_unchecked",
 		Description: "walsink accepts a reconnect's OPENING record at any " +
 			"LSN (pre-20afaf5): a stream that resumed past a hole looks " +
