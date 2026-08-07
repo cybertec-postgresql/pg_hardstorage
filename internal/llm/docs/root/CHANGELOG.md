@@ -13,6 +13,20 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **`wal stream` now captures the timeline-history file a cross-failover
+  PITR needs.** Nothing produced `<tli>.history` in a streaming-only
+  deployment: the only writer ran under `agent` with a Patroni URL
+  configured, and a `wal stream`-only HA setup runs neither that nor an
+  `archive_command`. Because the default `recovery_target_timeline` is
+  `latest`, PG does not fail when the file is absent — it follows the
+  highest timeline it can resolve history *for*, so recovery silently
+  proceeds along the pre-failover timeline and promotes a database
+  missing everything written after the promotion. The capture is
+  best-effort (refusing to stream would trade a PITR limitation for
+  losing all subsequent WAL) but never silent: a failure emits
+  `wal.timeline`/`history_not_captured` explaining the consequence.
+  Timeline 1 has no parent and is skipped without comment.
+
 - **`wal stream` no longer skips the old timeline's WAL after a
   promotion.** The resume point came from a lookup scoped to a single
   timeline. After a failover the new primary reports timeline N+1 and
