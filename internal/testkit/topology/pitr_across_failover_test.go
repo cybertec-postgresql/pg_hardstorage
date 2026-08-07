@@ -80,10 +80,21 @@ func TestPITR_AcrossAFailover_ArchiveServesEverySegment(t *testing.T) {
 	t.Logf("streaming with a leader-aware DSN across %d nodes", len(cluster.NodeDSNs()))
 
 	bin := buildProductBinary(t)
-	repoDir := t.TempDir()
+	// World-traversable: proof 4 boots a container (uid 999) whose
+	// restore_command must read this repo. See mkSharedDir.
+	repoDir := mkSharedDir(t, "pghs-pitr-repo-", 0o755)
 	repoURL := "file://" + repoDir
 	home := t.TempDir()
-	env := append(os.Environ(), "HOME="+home)
+	// The keyring lives in a world-readable shared dir because proof 4
+	// mounts it into the boot container: the WAL is ENCRYPTED (init
+	// --quick generates a local KEK), so the restore_command running
+	// inside recovery needs key access — the same requirement an
+	// operator's DR runbook has. Without it, wal fetch refuses with
+	// wal.fetch.decrypt_unavailable, which is the typed error doing its
+	// job, not a fixture fault.
+	keyringDir := mkSharedDir(t, "pghs-pitr-keyring-", 0o755)
+	env := append(os.Environ(), "HOME="+home,
+		"PG_HARDSTORAGE_KEYRING_DIR="+keyringDir)
 
 	runBin := func(timeout time.Duration, args ...string) (string, int) {
 		cctx, c := context.WithTimeout(ctx, timeout)
@@ -237,6 +248,75 @@ func TestPITR_AcrossAFailover_ArchiveServesEverySegment(t *testing.T) {
 	}
 	t.Logf("proof 3: %d segment(s) fetchable — %d on timeline %d, %d on timeline %d",
 		len(segs), onOld, tliBefore, onNew, tliAfter)
+
+	// --- Proof 4: a real PostgreSQL replays it. Everything above says
+	// the archive is complete and servable; this says PG AGREES —
+	// restore the pre-failover backup, recover with --to-latest, and
+	// the server must cross 2.history onto timeline 2 and serve marker
+	// B, the row that only ever existed after the promotion. This is
+	// the assertion the whole campaign exists for.
+	//
+	// The Spilo cluster is PG 17, so the boot container is postgres:17
+	// — same major, version-exact.
+	if out, err := exec.CommandContext(ctx, "chmod", "-R", "a+rX", repoDir).CombinedOutput(); err != nil {
+		t.Fatalf("chmod repo: %v\n%s", err, out)
+	}
+	targetRoot := mkSharedDir(t, "pghs-pitr-target-", 0o755)
+	target := filepath.Join(targetRoot, "restored")
+	if out, code := runBin(6*time.Minute, "restore", "db1", "latest",
+		"--repo", repoURL, "--target", target,
+		"--to-latest", "--to-action", "promote"); code != 0 {
+		t.Fatalf("restore --to-latest failed (%d):\n%s", code, lastLines(out, 1500))
+	}
+	// The boot container needs the KEK, and the keystore's mode gate
+	// dictates HOW: kek.bin must be exactly 0600 (a chmod a+r "fix"
+	// here cost a debugging session — the loader refuses 0644 by
+	// design), which for uid 999 means a copy OWNED by 999. This is
+	// the same provisioning a real recovery host needs, expressed in
+	// docker: the key arrives as the service user's own 0600 file.
+	bootKeyring := mkSharedDir(t, "pghs-pitr-bootkeyring-", 0o755)
+	kek, rerr := os.ReadFile(filepath.Join(keyringDir, "kek.bin"))
+	if rerr != nil {
+		t.Fatalf("read kek.bin: %v", rerr)
+	}
+	if werr := os.WriteFile(filepath.Join(bootKeyring, "kek.bin"), kek, 0o600); werr != nil {
+		t.Fatal(werr)
+	}
+	chownAll(t, ctx, bootKeyring, "999:999")
+	t.Cleanup(func() {
+		cctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		me := fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid())
+		chownAll(t, cctx, bootKeyring, me)
+	})
+	boot := bootRestoredDatadir(t, ctx, "postgres:17", target, []string{
+		bin + ":" + bin + ":ro",
+		repoDir + ":" + repoDir + ":ro",
+		bootKeyring + ":" + bootKeyring + ":ro",
+	}, []string{
+		"PG_HARDSTORAGE_KEYRING_DIR=" + bootKeyring,
+	})
+	boot.awaitPromoted(t, ctx, 4*time.Minute)
+
+	rows, qerr := boot.query(ctx, `SELECT note FROM failover_proof ORDER BY id`)
+	if qerr != nil {
+		t.Fatalf("query after promotion: %v\n%s", qerr, boot.logs(ctx))
+	}
+	if !strings.Contains(rows, "before-failover") {
+		t.Errorf("proof 4: marker A missing — the restore itself is broken: %q", rows)
+	}
+	if !strings.Contains(rows, "AFTER-failover") {
+		t.Errorf("proof 4: marker B missing.\n\nThe server promoted, but the row written "+
+			"AFTER the failover never arrived: PostgreSQL did not cross the timeline "+
+			"boundary during replay. Either 2.history was not served when PG probed for it, "+
+			"or the TLI-2 segments did not replay. Every fetch-level proof above passed — "+
+			"which is exactly why this boot exists.\ngot: %q\nboot log:\n%s",
+			rows, lastLines(boot.logs(ctx), 2500))
+	}
+	if !t.Failed() {
+		t.Logf("proof 4: BOOTED — PG replayed across timelines %d -> %d and served the "+
+			"post-failover row", tliBefore, tliAfter)
+	}
 }
 
 // currentTimeline returns the timeline the primary is WRITING on.

@@ -20,6 +20,7 @@ package testkit
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -121,12 +122,21 @@ func (p *Postgres) DataDir(t *testing.T) string {
 // on whichever single major the matrix happens to run (historically 17,
 // when the matrix was a silent no-op).
 func ExpectedPGMajor() string {
-	switch m := strings.TrimSpace(os.Getenv("PG_HARDSTORAGE_TEST_PG_MAJOR")); m {
-	case "15", "16", "18":
-		return m
-	default:
+	m := strings.TrimSpace(os.Getenv("PG_HARDSTORAGE_TEST_PG_MAJOR"))
+	if m == "" {
 		return "17"
 	}
+	// Accept any plausible major rather than an allowlist. The previous
+	// switch listed 15/16/18 and silently coerced EVERYTHING else to 17
+	// — including 19, so a matrix run that believed it was exercising
+	// PG 19 was testing 17 under a 19 label. A helper that substitutes
+	// a different major than asked is worse than one that crashes:
+	// every green result it produces is about the wrong version.
+	if n, err := strconv.Atoi(m); err == nil && n >= 15 && n <= 29 {
+		return m
+	}
+	panic(fmt.Sprintf("testkit: PG_HARDSTORAGE_TEST_PG_MAJOR=%q is not a PostgreSQL major in [15,29]; "+
+		"refusing to silently substitute another version", m))
 }
 
 // ExpectedPGMajorInt is ExpectedPGMajor parsed as an int.

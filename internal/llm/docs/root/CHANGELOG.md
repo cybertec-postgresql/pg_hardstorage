@@ -11,7 +11,34 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ## [Unreleased]
 
+### Added
+
+- **`restore --to-latest`: end-of-archive recovery.** There was no CLI
+  spelling for the most common disaster-recovery operation — restore the
+  backup, then replay *every* archived WAL segment. A restore without a
+  `--to*` target wrote no recovery files at all (while a doc comment
+  claimed otherwise), so booting it silently ignored everything archived
+  after the backup; and a fake far-future `--to` is no workaround, since
+  PostgreSQL 13+ FATALs when a recovery target outruns the WAL.
+  `--to-latest` writes `recovery.signal` + `restore_command` with no
+  target — PostgreSQL's definition of replay-to-end — then applies
+  `--to-action`. Conflicts with point targets are refused at flag level.
+
 ### Fixed
+
+- **`wal fetch` decrypt failures now name the exact refusing step.**
+  The error collapsed keyring-path-unresolvable, missing `kek.bin`, a
+  kek.bin *refused for its file mode* (the keystore requires 0600),
+  wrong KEK, and KMS-unreachable into one "could not be resolved"
+  message. `wal fetch` runs inside `restore_command`, in the most
+  minimal environment the product ever sees, mid-recovery — the
+  operator gets one shot at reading that line, and each cause has a
+  different fix.
+
+- **Test-only:** `testkit.ExpectedPGMajor` silently coerced any
+  unlisted major — including 19 — to 17, so a matrix believing it
+  tested PG 19 was testing 17 under a 19 label. It now accepts any
+  major in [15,29] verbatim and panics on garbage.
 
 - **`backup undelete` warns that a policy rotate will re-delete the
   resurrected backup.** Rotation deleted it as policy-excess; an

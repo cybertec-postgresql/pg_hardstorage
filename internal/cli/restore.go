@@ -54,6 +54,7 @@ PITR (replaying WAL up to a target):
   --to "2026-04-27 09:42 UTC" absolute time, parsed predictably
   --to-lsn 0/3000028          recover up to (and including) this LSN
   --to-name my-restore-point  recover up to a named restore point
+  --to-latest                 recover through ALL archived WAL, then --to-action
   --to-action pause|promote|shutdown   default pause (safest)
   --to-timeline latest|<N>    default 'latest'
 
@@ -99,6 +100,8 @@ binary's wal-fetch shim.`,
 		"recover up to this LSN (e.g. 0/3000028)")
 	c.Flags().StringVar(&opts.toName, "to-name", "",
 		"recover up to this PostgreSQL named restore point")
+	c.Flags().BoolVar(&opts.toLatest, "to-latest", false,
+		"recover through ALL archived WAL (no point-in-time target): restore_command replays every segment the repository holds on the target timeline, then --to-action applies. This is the ordinary disaster-recovery shape — without it, a plain restore boots with only the WAL bundled in the backup and silently ignores everything archived since.")
 	c.Flags().StringVar(&opts.toAction, "to-action", "pause",
 		"action when target reached: pause|promote|shutdown")
 	c.Flags().StringVar(&opts.toTimeline, "to-timeline", "latest",
@@ -133,10 +136,15 @@ type restoreOpts struct {
 
 	// PITR-related flags. At most one of toTime / toLSN / toName may
 	// be set; runRestore enforces this.
-	toTime      string
-	toLSN       string
-	toName      string
-	toAction    string
+	toTime   string
+	toLSN    string
+	toName   string
+	toAction string
+	// toLatest enables recovery with NO point-in-time target: replay
+	// every archived WAL segment the repository holds (following
+	// --to-timeline, default latest), then apply --to-action. See
+	// buildRecovery for why this needs its own flag.
+	toLatest    bool
 	toTimeline  string
 	toExclusive bool
 
@@ -479,10 +487,18 @@ func runRestore(cmd *cobra.Command, opts restoreOpts) error {
 // at the CLI layer with a clear structured error before the deeper
 // restore.WriteRecoveryFiles repeats the check.
 //
-// We always emit a restore_command pointing at this binary so PG
-// can fetch WAL during recovery — even when no explicit target is
-// set (the operator may want plain end-of-WAL recovery from our
-// archive).
+// End-of-archive recovery is opt-in via --to-latest. An earlier
+// version of this comment claimed recovery files were emitted "even
+// when no explicit target is set"; the code below never did that — a
+// plain restore returns nil and writes NO recovery files, so booting
+// it replays only the WAL bundled inside the backup and silently
+// ignores everything archived afterwards. That silence is exactly
+// wrong for the most common DR operation ("give me everything you
+// have"), and a fake far-future --to is not a workaround: PG 13+
+// FATALs with "recovery ended before configured recovery target was
+// reached" when the target outruns the WAL. --to-latest is the honest
+// spelling: recovery.signal + restore_command + no target, which PG
+// defines as replay-to-end-of-archive, then --to-action.
 // targetTime is the pre-parsed --to instant (the caller parses it
 // once and threads it here so the recovery_target_time armed on disk
 // is the exact instant used to resolve the seed backup). It is the
@@ -492,8 +508,16 @@ func buildRecovery(opts restoreOpts, targetTime time.Time) (*restore.Recovery, e
 	hasTime := opts.toTime != ""
 	hasName := opts.toName != ""
 
+	if opts.toLatest && (hasLSN || hasTime || hasName) {
+		return nil, output.NewError("usage.conflicting_targets",
+			"restore: --to-latest recovers through ALL archived WAL and cannot be combined with --to, --to-lsn or --to-name").Wrap(output.ErrUsage)
+	}
+
 	// No PITR flags at all: plain restore, no recovery files.
-	if !hasLSN && !hasTime && !hasName {
+	// (--to-latest is the explicit opt-in for target-LESS recovery; it
+	// flows through to the shared tail below so restore_command is
+	// attached exactly like every targeted recovery.)
+	if !hasLSN && !hasTime && !hasName && !opts.toLatest {
 		return nil, nil
 	}
 
@@ -574,6 +598,14 @@ func buildRestoreCommandString(deployment, repoURL string) (string, error) {
 // auto.conf emit, control-plane JSON body) sees a single uniform
 // shape regardless of the operator's casing.
 func validateRestoreTargets(opts *restoreOpts) error {
+	// Flag-level contradiction, checked before any repo or manifest
+	// I/O: end-of-archive recovery and a point target are two different
+	// operations, and which one wins must never depend on validation
+	// order.
+	if opts.toLatest && (opts.toLSN != "" || opts.toTime != "" || opts.toName != "") {
+		return output.NewError("usage.conflicting_targets",
+			"restore: --to-latest recovers through ALL archived WAL and cannot be combined with --to, --to-lsn or --to-name").Wrap(output.ErrUsage)
+	}
 	if opts.toLSN != "" {
 		// pglogrepl.ParseLSN tolerates trailing garbage and PG accepts
 		// non-canonical leading zeros, so a strict "<hex>/<hex>" shape

@@ -599,11 +599,20 @@ func runWalFetch(cmd *cobra.Command, opts walFetchOptions) error {
 	//     shared DEK resolved from a base-backup manifest. The all-plaintext
 	//     common case pays nothing.
 	if m.Encryption != nil {
-		encCAS, ok := decryptingCASFromEnvelope(cmd.Context(), sp,
+		encCAS, reason := decryptingCASFromEnvelope(cmd.Context(), sp,
 			m.Encryption.Scheme, m.Encryption.KEKRef, m.Encryption.WrappedDEK)
-		if !ok {
+		if encCAS == nil {
+			// The reason matters more here than almost anywhere: this
+			// runs inside restore_command, in a minimal recovery
+			// environment, and "could not be resolved" collapses a
+			// half-dozen distinct faults — keyring path unresolvable,
+			// kek.bin absent, kek.bin REFUSED for its file mode (the
+			// keystore requires 0600), wrong KEK, KMS unreachable —
+			// each with a different fix. An operator mid-recovery gets
+			// one shot at reading this line before PG gives up on the
+			// segment.
 			return output.NewError("wal.fetch.decrypt_unavailable",
-				fmt.Sprintf("wal fetch: segment %q is encrypted but its DEK could not be resolved (keyring/KMS unavailable or wrong KEK) — recovery needs key access, same as an encrypted base-backup restore", opts.segmentName))
+				fmt.Sprintf("wal fetch: segment %q is encrypted but its DEK could not be resolved (%s) — recovery needs key access, same as an encrypted base-backup restore", opts.segmentName, reason))
 		}
 		if err := writeSegmentAtomically(cmd.Context(), encCAS, m, opts.targetPath); err != nil {
 			return err
@@ -875,60 +884,72 @@ func buildWALDecryptingCAS(ctx context.Context, sp storage.StoragePlugin, deploy
 	if info == nil {
 		return nil, false
 	}
-	return decryptingCASFromEnvelope(ctx, sp, info.Scheme, info.KEKRef, info.WrappedDEK)
+	cas, _ := decryptingCASFromEnvelope(ctx, sp, info.Scheme, info.KEKRef, info.WrappedDEK)
+	return cas, cas != nil
 }
 
 // decryptingCASFromEnvelope resolves the plaintext DEK described by a single
 // envelope (scheme / kekRef / base64 wrapped DEK) — via cloud KMS or the local
 // keyring, mirroring a base-backup restore — and returns a CAS that decrypts
-// chunks with it. ok=false on any scheme mismatch or DEK-resolution failure,
-// so the caller keeps its original error. Shared by the segment-manifest
-// envelope path (issue #106) and the backup-manifest fallback.
-func decryptingCASFromEnvelope(ctx context.Context, sp storage.StoragePlugin, scheme, kekRef, wrappedB64 string) (*repo.CAS, bool) {
+// chunks with it, or (nil, reason) naming exactly which step refused.
+//
+// The reason string exists because this used to be a bare ok=false, and
+// a debugging session inside a recovery container burned three
+// container-boot cycles distinguishing "keyring path unresolvable" from
+// "kek.bin has mode 0644; require 0600" — a distinction the keystore
+// reports precisely and this function used to discard. wal fetch runs
+// inside restore_command, in the most minimal environment the product
+// ever sees; its errors must carry everything the operator needs,
+// because there is no second command to run for detail. Shared by the
+// segment-manifest envelope path (issue #106) and the backup-manifest
+// fallback.
+func decryptingCASFromEnvelope(ctx context.Context, sp storage.StoragePlugin, scheme, kekRef, wrappedB64 string) (*repo.CAS, string) {
 	if scheme != "aes-256-gcm" {
-		return nil, false
+		return nil, fmt.Sprintf("unsupported encryption scheme %q", scheme)
 	}
 	wrapped, err := base64.StdEncoding.DecodeString(wrappedB64)
 	if err != nil {
-		return nil, false
+		return nil, fmt.Sprintf("wrapped DEK is not valid base64: %v", err)
 	}
 
 	var dek []byte
 	if s := kms.SchemeOf(kekRef); s != "" && s != "local" {
 		// Provider settings come from the `kms.providers` entry matching
-		// this manifest's own KEKRef. Passing an empty UnwrapOpts here
-		// meant a provider needing an explicit region or credential could
-		// never be opened — and because this function reports failure as
-		// ok=false so the caller keeps its original error, the operator
-		// saw an unrelated downstream message rather than the KMS one.
+		// this manifest's own KEKRef.
 		d, uerr := keystore.UnwrapDEK(ctx, kekRef, wrapped, keystore.UnwrapOpts{
 			ProviderConfig: deploymentKMSResolver(nil)(kekRef),
 		})
 		if uerr != nil {
-			return nil, false
+			return nil, fmt.Sprintf("KMS unwrap via %s failed: %v", kekRef, uerr)
 		}
 		dek = d
 	} else {
 		pth, perr := paths.Resolve(paths.DefaultOptions())
-		if perr != nil || pth.Keyring.Value == "" || !keystore.KEKExists(pth.Keyring.Value) {
-			return nil, false
+		if perr != nil {
+			return nil, fmt.Sprintf("keyring path unresolvable: %v", perr)
+		}
+		if pth.Keyring.Value == "" {
+			return nil, "no keyring directory configured (set PG_HARDSTORAGE_KEYRING_DIR in the recovery environment)"
+		}
+		if !keystore.KEKExists(pth.Keyring.Value) {
+			return nil, fmt.Sprintf("no readable %s in keyring %s", keystore.KEKFileName, pth.Keyring.Value)
 		}
 		kek, kerr := keystore.KEKResolver(pth.Keyring.Value)(kekRef)
 		if kerr != nil {
-			return nil, false
+			return nil, fmt.Sprintf("KEK load from %s failed: %v", pth.Keyring.Value, kerr)
 		}
 		d, uerr := encryption.Unwrap(kek, wrapped)
 		if uerr != nil {
-			return nil, false
+			return nil, fmt.Sprintf("DEK unwrap failed (wrong KEK for ref %q?): %v", kekRef, uerr)
 		}
 		dek = d[:]
 	}
 
 	enc, err := aesgcm.New(dek)
 	if err != nil {
-		return nil, false
+		return nil, fmt.Sprintf("cipher init: %v", err)
 	}
-	return casdefault.NewEncrypted(sp, enc), true
+	return casdefault.NewEncrypted(sp, enc), ""
 }
 
 // deploymentBackupKEKRef returns the KEKRef of the deployment's first
