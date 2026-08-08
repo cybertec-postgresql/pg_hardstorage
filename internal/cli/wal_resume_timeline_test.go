@@ -43,6 +43,7 @@ import (
 
 	"github.com/jackc/pglogrepl"
 
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/output"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/pg/replication"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/pg/walsink"
 )
@@ -57,7 +58,7 @@ func slotAt(n uint64) *replication.SlotInfo {
 	return &replication.SlotInfo{RestartLSN: seg(n).String()}
 }
 
-// TestResolveStartLSN_AfterPromotionRefusesToSkipTheOldTimeline is the
+// TestResolveStartLSN_AfterPromotionResumesAtOldFrontierNotSlot is the
 // regression test for the bug.
 //
 // TLI 1 holds segments 0..10, so the frontier is the end of segment 10
@@ -68,30 +69,38 @@ func slotAt(n uint64) *replication.SlotInfo {
 // That is genuine, unrecoverable loss, and the only acceptable
 // behaviour is to say so. Anchoring at segment 50 and reporting success
 // is what this test forbids.
-func TestResolveStartLSN_AfterPromotionRefusesToSkipTheOldTimeline(t *testing.T) {
+func TestResolveStartLSN_AfterPromotionResumesAtOldFrontierNotSlot(t *testing.T) {
 	sp, _ := newFsRepo(t)
 	const dep = "db1"
 	for n := uint64(0); n <= 10; n++ {
 		putRealSeg(t, sp, dep, 1, n)
 	}
 
+	var events []*output.Event
 	lsn, note, err := resolveStartLSN(context.Background(), sp,
-		walStreamOptions{deployment: dep, pgConn: "x"}, 2, slotAt(50))
+		walStreamOptions{deployment: dep, pgConn: "x"}, 2, slotAt(50),
+		func(ev *output.Event) { events = append(events, ev) })
 
-	if err == nil {
-		t.Fatalf("resolveStartLSN returned %s (%s) with no error.\n\n"+
-			"TLI 1 is archived through segment 10 and the new leader's slot is at "+
-			"segment 50, so segments 11..49 are held nowhere. Resuming at segment 50 "+
-			"skips them silently: EnsureSlot runs with lastConfirmedLSN=0 so no gap is "+
-			"computed, walsink's contiguity guard resets on reconnect, and `wal audit` "+
-			"skips timeline transitions. The operator learns about it when a PITR across "+
-			"the window fails.", lsn, note)
+	if err != nil {
+		t.Fatalf("resolveStartLSN refused: %v\n\nThe essential property survives "+
+			"attempt-first: the resume must NOT skip to the slot at segment 50 — it "+
+			"resumes at the OLD timeline's frontier so nothing is silently skipped.", err)
 	}
-	if !strings.Contains(err.Error(), "start_before_slot_restart_lsn") &&
-		!strings.Contains(err.Error(), "older than the slot's restart_lsn") {
-		t.Fatalf("err = %v\n\nwant wal.start_before_slot_restart_lsn — the existing code "+
-			"already has the right diagnosis and remediation for unrecoverable WAL; the "+
-			"post-promotion path just never reached it", err)
+	if lsn != pglogrepl.LSN(11*walsink.SegmentSize) {
+		t.Fatalf("start = %s (%s), want the old timeline's frontier (end of segment 10).\n\n"+
+			"Resuming anywhere higher skips segments 11..49 silently: EnsureSlot runs "+
+			"with lastConfirmedLSN=0 so no gap is computed, walsink's contiguity guard "+
+			"resets on reconnect, and `wal audit` skips timeline transitions.", lsn, note)
+	}
+	warned := false
+	for _, ev := range events {
+		if ev.Op == "start_behind_slot_restart_lsn" {
+			warned = true
+		}
+	}
+	if !warned {
+		t.Error("resuming below the recreated slot's restart_lsn must WARN — the mismatch " +
+			"is the operator's early signal if PostgreSQL later reports the WAL removed")
 	}
 }
 
@@ -114,7 +123,7 @@ func TestResolveStartLSN_AfterPromotionResumesAtTheOldFrontier(t *testing.T) {
 	}
 
 	lsn, note, err := resolveStartLSN(context.Background(), sp,
-		walStreamOptions{deployment: dep, pgConn: "x"}, 2, slotAt(4))
+		walStreamOptions{deployment: dep, pgConn: "x"}, 2, slotAt(4), nil)
 	if err != nil {
 		t.Fatalf("resolveStartLSN: %v", err)
 	}
@@ -139,7 +148,7 @@ func TestResolveStartLSN_AfterPromotionResumesAtTheOldFrontier(t *testing.T) {
 func TestResolveStartLSN_GenuinelyFreshIsUnchanged(t *testing.T) {
 	sp, _ := newFsRepo(t)
 	lsn, note, err := resolveStartLSN(context.Background(), sp,
-		walStreamOptions{deployment: "db1", pgConn: "x"}, 1, slotAt(7))
+		walStreamOptions{deployment: "db1", pgConn: "x"}, 1, slotAt(7), nil)
 	if err != nil {
 		t.Fatalf("resolveStartLSN: %v", err)
 	}
@@ -158,7 +167,7 @@ func TestResolveStartLSN_GenuinelyFreshIsUnchanged(t *testing.T) {
 func TestResolveStartLSN_FreshOnALaterTimelineStaysFresh(t *testing.T) {
 	sp, _ := newFsRepo(t)
 	lsn, note, err := resolveStartLSN(context.Background(), sp,
-		walStreamOptions{deployment: "db1", pgConn: "x"}, 5, slotAt(7))
+		walStreamOptions{deployment: "db1", pgConn: "x"}, 5, slotAt(7), nil)
 	if err != nil {
 		t.Fatalf("resolveStartLSN: %v", err)
 	}
@@ -191,7 +200,7 @@ func TestResolveStartLSN_PrefersTheNearestTimelineBelow(t *testing.T) {
 	}
 
 	lsn, note, err := resolveStartLSN(context.Background(), sp,
-		walStreamOptions{deployment: dep, pgConn: "x"}, 3, slotAt(4))
+		walStreamOptions{deployment: dep, pgConn: "x"}, 3, slotAt(4), nil)
 	if err != nil {
 		t.Fatalf("resolveStartLSN: %v", err)
 	}

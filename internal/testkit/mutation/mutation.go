@@ -58,6 +58,19 @@ type Mutation struct {
 // in the named package — see the package doc.
 var Registry = []Mutation{
 	{
+		Tag: "mutation_wal_removed_retried",
+		Description: "the stream never recognises PostgreSQL's 'requested " +
+			"WAL segment has already been removed' verdict (the " +
+			"evidence-based replacement for the retired predictive " +
+			"start-vs-restart_lsn refusal, bug #28): recycled WAL is " +
+			"retried forever — issue #45's endless-loop shape — and the " +
+			"operator's re-anchor guidance never surfaces. Caught by " +
+			"TestDecideStreamStop_WalRemovedIsEvidenceBasedTerminal.",
+		Packages: []string{
+			"github.com/cybertec-postgresql/pg_hardstorage/internal/cli",
+		},
+	},
+	{
 		Tag: "mutation_fetch_sysid_unchecked",
 		Description: "wal fetch hands foreign WAL to recovery without an " +
 			"identity check (pre-#26): an archive mixing cluster lineages " +

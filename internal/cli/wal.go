@@ -2015,7 +2015,7 @@ func streamAttempt(
 		}
 	}
 
-	startLSN, resumeNote, err := resolveStartLSN(repoCtx, sp, opts, timeline, slotInfo)
+	startLSN, resumeNote, err := resolveStartLSN(repoCtx, sp, opts, timeline, slotInfo, emit)
 	if err != nil {
 		return nil, 0, 0, 0, timeline, identityID, err
 	}
@@ -2297,6 +2297,10 @@ func shouldEmitEvent(suppress bool, sev output.Severity) bool {
 // loop consults it, and that gap is how a permanent failure was
 // retried forever (issue #45).
 func decideStreamStop(streamErr error, noProgress int) (code, msg string, stop bool) {
+	if isWalRemovedError(streamErr) {
+		e := startBeforeRestartError(streamErr)
+		return "wal.start_before_slot_restart_lsn", e.Error(), true
+	}
 	if isPermanentStreamError(streamErr) {
 		return "wal.stream_permanent",
 			fmt.Sprintf("wal stream stopped: %v", streamErr), true
@@ -2326,6 +2330,14 @@ const maxNoProgressAttempts = 5
 // answering NotImplemented to a conditional COPY — produced an endless
 // reconnect loop instead of one actionable failure (issue #45).
 func isPermanentStreamError(err error) bool {
+	// PostgreSQL reporting the requested WAL as removed is the
+	// EVIDENCE-BASED form of the old predictive start-vs-restart_lsn
+	// refusal (see warnIfStartBehindRestart): the archive's resume
+	// point is genuinely recycled, reconnecting cannot fix it, and
+	// the operator remediation is the classic re-anchor sequence.
+	if isWalRemovedError(err) {
+		return true
+	}
 	// A backend that does not implement an operation will not have
 	// implemented it by the next attempt.
 	if errors.Is(err, storage.ErrUnsupported) {
@@ -2362,8 +2374,7 @@ func isPermanentStreamSetupError(err error) bool {
 		return true
 	}
 	switch oe.Code {
-	case "wal.start_before_slot_restart_lsn",
-		"wal.slot_no_restart_lsn":
+	case "wal.slot_no_restart_lsn":
 		return true
 	}
 	return false
@@ -2462,7 +2473,7 @@ func ensureSlot(ctx context.Context, dsn, slotName string) (*replication.SlotInf
 //
 // Note string explains which path was taken so it lands in the
 // start event's body for operator-visible diagnostics.
-func resolveStartLSN(ctx context.Context, sp storage.StoragePlugin, opts walStreamOptions, timeline uint32, slotInfo *replication.SlotInfo) (pglogrepl.LSN, string, error) {
+func resolveStartLSN(ctx context.Context, sp storage.StoragePlugin, opts walStreamOptions, timeline uint32, slotInfo *replication.SlotInfo, emit func(*output.Event)) (pglogrepl.LSN, string, error) {
 	// Slot restart_lsn is the floor — any computed start LSN below
 	// it would ask PG for WAL it may have already recycled (or, if
 	// max_slot_wal_keep_size kicked in, definitely has).  Parse it
@@ -2491,9 +2502,7 @@ func resolveStartLSN(ctx context.Context, sp storage.StoragePlugin, opts walStre
 				fmt.Sprintf("wal stream: --start-lsn %s is not segment-aligned (must be a multiple of %d)",
 					opts.startLSN, segSize)).Wrap(output.ErrUsage)
 		}
-		if err := assertStartGEQRestart(lsn, restartLSN, "explicit-flag", segSize); err != nil {
-			return 0, "", err
-		}
+		warnIfStartBehindRestart(lsn, restartLSN, "explicit-flag", segSize, emit)
 		return lsn, "explicit-flag", nil
 	}
 
@@ -2508,9 +2517,7 @@ func resolveStartLSN(ctx context.Context, sp storage.StoragePlugin, opts walStre
 			fmt.Sprintf("wal stream: list committed segments: %v", err)).Wrap(err)
 	}
 	if found {
-		if err := assertStartGEQRestart(endLSN, restartLSN, "resume-from-repo", segSize); err != nil {
-			return 0, "", err
-		}
+		warnIfStartBehindRestart(endLSN, restartLSN, "resume-from-repo", segSize, emit)
 		return endLSN, "resume-from-repo", nil
 	}
 
@@ -2530,11 +2537,20 @@ func resolveStartLSN(ctx context.Context, sp storage.StoragePlugin, opts walStre
 	//
 	// The previous timeline's frontier is a position the new primary
 	// can still serve, because the lineages share history up to the
-	// branch point.  So resume there and let the ordinary floor check
-	// decide: if the new primary has already recycled past it,
-	// assertStartGEQRestart raises wal.start_before_slot_restart_lsn,
-	// which tells the operator the WAL is unrecoverable and what to do
-	// about it.  Loud and wrong-but-known beats silent and lost.
+	// branch point.  So resume there and let POSTGRESQL decide. The
+	// old floor check refused whenever the frontier sat below the
+	// slot's restart_lsn — but restart_lsn is a retention FLOOR, not
+	// an availability ceiling, and Patroni recreates permanent slots
+	// at the PROMOTION point: after a DCS demotion storm the recreated
+	// slot routinely sits above a perfectly servable frontier, and the
+	// predictive refusal killed streamers in a self-healing situation
+	// (caught by the chaos gate's dcs_outage fault, nightly #8). Now:
+	// warn on the mismatch, ATTEMPT the stream, and let walsender's
+	// own "requested WAL segment ... has already been removed" be the
+	// evidence-based permanent stop (classified in
+	// isPermanentStreamError with the original operator guidance).
+	// Loud-if-actually-lost still beats silent — and self-healing
+	// beats loud-but-wrong.
 	priorLSN, priorTLI, priorFound, err := inventory.HighestArchivedLSNBefore(ctx, sp, opts.deployment, timeline)
 	if err != nil {
 		return 0, "", output.NewError("repo.list_failed",
@@ -2542,9 +2558,7 @@ func resolveStartLSN(ctx context.Context, sp storage.StoragePlugin, opts walStre
 	}
 	if priorFound {
 		note := fmt.Sprintf("resume-across-timeline-%d", priorTLI)
-		if err := assertStartGEQRestart(priorLSN, restartLSN, note, segSize); err != nil {
-			return 0, "", err
-		}
+		warnIfStartBehindRestart(priorLSN, restartLSN, note, segSize, emit)
 		return priorLSN, note, nil
 	}
 
@@ -2605,21 +2619,40 @@ func resolveStartLSN(ctx context.Context, sp storage.StoragePlugin, opts walStre
 // that case we accept any start position because we have nothing
 // to compare against.  All callers that pass real slot info will
 // have a non-zero restartLSN.
-func assertStartGEQRestart(start, restartLSN pglogrepl.LSN, branch string, segSize int64) error {
+func warnIfStartBehindRestart(start, restartLSN pglogrepl.LSN, branch string, segSize int64, emit func(*output.Event)) {
 	if restartLSN == 0 {
-		return nil
+		return
 	}
 	startSeg := uint64(start) &^ uint64(segSize-1)
 	restartSeg := uint64(restartLSN) &^ uint64(segSize-1)
 	if startSeg >= restartSeg {
-		return nil
+		return
 	}
+	if emit == nil {
+		return
+	}
+	emit(output.NewEvent(output.SeverityWarning, "wal.stream", "start_behind_slot_restart_lsn").
+		WithBody(map[string]any{
+			"start_lsn":   start.String(),
+			"restart_lsn": restartLSN.String(),
+			"branch":      branch,
+			"message": "computed start sits below the slot's restart_lsn. restart_lsn is a " +
+				"retention floor, not proof of recycling — Patroni recreates permanent slots at " +
+				"the promotion point, so after a failover this gap is usually still on disk. " +
+				"Attempting the stream; if the WAL is truly gone, walsender refuses loudly and " +
+				"that refusal is terminal (wal.start_before_slot_restart_lsn).",
+		}))
+}
+
+// startBeforeRestartError is the evidence-based form of the old
+// predictive refusal: raised when POSTGRESQL ITSELF reports the
+// requested WAL as removed. Same code, same operator guidance.
+func startBeforeRestartError(cause error) error {
 	return output.NewError("wal.start_before_slot_restart_lsn",
-		fmt.Sprintf("wal stream: computed start LSN %s (%s) sits in a WAL segment older than the slot's restart_lsn %s — PG has already recycled past this point and would refuse the stream",
-			start.String(), branch, restartLSN.String())).
+		fmt.Sprintf("wal stream: PostgreSQL reports the requested WAL as already removed — the archive's resume point has been recycled on the primary: %v", cause)).
 		WithSuggestion(&output.Suggestion{
 			Human: "the WAL between the highest archived segment and the slot's restart_lsn is unrecoverable — taking a fresh full backup ALONE does not heal this (the wal-stream resume looks at archived segments, not at backups). To restart cleanly: (1) take a fresh full backup (`pg_hardstorage backup <deployment>`), (2) drop the replication slot (`SELECT pg_drop_replication_slot('" + "<slot>" + "')` on the primary — the next `wal stream` recreates it with RESERVE_WAL anchored at PG's current position), (3) restart `wal stream`. Alternatively pass `--start-lsn=<segment-aligned LSN at or after restart_lsn>` to acknowledge the gap and resume from there.",
-		})
+		}).Wrap(cause)
 }
 
 // queryCurrentWalInsertLSN runs `SELECT pg_current_wal_insert_lsn()`

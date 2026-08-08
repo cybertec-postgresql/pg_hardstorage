@@ -15,6 +15,7 @@ package cli
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -31,8 +32,11 @@ func setupErr(code string) error {
 // --- Setup-error half (ported from the simulator, now on the real machine).
 
 func TestRetryPolicy_PermanentSetupErrorExitsImmediately(t *testing.T) {
+	// wal.start_before_slot_restart_lsn left this list when the
+	// predictive refusal became evidence-based: it now arrives as a
+	// STREAM error (walsender's removed-segment verdict), classified
+	// by decideStreamStop — see TestDecideStreamStop_WalRemoved.
 	for _, code := range []string{
-		"wal.start_before_slot_restart_lsn",
 		"wal.slot_no_restart_lsn",
 		"usage.bad_lsn",
 		"usage.unaligned_lsn",
@@ -225,5 +229,26 @@ func TestRetryPolicy_NoReconnectMidStreamReturnsStreamErr(t *testing.T) {
 	d := p.decide(attemptOutcome{StreamErr: streamBreak("break"), AttemptWall: time.Second})
 	if d.Action != retryReturnStreamErr {
 		t.Errorf("--no-reconnect mid-stream: %v, want retryReturnStreamErr", d.Action)
+	}
+}
+
+// TestDecideStreamStop_WalRemovedIsEvidenceBasedTerminal: PostgreSQL
+// reporting the requested WAL as removed is the evidence-based form
+// of the retired predictive refusal — same code, same remediation,
+// but only when the loss is REAL. Without this classification the
+// stream would retry the unfixable forever (issue #45's shape).
+func TestDecideStreamStop_WalRemovedIsEvidenceBasedTerminal(t *testing.T) {
+	err := errors.New(`ERROR: requested WAL segment 000000050000000000000003 has already been removed (SQLSTATE 58P01)`)
+	code, msg, stop := decideStreamStop(err, 0)
+	if !stop {
+		t.Fatal("walsender's removed-segment verdict must stop the stream — retrying " +
+			"cannot bring recycled WAL back")
+	}
+	if code != "wal.start_before_slot_restart_lsn" {
+		t.Errorf("code = %q, want the classic wal.start_before_slot_restart_lsn (operator "+
+			"guidance continuity)", code)
+	}
+	if !strings.Contains(msg, "already removed") && !strings.Contains(msg, "recycled") {
+		t.Errorf("message does not carry the diagnosis: %s", msg)
 	}
 }

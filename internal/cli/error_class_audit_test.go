@@ -47,7 +47,8 @@ import (
 // are added to that switch, add them here too — the asymmetry-detection
 // test below will catch a drift but it can't fix it for you.
 var permanentCodes = []string{
-	"wal.start_before_slot_restart_lsn",
+	// wal.start_before_slot_restart_lsn moved to the STREAM-error
+	// side (evidence-based, decideStreamStop) — bug #28.
 	"wal.slot_no_restart_lsn",
 	"usage.bad_lsn",
 	"usage.unaligned_lsn",

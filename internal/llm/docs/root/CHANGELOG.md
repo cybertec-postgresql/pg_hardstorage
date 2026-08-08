@@ -11,6 +11,25 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A recreated replication slot no longer kills the streamer.** The
+  resume floor check refused whenever the computed start sat below the
+  slot's `restart_lsn`, treating it as proof the WAL was recycled. It
+  is not: `restart_lsn` is a retention floor, and Patroni recreates
+  permanent slots at the promotion point — after a failover (the
+  chaos gate's new DCS-outage fault found it on a demotion storm) the
+  recreated slot routinely sits above a perfectly servable archive
+  frontier, and the predictive refusal stopped `wal stream`
+  permanently in a self-healing situation. The stream now warns on
+  the mismatch and ATTEMPTS the resume; PostgreSQL is the arbiter. If
+  the WAL is genuinely gone, walsender's own "requested WAL segment
+  has already been removed" is classified as the terminal error with
+  the same `wal.start_before_slot_restart_lsn` code and the same
+  re-anchor remediation — real losses read exactly as before, only
+  the false positives are gone.
+
+
 ## [1.2.0] — 2026-08-08
 
 ### Fixed

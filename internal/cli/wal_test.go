@@ -174,7 +174,7 @@ func TestHighestCommittedSegment_PerDeploymentIsolation(t *testing.T) {
 func TestResolveStartLSN_FreshNoSlot_ReturnsZero(t *testing.T) {
 	sp, _ := newFsRepo(t)
 	lsn, note, err := resolveStartLSN(context.Background(), sp,
-		walStreamOptions{deployment: "db1"}, 1, nil /* no slot info */)
+		walStreamOptions{deployment: "db1"}, 1, nil /* no slot info */, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -198,7 +198,7 @@ func TestResolveStartLSN_FreshSlot_UsesRestartLSNAlignedDown(t *testing.T) {
 	// 0/4000000; aligned-down answer is 0/3000000.
 	slot := &replication.SlotInfo{Name: "pg_hardstorage_db1", RestartLSN: "0/3000800"}
 	lsn, note, err := resolveStartLSN(context.Background(), sp,
-		walStreamOptions{deployment: "db1"}, 1, slot)
+		walStreamOptions{deployment: "db1"}, 1, slot, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -217,7 +217,7 @@ func TestResolveStartLSN_FreshSlot_RestartLSNOnSegmentBoundary(t *testing.T) {
 	// needed; the answer is restart_lsn itself.
 	slot := &replication.SlotInfo{Name: "pg_hardstorage_db1", RestartLSN: "0/3000000"}
 	lsn, note, err := resolveStartLSN(context.Background(), sp,
-		walStreamOptions{deployment: "db1"}, 1, slot)
+		walStreamOptions{deployment: "db1"}, 1, slot, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -244,7 +244,7 @@ func TestResolveStartLSN_ResumeFromRepo(t *testing.T) {
 		RestartLSN: pglogrepl.LSN(walsink.SegmentSize).String(),
 	}
 	lsn, note, err := resolveStartLSN(context.Background(), sp,
-		walStreamOptions{deployment: "db1"}, 1, slot)
+		walStreamOptions{deployment: "db1"}, 1, slot, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -257,26 +257,44 @@ func TestResolveStartLSN_ResumeFromRepo(t *testing.T) {
 	}
 }
 
-func TestResolveStartLSN_ResumeBehindSlot_Refuses(t *testing.T) {
+func TestResolveStartLSN_ResumeBehindSlot_WarnsAndAttempts(t *testing.T) {
 	sp, _ := newFsRepo(t)
-	// One committed segment in repo at segment 0 → end LSN
-	// = 1*SegmentSize.  But the slot's restart_lsn has
-	// already advanced past segment 5.  Resume from end of
-	// segment 0 would ask PG for WAL it has long recycled —
-	// the safety check must refuse with a typed error.
+	// One committed segment in repo at segment 0; the slot's
+	// restart_lsn is past segment 5. The OLD behaviour refused here
+	// predictively — and the chaos gate's dcs_outage fault proved
+	// that kills streamers in self-healing situations: restart_lsn is
+	// a retention floor, not proof of recycling, and Patroni
+	// recreates permanent slots at the promotion point. The resume
+	// must now WARN, return the archive frontier, and let PostgreSQL
+	// arbitrate (its removed-segment error is the evidence-based
+	// terminal, classified in decideStreamStop).
 	putRealSeg(t, sp, "db1", 1, 0)
 	slot := &replication.SlotInfo{
 		Name:       "pg_hardstorage_db1",
 		RestartLSN: pglogrepl.LSN(5 * walsink.SegmentSize).String(),
 	}
-	_, _, err := resolveStartLSN(context.Background(), sp,
-		walStreamOptions{deployment: "db1"}, 1, slot)
-	if err == nil {
-		t.Fatal("expected refusal when resume LSN is older than slot restart_lsn")
+	var events []*output.Event
+	lsn, note, err := resolveStartLSN(context.Background(), sp,
+		walStreamOptions{deployment: "db1"}, 1, slot,
+		func(ev *output.Event) { events = append(events, ev) })
+	if err != nil {
+		t.Fatalf("behind-slot resume must attempt, not refuse: %v", err)
 	}
-	if !strings.Contains(err.Error(), "start_before_slot_restart_lsn") &&
-		!strings.Contains(err.Error(), "older than the slot") {
-		t.Errorf("error should reference the safety check; got %v", err)
+	if lsn != pglogrepl.LSN(1*walsink.SegmentSize) {
+		t.Errorf("start = %s, want the archive frontier (end of segment 0)", lsn)
+	}
+	if note != "resume-from-repo" {
+		t.Errorf("note = %q", note)
+	}
+	found := false
+	for _, ev := range events {
+		if ev.Op == "start_behind_slot_restart_lsn" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("no start_behind_slot_restart_lsn warning emitted — the mismatch must be " +
+			"loud even while attempting")
 	}
 }
 
@@ -288,7 +306,7 @@ func TestResolveStartLSN_ExplicitFlagWins(t *testing.T) {
 	// flag's 0/3000000 — safety check passes.
 	slot := &replication.SlotInfo{Name: "pg_hardstorage_db1", RestartLSN: "0/2000000"}
 	lsn, note, err := resolveStartLSN(context.Background(), sp,
-		walStreamOptions{deployment: "db1", startLSN: "0/3000000"}, 1, slot)
+		walStreamOptions{deployment: "db1", startLSN: "0/3000000"}, 1, slot, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -301,21 +319,32 @@ func TestResolveStartLSN_ExplicitFlagWins(t *testing.T) {
 	}
 }
 
-func TestResolveStartLSN_ExplicitFlagBehindSlot_Refuses(t *testing.T) {
+func TestResolveStartLSN_ExplicitFlagBehindSlot_WarnsAndAttempts(t *testing.T) {
 	sp, _ := newFsRepo(t)
-	// Operator passed an explicit --start-lsn older than the
-	// slot's restart_lsn.  PG would either reject the
-	// START_REPLICATION or silently ignore us; the safety
-	// check turns this into a typed error before we ever
-	// open the streaming connection.
+	// Operator passed an explicit --start-lsn older than the slot's
+	// restart_lsn. Attempt-first applies here too: the operator's
+	// explicit position is honoured, the mismatch is warned loudly,
+	// and PostgreSQL arbitrates — its removed-segment error is the
+	// evidence-based terminal if the WAL is truly gone.
 	slot := &replication.SlotInfo{Name: "pg_hardstorage_db1", RestartLSN: "0/5000000"}
-	_, _, err := resolveStartLSN(context.Background(), sp,
-		walStreamOptions{deployment: "db1", startLSN: "0/3000000"}, 1, slot)
-	if err == nil {
-		t.Fatal("expected refusal when --start-lsn is older than slot restart_lsn")
+	var events []*output.Event
+	lsn, _, err := resolveStartLSN(context.Background(), sp,
+		walStreamOptions{deployment: "db1", startLSN: "0/3000000"}, 1, slot,
+		func(ev *output.Event) { events = append(events, ev) })
+	if err != nil {
+		t.Fatalf("explicit flag behind slot must attempt, not refuse: %v", err)
 	}
-	if !strings.Contains(err.Error(), "older than the slot") {
-		t.Errorf("error should reference the safety check; got %v", err)
+	if lsn.String() != "0/3000000" {
+		t.Errorf("start = %s, want the operator's explicit 0/3000000", lsn)
+	}
+	warned := false
+	for _, ev := range events {
+		if ev.Op == "start_behind_slot_restart_lsn" {
+			warned = true
+		}
+	}
+	if !warned {
+		t.Error("no warning for the behind-slot mismatch")
 	}
 }
 
@@ -323,7 +352,7 @@ func TestResolveStartLSN_RejectsUnalignedFlag(t *testing.T) {
 	sp, _ := newFsRepo(t)
 	// 0/3000001 is one byte past a segment boundary.
 	_, _, err := resolveStartLSN(context.Background(), sp,
-		walStreamOptions{deployment: "db1", startLSN: "0/3000001"}, 1, nil)
+		walStreamOptions{deployment: "db1", startLSN: "0/3000001"}, 1, nil, nil)
 	if err == nil {
 		t.Fatal("expected error on unaligned LSN")
 	}
@@ -335,7 +364,7 @@ func TestResolveStartLSN_RejectsUnalignedFlag(t *testing.T) {
 func TestResolveStartLSN_RejectsBadLSN(t *testing.T) {
 	sp, _ := newFsRepo(t)
 	_, _, err := resolveStartLSN(context.Background(), sp,
-		walStreamOptions{deployment: "db1", startLSN: "not-an-lsn"}, 1, nil)
+		walStreamOptions{deployment: "db1", startLSN: "not-an-lsn"}, 1, nil, nil)
 	if err == nil {
 		t.Fatal("expected parse error")
 	}
@@ -642,13 +671,12 @@ func TestIsPermanentStreamSetupError(t *testing.T) {
 		err  error
 		want bool
 	}{
-		// Permanent: operator must drop slot / pass --start-lsn.
-		{
-			name: "start_before_slot_restart_lsn (#79 reporter)",
-			err: output.NewError("wal.start_before_slot_restart_lsn",
-				"WAL recycled past resume LSN"),
-			want: true,
-		},
+		// wal.start_before_slot_restart_lsn is deliberately ABSENT
+		// from the setup-permanent set since the predictive refusal
+		// became evidence-based (bug #28, DCS-outage fault): the code
+		// now arrives as a STREAM error — walsender's removed-segment
+		// verdict — classified by decideStreamStop
+		// (TestDecideStreamStop_WalRemovedIsEvidenceBasedTerminal).
 		// Permanent: slot has no restart_lsn → stale slot, needs drop.
 		{
 			name: "slot_no_restart_lsn",
