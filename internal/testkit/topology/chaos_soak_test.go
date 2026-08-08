@@ -338,7 +338,16 @@ func TestChaosSoak_RestoreProof(t *testing.T) {
 	// So: report progress, and own the deadline rather than letting the
 	// test timeout own it. Running out of budget now says how far it
 	// got, which is actionable; a goroutine dump is not.
-	gateDeadline, hasGateDeadline := t.Context().Deadline()
+	// t.Deadline(), NOT t.Context().Deadline(): the test context
+	// carries no deadline in Go's testing package, so this call always
+	// reported ok=false and the gate silently ran on the 30-minute
+	// fallback below — a hardcoded ~22m verify budget (after the
+	// reserve) on every host, whatever -timeout said. That constant
+	// was measured three times across two machines before its origin
+	// was found: every PROOF INCOMPLETE of the week traces here, and
+	// the -timeout 150m the CI lane grants was never reaching the
+	// verify loop.
+	gateDeadline, hasGateDeadline := t.Deadline()
 	if !hasGateDeadline {
 		gateDeadline = time.Now().Add(30 * time.Minute)
 	}
