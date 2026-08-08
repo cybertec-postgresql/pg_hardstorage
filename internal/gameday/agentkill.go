@@ -94,6 +94,20 @@ func runAgentKill(ctx context.Context, opts RunOptions) (*Result, error) {
 	if recoverWithin == 0 {
 		recoverWithin = 30 * time.Second
 	}
+	// Misconfiguration is a STATIC property of the operator's
+	// parameters — classify it before anything fallible runs. This
+	// check used to sit at step 3, after the lease dance: under heavy
+	// load the short-TTL abandoned lease could expire before step 2
+	// probed it, the drill failed with the wrong class, and the
+	// operator saw "product failure" for what was their own budget.
+	if agentKillLeaseTTL+time.Second > recoverWithin {
+		r.Failure = fmt.Sprintf("recover_within (%s) is shorter than the lease TTL (%s); "+
+			"the drill cannot observe a reclaim that is not allowed to happen yet",
+			recoverWithin, agentKillLeaseTTL)
+		r.Misconfigured = true
+		r.Pass = false
+		return r, nil
+	}
 
 	sp, err := storage.Open(ctx, opts.RepoURL)
 	if err != nil {
@@ -153,15 +167,7 @@ func runAgentKill(ctx context.Context, opts RunOptions) (*Result, error) {
 	// 3. After expiry, recovery: agents may reclaim — but exactly one.
 	//    The window between "observed stale" and "overwrote" is where a
 	//    naive implementation lets every reclaimer through.
-	waitFor := agentKillLeaseTTL + time.Second
-	if waitFor > recoverWithin {
-		r.Failure = fmt.Sprintf("recover_within (%s) is shorter than the lease TTL (%s); "+
-			"the drill cannot observe a reclaim that is not allowed to happen yet",
-			recoverWithin, agentKillLeaseTTL)
-		r.Misconfigured = true
-		r.Pass = false
-		return r, nil
-	}
+	waitFor := agentKillLeaseTTL + time.Second // budget already validated up front
 	select {
 	case <-ctx.Done():
 		r.Failure = "cancelled while waiting for the abandoned lease to expire"

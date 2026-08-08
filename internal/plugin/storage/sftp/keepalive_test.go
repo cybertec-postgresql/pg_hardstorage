@@ -72,6 +72,14 @@ func startInProcSFTPServer(t *testing.T) (addr string, hostPub ssh.PublicKey) {
 	}
 	t.Cleanup(func() { _ = ln.Close() })
 
+	// ONE in-memory filesystem shared by every session: the reconnect
+	// tests write through connection N and read through connection
+	// N+1, and a per-session InMemHandler silently hands each session
+	// its own empty world — the first version of the recovery test
+	// "failed" with a not-found that was actually proof the reconnect
+	// worked.
+	handlers := gosftp.InMemHandler()
+
 	go func() {
 		for {
 			raw, aerr := ln.Accept()
@@ -109,7 +117,7 @@ func startInProcSFTPServer(t *testing.T) (addr string, hostPub ssh.PublicKey) {
 								string(req.Payload[4:]) == "sftp"
 							_ = req.Reply(ok, nil)
 							if ok {
-								srv := gosftp.NewRequestServer(ch, gosftp.InMemHandler())
+								srv := gosftp.NewRequestServer(ch, handlers)
 								_ = srv.Serve()
 								return
 							}
@@ -128,11 +136,24 @@ func startInProcSFTPServer(t *testing.T) (addr string, hostPub ssh.PublicKey) {
 // succeeding — the silent-drop shape) but forwards nothing.
 type blackholeProxy struct {
 	addr      string
+	ln        net.Listener
 	blackhole atomic.Bool
 	conns     struct {
 		sync.Mutex
 		all []net.Conn
 	}
+}
+
+func (p *blackholeProxy) close(t *testing.T) {
+	t.Helper()
+	if p.ln != nil {
+		_ = p.ln.Close()
+	}
+	p.conns.Lock()
+	for _, c := range p.conns.all {
+		_ = c.Close()
+	}
+	p.conns.Unlock()
 }
 
 func startBlackholeProxy(t *testing.T, upstream string) *blackholeProxy {
@@ -143,6 +164,7 @@ func startBlackholeProxy(t *testing.T, upstream string) *blackholeProxy {
 		t.Fatal(err)
 	}
 	p.addr = ln.Addr().String()
+	p.ln = ln
 	t.Cleanup(func() {
 		_ = ln.Close()
 		p.conns.Lock()
@@ -304,5 +326,136 @@ func TestKeepalive_LiveConnectionUntouched(t *testing.T) {
 				"never tear down a live peer", i, perr)
 		}
 		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+// TestReconnect_AfterTeardown_OpsRecover is bug #25's regression test:
+// the keepalive tearing down a dead connection must not brick the
+// HANDLE. A `wal stream` holds one plugin for days and the CLI opens
+// the repo once outside its retry loop — before reconnection existed,
+// one 70-second stall meant every later operation failed on the same
+// dead client until process restart, archiving stopped while the
+// primary kept writing.
+func TestReconnect_AfterTeardown_OpsRecover(t *testing.T) {
+	oi, ot, om := keepaliveInterval, keepaliveTimeout, keepaliveMisses
+	keepaliveInterval, keepaliveTimeout, keepaliveMisses = 150*time.Millisecond, 150*time.Millisecond, 2
+	orl := redialMinInterval
+	redialMinInterval = 100 * time.Millisecond
+	t.Cleanup(func() {
+		keepaliveInterval, keepaliveTimeout, keepaliveMisses = oi, ot, om
+		redialMinInterval = orl
+	})
+
+	serverAddr, hostPub := startInProcSFTPServer(t)
+	proxy := startBlackholeProxy(t, serverAddr)
+	khPath := filepath.Join(t.TempDir(), "known_hosts")
+	if err := os.WriteFile(khPath,
+		[]byte(knownhosts.Line([]string{proxy.addr}, hostPub)+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	u, _ := url.Parse("sftp://tester@" + proxy.addr + "/upload")
+	p := &Plugin{}
+	if oerr := p.Open(context.Background(), storage.StorageConfig{
+		URL:    u,
+		Extras: map[string]string{"known_hosts": khPath, "password": kaTestPassword},
+	}); oerr != nil {
+		t.Fatalf("open: %v", oerr)
+	}
+	t.Cleanup(func() {
+		closed := make(chan struct{})
+		go func() { _ = p.Close(); close(closed) }()
+		select {
+		case <-closed:
+		case <-time.After(5 * time.Second):
+		}
+	})
+	if _, perr := p.Put(context.Background(), "probe", strings.NewReader("v1"),
+		storage.PutOptions{ContentLength: 2}); perr != nil {
+		t.Fatalf("baseline put: %v", perr)
+	}
+
+	// Silent drop → keepalive teardown → the parked op errors.
+	proxy.blackhole.Store(true)
+	if _, gerr := p.Get(context.Background(), "probe"); gerr == nil {
+		t.Fatal("Get succeeded through a blackholed connection")
+	}
+
+	// The network comes back. The handle must HEAL: new connection
+	// through the proxy, operation succeeds, data intact.
+	proxy.blackhole.Store(false)
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		rc, gerr := p.Get(context.Background(), "probe")
+		if gerr == nil {
+			body, rerr := io.ReadAll(rc)
+			_ = rc.Close()
+			if rerr == nil && string(body) == "v1" {
+				return // healed
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("handle never recovered after the network came back: %v\n\n"+
+				"This is the brick: the keepalive rightly killed the dead connection, but "+
+				"nothing re-dials — a days-long wal stream stops archiving after one "+
+				"transient stall and stays stopped until an operator restarts it.", gerr)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
+// TestReconnect_ServerGone_TypedErrorFast: when the peer is REALLY
+// gone (listener closed), the reconnect path must fail with an error
+// promptly — not hang, not spin.
+func TestReconnect_ServerGone_TypedErrorFast(t *testing.T) {
+	oi, ot, om := keepaliveInterval, keepaliveTimeout, keepaliveMisses
+	keepaliveInterval, keepaliveTimeout, keepaliveMisses = 150*time.Millisecond, 150*time.Millisecond, 2
+	orl := redialMinInterval
+	redialMinInterval = 100 * time.Millisecond
+	t.Cleanup(func() {
+		keepaliveInterval, keepaliveTimeout, keepaliveMisses = oi, ot, om
+		redialMinInterval = orl
+	})
+
+	serverAddr, hostPub := startInProcSFTPServer(t)
+	proxy := startBlackholeProxy(t, serverAddr)
+	khPath := filepath.Join(t.TempDir(), "known_hosts")
+	if err := os.WriteFile(khPath,
+		[]byte(knownhosts.Line([]string{proxy.addr}, hostPub)+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	u, _ := url.Parse("sftp://tester@" + proxy.addr + "/upload")
+	p := &Plugin{}
+	if oerr := p.Open(context.Background(), storage.StorageConfig{
+		URL:    u,
+		Extras: map[string]string{"known_hosts": khPath, "password": kaTestPassword},
+	}); oerr != nil {
+		t.Fatalf("open: %v", oerr)
+	}
+	t.Cleanup(func() {
+		closed := make(chan struct{})
+		go func() { _ = p.Close(); close(closed) }()
+		select {
+		case <-closed:
+		case <-time.After(5 * time.Second):
+		}
+	})
+
+	proxy.blackhole.Store(true)
+	_, _ = p.Get(context.Background(), "probe") // force teardown
+	proxy.close(t)                              // peer truly gone: connects now refuse
+
+	done := make(chan error, 1)
+	go func() {
+		time.Sleep(250 * time.Millisecond) // past the redial rate limit
+		_, gerr := p.Get(context.Background(), "probe")
+		done <- gerr
+	}()
+	select {
+	case gerr := <-done:
+		if gerr == nil {
+			t.Fatal("Get succeeded against a gone server")
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("reconnect against a gone server hung instead of failing fast")
 	}
 }

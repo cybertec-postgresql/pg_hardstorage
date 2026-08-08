@@ -37,7 +37,7 @@ import (
 // connection down after keepaliveMisses consecutive failed probes.
 // Closing the connection is the point: it is the only lever that
 // unblocks pkg/sftp operations already in flight.
-func startKeepalive(conn *ssh.Client, cli *sftp.Client, stop <-chan struct{}) {
+func startKeepalive(conn *ssh.Client, cli *sftp.Client, stop <-chan struct{}, onDead func()) {
 	// Snapshot the tuning on the CALLER's goroutine: tests shrink and
 	// restore the package variables around each case, and a prober
 	// that read them directly raced the restore (caught by -race).
@@ -85,6 +85,12 @@ func startKeepalive(conn *ssh.Client, cli *sftp.Client, stop <-chan struct{}) {
 				// including the client Close that follows.
 				_ = conn.Close()
 				_ = cli.Close()
+				if onDead != nil {
+					// Tell the plugin so the NEXT operation
+					// reconnects instead of failing forever on this
+					// dead client (reconnect.go).
+					onDead()
+				}
 				return
 			}
 		}

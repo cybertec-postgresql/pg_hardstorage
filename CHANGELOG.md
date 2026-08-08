@@ -120,6 +120,27 @@ keeps reading that version for at least 24 months after a successor lands.
   which monitoring already sees, while a promoted-behind cluster is
   data loss.
 
+- **The agent-kill drill classifies an impossible budget before
+  running anything.** `recover_within` shorter than the drill's lease
+  TTL is the operator's parameter, and is now reported as
+  misconfiguration up front — previously the check sat after the
+  drill's timing-sensitive lease steps, so on a loaded host the
+  2-second probe lease could expire mid-drill and the operator saw a
+  spurious product failure instead of their own budget.
+
+- **An SFTP handle heals itself after a dead connection is torn
+  down.** The keepalive fix above turns a dead peer into an error —
+  but the handle it killed used to stay dead: a `wal stream` holds one
+  storage plugin for days and the CLI opens the repository once,
+  outside its retry loop, so a single 70-second network stall stopped
+  archiving until an operator restarted the process. Every operation
+  now passes through a reconnect gate: after a teardown, the next
+  operation re-dials with the parameters `Open` stored (rate-limited
+  to one attempt per interval, so an ongoing outage cannot stampede),
+  and a genuinely unreachable server fails fast with a typed error.
+  Measured recovery: the first operation after the network returns
+  completes in under half a second.
+
 - **A dead SFTP connection is now an error, not a forever-hang.**
   Caught live by the storage fault soak: `ssh.ClientConfig.Timeout`
   covers only the dial, and `pkg/sftp` sets no deadlines after it, so

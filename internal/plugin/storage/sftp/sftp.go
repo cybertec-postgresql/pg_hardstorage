@@ -85,11 +85,22 @@ type Plugin struct {
 
 	root string
 
-	mu     sync.Mutex
-	ssh    *ssh.Client
-	client *sftp.Client
-	kaStop chan struct{}
-	closed bool
+	// Dial parameters, kept for reconnection: a keepalive teardown
+	// (dead peer) must not brick a long-lived handle — a `wal stream`
+	// holds one for days, and before reconnection existed a single
+	// 70-second network stall left every subsequent operation failing
+	// until process restart.
+	host   string
+	cfgssh *ssh.ClientConfig
+
+	mu         sync.Mutex
+	ssh        *ssh.Client
+	client     *sftp.Client
+	kaStop     chan struct{}
+	gen        uint64 // connection generation; teardown of gen N must not kill gen N+1
+	dead       bool   // set by the keepalive teardown; cleared by redial
+	lastRedial time.Time
+	closed     bool
 }
 
 // Name implements storage.StoragePlugin.
@@ -106,8 +117,11 @@ func (p *Plugin) Name() string { return "sftp" }
 // writes (concurrency audit).
 func (p *Plugin) Capabilities() storage.Capabilities {
 	cond := true
-	if p.client != nil {
-		_, cond = p.client.HasExtension("hardlink@openssh.com")
+	p.mu.Lock()
+	cli := p.client
+	p.mu.Unlock()
+	if cli != nil {
+		_, cond = cli.HasExtension("hardlink@openssh.com")
 	}
 	return storage.Capabilities{
 		ConditionalPut: cond,
@@ -204,21 +218,32 @@ func (p *Plugin) Open(_ context.Context, cfg storage.StorageConfig) error {
 		HostKeyCallback: hk,
 		Timeout:         15 * time.Second,
 	}
+	p.host = host
+	p.cfgssh = cfgssh
+	p.root = root
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.dialLocked()
+}
+
+// dialLocked establishes (or re-establishes) the SSH+SFTP connection.
+// Caller holds p.mu.
+func (p *Plugin) dialLocked() error {
 	// Dial the TCP layer ourselves so kernel keepalives are armed
 	// (belt) under the SSH-level keepalive probe (braces, below —
 	// kernel defaults alone take hours to declare a peer dead).
-	raw, err := net.DialTimeout("tcp", host, cfgssh.Timeout)
+	raw, err := net.DialTimeout("tcp", p.host, p.cfgssh.Timeout)
 	if err != nil {
-		return fmt.Errorf("sftp: dial %s: %w", host, err)
+		return fmt.Errorf("sftp: dial %s: %w", p.host, err)
 	}
 	if tc, ok := raw.(*net.TCPConn); ok {
 		_ = tc.SetKeepAlive(true)
 		_ = tc.SetKeepAlivePeriod(30 * time.Second)
 	}
-	sc, chans, reqs, err := ssh.NewClientConn(raw, host, cfgssh)
+	sc, chans, reqs, err := ssh.NewClientConn(raw, p.host, p.cfgssh)
 	if err != nil {
 		_ = raw.Close()
-		return fmt.Errorf("sftp: dial %s: %w", host, err)
+		return fmt.Errorf("sftp: dial %s: %w", p.host, err)
 	}
 	conn := ssh.NewClient(sc, chans, reqs)
 	cli, err := sftp.NewClient(conn)
@@ -227,14 +252,32 @@ func (p *Plugin) Open(_ context.Context, cfg storage.StorageConfig) error {
 		return fmt.Errorf("sftp: open client: %w", err)
 	}
 
+	if p.kaStop != nil {
+		close(p.kaStop) // retire the previous generation's prober
+	}
 	p.ssh = conn
 	p.client = cli
-	p.root = root
+	p.dead = false
+	p.gen++
 	// A dead connection must become an error, not a hang — see
 	// keepalive.go for the soak-caught 14-minute sendPacket stall.
+	// The teardown callback marks THIS generation dead so the next
+	// operation reconnects instead of failing forever.
 	p.kaStop = make(chan struct{})
-	startKeepalive(conn, cli, p.kaStop)
+	gen := p.gen
+	startKeepalive(conn, cli, p.kaStop, func() { p.markDead(gen) })
 	return nil
+}
+
+// markDead records that generation gen's connection was torn down by
+// its keepalive. A stale callback (an older generation racing a
+// completed redial) is ignored.
+func (p *Plugin) markDead(gen uint64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.gen == gen {
+		p.dead = true
+	}
 }
 
 // Close implements storage.StoragePlugin.  Idempotent.
@@ -305,6 +348,10 @@ func (p *Plugin) resolve(key string) (string, error) {
 // (every modern OpenSSH server) and falls back to plain
 // Rename otherwise.
 func (p *Plugin) Put(ctx context.Context, key string, r io.Reader, opts storage.PutOptions) (storage.PutResult, error) {
+	cli, cerr := p.conn()
+	if cerr != nil {
+		return storage.PutResult{}, cerr
+	}
 	if err := p.assertOpen(); err != nil {
 		return storage.PutResult{}, err
 	}
@@ -313,23 +360,23 @@ func (p *Plugin) Put(ctx context.Context, key string, r io.Reader, opts storage.
 		return storage.PutResult{}, err
 	}
 	// Ensure parent directory.
-	if err := p.mkdirAll(path.Dir(full)); err != nil {
+	if err := p.mkdirAll(cli, path.Dir(full)); err != nil {
 		return storage.PutResult{}, err
 	}
 
 	tmp := full + ".hstmp-" + randomSuffix()
-	f, err := p.client.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC)
+	f, err := cli.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC)
 	if err != nil {
 		return storage.PutResult{}, fmt.Errorf("sftp: create tmp %s: %w", tmp, err)
 	}
 	written, copyErr := io.Copy(f, r)
 	closeErr := f.Close()
 	if copyErr != nil {
-		_ = p.client.Remove(tmp)
+		_ = cli.Remove(tmp)
 		return storage.PutResult{}, fmt.Errorf("sftp: copy to %s: %w", tmp, copyErr)
 	}
 	if closeErr != nil {
-		_ = p.client.Remove(tmp)
+		_ = cli.Remove(tmp)
 		return storage.PutResult{}, fmt.Errorf("sftp: close %s: %w", tmp, closeErr)
 	}
 
@@ -341,15 +388,15 @@ func (p *Plugin) Put(ctx context.Context, key string, r io.Reader, opts storage.
 		// destination is present.  The contract suite's
 		// concurrent-IfNotExists race is exactly the case
 		// this is required for.
-		linkErr := p.client.Link(tmp, full)
+		linkErr := cli.Link(tmp, full)
 		if linkErr == nil {
 			// Hardlink succeeded; tmp is now redundant.
 			// Best-effort cleanup.
-			_ = p.client.Remove(tmp)
+			_ = cli.Remove(tmp)
 			return storage.PutResult{Key: key, Size: written}, nil
 		}
 		if isAlreadyExists(linkErr) {
-			_ = p.client.Remove(tmp)
+			_ = cli.Remove(tmp)
 			return storage.PutResult{}, storage.ErrAlreadyExists
 		}
 		// Server doesn't support the hardlink extension —
@@ -358,17 +405,17 @@ func (p *Plugin) Put(ctx context.Context, key string, r io.Reader, opts storage.
 		// suite's ParallelPuts case fails on these servers;
 		// the agent's audit-chain serialisation makes the
 		// race academic in practice.
-		if _, err := p.client.Stat(full); err == nil {
-			_ = p.client.Remove(tmp)
+		if _, err := cli.Stat(full); err == nil {
+			_ = cli.Remove(tmp)
 			return storage.PutResult{}, storage.ErrAlreadyExists
 		}
 	} else {
 		// last-writer-wins semantics: remove dst if present so
 		// rename succeeds (sftp Rename semantics vary).
-		_ = p.client.Remove(full)
+		_ = cli.Remove(full)
 	}
-	if err := p.atomicRename(tmp, full); err != nil {
-		_ = p.client.Remove(tmp)
+	if err := p.atomicRename(cli, tmp, full); err != nil {
+		_ = cli.Remove(tmp)
 		return storage.PutResult{}, fmt.Errorf("sftp: rename %s -> %s: %w", tmp, full, err)
 	}
 	return storage.PutResult{Key: key, Size: written}, nil
@@ -403,15 +450,19 @@ func isAlreadyExists(err error) bool {
 // Rename otherwise.  Operators of strict-RFC SFTP servers
 // (rare) accept the small atomicity gap; the chunk store's
 // content-addressing absorbs any duplicate writes.
-func (p *Plugin) atomicRename(src, dst string) error {
-	if _, supported := p.client.HasExtension("posix-rename@openssh.com"); supported {
-		return p.client.PosixRename(src, dst)
+func (p *Plugin) atomicRename(cli *sftp.Client, src, dst string) error {
+	if _, supported := cli.HasExtension("posix-rename@openssh.com"); supported {
+		return cli.PosixRename(src, dst)
 	}
-	return p.client.Rename(src, dst)
+	return cli.Rename(src, dst)
 }
 
 // Get implements storage.StoragePlugin.
 func (p *Plugin) Get(ctx context.Context, key string) (io.ReadCloser, error) {
+	cli, cerr := p.conn()
+	if cerr != nil {
+		return nil, cerr
+	}
 	if err := p.assertOpen(); err != nil {
 		return nil, err
 	}
@@ -419,7 +470,7 @@ func (p *Plugin) Get(ctx context.Context, key string) (io.ReadCloser, error) {
 	if err != nil {
 		return nil, err
 	}
-	f, err := p.client.Open(full)
+	f, err := cli.Open(full)
 	if err != nil {
 		if isNotExist(err) {
 			return nil, storage.ErrNotFound
@@ -431,6 +482,10 @@ func (p *Plugin) Get(ctx context.Context, key string) (io.ReadCloser, error) {
 
 // Stat implements storage.StoragePlugin.
 func (p *Plugin) Stat(ctx context.Context, key string) (storage.ObjectInfo, error) {
+	cli, cerr := p.conn()
+	if cerr != nil {
+		return storage.ObjectInfo{}, cerr
+	}
 	if err := p.assertOpen(); err != nil {
 		return storage.ObjectInfo{}, err
 	}
@@ -438,7 +493,7 @@ func (p *Plugin) Stat(ctx context.Context, key string) (storage.ObjectInfo, erro
 	if err != nil {
 		return storage.ObjectInfo{}, err
 	}
-	fi, err := p.client.Stat(full)
+	fi, err := cli.Stat(full)
 	if err != nil {
 		if isNotExist(err) {
 			return storage.ObjectInfo{}, storage.ErrNotFound
@@ -455,6 +510,12 @@ func (p *Plugin) Stat(ctx context.Context, key string) (storage.ObjectInfo, erro
 // List implements storage.StoragePlugin.  Walks the prefix
 // recursively (SFTP's Walk uses depth-first traversal).
 func (p *Plugin) List(ctx context.Context, prefix string) iter.Seq2[storage.ObjectInfo, error] {
+	cli, cerr := p.conn()
+	if cerr != nil {
+		return func(yield func(storage.ObjectInfo, error) bool) {
+			yield(storage.ObjectInfo{}, cerr)
+		}
+	}
 	return func(yield func(storage.ObjectInfo, error) bool) {
 		if err := p.assertOpen(); err != nil {
 			yield(storage.ObjectInfo{}, err)
@@ -465,7 +526,7 @@ func (p *Plugin) List(ctx context.Context, prefix string) iter.Seq2[storage.Obje
 			yield(storage.ObjectInfo{}, err)
 			return
 		}
-		walker := p.client.Walk(full)
+		walker := cli.Walk(full)
 		for walker.Step() {
 			if err := ctx.Err(); err != nil {
 				yield(storage.ObjectInfo{}, err)
@@ -508,6 +569,10 @@ func (p *Plugin) List(ctx context.Context, prefix string) iter.Seq2[storage.Obje
 
 // Delete implements storage.StoragePlugin.
 func (p *Plugin) Delete(ctx context.Context, key string) error {
+	cli, cerr := p.conn()
+	if cerr != nil {
+		return cerr
+	}
 	if err := p.assertOpen(); err != nil {
 		return err
 	}
@@ -515,7 +580,7 @@ func (p *Plugin) Delete(ctx context.Context, key string) error {
 	if err != nil {
 		return err
 	}
-	if err := p.client.Remove(full); err != nil {
+	if err := cli.Remove(full); err != nil {
 		if isNotExist(err) {
 			return nil
 		}
@@ -528,6 +593,10 @@ func (p *Plugin) Delete(ctx context.Context, key string) error {
 // Uses posix-rename@openssh.com when the server supports it
 // (atomic), falls back to plain Rename otherwise.
 func (p *Plugin) RenameIfNotExists(ctx context.Context, src, dst string) error {
+	cli, cerr := p.conn()
+	if cerr != nil {
+		return cerr
+	}
 	if err := p.assertOpen(); err != nil {
 		return err
 	}
@@ -539,7 +608,7 @@ func (p *Plugin) RenameIfNotExists(ctx context.Context, src, dst string) error {
 	if err != nil {
 		return err
 	}
-	if _, err := p.client.Stat(dstFull); err == nil {
+	if _, err := cli.Stat(dstFull); err == nil {
 		return storage.ErrAlreadyExists
 	}
 	// Create the destination's parent, matching the fs reference
@@ -549,10 +618,10 @@ func (p *Plugin) RenameIfNotExists(ctx context.Context, src, dst string) error {
 	// exist and the gap was invisible. A cross-prefix rename failed
 	// with a bare "file does not exist" on sftp/scp while succeeding
 	// on fs:// and s3://.
-	if err := p.mkdirAll(path.Dir(dstFull)); err != nil {
+	if err := p.mkdirAll(cli, path.Dir(dstFull)); err != nil {
 		return err
 	}
-	if err := p.atomicRename(srcFull, dstFull); err != nil {
+	if err := p.atomicRename(cli, srcFull, dstFull); err != nil {
 		return fmt.Errorf("sftp: rename %s -> %s: %w", srcFull, dstFull, err)
 	}
 	return nil
@@ -566,7 +635,7 @@ func (p *Plugin) SetRetention(ctx context.Context, key string, until time.Time, 
 
 // mkdirAll creates all parents of dir.  SFTP doesn't have
 // MkdirAll natively in older servers; we walk the path.
-func (p *Plugin) mkdirAll(dir string) error {
+func (p *Plugin) mkdirAll(cli *sftp.Client, dir string) error {
 	if dir == "" || dir == "/" {
 		return nil
 	}
@@ -577,14 +646,14 @@ func (p *Plugin) mkdirAll(dir string) error {
 			continue
 		}
 		cur = cur + "/" + part
-		if _, err := p.client.Stat(cur); err == nil {
+		if _, err := cli.Stat(cur); err == nil {
 			continue
 		}
-		if err := p.client.Mkdir(cur); err != nil {
+		if err := cli.Mkdir(cur); err != nil {
 			// Tolerate races: if another process created the
 			// directory between our Stat and Mkdir, the second
 			// Stat will return success.
-			if _, statErr := p.client.Stat(cur); statErr == nil {
+			if _, statErr := cli.Stat(cur); statErr == nil {
 				continue
 			}
 			return fmt.Errorf("sftp: mkdir %s: %w", cur, err)
@@ -593,11 +662,13 @@ func (p *Plugin) mkdirAll(dir string) error {
 	return nil
 }
 
+var errClosed = errors.New("sftp: plugin not open")
+
 func (p *Plugin) assertOpen() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.closed || p.client == nil {
-		return errors.New("sftp: plugin not open")
+		return errClosed
 	}
 	return nil
 }

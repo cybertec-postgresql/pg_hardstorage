@@ -14,4 +14,4 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-func startKeepalive(conn *ssh.Client, cli *sftp.Client, stop <-chan struct{}) {}
+func startKeepalive(conn *ssh.Client, cli *sftp.Client, stop <-chan struct{}, onDead func()) {}

@@ -58,6 +58,21 @@ type Mutation struct {
 // in the named package — see the package doc.
 var Registry = []Mutation{
 	{
+		Tag: "mutation_sftp_no_reconnect",
+		Description: "the SFTP plugin never reconnects after a keepalive " +
+			"teardown (pre-fix bug #25): the keepalive rightly turns a dead " +
+			"peer into an error instead of a hang, but the HANDLE stayed " +
+			"dead — a days-long `wal stream` holds one storage plugin and " +
+			"the CLI opens the repo once outside its retry loop, so one " +
+			"70-second network stall stopped archiving until an operator " +
+			"restarted the process. Caught by " +
+			"TestReconnect_AfterTeardown_OpsRecover (blackhole cleared, " +
+			"next operation must heal through a fresh connection).",
+		Packages: []string{
+			"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage/sftp",
+		},
+	},
+	{
 		Tag: "mutation_sftp_no_keepalive",
 		Description: "the SFTP plugin has no connection keepalive " +
 			"(pre-fix bug #23, caught live by the storage fault soak: a " +

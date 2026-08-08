@@ -12,4 +12,9 @@ var (
 	keepaliveInterval = 30 * time.Second
 	keepaliveTimeout  = 20 * time.Second
 	keepaliveMisses   = 2
+
+	// redialMinInterval bounds how often a failed reconnect is
+	// retried (reconnect.go); shared here so tests build under the
+	// no-reconnect mutant too.
+	redialMinInterval = 5 * time.Second
 )
