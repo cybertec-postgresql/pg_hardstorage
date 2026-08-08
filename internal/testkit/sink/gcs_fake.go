@@ -105,7 +105,16 @@ func (g *gcsFakeRuntime) Up(ctx context.Context) error {
 		"-host", "0.0.0.0",
 		"-port", "4443",
 		"-public-host", fmt.Sprintf("127.0.0.1:%d", g.port),
-		"-backend", "memory",
+		// FILESYSTEM backend, not memory: the memory backend holds
+		// every object AND every abandoned multipart upload in the
+		// container's RAM — the fault soak abandons uploads by
+		// design, and on CI's memory ceiling the emulator died at a
+		// reproducible operation count (four runs, k00333x-k00339x
+		// every time; wedge → EOF burst → connection refused as the
+		// pressure grew). A 251 GiB dev host never reproduced it. An
+		// image bump (1.49.0→1.52.2) changed nothing because the
+		// leak is the backend choice, not an emulator bug.
+		"-backend", "filesystem",
 		"-data", "/data",
 	}
 	cmd := exec.CommandContext(ctx, "docker", args...)

@@ -221,7 +221,7 @@ func TestChaosSoak_RestoreProof(t *testing.T) {
 	}()
 
 	// Fault rounds until the budget expires.
-	faults := []string{"none", "switchover", "pause_leader", "backup_burst", "dcs_outage"}
+	faults := []string{"none", "switchover", "pause_leader", "backup_burst", "dcs_outage", "compound_storm"}
 	deadline := time.Now().Add(time.Duration(minutes) * time.Minute)
 	round := 0
 	roundBackupsOK := 0
@@ -254,6 +254,39 @@ func TestChaosSoak_RestoreProof(t *testing.T) {
 						_ = exec.Command("docker", "pause", n.container).Run()
 						time.Sleep(pauseFor)
 						_ = exec.Command("docker", "unpause", n.container).Run()
+					}
+				}
+			}
+		case "compound_storm":
+			// Faults do not strike alone in real incidents. The
+			// nastiest realistic stack: the DCS goes unreachable AND
+			// the leader dies hard, together. The survivors must hold
+			// until etcd returns, elect among themselves with the old
+			// leader entirely absent (no demoted-but-alive node to
+			// mislead anything), and the killed node later rejoins as
+			// a replica. The streamer's whole gauntlet in one round:
+			// dead peer, no primary, re-election, recreated slot.
+			if p.etcdContainer != "" {
+				if leader := p.findLeaderName(ctx); leader != "" {
+					var leaderContainer string
+					for _, n := range p.nodes {
+						out, err := exec.Command("docker", "exec", n.container, "hostname").CombinedOutput()
+						if err == nil && strings.TrimSpace(string(out)) == leader {
+							leaderContainer = n.container
+						}
+					}
+					if leaderContainer != "" {
+						t.Logf("  COMPOUND STORM: pausing etcd AND killing leader %s", leaderContainer[:12])
+						_ = exec.Command("docker", "pause", p.etcdContainer).Run()
+						_ = exec.Command("docker", "kill", leaderContainer).Run()
+						time.Sleep(time.Duration(31+rng.Intn(10)) * time.Second) // past the TTL, DCS still dark
+						_ = exec.Command("docker", "unpause", p.etcdContainer).Run()
+						// Election among survivors, then the dead node
+						// rejoins as a replica (pg_rewind/basebackup —
+						// Spilo handles it; the rejoin test pins it).
+						time.Sleep(15 * time.Second)
+						_ = exec.Command("docker", "start", leaderContainer).Run()
+						time.Sleep(15 * time.Second)
 					}
 				}
 			}
