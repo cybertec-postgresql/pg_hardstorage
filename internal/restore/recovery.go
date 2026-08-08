@@ -182,7 +182,7 @@ func WriteRecoveryFiles(target string, r Recovery) error {
 // restore.  Empty repoURL or deployment → restore_command line is
 // skipped (cluster still gets the signal + recovery_target, useful
 // for offline / synthesised-manifest tests).
-func WriteAutoRecovery(target, deployment, repoURL string) error {
+func WriteAutoRecovery(target, deployment, repoURL, sysID string) error {
 	autoPath := filepath.Join(target, "postgresql.auto.conf")
 	var b strings.Builder
 	b.WriteString("\n# --- pg_hardstorage managed block (auto-recovery) ---\n")
@@ -216,7 +216,7 @@ func WriteAutoRecovery(target, deployment, repoURL string) error {
 		// token /".  The PITR-config path (configPITR) routes
 		// through quoteSQL for the same reason.
 		fmt.Fprintf(&b, "restore_command = %s\n",
-			quoteSQL(walfetchcmd.Build(bin, deployment, repoURL)))
+			quoteSQL(walfetchcmd.BuildWithIdentity(bin, deployment, repoURL, sysID)))
 	}
 	if err := appendAutoConf(autoPath, b.String()); err != nil {
 		return err

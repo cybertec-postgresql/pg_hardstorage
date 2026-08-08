@@ -35,7 +35,7 @@ func TestBuildRecovery_UsesProvidedTargetTimeVerbatim(t *testing.T) {
 		toTimeline: "latest",
 	}
 
-	r, err := buildRecovery(opts, want)
+	r, err := buildRecovery(opts, want, "")
 	if err != nil {
 		t.Fatalf("buildRecovery: %v", err)
 	}
@@ -68,7 +68,7 @@ func TestBuildRecovery_TimeTargetIgnoresUnparseableString(t *testing.T) {
 		toAction:   "pause",
 		toTimeline: "latest",
 	}
-	r, err := buildRecovery(opts, want)
+	r, err := buildRecovery(opts, want, "")
 	if err != nil {
 		t.Fatalf("buildRecovery should not parse opts.toTime: %v", err)
 	}
@@ -92,7 +92,7 @@ func TestBuildRecovery_NonTimeTargetsUnaffected(t *testing.T) {
 	t.Run("lsn target", func(t *testing.T) {
 		o := base
 		o.toLSN = "0/3000028"
-		r, err := buildRecovery(o, bogus)
+		r, err := buildRecovery(o, bogus, "")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -107,7 +107,7 @@ func TestBuildRecovery_NonTimeTargetsUnaffected(t *testing.T) {
 	t.Run("name target", func(t *testing.T) {
 		o := base
 		o.toName = "before-the-incident"
-		r, err := buildRecovery(o, bogus)
+		r, err := buildRecovery(o, bogus, "")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -120,7 +120,7 @@ func TestBuildRecovery_NonTimeTargetsUnaffected(t *testing.T) {
 	})
 
 	t.Run("no target", func(t *testing.T) {
-		r, err := buildRecovery(base, bogus)
+		r, err := buildRecovery(base, bogus, "")
 		if err != nil {
 			t.Fatal(err)
 		}

@@ -192,3 +192,21 @@ func TestBuild_UnsetRestoreBinEnvFallsBack(t *testing.T) {
 		t.Errorf("empty override should fall back to agentBin:\n%s", got)
 	}
 }
+
+// TestBuildWithIdentity_ArmsTheCheck: the seed's system_identifier
+// reaches the generated command as a quoted --expect-system-identifier,
+// BEFORE the exit-code tail; empty identity emits exactly Build's
+// command so pre-schema manifests and old call sites change nothing.
+func TestBuildWithIdentity_ArmsTheCheck(t *testing.T) {
+	got := BuildWithIdentity("/p/bin/pg_hardstorage", "db1", "file:///srv/repo", "7000000000000000001")
+	if !strings.Contains(got, "--expect-system-identifier '7000000000000000001'") {
+		t.Errorf("identity flag missing or unquoted:\n%s", got)
+	}
+	if strings.Index(got, "--expect-system-identifier") > strings.Index(got, "ec=$?") {
+		t.Errorf("identity flag landed after the exit-code tail:\n%s", got)
+	}
+	if BuildWithIdentity("/p/bin/pg_hardstorage", "db1", "file:///srv/repo", "") !=
+		Build("/p/bin/pg_hardstorage", "db1", "file:///srv/repo") {
+		t.Error("empty identity must emit exactly Build's command")
+	}
+}

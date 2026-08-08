@@ -58,6 +58,22 @@ type Mutation struct {
 // in the named package — see the package doc.
 var Registry = []Mutation{
 	{
+		Tag: "mutation_fetch_sysid_unchecked",
+		Description: "wal fetch hands foreign WAL to recovery without an " +
+			"identity check (pre-#26): an archive mixing cluster lineages " +
+			"(reused deployment name after a wipe, a pre-guard mix, " +
+			"--allow-system-identifier-change) reaches PostgreSQL, which " +
+			"notices only MID-REPLAY with a FATAL naming neither the " +
+			"deployment nor the repair. With the seed's identifier " +
+			"threaded through restore_command, the first foreign segment " +
+			"is refused typed — and the strict tail aborts recovery " +
+			"loudly at that byte. Caught by " +
+			"TestCheckFetchSystemIdentifier_MismatchRefuses.",
+		Packages: []string{
+			"github.com/cybertec-postgresql/pg_hardstorage/internal/cli",
+		},
+	},
+	{
 		Tag: "mutation_sftp_no_reconnect",
 		Description: "the SFTP plugin never reconnects after a keepalive " +
 			"teardown (pre-fix bug #25): the keepalive rightly turns a dead " +

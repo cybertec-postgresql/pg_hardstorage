@@ -724,7 +724,7 @@ func Restore(ctx context.Context, opts Options) (res *Result, err error) {
 		// here means downstream cluster-start gates — postverify,
 		// the testkit's sandbox, the operator's own `pg_ctl start`
 		// after `pg_hardstorage restore` — all just work.
-		if err := WriteAutoRecovery(opts.TargetDir, m.Deployment, opts.RepoURL); err != nil {
+		if err := WriteAutoRecovery(opts.TargetDir, m.Deployment, opts.RepoURL, m.SystemIdentifier); err != nil {
 			return nil, output.NewError("restore.auto_recovery_write",
 				fmt.Sprintf("restore: stage auto-recovery: %v", err)).Wrap(err)
 		}
@@ -1900,7 +1900,7 @@ func restoreIncrementalChain(ctx context.Context, opts Options, sp storage.Stora
 		// path grew this else-branch; the chain path had no else at
 		// all, so a plain chain restore shipped an unbootable datadir.
 		// See issue #15.
-		if err := WriteAutoRecovery(opts.TargetDir, leaf.Deployment, opts.RepoURL); err != nil {
+		if err := WriteAutoRecovery(opts.TargetDir, leaf.Deployment, opts.RepoURL, leaf.SystemIdentifier); err != nil {
 			return nil, output.NewError("restore.auto_recovery_write",
 				fmt.Sprintf("restore chain: stage auto-recovery: %v", err)).Wrap(err)
 		}

@@ -204,7 +204,7 @@ func TestWriteRecoveryFiles_ActionShutdown(t *testing.T) {
 // the primer doesn't silently regress.
 func TestWriteAutoRecovery_PrimesNonPITRRestore(t *testing.T) {
 	dir := t.TempDir()
-	if err := restore.WriteAutoRecovery(dir, "db1", "file:///r"); err != nil {
+	if err := restore.WriteAutoRecovery(dir, "db1", "file:///r", ""); err != nil {
 		t.Fatal(err)
 	}
 	body, _ := os.ReadFile(filepath.Join(dir, "postgresql.auto.conf"))
@@ -242,7 +242,7 @@ func TestWriteAutoRecovery_PrimesNonPITRRestore(t *testing.T) {
 // restore_command.
 func TestWriteAutoRecovery_NeverSignalWithoutRestoreCommand(t *testing.T) {
 	dir := t.TempDir()
-	if err := restore.WriteAutoRecovery(dir, "db1", "file:///r"); err != nil {
+	if err := restore.WriteAutoRecovery(dir, "db1", "file:///r", ""); err != nil {
 		t.Fatalf("WriteAutoRecovery: %v", err)
 	}
 	body, _ := os.ReadFile(filepath.Join(dir, "postgresql.auto.conf"))
@@ -255,11 +255,30 @@ func TestWriteAutoRecovery_NeverSignalWithoutRestoreCommand(t *testing.T) {
 	// escape hatch for offline / synthesised-manifest use, and stays
 	// legal: no restore_command, and that is intentional.
 	dir2 := t.TempDir()
-	if err := restore.WriteAutoRecovery(dir2, "", ""); err != nil {
+	if err := restore.WriteAutoRecovery(dir2, "", "", ""); err != nil {
 		t.Fatalf("WriteAutoRecovery signal-only: %v", err)
 	}
 	body2, _ := os.ReadFile(filepath.Join(dir2, "postgresql.auto.conf"))
 	if strings.Contains(string(body2), "restore_command") {
 		t.Errorf("signal-only primer should not emit a restore_command; got:\n%s", body2)
+	}
+}
+
+// TestWriteAutoRecovery_ArmsIdentityCheck: the standby auto-recovery
+// path threads the seed's system_identifier into restore_command, so
+// a foreign segment is refused at the first fetch instead of PG's
+// mid-replay FATAL.
+func TestWriteAutoRecovery_ArmsIdentityCheck(t *testing.T) {
+	dir := t.TempDir()
+	if err := restore.WriteAutoRecovery(dir, "db1", "file:///r", "7000000000000000001"); err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(filepath.Join(dir, "postgresql.auto.conf"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(body), "--expect-system-identifier ''7000000000000000001''") &&
+		!strings.Contains(string(body), "--expect-system-identifier '7000000000000000001'") {
+		t.Errorf("auto.conf restore_command does not arm the identity check:\n%s", body)
 	}
 }

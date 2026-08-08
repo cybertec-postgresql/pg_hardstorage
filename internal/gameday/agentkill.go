@@ -52,7 +52,15 @@ const agentKillProbeDeployment = "__gameday_agentkill_probe"
 // agentKillLeaseTTL is short so the drill does not take minutes. The
 // production default is 15 minutes; what is under test is the
 // stale-break behaviour, not the specific duration.
-const agentKillLeaseTTL = 2 * time.Second
+// agentKillLeaseTTL balances two pressures: the drill's expiry wait
+// is TTL+1s (longer TTL = slower drill), while the observation window
+// for "a second agent is refused while the lease is live" is the TTL
+// itself — and at 2 seconds a host running a full -race suite
+// repeatedly could not fit an acquire-and-probe inside it (three
+// overrun retries exhausted, drill correctly self-classified as
+// host-too-loaded, test still red). Six seconds gives ~3x margin over
+// the worst observed overrun and costs five extra seconds per run.
+const agentKillLeaseTTL = 6 * time.Second
 
 // agentKillReclaimers is how many agents race to reclaim the abandoned
 // lease. More than two so "exactly one wins" is a real claim rather
@@ -118,39 +126,74 @@ func runAgentKill(ctx context.Context, opts RunOptions) (*Result, error) {
 	defer sp.Close()
 	defer cleanUpAgentKillProbe(ctx, sp, r)
 
-	// 1. A backup starts, and its agent is killed: the lease is taken
-	//    and then never renewed or released.
-	abandoned, err := backup.AcquireBackupLease(ctx, sp, agentKillProbeDeployment,
-		backup.LeaseOptions{Owner: "gameday-crashed-agent", TTL: agentKillLeaseTTL})
-	switch {
-	case errors.Is(err, backup.ErrLeaseNotEnforceable):
-		// A finding, and a serious one: on this backend a crashed
-		// agent's lease excludes nobody, so a second agent can back up
-		// the same deployment at the same time.
-		r.Failure = fmt.Sprintf("this repository backend cannot enforce a backup lease "+
-			"(%v). A crashed agent leaves a lease that excludes nothing, so two agents "+
-			"can back up the same deployment concurrently. Use a backend with atomic "+
-			"conditional put, or accept that concurrency control is advisory here", err)
-		r.Pass = false
-		return r, nil
-	case err != nil:
-		r.Failure = fmt.Sprintf("could not acquire the lease the drill abandons: %v", err)
-		r.Pass = false
-		return r, nil
-	}
-	_ = abandoned // deliberately never Released: that is the crash.
-	r.Evidence = append(r.Evidence, Event{
-		At:      time.Now().UTC(),
-		Kind:    "fault",
-		Message: "lease acquired and abandoned — the state a killed agent leaves behind",
-		Body:    map[string]any{"ttl": agentKillLeaseTTL.String(), "owner": "gameday-crashed-agent"},
-	})
+	// 1+2. Acquire-and-abandon, then assert a second agent is refused
+	// WHILE THE LEASE IS STILL LIVE. That last clause is a timing
+	// precondition, not a given: on a loaded host the whole sequence
+	// can take longer than the short probe TTL, the abandoned lease
+	// expires mid-drill, and the second acquire legitimately succeeds
+	// — which is not the product failure the message would claim. The
+	// drill validates its own observation window and retries on
+	// overrun; only an in-window second acquire is a finding. (Both
+	// agent-kill tests flaked exactly this way under a cold-cache
+	// full -race run before the window check existed.)
+	const overrunRetries = 3
+	step2ok := false
+	for attempt := 1; attempt <= overrunRetries; attempt++ {
+		abandoned, err := backup.AcquireBackupLease(ctx, sp, agentKillProbeDeployment,
+			backup.LeaseOptions{Owner: "gameday-crashed-agent", TTL: agentKillLeaseTTL})
+		switch {
+		case errors.Is(err, backup.ErrLeaseNotEnforceable):
+			// A finding, and a serious one: on this backend a crashed
+			// agent's lease excludes nobody, so a second agent can
+			// back up the same deployment at the same time.
+			r.Failure = fmt.Sprintf("this repository backend cannot enforce a backup lease "+
+				"(%v). A crashed agent leaves a lease that excludes nothing, so two agents "+
+				"can back up the same deployment concurrently. Use a backend with atomic "+
+				"conditional put, or accept that concurrency control is advisory here", err)
+			r.Pass = false
+			return r, nil
+		case err != nil:
+			r.Failure = fmt.Sprintf("could not acquire the lease the drill abandons: %v", err)
+			r.Pass = false
+			return r, nil
+		}
+		_ = abandoned // deliberately never Released: that is the crash.
+		acquiredAt := time.Now()
+		r.Evidence = append(r.Evidence, Event{
+			At:      acquiredAt.UTC(),
+			Kind:    "fault",
+			Message: "lease acquired and abandoned — the state a killed agent leaves behind",
+			Body:    map[string]any{"ttl": agentKillLeaseTTL.String(), "owner": "gameday-crashed-agent", "attempt": attempt},
+		})
 
-	// 2. While that lease is live, a second agent must be refused.
-	//    Without this, "recovery" below would be indistinguishable from
-	//    a lease that never excluded anyone.
-	if _, err := backup.AcquireBackupLease(ctx, sp, agentKillProbeDeployment,
-		backup.LeaseOptions{Owner: "gameday-second-agent", TTL: agentKillLeaseTTL}); !errors.Is(err, backup.ErrBackupInProgress) {
+		second, err := backup.AcquireBackupLease(ctx, sp, agentKillProbeDeployment,
+			backup.LeaseOptions{Owner: "gameday-second-agent", TTL: agentKillLeaseTTL})
+		inWindow := time.Since(acquiredAt) < agentKillLeaseTTL
+		if errors.Is(err, backup.ErrBackupInProgress) {
+			r.Evidence = append(r.Evidence, Event{
+				At:      time.Now().UTC(),
+				Kind:    "observed",
+				Message: "a second agent is refused while the abandoned lease is still within its TTL",
+			})
+			step2ok = true
+			break
+		}
+		if err == nil && !inWindow {
+			// Observation window collapsed: the abandoned lease had
+			// already expired when the second acquire ran, so its
+			// success proves nothing about exclusion. Clean the slate
+			// and try again.
+			if second != nil {
+				_ = second.Release(ctx)
+			}
+			cleanUpAgentKillProbe(ctx, sp, r)
+			r.Evidence = append(r.Evidence, Event{
+				At:      time.Now().UTC(),
+				Kind:    "observed",
+				Message: fmt.Sprintf("drill overran its own observation window (attempt %d: the sequence took longer than the %s lease TTL on this host) — retrying with a fresh lease", attempt, agentKillLeaseTTL),
+			})
+			continue
+		}
 		r.Failure = fmt.Sprintf("a second agent acquired the lease while the crashed "+
 			"agent's was still live (got %v, want ErrBackupInProgress). Two agents backing "+
 			"up one deployment concurrently is the condition the lease exists to prevent",
@@ -158,11 +201,15 @@ func runAgentKill(ctx context.Context, opts RunOptions) (*Result, error) {
 		r.Pass = false
 		return r, nil
 	}
-	r.Evidence = append(r.Evidence, Event{
-		At:      time.Now().UTC(),
-		Kind:    "observed",
-		Message: "a second agent is refused while the abandoned lease is still within its TTL",
-	})
+	if !step2ok {
+		r.Failure = fmt.Sprintf("the drill overran its own observation window %d times: this "+
+			"host cannot complete an acquire-and-probe inside the %s lease TTL. Not a product "+
+			"failure — re-run when the host is less loaded",
+			overrunRetries, agentKillLeaseTTL)
+		r.Misconfigured = true
+		r.Pass = false
+		return r, nil
+	}
 
 	// 3. After expiry, recovery: agents may reclaim — but exactly one.
 	//    The window between "observed stale" and "overwrote" is where a

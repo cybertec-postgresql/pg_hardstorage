@@ -109,6 +109,18 @@ const RestoreBinEnv = "PG_HARDSTORAGE_RESTORE_BIN"
 // `%f` / `%p` are emitted as literal placeholders for PG to
 // substitute per the usual restore_command contract.
 func Build(agentBin, deployment, repoURL string) string {
+	return BuildWithIdentity(agentBin, deployment, repoURL, "")
+}
+
+// BuildWithIdentity is Build carrying the seed backup's
+// system_identifier: the generated command passes it to `wal fetch
+// --expect-system-identifier`, which refuses the FIRST segment
+// archived by a different cluster — typed and named — instead of
+// letting PostgreSQL discover the mix mid-replay with a FATAL that
+// names neither the deployment nor the repair. Empty sysID emits
+// exactly Build's command (older call sites and pre-schema manifests
+// keep their behaviour).
+func BuildWithIdentity(agentBin, deployment, repoURL, sysID string) string {
 	// `-o text -q`: restore_command runs off-TTY, where the global
 	// output default is JSON — every routine "segment not in repo"
 	// probe (normal at end-of-WAL) would otherwise dump a 10-line
@@ -116,10 +128,15 @@ func Build(agentBin, deployment, repoURL string) string {
 	// twice per poll cycle, and restore error reports quoting the log
 	// tail became walls of nested escaped JSON. Text mode keeps it to
 	// a single line.
-	return fmt.Sprintf(`%s wal fetch %s %%f %%p --repo %s -o text -q; %s`,
+	expect := ""
+	if sysID != "" {
+		expect = " --expect-system-identifier " + ShellQuote(sysID)
+	}
+	return fmt.Sprintf(`%s wal fetch %s %%f %%p --repo %s%s -o text -q; %s`,
 		ShellQuote(resolveRestoreBin(agentBin)),
 		ShellQuote(deployment),
 		ShellQuote(repoURL),
+		expect,
 		oneShotTail())
 }
 

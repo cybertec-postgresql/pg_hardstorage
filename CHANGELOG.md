@@ -120,6 +120,22 @@ keeps reading that version for at least 24 months after a successor lands.
   which monitoring already sees, while a promoted-behind cluster is
   data loss.
 
+- **Restores refuse foreign WAL at the first byte, by name.** The
+  archive-side guards (`wal stream`, `wal push`) refuse a cluster's
+  system-identifier change at write time — but an archive that already
+  mixes lineages (a deployment name reused after a wipe, a pre-guard
+  mix, an `--allow-system-identifier-change` archive) reaches
+  recovery, and PostgreSQL notices only mid-replay, after the
+  restore's wallclock is spent, with a FATAL that names neither the
+  deployment nor the repair. `restore` and the standby auto-recovery
+  path now thread the seed backup's identifier into the generated
+  `restore_command` (`wal fetch --expect-system-identifier`), so the
+  first foreign segment is refused with a typed
+  `wal.fetch.system_identifier_mismatch` naming both identities — and
+  the strict tail aborts recovery loudly right there. Best-effort and
+  additive: an unreadable manifest or a pre-schema archive simply
+  leaves the check unarmed, never blocks a restore.
+
 - **The agent-kill drill classifies an impossible budget before
   running anything.** `recover_within` shorter than the drill's lease
   TTL is the operator's parameter, and is now reported as

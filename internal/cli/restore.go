@@ -327,7 +327,11 @@ func runRestore(cmd *cobra.Command, opts restoreOpts) error {
 	// real restore (issue #99). targetTime is the already-parsed --to
 	// instant (zero when --to was not set) so buildRecovery does not
 	// re-parse and cannot drift from the seed resolution above.
-	recovery, err := buildRecovery(opts, targetTime)
+	// Seed identity for the restore_command's belt-and-braces check:
+	// best-effort — an unreadable manifest yields "" and the check is
+	// simply not armed, never a blocked restore.
+	seedSysID := resolveSeedSystemIdentifier(cmd.Context(), opts.repoURL, opts.deployment, backupID, verifier)
+	recovery, err := buildRecovery(opts, targetTime, seedSysID)
 	if err != nil {
 		return err
 	}
@@ -503,7 +507,7 @@ func runRestore(cmd *cobra.Command, opts restoreOpts) error {
 // once and threads it here so the recovery_target_time armed on disk
 // is the exact instant used to resolve the seed backup). It is the
 // zero Time when --to was not set.
-func buildRecovery(opts restoreOpts, targetTime time.Time) (*restore.Recovery, error) {
+func buildRecovery(opts restoreOpts, targetTime time.Time, seedSysID string) (*restore.Recovery, error) {
 	hasLSN := opts.toLSN != ""
 	hasTime := opts.toTime != ""
 	hasName := opts.toName != ""
@@ -556,7 +560,7 @@ func buildRecovery(opts restoreOpts, targetTime time.Time) (*restore.Recovery, e
 		r.TargetName = opts.toName
 	}
 
-	cmd, err := buildRestoreCommandString(opts.deployment, opts.repoURL)
+	cmd, err := buildRestoreCommandString(opts.deployment, opts.repoURL, seedSysID)
 	if err != nil {
 		return nil, err
 	}
@@ -574,7 +578,7 @@ func buildRecovery(opts restoreOpts, targetTime time.Time) (*restore.Recovery, e
 // image, another host), the operator sets walfetchcmd.RestoreBinEnv
 // (PG_HARDSTORAGE_RESTORE_BIN) to the binary's path in that
 // environment; walfetchcmd.Build honours it (issue #107).
-func buildRestoreCommandString(deployment, repoURL string) (string, error) {
+func buildRestoreCommandString(deployment, repoURL, sysID string) (string, error) {
 	bin, err := os.Executable()
 	if err != nil {
 		return "", output.NewError("internal",
@@ -585,7 +589,7 @@ func buildRestoreCommandString(deployment, repoURL string) (string, error) {
 	// Goes through walfetchcmd.Build so the exit-6 → exit-1 wrapper
 	// is applied — see that package's docstring for the full
 	// rationale (restore sandbox recovery loop).
-	return walfetchcmd.Build(bin, deployment, repoURL), nil
+	return walfetchcmd.BuildWithIdentity(bin, deployment, repoURL, sysID), nil
 }
 
 // validateRestoreTargets parses and normalises the PG-typed PITR
@@ -1020,4 +1024,23 @@ func preflightAttestationGate(
 			fmt.Sprintf("restore: %v", err)).Wrap(err)
 	}
 	return nil
+}
+
+// resolveSeedSystemIdentifier reads the seed backup's recorded
+// system_identifier for the restore_command identity check.
+// Best-effort by design: any failure returns "" — the check is
+// belt-and-braces (PostgreSQL validates xlp_sysid itself, just
+// cryptically and mid-replay), and a transient manifest-read error
+// must never block a restore that would otherwise work.
+func resolveSeedSystemIdentifier(ctx context.Context, repoURL, deployment, backupID string, verifier *backup.Verifier) string {
+	_, sp, err := openRepo(ctx, repoURL)
+	if err != nil {
+		return ""
+	}
+	defer sp.Close()
+	m, _, err := backup.NewManifestStore(sp).ReadIncludingTombstoned(ctx, deployment, backupID, verifier)
+	if err != nil || m == nil {
+		return ""
+	}
+	return m.SystemIdentifier
 }
