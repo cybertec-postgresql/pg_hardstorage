@@ -11,6 +11,8 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ## [Unreleased]
 
+## [1.2.0] — 2026-08-08
+
 ### Fixed
 
 - **The window between an existing backup and a stream's first start is
