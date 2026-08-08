@@ -241,19 +241,45 @@ func readWalSource(t *testing.T, root string) string {
 // runWalStream needs a PG container plus a backend rigged to fail a
 // specific way, which tests the plumbing rather than the wiring.
 func TestStreamLoopUsesTheDecisions(t *testing.T) {
-	src := readWalSource(t, repoRootForWalTest(t))
+	root := repoRootForWalTest(t)
+	src := readWalSource(t, root)
+	policySrc := readCliSource(t, root, "wal_stream_retry_policy.go")
 
 	if !strings.Contains(src, "shouldEmitEvent(suppressEvents, e.Severity)") {
 		t.Error("the emit closure no longer routes through shouldEmitEvent, so warnings " +
 			"and errors are suppressed under --output json again (issue #45)")
 	}
-	if !strings.Contains(src, "decideStreamStop(streamErr, noProgress)") {
-		t.Error("the reconnect loop no longer consults decideStreamStop, so a permanent " +
+	// The decision chain moved when the loop's decisions were extracted
+	// into streamRetryPolicy (quality-plan step 4): the LOOP must
+	// consult the POLICY, and the POLICY must consult decideStreamStop.
+	// Break either link and every policy test stays green while the
+	// shipped loop restores issue #45's retry-forever behaviour.
+	if !strings.Contains(src, "policy.decide(attemptOutcome{") {
+		t.Error("runWalStream's reconnect loop no longer consults streamRetryPolicy.decide " +
+			"— the policy tests are exercising code the shipped loop does not run")
+	}
+	if !strings.Contains(src, "output.NewError(dec.StopCode, dec.StopMsg)") {
+		t.Error("the loop no longer honours the policy's stop verdict — a permanent " +
 			"mid-stream failure is retried forever again (issue #45)")
+	}
+	if !strings.Contains(policySrc, "decideStreamStop(o.StreamErr, p.noProgress)") {
+		t.Error("streamRetryPolicy no longer consults decideStreamStop, so the " +
+			"no-progress backstop is severed from the loop (issue #45)")
 	}
 	for _, code := range []string{"wal.stream_permanent", "wal.stream_no_progress"} {
 		if !strings.Contains(src, code) {
-			t.Errorf("wal.go no longer emits %q — a stop reason lost its name", code)
+			t.Errorf("wal.go no longer names %q — a stop reason lost its name", code)
 		}
 	}
+}
+
+// readCliSource reads one internal/cli source file for the wiring
+// guards above.
+func readCliSource(t *testing.T, root, name string) string {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(root, "internal", "cli", name))
+	if err != nil {
+		t.Fatalf("read %s: %v", name, err)
+	}
+	return string(b)
 }

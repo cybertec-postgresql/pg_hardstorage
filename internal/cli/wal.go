@@ -1671,19 +1671,22 @@ func runWalStream(cmd *cobra.Command, opts walStreamOptions) error {
 	//    resumes streaming.
 	startedAt := time.Now().UTC()
 	const initialBackoff = time.Second
-	backoff := initialBackoff
 	var (
-		firstStartLSN   pglogrepl.LSN
-		firstStartSet   bool
-		latestSynced    pglogrepl.LSN
-		latestBuffered  pglogrepl.LSN
-		latestTimeline  uint32
-		attempt         int
-		lastStreamErr   error // streamErr of the final attempt, for the honest clean_stop
-		noProgress      int   // consecutive failed attempts that synced nothing new
-		lastProgressLSN pglogrepl.LSN
-		streamSysID     string
+		firstStartLSN  pglogrepl.LSN
+		firstStartSet  bool
+		latestSynced   pglogrepl.LSN
+		latestBuffered pglogrepl.LSN
+		latestTimeline uint32
+		attempt        int
+		lastStreamErr  error // streamErr of the final attempt, for the honest clean_stop
+		streamSysID    string
 	)
+	// The DECISIONS (permanent vs retryable, no-progress accounting,
+	// backoff curves, when to stop) live in streamRetryPolicy — pure
+	// and driven directly by wal_stream_retry_policy_test.go. This
+	// loop performs only the I/O around them.
+	policy := newStreamRetryPolicy(opts.noReconnect, initialBackoff, opts.maxReconnectBackoff)
+retryLoop:
 	for {
 		if streamCtx.Err() != nil {
 			break
@@ -1705,112 +1708,56 @@ func runWalStream(cmd *cobra.Command, opts walStreamOptions) error {
 				return perr
 			}
 		}
-		if attemptErr != nil {
-			// Pre-Stream setup error (preflight, ensureSlot,
-			// resolveStartLSN, connect).  Treat as a connection-
-			// class failure for retry purposes — most setup
-			// failures clear once the new leader is up.
-			if streamCtx.Err() != nil {
-				break
+		if attemptErr == nil {
+			_ = attemptInfo
+			lastStreamErr = streamErr
+			if !firstStartSet {
+				firstStartLSN = attemptStart
+				firstStartSet = true
 			}
-			// Permanent setup errors (operator must intervene)
-			// bypass the retry loop.  Without this, a recycled-WAL
-			// gap surfaces as a tight wal.stream.reconnecting loop
-			// that masks the real, actionable structured error
-			// (issue #79).  --no-reconnect already takes the same
-			// exit; both arrive at the same return so the operator
-			// sees one clean failure mode.
-			if opts.noReconnect || isPermanentStreamSetupError(attemptErr) {
-				return attemptErr
+			if syncedAtExit > latestSynced {
+				latestSynced = syncedAtExit
 			}
-			emit(output.NewEvent(output.SeverityWarning, "wal.stream", "reconnecting").
-				WithBody(map[string]any{
-					"attempt": attempt,
-					"error":   attemptErr.Error(),
-					"backoff": backoff.String(),
-					"reason":  "setup_failure",
-				}))
-			if !sleepBackoff(streamCtx, backoff) {
-				break
+			if bufferedAtExit > latestBuffered {
+				latestBuffered = bufferedAtExit
 			}
-			backoff = nextBackoff(backoff, opts.maxReconnectBackoff)
-			continue
+			latestTimeline = attemptTLI
 		}
-		_ = attemptInfo
-		lastStreamErr = streamErr
-		if !firstStartSet {
-			firstStartLSN = attemptStart
-			firstStartSet = true
-		}
-		if syncedAtExit > latestSynced {
-			latestSynced = syncedAtExit
-		}
-		if bufferedAtExit > latestBuffered {
-			latestBuffered = bufferedAtExit
-		}
-		latestTimeline = attemptTLI
 
-		if errors.Is(streamErr, context.Canceled) {
-			// Clean exit via ctx cancellation (signal or --once).
-			break
-		}
-		if opts.noReconnect {
+		dec := policy.decide(attemptOutcome{
+			SetupErr:    attemptErr,
+			StreamErr:   streamErr,
+			Synced:      syncedAtExit,
+			AttemptWall: time.Since(attemptWallStart),
+			CtxErr:      streamCtx.Err(),
+		})
+		switch dec.Action {
+		case retryBreak:
+			break retryLoop
+		case retryReturnSetupErr:
+			return attemptErr
+		case retryReturnStreamErr:
 			return output.NewError("wal.stream_error",
 				fmt.Sprintf("wal stream: %v", streamErr)).Wrap(streamErr)
-		}
-		// A mid-stream failure that reconnecting cannot fix must stop
-		// the loop. Only pre-Stream SETUP errors were classified this
-		// way; anything that broke once streaming had begun was retried
-		// forever (issue #45). A repository backend that cannot commit
-		// a manifest fails identically on every attempt, so the loop
-		// re-streamed the same LSN indefinitely: chunks accumulated,
-		// no manifest ever landed, and the process grew until the
-		// kernel killed it.
-
-		// The backstop for permanent failures we have NOT enumerated,
-		// which is the case that actually bit: a raw backend error
-		// ("NotImplemented" from a conditional COPY) carries no code we
-		// could match on. Judge by outcome instead — an attempt that
-		// ends in error having synced nothing made no progress, and a
-		// run of those means retrying is not working, whatever the
-		// cause.
-		if syncedAtExit > lastProgressLSN {
-			lastProgressLSN = syncedAtExit
-			noProgress = 0
-		} else {
-			noProgress++
-		}
-		if code, msg, stop := decideStreamStop(streamErr, noProgress); stop {
-			return output.NewError(code, msg).Wrap(streamErr)
-		}
-		// Per-attempt connection that ended in an error — the most
-		// common shape after a Patroni failover. A connection that
-		// stayed up long enough to actually stream resets the backoff
-		// (a clean reconnect starts at the floor); one that broke
-		// almost immediately keeps escalating, so a flapping/instantly-
-		// failing stream can't spin us in a tight full-setup reconnect
-		// loop (CPU-pathology audit #1).
-		reason := "stream_break"
-		if errors.Is(streamErr, replication.ErrPrimaryDraining) {
-			// The primary is shutting down and its walsender was busy-
-			// looping keepalives waiting for a flush we can't advance
-			// (issue #34); we bailed so it can exit. Reconnect PROMPTLY
-			// — target_session_attrs=primary routes to the new primary
-			// once the old one finishes demoting; resume is gap-free
-			// from our real flush position.
-			reason = "primary_draining"
-		}
-		backoff = nextStreamBreakBackoff(time.Since(attemptWallStart), backoff, initialBackoff, opts.maxReconnectBackoff)
-		emit(output.NewEvent(output.SeverityWarning, "wal.stream", "reconnecting").
-			WithBody(map[string]any{
-				"attempt":    attempt,
-				"error":      streamErr.Error(),
-				"backoff":    backoff.String(),
-				"synced_lsn": syncedAtExit.String(),
-				"reason":     reason,
-			}))
-		if !sleepBackoff(streamCtx, backoff) {
-			break
+		case retryReturnStop:
+			return output.NewError(dec.StopCode, dec.StopMsg).Wrap(streamErr)
+		case retryContinue:
+			body := map[string]any{
+				"attempt": attempt,
+				"backoff": dec.EmitBackoff.String(),
+				"reason":  dec.Reason,
+			}
+			if attemptErr != nil {
+				body["error"] = attemptErr.Error()
+			} else {
+				body["error"] = streamErr.Error()
+				body["synced_lsn"] = syncedAtExit.String()
+			}
+			emit(output.NewEvent(output.SeverityWarning, "wal.stream", "reconnecting").
+				WithBody(body))
+			if !sleepBackoff(streamCtx, dec.SleepFor) {
+				break retryLoop
+			}
 		}
 	}
 

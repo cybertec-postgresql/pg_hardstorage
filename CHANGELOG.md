@@ -120,6 +120,17 @@ keeps reading that version for at least 24 months after a successor lands.
   which monitoring already sees, while a promoted-behind cluster is
   data loss.
 
+- **The stream retry loop's decisions are now directly testable.**
+  The loop's control flow — permanent-vs-retryable classification, the
+  no-progress stop backstop, duration-aware backoff reset, the
+  draining-primary fast path — was covered only by a hand-mirrored
+  simulator that verified its own mirror and silently omitted the
+  entire mid-stream half. The decisions now live in a pure state
+  machine (`streamRetryPolicy`) the loop consults, tested directly:
+  eleven cases including six the simulator never modeled. Behaviour
+  preserved bit-for-bit, including the emitted-backoff asymmetry
+  between the setup and stream-break paths.
+
 - **Restores refuse foreign WAL at the first byte, by name.** The
   archive-side guards (`wal stream`, `wal push`) refuse a cluster's
   system-identifier change at write time — but an archive that already
