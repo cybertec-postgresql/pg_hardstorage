@@ -150,7 +150,12 @@ jobs:
       - name: Run the soak
         env:
           PGHS_CHAOS_BIN: /tmp/pghs-chaos
-          PGHS_CHAOS_MINUTES: ${{ github.event.inputs.minutes || '45' }}
+          # No default: unset lets the gate auto-size its fault window
+          # from the go-test budget (⅛ of it, capped at 20m). The fixed
+          # 45 outgrew TWO hosts' verify budgets in one week — a fast
+          # local box and, post-upgrade, the CI runners themselves
+          # (PROOF INCOMPLETE 106/203, every verified backup passing).
+          PGHS_CHAOS_MINUTES: ${{ github.event.inputs.minutes }}
           PGHS_CHAOS_SEED: ${{ github.event.inputs.seed || '' }}
         run: |
           go test -tags chaos -count=1 -timeout 150m -v \

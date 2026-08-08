@@ -246,15 +246,31 @@ func (m *minioRuntime) waitReady(ctx context.Context, total time.Duration) error
 // -q --filter name=pg-hs-minio-)` to clean up leaks.
 func (m *minioRuntime) Down(ctx context.Context) error {
 	if m.container != "" {
+		if m.dataDir != "" {
+			// MinIO writes as the container's uid, so the host-side
+			// RemoveAll below cannot delete the object files. Wipe
+			// from INSIDE while the container exists — without this,
+			// every run leaked its full data tree silently (the
+			// discarded RemoveAll error hid it), and 2791 leaked
+			// trees totalling ~150 GiB once filled a host's root
+			// filesystem mid-soak.
+			_ = exec.CommandContext(ctx, "docker", "exec", m.container,
+				"sh", "-c", "rm -rf /data/* /data/.[!.]* 2>/dev/null").Run()
+		}
 		_ = exec.CommandContext(ctx, "docker", "rm", "-fv", m.container).Run()
 		m.container = ""
 	}
+	var residue error
 	if m.dataDir != "" {
-		_ = os.RemoveAll(m.dataDir)
+		if err := os.RemoveAll(m.dataDir); err != nil {
+			// Loud, not silent: residue here is how the leak above
+			// went unnoticed for the project's whole history.
+			residue = fmt.Errorf("minio sink: data dir not fully removed (container-uid residue?): %w", err)
+		}
 		m.dataDir = ""
 	}
 	m.port = 0
-	return nil
+	return residue
 }
 
 // URL implements Runtime.  path_style=true is required for

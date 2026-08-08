@@ -65,10 +65,34 @@ import (
 
 func TestChaosSoak_RestoreProof(t *testing.T) {
 	bin := chaosBinary(t)
+	// Fault-window sizing. PGHS_CHAOS_MINUTES is the explicit
+	// override; otherwise size from the test binary's own deadline so
+	// the verify+boot gate that follows the window always has room.
+	// The arithmetic that matters: fast hardware turns fault-minutes
+	// into backups at ~4.5/min, and the gate verifies at ~5/min — so
+	// the window must stay well under half the remaining budget or
+	// the gate ends with the honest-but-red PROOF INCOMPLETE. Two
+	// hosts proved this the same week: a local box (45m window → 206
+	// backups → 69 verified in budget) and, after a runner-hardware
+	// upgrade, CI itself (45m → 203 → 106). The empirical record —
+	// not theory — sets the divisor: the gate's observed verify
+	// budget is ~22m whatever the -timeout, and the one fully-green
+	// shape was a 15m window (81 backups, all verified+booted). An
+	// eighth of the budget, capped at 20m, stays inside that record
+	// on both hosts.
 	minutes := 6
 	if v := os.Getenv("PGHS_CHAOS_MINUTES"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			minutes = n
+		}
+	} else if deadline, ok := t.Deadline(); ok {
+		if m := int(time.Until(deadline).Minutes() / 8); m > 0 {
+			minutes = m
+			if minutes > 20 {
+				minutes = 20
+			}
+			t.Logf("chaos soak: fault window auto-sized to %dm from the %s test budget "+
+				"(set PGHS_CHAOS_MINUTES to override)", minutes, time.Until(deadline).Round(time.Minute))
 		}
 	}
 	seed := time.Now().UnixNano()

@@ -291,17 +291,27 @@ func waitTLSReady(ctx context.Context, port int, total time.Duration) error {
 // Idempotent.
 func (m *tlsMinioRuntime) Down(ctx context.Context) error {
 	if m.container != "" {
+		if m.dataDir != "" {
+			// Same container-uid trap as the plain minio sink: wipe
+			// from inside or the host-side RemoveAll below silently
+			// leaks the whole data tree on every run.
+			_ = execCommand(ctx, "docker", "exec", m.container,
+				"sh", "-c", "rm -rf /data/* /data/.[!.]* 2>/dev/null").Run()
+		}
 		_ = execCommand(ctx, "docker", "rm", "-fv", m.container).Run()
 		m.container = ""
 	}
+	var residue error
 	if m.dataDir != "" {
 		// Both dataDir and certDir live under the same parent
 		// tempdir; nuking the parent reclaims everything.
-		_ = os.RemoveAll(filepath.Dir(m.dataDir))
+		if err := os.RemoveAll(filepath.Dir(m.dataDir)); err != nil {
+			residue = fmt.Errorf("tls-minio sink: dir not fully removed (container-uid residue?): %w", err)
+		}
 		m.dataDir, m.certDir, m.caBundle = "", "", ""
 	}
 	m.port = 0
-	return nil
+	return residue
 }
 
 // URL emits the same query-param shape as the plain MinIO
