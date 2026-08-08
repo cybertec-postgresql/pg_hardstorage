@@ -761,6 +761,7 @@ func Restore(ctx context.Context, opts Options) (res *Result, err error) {
 			RecoveryArmed:  recoveryArmed,
 			RepoURL:        opts.RepoURL,
 			Deployment:     m.Deployment,
+			SeedSysID:      m.SystemIdentifier,
 		})
 		if err != nil {
 			return nil, output.NewError("restore.postverify_failed",
@@ -1935,6 +1936,7 @@ func restoreIncrementalChain(ctx context.Context, opts Options, sp storage.Stora
 			RecoveryArmed:  recoveryArmed,
 			RepoURL:        opts.RepoURL,
 			Deployment:     leaf.Deployment,
+			SeedSysID:      leaf.SystemIdentifier,
 		})
 		if pverr != nil {
 			return nil, output.NewError("restore.postverify_failed",

@@ -210,3 +210,22 @@ func TestBuildWithIdentity_ArmsTheCheck(t *testing.T) {
 		t.Error("empty identity must emit exactly Build's command")
 	}
 }
+
+// TestBuildStandbyWithIdentity_ArmsTheCheck — the standby variant
+// carries the flag inside the LENIENT tail: a mismatch exits nonzero,
+// which a standby treats as "not archived yet", so a foreign-lineage
+// standby freezes at the boundary logging the typed mismatch instead
+// of replaying foreign WAL.
+func TestBuildStandbyWithIdentity_ArmsTheCheck(t *testing.T) {
+	got := BuildStandbyWithIdentity("/p/bin/pg_hardstorage", "db1", "file:///srv/repo", "7000000000000000001")
+	if !strings.Contains(got, "--expect-system-identifier '7000000000000000001'") {
+		t.Errorf("identity flag missing or unquoted:\n%s", got)
+	}
+	if strings.Contains(got, "ABRT") {
+		t.Errorf("standby variant must keep the lenient tail:\n%s", got)
+	}
+	if BuildStandbyWithIdentity("/p/bin/pg_hardstorage", "db1", "file:///srv/repo", "") !=
+		BuildStandby("/p/bin/pg_hardstorage", "db1", "file:///srv/repo") {
+		t.Error("empty identity must emit exactly BuildStandby's command")
+	}
+}

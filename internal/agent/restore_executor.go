@@ -202,7 +202,8 @@ func (e *RestoreExecutor) Execute(ctx context.Context, job *ControlPlaneJob, pro
 		if err != nil {
 			return nil, fmt.Errorf("restore-executor: locate own binary for restore_command: %w", err)
 		}
-		rec.RestoreCommand = walfetchcmd.Build(bin, job.Deployment, repoURL)
+		rec.RestoreCommand = walfetchcmd.BuildWithIdentity(bin, job.Deployment, repoURL,
+			restore.SeedSystemIdentifier(ctx, repoURL, job.Deployment, backupID, e.verifier))
 	}
 
 	// KEK resolver. Built every time so a keyring rotation lands

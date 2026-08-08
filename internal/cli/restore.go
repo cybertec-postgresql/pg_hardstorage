@@ -1026,21 +1026,9 @@ func preflightAttestationGate(
 	return nil
 }
 
-// resolveSeedSystemIdentifier reads the seed backup's recorded
-// system_identifier for the restore_command identity check.
-// Best-effort by design: any failure returns "" — the check is
-// belt-and-braces (PostgreSQL validates xlp_sysid itself, just
-// cryptically and mid-replay), and a transient manifest-read error
-// must never block a restore that would otherwise work.
+// resolveSeedSystemIdentifier is restore.SeedSystemIdentifier with
+// the CLI's import shape — see that helper for the best-effort
+// rationale.
 func resolveSeedSystemIdentifier(ctx context.Context, repoURL, deployment, backupID string, verifier *backup.Verifier) string {
-	_, sp, err := openRepo(ctx, repoURL)
-	if err != nil {
-		return ""
-	}
-	defer sp.Close()
-	m, _, err := backup.NewManifestStore(sp).ReadIncludingTombstoned(ctx, deployment, backupID, verifier)
-	if err != nil || m == nil {
-		return ""
-	}
-	return m.SystemIdentifier
+	return restore.SeedSystemIdentifier(ctx, repoURL, deployment, backupID, verifier)
 }

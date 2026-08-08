@@ -169,7 +169,8 @@ func (m *Manager) Create(ctx context.Context, opts CreateOptions) (*Standby, err
 	// recovery paths, which self-terminate by signal on infrastructure
 	// faults — every nonzero here must stay a plain exit or a repo
 	// blip would crash the replica. See that package's docstring.
-	rcmd := walfetchcmd.BuildStandby(m.binPath, opts.Deployment, opts.RepoURL)
+	rcmd := walfetchcmd.BuildStandbyWithIdentity(m.binPath, opts.Deployment, opts.RepoURL,
+		restore.SeedSystemIdentifier(ctx, opts.RepoURL, opts.Deployment, resolvedID, opts.Verifier))
 
 	if _, err := restore.Restore(ctx, restore.Options{
 		RepoURL:        opts.RepoURL,

@@ -208,7 +208,8 @@ func (m *Manager) Create(ctx context.Context, opts CreateOptions) (*Session, err
 	// POSIX-safe quoting and the exit-6 → exit-1 mapping PG needs at
 	// end-of-archive — see that package's docstring for the full
 	// rationale.
-	rcmd := walfetchcmd.Build(m.binPath, opts.Deployment, opts.RepoURL)
+	rcmd := walfetchcmd.BuildWithIdentity(m.binPath, opts.Deployment, opts.RepoURL,
+		restore.SeedSystemIdentifier(ctx, opts.RepoURL, opts.Deployment, pickedID, opts.Verifier))
 
 	rec := &restore.Recovery{
 		Enable:         true,

@@ -156,10 +156,26 @@ func BuildWithIdentity(agentBin, deployment, repoURL, sysID string) string {
 // that stops early PROMOTES, and a promoted-behind cluster is data
 // loss, not lag.
 func BuildStandby(agentBin, deployment, repoURL string) string {
-	return fmt.Sprintf(`%s wal fetch %s %%f %%p --repo %s -o text -q; ec=$?; [ $ec = 6 ] && exit 1 || exit $ec`,
+	return BuildStandbyWithIdentity(agentBin, deployment, repoURL, "")
+}
+
+// BuildStandbyWithIdentity is BuildStandby carrying the seed backup's
+// system_identifier (see BuildWithIdentity). The identity REFUSAL
+// composes correctly with the lenient tail: a mismatch exits nonzero,
+// which a standby treats as "not archived yet" — so a foreign-lineage
+// standby freezes at the boundary and logs the typed mismatch every
+// poll, rather than replaying foreign WAL. Frozen-and-explaining is
+// the standby posture; the one-shot paths abort instead.
+func BuildStandbyWithIdentity(agentBin, deployment, repoURL, sysID string) string {
+	expect := ""
+	if sysID != "" {
+		expect = " --expect-system-identifier " + ShellQuote(sysID)
+	}
+	return fmt.Sprintf(`%s wal fetch %s %%f %%p --repo %s%s -o text -q; ec=$?; [ $ec = 6 ] && exit 1 || exit $ec`,
 		ShellQuote(resolveRestoreBin(agentBin)),
 		ShellQuote(deployment),
-		ShellQuote(repoURL))
+		ShellQuote(repoURL),
+		expect)
 }
 
 // resolveRestoreBin picks the executable to embed in the restore_command:

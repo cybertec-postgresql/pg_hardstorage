@@ -164,6 +164,13 @@ type Options struct {
 	RepoURL    string
 	Deployment string
 
+	// SeedSysID, when non-empty, arms the sandbox restore_command's
+	// cluster-identity check (wal fetch --expect-system-identifier)
+	// with the manifest-under-verification's system_identifier — the
+	// verifier must not green-light a backup by replaying WAL from a
+	// DIFFERENT lineage that happens to share the deployment name.
+	SeedSysID string
+
 	// AgentBinary, when non-empty, overrides the binary path
 	// used in the synthesised restore_command.  Defaults to
 	// os.Executable() (the agent invoking postverify).
@@ -324,7 +331,7 @@ func Verify(ctx context.Context, opts Options) (*Result, error) {
 	// stageForRecovery only wires the missing restore_command and skips
 	// the recovery_target='immediate' line — two targets would FATAL
 	// with "multiple recovery targets specified" (issue #56).
-	if err := stageForRecovery(opts.DataDir, opts.RepoURL, opts.Deployment, opts.AgentBinary, opts.RecoveryArmed); err != nil {
+	if err := stageForRecovery(opts.DataDir, opts.RepoURL, opts.Deployment, opts.AgentBinary, opts.SeedSysID, opts.RecoveryArmed); err != nil {
 		return res, fmt.Errorf("postverify: stage for recovery: %w", err)
 	}
 
@@ -824,7 +831,7 @@ func truncate(b []byte, n int) string {
 // gate at internal/cli/refuse_root.go refuses euid 0), and the
 // restore step that produced this dataDir already wrote its
 // files under that same uid.  No chown step needed here.
-func stageForRecovery(dataDir, repoURL, deployment, agentBinary string, pitrTargetArmed bool) error {
+func stageForRecovery(dataDir, repoURL, deployment, agentBinary, seedSysID string, pitrTargetArmed bool) error {
 	willHaveRestoreCommand := repoURL != "" && deployment != "" && pickAgentBinary(agentBinary) != ""
 
 	// PITR restore (`restore --to / --to-lsn / --to-name`) already
@@ -846,7 +853,7 @@ func stageForRecovery(dataDir, repoURL, deployment, agentBinary string, pitrTarg
 		if !willHaveRestoreCommand {
 			return nil
 		}
-		return appendRestoreCommand(dataDir, repoURL, deployment, agentBinary)
+		return appendRestoreCommand(dataDir, repoURL, deployment, agentBinary, seedSysID)
 	}
 
 	// Signal-file choice drives PG's startup mode and determines
@@ -921,7 +928,7 @@ func stageForRecovery(dataDir, repoURL, deployment, agentBinary string, pitrTarg
 		// double the single quotes here for PG's SQL-string-literal
 		// escape — wrapping in raw `'…'` would close the PG string
 		// at the first inner apostrophe and break the GUC parser.
-		rawCmd := walfetchcmd.Build(pickAgentBinary(agentBinary), deployment, repoURL)
+		rawCmd := walfetchcmd.BuildWithIdentity(pickAgentBinary(agentBinary), deployment, repoURL, seedSysID)
 		body += fmt.Sprintf("restore_command = '%s'\n",
 			strings.ReplaceAll(rawCmd, "'", "''"))
 	}
@@ -943,7 +950,7 @@ func stageForRecovery(dataDir, repoURL, deployment, agentBinary string, pitrTarg
 // thing missing for redo to reach the operator's target is the WAL-fetch
 // command.  Deliberately does NOT touch recovery_target / the signal
 // file — see the issue #56 note in stageForRecovery.
-func appendRestoreCommand(dataDir, repoURL, deployment, agentBinary string) error {
+func appendRestoreCommand(dataDir, repoURL, deployment, agentBinary, seedSysID string) error {
 	autoConf := filepath.Join(dataDir, "postgresql.auto.conf")
 	f, err := os.OpenFile(autoConf, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
@@ -952,7 +959,7 @@ func appendRestoreCommand(dataDir, repoURL, deployment, agentBinary string) erro
 	// walfetchcmd.Build emits POSIX-quoted args; double the single
 	// quotes for PG's SQL-string-literal escape (same as the non-PITR
 	// branch above).
-	rawCmd := walfetchcmd.Build(pickAgentBinary(agentBinary), deployment, repoURL)
+	rawCmd := walfetchcmd.BuildWithIdentity(pickAgentBinary(agentBinary), deployment, repoURL, seedSysID)
 	body := "\n# pg_hardstorage postverify (PITR restore_command):\n" +
 		fmt.Sprintf("restore_command = '%s'\n", strings.ReplaceAll(rawCmd, "'", "''"))
 	if _, err := f.WriteString(body); err != nil {

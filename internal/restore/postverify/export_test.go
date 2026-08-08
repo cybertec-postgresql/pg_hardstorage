@@ -7,7 +7,7 @@ import "context"
 // restore must NOT have postverify append `recovery_target = 'immediate'`
 // on top of the operator's recovery_target_* block.
 func StageForRecoveryForTest(dataDir, repoURL, deployment, agentBinary string, pitrTargetArmed bool) error {
-	return stageForRecovery(dataDir, repoURL, deployment, agentBinary, pitrTargetArmed)
+	return stageForRecovery(dataDir, repoURL, deployment, agentBinary, "", pitrTargetArmed)
 }
 
 // PickProbeDSNForTest exposes pickProbeDSN so the issue #85

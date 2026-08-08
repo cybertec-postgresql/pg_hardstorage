@@ -120,6 +120,21 @@ keeps reading that version for at least 24 months after a successor lands.
   which monitoring already sees, while a promoted-behind cluster is
   data loss.
 
+- **Every restore_command now arms the cluster-identity check.** The
+  check shipped armed on `restore` and the standby auto-recovery path;
+  the four remaining generators — standby bootstrap, time-travel, the
+  agent's restore executor, and the verifier's sandbox — passed an
+  empty identity and generated identity-blind commands. All six sites
+  now thread the seed backup's system_identifier (best-effort: an
+  unreadable manifest leaves the check unarmed, never blocks). The
+  standby variant composes with its lenient tail deliberately: a
+  foreign-lineage standby freezes at the boundary logging the typed
+  mismatch every poll instead of replaying foreign WAL. For the
+  verifier this closes a correctness corner: a backup must not
+  green-light by replaying WAL from a different lineage that shares
+  the deployment name. A source-level guard enumerates all six sites
+  and fails if any regresses to an unarmed builder.
+
 - **The stream retry loop's decisions are now directly testable.**
   The loop's control flow — permanent-vs-retryable classification, the
   no-progress stop backstop, duration-aware backoff reset, the
