@@ -127,7 +127,7 @@ var SinkImages = map[string]string{
 	"s3-minio":  "minio/minio:RELEASE.2025-01-20T14-49-07Z",
 	"tls-minio": "minio/minio:RELEASE.2025-01-20T14-49-07Z", // same image; TLS toggled by mounting certs
 	"azurite":   "mcr.microsoft.com/azure-storage/azurite:3.33.0",
-	"gcs-fake":  "fsouza/fake-gcs-server:1.49.0",
+	"gcs-fake":  "fsouza/fake-gcs-server:1.52.2",
 	"sftp":      "atmoz/sftp:alpine-3.7",
 	// ssh-exec is the scp fixture. The value is the BASE image; the
 	// runtime builds the final sshd image from it per-instance,
