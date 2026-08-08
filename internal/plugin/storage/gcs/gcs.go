@@ -59,6 +59,7 @@ import (
 	"time"
 
 	gcs "cloud.google.com/go/storage"
+	gax "github.com/googleapis/gax-go/v2"
 	"google.golang.org/api/iterator"
 	gcsoption "google.golang.org/api/option"
 
@@ -133,6 +134,22 @@ func (p *Plugin) Open(ctx context.Context, cfg storage.StorageConfig) error {
 	if err != nil {
 		return fmt.Errorf("gcs: open client: %w", err)
 	}
+	// Bounded retries, or a GCS outage parks operations for as long
+	// as the caller's context lives — and a wal streamer's context
+	// lives for DAYS. The SDK's default retries idempotent operations
+	// until the context deadline with backoff pauses up to 30s; the
+	// storage fault soak caught a worker asleep inside that loop for
+	// 37 minutes (gax.Sleep, retry.go) before the package timeout shot
+	// the binary. Five attempts with a 5s cap bounds any single
+	// operation's failure to roughly fifteen seconds; the callers'
+	// own retry/refusal machinery — which knows how to say things
+	// out loud — handles persistence from there. Same family as the
+	// SFTP dead-connection fix: the plugin's job is to FAIL, visibly,
+	// in bounded time.
+	cli.SetRetry(
+		gcs.WithBackoff(gax.Backoff{Initial: 500 * time.Millisecond, Max: 5 * time.Second, Multiplier: 2}),
+		gcs.WithMaxAttempts(5),
+	)
 	p.bucket = bucket
 	p.prefix = prefix
 	p.storageClass = storageClass

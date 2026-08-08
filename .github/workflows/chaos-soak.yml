@@ -21,7 +21,11 @@ on:
     inputs:
       minutes:
         description: "Soak budget in minutes"
-        default: "45"
+        # Empty: the gate auto-sizes its fault window from the go-test
+        # budget (1/8, capped 20m). Runner-hardware upgrades made the
+        # old fixed 45 outgrow the verify budget (203-217 backups, only
+        # ~100 verifiable) — set a number here only to override.
+        default: ""
       seed:
         description: "Fault-schedule seed (empty = random)"
         default: ""

@@ -15,6 +15,20 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **GCS operations fail in bounded time instead of retrying for the
+  caller's lifetime.** The SDK's default retries idempotent operations
+  until the context deadline with backoff pauses up to 30 seconds —
+  and a `wal stream` holds its context for days, so a GCS outage
+  parked operations indefinitely (the storage fault soak caught a
+  worker 37 minutes asleep inside the SDK's retry loop). The client
+  now caps retries at five attempts with a 5-second backoff ceiling:
+  any single operation fails visibly within ~15 seconds, and the
+  callers' own retry and refusal machinery — which knows how to say
+  things out loud — takes it from there. Same family as the SFTP
+  dead-connection fix.
+
+### Fixed
+
 - **The window between an existing backup and a stream's first start is
   now recorded — and a recovery that would cross it refuses.** `init
   --quick` (or any backup) followed by starting `wal stream` leaves WAL
