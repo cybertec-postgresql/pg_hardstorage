@@ -259,6 +259,14 @@ func (s *sftpRuntime) writeKnownHosts(ctx context.Context) error {
 // Idempotent.
 func (s *sftpRuntime) Down(ctx context.Context) error {
 	if s.container != "" {
+		if s.scratchDir != "" {
+			// The container wrote as uid 1001; the host user cannot
+			// delete those files. Wipe from INSIDE (sshd runs as
+			// root there) while the container still exists, so the
+			// host-side RemoveAll below only meets an empty dir.
+			_ = exec.CommandContext(ctx, "docker", "exec", s.container,
+				"sh", "-c", "rm -rf /home/"+sftpUser+"/"+sftpDir+"/* /home/"+sftpUser+"/"+sftpDir+"/.[!.]*").Run()
+		}
 		_ = exec.CommandContext(ctx, "docker", "rm", "-fv", s.container).Run()
 		s.container = ""
 	}
