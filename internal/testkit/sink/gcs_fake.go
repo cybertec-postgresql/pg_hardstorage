@@ -166,15 +166,28 @@ func (g *gcsFakeRuntime) waitBucketReady(ctx context.Context, total time.Duratio
 // tempdir, and clears the recorded port.  Idempotent.
 func (g *gcsFakeRuntime) Down(ctx context.Context) error {
 	if g.container != "" {
+		if g.dataDir != "" {
+			// Consistency with the minio sinks' leak fix: if the
+			// server ever writes as a foreign uid, the host-side
+			// RemoveAll below silently leaks the tree (2791 leaked
+			// minio trees / ~150 GiB on one host). No residue has
+			// been observed for fake-gcs-server, but the pattern is
+			// banned, not tolerated.
+			_ = exec.CommandContext(ctx, "docker", "exec", g.container,
+				"sh", "-c", "rm -rf /data/* /data/.[!.]* 2>/dev/null").Run()
+		}
 		_ = exec.CommandContext(ctx, "docker", "rm", "-fv", g.container).Run()
 		g.container = ""
 	}
+	var residue error
 	if g.dataDir != "" {
-		_ = os.RemoveAll(g.dataDir)
+		if err := os.RemoveAll(g.dataDir); err != nil {
+			residue = fmt.Errorf("gcs-fake sink: data dir not fully removed: %w", err)
+		}
 		g.dataDir = ""
 	}
 	g.port = 0
-	return nil
+	return residue
 }
 
 // URL points at the emulator using ONLY the plain
