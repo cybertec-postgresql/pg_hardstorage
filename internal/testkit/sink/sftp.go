@@ -32,6 +32,8 @@ import (
 // the credentials inline in the URL so EnvForAgent is empty
 // (no SSH-key host plumbing needed in tests).
 type sftpRuntime struct {
+	scratchDir string // PGHS_SINK_SCRATCH bind-mount dir, "" when unset
+
 	container string
 	port      int
 	// knownHosts is the path to a per-instance known_hosts
@@ -75,9 +77,32 @@ func (s *sftpRuntime) Up(ctx context.Context) error {
 		"run", "-d",
 		"--name", s.container,
 		"-p", fmt.Sprintf("127.0.0.1:%d:22", s.port),
+	}
+	// PGHS_SINK_SCRATCH relocates the server's upload directory onto a
+	// host path via bind mount. Without it the data lives in the
+	// container layer under docker's data-root — which sits on the
+	// root filesystem on typical hosts, and the storage soaks write at
+	// disk speed: the sftp fault soak filled a 7 GiB root reserve in
+	// 68 seconds, and the resulting server-side SSH_FX_FAILURE on a
+	// clean-path put is indistinguishable from a plugin bug until df
+	// is checked. Announced at startup by the soak's own log line
+	// (url=...); world-writable because the container writes as its
+	// own uid (1001).
+	if base := os.Getenv("PGHS_SINK_SCRATCH"); base != "" {
+		dir := filepath.Join(base, s.container+"-upload")
+		if err := os.MkdirAll(dir, 0o777); err != nil {
+			return fmt.Errorf("sftp sink: create scratch %s: %w", dir, err)
+		}
+		if err := os.Chmod(dir, 0o777); err != nil {
+			return fmt.Errorf("sftp sink: chmod scratch %s: %w", dir, err)
+		}
+		s.scratchDir = dir
+		args = append(args, "-v", dir+":/home/"+sftpUser+"/"+sftpDir)
+	}
+	args = append(args,
 		SinkImages["sftp"],
 		fmt.Sprintf("%s:%s:1001::%s", sftpUser, sftpPass, sftpDir),
-	}
+	)
 	cmd := exec.CommandContext(ctx, "docker", args...)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		s.container = ""
@@ -236,6 +261,10 @@ func (s *sftpRuntime) Down(ctx context.Context) error {
 	if s.container != "" {
 		_ = exec.CommandContext(ctx, "docker", "rm", "-fv", s.container).Run()
 		s.container = ""
+	}
+	if s.scratchDir != "" {
+		_ = os.RemoveAll(s.scratchDir)
+		s.scratchDir = ""
 	}
 	if s.knownHosts != "" {
 		// The dir we created is the parent of the
