@@ -109,6 +109,14 @@ archives:
 # .github/workflows/release.yml.
 homebrew_casks:
   - name: pg_hardstorage
+    # Caskless releases are a sanctioned mode, not an accident: when the
+    # tap token is absent the workflow's preflight either refuses the
+    # whole run (default) or — with repo var ALLOW_MISSING_TAP_TOKEN=true
+    # — proceeds deliberately WITHOUT a cask. This skip is the second
+    # half of that switch: without it goreleaser still tried the tap
+    # push, took a 401 AFTER uploading all 61 release assets, and marked
+    # an otherwise-complete release failed (v1.2.0's first publish).
+    skip_upload: "{{ if .Env.SKIP_CASK_UPLOAD }}true{{ else }}false{{ end }}"
     # Only the pg_hardstorage CLI archive — without this filter goreleaser
     # would also pull in the pg_hardstorage_testkit archive (two archives
     # per OS/arch), producing an ambiguous cask. Mirrors nfpms.ids.

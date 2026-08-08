@@ -221,7 +221,7 @@ func TestChaosSoak_RestoreProof(t *testing.T) {
 	}()
 
 	// Fault rounds until the budget expires.
-	faults := []string{"none", "switchover", "pause_leader", "backup_burst"}
+	faults := []string{"none", "switchover", "pause_leader", "backup_burst", "dcs_outage"}
 	deadline := time.Now().Add(time.Duration(minutes) * time.Minute)
 	round := 0
 	var faultLog []string
@@ -255,6 +255,28 @@ func TestChaosSoak_RestoreProof(t *testing.T) {
 						_ = exec.Command("docker", "unpause", n.container).Run()
 					}
 				}
+			}
+		case "dcs_outage":
+			// The DCS is the failure mode the OTHER faults never
+			// touch: pause etcd for 10-45s, straddling Patroni's 30s
+			// TTL. Below it the cluster rides the outage out; above
+			// it the leader SELF-DEMOTES (DCS-loss safety — it cannot
+			// prove it still holds the lock), every node is a replica
+			// until etcd returns and re-election runs. The streamer
+			// must refuse the demoted-but-alive node
+			// (wal.source_in_recovery is retryable by design), pick
+			// up the re-elected leader, and leave an archive the end
+			// gate can still prove gap-free.
+			if p.etcdContainer != "" {
+				pauseFor := time.Duration(10+rng.Intn(36)) * time.Second
+				t.Logf("  pausing etcd (DCS) for %s — Patroni ttl is 30s, so %s",
+					pauseFor, map[bool]string{true: "expect leader self-demotion + re-election", false: "cluster should ride it out"}[pauseFor > 30*time.Second])
+				_ = exec.Command("docker", "pause", p.etcdContainer).Run()
+				time.Sleep(pauseFor)
+				_ = exec.Command("docker", "unpause", p.etcdContainer).Run()
+				// Give the DCS session + election a beat to settle
+				// before the next fault lands on top of it.
+				time.Sleep(10 * time.Second)
 			}
 		case "backup_burst":
 			// Two concurrent backups racing each other + the streamer —

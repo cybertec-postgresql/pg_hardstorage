@@ -84,6 +84,7 @@ jobs:
       # at the end. GITHUB_TOKEN is fatal — nothing can publish without
       # it.
       - name: preflight-secrets
+        id: preflight
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
@@ -102,6 +103,10 @@ jobs:
           # permissions for a secret that did not exist. A warning was
           # what let it survive: warnings fail nothing, and the run went
           # red 6m46s later for a reason that named the wrong cause.
+          echo "caskless=false" >> "$GITHUB_OUTPUT"
+          if [ "${ALLOW_MISSING_TAP_TOKEN:-}" = "true" ] && [ -z "${HOMEBREW_TAP_TOKEN:-}" ]; then
+            echo "caskless=true" >> "$GITHUB_OUTPUT"
+          fi
           if [ "${ALLOW_MISSING_TAP_TOKEN:-}" = "true" ]; then
             echo "::warning title=Cask publishing disabled::repo variable ALLOW_MISSING_TAP_TOKEN=true, so the tap credential is not checked and this release will publish WITHOUT a Homebrew cask."
           elif [ -z "${HOMEBREW_TAP_TOKEN:-}" ]; then
@@ -141,6 +146,12 @@ jobs:
           # default GITHUB_TOKEN can't write a second repo.  Consumed by
           # the brews: stanza in .goreleaser.yaml.
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          # Second half of the caskless-release switch (preflight is the
+          # first): tells .goreleaser.yaml's homebrew_casks stanza to
+          # skip the tap push, instead of taking a 401 AFTER all release
+          # assets uploaded and marking a complete release failed.
+          # Always defined — goreleaser templates error on missing keys.
+          SKIP_CASK_UPLOAD: ${{ (vars.ALLOW_MISSING_TAP_TOKEN == 'true' && secrets.HOMEBREW_TAP_TOKEN == '') && 'true' || '' }}
 
       # Capture the goreleaser-emitted artifact list as JSON so the
       # SLSA generator can compute checksums for the binaries +
@@ -170,6 +181,10 @@ jobs:
           echo "subject-checksums=$checksums" >> "$GITHUB_OUTPUT"
     outputs:
       subject-checksums: ${{ steps.collect-artifacts.outputs.subject-checksums }}
+      # true when this run deliberately publishes WITHOUT a cask
+      # (ALLOW_MISSING_TAP_TOKEN=true and no tap token) — consumed by
+      # the homebrew-smoke gate, which has nothing to smoke then.
+      caskless: ${{ steps.preflight.outputs.caskless }}
 
   # SLSA Level 3 build provenance.  The reusable generator is
   # documented at https://github.com/slsa-framework/slsa-github-generator.
@@ -224,7 +239,12 @@ jobs:
     # skips on a manual workflow cancel.
     # On a manual dispatch, only run when a version was actually supplied —
     # a provenance-only backfill dispatch must not trip the cask smoke test.
-    if: ${{ !cancelled() && (github.event_name == 'push' || inputs.smoke_version != '') }}
+    # A sanctioned caskless release (ALLOW_MISSING_TAP_TOKEN=true with
+    # no tap token) publishes no cask, so there is nothing to smoke —
+    # skip instead of polling the tap for ten minutes and failing.
+    # Via the goreleaser job's output: the secrets context is not
+    # available in job-level if-expressions.
+    if: ${{ !cancelled() && (github.event_name == 'push' || inputs.smoke_version != '') && needs.goreleaser.outputs.caskless != 'true' }}
     runs-on: macos-latest
     steps:
       - name: Derive release version
