@@ -136,7 +136,16 @@ func TestChaosSoak_RestoreProof(t *testing.T) {
 	dsn := fmt.Sprintf("postgres://postgres:%s@%s/postgres?target_session_attrs=primary&sslmode=disable",
 		patroniSuperPassword, strings.Join(hosts, ","))
 
-	env := append(os.Environ(), "HOME="+home)
+	// HOME alone is not enough: paths.Resolve prefers the XDG
+	// variables when set, and GitHub's runners set them globally — so
+	// the agent's keyring (kek.bin) landed OUTSIDE the soak's
+	// controlled home on CI and the boot-proof prep found nothing to
+	// decrypt with. Blank them all, the same lesson newReadWorld
+	// already carries.
+	env := append(os.Environ(), "HOME="+home,
+		"XDG_CONFIG_HOME=", "XDG_DATA_HOME=", "XDG_CACHE_HOME=",
+		"XDG_STATE_HOME=", "XDG_RUNTIME_DIR=",
+		"PG_HARDSTORAGE_ROOT=", "PG_HARDSTORAGE_CONFIG_DIR=")
 	runBin := func(timeout time.Duration, args ...string) (string, int) {
 		cctx, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()
