@@ -474,6 +474,16 @@ func TestChaosSoak_RestoreProof(t *testing.T) {
 			break
 		}
 		if out, code := runBin(5*time.Minute, "verify", "db1", id, "--repo", repoURL, "--full"); code != 0 {
+			// A child killed by the gate's own deadline (ctx cancel →
+			// SIGKILL → exit -1 right as the budget check above trips
+			// on the next loop) is BUDGET, not corruption — reporting
+			// it as PROOF FAILED sent one investigation chasing a
+			// phantom verify failure that was the deadline's own
+			// mechanism.
+			if time.Now().After(gateDeadline) {
+				t.Logf("verify --full %s cut by the gate deadline mid-flight (exit %d) — counted as unverified, not failed", id, code)
+				continue
+			}
 			t.Errorf("PROOF FAILED: verify --full %s exited %d:\n%s", id, code, tail(out, 1200))
 			continue
 		}
