@@ -224,6 +224,7 @@ func TestChaosSoak_RestoreProof(t *testing.T) {
 	faults := []string{"none", "switchover", "pause_leader", "backup_burst", "dcs_outage"}
 	deadline := time.Now().Add(time.Duration(minutes) * time.Minute)
 	round := 0
+	roundBackupsOK := 0
 	var faultLog []string
 	for time.Now().Before(deadline) {
 		round++
@@ -293,14 +294,36 @@ func TestChaosSoak_RestoreProof(t *testing.T) {
 			<-done
 		}
 
-		// Every round also takes one scheduled-style backup.
+		// Every round also takes one scheduled-style backup. Two
+		// failure codes are CORRECT behaviour under this schedule, not
+		// findings: 7 (lease conflict — a burst backup still holds the
+		// lease) and 8 (unreachable — a dcs_outage demotion storm can
+		// leave the cluster PRIMARY-LESS for tens of seconds while
+		// re-election converges, and refusing loudly to back up a
+		// cluster with no primary is exactly right; CI hit this on the
+		// fault's first outing, round 9, mid-election after a 34s DCS
+		// pause compounded by a leader pause). The success-floor
+		// assertion after the loop keeps this tolerance from masking a
+		// backup path that is ALWAYS failing.
 		if out, code := runBin(4*time.Minute, "backup", "db1",
-			"--pg-connection", dsn, "--repo", repoURL); code != 0 && code != 7 {
-			t.Fatalf("round %d: backup failed with unexpected code %d (7=lease-conflict is tolerated):\n%s", round, code, tail(out, 1200))
+			"--pg-connection", dsn, "--repo", repoURL); code == 0 {
+			roundBackupsOK++
+		} else if code != 7 && code != 8 {
+			t.Fatalf("round %d: backup failed with unexpected code %d (7=lease-conflict and 8=no-primary/unreachable are tolerated):\n%s", round, code, tail(out, 1200))
 		}
 		time.Sleep(time.Duration(3+rng.Intn(5)) * time.Second)
 	}
 	stopChurn()
+	// The tolerance above must not hide a systemically broken backup
+	// path: across a whole schedule, at least a third of the rounds
+	// must have produced a successful backup — faults are transient,
+	// and even demotion storms resolve within a round or two.
+	if roundBackupsOK < round/3 {
+		t.Fatalf("only %d of %d rounds produced a successful backup — the tolerated "+
+			"failure codes are masking a backup path that is failing SYSTEMICALLY, "+
+			"not transiently", roundBackupsOK, round)
+	}
+	t.Logf("round backups: %d/%d succeeded", roundBackupsOK, round)
 	t.Logf("fault schedule (%d rounds): %s", round, strings.Join(faultLog, ","))
 
 	// The streamer must still be ALIVE after every fault (a crash or a
