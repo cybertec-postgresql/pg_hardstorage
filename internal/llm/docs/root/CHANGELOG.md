@@ -11,6 +11,8 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ## [Unreleased]
 
+## [1.2.1] — 2026-08-09
+
 ### Fixed
 
 - **The keystore accepts owner-only key files stricter than 0600,
