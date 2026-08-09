@@ -30,8 +30,11 @@ const (
 	PublicKeyFile  = "manifest_signing.pub"
 )
 
-// Mode bits we enforce on the private-key file. 0600 is the only
-// permission set we'll load from; anything broader is refused.
+// Mode bits we allow on the private-key file: owner read/write.
+// Any GROUP or OTHER bit is refused — that is the property the gate
+// exists for. Owner-only subsets (0400: a read-only mounted Secret)
+// are fine; the old exact-0600 match refused them and shipped a Helm
+// chart whose own defaultMode could never load (#46).
 const privateKeyMode fs.FileMode = 0o600
 
 // LoadOrGenerate returns a Signer + Verifier rooted on the keypair
@@ -89,7 +92,7 @@ func load(privPath, pubPath string) (*backup.Signer, *backup.Verifier, error) {
 	if err != nil {
 		return nil, nil, fmt.Errorf("keystore: stat private key: %w", err)
 	}
-	if mode := info.Mode().Perm(); mode != privateKeyMode {
+	if mode := info.Mode().Perm(); mode&^privateKeyMode != 0 {
 		return nil, nil, fmt.Errorf("keystore: %s has mode %#o; require %#o (chmod 0600 the file)",
 			privPath, mode, privateKeyMode)
 	}

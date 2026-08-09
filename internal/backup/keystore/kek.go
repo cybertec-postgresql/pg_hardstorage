@@ -39,7 +39,9 @@ func assertKEKFileMode(path string) error {
 	if !info.Mode().IsRegular() {
 		return fmt.Errorf("keystore: %s is not a regular file", path)
 	}
-	if mode := info.Mode().Perm(); mode != kekFileMode {
+	// Owner-only subsets pass (0400 = read-only Secret mount); any
+	// group/other bit is the actual hazard and is refused.
+	if mode := info.Mode().Perm(); mode&^kekFileMode != 0 {
 		return fmt.Errorf("keystore: %s has mode %#o; require %#o (chmod 0600 the file)",
 			path, mode, kekFileMode)
 	}

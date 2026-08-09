@@ -101,6 +101,8 @@ generated from the Cobra command tree on every
 | [`pg_hardstorage jit revoke`](pg_hardstorage_jit_revoke.md) | Revoke a JIT token (writes a sibling .revoked marker) |
 | [`pg_hardstorage jit show`](pg_hardstorage_jit_show.md) | Show one JIT token's full body + revocation status |
 | [`pg_hardstorage jit verify`](pg_hardstorage_jit_verify.md) | Verify a supplied JIT token is currently valid for an operation |
+| [`pg_hardstorage keyring`](pg_hardstorage_keyring.md) | Keyring utilities |
+| [`pg_hardstorage keyring install`](pg_hardstorage_keyring_install.md) | Copy keyring files into place with the modes the keystore requires |
 | [`pg_hardstorage kms`](pg_hardstorage_kms.md) | Manage encryption keys |
 | [`pg_hardstorage kms hsm-status`](pg_hardstorage_kms_hsm-status.md) | Report PKCS#11 / TPM 2.0 binding state (deferred) |
 | [`pg_hardstorage kms inspect`](pg_hardstorage_kms_inspect.md) | Read-only summary of the keyring |

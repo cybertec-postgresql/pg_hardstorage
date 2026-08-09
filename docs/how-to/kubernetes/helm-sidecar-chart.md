@@ -147,11 +147,23 @@ Two patterns:
 
 ### Local keyring (`kek_ref: local:...`)
 
-The keyring directory `/etc/pg_hardstorage/keyring/` mounts
-from a **Secret** — never the ConfigMap. Key material in a
+The keyring directory `/etc/pg_hardstorage/keyring/` mounts as an
+in-memory volume populated from a **Secret** — never the ConfigMap. Key material in a
 ConfigMap is readable by anyone with `get configmap`, which
 is a lower bar than `get secret` in any cluster that
 separates the two.
+
+The Secret is not mounted at the keyring path directly. Kubernetes
+rewrites the modes of Secret-mounted files when the pod runs with an
+`fsGroup` (group-read gets OR'd in — `defaultMode: 0600` arrives as
+`0640`), and the agent's keystore refuses any group- or
+world-readable `kek.bin` or signing key: that refusal is a security
+property, not a bug. The chart therefore runs an `install-keyring`
+initContainer — the agent's own `pg_hardstorage keyring install` —
+which copies the mounted material into an in-memory volume with
+owner-only modes. You will see this as a short-lived init step on
+pod start; if your Secrets are misnamed or missing, it is this step
+that fails, loudly, with the offending path in its output.
 
 Bring your own Secret (recommended). Works with
 sealed-secrets, external-secrets and CSI drivers, and keeps

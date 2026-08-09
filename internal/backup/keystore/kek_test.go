@@ -183,3 +183,22 @@ func TestLoadOrGenerateKEK_RefusesGroupReadable(t *testing.T) {
 		t.Fatal("expected refusal on mode-0640 KEK")
 	}
 }
+
+// TestLoadKEK_ReadOnlyOwnerModeAccepted: 0400 is STRICTER than 0600
+// and must load — a Kubernetes Secret mounted read-only is the
+// canonical producer (#46: the chart's own defaultMode 0400 was
+// refused by the old exact-0600 match, so the shipped keyring
+// feature could never start). Group/other bits remain refused; the
+// world-readable test above pins that side.
+func TestLoadKEK_ReadOnlyOwnerModeAccepted(t *testing.T) {
+	dir := t.TempDir()
+	if _, _, err := keystore.LoadOrGenerateKEK(dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(filepath.Join(dir, keystore.KEKFileName), 0o400); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := keystore.LoadOrGenerateKEK(dir); err != nil {
+		t.Fatalf("0400 KEK refused: %v — read-only-owner is stricter than 0600, not broader", err)
+	}
+}

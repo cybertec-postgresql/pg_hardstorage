@@ -57,6 +57,29 @@ spec:
       topologySpreadConstraints:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      {{- if include "pg-hardstorage-sidecar.keyringEnabled" . }}
+      initContainers:
+        # See the keyring-src volume comment: Secrets cannot be
+        # mounted at the keyring path directly because fsGroup mangles
+        # their modes past what the keystore's gates allow. The agent
+        # image is distroless, so the agent itself carries the copy.
+        - name: install-keyring
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - keyring
+            - install
+            - --from=/keyring-src
+            - --to=/etc/pg_hardstorage/keyring
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          volumeMounts:
+            - name: keyring-src
+              mountPath: /keyring-src
+              readOnly: true
+            - name: keyring
+              mountPath: /etc/pg_hardstorage/keyring
+      {{- end }}
       containers:
         - name: pg-hardstorage
           image: {{ include "pg-hardstorage-sidecar.image" . }}
@@ -129,7 +152,20 @@ spec:
             medium: Memory
             sizeLimit: 64Mi
         {{- if include "pg-hardstorage-sidecar.keyringEnabled" . }}
+        # The Secret material lands here (keyring-src) and is COPIED
+        # into the keyring emptyDir by the install-keyring
+        # initContainer. Mounting the Secret directly at the keyring
+        # path cannot work: fsGroup makes kubelet OR group-read into
+        # every projected file (issue #46's follow-up demonstrated
+        # 0600→0640), and the keystore refuses any group/other bit on
+        # kek.bin and the signing key — correctly. The copy lands the
+        # files owned by the runAsUser with owner-only modes, immune
+        # to fsGroup.
         - name: keyring
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1Mi
+        - name: keyring-src
           {{- if include "pg-hardstorage-sidecar.keyringProjected" . }}
           # Projected: the three keyring files may come from three
           # different Secrets, and they must all land in one directory.

@@ -242,3 +242,28 @@ func TestChartKeyringPerFileIsOptional(t *testing.T) {
 		t.Error("the default render references a keyring")
 	}
 }
+
+// TestChartKeyringGoesThroughTheInstallCopy holds the statefulset to
+// the initContainer shape: the Secret material mounts at keyring-src
+// and `pg_hardstorage keyring install` copies it into the keyring
+// emptyDir. Mounting Secrets at the keyring path DIRECTLY cannot
+// work — fsGroup makes kubelet OR group-read into projected files
+// (issue #46's follow-up measured 0600→0640), and the keystore
+// refuses group/other bits on kek.bin and the signing key. A future
+// "simplification" back to a direct mount would render fine, install
+// fine, and bootloop on first use.
+func TestChartKeyringGoesThroughTheInstallCopy(t *testing.T) {
+	manifests := renderChart(t, "keyring.kek.secretName=kek-secret")
+	for _, want := range []string{
+		"install-keyring",
+		"--from=/keyring-src",
+		"--to=/etc/pg_hardstorage/keyring",
+		"name: keyring-src",
+	} {
+		if !strings.Contains(manifests, want) {
+			t.Errorf("statefulset.yaml lost %q — the keyring must reach the agent through "+
+				"the keyring-install copy, or fsGroup's mode-mangling makes the keystore "+
+				"refuse it (#46)", want)
+		}
+	}
+}

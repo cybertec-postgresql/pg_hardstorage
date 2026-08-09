@@ -77,6 +77,7 @@ pg_hardstorage [flags]
 * [pg_hardstorage insider](pg_hardstorage_insider.md)	 - Insider-threat detection: scan the audit log for unusual patterns
 * [pg_hardstorage integrity](pg_hardstorage_integrity.md)	 - Continuous-attestation runs: re-verify manifests + chunks, sign the report
 * [pg_hardstorage jit](pg_hardstorage_jit.md)	 - Just-in-time access tokens for break-glass operations
+* [pg_hardstorage keyring](pg_hardstorage_keyring.md)	 - Keyring utilities
 * [pg_hardstorage kms](pg_hardstorage_kms.md)	 - Manage encryption keys
 * [pg_hardstorage lint](pg_hardstorage_lint.md)	 - Validate pg_hardstorage.yaml
 * [pg_hardstorage list](pg_hardstorage_list.md)	 - List backups for a deployment, newest first

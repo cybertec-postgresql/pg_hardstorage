@@ -13,6 +13,23 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **The keystore accepts owner-only key files stricter than 0600,
+  and the sidecar chart's keyring actually loads (#46).** Both
+  permission gates (`kek.bin`, signing key) demanded exactly `0600`;
+  a read-only `0400` — precisely what a mounted Kubernetes Secret
+  with the chart's own `defaultMode` produces — was refused, so the
+  keyring feature shipped in the chart could never start. The gates
+  now refuse what they always meant to refuse: any group or other
+  bit. On top, Kubernetes rewrites Secret-file modes under `fsGroup`
+  (group-read gets OR'd in), so the chart no longer mounts Secrets at
+  the keyring path at all: a new `install-keyring` initContainer runs
+  the new `pg_hardstorage keyring install` command — built for
+  distroless images — copying the material into an in-memory volume
+  with owner-only modes. A misconfigured Secret now fails the init
+  step loudly instead of producing a keyless pod. Credit to the
+  issue-#46 reporter, whose follow-up measured the fsGroup behaviour
+  before we shipped into it.
+
 - **A recreated replication slot no longer kills the streamer.** The
   resume floor check refused whenever the computed start sat below the
   slot's `restart_lsn`, treating it as proof the WAL was recycled. It

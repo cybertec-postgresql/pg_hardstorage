@@ -211,6 +211,7 @@ sandbox-PG runtime — extend per docs/SPEC.md.`,
 	root.SetVersionTemplate("pg_hardstorage {{.Version}}\n")
 
 	root.AddCommand(
+		newKeyringCmd(),
 		newVersionCmd(),
 		newInitCmd(),
 		newRealBackupCmd(),
