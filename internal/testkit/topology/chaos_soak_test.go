@@ -221,7 +221,7 @@ func TestChaosSoak_RestoreProof(t *testing.T) {
 	}()
 
 	// Fault rounds until the budget expires.
-	faults := []string{"none", "switchover", "pause_leader", "backup_burst", "dcs_outage", "compound_storm"}
+	faults := []string{"none", "switchover", "pause_leader", "backup_burst", "dcs_outage", "compound_storm", "janitor_sweep"}
 	deadline := time.Now().Add(time.Duration(minutes) * time.Minute)
 	round := 0
 	roundBackupsOK := 0
@@ -256,6 +256,40 @@ func TestChaosSoak_RestoreProof(t *testing.T) {
 						_ = exec.Command("docker", "unpause", n.container).Run()
 					}
 				}
+			}
+		case "janitor_sweep":
+			// Retention AS chaos. Every retention proof so far ran the
+			// janitors on a QUIET repo; the dedup-vs-GC commit gates
+			// (adopted-chunk re-stat in both the backup runner and the
+			// walsink) were proven at unit level. Here the real
+			// janitors race the real pipeline: gc --apply and wal
+			// prune --apply while the streamer commits segments,
+			// round backups run, and whatever fault the NEXT round
+			// brings lands on top. Two outcomes are correct: the
+			// janitor completes (deletions judged by the end gate —
+			// every backup must still verify, restore, and boot), or
+			// gc refuses because a backup lease is live (that refusal
+			// IS the dedup-vs-GC protection working; log it). What
+			// must never happen is what the end gate exists to catch:
+			// a backup or segment that verifies as present but lost a
+			// chunk to a sweep the gates should have blocked.
+			gcOut, gcCode := runBin(4*time.Minute, "repo", "gc", "--repo", repoURL,
+				"--apply")
+			switch {
+			case gcCode == 0:
+				t.Logf("  janitor: repo gc --apply completed mid-storm")
+			case strings.Contains(gcOut, "live_backup_lease"):
+				t.Logf("  janitor: gc refused under a live backup lease — the dedup-vs-GC guard, working")
+			default:
+				t.Errorf("janitor_sweep round %d: repo gc failed unexpectedly (%d):\n%s",
+					round, gcCode, tail(gcOut, 800))
+			}
+			if pOut, pCode := runBin(4*time.Minute, "wal", "prune", "db1", "--repo", repoURL,
+				"--apply"); pCode != 0 {
+				t.Errorf("janitor_sweep round %d: wal prune failed (%d):\n%s",
+					round, pCode, tail(pOut, 800))
+			} else {
+				t.Logf("  janitor: wal prune --apply completed mid-storm")
 			}
 		case "compound_storm":
 			// Faults do not strike alone in real incidents. The
