@@ -667,12 +667,19 @@ func buildRotateTask(name string, dep config.DeploymentConfig, verifier *backup.
 					reason = "policy=" + decision.PolicyName
 				}
 				if err := store.SoftDelete(ctx, name, m.BackupID, decision.PolicyName, reason); err != nil {
-					// Hold-protection: a held manifest is
-					// retention-immune. Skip cleanly so an
-					// active hold doesn't break the agent's
-					// scheduled rotation. Other errors
-					// still bubble up.
-					if errors.Is(err, backup.ErrManifestHeld) {
+					// Two refusals are expected here, not run-fatal; the agent
+					// skips both so one protected backup can't wedge the whole
+					// scheduled rotation: a held manifest is retention-immune,
+					// and a parent kept alive by a held (or concurrently
+					// committed) child cannot be tombstoned this run without
+					// orphaning that live child. The interactive `rotate` path
+					// protects a held chain's ancestors up-front via filterHeld;
+					// this is the agent-side equivalent, applied reactively.
+					// Without it one hold aborts every nightly run and any
+					// deletable backup ordered after the held anchor is never
+					// reclaimed. Any other error still bubbles up.
+					if errors.Is(err, backup.ErrManifestHeld) ||
+						errors.Is(err, backup.ErrChainHasLiveDescendants) {
 						continue
 					}
 					return fmt.Errorf("soft-delete %s: %w", m.BackupID, err)
