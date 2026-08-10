@@ -58,6 +58,21 @@ type Mutation struct {
 // in the named package — see the package doc.
 var Registry = []Mutation{
 	{
+		Tag: "mutation_materialize_offset_unchecked",
+		Description: "materializeFile writes restored chunks in slice " +
+			"order without confirming each chunk's Offset matches the " +
+			"running write position (pre-fix): a reordered or gapped " +
+			"chunk list that still sums to the file size restores " +
+			"BYTE-SCRAMBLED data that passes the size check with no " +
+			"error — silent corruption on the primary restore path. " +
+			"Manifest.Validate guards it upstream, but the reassembly " +
+			"must not rest the byte-order of restored data on a single " +
+			"guard. Caught by TestMaterializeFile_ReorderedChunksDetected.",
+		Packages: []string{
+			"github.com/cybertec-postgresql/pg_hardstorage/internal/restore",
+		},
+	},
+	{
 		Tag: "mutation_twelvehour_unchecked",
 		Description: "the natural-time PITR parser accepts malformed " +
 			"12-hour clocks (pre-fix): '13am' resolves to 13:00 (1pm), " +

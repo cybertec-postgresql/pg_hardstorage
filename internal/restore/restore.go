@@ -1248,6 +1248,22 @@ func materializeFile(ctx context.Context, cas *repo.CAS, destRoot string, f *bac
 			return bytesWritten, i, fmt.Errorf("chunk %s len mismatch: got %d, manifest says %d",
 				ref.Hash, len(body), ref.Len)
 		}
+		// Defense in depth on the most catastrophic failure surface:
+		// materializeFile writes chunks in slice order, so it must
+		// confirm each chunk's declared Offset is exactly where we're
+		// about to write it. Without this, a chunk list that is
+		// reordered or gapped but still sums to the right total would
+		// pass the size check below and produce a BYTE-SCRAMBLED file
+		// with no error — silent restore corruption. Manifest.Validate
+		// already enforces contiguity and restore re-runs it, so this
+		// is belt-and-braces (same posture as the restore-side sysid
+		// check) — but the byte-order of restored data is not
+		// something to leave resting on a single upstream guard.
+		if !chunkOffsetContiguous(ref.Offset, bytesWritten) {
+			return bytesWritten, i, fmt.Errorf("chunk %s offset=%d but the running write "+
+				"position is %d — the chunk list is not contiguous in offset order; refusing "+
+				"to write a byte-scrambled file", ref.Hash, ref.Offset, bytesWritten)
+		}
 		if _, err := dst.Write(body); err != nil {
 			return bytesWritten, i, fmt.Errorf("write chunk %s: %w", ref.Hash, err)
 		}

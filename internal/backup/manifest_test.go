@@ -264,3 +264,25 @@ func TestMarshalToBytes_HexHashes(t *testing.T) {
 		t.Errorf("manifest JSON contains a number-array hash (Hash type's MarshalText not used):\n%s", raw)
 	}
 }
+
+// TestManifestValidate_RejectsNonContiguousChunks pins the upstream
+// guard that restore's materializeFile relies on: a chunk list whose
+// offsets are not ascending-contiguous must be refused at Validate, so
+// the reassembly never sees a reorderable list. (materializeFile also
+// self-checks now, but this keeps the FIRST line of defense honest.)
+func TestManifestValidate_RejectsNonContiguousChunks(t *testing.T) {
+	base := sampleManifest()
+	// Two chunks with a GAP: [0,5) then [10,15) — offset 10 should be 5.
+	base.Files = []backup.FileEntry{{
+		Path: "base/16384/2619", Size: 10, Mode: 0o600,
+		Chunks: []backup.ChunkRef{
+			{Hash: repo.HashOf([]byte("AAAAA")), Offset: 0, Len: 5},
+			{Hash: repo.HashOf([]byte("BBBBB")), Offset: 10, Len: 5},
+		},
+	}}
+	if err := base.Validate(); err == nil {
+		t.Fatal("Manifest.Validate accepted a non-contiguous chunk list (offset gap) — the " +
+			"invariant materializeFile depends on to write bytes in the right order is not " +
+			"enforced")
+	}
+}

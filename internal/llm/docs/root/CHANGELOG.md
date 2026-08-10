@@ -13,6 +13,22 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **Restore refuses a non-contiguous chunk list instead of writing
+  scrambled bytes.** `materializeFile`, which rebuilds every file from
+  its chunks, wrote them in slice order and checked only per-chunk
+  length and total size — so a chunk list that was reordered or gapped
+  but still summed to the file size would restore byte-scrambled data
+  that passed every check, silently. It was safe in practice because
+  `Manifest.Validate` enforces contiguity and restore re-runs it, but
+  the byte-order of restored data should not rest on a single upstream
+  guard. `materializeFile` now confirms each chunk's recorded offset
+  matches the running write position and refuses otherwise — the same
+  belt-and-braces posture as the restore-side identity check. Found by
+  a direct-coverage pass on a function that previously had none.
+
+
+### Fixed
+
 - **The `--to` time parser rejects malformed 12-hour clocks instead of
   silently misreading them.** A 12-hour clock has hours 1..12, but the
   parser accepted `13am` (resolving to 13:00 — 1pm), `0am` (midnight),
