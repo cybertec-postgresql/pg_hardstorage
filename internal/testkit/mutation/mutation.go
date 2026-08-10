@@ -58,6 +58,19 @@ type Mutation struct {
 // in the named package — see the package doc.
 var Registry = []Mutation{
 	{
+		Tag: "mutation_twelvehour_unchecked",
+		Description: "the natural-time PITR parser accepts malformed " +
+			"12-hour clocks (pre-fix): '13am' resolves to 13:00 (1pm), " +
+			"'0am'/'0pm' to midnight/noon, so an operator meaning 1am who " +
+			"typos 13am silently gets a recovery_target_time twelve hours " +
+			"off — a confidently-wrong PITR target no downstream layer can " +
+			"catch. Caught by " +
+			"TestParse_MalformedTwelveHourClockRejected.",
+		Packages: []string{
+			"github.com/cybertec-postgresql/pg_hardstorage/internal/restore/naturaltime",
+		},
+	},
+	{
 		Tag: "mutation_wal_removed_retried",
 		Description: "the stream never recognises PostgreSQL's 'requested " +
 			"WAL segment has already been removed' verdict (the " +

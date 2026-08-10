@@ -308,6 +308,9 @@ func parseClock(s string) (int, int, bool) {
 		if m[2] != "" {
 			mi, _ = strconv.Atoi(m[2])
 		}
+		if !validTwelveHour(h) {
+			return 0, 0, false
+		}
 		switch m[3] {
 		case "am":
 			if h == 12 {

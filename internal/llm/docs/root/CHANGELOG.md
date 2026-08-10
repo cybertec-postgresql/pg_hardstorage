@@ -11,6 +11,18 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ## [Unreleased]
 
+### Fixed
+
+- **The `--to` time parser rejects malformed 12-hour clocks instead of
+  silently misreading them.** A 12-hour clock has hours 1..12, but the
+  parser accepted `13am` (resolving to 13:00 — 1pm), `0am` (midnight),
+  and `0pm` (noon): a plausible typo — meaning `1am`, typing `13am` —
+  silently produced a `recovery_target_time` twelve hours off, which no
+  downstream layer can catch once the instant is well-formed. Malformed
+  12-hour hours are now rejected loudly. Found by a fuzz pass on the
+  time parser; every valid form (`12am`→midnight, `12pm`→noon) is
+  unchanged.
+
 ## [1.2.1] — 2026-08-09
 
 ### Fixed
