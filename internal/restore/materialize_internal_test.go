@@ -105,3 +105,44 @@ func TestMaterializeFile_ReorderedChunksDetected(t *testing.T) {
 			"materializeFile must verify ref.Offset matches the running write position", got)
 	}
 }
+
+// TestMaterializeManifestInto_DirsAndFiles: the chain-staging
+// orchestrator recreates every captured empty dir (pg_combinebackup
+// requires them) and materialises every file. Covered end-to-end by
+// integration boots; this pins the unit behaviour directly — a
+// regression that stopped creating pg_tblspc/ silently broke every
+// incremental restore against PG 17 before (see the function's note).
+func TestMaterializeManifestInto_DirsAndFiles(t *testing.T) {
+	cas := materializeTestCAS(t)
+	body := []byte("heap page bytes")
+	m := &backup.Manifest{
+		// pg_combinebackup precondition the orchestrator enforces.
+		PGBackupManifest: []byte(`{"PostgreSQL-Backup-Manifest-Version":1,"Files":[]}`),
+		Dirs: []backup.DirEntry{
+			{Path: "pg_tblspc", Mode: 0o700},
+			{Path: "pg_wal", Mode: 0o700},
+		},
+		Files: []backup.FileEntry{
+			{Path: "base/16384/2619", Size: int64(len(body)), Mode: 0o600,
+				Chunks: []backup.ChunkRef{chunkOf(t, cas, 0, body)}},
+		},
+	}
+	dir := t.TempDir()
+	bytes, chunks, err := materializeManifestInto(context.Background(), cas, m, dir)
+	if err != nil {
+		t.Fatalf("materializeManifestInto: %v", err)
+	}
+	if bytes != int64(len(body)) || chunks != 1 {
+		t.Fatalf("accounted bytes=%d chunks=%d, want %d/1", bytes, chunks, len(body))
+	}
+	for _, d := range []string{"pg_tblspc", "pg_wal"} {
+		if info, err := os.Stat(filepath.Join(dir, d)); err != nil || !info.IsDir() {
+			t.Errorf("captured empty dir %q not recreated (err=%v) — pg_combinebackup would "+
+				"bail and the incremental restore breaks silently", d, err)
+		}
+	}
+	got, err := os.ReadFile(filepath.Join(dir, "base/16384/2619"))
+	if err != nil || string(got) != string(body) {
+		t.Fatalf("file not materialised correctly: got %q err %v", got, err)
+	}
+}
