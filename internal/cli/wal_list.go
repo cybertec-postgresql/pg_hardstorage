@@ -18,7 +18,6 @@ import (
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/pg/walsink"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo"
-	"github.com/cybertec-postgresql/pg_hardstorage/internal/wal/inventory"
 )
 
 // newWalListCmd implements `pg_hardstorage wal list <deployment>`.
@@ -360,11 +359,19 @@ func runWalRepair(cmd *cobra.Command, deployment, pgConn, repoURL, slotName stri
 		return mapRepoOpenErr(repoURL, err)
 	}
 	defer sp.Close()
-	// Delegated to the public inventory helper so the leader-
-	// follow coordinator and `wal repair` query the same source
-	// of truth. Behaviour is byte-equivalent to the v0.1
-	// in-package helper.
-	highestEnd, _, listErr := inventory.HighestArchivedLSN(cmd.Context(), sp,
+	// Use the SAME frontier lookup the leader-follow coordinator uses
+	// (archiveFrontierForLeader), not a raw HighestArchivedLSN — so the
+	// two agree across a failover boundary. `wal repair` is what an
+	// operator runs right after a promotion, on the freshly-promoted
+	// timeline where NOTHING is archived yet: a raw HighestArchivedLSN
+	// on the current TLI returns found=false → frontier 0, and the gap
+	// analysis below would then report the whole slot restart_lsn as a
+	// bogus gap starting at 0/0 (polluting the v1 monitoring contract on
+	// the exact command run during a failover). archiveFrontierForLeader
+	// falls back to the frontier of the timeline we branched from, which
+	// is the true "we have WAL up to here on disk" position; it returns
+	// 0 only on a genuine bootstrap (nothing archived on any timeline).
+	highestEnd, listErr := archiveFrontierForLeader(cmd.Context(), sp,
 		deployment, uint32(identity.Timeline))
 	if listErr != nil {
 		return output.NewError("repo.list_failed",
