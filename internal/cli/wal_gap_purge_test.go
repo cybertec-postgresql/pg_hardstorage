@@ -1,13 +1,16 @@
 package cli_test
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/output"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/wal/gapstate"
 )
@@ -18,13 +21,20 @@ import (
 // higher timeline so a lower timeline becomes a genuine orphan.
 func commitBackupOnTLI(t *testing.T, w *readWorld, deployment string, tli uint32, body []byte) string {
 	t.Helper()
+	return commitBackupOnTLIWithID(t, w, deployment, deployment+".tli.20260502T120000Z", tli, body)
+}
+
+// commitBackupOnTLIWithID is commitBackupOnTLI with a caller-chosen
+// backup ID, so a test can commit MORE than one backup (distinct IDs)
+// on different timelines.
+func commitBackupOnTLIWithID(t *testing.T, w *readWorld, deployment, id string, tli uint32, body []byte) string {
+	t.Helper()
 	cas := repo.NewCAS(w.sp)
 	info, err := cas.PutChunk(context.Background(), body)
 	if err != nil {
 		t.Fatalf("put chunk: %v", err)
 	}
 	ts := time.Now().UTC().Add(-time.Hour).Truncate(time.Second)
-	id := deployment + ".tli.20260502T120000Z"
 	m := &backup.Manifest{
 		Schema:           backup.Schema,
 		BackupID:         id,
@@ -257,6 +267,93 @@ func TestWalGapPurge_HelpDiscoverable(t *testing.T) {
 	for _, want := range []string{"--orphans", "--all", "--dry-run", "--yes", "deployment-wipe"} {
 		if !strings.Contains(stdout, want) {
 			t.Errorf("wal gap-purge --help missing %q:\n%s", want, stdout)
+		}
+	}
+}
+
+// TestWalGapPurge_Orphans_KeepsGapForWithinGraceTombstone pins the
+// tombstone-grace fix. `wal gap-purge --orphans` used to build its
+// live-timeline set from non-tombstoned manifests only. A soft-deleted
+// backup within the GC grace window is still restorable via `backup
+// undelete`, and its recovery_target_timeline='latest' PITR crosses
+// gaps on LATER timelines — so a gap between that backup's timeline and
+// the live backups' must survive. Excluding it let --orphans reap that
+// gap; a later undelete + unbounded recovery would then stop short at
+// the missing WAL and promote with no warning, the PITR refusal gone.
+//
+// Setup: a within-grace tombstoned backup on TLI 1, a live backup on
+// TLI 3, and a gap on TLI 2 between them. The TLI-2 gap must NOT be
+// reaped.
+func TestWalGapPurge_Orphans_KeepsGapForWithinGraceTombstone(t *testing.T) {
+	w := newReadWorld(t)
+	idA := commitBackupOnTLIWithID(t, w, "db1", "db1.a.20260101T000000Z", 1, []byte("older"))
+	commitBackupOnTLI(t, w, "db1", 3, []byte("live"))
+	// Soft-delete A now → its tombstone is well within the GC grace.
+	if err := w.store.SoftDelete(context.Background(), "db1", idA, "manual", "oops-restore-me-later"); err != nil {
+		t.Fatalf("soft-delete A: %v", err)
+	}
+	seedGap(t, w, "db1", 2, time.Date(2026, 5, 2, 12, 0, 0, 0, time.UTC))
+
+	stdout, _, exit := runCLI(t, "wal", "gap-purge", "db1",
+		"--repo", w.repoURL, "--orphans", "--yes", "-o", "json")
+	if exit != int(output.ExitOK) {
+		t.Fatalf("gap-purge --orphans exit=%d\n%s", exit, stdout)
+	}
+	all, _ := gapstate.New(w.sp).List(context.Background(), "db1")
+	kept := false
+	for _, r := range all {
+		if r.Timeline == 2 {
+			kept = true
+		}
+	}
+	if !kept {
+		t.Fatalf("gap on TLI 2 was reaped while a within-grace tombstoned backup on TLI 1 "+
+			"can still be undeleted and cross it — restore silently loses the PITR refusal.\n"+
+			"surviving records: %+v", all)
+	}
+}
+
+// TestWalGapPurge_Orphans_ReapsGapForPastGraceTombstone is the other
+// side: once a tombstone ages PAST the grace window the backup is
+// genuinely dead (gc reclaimed its chunks, wal-prune its WAL), so its
+// timeline must stop pinning gaps — routine cleanup keeps working.
+//
+// A tombstone marker backdated well beyond the grace stands in for
+// "aged out"; the TLI-2 gap below the only live backup (TLI 3) must be
+// reaped.
+func TestWalGapPurge_Orphans_ReapsGapForPastGraceTombstone(t *testing.T) {
+	w := newReadWorld(t)
+	idA := commitBackupOnTLIWithID(t, w, "db1", "db1.a.20260101T000000Z", 1, []byte("older"))
+	commitBackupOnTLI(t, w, "db1", 3, []byte("live"))
+
+	// Plant a tombstone marker for A whose TombstonedAt is far past the
+	// grace window — the "aged out, chunks+WAL already reclaimed" state.
+	old := time.Now().UTC().Add(-repo.DefaultTombstoneGracePeriod - 72*time.Hour)
+	tomb := backup.Tombstone{
+		Schema: backup.TombstoneSchema, BackupID: idA, Deployment: "db1",
+		TombstonedAt: old, Policy: "manual",
+	}
+	body, err := json.Marshal(&tomb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.sp.Put(context.Background(), backup.TombstonePath("db1", idA),
+		bytes.NewReader(body), storage.PutOptions{ContentLength: int64(len(body))}); err != nil {
+		t.Fatalf("plant backdated tombstone: %v", err)
+	}
+	seedGap(t, w, "db1", 2, time.Date(2026, 5, 2, 12, 0, 0, 0, time.UTC))
+
+	stdout, _, exit := runCLI(t, "wal", "gap-purge", "db1",
+		"--repo", w.repoURL, "--orphans", "--yes", "-o", "json")
+	if exit != int(output.ExitOK) {
+		t.Fatalf("gap-purge --orphans exit=%d\n%s", exit, stdout)
+	}
+	all, _ := gapstate.New(w.sp).List(context.Background(), "db1")
+	for _, r := range all {
+		if r.Timeline == 2 {
+			t.Fatalf("gap on TLI 2 survived even though the only backup at/below it is "+
+				"tombstoned PAST grace (dead) — routine cleanup would never make progress.\n"+
+				"records: %+v", all)
 		}
 	}
 }

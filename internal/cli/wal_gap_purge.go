@@ -15,6 +15,7 @@ import (
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/output"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/wal/gapstate"
 )
 
@@ -221,23 +222,48 @@ func runWalGapPurge(cmd *cobra.Command, deployment, repoURL string, orphans, all
 	}))
 }
 
-// collectLiveTimelines walks the deployment's live manifests
-// (signature-verified, non-tombstoned) and returns the set of
-// distinct Timeline values. Used by `--orphans` to decide which
-// gap records are still operationally meaningful.
+// collectLiveTimelines returns the set of distinct Timeline values for
+// every backup that is still RESTORABLE — live, or soft-deleted but
+// within the GC grace window. Used by `--orphans` to decide which gap
+// records are still operationally meaningful.
+//
+// Tombstoned-within-grace backups MUST count. A soft-deleted backup can
+// be brought back with `backup undelete` until its tombstone ages past
+// the grace period — the exact window gc keeps its chunks and wal-prune
+// keeps its WAL. If we excluded it (the old behaviour: List filters
+// tombstoned), its timeline would drop out of the live set, `--orphans`
+// would reap a gap on an intermediate timeline that the undeleted
+// backup's recovery_target_timeline='latest' PITR crosses, and restore
+// would then silently lose the ability to flag that gap — an unbounded
+// recovery would stop short at the missing WAL and promote without
+// warning. gc / wal-prune already honour this grace; `--orphans` must
+// match them or the three janitors disagree about what is still alive.
+//
+// Past grace the backup is genuinely dead (chunks + WAL reclaimed), so
+// it is dropped and routine cleanup makes progress as before.
 func collectLiveTimelines(ctx context.Context, store *backup.ManifestStore, deployment string, verifier *backup.Verifier) (map[uint32]struct{}, error) {
 	out := make(map[uint32]struct{})
-	for m, err := range store.List(ctx, deployment, verifier) {
+	graceCutoff := time.Now().UTC().Add(-repo.DefaultTombstoneGracePeriod)
+	for entry, err := range store.ListIncludingTombstoned(ctx, deployment, verifier) {
 		if err != nil {
-			// Signature failures don't define orphan-status:
-			// silently skip — same posture as
-			// pickLatestBackup.
+			// Signature/read failures don't define orphan-status:
+			// silently skip — same posture as the old List walk.
 			continue
 		}
-		if m == nil {
+		if entry.Manifest == nil {
 			continue
 		}
-		out[m.Timeline] = struct{}{}
+		if entry.Tombstoned {
+			ts, terr := store.ReadTombstone(ctx, deployment, entry.Manifest.BackupID)
+			switch {
+			case terr != nil || ts == nil || ts.TombstonedAt.IsZero():
+				// Age unknowable → keep the timeline. Over-keeping a tiny
+				// gap record is safe; reaping a still-needed one is not.
+			case ts.TombstonedAt.Before(graceCutoff):
+				continue // past grace — genuinely dead, don't let it pin gaps
+			}
+		}
+		out[entry.Manifest.Timeline] = struct{}{}
 	}
 	return out, nil
 }
