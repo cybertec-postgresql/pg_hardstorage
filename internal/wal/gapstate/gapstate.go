@@ -6,7 +6,7 @@
 // non-zero WAL gap (Mechanism 2 / Mechanism 3 dual-slot), it
 // writes a record at:
 //
-//	wal/<deployment>/gaps/<tli>-<unix-nanos>.json
+//	wal/<deployment>/gaps/<tli>-<unix-nanos>-<slot>.json
 //
 // The records are append-only — each detection is a fresh entry
 // rather than overwriting a single "current gap" file. That
@@ -33,6 +33,8 @@ package gapstate
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -93,7 +95,7 @@ func NewWithClock(sp storage.StoragePlugin, now func() time.Time) *Store {
 
 // Put writes a gap record at:
 //
-//	wal/<deployment>/gaps/<tli>-<unix-nanos>.json
+//	wal/<deployment>/gaps/<tli>-<unix-nanos>-<slot>.json
 //
 // Schema is auto-stamped if empty. DetectedAt defaults to the
 // store's clock when zero. Returns the canonical key on
@@ -120,14 +122,16 @@ func (s *Store) Put(ctx context.Context, r Record) (string, error) {
 		r.DetectedAt = r.DetectedAt.UTC()
 	}
 
-	key := keyFor(r.Deployment, r.Timeline, r.DetectedAt)
+	key := keyFor(r.Deployment, r.SlotName, r.Timeline, r.DetectedAt)
 	body, err := json.MarshalIndent(&r, "", "  ")
 	if err != nil {
 		return "", fmt.Errorf("gapstate: encode record: %w", err)
 	}
-	// IfNotExists: keys embed the unix-nano of the detection,
-	// so collisions effectively can't happen — but the flag is
-	// safety-belt against a clock-jump-backward situation.
+	// IfNotExists: keys embed the unix-nano AND a per-slot token,
+	// so two distinct detections can't collide — the flag is the
+	// safety-belt for the one case where they legitimately share a
+	// key: the SAME slot's detection retried (same slot, tli, nano),
+	// where an already-present record means a prior attempt landed.
 	if _, err := s.sp.Put(ctx, key, bytes.NewReader(body), storage.PutOptions{
 		ContentLength: int64(len(body)),
 		IfNotExists:   true,
@@ -393,8 +397,24 @@ func prefixFor(deployment string) string {
 
 // keyFor derives the record's canonical storage key. The key
 // embeds the TLI + unix-nano so List ordering is meaningful
-// even before we parse bodies.
-func keyFor(deployment string, tli uint32, detectedAt time.Time) string {
+// even before we parse bodies, and a per-slot token so two slots'
+// gaps NEVER share a key.
+//
+// The slot token matters because gaps are per-slot but a single
+// failover reconciles every configured slot in the same instant. Two
+// slots that gap on the same timeline can land the SAME (tli, unix-nano)
+// — and the Put below is IfNotExists, which the follower coordinator
+// treats as "my write already landed" (its retry-dedup contract). Without
+// the slot token the second slot's gap would collide with the first's
+// key, be dropped as already-present, and vanish — restore would then
+// fail to refuse a PITR into that lost gap. The token is a hash of the
+// slot name (not the raw name) so any slot-name byte is key-safe and two
+// distinct names never alias; the SAME slot retrying keeps the SAME key,
+// preserving the dedup the coordinator relies on.
+func keyFor(deployment, slotName string, tli uint32, detectedAt time.Time) string {
 	nanos := detectedAt.UTC().UnixNano()
-	return prefixFor(deployment) + strconv.FormatUint(uint64(tli), 10) + "-" + strconv.FormatInt(nanos, 10) + ".json"
+	sum := sha256.Sum256([]byte(slotName))
+	slotTok := hex.EncodeToString(sum[:8]) // 64-bit — collision-free for any real slot set
+	return prefixFor(deployment) + strconv.FormatUint(uint64(tli), 10) + "-" +
+		strconv.FormatInt(nanos, 10) + "-" + slotTok + ".json"
 }

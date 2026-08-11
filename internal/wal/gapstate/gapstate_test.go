@@ -272,3 +272,103 @@ func TestPut_DefaultsDetectedAtToClock(t *testing.T) {
 func startsWith(s, prefix string) bool {
 	return len(s) >= len(prefix) && s[:len(prefix)] == prefix
 }
+
+// TestPut_TwoSlotsSameTimelineSameInstantBothSurvive pins the
+// multi-slot collision fix. A single Patroni failover reconciles EVERY
+// configured slot (Mechanism 3: leader slot + replica slot(s)); each
+// can detect its own WAL gap on the same timeline, and the follower
+// stamps DetectedAt from one clock. If two slots' detections land on
+// the same (deployment, tli, unix-nano) — which a coarse clock or a
+// fixed test clock makes certain — the record key must STILL be unique
+// per slot.
+//
+// Before the per-slot token, keyFor omitted the slot: the second slot's
+// Put hit IfNotExists against the first's key. The follower coordinator
+// treats that ErrAlreadyExists as "my write already landed" (its
+// retry-dedup contract), so the second slot's gap was silently dropped
+// — and restore would then fail to refuse a PITR into that lost gap.
+//
+// Same clock for both Puts, same deployment + timeline, DIFFERENT slots:
+// both must persist and both must come back from List.
+func TestPut_TwoSlotsSameTimelineSameInstantBothSurvive(t *testing.T) {
+	sp := newSP(t)
+	at := time.Date(2026, 8, 11, 9, 0, 0, 0, time.UTC)
+	s := gapstate.NewWithClock(sp, fixedClock(at))
+
+	leaderRec := gapstate.Record{
+		Deployment: "db1", SlotName: "pg_hardstorage_db1", SlotRole: "leader",
+		Timeline: 7, GapStartLSN: "0/5000000", GapEndLSN: "0/5000100", GapBytes: 256,
+	}
+	replicaRec := gapstate.Record{
+		Deployment: "db1", SlotName: "pg_hardstorage_db1_replica", SlotRole: "replica",
+		Timeline: 7, GapStartLSN: "0/6000000", GapEndLSN: "0/6000200", GapBytes: 512,
+	}
+
+	kLeader, err := s.Put(context.Background(), leaderRec)
+	if err != nil {
+		t.Fatalf("Put leader-slot gap: %v", err)
+	}
+	kReplica, err := s.Put(context.Background(), replicaRec)
+	if err != nil {
+		t.Fatalf("Put replica-slot gap on the same timeline+instant was refused: %v\n\n"+
+			"a single failover records both slots' gaps at the same DetectedAt; the second "+
+			"must not collide with the first's key", err)
+	}
+	if kLeader == kReplica {
+		t.Fatalf("both slots produced the SAME key %q — one gap record overwrites the other "+
+			"and restore loses the ability to refuse a PITR into it", kLeader)
+	}
+
+	got, err := s.List(context.Background(), "db1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("List returned %d gap records, want 2 (one per slot) — a lost gap is a "+
+			"silently-permitted unsafe PITR", len(got))
+	}
+	bySlot := map[string]gapstate.Record{}
+	for _, r := range got {
+		bySlot[r.SlotName] = r
+	}
+	if r, ok := bySlot["pg_hardstorage_db1"]; !ok || r.GapBytes != 256 || r.GapStartLSN != "0/5000000" {
+		t.Errorf("leader-slot gap missing or corrupted: %+v", r)
+	}
+	if r, ok := bySlot["pg_hardstorage_db1_replica"]; !ok || r.GapBytes != 512 || r.GapStartLSN != "0/6000000" {
+		t.Errorf("replica-slot gap missing or corrupted: %+v", r)
+	}
+}
+
+// TestPut_SameSlotSameInstantIsIdempotent guards the OTHER side: the
+// per-slot token must not break the retry-dedup the coordinator relies
+// on. The SAME slot re-Put at the SAME (tli, instant) shares a key, so
+// IfNotExists reports it already exists — exactly one record on disk.
+func TestPut_SameSlotSameInstantIsIdempotent(t *testing.T) {
+	sp := newSP(t)
+	at := time.Date(2026, 8, 11, 9, 0, 0, 0, time.UTC)
+	s := gapstate.NewWithClock(sp, fixedClock(at))
+	rec := gapstate.Record{
+		Deployment: "db1", SlotName: "pg_hardstorage_db1", Timeline: 7,
+		GapStartLSN: "0/5000000", GapEndLSN: "0/5000100", GapBytes: 256,
+	}
+	k1, err := s.Put(context.Background(), rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The coordinator's retry: same record, same key. gapstate.Put
+	// surfaces the IfNotExists conflict as an error; the follower maps it
+	// to success. Here we assert the KEY is identical (so that mapping is
+	// sound) and that no duplicate landed.
+	k2, _ := s.Put(context.Background(), rec)
+	if k2 != "" && k2 != k1 {
+		t.Fatalf("a same-slot retry produced a DIFFERENT key (%q vs %q) — it would write a "+
+			"duplicate gap record instead of deduping", k2, k1)
+	}
+	got, err := s.List(context.Background(), "db1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("same-slot retry left %d records, want 1 (dedup broken)", len(got))
+	}
+}
