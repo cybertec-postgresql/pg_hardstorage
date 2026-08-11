@@ -1991,7 +1991,7 @@ func streamAttempt(
 	// for losing all subsequent WAL, which is plainly worse. So a
 	// failure warns and streaming continues — the same posture as the
 	// audit appends.
-	captureStreamTimelineHistory(repoCtx, d, sp, opts, timeline)
+	captureStreamTimelineHistory(repoCtx, d, sp, repoMeta.WORM, opts, timeline)
 
 	if attempt == 1 {
 		// Same durability honesty as the backup runner: on a backend
@@ -3045,7 +3045,7 @@ func (b walStreamResultBody) WriteText(w io.Writer) error {
 // file could not be stored would trade a PITR limitation for losing
 // all subsequent WAL, which is plainly worse. So a failure warns and
 // streaming continues — the same posture as the audit appends.
-func captureStreamTimelineHistory(ctx context.Context, d *output.Dispatcher, sp storage.StoragePlugin, opts walStreamOptions, tli uint32) {
+func captureStreamTimelineHistory(ctx context.Context, d *output.Dispatcher, sp storage.StoragePlugin, worm *repo.WORMPolicy, opts walStreamOptions, tli uint32) {
 	if tli <= 1 || opts.pgConn == "" || sp == nil {
 		return
 	}
@@ -3064,7 +3064,11 @@ func captureStreamTimelineHistory(ctx context.Context, d *output.Dispatcher, sp 
 			}))
 	}
 
-	store := timeline.New(sp)
+	// WORM: these .history files are captured during a failover and are
+	// never pruned — a compliance repo must Object-Lock them like its WAL,
+	// or a PITR that must cross this promotion loses the branch-point
+	// record. Nil policy (non-WORM repo) is identical to timeline.New.
+	store := timeline.NewWithRetention(sp, worm)
 
 	// Which of the ancestry do we not already hold? Checked before
 	// opening a connection, so an up-to-date archive costs no round

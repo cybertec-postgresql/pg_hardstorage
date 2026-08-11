@@ -955,7 +955,7 @@ func startPatroniFollowers(ctx context.Context, d *output.Dispatcher, deps map[s
 		// If the repo is unreachable at startup, log + skip; the
 		// agent itself stays up. The follower can be re-tried by
 		// restarting the agent after the repo is reachable again.
-		_, sp, oerr := repo.Open(ctx, dep.Repo)
+		meta, sp, oerr := repo.Open(ctx, dep.Repo)
 		if oerr != nil {
 			_ = d.Event(ctx, output.NewEvent(output.SeverityError, "agent", "patroni.repo_open_failed").
 				WithSubject(output.Subject{Deployment: name}).
@@ -965,7 +965,16 @@ func startPatroniFollowers(ctx context.Context, d *output.Dispatcher, deps map[s
 				}))
 			continue
 		}
-		ts := timeline.New(sp)
+		// WORM: timeline-history files are captured DURING a failover and
+		// are never pruned (wal-prune skips them) — they are the record of
+		// the cross-timeline lineage a PITR needs. On a retention repo they
+		// must be Object-Locked like the WAL and manifests, or a compliance
+		// repo can lose the history that lets recovery follow past a
+		// promotion. NewWithRetention re-derives the deadline per Put (the
+		// store stamps time.Now() at write), so a long-lived agent that
+		// captures histories months apart locks each correctly. Nil policy
+		// (non-WORM repo) makes this identical to timeline.New.
+		ts := timeline.NewWithRetention(sp, meta.WORM)
 		gs := gapstate.New(sp)
 
 		// DSNFor: the agent has the libpq DSN for the deployment

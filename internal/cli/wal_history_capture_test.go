@@ -41,7 +41,7 @@ func TestCaptureStreamTimelineHistory_SkipsTimelineOne(t *testing.T) {
 	sp, _ := newFsRepo(t)
 	d, buf := captureDispatcher(t)
 
-	captureStreamTimelineHistory(context.Background(), d, sp,
+	captureStreamTimelineHistory(context.Background(), d, sp, nil,
 		walStreamOptions{deployment: "db1", pgConn: "postgres://unreachable:1/x"}, 1)
 
 	if got := buf.String(); strings.Contains(got, "history_not_captured") {
@@ -65,7 +65,7 @@ func TestCaptureStreamTimelineHistory_UnreachablePGWarnsAndContinues(t *testing.
 
 	// The call must return rather than block or panic; the stream
 	// depends on it not being fatal.
-	captureStreamTimelineHistory(context.Background(), d, sp,
+	captureStreamTimelineHistory(context.Background(), d, sp, nil,
 		walStreamOptions{deployment: "db1", pgConn: "postgres://127.0.0.1:1/x"}, 2)
 
 	got := buf.String()
@@ -91,7 +91,7 @@ func TestCaptureStreamTimelineHistory_NoConnDoesNothing(t *testing.T) {
 	sp, _ := newFsRepo(t)
 	d, buf := captureDispatcher(t)
 
-	captureStreamTimelineHistory(context.Background(), d, sp,
+	captureStreamTimelineHistory(context.Background(), d, sp, nil,
 		walStreamOptions{deployment: "db1"}, 3)
 
 	if got := buf.String(); strings.Contains(got, "history_not_captured") {
@@ -156,7 +156,7 @@ func TestCaptureStreamTimelineHistory_SkipsWhatIsAlreadyStored(t *testing.T) {
 	}
 
 	d, buf := captureDispatcher(t)
-	captureStreamTimelineHistory(context.Background(), d, sp,
+	captureStreamTimelineHistory(context.Background(), d, sp, nil,
 		walStreamOptions{deployment: dep, pgConn: "postgres://127.0.0.1:1/x"}, 5)
 
 	if got := buf.String(); strings.Contains(got, "history_not_captured") {
@@ -189,7 +189,7 @@ func TestCaptureStreamTimelineHistory_MissingAncestorIsAttempted(t *testing.T) {
 	d, buf := captureDispatcher(t)
 	// PG is unreachable, so the attempt fails — and the warning is the
 	// proof that an attempt was made for the gap at all.
-	captureStreamTimelineHistory(context.Background(), d, sp,
+	captureStreamTimelineHistory(context.Background(), d, sp, nil,
 		walStreamOptions{deployment: dep, pgConn: "postgres://127.0.0.1:1/x"}, 5)
 
 	if got := buf.String(); !strings.Contains(got, "history_not_captured") {
