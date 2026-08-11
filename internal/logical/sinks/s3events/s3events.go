@@ -248,8 +248,16 @@ func (s *Sink) OnRecord(ctx context.Context, rec logicalreceiver.Record) error {
 		s.bufferSince = s.now()
 	}
 	s.buffered = append(s.buffered, rec)
-	if rec.ServerWALEnd > s.bufferEnd {
-		s.bufferEnd = rec.ServerWALEnd
+	// The confirmed LSN must be the end of data we actually RECEIVED, not
+	// rec.ServerWALEnd — that is the server's GLOBAL end-of-WAL at emission
+	// time, which races ahead of the logical decode stream. Reporting it
+	// back as confirmed_flush advances the slot past commits this sink never
+	// received; on a reconnect/failover PG will not resend them and they are
+	// lost. WALStart+len(Data) bounds the slot to bytes we hold — the same
+	// safe value the chunked sink uses. (It only ever moves the slot LESS
+	// far than ServerWALEnd, so it cannot lose data.)
+	if end := rec.WALStart + pglogrepl.LSN(len(rec.Data)); end > s.bufferEnd {
+		s.bufferEnd = end
 	}
 	if len(s.buffered) >= s.batchSize {
 		return s.flushLocked(ctx)
@@ -341,9 +349,9 @@ func (s *Sink) flushLocked(ctx context.Context) error {
 	if putErr == nil {
 		s.stats.BatchesWritten.Add(1)
 		s.stats.RecordsWritten.Add(uint64(len(batch)))
-		// Advance syncedLSN so PG can release WAL.  We use endLSN
-		// (highest ServerWALEnd we observed) so the slot moves
-		// monotonically.
+		// Advance syncedLSN so PG can release WAL.  endLSN is the end of
+		// the RECEIVED data (highest WALStart+len(Data) in the batch), which
+		// is monotonic and never overshoots data we hold — see OnRecord.
 		s.syncedLSN.Store(uint64(endLSN))
 		return nil
 	}

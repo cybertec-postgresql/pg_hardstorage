@@ -250,8 +250,10 @@ func TestEncode_EnvelopeShape(t *testing.T) {
 	if len(env.Records) != 2 {
 		t.Errorf("Records len = %d, want 2", len(env.Records))
 	}
-	if env.StartLSN != 16 || env.EndLSN != 48 {
-		t.Errorf("LSN bounds drift: start=%d end=%d", env.StartLSN, env.EndLSN)
+	// EndLSN is the end of RECEIVED data: rec(32,48,"beta") → 32+len("beta")=36,
+	// not the ServerWALEnd 48. (StartLSN is the first record's WALStart, 16.)
+	if env.StartLSN != 16 || env.EndLSN != 36 {
+		t.Errorf("LSN bounds drift: start=%d end=%d (want start=16 end=36)", env.StartLSN, env.EndLSN)
 	}
 	if env.BatchID == "" {
 		t.Errorf("BatchID empty")
@@ -303,9 +305,17 @@ func TestSyncedLSN_AdvancesOnSuccessfulPut(t *testing.T) {
 	if got := sink.SyncedLSN(); got != 0 {
 		t.Errorf("initial SyncedLSN = %d, want 0", got)
 	}
+	// WALStart=16, a 1-byte payload, but ServerWALEnd=48 (the server's
+	// global end-of-WAL, far past this record's data). SyncedLSN — which is
+	// reported to PG as confirmed_flush — must be the end of the RECEIVED
+	// data (16+1=17), NOT the ServerWALEnd (48). Confirming 48 would tell PG
+	// "I have everything through 48" while the sink holds one byte at 16;
+	// on a reconnect PG would skip 17..48 and any commit in that window is
+	// lost. This asserts we never confirm the server's global WAL position.
 	_ = sink.OnRecord(context.Background(), rec(16, 48, "x"))
-	if got := sink.SyncedLSN(); got != 48 {
-		t.Errorf("SyncedLSN after Put = %d, want 48", got)
+	if got := sink.SyncedLSN(); got != 17 {
+		t.Errorf("SyncedLSN after Put = %d, want 17 (WALStart+len, NOT the "+
+			"ServerWALEnd 48 — confirming that would advance the slot past unreceived data)", got)
 	}
 }
 
@@ -357,8 +367,9 @@ func TestPutFailure_WithDeadLetter_AdvancesSlot(t *testing.T) {
 	if len(dl.envelopes) != 1 {
 		t.Fatalf("expected 1 dead-letter envelope; got %d", len(dl.envelopes))
 	}
-	if got := sink.SyncedLSN(); got != 48 {
-		t.Errorf("SyncedLSN should advance past dead-letter; got %d", got)
+	// Advances to the received-data end (16+len("x")=17), not ServerWALEnd 48.
+	if got := sink.SyncedLSN(); got != 17 {
+		t.Errorf("SyncedLSN should advance past dead-letter to 17 (WALStart+len); got %d", got)
 	}
 	_, _, deadLettered, _ := sink.StatsSnapshot()
 	if deadLettered != 1 {
