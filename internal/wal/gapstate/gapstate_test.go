@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage/faultinject"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage/fs"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/wal/gapstate"
 )
@@ -370,5 +371,65 @@ func TestPut_SameSlotSameInstantIsIdempotent(t *testing.T) {
 	}
 	if len(got) != 1 {
 		t.Fatalf("same-slot retry left %d records, want 1 (dedup broken)", len(got))
+	}
+}
+
+// TestPurgeOrphans_DeleteFailureReturnsPartialProgress pins the
+// mid-walk failure contract of the reclamation janitor. PurgeOrphans
+// deletes orphan gap records one key at a time; if a Delete fails
+// partway, it must return the records it DID delete plus the error, so
+// the operator sees partial progress and can re-run to drain the rest
+// (the op is idempotent). A silent swallow would report success while
+// leaving records behind; losing the partial list would misreport what
+// was reaped. This branch was uncovered.
+//
+// Two orphan gaps on TLI 2 (below the only live TLI 5). Delete of the
+// OLDER one is faulted; PurgeOrphans deletes newest-first, so the newer
+// record is reaped, then the older Delete fails.
+func TestPurgeOrphans_DeleteFailureReturnsPartialProgress(t *testing.T) {
+	inner := newSP(t)
+	newer := time.Date(2026, 8, 11, 12, 0, 0, 0, time.UTC)
+	older := time.Date(2026, 8, 11, 11, 0, 0, 0, time.UTC)
+
+	seed := gapstate.New(inner)
+	kNewer, err := seed.Put(context.Background(), gapstate.Record{
+		Deployment: "db1", SlotName: "s", Timeline: 2, GapBytes: 100,
+		GapStartLSN: "0/1", GapEndLSN: "0/2", DetectedAt: newer,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	kOlder, err := seed.Put(context.Background(), gapstate.Record{
+		Deployment: "db1", SlotName: "s", Timeline: 2, GapBytes: 200,
+		GapStartLSN: "0/3", GapEndLSN: "0/4", DetectedAt: older,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Fault the Delete of the OLDER record only.
+	fi := faultinject.New(inner)
+	fi.Activate([]faultinject.Rule{{
+		Name: "fail-delete-older-gap", Ops: faultinject.OpDelete,
+		KeyPrefix: kOlder, Err: faultinject.ErrInjected,
+	}}, faultinject.ActivateOptions{})
+
+	removed, perr := gapstate.New(fi).PurgeOrphans(
+		context.Background(), "db1", map[uint32]struct{}{5: {}}, false)
+	if perr == nil {
+		t.Fatal("PurgeOrphans swallowed a mid-walk Delete failure — it must surface the error " +
+			"so the operator knows the sweep is incomplete and re-runs")
+	}
+	// Partial progress: exactly the newer record was reaped and reported.
+	if len(removed) != 1 || removed[0].GapBytes != 100 {
+		t.Fatalf("partial-progress list wrong: got %+v, want exactly the newer (100-byte) record", removed)
+	}
+	// On disk: the newer key is gone, the faulted older key survives, so a
+	// re-run (idempotent) drains it.
+	if _, e := inner.Stat(context.Background(), kNewer); e == nil {
+		t.Errorf("newer gap %s should have been deleted before the failure", kNewer)
+	}
+	if _, e := inner.Stat(context.Background(), kOlder); e != nil {
+		t.Errorf("faulted older gap %s should still be present for the re-run: %v", kOlder, e)
 	}
 }
