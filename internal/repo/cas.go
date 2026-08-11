@@ -34,8 +34,19 @@ func (h Hash) asArray() [32]byte { return [32]byte(h) }
 // propagation (default).
 type CASRetention struct {
 	// RetainUntil is the absolute deadline propagated to every
-	// PutChunk's PutOptions.RetainUntil. Zero disables.
+	// PutChunk's PutOptions.RetainUntil. Zero disables (unless
+	// RetainUntilFunc is set).
 	RetainUntil time.Time
+	// RetainUntilFunc, when non-nil, is evaluated at EACH PutChunk to
+	// recompute the deadline, and takes precedence over RetainUntil.
+	// Long-running writers need this: a deadline fixed at construction
+	// under-locks every chunk written after construction, so a WAL stream
+	// running longer than the retention window would leave its older WAL
+	// deletable before term while the per-segment manifest (locked with the
+	// current time) stays immutable — a WORM repo whose data outlives its
+	// lock. Bounded writers (backup, wal push) leave it nil and use the
+	// fixed RetainUntil.
+	RetainUntilFunc func() time.Time
 	// Mode is the WORMMode propagated alongside the deadline.
 	// Backends use this to choose the lock posture (compliance
 	// vs governance). Empty disables, regardless of RetainUntil.
@@ -44,7 +55,19 @@ type CASRetention struct {
 
 // IsZero reports whether retention is unconfigured.
 func (r CASRetention) IsZero() bool {
-	return r.RetainUntil.IsZero() || r.Mode == storage.WORMNone
+	if r.Mode == storage.WORMNone {
+		return true
+	}
+	return r.RetainUntil.IsZero() && r.RetainUntilFunc == nil
+}
+
+// retainUntil resolves the deadline for one PutChunk: the per-call clock
+// when configured (long-running writers), else the fixed deadline.
+func (r CASRetention) retainUntil() time.Time {
+	if r.RetainUntilFunc != nil {
+		return r.RetainUntilFunc()
+	}
+	return r.RetainUntil
 }
 
 // CAS is a content-addressed object store layered on top of a StoragePlugin.
@@ -563,7 +586,7 @@ func (c *CAS) PutChunk(ctx context.Context, body []byte) (ChunkInfo, error) {
 	// deadline + mode so WORM-capable backends apply the lock at
 	// PUT time. Backends without WORM ignore these fields.
 	if !c.retention.IsZero() {
-		putOpts.RetainUntil = c.retention.RetainUntil
+		putOpts.RetainUntil = c.retention.retainUntil()
 		putOpts.RetentionMode = c.retention.Mode
 	}
 	_, err = c.sp.Put(ctx, key, bytes.NewReader(envelope), putOpts)

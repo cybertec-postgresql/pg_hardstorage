@@ -1612,11 +1612,19 @@ func runWalStream(cmd *cobra.Command, opts walStreamOptions) error {
 	if durabilityMode != walsink.DurabilityPerChunk {
 		casOpts = append(casOpts, casdefault.WithChunkDurability(storage.DurabilityDeferred))
 	}
+	// WORM: a stream can run for weeks, so the chunk deadline must be
+	// recomputed per-Put (NewWithRetentionClock) — a fixed one set here
+	// would under-lock later WAL, leaving it deletable before term while
+	// its manifest (locked per-segment with the current time) stays
+	// immutable. `wal push` uses the fixed-deadline form because it handles
+	// one segment. On a non-WORM repo the policy is zero and these fall
+	// back to the plain constructors (no retention).
+	wormClock := func() time.Time { return time.Now().UTC() }
 	var cas *repo.CAS
 	if walEnc != nil {
-		cas = casdefault.NewEncrypted(sp, walEnc, casOpts...)
+		cas = casdefault.NewEncryptedWithRetentionClock(sp, walEnc, repoMeta.WORM, wormClock, casOpts...)
 	} else {
-		cas = casdefault.New(sp, casOpts...)
+		cas = casdefault.NewWithRetentionClock(sp, repoMeta.WORM, wormClock, casOpts...)
 	}
 
 	// 2. Cancellable streaming context + signal handler.  Ctrl-C

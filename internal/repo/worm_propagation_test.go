@@ -233,3 +233,49 @@ func TestCAS_GovernanceMode_PropagatesAsGovernance(t *testing.T) {
 		t.Errorf("RetentionMode = %q, want governance", puts[0].Opts.RetentionMode)
 	}
 }
+
+// TestCAS_WithRetentionClock_RecomputesDeadlinePerPut pins the fix for
+// long-running writers (WAL streaming). A deadline fixed at construction
+// under-locks every chunk written later than construction time: a stream
+// running longer than the retention window leaves its older WAL deletable
+// before term while the per-segment manifest (locked with the current
+// time) stays immutable. NewWithRetentionClock recomputes the deadline
+// from the clock at EACH PutChunk, so a chunk written later gets a later
+// deadline — the property a fixed deadline cannot provide.
+func TestCAS_WithRetentionClock_RecomputesDeadlinePerPut(t *testing.T) {
+	_, sp := newTestRepo(t)
+	defer sp.Close()
+	rec := &recordingStorage{inner: sp, wormCapable: true}
+
+	policy, _ := repo.MakeWORMPolicy("compliance", "7y")
+	clock := time.Date(2026, 4, 30, 12, 0, 0, 0, time.UTC)
+	cas := casdefault.NewWithRetentionClock(rec, policy, func() time.Time { return clock })
+
+	// First chunk at T1.
+	if _, err := cas.PutChunk(context.Background(), []byte("chunk-written-at-T1")); err != nil {
+		t.Fatalf("PutChunk T1: %v", err)
+	}
+	// A stream runs on; the clock advances well past construction time.
+	clock = clock.Add(200 * 24 * time.Hour) // ~6.5 months later
+	if _, err := cas.PutChunk(context.Background(), []byte("chunk-written-at-T2")); err != nil {
+		t.Fatalf("PutChunk T2: %v", err)
+	}
+
+	puts := rec.putsForKey("chunks/sha256/")
+	if len(puts) != 2 {
+		t.Fatalf("expected 2 chunk Puts; got %d", len(puts))
+	}
+	wantT1 := policy.RetainUntil(time.Date(2026, 4, 30, 12, 0, 0, 0, time.UTC))
+	wantT2 := policy.RetainUntil(time.Date(2026, 4, 30, 12, 0, 0, 0, time.UTC).Add(200 * 24 * time.Hour))
+	if !puts[0].Opts.RetainUntil.Equal(wantT1) {
+		t.Errorf("chunk 1 RetainUntil = %s, want %s (T1-based)", puts[0].Opts.RetainUntil, wantT1)
+	}
+	if !puts[1].Opts.RetainUntil.Equal(wantT2) {
+		t.Errorf("chunk 2 RetainUntil = %s, want %s (T2-based)", puts[1].Opts.RetainUntil, wantT2)
+	}
+	if !puts[1].Opts.RetainUntil.After(puts[0].Opts.RetainUntil) {
+		t.Fatalf("later chunk's deadline (%s) must be AFTER the earlier one's (%s) — a fixed "+
+			"deadline would leave the later WAL deletable before term",
+			puts[1].Opts.RetainUntil, puts[0].Opts.RetainUntil)
+	}
+}

@@ -172,6 +172,48 @@ func NewWithRetention(sp storage.StoragePlugin, policy *repo.WORMPolicy, now tim
 	)
 }
 
+// NewWithRetentionClock is NewWithRetention for a LONG-RUNNING writer: the
+// deadline is recomputed from `now()` at each PutChunk instead of being
+// fixed at construction. WAL streaming needs this — a stream that runs
+// longer than the retention window would otherwise lock every chunk to
+// (stream-start + term), leaving its older WAL deletable before term while
+// the per-segment manifest (locked with the current time) stays immutable.
+// Bounded writers (backup, wal push) use the fixed-deadline NewWithRetention.
+func NewWithRetentionClock(sp storage.StoragePlugin, policy *repo.WORMPolicy, now func() time.Time, opts ...Option) *repo.CAS {
+	if policy.IsZero() {
+		return New(sp, opts...)
+	}
+	c := resolveOpts(opts...)
+	return repo.NewCAS(sp,
+		repo.WithCompressor(compressorFor(c.level)),
+		repo.WithChunkDurability(c.durability),
+		repo.WithDedupHints(c.hints),
+		repo.WithRetention(repo.CASRetention{
+			RetainUntilFunc: func() time.Time { return policy.RetainUntil(now()) },
+			Mode:            storage.WORMMode(policy.Mode),
+		}),
+	)
+}
+
+// NewEncryptedWithRetentionClock is the encrypted + per-Put-clock retention
+// combo (see NewWithRetentionClock).
+func NewEncryptedWithRetentionClock(sp storage.StoragePlugin, enc encryption.Encryptor, policy *repo.WORMPolicy, now func() time.Time, opts ...Option) *repo.CAS {
+	if policy.IsZero() {
+		return NewEncrypted(sp, enc, opts...)
+	}
+	c := resolveOpts(opts...)
+	return repo.NewCAS(sp,
+		repo.WithCompressor(compressorFor(c.level)),
+		repo.WithChunkDurability(c.durability),
+		repo.WithDedupHints(c.hints),
+		repo.WithEncryptor(enc),
+		repo.WithRetention(repo.CASRetention{
+			RetainUntilFunc: func() time.Time { return policy.RetainUntil(now()) },
+			Mode:            storage.WORMMode(policy.Mode),
+		}),
+	)
+}
+
 // NewEncryptedWithRetention is the encrypted + retention combo.
 func NewEncryptedWithRetention(sp storage.StoragePlugin, enc encryption.Encryptor, policy *repo.WORMPolicy, now time.Time, opts ...Option) *repo.CAS {
 	if policy.IsZero() {
