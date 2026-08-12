@@ -73,6 +73,19 @@ var Registry = []Mutation{
 		},
 	},
 	{
+		Tag: "mutation_partial_offset_unchecked",
+		Description: "materialiseOneFile (partial table extraction) writes " +
+			"chunks in slice order without confirming each chunk's Offset " +
+			"matches the running write position (pre-fix): a reordered chunk " +
+			"list that still sums to the file size hands back a BYTE-SCRAMBLED " +
+			"table file that passes the size check with no error. The partial " +
+			"path was a copy of the pre-#32 materializeFile and missed the " +
+			"guard. Caught by TestMaterialiseOneFile_RejectsReorderedChunks.",
+		Packages: []string{
+			"github.com/cybertec-postgresql/pg_hardstorage/internal/partial",
+		},
+	},
+	{
 		Tag: "mutation_twelvehour_unchecked",
 		Description: "the natural-time PITR parser accepts malformed " +
 			"12-hour clocks (pre-fix): '13am' resolves to 13:00 (1pm), " +

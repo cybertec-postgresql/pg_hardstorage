@@ -406,7 +406,7 @@ func materialiseOneFile(ctx context.Context, cas *repo.CAS, target string, f *ba
 		// restore path guards this (restore.chunkOffsetContiguous, bug
 		// #32); this mirror must too, or `partial dump`/`partial restore`
 		// hands back corrupt table data that looks correct.
-		if ref.Offset != bytesWritten {
+		if !chunkOffsetContiguous(ref.Offset, bytesWritten) {
 			return bytesWritten, fmt.Errorf("chunk %s offset=%d but running write position is %d: "+
 				"the manifest's chunks are out of order; refusing to write a byte-scrambled file",
 				ref.Hash, ref.Offset, bytesWritten)
