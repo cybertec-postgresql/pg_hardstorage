@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/encryption"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
@@ -58,15 +59,15 @@ func TestResolveOrMint_ReadBackAdoptsOnDishonestBackend(t *testing.T) {
 	// Two mints back-to-back: on the lying backend BOTH puts "succeed".
 	// The read-back must make the final agreed DEK equal what a fresh
 	// resolve sees — no writer keeps a private divergent DEK.
-	r1, err := sharedkey.ResolveOrMint(context.Background(), sp, kekRef, unwrap, wrap)
+	r1, err := sharedkey.ResolveOrMint(context.Background(), sp, kekRef, unwrap, wrap, time.Time{}, "")
 	if err != nil || !r1.Have {
 		t.Fatalf("mint 1: %v have=%v", err, r1.Have)
 	}
-	r2, err := sharedkey.ResolveOrMint(context.Background(), sp, kekRef, unwrap, wrap)
+	r2, err := sharedkey.ResolveOrMint(context.Background(), sp, kekRef, unwrap, wrap, time.Time{}, "")
 	if err != nil || !r2.Have {
 		t.Fatalf("mint 2: %v have=%v", err, r2.Have)
 	}
-	final, err := sharedkey.ResolveOrMint(context.Background(), sp, kekRef, unwrap, wrap)
+	final, err := sharedkey.ResolveOrMint(context.Background(), sp, kekRef, unwrap, wrap, time.Time{}, "")
 	if err != nil || !final.Have {
 		t.Fatalf("final resolve: %v", err)
 	}

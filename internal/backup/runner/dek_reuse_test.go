@@ -9,6 +9,7 @@ import (
 	"iter"
 	"net/url"
 	"testing"
+	"time"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/encryption"
@@ -103,7 +104,7 @@ func (s listErrSP) List(_ context.Context, _ string) iter.Seq2[storage.ObjectInf
 func TestSelectDEK_EmptyRepoGeneratesFresh(t *testing.T) {
 	sp := newRunnerSP(t)
 	cfg := &EncryptionConfig{KEKRef: "local:default"}
-	dek, err := selectDEK(context.Background(), sp, "local:default", cfg)
+	dek, err := selectDEK(context.Background(), sp, "local:default", cfg, time.Time{}, "")
 	if err != nil {
 		t.Fatalf("selectDEK on empty repo: %v", err)
 	}
@@ -134,7 +135,7 @@ func TestSelectDEK_ReusesExistingDEK(t *testing.T) {
 	}
 	putManifest(t, sp, "manifests/db1/backups/db1.full.x/manifest.json", m)
 	cfg := &EncryptionConfig{KEK: kek, KEKRef: "local:default"}
-	got, err := selectDEK(context.Background(), sp, "local:default", cfg)
+	got, err := selectDEK(context.Background(), sp, "local:default", cfg, time.Time{}, "")
 	if err != nil {
 		t.Fatalf("selectDEK: %v", err)
 	}
@@ -150,7 +151,7 @@ func TestSelectDEK_ReusesExistingDEK(t *testing.T) {
 func TestSelectDEK_ListErrorFailsNotFresh(t *testing.T) {
 	sp := listErrSP{StoragePlugin: newRunnerSP(t), err: errors.New("boom: transient list failure")}
 	cfg := &EncryptionConfig{KEKRef: "local:default"}
-	if _, err := selectDEK(context.Background(), sp, "local:default", cfg); err == nil {
+	if _, err := selectDEK(context.Background(), sp, "local:default", cfg, time.Time{}, ""); err == nil {
 		t.Fatal("selectDEK must FAIL on a List error, not silently generate a fresh DEK")
 	}
 }
@@ -177,7 +178,7 @@ func TestSelectDEK_UnwrappableExistingFailsNotFresh(t *testing.T) {
 		kek[i] = byte(i + 1)
 	}
 	cfg := &EncryptionConfig{KEK: kek, KEKRef: "local:default"}
-	if _, err := selectDEK(context.Background(), sp, "local:default", cfg); err == nil {
+	if _, err := selectDEK(context.Background(), sp, "local:default", cfg, time.Time{}, ""); err == nil {
 		t.Fatal("selectDEK must FAIL when a prior DEK exists but can't be unwrapped, not generate a fresh DEK")
 	}
 }

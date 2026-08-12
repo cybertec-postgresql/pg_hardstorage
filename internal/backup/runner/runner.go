@@ -560,7 +560,13 @@ func Take(ctx context.Context, opts TakeOptions) (*Result, error) {
 		// positively confirmed none exists. A lookup error or an existing-
 		// but-unusable DEK fails the backup rather than silently forking
 		// the DEK into an unrestorable backup.
-		dek, err := selectDEK(ctx, sp, kekRef, opts.Encryption)
+		var dekRetainUntil time.Time
+		var dekMode storage.WORMMode
+		if !repoMeta.WORM.IsZero() {
+			dekRetainUntil = repoMeta.WORM.RetainUntil(wormNow)
+			dekMode = storage.WORMMode(repoMeta.WORM.Mode)
+		}
+		dek, err := selectDEK(ctx, sp, kekRef, opts.Encryption, dekRetainUntil, dekMode)
 		if err != nil {
 			return nil, err
 		}

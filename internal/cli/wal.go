@@ -330,7 +330,8 @@ func runWalPush(cmd *cobra.Command, opts walPushOptions) error {
 	// exists, so WAL is no longer plaintext at rest (issue #106). The CAS and
 	// the manifest envelope MUST use the same DEK; buildWALEncryption returns
 	// both. nil enc → plaintext push (no KEK), preserving prior behaviour.
-	enc, encInfo, err := resolveWALEncryption(cmd.Context(), sp, opts.deployment, opts.kekRef, opts.kmsConfig)
+	dekRetainUntil, dekMode := wormDEKParams(repoMeta, wormNow)
+	enc, encInfo, err := resolveWALEncryption(cmd.Context(), sp, opts.deployment, opts.kekRef, opts.kmsConfig, dekRetainUntil, dekMode)
 	if err != nil {
 		return output.NewError("wal.encryption_setup_failed",
 			fmt.Sprintf("wal push: %v", err)).Wrap(err)
@@ -1008,7 +1009,18 @@ func deploymentBackupKEKRef(ctx context.Context, sp storage.StoragePlugin, deplo
 // KEKRef than cfg, WAL stays plaintext rather than diverge (e.g. a leftover
 // local kek.bin while backups are cloud-KMS, or a mismatched --kek). The
 // read-side mitigation still covers any cross-posture chunk collision.
-func buildWALEncryption(ctx context.Context, sp storage.StoragePlugin, deployment string, cfg *runner.EncryptionConfig) (encryption.Encryptor, *walsink.EncryptionInfo, error) {
+
+// wormDEKParams resolves the shared-DEK retention deadline + mode from the
+// repo's WORM policy (zero time on a non-WORM repo). The shared DEK must be
+// Object-Locked at least as long as any backup it decrypts.
+func wormDEKParams(repoMeta *repo.Metadata, now time.Time) (time.Time, storage.WORMMode) {
+	if repoMeta == nil || repoMeta.WORM.IsZero() {
+		return time.Time{}, ""
+	}
+	return repoMeta.WORM.RetainUntil(now), storage.WORMMode(repoMeta.WORM.Mode)
+}
+
+func buildWALEncryption(ctx context.Context, sp storage.StoragePlugin, deployment string, cfg *runner.EncryptionConfig, dekRetainUntil time.Time, dekMode storage.WORMMode) (encryption.Encryptor, *walsink.EncryptionInfo, error) {
 	if cfg == nil {
 		return nil, nil, nil // no encryption configured → plaintext WAL
 	}
@@ -1042,7 +1054,7 @@ func buildWALEncryption(ctx context.Context, sp storage.StoragePlugin, deploymen
 	// yet, so a WAL full-page image that dedups against a base chunk was
 	// stored under a different DEK than the backup manifest referenced it
 	// by — leaving the backup unrestorable (issue #31).
-	res, rerr := sharedkey.ResolveOrMint(ctx, sp, cfg.KEKRef, unwrap, wrap)
+	res, rerr := sharedkey.ResolveOrMint(ctx, sp, cfg.KEKRef, unwrap, wrap, dekRetainUntil, dekMode)
 	if rerr != nil {
 		return nil, nil, fmt.Errorf("wal: cannot determine or mint the shared DEK; refusing to write WAL that the CAS's plaintext-hash dedup would leave unrestorable: %w", rerr)
 	}
@@ -1077,7 +1089,7 @@ func buildWALEncryption(ctx context.Context, sp storage.StoragePlugin, deploymen
 // needed to wrap/unwrap the DEK here, so it is closed before returning — the
 // returned encryptor is DEK-based and outlives it (important for `wal stream`,
 // which then runs for a long time). Empty kekRef + no keyring → plaintext.
-func resolveWALEncryption(ctx context.Context, sp storage.StoragePlugin, deployment, kekRef string, kmsConfig map[string]string) (encryption.Encryptor, *walsink.EncryptionInfo, error) {
+func resolveWALEncryption(ctx context.Context, sp storage.StoragePlugin, deployment, kekRef string, kmsConfig map[string]string, dekRetainUntil time.Time, dekMode storage.WORMMode) (encryption.Encryptor, *walsink.EncryptionInfo, error) {
 	keyringDir := ""
 	if pth, perr := paths.Resolve(paths.DefaultOptions()); perr == nil {
 		keyringDir = pth.Keyring.Value
@@ -1097,7 +1109,7 @@ func resolveWALEncryption(ctx context.Context, sp storage.StoragePlugin, deploym
 	if cfg != nil && cfg.Provider != nil {
 		defer cfg.Provider.Close()
 	}
-	return buildWALEncryption(ctx, sp, deployment, cfg)
+	return buildWALEncryption(ctx, sp, deployment, cfg, dekRetainUntil, dekMode)
 }
 
 // writeSegmentAtomically reassembles m's chunks from cas into
@@ -1593,7 +1605,8 @@ func runWalStream(cmd *cobra.Command, opts walStreamOptions) error {
 	// encryptor plus the envelope stamped on every segment manifest. A nil
 	// encryptor means no local KEK — the stream stays plaintext, exactly as
 	// before.
-	walEnc, walEncInfo, err := resolveWALEncryption(repoCtx, sp, opts.deployment, opts.kekRef, opts.kmsConfig)
+	dekRetainUntil, dekMode := wormDEKParams(repoMeta, time.Now().UTC())
+	walEnc, walEncInfo, err := resolveWALEncryption(repoCtx, sp, opts.deployment, opts.kekRef, opts.kmsConfig, dekRetainUntil, dekMode)
 	if err != nil {
 		return output.NewError("wal.encryption_setup_failed",
 			fmt.Sprintf("wal stream: %v", err)).Wrap(err)

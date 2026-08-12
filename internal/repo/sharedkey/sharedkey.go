@@ -24,6 +24,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
+
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/invariant"
 	"io"
 	"strings"
@@ -169,13 +171,28 @@ func Resolve(ctx context.Context, sp storage.StoragePlugin, wantKEKRef string, u
 //
 // A hard storage error is returned as err so the caller fails rather than
 // mistaking "couldn't coordinate" for "no DEK exists".
-func ResolveOrMint(ctx context.Context, sp storage.StoragePlugin, kekRef string, unwrap Unwrapper, wrap Wrapper) (MintResult, error) {
+// retainUntil + mode carry the repo's WORM policy (zero time = non-WORM
+// repo). The shared DEK decrypts EVERY chunk in the repo, so on a
+// retention repo it MUST outlive every backup it protects, or a compliance
+// repo whose chunks/manifests/WAL are all Object-Locked can still lose ALL
+// encrypted data the moment this one tiny object is deleted. The DEK is
+// minted once but backups written later are locked longer, so we both lock
+// it at mint AND extend it to now+term on every resolve — SetRetention only
+// ever lengthens (no BypassGovernanceRetention), so this can never shorten
+// an existing lock. Best-effort: a failed retention op must not fail the
+// backup (the DEK value is what the backup needs); the next backup retries.
+func ResolveOrMint(ctx context.Context, sp storage.StoragePlugin, kekRef string, unwrap Unwrapper, wrap Wrapper, retainUntil time.Time, mode storage.WORMMode) (MintResult, error) {
 	key := sharedDEKKey(kekRef)
 
 	// 1. Authoritative object.
 	if wrapped, ok := readWrappedDEK(ctx, sp, key, kekRef); ok {
 		out, err := unwrapInto(wrapped, unwrap)
 		if err != nil || out.Have {
+			// Extend the DEK's lock to cover a backup written now (see the
+			// doc above). Only when it exists and is usable under this KEK.
+			if err == nil && out.Have {
+				extendDEKRetention(ctx, sp, key, retainUntil, mode)
+			}
 			return out, err
 		}
 		// Present but won't unwrap under this KEK — e.g. a stale
@@ -208,9 +225,9 @@ func ResolveOrMint(ctx context.Context, sp storage.StoragePlugin, kekRef string,
 		// replace it: the adopted DEK is proven against a committed
 		// manifest, the stale wrap is provably useless to this KEK.
 		if wrapped, werr := wrap(out.DEK); werr == nil {
-			if perr := putSharedDEK(ctx, sp, key, kekRef, wrapped); errors.Is(perr, storage.ErrAlreadyExists) {
+			if perr := putSharedDEK(ctx, sp, key, kekRef, wrapped, retainUntil, mode); errors.Is(perr, storage.ErrAlreadyExists) {
 				if existing, ok := readWrappedDEK(ctx, sp, key, kekRef); !ok || !unwrapsToSame(existing, unwrap, out.DEK) {
-					_ = putSharedDEKOverwrite(ctx, sp, key, kekRef, wrapped)
+					_ = putSharedDEKOverwrite(ctx, sp, key, kekRef, wrapped, retainUntil, mode)
 				}
 			}
 		}
@@ -229,7 +246,7 @@ func ResolveOrMint(ctx context.Context, sp storage.StoragePlugin, kekRef string,
 	if werr != nil {
 		return MintResult{}, fmt.Errorf("sharedkey: wrap fresh DEK: %w", werr)
 	}
-	perr := putSharedDEK(ctx, sp, key, kekRef, wrapped)
+	perr := putSharedDEK(ctx, sp, key, kekRef, wrapped, retainUntil, mode)
 	if perr == nil {
 		// We won the conditional PUT — but do not TRUST it blindly:
 		// read back the stored object and adopt whatever is there. On
@@ -283,7 +300,7 @@ func unwrapInto(wrapped []byte, unwrap Unwrapper) (MintResult, error) {
 
 // putSharedDEK writes the shared-DEK envelope at key with IfNotExists, so
 // only the first writer wins. Returns storage.ErrAlreadyExists on conflict.
-func putSharedDEK(ctx context.Context, sp storage.StoragePlugin, key, kekRef string, wrapped []byte) error {
+func putSharedDEK(ctx context.Context, sp storage.StoragePlugin, key, kekRef string, wrapped []byte, retainUntil time.Time, mode storage.WORMMode) error {
 	body, err := json.Marshal(manifestEnvelope{Encryption: &envelope{
 		Scheme:     Scheme,
 		KEKRef:     kekRef,
@@ -292,11 +309,29 @@ func putSharedDEK(ctx context.Context, sp storage.StoragePlugin, key, kekRef str
 	if err != nil {
 		return err
 	}
-	_, err = sp.Put(ctx, key, bytes.NewReader(body), storage.PutOptions{
+	opts := storage.PutOptions{
 		IfNotExists:   true,
 		ContentLength: int64(len(body)),
-	})
+	}
+	if !retainUntil.IsZero() {
+		opts.RetainUntil = retainUntil
+		opts.RetentionMode = mode
+	}
+	_, err = sp.Put(ctx, key, bytes.NewReader(body), opts)
 	return err
+}
+
+// extendDEKRetention lengthens the shared-DEK object's WORM lock to
+// retainUntil so it always outlives the newest backup. Best-effort and
+// extend-only: SetRetention never shortens (no bypass), so a backend
+// rejecting an already-longer lock — or any transient error — is ignored;
+// the DEK keeps whatever (longer-or-equal) lock it has and the next backup
+// retries. Zero retainUntil (non-WORM repo) is a no-op.
+func extendDEKRetention(ctx context.Context, sp storage.StoragePlugin, key string, retainUntil time.Time, mode storage.WORMMode) {
+	if retainUntil.IsZero() {
+		return
+	}
+	_ = sp.SetRetention(ctx, key, retainUntil, mode)
 }
 
 // isManifestKey reports whether key under prefix is a manifest worth reading
@@ -360,7 +395,7 @@ func unwrapsToSame(wrapped []byte, unwrap Unwrapper, dek [encryption.KeyLen]byte
 // PROVEN unusable under the caller's KEK (rotation leftovers) — the
 // normal mint path must keep using the IfNotExists variant so
 // concurrent first-writers still converge on a single winner.
-func putSharedDEKOverwrite(ctx context.Context, sp storage.StoragePlugin, key, kekRef string, wrapped []byte) error {
+func putSharedDEKOverwrite(ctx context.Context, sp storage.StoragePlugin, key, kekRef string, wrapped []byte, retainUntil time.Time, mode storage.WORMMode) error {
 	body, err := json.Marshal(manifestEnvelope{Encryption: &envelope{
 		Scheme:     Scheme,
 		KEKRef:     kekRef,
@@ -369,9 +404,12 @@ func putSharedDEKOverwrite(ctx context.Context, sp storage.StoragePlugin, key, k
 	if err != nil {
 		return err
 	}
-	_, err = sp.Put(ctx, key, bytes.NewReader(body), storage.PutOptions{
-		ContentLength: int64(len(body)),
-	})
+	opts := storage.PutOptions{ContentLength: int64(len(body))}
+	if !retainUntil.IsZero() {
+		opts.RetainUntil = retainUntil
+		opts.RetentionMode = mode
+	}
+	_, err = sp.Put(ctx, key, bytes.NewReader(body), opts)
 	return err
 }
 
@@ -396,7 +434,7 @@ func putSharedDEKOverwrite(ctx context.Context, sp storage.StoragePlugin, key, k
 // when the destination slot already unwraps to the SAME DEK under the
 // new KEK, nothing is rewritten (a rewrap emits a fresh random nonce,
 // so blind rewrites change repo bytes on every resume run).
-func Rewrap(ctx context.Context, sp storage.StoragePlugin, oldRef, newRef string, unwrapOld, unwrapNew Unwrapper, wrapNew Wrapper, removeOld bool) (bool, error) {
+func Rewrap(ctx context.Context, sp storage.StoragePlugin, oldRef, newRef string, unwrapOld, unwrapNew Unwrapper, wrapNew Wrapper, removeOld bool, retainUntil time.Time, mode storage.WORMMode) (bool, error) {
 	wrapped, ok := readWrappedDEK(ctx, sp, sharedDEKKey(oldRef), oldRef)
 	if !ok {
 		return false, nil
@@ -432,7 +470,7 @@ func Rewrap(ctx context.Context, sp storage.StoragePlugin, oldRef, newRef string
 	// action and the new slot may hold a stale leftover from an
 	// earlier partial rotation; the DEK content is the invariant
 	// (same DEK, new wrap), so replacing is always safe here.
-	if err := putSharedDEKOverwrite(ctx, sp, newKey, newRef, newWrapped); err != nil {
+	if err := putSharedDEKOverwrite(ctx, sp, newKey, newRef, newWrapped, retainUntil, mode); err != nil {
 		return false, fmt.Errorf("sharedkey rewrap: publish %s object: %w", newRef, err)
 	}
 	if oldKey := sharedDEKKey(oldRef); removeOld && oldKey != newKey {

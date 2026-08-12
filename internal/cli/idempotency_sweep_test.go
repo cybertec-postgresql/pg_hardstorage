@@ -113,7 +113,7 @@ func seedIdempotencyRepo(t *testing.T, encrypted bool) (repoURL, repoDir string)
 				}
 				return d[:], nil
 			},
-			func(dek [encryption.KeyLen]byte) ([]byte, error) { return encryption.Wrap(kek, dek) })
+			func(dek [encryption.KeyLen]byte) ([]byte, error) { return encryption.Wrap(kek, dek) }, time.Time{}, "")
 		if merr != nil || !res.Have {
 			t.Fatalf("mint shared DEK: have=%v err=%v", res.Have, merr)
 		}

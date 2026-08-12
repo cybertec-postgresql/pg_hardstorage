@@ -4,6 +4,7 @@ import (
 	"context"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/encryption"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo/sharedkey"
@@ -37,7 +38,7 @@ func TestResolveOrMint_ConcurrentWritersConverge(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			<-start // maximise the race window
-			res, err := sharedkey.ResolveOrMint(context.Background(), sp, kekRef, unwrap, wrap)
+			res, err := sharedkey.ResolveOrMint(context.Background(), sp, kekRef, unwrap, wrap, time.Time{}, "")
 			if err != nil {
 				errs[i] = err
 				return
@@ -66,7 +67,7 @@ func TestResolveOrMint_ConcurrentWritersConverge(t *testing.T) {
 		}
 	}
 	// And a fresh resolve reads back the same committed DEK.
-	res, err := sharedkey.ResolveOrMint(context.Background(), sp, kekRef, unwrap, wrap)
+	res, err := sharedkey.ResolveOrMint(context.Background(), sp, kekRef, unwrap, wrap, time.Time{}, "")
 	if err != nil || !res.Have || res.DEK != want {
 		t.Fatalf("post-hoc resolve = (%x, have=%v, err=%v), want %x", res.DEK[:8], res.Have, err, want[:8])
 	}
@@ -86,7 +87,7 @@ func TestResolveOrMint_AdoptsLegacyManifestDEK(t *testing.T) {
 	wrapped := mustWrap(t, kek, legacy)
 	putEnvelopeManifest(t, sp, "manifests/db1/backups/b1/manifest.json", kekRef, wrapped)
 
-	res, err := sharedkey.ResolveOrMint(context.Background(), sp, kekRef, unwrapperFor(kek), wrapperFor(kek))
+	res, err := sharedkey.ResolveOrMint(context.Background(), sp, kekRef, unwrapperFor(kek), wrapperFor(kek), time.Time{}, "")
 	if err != nil || !res.Have {
 		t.Fatalf("adopt: err=%v have=%v", err, res.Have)
 	}
@@ -105,11 +106,11 @@ func TestResolveOrMint_WrongKEKIsUnusable(t *testing.T) {
 	sp := newSP(t)
 
 	// Owner mints the shared DEK.
-	if _, err := sharedkey.ResolveOrMint(context.Background(), sp, kekRef, unwrapperFor(owner), wrapperFor(owner)); err != nil {
+	if _, err := sharedkey.ResolveOrMint(context.Background(), sp, kekRef, unwrapperFor(owner), wrapperFor(owner), time.Time{}, ""); err != nil {
 		t.Fatalf("owner mint: %v", err)
 	}
 	// Stranger (wrong KEK) must not mint a divergent DEK.
-	res, err := sharedkey.ResolveOrMint(context.Background(), sp, kekRef, unwrapperFor(stranger), wrapperFor(stranger))
+	res, err := sharedkey.ResolveOrMint(context.Background(), sp, kekRef, unwrapperFor(stranger), wrapperFor(stranger), time.Time{}, "")
 	if err != nil {
 		t.Fatalf("stranger: unexpected hard error %v", err)
 	}

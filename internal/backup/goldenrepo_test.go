@@ -207,7 +207,7 @@ func TestGoldenRepo_StillReadable(t *testing.T) {
 			}
 			return d[:], nil
 		},
-		func(d [encryption.KeyLen]byte) ([]byte, error) { return encryption.Wrap(kek, d) })
+		func(d [encryption.KeyLen]byte) ([]byte, error) { return encryption.Wrap(kek, d) }, time.Time{}, "")
 	if err != nil || !res.Have {
 		t.Fatalf("golden shared-DEK object no longer resolves: have=%v err=%v", res.Have, err)
 	}
@@ -296,7 +296,7 @@ func TestGoldenRepo_Regenerate(t *testing.T) {
 			}
 			return d[:], nil
 		},
-		func(d [encryption.KeyLen]byte) ([]byte, error) { return encryption.Wrap(kek, d) })
+		func(d [encryption.KeyLen]byte) ([]byte, error) { return encryption.Wrap(kek, d) }, time.Time{}, "")
 	if err != nil || !res.Have {
 		t.Fatalf("mint: %v", err)
 	}

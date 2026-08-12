@@ -3,6 +3,7 @@ package backup_test
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/encryption"
@@ -42,7 +43,7 @@ func TestRotateKEK_MigratesSharedDEKObject(t *testing.T) {
 	// Seed: one encrypted manifest + the shared-DEK object, both
 	// under local:default / oldKEK — the post-#31 steady state.
 	w.commitEncrypted(t, "db1", "db1.full.20260430T120000Z.aaaa", oldKEK, "local:default", 0)
-	seed, err := sharedkey.ResolveOrMint(ctx, w.sp, "local:default", unwrapWith(oldKEK), wrapWith(oldKEK))
+	seed, err := sharedkey.ResolveOrMint(ctx, w.sp, "local:default", unwrapWith(oldKEK), wrapWith(oldKEK), time.Time{}, "")
 	if err != nil || !seed.Have {
 		t.Fatalf("seed shared DEK: have=%v err=%v", seed.Have, err)
 	}
@@ -64,7 +65,7 @@ func TestRotateKEK_MigratesSharedDEKObject(t *testing.T) {
 
 	// The NEXT backup resolves under the new ref with the new KEK and
 	// must get the SAME DEK (chunk dedup depends on it).
-	got, err := sharedkey.ResolveOrMint(ctx, w.sp, "local:v2", unwrapWith(newKEK), wrapWith(newKEK))
+	got, err := sharedkey.ResolveOrMint(ctx, w.sp, "local:v2", unwrapWith(newKEK), wrapWith(newKEK), time.Time{}, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -78,7 +79,7 @@ func TestRotateKEK_MigratesSharedDEKObject(t *testing.T) {
 	// The CLI/agent stamp the FIXED ref local:default on every local
 	// backup; that slot must also resolve to the SAME DEK under the
 	// new KEK (the alias slot rotation writes).
-	got2, err := sharedkey.ResolveOrMint(ctx, w.sp, "local:default", unwrapWith(newKEK), wrapWith(newKEK))
+	got2, err := sharedkey.ResolveOrMint(ctx, w.sp, "local:default", unwrapWith(newKEK), wrapWith(newKEK), time.Time{}, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -120,14 +121,14 @@ func TestResolveOrMint_StaleObjectFallsThroughToManifests(t *testing.T) {
 
 	// Plant a STALE shared-DEK object wrapped under the OLD KEK (what
 	// a pre-fix rotation leaves behind): mint it into an empty repo…
-	if seed, err := sharedkey.ResolveOrMint(ctx, w.sp, "local:default", unwrapOld, wrapOld); err != nil || !seed.Have {
+	if seed, err := sharedkey.ResolveOrMint(ctx, w.sp, "local:default", unwrapOld, wrapOld, time.Time{}, ""); err != nil || !seed.Have {
 		t.Fatalf("seed stale object: have=%v err=%v", seed.Have, err)
 	}
 	// …then commit a manifest wrapped under the NEW KEK at the same
 	// ref (as a completed legacy manifest rotation leaves them).
 	w.commitEncrypted(t, "db1", "db1.full.20260430T120000Z.bbbb", newKEK, "local:default", 0)
 
-	got, err := sharedkey.ResolveOrMint(ctx, w.sp, "local:default", unwrapNew, wrapNew)
+	got, err := sharedkey.ResolveOrMint(ctx, w.sp, "local:default", unwrapNew, wrapNew, time.Time{}, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -160,7 +161,7 @@ func TestRotateKEK_RerunIsIdempotent(t *testing.T) {
 	seedWrap := func(dek [encryption.KeyLen]byte) ([]byte, error) {
 		return encryption.Wrap(oldKEK, dek)
 	}
-	if seed, err := sharedkey.ResolveOrMint(ctx, w.sp, "local:default", seedUnwrap, seedWrap); err != nil || !seed.Have {
+	if seed, err := sharedkey.ResolveOrMint(ctx, w.sp, "local:default", seedUnwrap, seedWrap, time.Time{}, ""); err != nil || !seed.Have {
 		t.Fatalf("seed: have=%v err=%v", seed.Have, err)
 	}
 

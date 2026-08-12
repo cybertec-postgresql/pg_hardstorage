@@ -8,6 +8,7 @@ import (
 	"fmt"
 	stdio "io"
 	"strings"
+	"time"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/output"
@@ -36,7 +37,7 @@ import (
 // enumerate) and a prior wrapped DEK that won't unwrap — instead FAIL the
 // backup: generating a fresh DEK there yields a backup whose deduped chunks
 // are unrestorable, discovered only at restore time (issue #28).
-func selectDEK(ctx context.Context, sp storage.StoragePlugin, kekRef string, cfg *EncryptionConfig) ([encryption.KeyLen]byte, error) {
+func selectDEK(ctx context.Context, sp storage.StoragePlugin, kekRef string, cfg *EncryptionConfig, retainUntil time.Time, mode storage.WORMMode) ([encryption.KeyLen]byte, error) {
 	var dek [encryption.KeyLen]byte
 
 	// ResolveOrMint mints the shared DEK atomically (single-winner PUT on
@@ -46,6 +47,7 @@ func selectDEK(ctx context.Context, sp storage.StoragePlugin, kekRef string, cfg
 	res, err := sharedkey.ResolveOrMint(ctx, sp, kekRef,
 		func(wrapped []byte) ([]byte, error) { return unwrapDEKForReuse(ctx, cfg, wrapped) },
 		func(d [encryption.KeyLen]byte) ([]byte, error) { return wrapDEKForReuse(ctx, cfg, d) },
+		retainUntil, mode,
 	)
 	if err != nil {
 		return dek, fmt.Errorf("backup: cannot determine or mint the shared DEK for KEK %q; refusing a fresh DEK that the CAS's plaintext-hash dedup would leave unrestorable against existing chunks: %w", kekRef, err)

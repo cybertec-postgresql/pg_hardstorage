@@ -279,7 +279,7 @@ func RotateKEK(ctx context.Context, sp storage.StoragePlugin, opts RotateKEKOpti
 			}
 			return d[:], nil
 		}
-		migrated, rerr := sharedkey.Rewrap(ctx, sp, opts.OldKEKRef, opts.NewKEKRef, unwrapOld, unwrapNew, wrapNew, true)
+		migrated, rerr := sharedkey.Rewrap(ctx, sp, opts.OldKEKRef, opts.NewKEKRef, unwrapOld, unwrapNew, wrapNew, true, opts.RetainUntil, opts.RetentionMode)
 		if rerr != nil || !migrated {
 			// Idempotent re-run: a prior rotation already migrated the
 			// slots, so they unwrap under the NEW KEK — "the old KEK
@@ -306,7 +306,7 @@ func RotateKEK(ctx context.Context, sp storage.StoragePlugin, opts RotateKEKOpti
 		// issue #28 class). Keep the alias slot on the SAME DEK,
 		// wrapped under the new KEK.
 		if migrated && strings.HasPrefix(opts.NewKEKRef, "local:") && opts.NewKEKRef != localDefaultKEKRef {
-			if _, aerr := sharedkey.Rewrap(ctx, sp, opts.NewKEKRef, localDefaultKEKRef, unwrapNew, unwrapNew, wrapNew, false); aerr != nil {
+			if _, aerr := sharedkey.Rewrap(ctx, sp, opts.NewKEKRef, localDefaultKEKRef, unwrapNew, unwrapNew, wrapNew, false, opts.RetainUntil, opts.RetentionMode); aerr != nil {
 				finish()
 				return res, fmt.Errorf("backup rotate-kek: refresh local-default shared-DEK alias: %w", aerr)
 			}
