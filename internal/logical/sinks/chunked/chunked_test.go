@@ -2,7 +2,10 @@ package chunked_test
 
 import (
 	"context"
+	"io"
 	"net/url"
+	"strings"
+	"sync"
 	"testing"
 
 	"github.com/jackc/pglogrepl"
@@ -11,6 +14,7 @@ import (
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/pg/logicalreceiver"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage/fs"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo/casdefault"
 )
 
@@ -119,4 +123,75 @@ func openFS(t *testing.T, repoURL string) storage.StoragePlugin {
 		t.Fatal(err)
 	}
 	return p
+}
+
+// recordingSP wraps a StoragePlugin, advertises WORM, and captures the
+// PutOptions of every Put so a test can assert retention propagation.
+type recordingSP struct {
+	storage.StoragePlugin
+	mu   sync.Mutex
+	puts map[string]storage.PutOptions
+}
+
+func (r *recordingSP) Put(ctx context.Context, key string, src io.Reader, opts storage.PutOptions) (storage.PutResult, error) {
+	r.mu.Lock()
+	if r.puts == nil {
+		r.puts = map[string]storage.PutOptions{}
+	}
+	r.puts[key] = opts
+	r.mu.Unlock()
+	return r.StoragePlugin.Put(ctx, key, src, opts)
+}
+
+func (r *recordingSP) Capabilities() storage.Capabilities {
+	c := r.StoragePlugin.Capabilities()
+	c.WORM = true
+	return c
+}
+
+// TestSink_WORMLocksSegmentManifest pins that a logical-stream segment
+// manifest is Object-Locked on a retention repo — the companion to the
+// gc fix (which stops gc reaping the chunks) and the WAL/timeline WORM
+// fixes. Without Options.WORM the manifest commits with a bare
+// PutOptions and a compliance repo's CDC manifests stay deletable
+// before term while backups and WAL are immutable.
+func TestSink_WORMLocksSegmentManifest(t *testing.T) {
+	dir := t.TempDir()
+	rec := &recordingSP{StoragePlugin: openFS(t, "file://"+dir)}
+	defer rec.Close()
+	cas := casdefault.New(rec)
+
+	policy, _ := repo.MakeWORMPolicy("compliance", "7y")
+	s, err := chunked.New(cas, rec, chunked.Options{
+		Deployment: "db1", StreamName: "events",
+		Slot: "pg_hardstorage_logical_events", Plugin: "pgoutput",
+		BatchBytes: 16, WORM: policy,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.OnRecord(context.Background(),
+		logicalreceiver.Record{WALStart: pglogrepl.LSN(0x1000), Data: make([]byte, 64)}); err != nil {
+		t.Fatal(err)
+	}
+
+	var manifestOpts *storage.PutOptions
+	rec.mu.Lock()
+	for k, o := range rec.puts {
+		if strings.HasPrefix(k, "logical/") && strings.HasSuffix(k, ".json") {
+			oc := o
+			manifestOpts = &oc
+		}
+	}
+	rec.mu.Unlock()
+	if manifestOpts == nil {
+		t.Fatal("no logical/ segment manifest was committed")
+	}
+	if manifestOpts.RetainUntil.IsZero() {
+		t.Fatal("segment manifest committed WITHOUT a retention deadline on a WORM repo — " +
+			"a compliance repo's logical CDC manifests would stay deletable before term")
+	}
+	if manifestOpts.RetentionMode != storage.WORMMode("compliance") {
+		t.Errorf("RetentionMode = %q, want compliance", manifestOpts.RetentionMode)
+	}
 }

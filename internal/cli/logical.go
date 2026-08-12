@@ -375,7 +375,7 @@ func runLogicalStream(cmd *cobra.Command, opts logicalStreamOptions) error {
 		return mapLogicalError("logical stream", err)
 	}
 
-	_, sp, err := repo.Open(cmd.Context(), stream.RepoURL)
+	meta, sp, err := repo.Open(cmd.Context(), stream.RepoURL)
 	if err != nil {
 		return mapRepoOpenErr(stream.RepoURL, err)
 	}
@@ -383,7 +383,9 @@ func runLogicalStream(cmd *cobra.Command, opts logicalStreamOptions) error {
 	if err := assertRepoWritable(cmd.Context(), sp, "logical stream"); err != nil {
 		return err
 	}
-	cas := casdefault.New(sp)
+	// WORM: lock CDC chunks per-Put on a retention repo (long-running
+	// stream; nil policy falls back to the plain CAS).
+	cas := casdefault.NewWithRetentionClock(sp, meta.WORM, func() time.Time { return time.Now().UTC() })
 
 	// 1. Ensure the slot exists. Idempotent.
 	{
@@ -409,6 +411,7 @@ func runLogicalStream(cmd *cobra.Command, opts logicalStreamOptions) error {
 		StreamName: stream.Name,
 		Slot:       stream.Slot,
 		Plugin:     stream.Plugin,
+		WORM:       meta.WORM,
 	})
 	if err != nil {
 		return output.NewError("logical.sink_init_failed",

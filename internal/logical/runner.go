@@ -352,12 +352,15 @@ func (r *Runner) superviseStream(ctx context.Context, s *Stream) {
 // Returns nil on clean stop (ctx done from receiver) or an error
 // the supervisor will retry through.
 func (r *Runner) runStreamOnce(ctx context.Context, s *Stream, conn string) error {
-	_, sp, err := repo.Open(ctx, s.RepoURL)
+	meta, sp, err := repo.Open(ctx, s.RepoURL)
 	if err != nil {
 		return fmt.Errorf("open repo: %w", err)
 	}
 	defer sp.Close()
-	cas := casdefault.New(sp)
+	// WORM: lock CDC chunks per-Put (a logical stream is long-running, so a
+	// fixed deadline would under-lock later batches — see the WAL fix). Nil
+	// policy (non-WORM repo) falls back to the plain CAS.
+	cas := casdefault.NewWithRetentionClock(sp, meta.WORM, func() time.Time { return time.Now().UTC() })
 
 	// Ensure the slot exists. Idempotent on already-present.
 	{
@@ -377,6 +380,7 @@ func (r *Runner) runStreamOnce(ctx context.Context, s *Stream, conn string) erro
 		StreamName: s.Name,
 		Slot:       s.Slot,
 		Plugin:     s.Plugin,
+		WORM:       meta.WORM,
 	})
 	if err != nil {
 		return fmt.Errorf("build sink: %w", err)

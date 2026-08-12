@@ -95,6 +95,13 @@ type Options struct {
 	// ChunkerFactory builds the chunker per batch. Defaults to
 	// chunker.New (FastCDC). Tests substitute fixed-size chunkers.
 	ChunkerFactory func() *chunker.Chunker
+
+	// WORM, when non-zero, Object-Locks each committed segment manifest
+	// on a retention repo (the chunks are locked by the CAS the caller
+	// passes to New). Nil = no lock (non-WORM repo). Without it, a
+	// compliance repo's logical-stream manifests stay deletable before
+	// term while backups and WAL are immutable.
+	WORM *repo.WORMPolicy
 }
 
 // Sink is the v0.1 chunked logical-decoding sink.
@@ -271,7 +278,15 @@ func (s *Sink) commitManifest(ctx context.Context, m *SegmentManifest) error {
 	body = append(body, '\n')
 	key := SegmentPath(m.Deployment, m.StreamName, s.startLSN)
 	// Conditional PUT where available, staging where not (issue #45).
-	if err := storage.CommitExclusive(ctx, s.sp, key, body, storage.PutOptions{}); err != nil {
+	putOpts := storage.PutOptions{}
+	if !s.opts.WORM.IsZero() {
+		// Per-Put clock: a logical stream runs for weeks, so each segment
+		// locks from its own write time (matches walsink's manifests).
+		now := time.Now().UTC()
+		putOpts.RetainUntil = s.opts.WORM.RetainUntil(now)
+		putOpts.RetentionMode = storage.WORMMode(s.opts.WORM.Mode)
+	}
+	if err := storage.CommitExclusive(ctx, s.sp, key, body, putOpts); err != nil {
 		if errors.Is(err, storage.ErrAlreadyExists) {
 			// Idempotent: a previous flush at this start_lsn
 			// already committed this batch. Chunks deduplicated
