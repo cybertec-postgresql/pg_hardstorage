@@ -62,6 +62,7 @@ func fullDeployment(useSlots bool) config.DeploymentConfig {
 			Slots:        slots,
 			Interval:     "10s",
 		},
+		AllowUnenforceableLease: true,
 	}
 }
 

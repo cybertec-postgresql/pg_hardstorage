@@ -314,6 +314,17 @@ type DeploymentConfig struct {
 	// Default (zero value, Enabled=false) means "no TDE" — the
 	// historical behaviour with strict on-disk header parsing.
 	TDE TDEConfig `yaml:"tde,omitempty" json:"tde,omitempty"`
+
+	// AllowUnenforceableLease proceeds even when the storage backend cannot
+	// perform atomic conditional writes (ConditionalPut=false), such as Ceph
+	// S3 or some MinIO deployments.  The scheduled-backup lease is then
+	// best-effort: a second concurrent runner could hold the same lease.
+	//
+	// Safe when exactly one agent replica exists — the StatefulSet chart
+	// enforces replicas=1 and documents this constraint.  Set to true only
+	// when you are certain no other agent backs up this deployment
+	// concurrently.
+	AllowUnenforceableLease bool `yaml:"allow_unenforceable_lease,omitempty" json:"allow_unenforceable_lease,omitempty"`
 }
 
 // TDEConfig declares Transparent Data Encryption posture for a
@@ -1008,6 +1019,9 @@ func mergeDeployment(existing, overlay DeploymentConfig) DeploymentConfig {
 	}
 	if overlay.Classification != "" {
 		existing.Classification = overlay.Classification
+	}
+	if overlay.AllowUnenforceableLease {
+		existing.AllowUnenforceableLease = true
 	}
 	return existing
 }
