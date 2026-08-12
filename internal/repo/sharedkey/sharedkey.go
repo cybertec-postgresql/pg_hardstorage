@@ -309,6 +309,7 @@ func putSharedDEK(ctx context.Context, sp storage.StoragePlugin, key, kekRef str
 	if err != nil {
 		return err
 	}
+	retainUntil, mode = dekRetention(retainUntil, mode)
 	opts := storage.PutOptions{
 		IfNotExists:   true,
 		ContentLength: int64(len(body)),
@@ -328,6 +329,7 @@ func putSharedDEK(ctx context.Context, sp storage.StoragePlugin, key, kekRef str
 // the DEK keeps whatever (longer-or-equal) lock it has and the next backup
 // retries. Zero retainUntil (non-WORM repo) is a no-op.
 func extendDEKRetention(ctx context.Context, sp storage.StoragePlugin, key string, retainUntil time.Time, mode storage.WORMMode) {
+	retainUntil, mode = dekRetention(retainUntil, mode)
 	if retainUntil.IsZero() {
 		return
 	}
@@ -404,6 +406,7 @@ func putSharedDEKOverwrite(ctx context.Context, sp storage.StoragePlugin, key, k
 	if err != nil {
 		return err
 	}
+	retainUntil, mode = dekRetention(retainUntil, mode)
 	opts := storage.PutOptions{ContentLength: int64(len(body))}
 	if !retainUntil.IsZero() {
 		opts.RetainUntil = retainUntil

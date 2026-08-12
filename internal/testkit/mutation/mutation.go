@@ -86,6 +86,20 @@ var Registry = []Mutation{
 		},
 	},
 	{
+		Tag: "mutation_dek_retention_dropped",
+		Description: "the shared DEK — the single object that decrypts EVERY " +
+			"encrypted chunk in the repo — is written without a WORM " +
+			"RetainUntil (pre-fix): on a compliance repo the chunks, " +
+			"manifests, WAL and timeline history are all Object-Locked but " +
+			"the DEK is deletable, so deleting one tiny object loses ALL " +
+			"encrypted data while the immutable chunks remain unreadable. " +
+			"The worst WORM gap there is. Caught by " +
+			"TestResolveOrMint_WORMLocksAndExtendsSharedDEK.",
+		Packages: []string{
+			"github.com/cybertec-postgresql/pg_hardstorage/internal/repo/sharedkey",
+		},
+	},
+	{
 		Tag: "mutation_twelvehour_unchecked",
 		Description: "the natural-time PITR parser accepts malformed " +
 			"12-hour clocks (pre-fix): '13am' resolves to 13:00 (1pm), " +
