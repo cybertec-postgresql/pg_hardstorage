@@ -399,6 +399,18 @@ func materialiseOneFile(ctx context.Context, cas *repo.CAS, target string, f *ba
 			return bytesWritten, fmt.Errorf("chunk %s len mismatch: got %d, want %d",
 				ref.Hash, len(body), ref.Len)
 		}
+		// Offset contiguity: chunks are written in slice order, so a
+		// manifest whose chunk offsets don't march monotonically from the
+		// running write position would silently produce a byte-scrambled
+		// file that still passes the total-size check below. The full
+		// restore path guards this (restore.chunkOffsetContiguous, bug
+		// #32); this mirror must too, or `partial dump`/`partial restore`
+		// hands back corrupt table data that looks correct.
+		if ref.Offset != bytesWritten {
+			return bytesWritten, fmt.Errorf("chunk %s offset=%d but running write position is %d: "+
+				"the manifest's chunks are out of order; refusing to write a byte-scrambled file",
+				ref.Hash, ref.Offset, bytesWritten)
+		}
 		if _, err := dst.Write(body); err != nil {
 			return bytesWritten, fmt.Errorf("write chunk %s: %w", ref.Hash, err)
 		}
