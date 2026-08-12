@@ -67,14 +67,16 @@ func (o CollectReferencesOptions) effectiveNow() time.Time {
 }
 
 // RefSet collects every chunk hash referenced by visible manifests
-// (backup + WAL segment). The output drives the GC's orphan-finder
-// and the scrub's "is this chunk still referenced" check.
+// (backup + WAL segment + logical-stream segment). The output drives
+// the GC's orphan-finder and the scrub's "is this chunk still
+// referenced" check.
 //
-// Implementation note: we walk the repo's two manifest prefixes
-// (`manifests/` and `wal/`) without parsing per-deployment shape
-// — a chunk is referenced iff its hash appears in any committed
-// manifest's chunks list, regardless of which kind. This keeps GC
-// independent of future manifest shapes.
+// Implementation note: we walk the repo's THREE manifest prefixes
+// (`manifests/`, `wal/`, and `logical/`) without parsing per-deployment
+// shape — a chunk is referenced iff its hash appears in any committed
+// manifest's chunks list, regardless of which kind. Every writer that
+// puts chunks in the shared CAS MUST have its manifests reachable from
+// one of these prefixes, or GC will reap its chunks as orphans.
 type RefSet struct {
 	mu     sync.Mutex
 	hashes map[Hash]struct{}
@@ -209,6 +211,32 @@ func CollectReferencesWithOptions(ctx context.Context, sp storage.StoragePlugin,
 
 	// Walk WAL segment manifests under wal/<dep>/<TLI>/<seg>.json.
 	for info, err := range sp.List(ctx, "wal/") {
+		if err != nil {
+			return nil, err
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if !strings.HasSuffix(info.Key, ".json") {
+			continue
+		}
+		if strings.Contains(info.Key, ".json.tmp.") {
+			continue
+		}
+		if err := harvestManifest(ctx, sp, info.Key, refs, harvestWAL); err != nil {
+			return nil, err
+		}
+	}
+
+	// Walk logical-stream segment manifests under
+	// logical/<dep>/<stream>/<startLSN>.json. The chunked logical sink
+	// (internal/logical/sinks/chunked) writes its CDC batches as chunks in
+	// the SAME shared CAS (chunks/sha256/) as backups and WAL, but records
+	// them under this THIRD prefix. Without walking it, every chunk a
+	// logical stream archived looks unreferenced and `repo gc --apply`
+	// reaps it — silently destroying the logical replication archive. Same
+	// {"chunks":[{"hash":...}]} shape as a WAL segment manifest.
+	for info, err := range sp.List(ctx, "logical/") {
 		if err != nil {
 			return nil, err
 		}

@@ -438,3 +438,48 @@ func TestGC_WALManifest_ContributesReferences(t *testing.T) {
 // sentinel — earlier I tried a hand-rolled reader and learned the
 // hard way that interface contracts trump cleverness.)
 func readerOf(s string) io.Reader { return strings.NewReader(s) }
+
+// TestGC_LogicalStreamChunksAreReferenced pins the fix for the
+// third-manifest-home data-loss bug. The chunked logical sink
+// (internal/logical/sinks/chunked) writes its CDC batches as chunks in
+// the SAME shared CAS as backups and WAL, but records them under the
+// `logical/` prefix — a manifest home CollectReferences did not walk.
+// Without the walk, a chunk referenced only by a logical-stream manifest
+// looks like an orphan and `repo gc --apply` reaps it, silently
+// destroying the logical replication archive.
+//
+// A chunk referenced ONLY by a logical/ segment manifest must be in the
+// reference set and therefore NOT an orphan.
+func TestGC_LogicalStreamChunksAreReferenced(t *testing.T) {
+	sp, cas := newGCRepo(t)
+
+	ci, err := cas.PutChunk(context.Background(), []byte("logical-cdc-batch-payload"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A logical-stream segment manifest, same {"chunks":[{"hash":...}]}
+	// shape as a WAL segment manifest, at the sink's real key layout
+	// logical/<dep>/<stream>/<startLSN>.json.
+	manifestJSON := `{"schema":"pg_hardstorage.logical.segment.v1","chunks":[{"hash":"` + ci.Hash.String() + `"}]}`
+	if _, err := sp.Put(context.Background(), "logical/db1/stream1/0-3000028.json",
+		readerOf(manifestJSON), storage.PutOptions{ContentLength: int64(len(manifestJSON))}); err != nil {
+		t.Fatal(err)
+	}
+
+	refs, err := repo.CollectReferences(context.Background(), sp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !refs.Has(ci.Hash) {
+		t.Errorf("logical-stream chunk %s is NOT in the reference set — gc would reap live CDC data", ci.Hash)
+	}
+	orphans, err := repo.FindOrphans(context.Background(), sp, refs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(orphans) != 0 {
+		t.Fatalf("a chunk referenced only by a logical/ manifest was flagged orphan (%d orphans) — "+
+			"`repo gc --apply` would delete the logical replication archive", len(orphans))
+	}
+}
