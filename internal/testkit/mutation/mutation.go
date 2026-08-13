@@ -86,6 +86,36 @@ var Registry = []Mutation{
 		},
 	},
 	{
+		Tag: "mutation_gap_purge_grace_dropped",
+		Description: "`wal gap-purge --orphans` treats every tombstoned " +
+			"timeline as dead, ignoring the GC grace (pre-fix): a " +
+			"within-grace tombstoned backup — still restorable via `backup " +
+			"undelete` — drops out of the live set, so a gap on an " +
+			"intermediate timeline its recovery_target_timeline='latest' " +
+			"PITR would cross gets reaped, and restore silently loses the " +
+			"refusal that flags the missing WAL. gc / wal-prune honour this " +
+			"grace; gap-purge must match. Caught by " +
+			"TestWalGapPurge_Orphans_KeepsGapForWithinGraceTombstone.",
+		Packages: []string{
+			"github.com/cybertec-postgresql/pg_hardstorage/internal/cli",
+		},
+	},
+	{
+		Tag: "mutation_agent_rotation_abort_on_livedesc",
+		Description: "the agent's scheduled rotation skips ONLY a held " +
+			"manifest, treating a parent kept alive by its held child " +
+			"(ErrChainHasLiveDescendants) as run-fatal (pre-fix): one hold " +
+			"then aborts every nightly rotation and any deletable backup " +
+			"ordered after the held anchor is never reclaimed — unbounded " +
+			"repo/WAL growth on the unattended path nobody watches. The " +
+			"interactive `rotate` path protects held chains' ancestors " +
+			"up-front; the agent must skip both reactively. Caught by " +
+			"TestAgentRotate_HoldOnIncrementalDoesNotWedgeScheduledRetention.",
+		Packages: []string{
+			"github.com/cybertec-postgresql/pg_hardstorage/internal/cli",
+		},
+	},
+	{
 		Tag: "mutation_dek_retention_dropped",
 		Description: "the shared DEK — the single object that decrypts EVERY " +
 			"encrypted chunk in the repo — is written without a WORM " +

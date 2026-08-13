@@ -255,11 +255,7 @@ func collectLiveTimelines(ctx context.Context, store *backup.ManifestStore, depl
 		}
 		if entry.Tombstoned {
 			ts, terr := store.ReadTombstone(ctx, deployment, entry.Manifest.BackupID)
-			switch {
-			case terr != nil || ts == nil || ts.TombstonedAt.IsZero():
-				// Age unknowable → keep the timeline. Over-keeping a tiny
-				// gap record is safe; reaping a still-needed one is not.
-			case ts.TombstonedAt.Before(graceCutoff):
+			if !tombstonedTimelineStillLive(terr, ts, graceCutoff) {
 				continue // past grace — genuinely dead, don't let it pin gaps
 			}
 		}

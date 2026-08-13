@@ -678,8 +678,7 @@ func buildRotateTask(name string, dep config.DeploymentConfig, verifier *backup.
 					// Without it one hold aborts every nightly run and any
 					// deletable backup ordered after the held anchor is never
 					// reclaimed. Any other error still bubbles up.
-					if errors.Is(err, backup.ErrManifestHeld) ||
-						errors.Is(err, backup.ErrChainHasLiveDescendants) {
+					if retentionRotateSkippable(err) {
 						continue
 					}
 					return fmt.Errorf("soft-delete %s: %w", m.BackupID, err)
