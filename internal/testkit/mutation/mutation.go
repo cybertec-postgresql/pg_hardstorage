@@ -86,6 +86,20 @@ var Registry = []Mutation{
 		},
 	},
 	{
+		Tag: "mutation_gap_slot_key_dropped",
+		Description: "the gap-record storage key omits its per-slot token " +
+			"(pre-fix): a single Patroni failover reconciles every " +
+			"configured slot in the same instant, so two slots that gap on " +
+			"the same timeline at the same unix-nano share a key; the second " +
+			"slot's IfNotExists PUT is rejected as already-present and its " +
+			"gap record is SILENTLY DROPPED — restore then can't refuse a " +
+			"PITR into that lost gap. Caught by " +
+			"TestPut_TwoSlotsSameTimelineSameInstantBothSurvive.",
+		Packages: []string{
+			"github.com/cybertec-postgresql/pg_hardstorage/internal/wal/gapstate",
+		},
+	},
+	{
 		Tag: "mutation_gap_purge_grace_dropped",
 		Description: "`wal gap-purge --orphans` treats every tombstoned " +
 			"timeline as dead, ignoring the GC grace (pre-fix): a " +

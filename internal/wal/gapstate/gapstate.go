@@ -33,8 +33,6 @@ package gapstate
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -413,8 +411,6 @@ func prefixFor(deployment string) string {
 // preserving the dedup the coordinator relies on.
 func keyFor(deployment, slotName string, tli uint32, detectedAt time.Time) string {
 	nanos := detectedAt.UTC().UnixNano()
-	sum := sha256.Sum256([]byte(slotName))
-	slotTok := hex.EncodeToString(sum[:8]) // 64-bit — collision-free for any real slot set
 	return prefixFor(deployment) + strconv.FormatUint(uint64(tli), 10) + "-" +
-		strconv.FormatInt(nanos, 10) + "-" + slotTok + ".json"
+		strconv.FormatInt(nanos, 10) + "-" + slotKeyToken(slotName) + ".json"
 }
