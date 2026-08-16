@@ -1446,8 +1446,14 @@ func deploymentRecordedSysID(ctx context.Context, sp storage.StoragePlugin, depl
 		}
 		key := info.Key
 		// Per-segment manifests only: skip in-flight tmp files and the
-		// history/ aux tree (history files carry no system_identifier).
-		if !strings.HasSuffix(key, ".json") || strings.Contains(key, ".json.tmp.") {
+		// history/ aux tree (history files carry no system_identifier). The
+		// temp check is BASENAME-scoped, never full-key: a deployment whose
+		// NAME contains ".json.tmp." (validateStorageID permits dots) would
+		// otherwise have every segment skipped, deploymentRecordedSysID would
+		// return found=false, and guardSystemIdentifier fails OPEN on that —
+		// silently disabling the foreign-cluster guard so a different
+		// cluster's WAL corrupts the lineage.
+		if !strings.HasSuffix(key, ".json") || segmentKeyBasenameIsTemp(key) {
 			continue
 		}
 		if strings.Contains(key, "/history/") {
@@ -2733,7 +2739,7 @@ func highestCommittedSegment(ctx context.Context, sp storage.StoragePlugin, depl
 			continue
 		}
 		// Skip in-flight tmp files (foo.json.tmp.*).
-		if strings.Contains(key, ".json.tmp.") {
+		if segmentKeyBasenameIsTemp(key) {
 			continue
 		}
 		base := key[len(prefix) : len(key)-len(wantSuffix)]

@@ -1449,7 +1449,7 @@ func scrubManifestAware(ctx context.Context, sp storage.StoragePlugin, limit int
 			// Propagate so the scrub surfaces the error instead.
 			return agg, distinctRefs, lerr
 		}
-		if !strings.HasSuffix(info.Key, ".json") || strings.Contains(info.Key, ".json.tmp.") {
+		if !strings.HasSuffix(info.Key, ".json") || segmentKeyBasenameIsTemp(info.Key) {
 			continue
 		}
 		if limit > 0 && agg.Sampled >= limit {

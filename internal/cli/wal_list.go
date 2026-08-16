@@ -135,7 +135,7 @@ func scanWALSegments(ctx context.Context, sp storage.StoragePlugin, deployment s
 		if !strings.HasSuffix(key, wantSuffix) {
 			continue
 		}
-		if strings.Contains(key, ".json.tmp.") {
+		if segmentKeyBasenameIsTemp(key) {
 			continue
 		}
 		// Layout: wal/<dep>/<TLI-hex>/<24-char>.json. Guard the
