@@ -478,4 +478,19 @@ var Registry = []Mutation{
 			"github.com/cybertec-postgresql/pg_hardstorage/internal/repo",
 		},
 	},
+	{
+		Tag: "mutation_inventory_temp_fullkey",
+		Description: "the WAL-inventory frontier walks (HighestArchivedLSN, " +
+			"FirstWALHoleInRange, NextArchivedLSNAtOrAfter) skip staging temps " +
+			"via a FULL-key `.json.tmp.` match instead of the basename " +
+			"(pre-fix): every committed segment of a deployment whose NAME " +
+			"contains `.json.tmp.` (validateStorageID permits dots) is " +
+			"skipped, so HighestArchivedLSN reports nothing archived — the " +
+			"archive frontier goes blind, a Patroni failover gap is silently " +
+			"missed (bug-#2 class) and restore bounds are wrong. Caught by " +
+			"TestFrontier_UnderDottedDeployment.",
+		Packages: []string{
+			"github.com/cybertec-postgresql/pg_hardstorage/internal/wal/inventory",
+		},
+	},
 }

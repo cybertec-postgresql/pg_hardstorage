@@ -39,7 +39,7 @@ func NextArchivedLSNAtOrAfter(ctx context.Context, sp storage.StoragePlugin, dep
 			return 0, false, cerr
 		}
 		key := info.Key
-		if !strings.HasSuffix(key, ".json") || strings.Contains(key, ".json.tmp.") {
+		if !strings.HasSuffix(key, ".json") || segmentKeyIsStagingTemp(key) {
 			continue
 		}
 		rc, gerr := sp.Get(ctx, key)

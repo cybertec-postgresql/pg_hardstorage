@@ -118,7 +118,7 @@ func FirstWALHoleInRange(ctx context.Context, sp storage.StoragePlugin, deployme
 			return 0, false, cerr
 		}
 		key := info.Key
-		if !strings.HasSuffix(key, ".json") || strings.Contains(key, ".json.tmp.") {
+		if !strings.HasSuffix(key, ".json") || segmentKeyIsStagingTemp(key) {
 			continue
 		}
 		base := key[len(prefix) : len(key)-len(".json")]
@@ -198,7 +198,7 @@ func highestSegmentKey(ctx context.Context, sp storage.StoragePlugin, deployment
 			continue
 		}
 		// Skip in-flight tmp files (foo.json.tmp.*).
-		if strings.Contains(key, ".json.tmp.") {
+		if segmentKeyIsStagingTemp(key) {
 			continue
 		}
 		base := key[len(prefix) : len(key)-len(wantSuffix)]
