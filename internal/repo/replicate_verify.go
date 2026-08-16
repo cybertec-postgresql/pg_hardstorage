@@ -651,7 +651,7 @@ func isManifestKey(key string) bool {
 // replica-verify silently considered ZERO segments and always reported
 // "consistent," even against a replica missing all its WAL.)
 func isWALSegmentManifestKey(key string) bool {
-	if !strings.HasSuffix(key, ".json") || strings.Contains(key, ".json.tmp.") {
+	if !strings.HasSuffix(key, ".json") || tmpMarkerInBasename(key) {
 		return false
 	}
 	base := strings.TrimSuffix(key, ".json")

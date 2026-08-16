@@ -493,4 +493,20 @@ var Registry = []Mutation{
 			"github.com/cybertec-postgresql/pg_hardstorage/internal/wal/inventory",
 		},
 	},
+	{
+		Tag: "mutation_replicate_temp_fullkey",
+		Description: "Replicate and the replica-verify segment walk skip " +
+			"staging temps via a FULL-key `.tmp.` match instead of the " +
+			"basename (pre-fix): a committed backup whose ID contains `.tmp.` " +
+			"(e.g. `db1.full.tmp.abc`) or a WAL segment under a deployment " +
+			"named `dep.tmp.x` — validateStorageID permits dots — is dropped " +
+			"from the copy, so the DR replica silently OMITS that backup / " +
+			"segment (data loss on a DR failover; replica-verify then reports " +
+			"'consistent' against a repo missing them). Caught by " +
+			"TestReplicate_CopiesBackupWithTmpInID + " +
+			"TestIsWALSegmentManifestKey_DottedDeployment.",
+		Packages: []string{
+			"github.com/cybertec-postgresql/pg_hardstorage/internal/repo",
+		},
+	},
 }

@@ -242,7 +242,7 @@ func Replicate(ctx context.Context, src, dst storage.StoragePlugin, opts Replica
 		if !strings.HasSuffix(info.Key, "/manifest.json") {
 			continue
 		}
-		if strings.Contains(info.Key, ".tmp.") {
+		if tmpMarkerInBasename(info.Key) {
 			continue
 		}
 		// _replicas/ holds redundancy copies that we'll mirror as a
@@ -289,7 +289,7 @@ func Replicate(ctx context.Context, src, dst storage.StoragePlugin, opts Replica
 				return res, fmt.Errorf("repo replicate: list src wal: %w", err)
 			}
 			key := info.Key
-			if strings.Contains(key, ".tmp.") {
+			if tmpMarkerInBasename(key) {
 				continue // staging temp (manifest or .history)
 			}
 			switch {
