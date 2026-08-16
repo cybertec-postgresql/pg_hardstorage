@@ -461,4 +461,18 @@ var Registry = []Mutation{
 			"github.com/cybertec-postgresql/pg_hardstorage/internal/pg",
 		},
 	},
+	{
+		Tag: "mutation_stale_temp_fullkey",
+		Description: "FindStaleTempManifests matches the `.json.tmp.` / " +
+			"`.history.tmp.` staging marker anywhere in the FULL key instead " +
+			"of the basename (pre-fix): a COMMITTED manifest under a " +
+			"deployment or backup ID that contains that literal — permitted " +
+			"because validateStorageID allows dots, e.g. " +
+			"`.../backups/evil.json.tmp.x/manifest.json` — is flagged a stale " +
+			"temp and DELETED by `repo gc --apply`, silently destroying a live " +
+			"backup. Caught by TestFindStaleTemp_NeverFlagsLiveManifest.",
+		Packages: []string{
+			"github.com/cybertec-postgresql/pg_hardstorage/internal/repo",
+		},
+	},
 }

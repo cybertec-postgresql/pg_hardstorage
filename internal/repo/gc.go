@@ -509,9 +509,10 @@ func FindStaleTempManifests(ctx context.Context, sp storage.StoragePlugin, opts 
 			// Manifest staging files (`*.json.tmp.<rand>`) and timeline
 			// history staging files (`*.history.tmp.<rand>`, written by
 			// timeline.Store) are both orphaned commit temps a crash can
-			// strand. Reap either.
-			if !strings.Contains(info.Key, ".json.tmp.") &&
-				!strings.Contains(info.Key, ".history.tmp.") {
+			// strand. Reap either — but ONLY when the staging marker is in
+			// the key's basename, never a parent path component. See
+			// isStaleTempKey (own file for the mutation guard).
+			if !isStaleTempKey(info.Key) {
 				continue
 			}
 			if minAge > 0 {
