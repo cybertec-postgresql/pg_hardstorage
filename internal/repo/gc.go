@@ -220,7 +220,12 @@ func CollectReferencesWithOptions(ctx context.Context, sp storage.StoragePlugin,
 		if !strings.HasSuffix(info.Key, ".json") {
 			continue
 		}
-		if strings.Contains(info.Key, ".json.tmp.") {
+		// Skip staging temps — basename-scoped, never a full-key match: a
+		// committed segment under a deployment whose NAME contains
+		// ".json.tmp." (validateStorageID permits dots) must still be
+		// harvested, or its chunks drop from the ref set and gc reaps live
+		// WAL. See isStaleTempKey.
+		if isStaleTempKey(info.Key) {
 			continue
 		}
 		if err := harvestManifest(ctx, sp, info.Key, refs, harvestWAL); err != nil {
@@ -246,7 +251,10 @@ func CollectReferencesWithOptions(ctx context.Context, sp storage.StoragePlugin,
 		if !strings.HasSuffix(info.Key, ".json") {
 			continue
 		}
-		if strings.Contains(info.Key, ".json.tmp.") {
+		// Basename-scoped temp skip (see the WAL walk above): a logical
+		// segment under a deployment name containing ".json.tmp." must be
+		// harvested, not skipped, or gc reaps the logical archive's chunks.
+		if isStaleTempKey(info.Key) {
 			continue
 		}
 		if err := harvestManifest(ctx, sp, info.Key, refs, harvestWAL); err != nil {

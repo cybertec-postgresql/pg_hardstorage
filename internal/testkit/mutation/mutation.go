@@ -463,14 +463,17 @@ var Registry = []Mutation{
 	},
 	{
 		Tag: "mutation_stale_temp_fullkey",
-		Description: "FindStaleTempManifests matches the `.json.tmp.` / " +
-			"`.history.tmp.` staging marker anywhere in the FULL key instead " +
-			"of the basename (pre-fix): a COMMITTED manifest under a " +
-			"deployment or backup ID that contains that literal — permitted " +
-			"because validateStorageID allows dots, e.g. " +
-			"`.../backups/evil.json.tmp.x/manifest.json` — is flagged a stale " +
-			"temp and DELETED by `repo gc --apply`, silently destroying a live " +
-			"backup. Caught by TestFindStaleTemp_NeverFlagsLiveManifest.",
+		Description: "isStaleTempKey matches the `.json.tmp.` / `.history.tmp.` " +
+			"staging marker anywhere in the FULL key instead of the basename " +
+			"(pre-fix). Three sites route through it: FindStaleTempManifests " +
+			"(a COMMITTED manifest under a dotted deployment/backup ID — " +
+			"validateStorageID permits dots, e.g. `.../evil.json.tmp.x/" +
+			"manifest.json` — is DELETED by `repo gc --apply`) and " +
+			"CollectReferences' WAL+logical walks (a committed segment under a " +
+			"deployment named `db.json.tmp.x` is dropped from the ref set, so " +
+			"gc reaps its live chunks). Both are silent data loss. Caught by " +
+			"TestFindStaleTemp_NeverFlagsLiveManifest + " +
+			"TestCollectReferences_HarvestsSegmentUnderDottedDeployment.",
 		Packages: []string{
 			"github.com/cybertec-postgresql/pg_hardstorage/internal/repo",
 		},

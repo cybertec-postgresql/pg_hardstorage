@@ -352,7 +352,14 @@ func oldestKeptBackupFrontier(ctx context.Context, sp storage.StoragePlugin, dep
 				}
 			}
 		case strings.HasSuffix(key, "/manifest.json"):
-			if strings.Contains(key, ".tmp.") {
+			// Basename-scoped temp skip: a committed manifest whose backup
+			// ID or deployment contains ".tmp." (validateStorageID permits
+			// dots) must NOT be dropped from the frontier — dropping the
+			// min-start_lsn backup advances the frontier past it and prunes
+			// the WAL it needs (silent PITR hole). Genuine manifest temps end
+			// in ".json.tmp.<rand>", so they never reach this /manifest.json
+			// case anyway; the basename check is the correct, safe guard.
+			if isStaleTempKey(key) {
 				continue
 			}
 			manifestKeys = append(manifestKeys, key)
