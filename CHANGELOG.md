@@ -11,30 +11,28 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ## [Unreleased]
 
-### Added
+### Fixed
 
-- **`backup` honours the `--tde` flag and a deployment's `tde:` block,
-  stamping `source_tde` on the manifest.** New flags `--tde`,
-  `--tde-engine`, and `--tde-key-ref` declare that the source
-  PostgreSQL has Transparent Data Encryption enabled (CYBERTEC PGEE,
-  pg_tde, EDB TDE); the same declaration can live in the deployment's
-  `tde:` block in `pg_hardstorage.yaml` (the flags win when both are
-  set). The declaration is stamped onto the backup manifest as
-  `source_tde` and surfaced in the backup result JSON and text output.
-  That stamp is what lets a later restore refuse a vanilla-PostgreSQL
-  target loudly instead of writing a data dir full of ciphertext.
-  Previously the `tde:` block and any `--tde` flag were silently
-  ignored on the `backup` path, so `source_tde` was always `null` even
-  for a declared-TDE deployment, contradicting the TDE-awareness docs.
-  The field is additive and omitted when TDE is not declared, so
-  nothing changes for existing non-TDE deployments. Note this is
-  posture metadata only: a backup and same-engine restore of a TDE
-  cluster already worked with no flag, because `BASE_BACKUP` and
+- **`backup` no longer silently drops a TDE declaration — the
+  `source_tde` manifest stamp works.** The runner could already record
+  source Transparent Data Encryption on the manifest and `wal push`
+  had a `--tde` flag, but the `backup` command wired up neither: it had
+  no TDE flag and never read the deployment's `tde:` block, so
+  `source_tde` was always `null` even for a declared-TDE deployment
+  (CYBERTEC PGEE, pg_tde, EDB TDE), contradicting the TDE-awareness
+  docs. `backup` now gains `--tde`, `--tde-engine`, and `--tde-key-ref`
+  and also reads `tde.enabled` from the deployment config (the flags
+  win when both are set); the declaration is stamped onto the manifest
+  as `source_tde` and surfaced in the backup result JSON and text
+  output. That stamp is what lets a later restore refuse a
+  vanilla-PostgreSQL target loudly instead of writing a data dir full
+  of ciphertext. The field is additive and omitted when TDE is not
+  declared, so nothing changes for existing non-TDE deployments. Note
+  this is posture metadata only: a backup and same-engine restore of a
+  TDE cluster already worked with no flag, because `BASE_BACKUP` and
   replication deliver plaintext over the wire (the source engine
   decrypts above the replication boundary) — the flag records the
   source posture, it is not required for the backup to succeed. (#48)
-
-### Fixed
 
 - **Restore refuses a non-contiguous chunk list instead of writing
   scrambled bytes.** `materializeFile`, which rebuilds every file from
