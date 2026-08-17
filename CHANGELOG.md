@@ -11,7 +11,29 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ## [Unreleased]
 
+## [1.2.2] — 2026-08-17
+
 ### Fixed
+
+- **Storage janitors and guards no longer mishandle a deployment or
+  backup ID that contains a `.tmp.` / `.json.tmp.` substring (silent
+  data loss).** A deployment or backup ID may legitimately contain dots
+  — only path separators and control characters are barred — but
+  several storage walks matched the commit-staging-temp marker against
+  the FULL object key instead of just the filename. A committed object
+  under such a name (e.g. a backup `db1.full.tmp.abc` or a deployment
+  `db.json.tmp.x`) could be mistaken for an in-flight staging temp and
+  skipped or swept: `repo gc` could delete a live backup's manifest or
+  reap a still-referenced chunk, `wal prune` could advance its frontier
+  past a live backup and delete WAL it still needs, `repo replicate`
+  could silently omit a backup from a DR replica, the archive-frontier
+  lookups could report "nothing archived" (blinding failover-gap
+  detection), and the foreign-cluster `system_identifier` guard could
+  fail open. Every affected matcher is now scoped to the key's
+  basename, so a committed object is never mistaken for a temp
+  regardless of its deployment or backup name. Reachable only for the
+  unusual (but valid) dot-`tmp` naming; no conventional deployment was
+  affected.
 
 - **`backup` no longer silently drops a TDE declaration — the
   `source_tde` manifest stamp works.** The runner could already record
@@ -46,9 +68,6 @@ keeps reading that version for at least 24 months after a successor lands.
   matches the running write position and refuses otherwise — the same
   belt-and-braces posture as the restore-side identity check. Found by
   a direct-coverage pass on a function that previously had none.
-
-
-### Fixed
 
 - **The `--to` time parser rejects malformed 12-hour clocks instead of
   silently misreading them.** A 12-hour clock has hours 1..12, but the
