@@ -13,6 +13,15 @@ operator deciding whether to upgrade.
 
 ## Releases
 
+- **[v1.2](v1.2.md)** — the failover release.  A chaos gate that
+  drives real Patroni faults (DCS outages, compound storms,
+  retention janitors mid-storm) and then restores and boots the
+  backups it took, plus the silent WAL-gap and storage-walk
+  data-loss classes it surfaced and fixed.  Adds `restore
+  --to-latest`, the `backup --tde` family with `source_tde`
+  manifest stamping, an append-only repository mode, and
+  `keyring install`; fixes the sidecar chart's keyring so it
+  actually loads.  Backward compatible — no migration.
 - **[v1.1](v1.1.md)** — cloud KMS becomes configurable in
   `pg_hardstorage.yaml` (`kms.providers[]` + per-deployment
   `kek_ref`), which is what finally lets the agent's
