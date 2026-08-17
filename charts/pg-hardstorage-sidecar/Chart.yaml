@@ -9,7 +9,7 @@ description: |
   Kubernetes-native workload. Fully-managed DBaaS (RDS / Cloud SQL)
   are not supported — they do not expose BASE_BACKUP to customers.
 type: application
-version: 0.1.1
+version: 0.1.2
 appVersion: "0.1.1"
 kubeVersion: ">= 1.24.0-0"
 home: https://github.com/cybertec-postgresql/pg_hardstorage

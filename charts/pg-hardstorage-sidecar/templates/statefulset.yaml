@@ -71,8 +71,15 @@ spec:
             - install
             - --from=/keyring-src
             - --to=/etc/pg_hardstorage/keyring
+          # Same hardened context as the main container. There is no use
+          # case for a different security posture on the keyring-install
+          # init step, and the previously-referenced .Values.container
+          # SecurityContext was never defined in values.yaml, so this
+          # initContainer silently ran with an EMPTY securityContext
+          # (issue #49). readOnlyRootFilesystem is fine here: the install
+          # writes only to the mounted `keyring` emptyDir, not the root fs.
           securityContext:
-            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+            {{- toYaml .Values.securityContext | nindent 12 }}
           volumeMounts:
             - name: keyring-src
               mountPath: /keyring-src
