@@ -48,14 +48,31 @@ deployments:
       key_ref: kms-secret://prod/pgee  # operator-supplied; informational
 ```
 
-Or pass `--tde` on the relevant CLI surfaces (currently
-`pg_hardstorage wal push`).  Default is `tde.enabled: false` —
-the historical behaviour with strict on-disk header parsing.
+Or pass `--tde` on the relevant CLI surfaces — `pg_hardstorage
+backup` and `pg_hardstorage wal push`.  On `backup` you can also
+name the engine and key reference inline with `--tde-engine` /
+`--tde-key-ref` (either implies `--tde`); the flags win over the
+deployment's `tde:` block when both are present.  Default is
+`tde.enabled: false` — the historical behaviour with strict
+on-disk header parsing.
 
 Once set, the agent treats EVERY path that would otherwise parse
 PG byte layout off disk as "ciphertext, don't peek".  The
 relaxation is symmetric: backup-side, restore-side, and the
 manifest stamps so future restores know.
+
+> **Why a plain backup/restore of a TDE cluster "just works"
+> without the flag.**  `BASE_BACKUP` and `START_REPLICATION`
+> deliver **plaintext over the wire** — CYBERTEC PGEE / pg_tde
+> decrypt above the replication boundary — and the content-defined
+> chunker treats those bytes opaquely either way.  So a backup and
+> a same-engine restore succeed with no flag at all; that is
+> expected, not a bug.  What the flag adds is **posture metadata**:
+> the `source_tde` manifest stamp (below) so a future restore onto
+> **vanilla** PostgreSQL is refused loudly instead of writing a
+> data dir full of ciphertext, and the `wal push` header-skip.
+> Without the flag the backup is untagged and restore cannot know
+> the source was encrypted.
 
 ---
 

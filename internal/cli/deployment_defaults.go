@@ -14,10 +14,54 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/config"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/output"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/paths"
 )
+
+// deploymentTDE resolves the effective source-TDE declaration for a backup:
+// the --tde / --tde-engine / --tde-key-ref flags OR the named deployment's
+// `tde:` block in pg_hardstorage.yaml. Returns nil when TDE is declared
+// neither way — the manifest then carries no source_tde block, exactly the
+// historical behaviour. Flags win over the config block, matching how
+// deploymentDefaults / deploymentKMS treat --repo / --pg-connection / --kek.
+//
+// This is the wiring the tde-awareness docs promised: before it, the `tde:`
+// block and any --tde flag were silently ignored on the backup path, so
+// source_tde was always null even for a declared-TDE deployment (issue #48).
+func deploymentTDE(deployment string, tdeFlag bool, engineFlag, keyRefFlag string) *backup.SourceTDEInfo {
+	enabled := tdeFlag || engineFlag != "" || keyRefFlag != ""
+	engine, keyRef := engineFlag, keyRefFlag
+
+	// Fold in the deployment's tde: block unless the operator pinned the
+	// corresponding value on the command line.
+	if deployment != "" {
+		if p, err := paths.Resolve(paths.DefaultOptions()); err == nil {
+			if loaded, err := config.Load(p); err == nil && loaded != nil {
+				if dep, ok := loaded.Config.Deployments[deployment]; ok && dep.TDE.Enabled {
+					enabled = true
+					if engine == "" {
+						engine = dep.TDE.Engine
+					}
+					if keyRef == "" {
+						keyRef = dep.TDE.KeyRef
+					}
+				}
+			}
+		}
+	}
+	if !enabled {
+		return nil
+	}
+	// Empty engine stamps as the literal "unspecified" (matches the
+	// SourceTDEInfo contract): the operator declared TDE without naming
+	// an engine, which is accepted.
+	if engine == "" {
+		engine = "unspecified"
+	}
+	return &backup.SourceTDEInfo{Engine: engine, KeyRef: keyRef}
+}
 
 // resolveDeploymentDefaults fills empty pgConn / repoURL from the named
 // deployment in deps. Explicit (non-empty) values always win, so a flag

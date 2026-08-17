@@ -78,6 +78,17 @@ The repository must already exist — create it with ` + "`" + `pg_hardstorage r
 		"per-call config for the cloud-KMS provider (e.g. region=us-east-1,use_fips_endpoint=true). "+
 			"Only consulted for a cloud scheme; replaces the matching kms.providers entry in "+
 			"pg_hardstorage.yaml for this run.")
+	c.Flags().BoolVar(&opts.tde, "tde", false,
+		"declare the source PostgreSQL has Transparent Data Encryption enabled "+
+			"(CYBERTEC PGEE, pg_tde, EDB TDE). Stamps source_tde on the manifest so a "+
+			"later restore refuses a vanilla-PG target and skips plaintext verify. Also "+
+			"honoured via the deployment's `tde:` block in pg_hardstorage.yaml. Backup itself "+
+			"works with or without this — BASE_BACKUP delivers plaintext over the wire — the "+
+			"flag only records the source posture for restore-time safety.")
+	c.Flags().StringVar(&opts.tdeEngine, "tde-engine", "",
+		"free-form TDE engine label stamped on the manifest (e.g. cybertec_enterprise, pg_tde, edb_tde); implies --tde")
+	c.Flags().StringVar(&opts.tdeKeyRef, "tde-key-ref", "",
+		"opaque operator key-set reference stamped on the manifest for forensic/migration purposes; implies --tde")
 	c.Flags().StringVar(&opts.incrementalFrom, "incremental-from", "",
 		"take a PG 17+ incremental backup against this parent backup ID; "+
 			"requires summarize_wal=on on the source DB")
@@ -123,6 +134,17 @@ type runOptions struct {
 	kekRef          string
 	kmsConfig       map[string]string
 	incrementalFrom string
+
+	// tde / tdeEngine / tdeKeyRef declare that the SOURCE PostgreSQL
+	// has Transparent Data Encryption enabled (CYBERTEC PGEE, pg_tde,
+	// EDB TDE). They stamp source_tde on the manifest so restore can
+	// refuse a vanilla-PG target and skip plaintext verify. Equivalent
+	// to the deployment's `tde:` block in pg_hardstorage.yaml; the flags
+	// win when both are present. Independent of --encrypt (repo-side
+	// envelope encryption): a backup can be source-TDE and repo-plaintext.
+	tde       bool
+	tdeEngine string
+	tdeKeyRef string
 
 	// ignoreCapacity skips the pre-flight free-space gate.
 	// Operators with intentionally over-tight repos (or
@@ -181,6 +203,11 @@ func runBackup(cmd *cobra.Command, opts runOptions) error {
 	// run, and the matching `kms.providers` entry supplies region /
 	// credentials in place of --kms-config.
 	kekRef, kmsConfig := deploymentKMS(opts.deployment, opts.kekRef, opts.kmsConfig)
+
+	// Source-TDE declaration: --tde/--tde-engine/--tde-key-ref or the
+	// deployment's tde: block. Stamped onto the manifest (source_tde) so
+	// restore refuses a vanilla-PG target. nil when TDE isn't declared.
+	sourceTDE := deploymentTDE(opts.deployment, opts.tde, opts.tdeEngine, opts.tdeKeyRef)
 
 	// Required-field checks (local mode only — a control-plane dispatch
 	// returned above). Validate the resolved values, not the raw flags:
@@ -289,6 +316,7 @@ func runBackup(cmd *cobra.Command, opts runOptions) error {
 		Fast:         opts.fast,
 		IncludeWAL:   opts.includeWAL,
 		Encryption:   encConfig,
+		SourceTDE:    sourceTDE,
 		Incremental:  incrConfig,
 		StallTimeout: opts.stallTimeout,
 		SkipLease:    opts.allowConcurrent,
@@ -310,6 +338,7 @@ func runBackup(cmd *cobra.Command, opts runOptions) error {
 		Tenant:           res.Tenant,
 		PGVersion:        res.PGVersion,
 		SystemIdentifier: res.SystemIdentifier,
+		SourceTDE:        sourceTDE,
 		StartLSN:         res.StartLSN,
 		StopLSN:          res.StopLSN,
 		Timeline:         res.Timeline,
@@ -497,6 +526,12 @@ type backupResultBody struct {
 	UniqueChunkBytes int64  `json:"unique_chunk_bytes"`
 	PrimaryKey       string `json:"primary_key"`
 	Encrypted        bool   `json:"encrypted"`
+	// SourceTDE echoes the source Transparent-Data-Encryption posture
+	// that was stamped onto the manifest (nil / omitted when the
+	// deployment was not declared TDE). Surfacing it in the backup
+	// result answers "was this a TDE-source backup?" without re-reading
+	// the manifest (issue #48).
+	SourceTDE *backup.SourceTDEInfo `json:"source_tde,omitempty"`
 }
 
 // WriteText is the text-renderer hook. Compact, scan-friendly output
@@ -525,6 +560,13 @@ func (b backupResultBody) WriteText(w io.Writer) error {
 		fmt.Fprintf(bw, "  Encryption:       AES-256-GCM (per-backup DEK, wrapped under local KEK)\n")
 	} else {
 		fmt.Fprintf(bw, "  Encryption:       none\n")
+	}
+	if b.SourceTDE != nil {
+		if b.SourceTDE.KeyRef != "" {
+			fmt.Fprintf(bw, "  Source TDE:       %s (key_ref %s)\n", b.SourceTDE.Engine, b.SourceTDE.KeyRef)
+		} else {
+			fmt.Fprintf(bw, "  Source TDE:       %s\n", b.SourceTDE.Engine)
+		}
 	}
 	fmt.Fprintf(bw, "  Manifest:         %s", b.PrimaryKey)
 
