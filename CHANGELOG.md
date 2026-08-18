@@ -11,6 +11,36 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Restore of a backup with a non-default tablespace now creates the
+  `pg_tblspc/<oid>` symlinks, so verify and startup succeed (#50).**
+  A restore materialised a non-default tablespace's files at their
+  (remapped) location and wrote `tablespace_map`, but never created the
+  `pg_tblspc/<oid>` symlink in the restored data directory — the code
+  assumed PostgreSQL would create those links at recovery start.
+  However, the in-process `pg_verifybackup` (and PG startup) runs
+  *before* recovery and resolves a tablespace file's `pg_tblspc/<oid>/…`
+  path through that link, so the restore failed with
+  `verifybackup_failed: file "pg_tblspc/…": file missing from restored
+  datadir` and `pg_tblspc/` was left empty. `pg_basebackup` creates these
+  symlinks itself; the restore now does too, pointing each at the same
+  location `tablespace_map` records, before the verify gate. Covered by a
+  new real-PostgreSQL integration test that creates a table in a
+  non-default tablespace, backs it up, and restores it clean.
+- **The post-restore boot smoke test skips clearly when `postgresql.conf`
+  lives outside PGDATA (#50).** On the Debian/Ubuntu
+  `/etc/postgresql/<v>/main` layout (or any cluster with an external
+  `config_file`), `BASE_BACKUP` carries no `postgresql.conf` into the data
+  directory, so the `pg_ctl start` smoke test failed with a cryptic
+  "could not access the server configuration file". That is a
+  configuration layout, not a broken backup: `postverify` now detects the
+  absent `postgresql.conf` and skips with an actionable reason
+  (`restore.postverify_skipped`) in the default mode — or fails
+  `--verify-restore=require` with the same clear explanation — instead of
+  the raw `pg_ctl` error. Normal restores keep `postgresql.conf` inside
+  PGDATA and are unaffected.
+
 ## [1.2.2] — 2026-08-17
 
 ### Fixed
