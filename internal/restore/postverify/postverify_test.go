@@ -197,3 +197,73 @@ func TestStageForRecovery_NonPITR_GetsImmediateTarget(t *testing.T) {
 		t.Errorf("non-PITR restore should get recovery_target_action='promote'; auto.conf:\n%s", s)
 	}
 }
+
+// fakePGDATAConf builds a minimal directory that looks like a PGDATA
+// (global/pg_control present) with postgresql.conf optionally present.
+func fakePGDATAConf(t *testing.T, withConf bool) string {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "global"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "global", "pg_control"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if withConf {
+		if err := os.WriteFile(filepath.Join(dir, "postgresql.conf"), []byte("# conf\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return dir
+}
+
+// Issue #50 (secondary): a restored datadir whose source keeps
+// postgresql.conf outside PGDATA (Debian /etc/postgresql layout) must skip
+// the boot smoke test with an actionable reason, not fail with a cryptic
+// pg_ctl "could not access the server configuration file".
+func TestVerify_AutoMode_SkipsWhenPostgresqlConfAbsent(t *testing.T) {
+	res, err := postverify.Verify(context.Background(), postverify.Options{
+		Mode:    postverify.ModeAuto,
+		DataDir: fakePGDATAConf(t, false),
+	})
+	if err != nil {
+		t.Fatalf("auto mode should not error: %v", err)
+	}
+	if !res.Skipped {
+		t.Fatal("expected Skipped=true when postgresql.conf is absent")
+	}
+	if !strings.Contains(res.SkipReason, "postgresql.conf") {
+		t.Errorf("SkipReason %q should mention postgresql.conf", res.SkipReason)
+	}
+}
+
+func TestVerify_RequiredMode_HardFailsWithClearReasonWhenConfAbsent(t *testing.T) {
+	_, err := postverify.Verify(context.Background(), postverify.Options{
+		Mode:    postverify.ModeRequired,
+		DataDir: fakePGDATAConf(t, false),
+	})
+	if err == nil {
+		t.Fatal("required mode should hard-fail when postgresql.conf is absent")
+	}
+	if !strings.Contains(err.Error(), "postgresql.conf") {
+		t.Errorf("error %q should explain the missing postgresql.conf", err)
+	}
+}
+
+func TestVerify_PassesConfCheckWhenPresent(t *testing.T) {
+	// With postgresql.conf present the conf gate passes through; on a host
+	// without a matching pg_ctl it then skips for that reason instead — so
+	// the skip (if any) must NOT be about postgresql.conf. PGMajorVersion=99
+	// guarantees findHostPGBin misses regardless of host PG installs.
+	res, err := postverify.Verify(context.Background(), postverify.Options{
+		Mode:           postverify.ModeAuto,
+		DataDir:        fakePGDATAConf(t, true),
+		PGMajorVersion: 99,
+	})
+	if err != nil {
+		t.Fatalf("auto mode should not error: %v", err)
+	}
+	if res.Skipped && strings.Contains(res.SkipReason, "postgresql.conf") {
+		t.Errorf("conf present but skipped for a postgresql.conf reason: %q", res.SkipReason)
+	}
+}

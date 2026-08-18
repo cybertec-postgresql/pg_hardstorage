@@ -254,6 +254,30 @@ func Verify(ctx context.Context, opts Options) (*Result, error) {
 		}
 	}
 
+	// A cluster whose source keeps postgresql.conf OUTSIDE PGDATA — the
+	// Debian/Ubuntu /etc/postgresql/<v>/main layout, or any cluster with
+	// an external config_file — restores a datadir with no postgresql.conf
+	// in it (BASE_BACKUP only carries what's under PGDATA). pg_ctl then
+	// fails with a cryptic "could not access the server configuration file"
+	// (issue #50). That's a config layout, not a broken backup: skip the
+	// datadir-only boot smoke test with an actionable reason, and give
+	// Required the same clear explanation rather than the raw pg_ctl error.
+	if _, err := os.Stat(filepath.Join(opts.DataDir, "postgresql.conf")); err != nil {
+		reason := "restored datadir has no postgresql.conf — the source cluster keeps its " +
+			"configuration outside PGDATA (e.g. Debian/Ubuntu's /etc/postgresql/<v>/main layout, " +
+			"or an external config_file). The datadir-only boot smoke test cannot run; verify by " +
+			"starting PG with your config, e.g. `pg_ctl -D " + opts.DataDir +
+			" -o \"-c config_file=/path/to/postgresql.conf -c hba_file=/path/to/pg_hba.conf\" start`"
+		switch opts.Mode {
+		case ModeRequired:
+			return res, fmt.Errorf("postverify: %s", reason)
+		default:
+			res.Skipped = true
+			res.SkipReason = reason
+			return res, nil
+		}
+	}
+
 	// Locate pg_ctl + psql on the host.  Probe multiple
 	// install paths since PGDG-RPM uses /usr/pgsql-N/bin,
 	// PGDG-APT uses /usr/lib/postgresql/N/bin, distros use
