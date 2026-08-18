@@ -628,6 +628,19 @@ func Restore(ctx context.Context, opts Options) (res *Result, err error) {
 		}
 	}
 
+	// 5b. Create the pg_tblspc/<oid> symlinks pointing at each
+	// non-default tablespace's restored location. pg_basebackup creates
+	// these; our restore must too, and BEFORE the L2 verify below —
+	// pg_verifybackup (and later PG startup) resolves a tablespace file's
+	// pg_tblspc/<oid>/... path through this link, so without it the files
+	// sit at their mapped location but pg_tblspc/ is empty and verify
+	// fails "file missing from restored datadir" (issue #50). The link
+	// targets the SAME path tablespace_map records, so it stays
+	// consistent with what PG reads at recovery.
+	if err := writeTablespaceSymlinks(opts.TargetDir, tsDests); err != nil {
+		return nil, err
+	}
+
 	// L2 — in-process pg_verifybackup.  Hash every file PG
 	// recorded in its backup_manifest and compare to the
 	// recorded checksum.  Catches missing / truncated /
@@ -1302,6 +1315,55 @@ func materializeFile(ctx context.Context, cas *repo.CAS, destRoot string, f *bac
 // Keying on "absolute Location" is the reliable discriminator (a real
 // CREATE TABLESPACE always has an absolute directory) and keeps those
 // PGDATA-root files routed to TargetDir via fileDestRoot's fallback.
+// writeTablespaceSymlinks creates one pg_tblspc/<oid> symlink per
+// non-default tablespace, each pointing at the location its files were
+// materialised into (the value tablespaceDestRoots resolved, and the
+// same path the on-disk tablespace_map records). pg_basebackup produces
+// these links; a pg_hardstorage restore must too, or a tablespace file's
+// pg_tblspc/<oid>/... path resolves nowhere — pg_verifybackup reports it
+// "missing from restored datadir" and PG cannot open the tablespace
+// (issue #50).
+//
+// Idempotent for a resumed restore: a link that already points at the
+// right place is left alone; any other pre-existing entry at that path is
+// replaced. The tablespace directory itself is ensured to exist so an
+// EMPTY tablespace (no files, no dirs) still gets a usable link.
+func writeTablespaceSymlinks(target string, tsDests map[uint32]string) error {
+	if len(tsDests) == 0 {
+		return nil
+	}
+	linkDir := filepath.Join(target, "pg_tblspc")
+	if err := os.MkdirAll(linkDir, 0o700); err != nil {
+		return output.NewError("restore.tablespace_symlink_failed",
+			fmt.Sprintf("restore: create pg_tblspc dir: %v", err)).Wrap(err)
+	}
+	for oid, dest := range tsDests {
+		// The tablespace's real directory must exist for the link to be
+		// usable even when the tablespace held nothing at backup time.
+		if err := os.MkdirAll(dest, 0o700); err != nil {
+			return output.NewError("restore.tablespace_symlink_failed",
+				fmt.Sprintf("restore: create tablespace %d directory %q: %v", oid, dest, err)).Wrap(err)
+		}
+		link := filepath.Join(linkDir, strconv.FormatUint(uint64(oid), 10))
+		if fi, err := os.Lstat(link); err == nil {
+			if fi.Mode()&os.ModeSymlink != 0 {
+				if cur, rerr := os.Readlink(link); rerr == nil && cur == dest {
+					continue // already correct — resumed restore
+				}
+			}
+			if err := os.RemoveAll(link); err != nil {
+				return output.NewError("restore.tablespace_symlink_failed",
+					fmt.Sprintf("restore: replace pg_tblspc/%d: %v", oid, err)).Wrap(err)
+			}
+		}
+		if err := os.Symlink(dest, link); err != nil {
+			return output.NewError("restore.tablespace_symlink_failed",
+				fmt.Sprintf("restore: symlink pg_tblspc/%d -> %q: %v", oid, dest, err)).Wrap(err)
+		}
+	}
+	return nil
+}
+
 func tablespaceDestRoots(m *backup.Manifest, remap TablespaceRemap) map[uint32]string {
 	out := make(map[uint32]string, len(m.Tablespaces))
 	for _, ts := range m.Tablespaces {

@@ -134,4 +134,34 @@ func TestRestore_NonDefaultTablespace_LandsAtLocation(t *testing.T) {
 	if string(tm) != "16384 "+tsLocation+"\n" {
 		t.Errorf("tablespace_map = %q, want the location we materialised into", tm)
 	}
+
+	// pg_tblspc/<oid> MUST be a symlink to the tablespace location
+	// (issue #50). pg_verifybackup runs before PG recovery and resolves
+	// pg_tblspc/16384/... through this link; without it the tablespace
+	// files sit at their location but pg_tblspc/ is empty and verify
+	// fails "file missing from restored datadir". pg_basebackup creates
+	// these links; our restore must too.
+	link := filepath.Join(target, "pg_tblspc", "16384")
+	fi, err := os.Lstat(link)
+	if err != nil {
+		t.Fatalf("pg_tblspc/16384 symlink missing (issue #50): %v", err)
+	}
+	if fi.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("pg_tblspc/16384 is not a symlink (mode %v)", fi.Mode())
+	}
+	dest, err := os.Readlink(link)
+	if err != nil {
+		t.Fatalf("readlink pg_tblspc/16384: %v", err)
+	}
+	if dest != tsLocation {
+		t.Errorf("pg_tblspc/16384 -> %q, want %q", dest, tsLocation)
+	}
+	// And it must actually resolve to the relation bytes through the link.
+	viaLink, err := os.ReadFile(filepath.Join(link, tsRelPath))
+	if err != nil {
+		t.Fatalf("tablespace relation not reachable via pg_tblspc symlink: %v", err)
+	}
+	if string(viaLink) != string(tsBody) {
+		t.Errorf("bytes via pg_tblspc symlink mismatch")
+	}
 }
