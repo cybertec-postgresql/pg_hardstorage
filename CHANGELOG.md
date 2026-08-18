@@ -11,6 +11,8 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ## [Unreleased]
 
+## [1.2.3] — 2026-08-18
+
 ### Fixed
 
 - **Restore of a backup with a non-default tablespace now creates the
