@@ -600,3 +600,45 @@ func TestLoad_SampleYAMLParses(t *testing.T) {
 		t.Error("encrypted-pgee.tde.enabled must be true in the sample (this is the TDE-source example)")
 	}
 }
+
+// TestLoad_AllowUnenforceableLeaseRoundTrip confirms that
+// allow_unenforceable_lease parses into DeploymentConfig and that the
+// zero value (omitted) defaults to false.  Catches a YAML-tag
+// regression that would silently ignore the operator's declaration
+// and leave the scheduled agent unable to acquire a lease on Ceph S3
+// or other backends without atomic conditional writes.
+func TestLoad_AllowUnenforceableLeaseRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "pg_hardstorage.yaml"), `
+schema: pg_hardstorage.config.v1
+deployments:
+  ceph-s3:
+    pg_connection: postgres://backup@db/postgres
+    repo: s3://bucket/prefix?endpoint=https://ceph.example.com
+    allow_unenforceable_lease: true
+  strict:
+    pg_connection: postgres://backup@db/postgres
+    repo: s3://bucket/strict
+    # no allow_unenforceable_lease: defaults to false
+`)
+	p := pathsForTempDir(t, dir)
+	res, err := config.Load(p)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	ceph, ok := res.Config.Deployments["ceph-s3"]
+	if !ok {
+		t.Fatal("ceph-s3 missing from deployments")
+	}
+	if !ceph.AllowUnenforceableLease {
+		t.Errorf("ceph-s3.allow_unenforceable_lease = false, want true")
+	}
+
+	strict, ok := res.Config.Deployments["strict"]
+	if !ok {
+		t.Fatal("strict missing from deployments")
+	}
+	if strict.AllowUnenforceableLease {
+		t.Errorf("strict.allow_unenforceable_lease = true; expected default false")
+	}
+}

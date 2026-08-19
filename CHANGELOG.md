@@ -11,6 +11,39 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ## [Unreleased]
 
+## [1.2.4] — 2026-08-19
+
+### Fixed
+
+- **Numeric CLI options reject non-finite (`NaN` / `Inf`) values.** Go's
+  flag parsing accepts `"NaN"`, `"Inf"`, and `"+Inf"` as valid `float64`s,
+  so a numeric option could arrive non-finite and slip past a plain
+  `x <= 0` / `x < 0` bound (every comparison with `NaN` is false, and `Inf`
+  passes a lower bound), then feed a nonsensical multiplier or price into a
+  gate. `--capacity-safety-factor`, `--safety-factor`, `--price-per-gb-month`,
+  `--threshold`, `--spike-factor`, and `--max-mbps` now reject a non-finite
+  value with a usage error. Salvaged from #30 (postgresql007).
+
+### Added
+
+- **`allow_unenforceable_lease` per-deployment config for backends without
+  atomic conditional writes.** Ceph S3 and some MinIO deployments cannot
+  perform an atomic conditional put, so the per-deployment backup lease
+  cannot be acquired and an agent's *scheduled* backups fail with
+  `backup.lease_failed`. The new `deployments.<name>.allow_unenforceable_lease`
+  flag lets the operator proceed anyway — the scheduler skips the lease,
+  mirroring the existing `backup --allow-concurrent` semantics. Safe when
+  exactly one agent runner exists (the sidecar chart enforces and documents
+  `replicas=1`); the operator takes explicit responsibility by setting it.
+  Honoured on **both** agent backup paths — the control-plane executor and
+  the in-process schedule that the sidecar chart's `pg_hardstorage agent`
+  actually runs.
+
+  🎉 **pg_hardstorage's first external contribution** — thank you
+  [@flku-snp](https://github.com/flku-snp) (#47). The in-process-schedule
+  wiring + its integration test were added as a follow-up so the option
+  behaves the same in both agent modes.
+
 ## [1.2.3] — 2026-08-18
 
 ### Fixed

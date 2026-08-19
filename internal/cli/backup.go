@@ -670,6 +670,10 @@ func backupCapacityPreflight(ctx context.Context, opts runOptions, verifier *bac
 		return err
 	}
 
+	if !finiteFloat(opts.capacitySafetyFactor) || opts.capacitySafetyFactor <= 0 {
+		return output.NewError("usage.bad_flag",
+			fmt.Sprintf("backup: --capacity-safety-factor must be a finite value > 0; got %v", opts.capacitySafetyFactor)).Wrap(output.ErrUsage)
+	}
 	res, err := capacity.Preflight(ctx, sp, capacity.PreflightOptions{
 		ProjectedBytes: projected,
 		SafetyFactor:   opts.capacitySafetyFactor,

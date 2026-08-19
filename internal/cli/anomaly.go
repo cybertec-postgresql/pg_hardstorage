@@ -104,9 +104,9 @@ func newAnomalyCheckCmd() *cobra.Command {
 
 func runAnomalyCheck(cmd *cobra.Command, deployment, repoURL string, threshold float64, window, minSamples int, all bool) error {
 	d := DispatcherFrom(cmd)
-	if threshold <= 0 {
+	if !finiteFloat(threshold) || threshold <= 0 {
 		return output.NewError("usage.bad_flag",
-			fmt.Sprintf("anomaly check: --threshold must be > 0; got %v", threshold)).Wrap(output.ErrUsage)
+			fmt.Sprintf("anomaly check: --threshold must be a finite value > 0; got %v", threshold)).Wrap(output.ErrUsage)
 	}
 	if minSamples < 2 {
 		return output.NewError("usage.bad_flag",

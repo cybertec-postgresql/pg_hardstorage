@@ -166,6 +166,7 @@ func (b *BackupExecutor) runBackup(ctx context.Context, job *ControlPlaneJob, pr
 		InactivityTimeout: inactivity,
 		OnEvent:           emit,
 		Encryption:        enc,
+		SkipLease:         dep.AllowUnenforceableLease,
 		// Actor in the audit chain: the dispatch path uses the
 		// agent-id-on-job, distinguishing scheduler-driven backups
 		// from operator-initiated ones.

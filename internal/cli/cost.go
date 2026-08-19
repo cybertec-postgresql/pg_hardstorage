@@ -75,6 +75,10 @@ type costReportOptions struct {
 
 func runCostReport(cmd *cobra.Command, opts costReportOptions) error {
 	d := DispatcherFrom(cmd)
+	if !finiteFloat(opts.price) || opts.price < 0 {
+		return output.NewError("usage.bad_flag",
+			fmt.Sprintf("cost: --price-per-gb-month must be a finite value >= 0; got %v", opts.price)).Wrap(output.ErrUsage)
+	}
 	_, sp, err := openRepo(cmd.Context(), opts.repoURL)
 	if err != nil {
 		return err

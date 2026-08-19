@@ -110,6 +110,10 @@ func runCapacityPreflight(cmd *cobra.Command, opts capacityPreflightOptions) err
 	if opts.repoURL == "" {
 		return missingFlagErr(cmd, "--repo (or a positional <url>)")
 	}
+	if !finiteFloat(opts.safetyFactor) || opts.safetyFactor <= 0 {
+		return output.NewError("usage.bad_flag",
+			fmt.Sprintf("capacity preflight: --safety-factor must be a finite value > 0; got %v", opts.safetyFactor)).Wrap(output.ErrUsage)
+	}
 	if opts.projectedBytes > 0 && opts.fromDeployment != "" {
 		return output.NewError("usage.bad_flag",
 			"capacity preflight: --projected-bytes and --from-deployment are mutually exclusive").Wrap(output.ErrUsage)
