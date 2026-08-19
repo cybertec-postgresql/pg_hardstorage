@@ -44,6 +44,7 @@ func TestMergeDeployment_CarriesEveryField(t *testing.T) {
 			PasswordFile: "/pw", Slot: "s", Slots: []PatroniSlot{{Name: "a", Role: "leader"}},
 			Interval: "10s",
 		},
+		AllowUnenforceableLease: true,
 	}
 
 	got := mergeDeployment(base, overlay)
