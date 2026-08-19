@@ -11,6 +11,17 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Numeric CLI options reject non-finite (`NaN` / `Inf`) values.** Go's
+  flag parsing accepts `"NaN"`, `"Inf"`, and `"+Inf"` as valid `float64`s,
+  so a numeric option could arrive non-finite and slip past a plain
+  `x <= 0` / `x < 0` bound (every comparison with `NaN` is false, and `Inf`
+  passes a lower bound), then feed a nonsensical multiplier or price into a
+  gate. `--capacity-safety-factor`, `--safety-factor`, `--price-per-gb-month`,
+  `--threshold`, and `--spike-factor` now reject a non-finite value with a
+  usage error. Salvaged from #30 (postgresql007).
+
 ### Added
 
 - **`allow_unenforceable_lease` per-deployment config for backends without
