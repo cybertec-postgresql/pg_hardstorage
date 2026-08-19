@@ -11,6 +11,8 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ## [Unreleased]
 
+## [1.2.4] — 2026-08-19
+
 ### Fixed
 
 - **Numeric CLI options reject non-finite (`NaN` / `Inf`) values.** Go's
