@@ -11,7 +11,82 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ## [Unreleased]
 
+## [1.2.3] — 2026-08-18
+
 ### Fixed
+
+- **Restore of a backup with a non-default tablespace now creates the
+  `pg_tblspc/<oid>` symlinks, so verify and startup succeed (#50).**
+  A restore materialised a non-default tablespace's files at their
+  (remapped) location and wrote `tablespace_map`, but never created the
+  `pg_tblspc/<oid>` symlink in the restored data directory — the code
+  assumed PostgreSQL would create those links at recovery start.
+  However, the in-process `pg_verifybackup` (and PG startup) runs
+  *before* recovery and resolves a tablespace file's `pg_tblspc/<oid>/…`
+  path through that link, so the restore failed with
+  `verifybackup_failed: file "pg_tblspc/…": file missing from restored
+  datadir` and `pg_tblspc/` was left empty. `pg_basebackup` creates these
+  symlinks itself; the restore now does too, pointing each at the same
+  location `tablespace_map` records, before the verify gate. Covered by a
+  new real-PostgreSQL integration test that creates a table in a
+  non-default tablespace, backs it up, and restores it clean.
+- **The post-restore boot smoke test skips clearly when `postgresql.conf`
+  lives outside PGDATA (#50).** On the Debian/Ubuntu
+  `/etc/postgresql/<v>/main` layout (or any cluster with an external
+  `config_file`), `BASE_BACKUP` carries no `postgresql.conf` into the data
+  directory, so the `pg_ctl start` smoke test failed with a cryptic
+  "could not access the server configuration file". That is a
+  configuration layout, not a broken backup: `postverify` now detects the
+  absent `postgresql.conf` and skips with an actionable reason
+  (`restore.postverify_skipped`) in the default mode — or fails
+  `--verify-restore=require` with the same clear explanation — instead of
+  the raw `pg_ctl` error. Normal restores keep `postgresql.conf` inside
+  PGDATA and are unaffected.
+
+## [1.2.2] — 2026-08-17
+
+### Fixed
+
+- **Storage janitors and guards no longer mishandle a deployment or
+  backup ID that contains a `.tmp.` / `.json.tmp.` substring (silent
+  data loss).** A deployment or backup ID may legitimately contain dots
+  — only path separators and control characters are barred — but
+  several storage walks matched the commit-staging-temp marker against
+  the FULL object key instead of just the filename. A committed object
+  under such a name (e.g. a backup `db1.full.tmp.abc` or a deployment
+  `db.json.tmp.x`) could be mistaken for an in-flight staging temp and
+  skipped or swept: `repo gc` could delete a live backup's manifest or
+  reap a still-referenced chunk, `wal prune` could advance its frontier
+  past a live backup and delete WAL it still needs, `repo replicate`
+  could silently omit a backup from a DR replica, the archive-frontier
+  lookups could report "nothing archived" (blinding failover-gap
+  detection), and the foreign-cluster `system_identifier` guard could
+  fail open. Every affected matcher is now scoped to the key's
+  basename, so a committed object is never mistaken for a temp
+  regardless of its deployment or backup name. Reachable only for the
+  unusual (but valid) dot-`tmp` naming; no conventional deployment was
+  affected.
+
+- **`backup` no longer silently drops a TDE declaration — the
+  `source_tde` manifest stamp works.** The runner could already record
+  source Transparent Data Encryption on the manifest and `wal push`
+  had a `--tde` flag, but the `backup` command wired up neither: it had
+  no TDE flag and never read the deployment's `tde:` block, so
+  `source_tde` was always `null` even for a declared-TDE deployment
+  (CYBERTEC PGEE, pg_tde, EDB TDE), contradicting the TDE-awareness
+  docs. `backup` now gains `--tde`, `--tde-engine`, and `--tde-key-ref`
+  and also reads `tde.enabled` from the deployment config (the flags
+  win when both are set); the declaration is stamped onto the manifest
+  as `source_tde` and surfaced in the backup result JSON and text
+  output. That stamp is what lets a later restore refuse a
+  vanilla-PostgreSQL target loudly instead of writing a data dir full
+  of ciphertext. The field is additive and omitted when TDE is not
+  declared, so nothing changes for existing non-TDE deployments. Note
+  this is posture metadata only: a backup and same-engine restore of a
+  TDE cluster already worked with no flag, because `BASE_BACKUP` and
+  replication deliver plaintext over the wire (the source engine
+  decrypts above the replication boundary) — the flag records the
+  source posture, it is not required for the backup to succeed. (#48)
 
 - **Restore refuses a non-contiguous chunk list instead of writing
   scrambled bytes.** `materializeFile`, which rebuilds every file from
@@ -25,9 +100,6 @@ keeps reading that version for at least 24 months after a successor lands.
   matches the running write position and refuses otherwise — the same
   belt-and-braces posture as the restore-side identity check. Found by
   a direct-coverage pass on a function that previously had none.
-
-
-### Fixed
 
 - **The `--to` time parser rejects malformed 12-hour clocks instead of
   silently misreading them.** A 12-hour clock has hours 1..12, but the
