@@ -117,6 +117,18 @@ The repository must already exist — create it with \fBpg_hardstorage repo init
 	abort with backup.io_starved if no progress event for this long (0 = disabled; soak drivers pin 5m)
 
 .PP
+\fB--tde\fP[=false]
+	declare the source PostgreSQL has Transparent Data Encryption enabled (CYBERTEC PGEE, pg_tde, EDB TDE). Stamps source_tde on the manifest so a later restore refuses a vanilla-PG target and skips plaintext verify. Also honoured via the deployment's \fBtde:\fR block in pg_hardstorage.yaml. Backup itself works with or without this — BASE_BACKUP delivers plaintext over the wire — the flag only records the source posture for restore-time safety.
+
+.PP
+\fB--tde-engine\fP=""
+	free-form TDE engine label stamped on the manifest (e.g. cybertec_enterprise, pg_tde, edb_tde); implies --tde
+
+.PP
+\fB--tde-key-ref\fP=""
+	opaque operator key-set reference stamped on the manifest for forensic/migration purposes; implies --tde
+
+.PP
 \fB--tenant\fP="default"
 	tenant scope for the backup
 

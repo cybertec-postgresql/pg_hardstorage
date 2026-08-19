@@ -58,6 +58,9 @@ pg_hardstorage backup <deployment> [flags]
       --pg-connection string               libpq connection string for the source PostgreSQL (required)
       --repo string                        repository URL (file://, s3://, ...) — must already exist (required)
       --stall-timeout duration             abort with backup.io_starved if no progress event for this long (0 = disabled; soak drivers pin 5m)
+      --tde tde:                           declare the source PostgreSQL has Transparent Data Encryption enabled (CYBERTEC PGEE, pg_tde, EDB TDE). Stamps source_tde on the manifest so a later restore refuses a vanilla-PG target and skips plaintext verify. Also honoured via the deployment's tde: block in pg_hardstorage.yaml. Backup itself works with or without this — BASE_BACKUP delivers plaintext over the wire — the flag only records the source posture for restore-time safety.
+      --tde-engine string                  free-form TDE engine label stamped on the manifest (e.g. cybertec_enterprise, pg_tde, edb_tde); implies --tde
+      --tde-key-ref string                 opaque operator key-set reference stamped on the manifest for forensic/migration purposes; implies --tde
       --tenant string                      tenant scope for the backup (default "default")
   -v, --verbose                            emit one line per regular file as it commits to the CAS — file path, logical size, chunk count, deduped chunks, and bytes the CAS actually had to store after dedup.  Useful for live progress on large backups; suppressed under --output json (JSON consumers see file events as backup.file_archived structured events instead).
 ```
