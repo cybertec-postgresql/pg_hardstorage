@@ -112,6 +112,10 @@ type insiderScanFlags struct {
 
 func runInsiderScan(cmd *cobra.Command, f insiderScanFlags) error {
 	d := DispatcherFrom(cmd)
+	if !finiteFloat(f.factor) || f.factor <= 0 {
+		return output.NewError("usage.bad_flag",
+			fmt.Sprintf("insider scan: --spike-factor must be a finite value > 0; got %v", f.factor)).Wrap(output.ErrUsage)
+	}
 	failOn, err := parseFailOnSeverity(f.failOn)
 	if err != nil {
 		return output.NewError("usage.bad_flag",
