@@ -22,6 +22,8 @@ func TestNumericFlags_RejectNonFinite(t *testing.T) {
 		{"cost --price-per-gb-month=NaN", []string{"cost", "report", "--repo", repoURL, "--price-per-gb-month=NaN"}},
 		{"forecast --price-per-gb-month=Inf", []string{"forecast", repoURL, "--price-per-gb-month=Inf"}},
 		{"insider --spike-factor=NaN", []string{"insider", "scan", "--repo", repoURL, "--spike-factor=NaN"}},
+		{"repo replicate --max-mbps=Inf", []string{"repo", "replicate", "--from", repoURL, "--to", "file://" + t.TempDir(), "--max-mbps=Inf"}},
+		{"repo replicate --max-mbps=NaN", []string{"repo", "replicate", "--from", repoURL, "--to", "file://" + t.TempDir(), "--max-mbps=NaN"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
