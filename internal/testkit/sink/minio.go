@@ -159,6 +159,13 @@ func (m *minioRuntime) Up(ctx context.Context) error {
 		return fmt.Errorf("minio sink: docker run %s: %w (output: %s)",
 			container, err, truncate(out, 256))
 	}
+	// docker run -d returns success when the container STARTS, not
+	// when it survives — fail fast if the entrypoint exits inside
+	// the budget instead of burning the 120s readiness budget.
+	if err := ensureContainerRunning(ctx, m.container, 15*time.Second); err != nil {
+		_ = m.Down(context.Background())
+		return err
+	}
 
 	// 120s budget (was 60s).  Docker daemon contention with 4
 	// parallel campaigns (compat + soak + scenario-sweep + k8s

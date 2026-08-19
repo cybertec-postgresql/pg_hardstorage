@@ -125,6 +125,13 @@ func (s *sshExecRuntime) Up(ctx context.Context) error {
 		s.cleanupDir()
 		return fmt.Errorf("ssh-exec sink: docker run %s: %w (%s)", name, err, truncate(out, 256))
 	}
+	// docker run -d returns success when the container STARTS, not
+	// when it survives — fail fast if the entrypoint exits inside
+	// the budget instead of burning the TCP + keyscan budgets.
+	if err := ensureContainerRunning(ctx, s.container, 15*time.Second); err != nil {
+		_ = s.Down(context.Background())
+		return err
+	}
 
 	if err := waitTCPReady(ctx, s.port, 30*time.Second); err != nil {
 		_ = s.Down(context.Background())

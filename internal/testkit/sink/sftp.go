@@ -109,6 +109,15 @@ func (s *sftpRuntime) Up(ctx context.Context) error {
 		return fmt.Errorf("sftp sink: docker run: %w (output: %s)",
 			err, truncate(out, 256))
 	}
+	// docker run -d returns success when the container STARTS, not
+	// when it survives: a fixture image that cannot execute on this
+	// host (amd64-only image on an arm64 host without binfmt/qemu)
+	// exits milliseconds after start. Fail fast with docker's verdict
+	// instead of burning the banner-wait budget on a dead port.
+	if err := ensureContainerRunning(ctx, s.container, 15*time.Second); err != nil {
+		_ = s.Down(context.Background())
+		return err
+	}
 	// SSH server opens its TCP socket as part of normal
 	// startup; once we can dial it, sshd is ready.
 	if err := waitTCPReady(ctx, s.port, 30*time.Second); err != nil {

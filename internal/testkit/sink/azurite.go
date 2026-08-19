@@ -84,6 +84,13 @@ func (a *azuriteRuntime) Up(ctx context.Context) error {
 		return fmt.Errorf("azurite sink: docker run: %w (output: %s)",
 			err, truncate(out, 256))
 	}
+	// docker run -d returns success when the container STARTS, not
+	// when it survives — fail fast if the entrypoint exits inside
+	// the budget instead of burning the TCP readiness budget.
+	if err := ensureContainerRunning(ctx, a.container, 15*time.Second); err != nil {
+		_ = a.Down(context.Background())
+		return err
+	}
 	if err := waitTCPReady(ctx, a.port, 30*time.Second); err != nil {
 		_ = a.Down(context.Background())
 		return err

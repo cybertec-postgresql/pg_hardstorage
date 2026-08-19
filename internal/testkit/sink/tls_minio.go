@@ -162,6 +162,13 @@ func (m *tlsMinioRuntime) Up(ctx context.Context) error {
 		return fmt.Errorf("tls-minio sink: docker run %s: %w (output: %s)",
 			container, err, truncate(out, 256))
 	}
+	// docker run -d returns success when the container STARTS, not
+	// when it survives — fail fast if the entrypoint exits inside
+	// the budget instead of burning the 120s TLS readiness budget.
+	if err := ensureContainerRunning(ctx, m.container, 15*time.Second); err != nil {
+		_ = m.Down(context.Background())
+		return err
+	}
 
 	// MinIO TLS readiness: poll /minio/health/ready over HTTPS
 	// with cert verification disabled (we want server-up, not
@@ -209,7 +216,7 @@ func captureDockerLogs(container string) string {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "docker", "logs", "--tail", "30", container)
+	cmd := execCommand(ctx, "docker", "logs", "--tail", "30", container)
 	out, err := cmd.CombinedOutput()
 	if err != nil || len(out) == 0 {
 		return ""

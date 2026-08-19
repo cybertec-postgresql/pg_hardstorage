@@ -8,6 +8,7 @@ package sftp_test
 
 import (
 	"context"
+	"errors"
 	"net/url"
 	"os"
 	"os/exec"
@@ -43,6 +44,16 @@ func openSFTPOnFresh(t *testing.T) storage.StoragePlugin {
 		t.Fatalf("sink.New(sftp): %v", err)
 	}
 	if err := s.Up(context.Background()); err != nil {
+		// The atmoz/sftp fixture image is amd64-only. On a host that
+		// cannot execute it (arm64 without binfmt/qemu) the container
+		// exits milliseconds after start with "exec format error" —
+		// an environment limitation, not a plugin regression. Skip,
+		// the way requireDocker skips an unreachable daemon; any other
+		// container death is still a hard failure.
+		var ce *sink.ContainerExitError
+		if errors.As(err, &ce) && ce.IsPlatformMismatch() {
+			t.Skipf("SFTP fixture image cannot execute on this platform: %v", err)
+		}
 		t.Fatalf("sink.Up: %v", err)
 	}
 	t.Cleanup(func() { _ = s.Down(context.Background()) })

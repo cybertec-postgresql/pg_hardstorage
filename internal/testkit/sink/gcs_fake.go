@@ -123,6 +123,13 @@ func (g *gcsFakeRuntime) Up(ctx context.Context) error {
 		return fmt.Errorf("gcs-fake sink: docker run: %w (output: %s)",
 			err, truncate(out, 256))
 	}
+	// docker run -d returns success when the container STARTS, not
+	// when it survives — fail fast if the entrypoint exits inside
+	// the budget instead of burning the TCP readiness budget.
+	if err := ensureContainerRunning(ctx, g.container, 15*time.Second); err != nil {
+		_ = g.Down(context.Background())
+		return err
+	}
 	if err := waitTCPReady(ctx, g.port, 30*time.Second); err != nil {
 		_ = g.Down(context.Background())
 		return err

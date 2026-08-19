@@ -46,6 +46,7 @@ import (
 	"net"
 	"os/exec"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -215,6 +216,95 @@ func waitTCPReady(ctx context.Context, port int, total time.Duration) error {
 		}
 	}
 	return fmt.Errorf("sink: %s did not become ready within %s", addr, total)
+}
+
+// ContainerExitError is returned by ensureContainerRunning when the
+// sink's container dies before it can serve readiness.
+//
+// `docker run -d` reports success when the container STARTS, not when
+// it SURVIVES. A fixture image that cannot execute on this platform
+// (an amd64-only image on an arm64 host without binfmt/qemu), a
+// broken entrypoint, or a corrupt layer exits within milliseconds of
+// start — and without this check every sink readiness wait (waitTCPReady
+// / waitSSHBanner / waitReady) burns its full 30–120s budget against a
+// port no one will ever serve. Because the storage contract suite
+// brings up a FRESH sink per subtest, one unrunnable fixture costs
+// N subtests × budget of wallclock and routinely trips go test's
+// 600s package timeout, masquerading as a hang.
+//
+// ExitCode and Log carry docker's verdict so a caller can distinguish
+// "the fixture cannot run on this platform" (tests: skip) from "the
+// fixture regressed" (tests: fail loud).
+type ContainerExitError struct {
+	Container string
+	ExitCode  int
+	Log       string
+}
+
+func (e *ContainerExitError) Error() string {
+	return fmt.Sprintf("container %s exited with code %d before readiness (log tail: %q)",
+		e.Container, e.ExitCode, e.Log)
+}
+
+// IsPlatformMismatch reports whether the exit signature is the host
+// being unable to EXECUTE the image at all — binfmt/qemu missing for a
+// foreign-architecture binary. Docker's own log line for this is
+// "exec <path>: exec format error". Callers (tests) map this to a
+// skip: the fixture is sound, the host simply cannot run it.
+func (e *ContainerExitError) IsPlatformMismatch() bool {
+	return strings.Contains(e.Log, "exec format error")
+}
+
+// ensureContainerRunning polls `docker inspect` until the container
+// reports "running" or reports a terminal state.
+//
+// budget bounds the wait for slow entrypoints (the image is already
+// pulled at this point; this covers user-creation scripts, host-key
+// generation, and SELinux label application). A container that EXITS
+// inside the window is a hard failure returned immediately as
+// *ContainerExitError — the readiness probes that follow would only
+// time out on a socket that is never going to be served.
+//
+// Transient `docker inspect` failures (daemon under load) are retried
+// until the budget elapses; the caller's context can still abort early.
+func ensureContainerRunning(ctx context.Context, container string, budget time.Duration) error {
+	deadline := time.Now().Add(budget)
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		out, err := execCommand(ctx, "docker", "inspect",
+			"--format", "{{.State.Status}}\t{{.State.ExitCode}}", container).Output()
+		if err == nil {
+			parts := strings.SplitN(strings.TrimSpace(string(out)), "\t", 2)
+			switch parts[0] {
+			case "running":
+				return nil
+			case "exited", "dead":
+				code := 0
+				if len(parts) == 2 {
+					_, _ = fmt.Sscanf(parts[1], "%d", &code)
+				}
+				return &ContainerExitError{
+					Container: container,
+					ExitCode:  code,
+					Log:       captureDockerLogs(container),
+				}
+			}
+			// "created" / "pausing" / "restarting": not terminal; keep waiting.
+		} else if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		// inspect failed transiently (daemon load): retry below.
+		if time.Now().After(deadline) {
+			return fmt.Errorf("sink: container %s still not running after %s", container, budget)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
 }
 
 // PreflightAirgap reports whether the docker image for the
