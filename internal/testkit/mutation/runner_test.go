@@ -46,13 +46,29 @@ func TestMutationsAreCaught(t *testing.T) {
 				"-count=1",
 				"-timeout=120s",
 			}
+			// Focus narrows the subprocess to the catching test(s).
+			// Without it a slow package (internal/cli: ~1200 tests,
+			// some Docker-backed) burns its whole 120s budget even
+			// after the catching test has failed, because Go keeps
+			// running the remaining tests.
+			if m.Focus != "" {
+				args = append(args, "-run", m.Focus)
+			}
 			args = append(args, m.Packages...)
 			cmd := exec.Command("go", args...)
 			var stdout, stderr bytes.Buffer
 			cmd.Stdout = &stdout
 			cmd.Stderr = &stderr
 			err := cmd.Run()
+			out := stdout.String() + stderr.String()
 			if err == nil {
+				if strings.Contains(out, "no tests to run") {
+					t.Errorf("mutation %s: Focus %q matched no tests in %v — the "+
+						"catching test was renamed or the regex is stale. "+
+						"Update the Registry entry.\n%s",
+						m.Tag, m.Focus, m.Packages, indent(out))
+					return
+				}
 				t.Errorf("MUTATION COVERAGE GAP: %s\n  description: %s\n  packages: %v\n"+
 					"  expected `go test -tags=%s` to FAIL but it passed.\n"+
 					"  Either the mutation is a no-op or the test suite doesn't catch it.\n"+
@@ -65,7 +81,6 @@ func TestMutationsAreCaught(t *testing.T) {
 			// the output looks like a real test failure (not a
 			// build error) so a regression in the mutation file
 			// itself doesn't masquerade as "caught".
-			out := stdout.String() + stderr.String()
 			if strings.Contains(out, "build failed") ||
 				strings.Contains(out, "[build failed]") ||
 				strings.Contains(out, "syntax error") {

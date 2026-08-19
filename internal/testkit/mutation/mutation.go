@@ -51,6 +51,22 @@ type Mutation struct {
 	// the harness exits as soon as it sees a non-zero exit from
 	// any of them.
 	Packages []string
+
+	// Focus is a Go test-name regex (matched with `go test -run`)
+	// naming the test(s) that catch this mutation.  Every entry
+	// MUST set it: a full-suite subprocess is the fallback the
+	// harness must not need — on a slow package (internal/cli
+	// runs ~1200 tests, some Docker-backed) the suite burns its
+	// entire 120s -timeout budget even after the catching test
+	// has already failed, because Go keeps running the remaining
+	// tests.  Ten of the thirty-three registry entries target
+	// internal/cli; at 120s each they alone would exceed the
+	// harness's outer budget by 4×.  Running only the catching
+	// test(s) is also the sharper question: "does THIS test kill
+	// THIS mutation?".  Empty Focus means "run the full suite"
+	// and is reserved for entries whose catching surface is a
+	// wide test class rather than named tests.
+	Focus string
 }
 
 // Registry is the canonical list of mutations the harness runs.
@@ -58,7 +74,8 @@ type Mutation struct {
 // in the named package — see the package doc.
 var Registry = []Mutation{
 	{
-		Tag: "mutation_materialize_offset_unchecked",
+		Tag:   "mutation_materialize_offset_unchecked",
+		Focus: "^TestMaterializeFile_ReorderedChunksDetected$",
 		Description: "materializeFile writes restored chunks in slice " +
 			"order without confirming each chunk's Offset matches the " +
 			"running write position (pre-fix): a reordered or gapped " +
@@ -73,7 +90,8 @@ var Registry = []Mutation{
 		},
 	},
 	{
-		Tag: "mutation_partial_offset_unchecked",
+		Tag:   "mutation_partial_offset_unchecked",
+		Focus: "^TestMaterialiseOneFile_RejectsReorderedChunks$",
 		Description: "materialiseOneFile (partial table extraction) writes " +
 			"chunks in slice order without confirming each chunk's Offset " +
 			"matches the running write position (pre-fix): a reordered chunk " +
@@ -86,7 +104,8 @@ var Registry = []Mutation{
 		},
 	},
 	{
-		Tag: "mutation_gap_slot_key_dropped",
+		Tag:   "mutation_gap_slot_key_dropped",
+		Focus: "^TestPut_TwoSlotsSameTimelineSameInstantBothSurvive$",
 		Description: "the gap-record storage key omits its per-slot token " +
 			"(pre-fix): a single Patroni failover reconciles every " +
 			"configured slot in the same instant, so two slots that gap on " +
@@ -100,7 +119,8 @@ var Registry = []Mutation{
 		},
 	},
 	{
-		Tag: "mutation_gap_purge_grace_dropped",
+		Tag:   "mutation_gap_purge_grace_dropped",
+		Focus: "^TestWalGapPurge_Orphans_KeepsGapForWithinGraceTombstone$",
 		Description: "`wal gap-purge --orphans` treats every tombstoned " +
 			"timeline as dead, ignoring the GC grace (pre-fix): a " +
 			"within-grace tombstoned backup — still restorable via `backup " +
@@ -115,7 +135,8 @@ var Registry = []Mutation{
 		},
 	},
 	{
-		Tag: "mutation_agent_rotation_abort_on_livedesc",
+		Tag:   "mutation_agent_rotation_abort_on_livedesc",
+		Focus: "^TestAgentRotate_HoldOnIncrementalDoesNotWedgeScheduledRetention$",
 		Description: "the agent's scheduled rotation skips ONLY a held " +
 			"manifest, treating a parent kept alive by its held child " +
 			"(ErrChainHasLiveDescendants) as run-fatal (pre-fix): one hold " +
@@ -130,7 +151,8 @@ var Registry = []Mutation{
 		},
 	},
 	{
-		Tag: "mutation_dek_retention_dropped",
+		Tag:   "mutation_dek_retention_dropped",
+		Focus: "^TestResolveOrMint_WORMLocksAndExtendsSharedDEK$",
 		Description: "the shared DEK — the single object that decrypts EVERY " +
 			"encrypted chunk in the repo — is written without a WORM " +
 			"RetainUntil (pre-fix): on a compliance repo the chunks, " +
@@ -144,7 +166,8 @@ var Registry = []Mutation{
 		},
 	},
 	{
-		Tag: "mutation_twelvehour_unchecked",
+		Tag:   "mutation_twelvehour_unchecked",
+		Focus: "^TestParse_MalformedTwelveHourClockRejected$",
 		Description: "the natural-time PITR parser accepts malformed " +
 			"12-hour clocks (pre-fix): '13am' resolves to 13:00 (1pm), " +
 			"'0am'/'0pm' to midnight/noon, so an operator meaning 1am who " +
@@ -157,7 +180,8 @@ var Registry = []Mutation{
 		},
 	},
 	{
-		Tag: "mutation_wal_removed_retried",
+		Tag:   "mutation_wal_removed_retried",
+		Focus: "^TestDecideStreamStop_WalRemovedIsEvidenceBasedTerminal$",
 		Description: "the stream never recognises PostgreSQL's 'requested " +
 			"WAL segment has already been removed' verdict (the " +
 			"evidence-based replacement for the retired predictive " +
@@ -170,7 +194,8 @@ var Registry = []Mutation{
 		},
 	},
 	{
-		Tag: "mutation_fetch_sysid_unchecked",
+		Tag:   "mutation_fetch_sysid_unchecked",
+		Focus: "^TestCheckFetchSystemIdentifier_MismatchRefuses$",
 		Description: "wal fetch hands foreign WAL to recovery without an " +
 			"identity check (pre-#26): an archive mixing cluster lineages " +
 			"(reused deployment name after a wipe, a pre-guard mix, " +
@@ -186,7 +211,8 @@ var Registry = []Mutation{
 		},
 	},
 	{
-		Tag: "mutation_sftp_no_reconnect",
+		Tag:   "mutation_sftp_no_reconnect",
+		Focus: "^TestReconnect_AfterTeardown_OpsRecover$",
 		Description: "the SFTP plugin never reconnects after a keepalive " +
 			"teardown (pre-fix bug #25): the keepalive rightly turns a dead " +
 			"peer into an error instead of a hang, but the HANDLE stayed " +
@@ -201,7 +227,8 @@ var Registry = []Mutation{
 		},
 	},
 	{
-		Tag: "mutation_sftp_no_keepalive",
+		Tag:   "mutation_sftp_no_keepalive",
+		Focus: "^TestKeepalive_DeadConnectionErrorsInsteadOfHanging$",
 		Description: "the SFTP plugin has no connection keepalive " +
 			"(pre-fix bug #23, caught live by the storage fault soak: a " +
 			"worker sat 14 minutes inside pkg/sftp sendPacket): " +
@@ -219,7 +246,8 @@ var Registry = []Mutation{
 		},
 	},
 	{
-		Tag: "mutation_history_preflight_absent",
+		Tag:   "mutation_history_preflight_absent",
+		Focus: "^TestPreflightTimelineHistory_(MissingHistory_Refuses|IntermediateHoleRefuses|PinnedTimeline)$",
 		Description: "restore has no timeline-history reachability " +
 			"preflight (pre-fix bug #22): PostgreSQL probes <N>.history " +
 			"ascending and stops at the FIRST miss, so one unarchived or " +
@@ -234,7 +262,8 @@ var Registry = []Mutation{
 		},
 	},
 	{
-		Tag: "mutation_restore_cmd_lenient_tail",
+		Tag:   "mutation_restore_cmd_lenient_tail",
+		Focus: "^TestBuild_(ExitCodeMappingThroughRealShell|ContainsExitCodeMapping)$",
 		Description: "the one-shot restore_command tail passes " +
 			"infrastructure-fault exit codes through instead of dying by " +
 			"signal (pre-fix bug #21): PostgreSQL treats EVERY plain " +
@@ -252,7 +281,8 @@ var Registry = []Mutation{
 		},
 	},
 	{
-		Tag: "mutation_prestream_gap_ignores_frontier",
+		Tag:   "mutation_prestream_gap_ignores_frontier",
+		Focus: "^TestRecordPreStreamGap_Frontier(BoundsTheWindow|OnPriorTimeline|CoversStart_NoRecord)$",
 		Description: "the fresh-slot gap recorder never consults the " +
 			"archive frontier (pre-fix bug #20): after a Patroni failover " +
 			"destroys the slot, the reconnect records [oldest-backup.stop, " +
@@ -268,7 +298,8 @@ var Registry = []Mutation{
 		},
 	},
 	{
-		Tag: "mutation_undelete_wal_unchecked",
+		Tag:   "mutation_undelete_wal_unchecked",
+		Focus: "^(TestRecordResurrectedWALGap_PrunedWindow_(Records|Idempotent)|TestBackupUndelete_RecordsPrunedWALGap)$",
 		Description: "backup undelete verifies chunks but never the WAL " +
 			"(pre-fix bug #19): a tombstoned backup does not hold the " +
 			"prune frontier, so `wal prune` legitimately deletes the " +
@@ -284,7 +315,8 @@ var Registry = []Mutation{
 		},
 	},
 	{
-		Tag: "mutation_timetarget_blanket_refusal",
+		Tag:   "mutation_timetarget_blanket_refusal",
+		Focus: "^(TestPreflightTimeTargetGap_(GapBelowSeedStop|ManifestGapBelowStop)_Allowed|TestEmitTimeTargetGapWarning_BoundedBySeedStop)$",
 		Description: "the time/name-target gap preflight refuses on ANY " +
 			"recorded gap, ignoring whether the seed backup's replay can " +
 			"reach it (pre-fix bug #18): gapstate records are eternal, so " +
@@ -300,7 +332,8 @@ var Registry = []Mutation{
 		},
 	},
 	{
-		Tag: "mutation_stream_first_record_unchecked",
+		Tag:   "mutation_stream_first_record_unchecked",
+		Focus: "^TestSink_OpeningRecordPastTheResumePoint_Refused$",
 		Description: "walsink accepts a reconnect's OPENING record at any " +
 			"LSN (pre-20afaf5): a stream that resumed past a hole looks " +
 			"contiguous forever after, and PG recycles the missing WAL. " +
@@ -310,7 +343,8 @@ var Registry = []Mutation{
 		},
 	},
 	{
-		Tag: "mutation_adoption_unrecorded",
+		Tag:   "mutation_adoption_unrecorded",
+		Focus: "^(TestVerifyAdoptedChunks_SweptAdoptionRefusesCommit|TestSink_AdoptedChunkSweptMidStream_RefusesCommit)$",
 		Description: "the CAS forgets which chunks it ADOPTED rather than " +
 			"wrote (pre-c31688b), so the commit-time dedup-vs-GC gates " +
 			"have nothing to re-Stat: a backup or WAL segment commits a " +
@@ -324,7 +358,8 @@ var Registry = []Mutation{
 		},
 	},
 	{
-		Tag: "mutation_standby_source_unguarded",
+		Tag:   "mutation_standby_source_unguarded",
+		Focus: "^TestGuardSourceIsPrimary_UnreachableFailsOpenButWarns$",
 		Description: "wal stream never asks pg_is_in_recovery (pre-6fc79f8): " +
 			"after a failover a single-host DSN reconnects to the DEMOTED " +
 			"node and silently archives second-hand WAL from a replica — " +
@@ -337,7 +372,8 @@ var Registry = []Mutation{
 		},
 	},
 	{
-		Tag: "mutation_undelete_argv_order",
+		Tag:   "mutation_undelete_argv_order",
+		Focus: "^TestCascadeUnwind_RoundTripRestoresTheChain$",
 		Description: "batch undelete processes IDs in argv order " +
 			"(pre-3af06d4): cascade_deleted is LEAF-first and the store " +
 			"refuses an incremental under a tombstoned ancestor, so the " +
@@ -349,7 +385,8 @@ var Registry = []Mutation{
 		},
 	},
 	{
-		Tag: "mutation_undelete_no_postflip_check",
+		Tag:   "mutation_undelete_no_postflip_check",
+		Focus: "^TestUndelete_SweptDuringUndelete_RetombstonesAndRefuses$",
 		Description: "undelete skips the chunk re-verification at the " +
 			"VISIBILITY point (pre-983dc4e): the pre-flight ran while the " +
 			"manifest was hidden and gc's sweep uses an older snapshot, so " +
@@ -362,7 +399,8 @@ var Registry = []Mutation{
 		},
 	},
 	{
-		Tag: "mutation_gap_timeline_skip",
+		Tag:   "mutation_gap_timeline_skip",
+		Focus: "^(TestFindGaps_AcrossATimelineChange|TestWalAudit_HoleStraddlingAPromotionIsDetected)$",
 		Description: "cli.findGaps regains the pre-59816d8 `continue` on a " +
 			"timeline change, making `wal audit` — and the chaos soak's " +
 			"gap-free gate, which runs it — structurally blind to a WAL " +
@@ -377,7 +415,8 @@ var Registry = []Mutation{
 		},
 	},
 	{
-		Tag: "mutation_frontier_no_prior_timeline",
+		Tag:   "mutation_frontier_no_prior_timeline",
+		Focus: "^(TestResolveStartLSN_AfterPromotion|TestArchiveFrontierForLeader_)",
 		Description: "inventory.HighestArchivedLSNBefore never finds a " +
 			"prior timeline — the pre-c2c9aa4 world where nothing looked " +
 			"below the current one. A post-promotion `wal stream` resume " +
@@ -393,7 +432,8 @@ var Registry = []Mutation{
 		},
 	},
 	{
-		Tag: "mutation_exit_route_undocumented",
+		Tag:   "mutation_exit_route_undocumented",
+		Focus: "^TestExitCodes_NoUndocumentedRoutes$",
 		Description: "output.codePrefixToExit gains a namespace route " +
 			"(quarantine.*) and a leaf route (storage.no_space) that " +
 			"docs/reference/exit-codes.md does not list. " +
@@ -407,7 +447,8 @@ var Registry = []Mutation{
 		},
 	},
 	{
-		Tag: "mutation_chunkkey_no_suffix",
+		Tag:   "mutation_chunkkey_no_suffix",
+		Focus: "^(TestChunkKey_Format|TestParseChunkKey_(RoundTrip|RejectsBogus))$",
 		Description: "repo.ChunkKey drops the .chk suffix; round-trip + " +
 			"ParseChunkKey tests must catch it.",
 		Packages: []string{
@@ -415,7 +456,8 @@ var Registry = []Mutation{
 		},
 	},
 	{
-		Tag: "mutation_audit_hash_zeroed",
+		Tag:   "mutation_audit_hash_zeroed",
+		Focus: "^(TestAudit_VerifyChain_HappyPath|TestAudit_Append_FirstEventLinksToGenesis)$",
 		Description: "audit.ComputeHash returns a constant zero hash; " +
 			"chain-walking + Append-genesis tests must catch it.",
 		Packages: []string{
@@ -423,7 +465,8 @@ var Registry = []Mutation{
 		},
 	},
 	{
-		Tag: "mutation_threshold_off_by_one",
+		Tag:   "mutation_threshold_off_by_one",
+		Focus: "^TestVerifyAttestation_QuorumMet$",
 		Description: "threshold.quorumMet uses > instead of >=; " +
 			"members==threshold no longer passes; QuorumMet test must catch it.",
 		Packages: []string{
@@ -431,7 +474,8 @@ var Registry = []Mutation{
 		},
 	},
 	{
-		Tag: "mutation_lsn_shape_loose",
+		Tag:   "mutation_lsn_shape_loose",
+		Focus: "^(TestProperty_LooksLikeLSN_RejectsMultipleSlashes|TestLooksLikeLSN_HandRolledInvalids)$",
 		Description: "restore.LooksLikeLSN drops the 'exactly one slash' " +
 			"check, re-introducing the silent multi-slash regression " +
 			"(0//0 sneaks through).  Property tests in " +
@@ -441,7 +485,8 @@ var Registry = []Mutation{
 		},
 	},
 	{
-		Tag: "mutation_target_reachable_off_by_one",
+		Tag:   "mutation_target_reachable_off_by_one",
+		Focus: "^TestCheckTargetReachable_LSN_EqualsStop_(Exclusive_Refuses|Inclusive)$",
 		Description: "restore.targetReachable drops the exclusive-stop " +
 			"strictness and uses >= for both modes, re-introducing the " +
 			"issue-#99 bug where `--to-lsn <stop> --to-exclusive` is " +
@@ -453,7 +498,8 @@ var Registry = []Mutation{
 		},
 	},
 	{
-		Tag: "mutation_identifier_no_length_cap",
+		Tag:   "mutation_identifier_no_length_cap",
+		Focus: "^TestProperty_ValidIdentifier_RejectsOutOfRangeLengths$",
 		Description: "pg.ValidIdentifier drops the 1..63 byte length cap, " +
 			"accepting arbitrarily-long (and empty) identifiers.  Property " +
 			"tests in identifier_property_test.go must catch it.",
@@ -462,7 +508,8 @@ var Registry = []Mutation{
 		},
 	},
 	{
-		Tag: "mutation_stale_temp_fullkey",
+		Tag:   "mutation_stale_temp_fullkey",
+		Focus: "^(TestFindStaleTemp_NeverFlagsLiveManifest|TestCollectReferences_HarvestsSegmentUnderDottedDeployment)$",
 		Description: "isStaleTempKey matches the `.json.tmp.` / `.history.tmp.` " +
 			"staging marker anywhere in the FULL key instead of the basename " +
 			"(pre-fix). Three sites route through it: FindStaleTempManifests " +
@@ -479,7 +526,8 @@ var Registry = []Mutation{
 		},
 	},
 	{
-		Tag: "mutation_inventory_temp_fullkey",
+		Tag:   "mutation_inventory_temp_fullkey",
+		Focus: "^TestFrontier_UnderDottedDeployment$",
 		Description: "the WAL-inventory frontier walks (HighestArchivedLSN, " +
 			"FirstWALHoleInRange, NextArchivedLSNAtOrAfter) skip staging temps " +
 			"via a FULL-key `.json.tmp.` match instead of the basename " +
@@ -494,7 +542,8 @@ var Registry = []Mutation{
 		},
 	},
 	{
-		Tag: "mutation_replicate_temp_fullkey",
+		Tag:   "mutation_replicate_temp_fullkey",
+		Focus: "^(TestReplicate_CopiesBackupWithTmpInID|TestIsWALSegmentManifestKey_DottedDeployment)$",
 		Description: "Replicate and the replica-verify segment walk skip " +
 			"staging temps via a FULL-key `.tmp.` match instead of the " +
 			"basename (pre-fix): a committed backup whose ID contains `.tmp.` " +

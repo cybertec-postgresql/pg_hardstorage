@@ -360,12 +360,22 @@ test-patroni: | $(HS_TMPDIR)
 	go test -tags='integration patroni' -count=1 -timeout=$(PATRONI_TIMEOUT) ./internal/testkit/topology/...
 
 # Mutation harness. Loops over internal/testkit/mutation/Registry and
-# runs `go test -tags=<mutation-tag>` against each affected package,
-# asserting the suite catches the deliberate regression. A failure
-# here is a coverage gap (an existing mutation no longer breaks any
-# test). Adds ~30s wallclock; not part of the default `test` target.
+# runs `go test -tags=<mutation-tag> -run <Focus>` against each
+# affected package, asserting the catching test(s) catch the
+# deliberate regression. A failure here is a coverage gap (an
+# existing mutation no longer breaks any test).
+#
+# Wallclock: one subprocess per registry entry (33), each bounded by
+# its own 120s -timeout but normally seconds-to-minutes — Focus
+# narrows the run to the catching test, so a slow package (internal/cli
+# ~1200 tests) no longer burns the full 120s after the mutation is
+# already caught. Budget below is 33 × the realistic per-entry cost
+# with margin for cold build caches; it was 300s back when the
+# registry had three fast entries and the harness ran FULL suites,
+# which the current registry makes impossible (ten entries target
+# internal/cli alone). Not part of the default `test` target.
 test-mutations: | $(HS_TMPDIR)
-	go test -tags=mutation_runner -count=1 -timeout=300s ./internal/testkit/mutation/...
+	go test -tags=mutation_runner -count=1 -timeout=30m ./internal/testkit/mutation/...
 
 # WAL-stream scenario suite. Continuous WAL streaming is the
 # headline feature of pg_hardstorage; this target gates every
