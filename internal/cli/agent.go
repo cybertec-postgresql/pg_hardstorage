@@ -575,6 +575,15 @@ func buildBackupTask(name string, dep config.DeploymentConfig, kmsCfg config.KMS
 				Signer:       signer,
 				Verifier:     verifier,
 				Encryption:   enc,
+				// Honour allow_unenforceable_lease on the in-process
+				// schedule too, not just the control-plane executor
+				// (internal/agent/executor.go). The sidecar chart runs
+				// `pg_hardstorage agent`, so a chart-deployed agent's
+				// scheduled backups flow through THIS path — on a backend
+				// without atomic conditional writes (Ceph S3, some MinIO)
+				// they would otherwise fail with backup.lease_failed even
+				// with the config set. Introduced with #47.
+				SkipLease: dep.AllowUnenforceableLease,
 			})
 			return err
 		},
