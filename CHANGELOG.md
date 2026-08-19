@@ -19,8 +19,8 @@ keeps reading that version for at least 24 months after a successor lands.
   `x <= 0` / `x < 0` bound (every comparison with `NaN` is false, and `Inf`
   passes a lower bound), then feed a nonsensical multiplier or price into a
   gate. `--capacity-safety-factor`, `--safety-factor`, `--price-per-gb-month`,
-  `--threshold`, and `--spike-factor` now reject a non-finite value with a
-  usage error. Salvaged from #30 (postgresql007).
+  `--threshold`, `--spike-factor`, and `--max-mbps` now reject a non-finite
+  value with a usage error. Salvaged from #30 (postgresql007).
 
 ### Added
 
