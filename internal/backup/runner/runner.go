@@ -22,6 +22,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/audit"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup"
@@ -1260,28 +1261,61 @@ func summarize(opts TakeOptions, m *backup.Manifest, _ *tarsink.Sink, identity p
 // Empty result + nil error means "no gaps" — return nil so
 // the manifest's omitempty keeps the JSON shape compact.
 
+// statVerifyConcurrency caps the parallel Stat fan-out in
+// verifyAdoptedChunks. An incremental backup that dedupes heavily
+// can carry hundreds of thousands of adopted hashes; at one
+// round-trip per Stat, serial verification takes hours on object
+// storage. 32 in flight keeps the gate proportional to typical
+// backend concurrency tolerance, mirroring the tarsink chunk pool's
+// bounded fan-out (perf audit #4).
+const statVerifyConcurrency = 32
+
 // verifyAdoptedChunks re-Stats every chunk the CAS deduplicated
 // against (rather than wrote) and fails if any is gone — the
 // commit-time gate for the dedup-vs-GC race. See the call site in
 // Backup for the full rationale. Split out so the gate is testable
 // without a running PostgreSQL: the race it closes is between storage
 // operations, not database ones.
+
 func verifyAdoptedChunks(ctx context.Context, sp storage.StoragePlugin, cas *repo.CAS) error {
 	adopted := cas.AdoptedHashes()
-	var missing []string
+	if len(adopted) == 0 {
+		return nil
+	}
+	var (
+		mu      sync.Mutex
+		missing []string
+	)
+	// The Stats fan out: the gate reads nothing this run wrote, so
+	// the only shared state is the missing-list append. The bounded
+	// errgroup keeps in-flight work at O(statVerifyConcurrency). A
+	// worker fails the group ONLY on ctx cancellation — a Stat error
+	// is never a group error:
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(statVerifyConcurrency)
 	for _, h := range adopted {
-		if _, err := sp.Stat(ctx, repo.ChunkKey(h)); err != nil {
-			if errors.Is(err, storage.ErrNotFound) {
-				missing = append(missing, h.String())
-				continue
+		g.Go(func() error {
+			if err := ctx.Err(); err != nil {
+				return err
 			}
-			// A transient Stat error is not evidence of loss; failing
-			// the whole backup on it would trade a possible gap for a
-			// certain one. The chunk was present at adopt time, so
-			// proceed — the post-commit verify and scrub remain the
-			// wider nets.
-			continue
-		}
+			if _, err := sp.Stat(gctx, repo.ChunkKey(h)); err != nil {
+				if errors.Is(err, storage.ErrNotFound) {
+					mu.Lock()
+					missing = append(missing, h.String())
+					mu.Unlock()
+					return nil
+				}
+				// A transient Stat error is not evidence of loss; failing
+				// the whole backup on it would trade a possible gap for a
+				// certain one. The chunk was present at adopt time, so
+				// proceed — the post-commit verify and scrub remain the
+				// wider nets.
+			}
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return err
 	}
 	if len(missing) > 0 {
 		if len(missing) > 8 {

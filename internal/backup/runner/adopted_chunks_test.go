@@ -22,8 +22,11 @@ package runner
 import (
 	"bytes"
 	"context"
+	"errors"
+	"fmt"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
@@ -185,5 +188,95 @@ func TestAdoptedHashes_MemoryHitsDoNotDuplicate(t *testing.T) {
 	}
 	if got := len(cas.AdoptedHashes()); got != 1 {
 		t.Errorf("AdoptedHashes has %d entries for one adopted chunk put 5 times, want 1", got)
+	}
+}
+
+// fanOutStorage wraps a StoragePlugin and tallies concurrent Stat
+// calls, so a test can PROVE the commit gate verifies adopted chunks
+// in parallel rather than serially.
+type fanOutStorage struct {
+	storage.StoragePlugin
+	inflight atomic.Int64
+	max      atomic.Int64
+}
+
+func (f *fanOutStorage) Stat(ctx context.Context, key string) (storage.ObjectInfo, error) {
+	if cur := f.inflight.Add(1); cur > f.max.Load() {
+		f.max.Store(cur)
+	}
+	defer f.inflight.Add(-1)
+	return f.StoragePlugin.Stat(ctx, key)
+}
+
+// TestVerifyAdoptedChunks_StatsFanOut pins perf audit #4: the gate
+// must not Stat adopted chunks one round-trip at a time — a
+// heavily-deduped incremental carries hundreds of thousands of them,
+// which is hours of serial Stats on object storage. With 128 adopted
+// chunks the parallel gate observes >1 in flight and stays under the
+// pool bound; the serial version observes exactly 1.
+func TestVerifyAdoptedChunks_StatsFanOut(t *testing.T) {
+	sp := &fanOutStorage{StoragePlugin: adoptTestRepo(t)}
+	ctx := context.Background()
+
+	const n = 128
+	hints := make(map[repo.Hash]struct{}, n)
+	bodies := make([][]byte, n)
+	for i := range bodies {
+		bodies[i] = []byte(fmt.Sprintf("fan-out chunk body %03d", i))
+		hints[repo.HashOf(bodies[i])] = struct{}{}
+	}
+	// Seed the objects (an anonymous CAS does the writing).
+	for _, b := range bodies {
+		if _, err := casdefault.New(sp).PutChunk(ctx, b); err != nil {
+			t.Fatalf("seed PutChunk: %v", err)
+		}
+	}
+
+	// The gate's CAS adopts every seeded chunk without writing it.
+	cas := casdefault.New(sp, casdefault.WithDedupHints(hints))
+	for _, b := range bodies {
+		info, err := cas.PutChunk(ctx, b)
+		if err != nil {
+			t.Fatalf("adopting PutChunk: %v", err)
+		}
+		if !info.Deduped {
+			t.Fatal("fixture broken: chunk was not adopted — the test would measure nothing")
+		}
+	}
+	if got := len(cas.AdoptedHashes()); got != n {
+		t.Fatalf("AdoptedHashes = %d, want %d — fixture did not adopt", got, n)
+	}
+
+	if err := verifyAdoptedChunks(ctx, sp, cas); err != nil {
+		t.Fatalf("gate refused a healthy backup: %v", err)
+	}
+	if got := sp.max.Load(); got < 2 {
+		t.Errorf("max in-flight Stats = %d, want >1: the gate verified %d chunks serially", got, n)
+	}
+	if got := sp.max.Load(); got > statVerifyConcurrency {
+		t.Errorf("max in-flight Stats = %d, want <= %d: the fan-out is not bounded", got, statVerifyConcurrency)
+	}
+}
+
+// TestVerifyAdoptedChunks_CancelledContextStops: a cancelled commit
+// context must stop the gate promptly with the context error, not
+// finish the whole fan-out on a dead context.
+func TestVerifyAdoptedChunks_CancelledContextStops(t *testing.T) {
+	sp := &fanOutStorage{StoragePlugin: adoptTestRepo(t)}
+	body := []byte("cancel-me")
+	h := repo.HashOf(body)
+	if _, err := casdefault.New(sp).PutChunk(context.Background(), body); err != nil {
+		t.Fatal(err)
+	}
+	cas := casdefault.New(sp, casdefault.WithDedupHints(map[repo.Hash]struct{}{h: {}}))
+	if _, err := cas.PutChunk(context.Background(), body); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := verifyAdoptedChunks(ctx, sp, cas)
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("gate on a cancelled context = %v, want context.Canceled", err)
 	}
 }
