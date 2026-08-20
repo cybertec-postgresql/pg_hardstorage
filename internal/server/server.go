@@ -70,7 +70,8 @@ type Config struct {
 
 	// Auth configures bearer-token authentication. v0.1 reads a
 	// single token from TokenFile; OIDC + multi-token RBAC land in
-	//.
+	// v0.2. TokenFile empty + no tls.client_ca_file is only legal on
+	// loopback listeners — NewWithJobs enforces that (SEC-1).
 	Auth AuthConfig `yaml:"auth,omitempty"`
 
 	// Repos are the repositories the server reports on. The
@@ -197,6 +198,17 @@ func NewWithJobs(cfg Config, jobs *JobRegistry) (*Server, error) {
 		if err := assertTokenFileMode(cfg.Auth.TokenFile); err != nil {
 			return nil, fmt.Errorf("server: token file: %w", err)
 		}
+	}
+	// SEC-1: a control plane reachable from beyond loopback must
+	// authenticate its clients. requireAuth skips token checking when
+	// no token is configured (documented for behind-mTLS deployments),
+	// so without this gate a non-loopback listener with plain TLS and
+	// no client-cert verification exposes the full job-queue + restore
+	// API — including arbitrary target_dir materialization on every
+	// agent — to anyone who can reach the port.
+	if !isLoopback(cfg.Listen) && s.token == "" && cfg.TLS.ClientCAFile == "" {
+		return nil, errors.New("server: non-loopback control plane requires authentication: " +
+			"set auth.token_file (bearer token) or tls.client_ca_file (mTLS client verification)")
 	}
 	s.srv = &http.Server{
 		Addr:              cfg.Listen,

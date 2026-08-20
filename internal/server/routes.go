@@ -208,6 +208,9 @@ func (s *Server) routes() http.Handler {
 // requireAuth wraps a handler with bearer-token verification. Skips
 // auth when the server has no token configured (intended for
 // behind-mTLS deployments where the client cert IS the auth).
+// NewWithJobs refuses to construct a non-loopback server without a
+// token or mTLS client verification, so this skip can only ever
+// apply to loopback or client-cert-authenticated listeners.
 func (s *Server) requireAuth(h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if s.token == "" {
