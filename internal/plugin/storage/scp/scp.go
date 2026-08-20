@@ -247,16 +247,28 @@ func (p *Plugin) resolve(key string) (string, error) {
 // resolvePrefix maps a repo-relative prefix to an absolute remote
 // path. Unlike resolve it accepts the empty prefix, which maps to the
 // repo root — List(ctx, "") must enumerate the whole repository
-// (repo.Wipe relies on it). The ".."/absolute refusals still apply so
-// a listing can never escape the root.
+// (repo.Wipe relies on it).
+//
+// Containment: path.Join cleans, so any ".." segments resolve against
+// the literal join before we compare. A hostile prefix such as
+// "../etc/passwd" canonicalises outside the root and is refused by the
+// sub-prefix check below; a legitimate key that merely CONTAINS ".."
+// as a substring (e.g. "manifests/db..prod/x" — validateStorageID
+// permits dots in deployment/backup IDs) stays under the root and is
+// allowed. Absolute prefixes are still refused up front. This mirrors
+// restore.safeJoinTarget's join-then-containment posture (F-0002).
 func (p *Plugin) resolvePrefix(prefix string) (string, error) {
-	if strings.Contains(prefix, "..") {
-		return "", fmt.Errorf("scp: key %q contains '..' (refused)", prefix)
-	}
 	if path.IsAbs(prefix) {
 		return "", fmt.Errorf("scp: absolute key %q (refused)", prefix)
 	}
-	return path.Join(p.root, prefix), nil
+	full := path.Join(p.root, prefix)
+	// p.root is path.Clean-ed at Open and has no trailing slash, and
+	// Join cleans its result. full therefore escapes the root iff it
+	// is neither the root itself nor a path strictly beneath it.
+	if full != p.root && !strings.HasPrefix(full, p.root+"/") {
+		return "", fmt.Errorf("scp: key %q escapes repo root %q (refused)", prefix, p.root)
+	}
+	return full, nil
 }
 
 // Put writes r to key.  Atomicity model mirrors the sftp plugin:
