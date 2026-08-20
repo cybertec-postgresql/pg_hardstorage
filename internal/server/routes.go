@@ -409,6 +409,18 @@ func (s *Server) handleDeploymentsSubtree(w http.ResponseWriter, r *http.Request
 		return
 	}
 	name, verb := parts[0], parts[1]
+	// Boundary validation (F-0004): the manifest-store chokepoint
+	// (validateStorageID) already blocks a hostile deployment name at
+	// read time, but the API surface must reject it up front with a
+	// clean 4xx — the store chokepoint alone answers a traversal name
+	// with a silent 200 + empty list, and enqueued jobs only fail deep
+	// inside the agent. Same rule the backup-runner create path uses,
+	// so every name this accepts is one the runner can also store.
+	if err := backup.ValidateDeployment(name); err != nil {
+		s.writeError(w, http.StatusBadRequest, "usage.bad_deployment",
+			"deployments: "+err.Error())
+		return
+	}
 	switch verb {
 	case "backups":
 		switch r.Method {
@@ -611,6 +623,16 @@ func (s *Server) handleEnqueueVerify(w http.ResponseWriter, r *http.Request, dep
 			"deployments/<n>/verifies: backup_id is required (or \"latest\")")
 		return
 	}
+	// Boundary validation (F-0004): "latest" is a sentinel the agent
+	// resolves at claim time; anything else must be a storage-safe
+	// backup ID or it only fails deep inside the executor.
+	if backupID != "latest" {
+		if err := backup.ValidateBackupID(backupID); err != nil {
+			s.writeError(w, http.StatusBadRequest, "usage.bad_backup_id",
+				"deployments/<n>/verifies: "+err.Error())
+			return
+		}
+	}
 	repoURL := ""
 	if v, ok := args["repo"].(string); ok {
 		repoURL = v
@@ -671,6 +693,16 @@ func (s *Server) handleEnqueueRestore(w http.ResponseWriter, r *http.Request, de
 		s.writeError(w, http.StatusBadRequest, "usage.missing_field",
 			"deployments/<n>/restores: backup_id is required (or \"latest\")")
 		return
+	}
+	// Boundary validation (F-0004): "latest" is a sentinel the agent
+	// resolves at claim time; anything else must be a storage-safe
+	// backup ID or it only fails deep inside the executor.
+	if backupID != "latest" {
+		if err := backup.ValidateBackupID(backupID); err != nil {
+			s.writeError(w, http.StatusBadRequest, "usage.bad_backup_id",
+				"deployments/<n>/restores: "+err.Error())
+			return
+		}
 	}
 	targetDir, _ := args["target_dir"].(string)
 	if err := validateRestoreTargetDir(targetDir, s.cfg.RestoreRoots); err != nil {
