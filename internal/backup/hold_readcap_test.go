@@ -40,7 +40,7 @@ func (neverEndingReader) Read(p []byte) (int, error) {
 }
 
 // TestGetHold_ReadIsCapped pins bug 76: GetHold reads the hold body with a
-// bounded read (readAllLimited/MaxManifestBytes), so a corrupt or oversized
+// bounded read (ReadAllLimited/MaxManifestBytes), so a corrupt or oversized
 // hold object errors out instead of OOMing every hold path.
 func TestGetHold_ReadIsCapped(t *testing.T) {
 	store, sp, signer, _ := newStore(t)

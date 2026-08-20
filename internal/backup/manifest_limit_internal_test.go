@@ -11,18 +11,18 @@ import (
 // route through this helper with MaxManifestBytes.
 func TestReadAllLimited(t *testing.T) {
 	// Under the limit: returns the bytes verbatim.
-	body, err := readAllLimited(strings.NewReader("hello"), 100)
+	body, err := ReadAllLimited(strings.NewReader("hello"), 100)
 	if err != nil || string(body) != "hello" {
 		t.Fatalf("under-limit read: body=%q err=%v", body, err)
 	}
 
 	// Exactly at the limit: still ok.
-	if _, err := readAllLimited(strings.NewReader("12345"), 5); err != nil {
+	if _, err := ReadAllLimited(strings.NewReader("12345"), 5); err != nil {
 		t.Errorf("at-limit read should succeed; got %v", err)
 	}
 
 	// Over the limit: error, no unbounded allocation.
-	if _, err := readAllLimited(strings.NewReader(strings.Repeat("x", 10_000)), 16); err == nil {
+	if _, err := ReadAllLimited(strings.NewReader(strings.Repeat("x", 10_000)), 16); err == nil {
 		t.Fatal("over-limit read must error (input-validation audit #2); got nil")
 	} else if !strings.Contains(err.Error(), "exceeds") {
 		t.Errorf("over-limit error should mention the byte limit; got %v", err)

@@ -95,9 +95,11 @@ func validateRef(deployment, backupID string) error {
 // #2). 1 GiB is far above any real manifest yet bounds the blast radius.
 const MaxManifestBytes = 1 << 30
 
-// readAllLimited reads up to max bytes from rc, returning an error rather
-// than allocating unboundedly when the source exceeds it.
-func readAllLimited(rc stdio.Reader, max int64) ([]byte, error) {
+// ReadAllLimited reads up to max bytes from rc, returning an error
+// rather than allocating unboundedly when the source exceeds it.
+// Exported so out-of-package manifest readers (the backup runner's
+// DEK-reuse probe) share the same cap and limit-detection semantics.
+func ReadAllLimited(rc stdio.Reader, max int64) ([]byte, error) {
 	body, err := stdio.ReadAll(stdio.LimitReader(rc, max+1))
 	if err != nil {
 		return nil, err
@@ -426,7 +428,7 @@ func (ms *ManifestStore) ReadAttestationless(ctx context.Context, deployment, ba
 	primaryKey := PrimaryPath(deployment, backupID)
 	rc, gerr := ms.sp.Get(ctx, primaryKey)
 	if gerr == nil {
-		body, rerr := readAllLimited(rc, MaxManifestBytes)
+		body, rerr := ReadAllLimited(rc, MaxManifestBytes)
 		_ = rc.Close()
 		if rerr == nil {
 			if m, perr := ParseAttestationless(body); perr == nil {
@@ -441,7 +443,7 @@ func (ms *ManifestStore) ReadAttestationless(ctx context.Context, deployment, ba
 		return nil, gerr2
 	}
 	defer rc2.Close()
-	body2, rerr2 := readAllLimited(rc2, MaxManifestBytes)
+	body2, rerr2 := ReadAllLimited(rc2, MaxManifestBytes)
 	if rerr2 != nil {
 		return nil, rerr2
 	}
@@ -561,7 +563,7 @@ func (ms *ManifestStore) readVerified(ctx context.Context, key string, verifier 
 		return nil, err
 	}
 	defer rc.Close()
-	body, err := readAllLimited(rc, MaxManifestBytes)
+	body, err := ReadAllLimited(rc, MaxManifestBytes)
 	if err != nil {
 		return nil, fmt.Errorf("read body: %w", err)
 	}
@@ -808,7 +810,7 @@ func (ms *ManifestStore) ListAttestationless(ctx context.Context, deployment str
 				}
 				continue
 			}
-			body, rerr := readAllLimited(rc, MaxManifestBytes)
+			body, rerr := ReadAllLimited(rc, MaxManifestBytes)
 			_ = rc.Close()
 			if rerr != nil {
 				if !yield(nil, rerr) {
@@ -1702,7 +1704,7 @@ func (ms *ManifestStore) backupIsLive(ctx context.Context, deployment, backupID 
 func (ms *ManifestStore) readManifestUnverified(ctx context.Context, deployment, backupID string) (*Manifest, error) {
 	primaryKey := PrimaryPath(deployment, backupID)
 	if rc, err := ms.sp.Get(ctx, primaryKey); err == nil {
-		body, rerr := readAllLimited(rc, MaxManifestBytes)
+		body, rerr := ReadAllLimited(rc, MaxManifestBytes)
 		_ = rc.Close()
 		if rerr == nil {
 			if m, perr := ParseAttestationless(body); perr == nil {
@@ -1716,7 +1718,7 @@ func (ms *ManifestStore) readManifestUnverified(ctx context.Context, deployment,
 		return nil, err
 	}
 	defer rc2.Close()
-	body2, rerr2 := readAllLimited(rc2, MaxManifestBytes)
+	body2, rerr2 := ReadAllLimited(rc2, MaxManifestBytes)
 	if rerr2 != nil {
 		return nil, rerr2
 	}
@@ -1730,7 +1732,7 @@ func (ms *ManifestStore) readKeyBytes(ctx context.Context, key string) ([]byte, 
 		return nil, err
 	}
 	defer rc.Close()
-	return readAllLimited(rc, MaxManifestBytes)
+	return ReadAllLimited(rc, MaxManifestBytes)
 }
 
 // EnsureReplica guarantees the redundant replica copy of a committed
@@ -1914,7 +1916,7 @@ func (ms *ManifestStore) loadChainSnapshot(ctx context.Context, deployment strin
 		if err != nil {
 			return chainSnapshot{}, fmt.Errorf("read %s: %w", key, err)
 		}
-		body, err := readAllLimited(rc, MaxManifestBytes)
+		body, err := ReadAllLimited(rc, MaxManifestBytes)
 		_ = rc.Close()
 		if err != nil {
 			return chainSnapshot{}, fmt.Errorf("read body %s: %w", key, err)
@@ -2192,7 +2194,7 @@ func (ms *ManifestStore) ReadTombstone(ctx context.Context, deployment, backupID
 		return nil, err
 	}
 	defer rc.Close()
-	body, err := readAllLimited(rc, MaxManifestBytes)
+	body, err := ReadAllLimited(rc, MaxManifestBytes)
 	if err != nil {
 		return nil, fmt.Errorf("backup: read tombstone: %w", err)
 	}

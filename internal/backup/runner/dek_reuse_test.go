@@ -7,7 +7,9 @@ import (
 	"encoding/json"
 	"errors"
 	"iter"
+	"io"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 
@@ -180,5 +182,52 @@ func TestSelectDEK_UnwrappableExistingFailsNotFresh(t *testing.T) {
 	cfg := &EncryptionConfig{KEK: kek, KEKRef: "local:default"}
 	if _, err := selectDEK(context.Background(), sp, "local:default", cfg, time.Time{}, ""); err == nil {
 		t.Fatal("selectDEK must FAIL when a prior DEK exists but can't be unwrapped, not generate a fresh DEK")
+	}
+}
+
+// infiniteReader yields 'x' forever — a manifest body far larger than
+// MaxManifestBytes without ever allocating it.
+type infiniteReader struct{}
+
+func (infiniteReader) Read(p []byte) (int, error) {
+	for i := range p {
+		p[i] = 'x'
+	}
+	return len(p), nil
+}
+
+// oversizedManifestSP returns an effectively unbounded body for one
+// key, simulating a corrupt/oversized manifest object. Every other key
+// passes through to the wrapped plugin.
+type oversizedManifestSP struct {
+	storage.StoragePlugin
+	manifestKey string
+}
+
+func (s *oversizedManifestSP) Get(ctx context.Context, key string) (io.ReadCloser, error) {
+	if key == s.manifestKey {
+		return io.NopCloser(io.LimitReader(infiniteReader{}, int64(backup.MaxManifestBytes)+1024)), nil
+	}
+	return s.StoragePlugin.Get(ctx, key)
+}
+
+// TestReadManifestNoVerify_ReadIsCapped pins perf audit #5a: the DEK-reuse
+// probe reads the manifest with the same ReadAllLimited/MaxManifestBytes
+// cap as every other manifest consumer, so a corrupt/oversized manifest
+// object errors out instead of being slurped unboundedly into memory by
+// an unbounded ReadAll before the JSON can be rejected.
+func TestReadManifestNoVerify_ReadIsCapped(t *testing.T) {
+	sp := newRunnerSP(t)
+	const key = "manifests/db1/backups/db1.full.A/manifest.json"
+	wrapped := &oversizedManifestSP{StoragePlugin: sp, manifestKey: key}
+	_, found, err := readManifestNoVerify(context.Background(), wrapped, key)
+	if err == nil {
+		t.Fatal("readManifestNoVerify on an oversized manifest body must error (read cap), not slurp it unboundedly")
+	}
+	if found {
+		t.Error("found = true on an error read; want false")
+	}
+	if !strings.Contains(err.Error(), "exceeds") {
+		t.Errorf("error should mention the byte limit; got %v", err)
 	}
 }

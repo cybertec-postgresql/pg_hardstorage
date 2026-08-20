@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	stdio "io"
 	"strings"
 	"time"
 
@@ -136,7 +135,11 @@ func readManifestNoVerify(ctx context.Context, sp storage.StoragePlugin, key str
 		return nil, false, err
 	}
 	defer rc.Close()
-	body, err := stdio.ReadAll(rc)
+	// Bounded read like every other manifest consumer (perf audit #5a):
+	// this is a DEK-reuse probe that may touch a manifest that declares
+	// a huge files/chunks array or is corrupt/oversized; an unbounded
+	// ReadAll would OOM the runner before the JSON can be rejected.
+	body, err := backup.ReadAllLimited(rc, backup.MaxManifestBytes)
 	if err != nil {
 		return nil, false, err
 	}

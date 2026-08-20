@@ -289,8 +289,8 @@ func (ms *ManifestStore) GetHold(ctx context.Context, deployment, backupID strin
 	// unbounded io.ReadAll over a corrupt or maliciously oversized hold
 	// object would OOM every hold path (IsActivelyHeld, ListHolds,
 	// PutHoldUntil's HeldAt-preserve read, the retention pre-filter).
-	// Same MaxManifestBytes cap as readAllLimited's manifest callers.
-	body, err := readAllLimited(rc, MaxManifestBytes)
+	// Same MaxManifestBytes cap as ReadAllLimited's manifest callers.
+	body, err := ReadAllLimited(rc, MaxManifestBytes)
 	if err != nil {
 		return nil, fmt.Errorf("backup: read hold: %w", err)
 	}
