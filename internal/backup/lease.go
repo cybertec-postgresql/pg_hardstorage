@@ -36,7 +36,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/cybertec-postgresql/pg_hardstorage/internal/invariant"
 	stdio "io"
 	"os"
 	"sync"
@@ -411,14 +410,26 @@ func (l *Lease) Renew(ctx context.Context) error {
 	}
 	next := mine
 	next.ExpiresAt = l.now().UTC().Add(l.ttl)
-	// Fencing monotonicity: a renewal must strictly EXTEND the lease.
-	// Writing an expiry at-or-before the stored one would shrink the
-	// mutual-exclusion window mid-backup and invite a second writer —
-	// impossible unless the TTL/clock plumbing in this file is broken,
-	// which is exactly when we must not keep going.
-	invariant.Assert(next.ExpiresAt.After(cur.ExpiresAt),
-		"lease renewal for %q does not extend expiry (cur %s, next %s, ttl %s)",
-		l.deployment, cur.ExpiresAt.Format(time.RFC3339Nano), next.ExpiresAt.Format(time.RFC3339Nano), l.ttl)
+	// Fencing monotonicity: a renewal must never SHRINK the lease.
+	// Writing an expiry at-or-before the stored one would narrow the
+	// mutual-exclusion window mid-backup and invite a second writer.
+	//
+	// This condition is reachable WITHOUT any binary defect: a
+	// backward wall-clock step (NTP step, VM suspend/resume) between
+	// two renewals makes now+ttl fall at-or-before the stored
+	// expiry. The stored lease is still live in wall-clock time, and
+	// `next` would be content-identical to the stored body, so there
+	// is nothing to extend: keep holding without writing. (Panic
+	// here would kill the agent mid-backup over an environmental
+	// clock event, and fail-closed abort is unnecessary because no
+	// write happens and no window narrows.) Extensions resume as
+	// soon as the clock passes cur.ExpiresAt - ttl; if it never
+	// does, the lease lapses in wall-clock time, a reclaimer takes
+	// over, and the token check above aborts the backup on the next
+	// tick.
+	if !next.ExpiresAt.After(cur.ExpiresAt) {
+		return nil
+	}
 	if err := l.put(ctx, next, false); err != nil {
 		return fmt.Errorf("backup: renew lease for %q: %w", l.deployment, err)
 	}

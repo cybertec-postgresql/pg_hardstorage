@@ -70,3 +70,70 @@ func TestLease_RenewExtendsWhileLive(t *testing.T) {
 		t.Fatalf("a continuously-renewed lease must keep blocking acquirers; got %v", err)
 	}
 }
+
+// TestLease_RenewClockStepBackKeepsLease pins the crash-audit fix: a
+// backward wall-clock step (NTP step, VM suspend/resume) between two
+// renewals made now+ttl fall at-or-before the stored expiry and trip
+// the old "renewal must extend expiry" invariant — a PANIC that killed
+// the agent mid-backup. Renew now keeps the lease without writing
+// (the would-be body is content-identical to the stored one, so no
+// PUT, no shrunken window) and resumes extending once the clock
+// passes cur.ExpiresAt - ttl.
+func TestLease_RenewClockStepBackKeepsLease(t *testing.T) {
+	sp := newLeaseSP(t)
+	ctx := context.Background()
+	clk := newClock()
+
+	a, err := AcquireBackupLease(ctx, sp, "db1", LeaseOptions{Owner: "agent-A", TTL: 15 * time.Minute, now: clk.now})
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	// Healthy renewal on the TTL/3 cadence: expiry tracks forward.
+	clk.advance(5 * time.Minute) // 12:05
+	if err := a.Renew(ctx); err != nil {
+		t.Fatalf("healthy renewal: %v", err)
+	}
+	healthyExpiry := a.body.ExpiresAt // 12:20
+
+	// The NTP step: clock jumps 10 minutes BACKWARD, past the last
+	// renewal. now+ttl (12:10) is now BEFORE the stored expiry (12:20).
+	clk.advance(-10 * time.Minute) // 11:55
+
+	renew := func() (err error) {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("Renew PANICKED on a backward clock step: %v", r)
+			}
+		}()
+		err = a.Renew(ctx)
+		return err
+	}
+
+	if err := renew(); err != nil {
+		t.Fatalf("renewal across a clock step-back must not abort the healthy holder; got %v", err)
+	}
+	// No shrunken (or any) write: the stored lease still carries the
+	// healthy 12:20 expiry.
+	stored, err := a.read(ctx)
+	if err != nil {
+		t.Fatalf("read stored lease: %v", err)
+	}
+	if !stored.ExpiresAt.Equal(healthyExpiry) {
+		t.Fatalf("stored expiry = %s, want unchanged %s — renewal must not shrink the window",
+			stored.ExpiresAt.Format(time.RFC3339Nano), healthyExpiry.Format(time.RFC3339Nano))
+	}
+	// A second holder is still blocked — the lease is live in
+	// wall-clock time.
+	if _, err := AcquireBackupLease(ctx, sp, "db1", LeaseOptions{Owner: "agent-B", TTL: 15 * time.Minute, now: clk.now}); !errors.Is(err, ErrBackupInProgress) {
+		t.Fatalf("lease must still block a second acquirer after the clock step; got %v", err)
+	}
+	// Forward again past cur.ExpiresAt - ttl: renewals extend normally.
+	clk.advance(12 * time.Minute) // 12:07 → now+ttl = 12:22 > 12:20
+	if err := renew(); err != nil {
+		t.Fatalf("renewal after the clock recovered must extend; got %v", err)
+	}
+	if !a.body.ExpiresAt.After(healthyExpiry) {
+		t.Fatalf("post-recovery renewal did not extend: %s <= %s",
+			a.body.ExpiresAt.Format(time.RFC3339Nano), healthyExpiry.Format(time.RFC3339Nano))
+	}
+}
