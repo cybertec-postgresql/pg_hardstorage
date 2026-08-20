@@ -376,14 +376,18 @@ func (s *Server) handleDeployments(w http.ResponseWriter, r *http.Request) {
 		func() {
 			_, sp, err := repo.Open(r.Context(), url)
 			if err != nil {
-				s.logger.Errorf("deployments: open %s: %v", url, err)
+				// SEC-3: log the redacted URL + scrubbed error — repo
+				// URLs routinely embed credentials (userinfo, ?sig=),
+				// and this log line lands in whatever aggregates the
+				// control plane's stderr.
+				s.logger.Errorf("deployments: open %s: %s", redactRepoURL(url), redactRepoErr(err, url))
 				return
 			}
 			defer sp.Close()
 			ms := backup.NewManifestStore(sp)
 			deployments, err := ms.Deployments(r.Context())
 			if err != nil {
-				s.logger.Errorf("deployments: list %s: %v", url, err)
+				s.logger.Errorf("deployments: list %s: %s", redactRepoURL(url), redactRepoErr(err, url))
 				return
 			}
 			for _, dep := range deployments {
