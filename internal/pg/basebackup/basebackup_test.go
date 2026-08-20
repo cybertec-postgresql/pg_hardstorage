@@ -578,6 +578,27 @@ func TestDrive_BadStopLSNRow(t *testing.T) {
 	}
 }
 
+// TestDrive_EmptyStartLSNRow pins that an empty recptr in the start-LSN
+// result set is a protocol violation refused at parse time. A silent
+// empty would previously let the runner fall back to the pre-backup
+// IDENTIFY_SYSTEM position — a lower bound that mis-reports the start
+// and over-retains WAL.
+func TestDrive_EmptyStartLSNRow(t *testing.T) {
+	r, be, ctx, cancel := pipeDrive(t)
+	defer cancel()
+
+	go func() {
+		msgs := []pgproto3.BackendMessage{}
+		msgs = append(msgs, lsnResult("", "1")...)
+		emit(t, be, msgs...)
+	}()
+
+	err := drive(ctx, r, Options{}, newRecordingSink(), &Result{})
+	if err == nil || !strings.Contains(err.Error(), "parse start LSN row") {
+		t.Errorf("expected empty-recptr parse error; got %v", err)
+	}
+}
+
 func TestDrive_StatsAccumulate(t *testing.T) {
 	r, be, ctx, cancel := pipeDrive(t)
 	defer cancel()

@@ -1155,14 +1155,15 @@ func buildManifest(opts TakeOptions, bb *basebackup.Result, sink *tarsink.Sink, 
 	// point, i.e. the backup_label "START WAL LOCATION", where WAL replay
 	// must begin — as its first result set (bb.StartLSN). Record THAT:
 	// it is what the WAL-retention frontier must protect and what restore
-	// reports. Earlier code used identity.XLogPos (the IDENTIFY_SYSTEM
-	// position taken BEFORE the backup), which is only a lower bound, so
-	// it over-retained WAL and mis-reported the start. Fall back to it
-	// only if BASE_BACKUP somehow didn't surface a start LSN.
+	// reports. identity.XLogPos (the IDENTIFY_SYSTEM position taken
+	// BEFORE the backup) is only a lower bound — using it would
+	// over-retain WAL and mis-report the start. It is therefore NOT a
+	// fallback: an empty StartLSN here means the wire parser accepted
+	// a malformed result set (it refuses empty recptrs — see
+	// basebackup.parseLSNRow), and the manifest gate below rejects an
+	// empty start_lsn before commit. A backup that cannot state its own
+	// start position is not restorable; failing it loudly is.
 	startLSN := bb.StartLSN
-	if startLSN == "" {
-		startLSN = identity.XLogPos
-	}
 	return &backup.Manifest{
 		Schema:           backup.Schema,
 		BackupID:         backupID,

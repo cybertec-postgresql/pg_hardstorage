@@ -639,6 +639,9 @@ func parseLSNRow(m *pgproto3.DataRow) (string, uint32, error) {
 		return "", 0, fmt.Errorf("expected 2 columns (recptr, tli); got %d", len(m.Values))
 	}
 	lsn := string(m.Values[0])
+	if lsn == "" {
+		return "", 0, errors.New("empty recptr — a BASE_BACKUP LSN result set with an empty recptr is a protocol violation; refusing to stream further")
+	}
 	tli, err := parseUint32Bytes(m.Values[1])
 	if err != nil {
 		return "", 0, fmt.Errorf("timeline: %w", err)

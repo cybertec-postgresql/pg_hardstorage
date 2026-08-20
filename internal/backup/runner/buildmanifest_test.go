@@ -36,11 +36,16 @@ func TestBuildManifest_StartLSNIsBaseBackupRedo(t *testing.T) {
 		t.Errorf("StartLSN = %q, want the BASE_BACKUP redo %q (not XLogPos %q)", m.StartLSN, redo, xlogpos)
 	}
 
-	// Defensive fallback: if BASE_BACKUP somehow didn't surface a start
-	// LSN, fall back to the IDENTIFY_SYSTEM lower bound rather than empty.
+	// No silent fallback: if a BASE_BACKUP result somehow carried an
+	// empty start LSN, buildManifest must pass it through — NOT
+	// substitute the IDENTIFY_SYSTEM lower bound, which would
+	// mis-report the start and over-retain WAL. The wire parser
+	// refuses empty recptrs (basebackup.parseLSNRow) and the
+	// manifest gate (m.Validate) rejects an empty start_lsn before
+	// commit, so an empty value never reaches a committed manifest.
 	bb.StartLSN = ""
 	m2 := buildManifest(TakeOptions{Deployment: "db1"}, bb, sink, "db1.full.y", identity, 170000)
-	if m2.StartLSN != xlogpos {
-		t.Errorf("empty BASE_BACKUP start: StartLSN = %q, want fallback %q", m2.StartLSN, xlogpos)
+	if m2.StartLSN != "" {
+		t.Errorf("empty BASE_BACKUP start: StartLSN = %q, want empty (no XLogPos fallback)", m2.StartLSN)
 	}
 }
