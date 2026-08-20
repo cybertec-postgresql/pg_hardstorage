@@ -2,7 +2,7 @@ module github.com/cybertec-postgresql/pg_hardstorage
 
 go 1.26
 
-toolchain go1.26.5
+toolchain go1.26.6
 
 require (
 	cloud.google.com/go/kms v1.30.0
