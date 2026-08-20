@@ -263,6 +263,29 @@ func (c *CAS) AdoptedHashes() []Hash {
 	return out
 }
 
+// ForgetAdopted drops the given hashes from this CAS's adoption set.
+//
+// Callers MUST only forget a hash AFTER a manifest that references it
+// has committed (or been verified as an already-committed idempotent
+// re-commit). Once a committed manifest references a chunk, gc's
+// orphan sweep can no longer delete it — the manifest is a referent —
+// so the commit-time re-verification that the adoption set exists for
+// (AdoptedHashes / WasAdopted) can never need the entry again, even
+// if a later segment or backup re-adopts the same hash: the earlier
+// committed manifest already implies the chunk's continued presence.
+//
+// This is what keeps a long-lived CAS bounded: `wal stream` reuses one
+// CAS for days or weeks, and without the release the set would retain
+// every deduplicated hash ever seen (memory-leak audit #2).
+//
+// Forgetting a hash that was never adopted is a no-op; calling it
+// twice is harmless.
+func (c *CAS) ForgetAdopted(hashes ...Hash) {
+	for _, h := range hashes {
+		c.adopted.Delete(h)
+	}
+}
+
 // CASOption configures a CAS at construction.
 type CASOption func(*CAS)
 

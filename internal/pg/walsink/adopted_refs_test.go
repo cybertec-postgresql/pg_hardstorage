@@ -185,3 +185,48 @@ func TestSink_AdoptedChunkIntact_Commits(t *testing.T) {
 		t.Errorf("segment manifest not committed: %v", err)
 	}
 }
+
+// TestSink_CommittedSegmentReleasesAdoptedRefs pins the memory bound
+// for a days-long `wal stream`: one CAS is reused for the whole
+// session, and the adoption set must not retain every deduplicated
+// hash ever seen. After a segment manifest commits, its chunk refs
+// are protected from gc by the manifest itself, so the entries may
+// (and must) be released. Red pre-fix: the entry survived the commit
+// and the set grew without bound.
+func TestSink_CommittedSegmentReleasesAdoptedRefs(t *testing.T) {
+	body := bytes.Repeat([]byte{0xEE}, int(walsink.SegmentSize))
+	recurring := firstChunkOf(t, body)
+	h := repo.HashOf(recurring)
+
+	sp := openFsRepo(t)
+	// Seed the orphan under an anonymous CAS; the sink's CAS adopts.
+	if _, err := casdefault.New(sp).PutChunk(context.Background(), recurring); err != nil {
+		t.Fatal(err)
+	}
+	cas := casdefault.New(sp)
+	s, err := walsink.New(cas, sp, walsink.Options{
+		Deployment: "db1", Timeline: 1, SystemIdentifier: "7388123456789",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.OnRecord(context.Background(), replication.XLogRecord{
+		WALStart: pglogrepl.LSN(0), Data: body,
+	}); err != nil {
+		t.Fatalf("OnRecord: %v", err)
+	}
+	if err := s.Close(context.Background()); err != nil {
+		t.Fatalf("a healthy adopted segment failed to commit: %v", err)
+	}
+	if _, err := sp.Stat(context.Background(),
+		walsink.SegmentPath("db1", 1, walsink.SegmentFileName(1, 0, walsink.SegmentSize))); err != nil {
+		t.Fatalf("segment manifest not committed: %v", err)
+	}
+	if cas.WasAdopted(h) {
+		t.Error("committed segment's adopted ref was not released — " +
+			"a days-long wal stream would retain this entry forever")
+	}
+	if got := len(cas.AdoptedHashes()); got != 0 {
+		t.Errorf("AdoptedHashes = %d entries after the only segment committed, want 0", got)
+	}
+}

@@ -987,6 +987,7 @@ func (s *Sink) commitManifest(ctx context.Context, m *SegmentManifest) error {
 	// append-only copy of record could not previously host WAL
 	// archiving at all, because every segment emitted a delete marker
 	// (issue #45).
+	var commitErr error
 	if err := storage.CommitExclusive(ctx, s.sp, key, body, putOpts); err != nil {
 		if errors.Is(err, storage.ErrAlreadyExists) {
 			// Existing manifest at this key: either a true idempotent
@@ -997,9 +998,26 @@ func (s *Sink) commitManifest(ctx context.Context, m *SegmentManifest) error {
 			// on-disk manifest and returns nil only when every
 			// identifying field — sysid + ordered chunk-list —
 			// matches; otherwise a splitbrain.* structured error.
-			return verifyExistingManifest(ctx, s.sp, key, m)
+			commitErr = verifyExistingManifest(ctx, s.sp, key, m)
+		} else {
+			return fmt.Errorf("walsink: commit manifest: %w", err)
 		}
-		return fmt.Errorf("walsink: commit manifest: %w", err)
+	}
+	if commitErr != nil {
+		return commitErr
+	}
+	// The segment manifest is committed (or verified as an
+	// already-committed idempotent re-commit): every chunk it
+	// references is now referenced by a committed manifest, so gc's
+	// orphan sweep can no longer pull one out from under us and the
+	// commit-time re-verification has served its purpose for this
+	// segment.  Release the adopted entries or a days-long
+	// `wal stream` — one CAS for the whole session — would retain
+	// every deduplicated hash ever seen: unbounded growth
+	// (memory-leak audit #2).  A failed commit must NOT release:
+	// the retry re-verifies the same refs.
+	for _, ref := range m.Chunks {
+		s.cas.ForgetAdopted(ref.Hash)
 	}
 	return nil
 }

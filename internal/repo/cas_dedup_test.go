@@ -163,3 +163,53 @@ func TestDedupHints_NilIsZeroOverhead(t *testing.T) {
 		t.Errorf("DedupStats = %+v, want Misses=1 HitsInMemory=2", s)
 	}
 }
+
+// TestCAS_ForgetAdopted pins the adoption-set lifecycle: an entry is
+// dropped exactly when ForgetAdopted names it, and forgetting is a
+// no-op for unknown hashes and safe to repeat. walsink relies on this
+// to keep a days-long `wal stream` (one CAS for the whole session)
+// from retaining every deduplicated hash ever seen.
+func TestCAS_ForgetAdopted(t *testing.T) {
+	ctx := context.Background()
+	sp := openFS(t)
+	body := []byte("forget-me-after-commit")
+
+	first := repo.NewCAS(sp)
+	if _, err := first.PutChunk(ctx, body); err != nil {
+		t.Fatalf("first PutChunk: %v", err)
+	}
+	second := repo.NewCAS(sp)
+	info, err := second.PutChunk(ctx, body)
+	if err != nil {
+		t.Fatalf("second PutChunk: %v", err)
+	}
+	if !info.Deduped {
+		t.Fatal("chunk not deduplicated — the test setup no longer adopts")
+	}
+	h := repo.HashOf(body)
+	if !second.WasAdopted(h) {
+		t.Fatal("deduplicated hash not marked adopted before ForgetAdopted")
+	}
+	if got := len(second.AdoptedHashes()); got != 1 {
+		t.Fatalf("AdoptedHashes = %d entries, want 1 before forget", got)
+	}
+
+	second.ForgetAdopted(h)
+	if second.WasAdopted(h) {
+		t.Error("WasAdopted still true after ForgetAdopted")
+	}
+	if got := len(second.AdoptedHashes()); got != 0 {
+		t.Errorf("AdoptedHashes = %d entries, want 0 after forget", got)
+	}
+	// Unknown hash: no-op. Repeated forget: harmless.
+	second.ForgetAdopted(repo.HashOf([]byte("never-adopted-here")))
+	second.ForgetAdopted(h)
+	if got := len(second.AdoptedHashes()); got != 0 {
+		t.Errorf("AdoptedHashes = %d entries after no-op/repeat forgets, want 0", got)
+	}
+	// The first CAS (the writer) never adopted: nothing to forget,
+	// and its set stays empty.
+	if got := len(first.AdoptedHashes()); got != 0 {
+		t.Errorf("writer's AdoptedHashes = %d entries, want 0", got)
+	}
+}
