@@ -2611,16 +2611,19 @@ func resolveStartLSN(ctx context.Context, sp storage.StoragePlugin, opts walStre
 		alignedDown := pglogrepl.LSN(uint64(restartLSN) &^ uint64(segSize-1))
 		return alignedDown, "fresh-slot-restart-lsn", nil
 	}
-	// Slot info absent (legacy --no-slot path or unit-test stub
-	// without a pgConn) — fall back to the historical behaviour.
-	// This branch is the only place LSN(0) can leak through, and
-	// only when the operator opted out of the slot.
-	if opts.pgConn == "" {
-		return pglogrepl.LSN(0), "fresh-no-slot-no-conn", nil
-	}
+	// Fresh deployment with no slot: start at the cluster's current
+	// WAL insert LSN. A query failure must NOT fall back to LSN 0 —
+	// a zero start disables walsink's first-record contiguity gate
+	// (Options.ExpectedFirstLSN == 0), and under --no-slot PG may
+	// recycle WAL out from under the streamer, so a reconnect whose
+	// first record arrives past a hole would then look contiguous
+	// forever: a silent archive gap. Returning an error instead lets
+	// the reconnect loop retry (transient blips self-heal) and a
+	// persistent failure surfaces as a loud stop.
 	curLSN, qerr := queryCurrentWalInsertLSN(ctx, opts.pgConn)
 	if qerr != nil {
-		return pglogrepl.LSN(0), "fresh-no-slot-query-failed", nil
+		return 0, "", output.NewError("wal.current_lsn_failed",
+			fmt.Sprintf("wal stream: fresh no-slot start: pg_current_wal_insert_lsn() failed: %v (refusing to fall back to LSN 0: a zero start disables the first-record contiguity guard)", qerr)).Wrap(qerr)
 	}
 	alignedLSN := pglogrepl.LSN(uint64(curLSN) &^ uint64(segSize-1))
 	return alignedLSN, "fresh-no-slot-current", nil

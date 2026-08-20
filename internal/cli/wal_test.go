@@ -171,18 +171,28 @@ func TestHighestCommittedSegment_PerDeploymentIsolation(t *testing.T) {
 	}
 }
 
-func TestResolveStartLSN_FreshNoSlot_ReturnsZero(t *testing.T) {
+// A fresh no-slot start whose LSN query fails must refuse to stream,
+// not fall back to LSN 0: a zero start disables walsink's
+// first-record contiguity gate, and under --no-slot PG may recycle
+// WAL out from under the streamer, so a reconnect whose first record
+// arrives past a hole would look contiguous forever — a silent
+// archive gap. Both ways the query can fail (no connection string at
+// all, and an unreachable one) must surface as an error the
+// reconnect loop can retry.
+func TestResolveStartLSN_FreshNoSlotQueryFailure_RefusesLSNZero(t *testing.T) {
 	sp, _ := newFsRepo(t)
-	lsn, note, err := resolveStartLSN(context.Background(), sp,
-		walStreamOptions{deployment: "db1"}, 1, nil /* no slot info */, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if lsn != 0 {
-		t.Errorf("LSN = %v, want 0 on fresh-no-slot path", lsn)
-	}
-	if note != "fresh-no-slot-no-conn" {
-		t.Errorf("note = %q, want fresh-no-slot-no-conn", note)
+	for _, pgConn := range []string{"", "host=127.0.0.1 port=1 dbname=x user=x"} {
+		lsn, note, err := resolveStartLSN(context.Background(), sp,
+			walStreamOptions{deployment: "db1", pgConn: pgConn}, 1, nil /* no slot info */, nil)
+		if err == nil {
+			t.Fatalf("pgConn=%q: resolveStartLSN = LSN %v (%q), want refusal error — LSN 0 would disable the contiguity gate", pgConn, lsn, note)
+		}
+		if !strings.Contains(err.Error(), "pg_current_wal_insert_lsn") {
+			t.Errorf("pgConn=%q: error = %q, want it to name the failed query", pgConn, err)
+		}
+		if !strings.Contains(err.Error(), "contiguity") {
+			t.Errorf("pgConn=%q: error = %q, want it to explain why LSN 0 is refused", pgConn, err)
+		}
 	}
 }
 
