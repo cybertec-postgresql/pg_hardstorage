@@ -3,12 +3,6 @@
 # binary + a real PostgreSQL service container.  Catches
 # tutorial bit-rot the second a CLI flag is renamed.
 #
-# Triggers on doc-relevant paths only.  Per-PR runs are
-# kept under 5 min by skipping blocks that need external
-# services (Patroni cluster, K8s, AWS KMS) — those blocks
-# carry a `skip-in-ci="..."` directive in the markdown and
-# the runner honours `PG_HARDSTORAGE_DOCTEST_CI=1`.
-#
 # Local equivalent: `make docs-doctest` against an
 # operator-supplied PG (no skip-in-ci, runs everything).
 
@@ -16,31 +10,15 @@ name: docs-doctest
 
 on:
   push:
-    branches: [main]
-    paths:
-      - "docs/tutorials/**"
-      - "docs/how-to/**"
-      - "docs/CONTRIBUTING-DOCS.md"
-      - "cmd/doctest/**"
-      - "internal/cli/**"
-      - "Makefile"
-      - ".github/workflows/docs-doctest.yml"
-  pull_request:
-    branches: [main]
-    paths:
-      - "docs/tutorials/**"
-      - "docs/how-to/**"
-      - "docs/CONTRIBUTING-DOCS.md"
-      - "cmd/doctest/**"
-      - "internal/cli/**"
-      - "Makefile"
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 concurrency:
   group: docs-doctest-${{ github.ref }}
   cancel-in-progress: true
-
-permissions:
-  contents: read
 
 env:
   GO_VERSION: "1.26.5"

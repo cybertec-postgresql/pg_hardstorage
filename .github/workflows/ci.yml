@@ -1,17 +1,15 @@
-# CI — runs on every push and PR.
-#
-# Jobs are split so a unit-test failure is visible without waiting on
-# the (slower) integration suite, and so we can require the cheap gates
-# (vet, lint, race-tests) on PRs while running the full matrix nightly.
-
 name: CI
 
+# CI — runs only on a release tag push (v*) and on manual
+# dispatch. PR CI and per-push CI were removed in the cost
+# pass on 2026-08-20: every PR push was burning ~30 min of
+# paid macos+windows runners for signal a release tag
+# already provides once per release. The recommended
+# developer flow is now `make ci` locally before tagging.
 on:
   push:
-    branches: [main]
-    tags-ignore: ["v*"]   # release.yml owns tag pushes
-  pull_request:
-    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
 
 # Cancel in-progress runs for the same ref — a force-push or rebase
 # shouldn't burn CI minutes on the discarded history.

@@ -1,7 +1,5 @@
-# Documentation site CI — runs on every push and PR that
-# touches docs-related paths.
-#
-# Three gates:
+# Documentation site CI — fires only on a release tag push
+# (v*) or on manual dispatch.  Three gates run in sequence:
 #
 #   1. docs-regen drift  — every auto-generated page (CLI
 #      reference, manpages) must match the live source of
@@ -13,9 +11,8 @@
 #      Soft-fail (warning) for now; will promote to
 #      hard-fail once the link inventory stabilises.
 #
-# The build artefact is the rendered ./site/ directory,
-# uploaded so PR reviewers can preview the rendered site
-# without spinning up MkDocs locally.
+# On a tag push the rendered site is published to GitHub
+# Pages (custom domain docs.pghardstorage.org via docs/CNAME).
 #
 # On push to main the rendered site is published to GitHub
 # Pages (custom domain docs.pghardstorage.org via docs/CNAME).
@@ -26,24 +23,8 @@ name: docs
 
 on:
   push:
-    branches: [main]
-    paths:
-      - "docs/**"
-      - "mkdocs.yml"
-      - "cmd/docsgen/**"
-      - "internal/cli/**"
-      - "Makefile"
-      - ".github/workflows/docs.yml"
-  pull_request:
-    branches: [main]
-    paths:
-      - "docs/**"
-      - "mkdocs.yml"
-      - "cmd/docsgen/**"
-      - "internal/cli/**"
-      - "Makefile"
-      - ".github/workflows/docs.yml"
-
+    tags: ["v*"]
+  workflow_dispatch:
 concurrency:
   group: docs-${{ github.ref }}
   cancel-in-progress: true
@@ -173,7 +154,7 @@ jobs:
     # (including from forks) only build + preview, never
     # publish.  Needs the strict build to have passed.
     name: deploy to GitHub Pages
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
     needs: [build]
     environment:

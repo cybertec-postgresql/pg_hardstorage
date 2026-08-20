@@ -19,11 +19,6 @@
 name: packaging-weekly
 
 on:
-  schedule:
-    # Sunday 02:00 UTC.  Far from peak runner contention,
-    # results land before Monday standup.
-    - cron: "0 2 * * 0"
-  # Manual trigger for operator-driven validation runs.
   workflow_dispatch:
 
 permissions:
