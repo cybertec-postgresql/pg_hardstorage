@@ -68,6 +68,7 @@ func (r *AgentRegistry) Heartbeat(req HeartbeatRequest) (*Agent, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	now := time.Now().UTC()
+	r.pruneStale(now)
 	a, ok := r.agents[req.ID]
 	if !ok {
 		a = &Agent{
@@ -139,14 +140,40 @@ func (r *AgentRegistry) Get(id string) *Agent {
 	return &out
 }
 
-// Remove drops the agent. Used by graceful-shutdown handlers (when
-// they land) and by tests; the registry doesn't auto-prune
-// expired entries — the inactive-filter at List time is sufficient
-// for v0.1.
+// Remove drops the agent explicitly. Used by graceful-shutdown
+// handlers (when they land) and by tests. Heartbeat additionally
+// prunes entries that go stale on their own — see pruneStale.
 func (r *AgentRegistry) Remove(id string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	delete(r.agents, id)
+}
+
+// pruneStaleFactor is how many inactivity-timeouts an agent may go
+// silent for before Heartbeat drops its registry entry outright
+// (memory-leak audit #3). A plain timeout would churn entries on
+// transient heartbeat gaps (flapping links, slow agent-side cycles);
+// ten multiples means a pruned agent has been invisible to the
+// active fleet view and the 'total' metric for minutes, and if it
+// returns its next heartbeat simply re-registers it.
+const pruneStaleFactor = 10
+
+// pruneStale drops entries whose last heartbeat is older than
+// pruneStaleFactor × timeout. Runs under Heartbeat's write lock, so
+// it is amortised to one map scan per heartbeat — trivial at fleet
+// scale (one entry per agent host, ~10 s heartbeat cadence).
+//
+// Without it the registry grows by one entry per distinct agent ID
+// for the process lifetime: decommissioned or crashed hosts stay in
+// the map forever (List's active filter only hides entries, it never
+// deletes), and metrics.SetAgents counts them in 'total' as zombies.
+func (r *AgentRegistry) pruneStale(now time.Time) {
+	cutoff := now.Add(-r.timeout * pruneStaleFactor)
+	for id, a := range r.agents {
+		if a.LastHeartbeat.Before(cutoff) {
+			delete(r.agents, id)
+		}
+	}
 }
 
 // Timeout returns the configured inactive threshold.
