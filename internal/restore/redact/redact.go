@@ -32,7 +32,10 @@
 //   - hash_keep_domain    — emails: hash localpart, keep @domain
 //   - replace_with_xxx    — replace every char with 'x'
 //   - constant:<value>    — replace with a literal value
-//   - regex:<pattern>:<replacement> — global regex sub
+//   - regex:<pattern>:<replacement> — global regex sub; the
+//     replacement follows Postgres' regexp_replace backreference
+//     rules (\0/\00 = whole match, \1..\9 = capture group, empty
+//     when the group did not participate, \\ = literal backslash)
 //
 // Determinism: hashing strategies use a per-restore salt
 // stored in the restore's audit event so the operator can
@@ -262,9 +265,78 @@ func RedactValue(strategy Strategy, salt []byte, value string) string {
 		if err != nil {
 			return value
 		}
-		return re.ReplaceAllString(value, parts[1])
+		// The production SQL is Postgres' regexp_replace (see
+		// strategyToSQLExpr), whose replacement string expands
+		// \0/\00, \1..\9 and \\ — NOT Go's $1 syntax. Emulate the PG
+		// semantics so the dry-run preview equals the value the UPDATE
+		// writes (the bug-#75 invariant).
+		return pgReplaceAll(re, parts[1], value)
 	}
 	return value
+}
+
+// pgReplaceAll applies re to value, expanding the replacement string
+// with Postgres' regexp_replace semantics so the dry-run preview
+// matches the UPDATE strategyToSQLExpr emits byte-for-byte.
+func pgReplaceAll(re *regexp.Regexp, repl, value string) string {
+	matches := re.FindAllStringSubmatchIndex(value, -1)
+	if len(matches) == 0 {
+		return value
+	}
+	var out strings.Builder
+	last := 0
+	for _, m := range matches {
+		out.WriteString(value[last:m[0]])
+		groups := make([]string, len(m)/2-1)
+		for g := 1; g < len(m)/2; g++ {
+			if m[2*g] >= 0 {
+				groups[g-1] = value[m[2*g]:m[2*g+1]]
+			}
+		}
+		out.WriteString(expandPgReplacement(repl, value[m[0]:m[1]], groups))
+		last = m[1]
+	}
+	out.WriteString(value[last:])
+	return out.String()
+}
+
+// expandPgReplacement expands one replacement string for one match,
+// following Postgres' documented regexp_replace rules: \0 or \00 is
+// the whole match, \1..\9 the capture group's substring (empty when
+// the group did not participate or the index is out of range), \\ a
+// literal backslash, and any other backslash-escaped character that
+// character itself.
+func expandPgReplacement(repl, match string, groups []string) string {
+	var b strings.Builder
+	for i := 0; i < len(repl); i++ {
+		c := repl[i]
+		if c != '\\' {
+			b.WriteByte(c)
+			continue
+		}
+		i++
+		if i >= len(repl) {
+			b.WriteByte('\\') // trailing backslash: nothing to escape
+			continue
+		}
+		d := repl[i]
+		switch {
+		case d == '\\':
+			b.WriteByte('\\')
+		case d == '0':
+			if i+1 < len(repl) && repl[i+1] == '0' {
+				i++ // \00 is an alias for \0
+			}
+			b.WriteString(match)
+		case d >= '1' && d <= '9':
+			if g := int(d - '0'); g <= len(groups) {
+				b.WriteString(groups[g-1])
+			}
+		default:
+			b.WriteByte(d)
+		}
+	}
+	return b.String()
 }
 
 // hashUUID reproduces the production SQL for hash_to_uuid:

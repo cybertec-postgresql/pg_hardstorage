@@ -97,6 +97,51 @@ func TestRedactValue_Strategies(t *testing.T) {
 	}
 }
 
+// TestRedactValue_RegexBackrefs_MatchPostgres pins the invariant the
+// package doc promises (dry-run preview equals the value the
+// production SQL writes — the bug-#75 class): strategyToSQLExpr
+// emits Postgres' regexp_replace, whose replacement string expands
+// \0/\00 (whole match), \1..\9 (capture groups, empty when the group
+// did not participate), \\ (literal backslash) and treats every other
+// backslash-escaped char as that char. Go's ReplaceAllString expands
+// $1-style refs instead, so RedactValue must emulate the PG
+// semantics. The \1 case was cross-checked against a live
+// postgres:18 running the exact generated UPDATE (F-0009 audit):
+// 'mail me at bob@corp.io please' -> 'mail me at
+// bob@redacted.examplecorp.io please'.
+func TestRedactValue_RegexBackrefs_MatchPostgres(t *testing.T) {
+	salt := []byte("super-secret-salt")
+	cases := []struct {
+		strategy redact.Strategy
+		input    string
+		want     string
+	}{
+		// \1 -> capture group 1 (verified on live postgres:18)
+		{"regex:([a-z]+)@:\\1@redacted.example",
+			"mail me at bob@corp.io please",
+			"mail me at bob@redacted.examplecorp.io please"},
+		// \0 -> whole match
+		{"regex:(\\d+)-(\\d+):<\\2/\\1>", "frac 3-4", "frac <4/3>"},
+		// \\ -> literal backslash
+		{`regex:a:\\`, "a", `\`},
+		// \x (x not a digit) -> literal x
+		{"regex:a:\\x", "a", "x"},
+		// group that did not participate -> empty
+		{"regex:(a|b)(c)?:\\2!", "b", "!"},
+		// out-of-range group ref -> empty
+		{"regex:a:\\9!", "a", "!"},
+		// $ has no expansion in PG replacement strings
+		{"regex:(x):$1", "x", "$1"},
+		// no backrefs: unchanged behaviour
+		{"regex:\\d+:#", "ssn=123-45-6789", "ssn=#-#-#"},
+	}
+	for _, tc := range cases {
+		if got := redact.RedactValue(tc.strategy, salt, tc.input); got != tc.want {
+			t.Errorf("RedactValue(%q,%q) = %q, want %q", tc.strategy, tc.input, got, tc.want)
+		}
+	}
+}
+
 func TestRedactValue_HashIsDeterministic(t *testing.T) {
 	salt := []byte("salt")
 	a := redact.RedactValue("hash_to_uuid", salt, "alice")
