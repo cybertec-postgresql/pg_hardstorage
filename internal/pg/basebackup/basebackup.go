@@ -369,10 +369,15 @@ const (
 // PG always emits archives in order; the index we surface to Sink is
 // the position in res.Tablespaces.  Surplus archives or a manifest
 // arriving when Manifest=false produce ErrUnexpectedMessage.
-func drainMultiplexed(ctx context.Context, reader *streaming.Reader, opts Options, sink Sink, res *Result) error {
+func drainMultiplexed(ctx context.Context, reader *streaming.Reader, opts Options, sink Sink, res *Result) (retErr error) {
 	const stateInitial = -2
 	current := stateInitial
 	archivesSeen := 0
+	// openIdx is the archive started in the sink and not yet ended
+	// (stateInitial when none).  It is separate from `current` because
+	// a failed closeCurrent() returns while `current` still names an
+	// archive the sink has already torn down.
+	openIdx := stateInitial
 
 	closeCurrent := func() error {
 		if current == stateInitial {
@@ -381,8 +386,26 @@ func drainMultiplexed(ctx context.Context, reader *streaming.Reader, opts Option
 		if err := sink.OnTablespaceEnd(current); err != nil {
 			return fmt.Errorf("basebackup: sink rejected idx=%d end: %w", current, err)
 		}
+		openIdx = stateInitial
 		return nil
 	}
+
+	// If the stream dies mid-archive (network drop, malformed frame,
+	// sink data rejection, manifest DoS guard), the in-progress
+	// tablespace is never ended in the sink.  Sinks that parse
+	// archives in a background goroutine (tarsink) would then leak the
+	// goroutine AND its io.Pipe: the parser blocks on a pipe read that
+	// no one closes, for the lifetime of the process.  Best-effort
+	// end of the open archive re-runs the sink's normal teardown
+	// (close pipe, drain the parser); the result is discarded — the
+	// backup is already failing and the original error is what the
+	// caller needs.  Swallowing the teardown error is deliberate: a
+	// failing backup must not report a second, downstream error.
+	defer func() {
+		if retErr != nil && openIdx != stateInitial {
+			_ = sink.OnTablespaceEnd(openIdx)
+		}
+	}()
 
 	for {
 		msg, err := reader.Receive(ctx)
@@ -411,6 +434,7 @@ func drainMultiplexed(ctx context.Context, reader *streaming.Reader, opts Option
 				if err := sink.OnTablespaceStart(current, res.Tablespaces[current]); err != nil {
 					return fmt.Errorf("basebackup: sink rejected idx=%d start: %w", current, err)
 				}
+				openIdx = current
 				// Payload is archive_name\0tablespace_path\0; we
 				// don't surface it to the Sink today (the caller
 				// already has TablespaceInfo).  Discarding is
@@ -451,6 +475,7 @@ func drainMultiplexed(ctx context.Context, reader *streaming.Reader, opts Option
 				if err := sink.OnTablespaceStart(ManifestSinkIndex, TablespaceInfo{}); err != nil {
 					return fmt.Errorf("basebackup: sink rejected manifest start: %w", err)
 				}
+				openIdx = ManifestSinkIndex
 			default:
 				return fmt.Errorf("basebackup: %w unknown multiplex type byte 0x%02x",
 					streaming.ErrUnexpectedMessage, typeByte)

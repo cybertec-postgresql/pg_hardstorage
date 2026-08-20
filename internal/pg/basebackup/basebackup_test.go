@@ -3,8 +3,10 @@ package basebackup
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -972,5 +974,122 @@ func TestEscapeSingleQuotes_HardeningInvariants(t *testing.T) {
 				t.Errorf("trailing unescaped \\' run of length %d in %q", run, got)
 			}
 		})
+	}
+}
+
+// leakSink mimics the lifecycle of tarsink.Sink: OnTablespaceStart
+// spawns a parser goroutine that blocks reading from an io.Pipe;
+// OnTablespaceEnd closes the writer and waits for the goroutine to
+// drain.  If OnTablespaceEnd is NEVER called, the goroutine blocks on
+// the pipe read for the lifetime of the process — the leak that the
+// deferred teardown in drainMultiplexed must prevent.
+type leakSink struct {
+	pw        *io.PipeWriter
+	doneCh    chan struct{}
+	parserWG  sync.WaitGroup
+	startedCh chan struct{}
+	ends      int
+}
+
+func newLeakSink() *leakSink {
+	return &leakSink{doneCh: make(chan struct{}), startedCh: make(chan struct{})}
+}
+
+func (s *leakSink) OnTablespaceStart(_ int, _ TablespaceInfo) error {
+	if s.pw != nil {
+		return errors.New("leakSink: already started")
+	}
+	pr, pw := io.Pipe()
+	s.pw = pw
+	s.parserWG.Add(1)
+	go func() {
+		defer s.parserWG.Done()
+		defer close(s.doneCh)
+		_, _ = io.Copy(io.Discard, pr) // blocks until the writer closes
+		_ = pr.Close()
+	}()
+	close(s.startedCh)
+	return nil
+}
+
+func (s *leakSink) OnTablespaceData(_ int, data []byte) error {
+	_, err := s.pw.Write(data)
+	return err
+}
+
+func (s *leakSink) OnTablespaceEnd(_ int) error {
+	s.ends++
+	if s.pw == nil {
+		return nil
+	}
+	_ = s.pw.Close()
+	s.pw = nil
+	s.parserWG.Wait() // parser drains and exits; no leak
+	return nil
+}
+
+// TestDrive_NetworkErrorMidArchiveTearsDownSink pins that a stream
+// failure mid-archive still ends the in-progress tablespace in the
+// sink.  Before the fix, drainMultiplexed returned on the read error
+// without calling OnTablespaceEnd, so a background-parsing sink
+// (tarsink) leaked its parser goroutine AND its io.Pipe on every
+// failed base backup: the parser blocked on a pipe read no one would
+// ever close, for the lifetime of the process.
+func TestDrive_NetworkErrorMidArchiveTearsDownSink(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	r := streaming.NewWithConn(ctx, clientConn, streaming.Options{
+		InactivityTimeout: 5 * time.Second,
+	})
+	be := pgproto3.NewBackend(serverConn, serverConn)
+	t.Cleanup(func() {
+		_ = r.Close()
+		_ = serverConn.Close()
+	})
+
+	sink := newLeakSink()
+
+	go func() {
+		msgs := []pgproto3.BackendMessage{}
+		msgs = append(msgs, lsnResult("0/2000028", "1")...)
+		msgs = append(msgs,
+			tablespaceListSchema(),
+			dataRow("1663", "pg_default", "1024"),
+			&pgproto3.CommandComplete{CommandTag: []byte("SELECT")},
+			&pgproto3.CopyOutResponse{},
+			archiveFrame("base.tar", ""),
+			dataFrame([]byte("x")),
+		)
+		emit(t, be, msgs...)
+		// Wait until drive has started the archive (the sink's parser
+		// goroutine is up and blocked on the pipe), THEN close the
+		// server half mid-archive.  Without this the close could land
+		// before the 'n' frame and the test would pass trivially.
+		<-sink.startedCh
+		_ = serverConn.Close()
+	}()
+
+	err := drive(ctx, r, Options{}, sink, &Result{})
+	if err == nil {
+		t.Fatal("expected drive to fail on the mid-archive connection close")
+	}
+
+	// The deferred teardown must have ended the open archive: the
+	// parser goroutine is done (OnTablespaceEnd waits for it).  Pre-fix
+	// this times out — the goroutine is still blocked on the pipe.
+	parsersDone := make(chan struct{})
+	go func() {
+		sink.parserWG.Wait()
+		close(parsersDone)
+	}()
+	select {
+	case <-parsersDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("parser goroutine still blocked on the pipe after drive failed — " +
+			"OnTablespaceEnd was never called; the failed backup leaked the sink's goroutine")
+	}
+	if sink.ends != 1 {
+		t.Errorf("OnTablespaceEnd called %d times, want 1 (the deferred teardown)", sink.ends)
 	}
 }
