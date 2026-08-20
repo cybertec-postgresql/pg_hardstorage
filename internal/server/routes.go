@@ -108,6 +108,26 @@ func parseLimit(raw string, def, max int) (int, error) {
 	return n, nil
 }
 
+// repoAllowed is the SEC-2 control-plane-side guard: a job-supplied
+// repo URL must be one the control plane itself is configured with
+// (server.repos), so a misconfigured or hostile control plane cannot
+// queue jobs that stream a deployment's data to an unknown repo.
+// Matching mirrors the agent's repoMatches (trailing-slash
+// insensitive). An empty repo (defaults to repos[0] later) and a
+// control plane with no configured repos are both accepted here —
+// the agent's per-deployment repo guard is the final authority.
+func (s *Server) repoAllowed(repoURL string) error {
+	if repoURL == "" || len(s.cfg.Repos) == 0 {
+		return nil
+	}
+	for _, r := range s.cfg.Repos {
+		if strings.TrimRight(r, "/") == strings.TrimRight(repoURL, "/") {
+			return nil
+		}
+	}
+	return fmt.Errorf("repo %q is not in the control plane's configured repos (server.repos)", repoURL)
+}
+
 // validateRestoreTargetDir performs defence-in-depth checks on a
 // caller-supplied restore target directory:
 //
@@ -576,6 +596,13 @@ func (s *Server) handleEnqueueBackup(w http.ResponseWriter, r *http.Request, dep
 	if v, ok := args["repo"].(string); ok {
 		repoURL = v
 	}
+	// SEC-2: refuse to queue work for a repo this control plane does
+	// not know (agent-side guard remains the last line of defence).
+	if err := s.repoAllowed(repoURL); err != nil {
+		s.writeError(w, http.StatusBadRequest, "usage.bad_repo",
+			"deployments/<n>/backups: "+err.Error())
+		return
+	}
 	if repoURL == "" && len(s.cfg.Repos) > 0 {
 		repoURL = s.cfg.Repos[0]
 	}
@@ -639,6 +666,11 @@ func (s *Server) handleEnqueueVerify(w http.ResponseWriter, r *http.Request, dep
 	repoURL := ""
 	if v, ok := args["repo"].(string); ok {
 		repoURL = v
+	}
+	if err := s.repoAllowed(repoURL); err != nil {
+		s.writeError(w, http.StatusBadRequest, "usage.bad_repo",
+			"deployments/<n>/verifies: "+err.Error())
+		return
 	}
 	if repoURL == "" && len(s.cfg.Repos) > 0 {
 		repoURL = s.cfg.Repos[0]
@@ -721,6 +753,11 @@ func (s *Server) handleEnqueueRestore(w http.ResponseWriter, r *http.Request, de
 	repoURL := ""
 	if v, ok := args["repo"].(string); ok {
 		repoURL = v
+	}
+	if err := s.repoAllowed(repoURL); err != nil {
+		s.writeError(w, http.StatusBadRequest, "usage.bad_repo",
+			"deployments/<n>/restores: "+err.Error())
+		return
 	}
 	if repoURL == "" && len(s.cfg.Repos) > 0 {
 		repoURL = s.cfg.Repos[0]

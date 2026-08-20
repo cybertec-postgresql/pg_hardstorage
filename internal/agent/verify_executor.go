@@ -93,7 +93,13 @@ func (e *VerifyExecutor) Execute(ctx context.Context, job *ControlPlaneJob, prog
 	if repoURL == "" {
 		return nil, fmt.Errorf("verify-executor: deployment %q has no repo configured locally and the job didn't supply one", job.Deployment)
 	}
-	if dep.Repo != "" && !repoMatches(repoURL, dep.Repo) {
+	if dep.Repo == "" {
+		// SEC-2: with no local repo there is nothing to check the
+		// job-supplied URL against — trusting it would let a
+		// control-plane client point verify at an attacker repo.
+		return nil, fmt.Errorf("verify-executor: deployment %q has no repo configured locally; refusing job-supplied repo %s (declare the repo in the agent config)", job.Deployment, repoURL)
+	}
+	if !repoMatches(repoURL, dep.Repo) {
 		return nil, fmt.Errorf("verify-executor: deployment %q job repo (%s) doesn't match agent-local repo (%s); refusing", job.Deployment, repoURL, dep.Repo)
 	}
 	if e.verifier == nil {

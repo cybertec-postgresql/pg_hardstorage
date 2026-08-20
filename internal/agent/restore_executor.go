@@ -100,11 +100,16 @@ func (e *RestoreExecutor) Execute(ctx context.Context, job *ControlPlaneJob, pro
 	if repoURL == "" {
 		return nil, fmt.Errorf("restore-executor: deployment %q has no repo configured locally and the job didn't supply one", job.Deployment)
 	}
-	// Cross-repo refusal — same posture as BackupExecutor. We will
-	// not read from a repo other than the agent's declared one, so
-	// a misconfigured control plane can't redirect a restore to an
-	// untrusted source.
-	if dep.Repo != "" && !repoMatches(repoURL, dep.Repo) {
+	// SEC-2: with no local repo there is nothing to check the
+	// job-supplied URL against — refusing, otherwise a
+	// control-plane client could point a restore at an attacker
+	// repo. The cross-repo match below is the same guardrail as
+	// BackupExecutor: we never read from a repo other than the
+	// agent's declared one.
+	if dep.Repo == "" {
+		return nil, fmt.Errorf("restore-executor: deployment %q has no repo configured locally; refusing job-supplied repo %s (declare the repo in the agent config)", job.Deployment, repoURL)
+	}
+	if !repoMatches(repoURL, dep.Repo) {
 		return nil, fmt.Errorf("restore-executor: deployment %q job repo (%s) doesn't match agent-local repo (%s); refusing", job.Deployment, repoURL, dep.Repo)
 	}
 	if e.verifier == nil {

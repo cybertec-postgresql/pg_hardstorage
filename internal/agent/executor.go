@@ -87,7 +87,14 @@ func (b *BackupExecutor) runBackup(ctx context.Context, job *ControlPlaneJob, pr
 	if repoURL == "" {
 		return nil, fmt.Errorf("backup-executor: deployment %q has no repo configured locally and the job didn't supply one", job.Deployment)
 	}
-	if dep.Repo != "" && !repoMatches(repoURL, dep.Repo) {
+	if dep.Repo == "" {
+		// SEC-2: with no local repo there is nothing to check the
+		// job-supplied URL against — trusting it would let anyone
+		// with control-plane access redirect this deployment's base
+		// backup (fresh full-cluster data) to an attacker repo.
+		return nil, fmt.Errorf("backup-executor: deployment %q has no repo configured locally; refusing job-supplied repo %s (declare the repo in the agent config)", job.Deployment, repoURL)
+	}
+	if !repoMatches(repoURL, dep.Repo) {
 		// Refuse cross-repo writes: the control plane should never
 		// dispatch a job whose RepoURL diverges from the agent's
 		// declared repo. This is a guardrail against control-plane
