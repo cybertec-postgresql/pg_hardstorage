@@ -1,9 +1,11 @@
-// sftp.go — SFTP sink (atmoz/sftp, OpenSSH-based).
+// sftp.go — SFTP sink (OpenSSH chroot-sftp, built locally from alpine).
 package sink
 
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net"
@@ -15,10 +17,13 @@ import (
 	"time"
 )
 
-// sftpRuntime brings up the atmoz/sftp container, an
+// sftpRuntime brings up the chroot-sftp container, an
 // OpenSSH-based SFTP server with a tiny per-user setup line.
+// The image is built locally (see buildImage) so the fixture
+// exists on every architecture the host can build for.
 //
-// Image arg syntax (atmoz/sftp):
+// Image arg syntax (kept compatible with atmoz/sftp, the
+// image this fixture replaced):
 //
 //	<user>:<password>:[uid]:[gid]:[absolute-or-relative-dir]
 //
@@ -47,7 +52,7 @@ type sftpRuntime struct {
 const (
 	sftpUser = "testkit"
 	sftpPass = "testkit"
-	sftpDir  = "upload" // created at /home/<user>/upload by atmoz/sftp
+	sftpDir  = "upload" // created at /home/<user>/upload by the entrypoint
 )
 
 var sftpCounter atomic.Uint64
@@ -57,13 +62,17 @@ func newSFTP() *sftpRuntime { return &sftpRuntime{} }
 // Name returns "sftp".
 func (s *sftpRuntime) Name() string { return "sftp" }
 
-// Up runs the atmoz/sftp container with the testkit user
+// Up builds (or reuses) the fixture image, runs it with the testkit user
 // pre-created, waits for the SSH banner (sshd takes longer
 // than the TCP listener under daemon contention), and writes
 // a per-instance known_hosts file via ssh-keyscan.
 func (s *sftpRuntime) Up(ctx context.Context) error {
 	if s.container != "" {
 		return errors.New("sftpRuntime: already up")
+	}
+	image, err := s.buildImage(ctx)
+	if err != nil {
+		return err
 	}
 	port, err := pickFreePort()
 	if err != nil {
@@ -100,7 +109,7 @@ func (s *sftpRuntime) Up(ctx context.Context) error {
 		args = append(args, "-v", dir+":/home/"+sftpUser+"/"+sftpDir)
 	}
 	args = append(args,
-		SinkImages["sftp"],
+		image,
 		fmt.Sprintf("%s:%s:1001::%s", sftpUser, sftpPass, sftpDir),
 	)
 	cmd := exec.CommandContext(ctx, "docker", args...)
@@ -127,7 +136,7 @@ func (s *sftpRuntime) Up(ctx context.Context) error {
 
 	// TCP-ready isn't enough — docker's port-proxy listens
 	// before sshd is actually serving SSH protocol, AND
-	// atmoz/sftp generates host keys at first boot (the
+	// the entrypoint generates host keys at first boot (the
 	// container's startup script writes /etc/ssh/ssh_host_*
 	// keys before exec'ing sshd; under docker-daemon
 	// contention this can take >15s).  Wait for the SSH
@@ -344,4 +353,157 @@ func (s *sftpRuntime) Extras() map[string]string {
 		"known_hosts": s.knownHosts,
 		"password":    sftpPass,
 	}
+}
+
+// --- fixture image -------------------------------------------------
+//
+// The SFTP server is built locally from alpine rather than pulled
+// pre-baked. The old fixture, atmoz/sftp:alpine-3.7, publishes an
+// amd64-only manifest; on an arm64 host the container exited
+// immediately with "exec /entrypoint: exec format error", so every
+// sftp-backed test failed and the backend had no real-server coverage
+// at all on that architecture. Building from a multi-arch base means
+// the fixture exists wherever docker can build, which is the property
+// a test fixture actually needs.
+//
+// The image is deliberately exec-LESS: `ForceCommand internal-sftp`
+// plus a chroot. That preserves the distinction the ssh-exec fixture
+// documents — scp needs a server that permits remote commands, sftp
+// must be proven against one that does not — so this cannot silently
+// become a second ssh-exec and let an scp-shaped bug pass as sftp
+// coverage.
+
+// sftpEntrypoint reproduces the atmoz/sftp user-spec contract that
+// Up already speaks: `<user>:<pass>:[uid]:[gid]:[dir]`. Keeping the
+// argument shape means the swap is an image change, not a rewrite of
+// every caller.
+//
+// Host keys are generated HERE, at container start, not baked into the
+// image at build time: instances share one image tag, and a shared
+// host key would make the per-instance known_hosts file meaningless.
+//
+// The chroot layout is what OpenSSH demands and is easy to get wrong:
+// ChrootDirectory and every component above it must be owned by root
+// and not group- or world-writable, or sshd refuses the session with
+// "bad ownership or modes for chroot directory". So /home/<user> stays
+// root-owned 0755 and only the upload dir beneath it belongs to the
+// user.
+const sftpEntrypoint = `#!/bin/sh
+set -eu
+
+spec="${1:-}"
+if [ -z "$spec" ]; then
+	echo "usage: <user>:<pass>:[uid]:[gid]:[dir]" >&2
+	exit 2
+fi
+
+user=$(printf '%s' "$spec" | cut -d: -f1)
+pass=$(printf '%s' "$spec" | cut -d: -f2)
+uid=$(printf '%s' "$spec" | cut -d: -f3)
+gid=$(printf '%s' "$spec" | cut -d: -f4)
+dir=$(printf '%s' "$spec" | cut -d: -f5)
+
+[ -n "$user" ] || { echo "empty user in spec" >&2; exit 2; }
+[ -n "$dir" ] || dir=upload
+
+if [ -n "$gid" ]; then
+	addgroup -g "$gid" "$user" 2>/dev/null || true
+	grp="$user"
+else
+	grp=""
+fi
+
+if [ -n "$uid" ]; then
+	adduser -D -H -u "$uid" ${grp:+-G "$grp"} -h "/home/$user" -s /sbin/nologin "$user"
+else
+	adduser -D -H -h "/home/$user" -s /sbin/nologin "$user"
+fi
+
+if [ -n "$pass" ]; then
+	printf '%s:%s\n' "$user" "$pass" | chpasswd
+else
+	passwd -u "$user"
+fi
+
+# Chroot root: root-owned, not group/world writable (sshd requirement).
+mkdir -p "/home/$user"
+chown root:root "/home/$user"
+chmod 0755 "/home/$user"
+
+# The writable area beneath it. When PGHS_SINK_SCRATCH bind-mounts a
+# host directory here, this chown is what makes it usable by the
+# container's uid.
+mkdir -p "/home/$user/$dir"
+chown "$user" "/home/$user/$dir"
+chmod 0755 "/home/$user/$dir"
+
+# Per-instance host keys — see the comment on sftpEntrypoint.
+ssh-keygen -A >/dev/null
+
+exec /usr/sbin/sshd -D -e
+`
+
+// sftpSSHDConfig forbids everything except SFTP. internal-sftp is
+// built into sshd, so the chrooted session needs no binaries, no
+// libraries and no /dev inside the chroot.
+const sftpSSHDConfig = `Port 22
+PermitRootLogin no
+PasswordAuthentication yes
+KbdInteractiveAuthentication no
+UsePAM no
+AllowTcpForwarding no
+X11Forwarding no
+PrintMotd no
+Subsystem sftp internal-sftp
+ForceCommand internal-sftp
+ChrootDirectory %h
+`
+
+// sftpDockerfile is the image definition. It is a function rather than
+// a constant so a test can hash it without invoking docker.
+func sftpDockerfile() string {
+	return "FROM " + SinkImages["sftp"] + "\n" +
+		"RUN apk add --no-cache openssh-server openssh-keygen shadow\n" +
+		"COPY sshd_config /etc/ssh/sshd_config\n" +
+		"COPY entrypoint.sh /usr/local/bin/entrypoint.sh\n" +
+		"EXPOSE 22\n" +
+		`ENTRYPOINT ["/bin/sh","/usr/local/bin/entrypoint.sh"]` + "\n"
+}
+
+// sftpImageTag derives the tag from the content that defines the
+// image, so concurrent builds of identical content converge on one tag
+// (full cache hit, no tag-repointing races between packages) while any
+// edit here lands on a fresh tag instead of silently reusing a stale
+// image. Every input file is hashed: the Dockerfile text alone would
+// not change when only the entrypoint or sshd_config did.
+func sftpImageTag(dockerfile, entrypoint, sshdConfig string) string {
+	sum := sha256.Sum256([]byte(dockerfile + "\x00" + entrypoint + "\x00" + sshdConfig))
+	return "pg-hardstorage-testkit-sftp:" + hex.EncodeToString(sum[:6])
+}
+
+// buildImage builds the chroot-sftp image and returns its tag.
+func (s *sftpRuntime) buildImage(ctx context.Context) (string, error) {
+	bctx, err := os.MkdirTemp("", "pg-hs-sftp-img-*")
+	if err != nil {
+		return "", fmt.Errorf("sftp sink: mkdir build ctx: %w", err)
+	}
+	defer func() { _ = os.RemoveAll(bctx) }()
+
+	dockerfile := sftpDockerfile()
+	for name, body := range map[string]string{
+		"Dockerfile":    dockerfile,
+		"entrypoint.sh": sftpEntrypoint,
+		"sshd_config":   sftpSSHDConfig,
+	} {
+		if err := os.WriteFile(filepath.Join(bctx, name), []byte(body), 0o644); err != nil {
+			return "", fmt.Errorf("sftp sink: write %s: %w", name, err)
+		}
+	}
+
+	tag := sftpImageTag(dockerfile, sftpEntrypoint, sftpSSHDConfig)
+	if out, err := exec.CommandContext(ctx, "docker", "build", "-q",
+		"-t", tag, bctx).CombinedOutput(); err != nil {
+		return "", fmt.Errorf("sftp sink: docker build: %w (%s)", err, truncate(out, 400))
+	}
+	return tag, nil
 }

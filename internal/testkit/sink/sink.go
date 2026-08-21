@@ -129,7 +129,14 @@ var SinkImages = map[string]string{
 	"tls-minio": "minio/minio:RELEASE.2025-01-20T14-49-07Z", // same image; TLS toggled by mounting certs
 	"azurite":   "mcr.microsoft.com/azure-storage/azurite:3.33.0",
 	"gcs-fake":  "fsouza/fake-gcs-server:1.52.2",
-	"sftp":      "atmoz/sftp:alpine-3.7",
+	// sftp is the SFTP fixture. Like ssh-exec the value is the BASE
+	// image, not a runnable server: the runtime builds an OpenSSH
+	// chroot-sftp image from it. It used to be atmoz/sftp:alpine-3.7,
+	// which publishes an amd64-only manifest — on an arm64 host every
+	// sftp-backed test died with "exec /entrypoint: exec format error"
+	// and the whole backend went untested. Building from alpine means
+	// the fixture exists for whatever architecture the host runs.
+	"sftp": "alpine:3.20",
 	// ssh-exec is the scp fixture. The value is the BASE image; the
 	// runtime builds the final sshd image from it per-instance,
 	// because that image embeds a throwaway authorized_keys that must
