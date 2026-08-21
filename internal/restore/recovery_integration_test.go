@@ -53,6 +53,41 @@ func TestIntegration_PITR_RestoreToLSN(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
 	defer cancel()
 
+	// 0. Reserve the streamer's slot BEFORE the base backup.
+	//
+	// `wal stream` creates its slot on first run (ensureSlot ->
+	// replication.EnsureSlot, which adopts an existing slot and only
+	// creates a missing one). Until that slot exists nothing reserves
+	// WAL, so every segment written between the backup and the slot's
+	// creation is recycled without ever reaching the repo. Step 3 then
+	// asks to restore to bres.StopLSN — an LSN sitting inside exactly
+	// that hole — and the gap detector correctly refuses:
+	//
+	//   restore.target_in_wal_gap: target_lsn 0/2000120 falls within a
+	//   known WAL gap (0/2000120..0/3000000, 16776928 bytes)
+	//
+	// The test used to get away with it because the slot usually
+	// appeared while the cluster was still writing the backup's own
+	// segment, so that segment was archived intact. It is a race, not
+	// a guarantee: under parallel load the writer goroutine below
+	// crosses the segment boundary first and the segment is skipped.
+	// Reserving up front is also the order a real deployment uses —
+	// archiving is running before you take a backup, never after.
+	slotConn, err := pg.Connect(ctx, srv.DSN, pg.ModeRegular)
+	if err != nil {
+		t.Fatalf("connect for slot reservation: %v", err)
+	}
+	// true = immediately_reserve: pin restart_lsn now rather than at
+	// first use, which is the whole point of doing this before the
+	// backup.
+	if rerr := slotConn.PgConn().ExecParams(ctx,
+		"SELECT pg_create_physical_replication_slot('pg_hardstorage_db1', true)",
+		nil, nil, nil, nil).Read().Err; rerr != nil {
+		slotConn.Close(ctx)
+		t.Fatalf("reserve replication slot: %v", rerr)
+	}
+	slotConn.Close(ctx)
+
 	// 1. Take a base backup.
 	bres, err := runner.Take(ctx, runner.TakeOptions{
 		PGConnString:    srv.DSN,
