@@ -45,6 +45,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/obs/metrics"
@@ -126,6 +127,17 @@ type Server struct {
 	agents *AgentRegistry
 	jobs   *JobRegistry
 	token  string
+
+	// readyz caches the last full readiness probe (perf audit #6:
+	// the probe is unauthenticated and hit by k8s / load-balancers
+	// every few seconds; a full repo.Open per probe — backend
+	// connect + HSREPO + format check — is far more than a
+	// liveness check needs). readyzMu guards the rest.
+	readyzMu    sync.Mutex
+	readyzOut   []repoCheck
+	readyzReady bool
+	readyzAt    time.Time
+	readyzTTL   time.Duration
 }
 
 // Logger is a tiny structured-log shim. The dispatcher's structured
@@ -181,10 +193,11 @@ func NewWithJobs(cfg Config, jobs *JobRegistry) (*Server, error) {
 		jobs.WithMaxConcurrent(cfg.MaxConcurrentJobs)
 	}
 	s := &Server{
-		cfg:    cfg,
-		logger: stdLogger{},
-		agents: NewAgentRegistry(cfg.HeartbeatTimeout),
-		jobs:   jobs,
+		cfg:       cfg,
+		logger:    stdLogger{},
+		agents:    NewAgentRegistry(cfg.HeartbeatTimeout),
+		jobs:      jobs,
+		readyzTTL: readyzRecheckDefault,
 	}
 	if cfg.Auth.TokenFile != "" {
 		body, err := os.ReadFile(cfg.Auth.TokenFile)

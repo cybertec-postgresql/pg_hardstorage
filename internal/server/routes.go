@@ -262,12 +262,62 @@ func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 // configured repo is reachable. A repo's read failure trips the
 // probe; agent registrations are NOT required to be ready (the
 // control plane works without agents — operators can still query).
+//
+// The last fully-ready probe result is served from cache for
+// readyzRecheckDefault (perf audit #6): readyz is unauthenticated
+// and hit by k8s / load-balancer probes every few seconds, and a
+// full repo.Open per probe (backend connect + HSREPO read + format
+// check) costs more than a liveness check needs — especially for
+// remote backends (a fresh SFTP session / S3 credentials round per
+// probe). A probe that finds ANY repo degraded is NEVER cached: the
+// degraded state is re-probed on every request so recovery is
+// detected on the next probe.
 func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
-	type repoCheck struct {
-		URL   string `json:"url"`
-		Ready bool   `json:"ready"`
-		Error string `json:"error,omitempty"`
+	s.readyzMu.Lock()
+	fresh := s.readyzReady && time.Since(s.readyzAt) < s.readyzTTL
+	cachedOut, cachedReady := s.readyzOut, s.readyzReady
+	s.readyzMu.Unlock()
+
+	var out []repoCheck
+	var allReady bool
+	if fresh {
+		out, allReady = cachedOut, cachedReady
+	} else {
+		out, allReady = s.probeRepos(r)
 	}
+
+	status := http.StatusOK
+	if !allReady {
+		status = http.StatusServiceUnavailable
+	}
+	s.writeJSON(w, status, envelope{
+		Result: map[string]any{
+			"status": map[bool]string{true: "ready", false: "degraded"}[allReady],
+			"repos":  out,
+		},
+	})
+}
+
+// repoCheck is one readiness-probe entry per configured repo.
+type repoCheck struct {
+	URL   string `json:"url"`
+	Ready bool   `json:"ready"`
+	Error string `json:"error,omitempty"`
+}
+
+// readyzRecheckDefault is how long a fully-ready probe result is
+// served from cache before the next probe re-Opens every repo.
+// 30s matches the default heartbeat cadence and is well below any
+// operator's expectation that "a broken repo shows up in the
+// probe" — the degraded path is never cached, so only the healthy
+// case gets the grace.
+const readyzRecheckDefault = 30 * time.Second
+
+// probeRepos performs the actual readiness probe: Open every
+// configured repo, report per-repo reachability. A fully-ready
+// result is cached for s.readyzTTL (handleReadyz); a degraded
+// result is returned uncached so the next request re-probes.
+func (s *Server) probeRepos(r *http.Request) ([]repoCheck, bool) {
 	out := make([]repoCheck, 0, len(s.cfg.Repos))
 	allReady := true
 	for _, repoURL := range s.cfg.Repos {
@@ -295,16 +345,14 @@ func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 		}()
 		out = append(out, check)
 	}
-	status := http.StatusOK
-	if !allReady {
-		status = http.StatusServiceUnavailable
+	if allReady {
+		s.readyzMu.Lock()
+		s.readyzOut = out
+		s.readyzReady = true
+		s.readyzAt = time.Now()
+		s.readyzMu.Unlock()
 	}
-	s.writeJSON(w, status, envelope{
-		Result: map[string]any{
-			"status": map[bool]string{true: "ready", false: "degraded"}[allReady],
-			"repos":  out,
-		},
-	})
+	return out, allReady
 }
 
 // redactRepoURL strips secrets from a repo URL so the unauthenticated
