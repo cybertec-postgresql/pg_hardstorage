@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"text/tabwriter"
@@ -56,7 +57,10 @@ func newImageCmd() *cobra.Command {
 // adding a new sink kind means adding it to that map and
 // nothing else.
 func newImagePullSinksCmd() *cobra.Command {
-	var only string
+	var (
+		only      string
+		archCheck bool
+	)
 	c := &cobra.Command{
 		Use:   "pull-sinks",
 		Short: "Pre-pull every sink emulator image (for air-gap operation)",
@@ -69,19 +73,30 @@ Use --only=s3-minio,azurite to limit the pull to a subset.
 
 Once this command has succeeded, every sink-enabled scenario
 runs without network — pass --airgap to validate / scenario
-run to enforce that promise (refuses to dial out at runtime).`,
+run to enforce that promise (refuses to dial out at runtime).
+
+Each image is checked against THIS machine's os/arch before it
+is pulled: a pin that publishes no manifest for the host dies
+at container start with "exec format error" and silently costs
+the backend all of its real-server coverage.  Pass
+--arch-check=false when staging images for a DIFFERENT host
+(pre-seeding an arm64 air-gapped box from an amd64 laptop),
+where a host-arch mismatch is expected rather than a defect.`,
 		Args:         cobra.NoArgs,
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return runImagePullSinks(cmd, only)
+			return runImagePullSinks(cmd, only, archCheck)
 		},
 	}
 	c.Flags().StringVar(&only, "only", "",
 		"comma-separated list of sink kinds to pull (default: all)")
+	c.Flags().BoolVar(&archCheck, "arch-check", true,
+		"refuse an image that publishes no manifest for this host's os/arch "+
+			"(disable when staging images for a different host)")
 	return c
 }
 
-func runImagePullSinks(cmd *cobra.Command, only string) error {
+func runImagePullSinks(cmd *cobra.Command, only string, archCheck bool) error {
 	wanted := sink.SinkImages
 	if only != "" {
 		wanted = map[string]string{}
@@ -107,6 +122,16 @@ func runImagePullSinks(cmd *cobra.Command, only string) error {
 	out := cmd.OutOrStdout()
 	for _, k := range kinds {
 		img := wanted[k]
+		if archCheck {
+			// Before the pull, not after: a pin with no manifest for
+			// this host is not a slow pull, it is an image that can
+			// never run here, and the operator needs to hear that with
+			// the platform list in hand rather than discover it as a
+			// container that exits milliseconds after `docker run`.
+			if err := sink.VerifyImageArch(cmd.Context(), k, runtime.GOOS, runtime.GOARCH); err != nil {
+				return fmt.Errorf("image pull-sinks: %w", err)
+			}
+		}
 		fmt.Fprintf(out, "→ pulling %s (%s)\n", k, img)
 		c := exec.CommandContext(cmd.Context(), "docker", "pull", img)
 		c.Stdout = out
