@@ -2,9 +2,12 @@
 --
 -- Creates the in-database surface for backup-state introspection
 -- from inside the PostgreSQL cluster pg_hardstorage backs up.
--- The schema is populated by `pg_hardstorage db refresh
--- --pg-connection ...`, run by the agent on a schedule (or
--- manually by an operator).
+-- The state tables are written only through the SECURITY DEFINER
+-- pg_hardstorage.upsert_backup / upsert_health / upsert_rpo
+-- functions, which are granted to the pg_hardstorage_writer role.
+-- No built-in data-plane path calls those upserts yet: until one
+-- lands (or an operator calls the functions directly), the views
+-- stay empty.
 --
 -- Three operator-facing views land in this version:
 --
@@ -57,7 +60,7 @@ CREATE TABLE pg_hardstorage.backups_state (
     PRIMARY KEY (deployment, backup_id)
 );
 COMMENT ON TABLE pg_hardstorage.backups_state IS
-    'Authoritative table populated by the agent via `pg_hardstorage db refresh`.';
+    'Authoritative table; written only via pg_hardstorage.upsert_backup().';
 
 CREATE INDEX backups_state_started_at_idx
     ON pg_hardstorage.backups_state (deployment, started_at DESC);
@@ -112,7 +115,7 @@ CREATE OR REPLACE VIEW pg_hardstorage.backups AS
         last_refreshed_at
     FROM pg_hardstorage.backups_state;
 COMMENT ON VIEW pg_hardstorage.backups IS
-    'One row per committed backup.  Refresh via `pg_hardstorage db refresh`.';
+    'One row per committed backup.  Written via pg_hardstorage.upsert_backup().';
 
 CREATE OR REPLACE VIEW pg_hardstorage.health AS
     SELECT

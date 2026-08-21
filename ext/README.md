@@ -1,15 +1,21 @@
 # ext
 
-PostgreSQL server-side extension that augments pg_hardstorage with in-database
-hooks the external binary can't get from the wire protocol — currently catalog
-introspection helpers used by chain verification and partial restore.
+PostgreSQL server-side extension that augments pg_hardstorage with
+in-database backup-state introspection the external binary can't get
+from the wire protocol: the `pg_hardstorage.backups` / `health` /
+`rpo` views plus the `pg_hardstorage_writer` role and upsert
+functions that write the backing tables.  Operator-facing today —
+no built-in data-plane path calls the upserts yet, so the views
+stay empty until one lands (or an operator upserts directly).
 
 ## What lives here
 
-A standard PGXS-built extension (`.control`, versioned `.sql`, `Makefile`). The
-Go side that loads and calls into this extension lives under
-`../internal/dbext/`. Built artefacts ship in the `pg-hardstorage-extension`
-package (Debian) and the matching RPM.
+A standard PGXS-built extension (`.control`, versioned `.sql`, `Makefile`).
+The Go side that installs this SQL (on-disk `CREATE EXTENSION` or inline
+`db install-extension`) lives under `../internal/dbext/`.  The extension
+ships as source under `ext/`; no dedicated `pg-hardstorage-extension`
+Debian package exists — the `debian/` packaging (pg-hardstorage, -common,
+-server, -compat-*) does not install the extension.
 
 ## Key files / subdirs
 

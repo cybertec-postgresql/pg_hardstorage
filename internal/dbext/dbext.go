@@ -2,8 +2,10 @@
 //
 // It ships the SQL the operator's PostgreSQL server needs to
 // expose `pg_hardstorage.backups`, `pg_hardstorage.health` and
-// `pg_hardstorage.rpo` views, plus the upsert helpers the agent
-// uses to refresh them.
+// `pg_hardstorage.rpo` views, plus the upsert functions the state
+// tables are written through.  The extension is operator-facing
+// today: no built-in data-plane path calls the upserts yet, so the
+// views stay empty until one lands or an operator upserts directly.
 //
 // Two modes:
 //
