@@ -28,9 +28,12 @@ package topology_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -89,10 +92,26 @@ func TestBackup_InterruptedByAFailover_FailsHonestly(t *testing.T) {
 	// Enough data that BASE_BACKUP takes long enough to interrupt.
 	// Without this the backup finishes before the switchover lands and
 	// the test proves nothing.
-	execSQL(t, ctx, topo, `CREATE TABLE bulk AS
-		SELECT g AS id, repeat('x', 512) AS pad FROM generate_series(1, 1500000) g`)
+	//
+	// The row count is a function of how fast the host is, not a
+	// property of the scenario: 1.5M rows (~768 MB) kept BASE_BACKUP
+	// busy for well over the trigger delay on the hardware this was
+	// written on, and finished in under 4s on an NVMe box — at which
+	// point the test could no longer overlap the two and failed
+	// honestly rather than pretending. Raised, and made tunable so a
+	// slow machine can dial it back down without editing the test.
+	rows := 6000000
+	if v := os.Getenv("PGHS_FAILOVER_SEED_ROWS"); v != "" {
+		n, perr := strconv.Atoi(v)
+		if perr != nil || n <= 0 {
+			t.Fatalf("PGHS_FAILOVER_SEED_ROWS=%q is not a positive integer", v)
+		}
+		rows = n
+	}
+	execSQL(t, ctx, topo, fmt.Sprintf(`CREATE TABLE bulk AS
+		SELECT g AS id, repeat('x', 512) AS pad FROM generate_series(1, %d) g`, rows))
 	execSQL(t, ctx, topo, `CHECKPOINT`)
-	t.Logf("seeded a table large enough to slow BASE_BACKUP")
+	t.Logf("seeded %d rows (~%d MB) to slow BASE_BACKUP", rows, rows*512/(1024*1024))
 
 	// Baseline: `init --quick` takes a backup of its own, so "the list
 	// is non-empty" says nothing. What matters is whether the
@@ -107,6 +126,11 @@ func TestBackup_InterruptedByAFailover_FailsHonestly(t *testing.T) {
 	}
 	t.Logf("baseline: %d backup(s) already present before the interrupted run", len(baseline))
 
+	// Repo size before the interrupted run, so the in-flight watch
+	// below measures only what THIS backup writes (init --quick already
+	// left a backup behind).
+	baseRepoBytes := dirBytes(repoDir)
+
 	// Start the backup, then demote its source out from under it.
 	type backupOutcome struct {
 		out  string
@@ -119,19 +143,36 @@ func TestBackup_InterruptedByAFailover_FailsHonestly(t *testing.T) {
 	}()
 
 	backupStart := time.Now()
-	time.Sleep(4 * time.Second)
 
-	// If the backup has already finished, the switchover cannot
-	// interrupt it and this test proves nothing. Say so rather than
-	// reporting a pass — a scenario that did not happen is not evidence
-	// that it is handled.
-	select {
-	case res := <-done:
-		t.Fatalf("the backup finished in %s, before the switchover could interrupt it "+
-			"(exit %d).\n\nThis test only means something if the two overlap. Seed more "+
-			"data so BASE_BACKUP runs longer, or trigger the switchover sooner.",
-			time.Since(backupStart).Truncate(time.Millisecond), res.code)
-	default:
+	// Trigger on evidence, not on a fixed delay. A constant sleep has
+	// to be long enough for the slowest host to have started streaming
+	// and short enough that the fastest host has not already finished —
+	// on fast hardware no such constant exists, and the old 4s lost the
+	// overlap entirely. Watch the repo instead and switch over the
+	// moment bytes are actually landing, which buys back every second
+	// the sleep was spending.
+	const inFlightBytes = 8 << 20
+	inFlight := false
+	for deadline := time.Now().Add(90 * time.Second); time.Now().Before(deadline); {
+		select {
+		case res := <-done:
+			// The backup finished before we ever saw it streaming. Say
+			// so rather than reporting a pass — a scenario that did not
+			// happen is not evidence that it is handled.
+			t.Fatalf("the backup finished in %s, before the switchover could interrupt it "+
+				"(exit %d).\n\nThis test only means something if the two overlap. Raise "+
+				"PGHS_FAILOVER_SEED_ROWS (currently %d) so BASE_BACKUP runs longer on this host.",
+				time.Since(backupStart).Truncate(time.Millisecond), res.code, rows)
+		case <-time.After(100 * time.Millisecond):
+		}
+		if dirBytes(repoDir) >= baseRepoBytes+inFlightBytes {
+			inFlight = true
+			break
+		}
+	}
+	if !inFlight {
+		t.Fatalf("no backup bytes reached %s within 90s — BASE_BACKUP never started streaming",
+			repoDir)
 	}
 
 	t.Logf("switching over while the backup is in flight (%s elapsed)",
@@ -367,4 +408,21 @@ func backupIDs(t *testing.T, out string) []string {
 		ids = append(ids, b.BackupID)
 	}
 	return ids
+}
+
+// dirBytes totals the bytes under root, ignoring errors: it is a
+// progress signal, not an accounting one, and a file vanishing under a
+// concurrent writer must not fail the walk.
+func dirBytes(root string) int64 {
+	var total int64
+	_ = filepath.WalkDir(root, func(_ string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil //nolint:nilerr // transient walk errors are not fatal here
+		}
+		if info, ierr := d.Info(); ierr == nil {
+			total += info.Size()
+		}
+		return nil
+	})
+	return total
 }
