@@ -52,8 +52,8 @@ import (
 //     binary doesn't know how to verify (a future scheme written by
 //     a newer pg_hardstorage).
 //   - unencrypted — the manifest has no encryption block (NOT a
-//     break — operators who require encryption can drive their
-//     own policy from this counter).
+//     break by default — operators who require encryption pass
+//     --require-encrypted and get exit 9 for these too).
 //
 // Exit-code mapping:
 //
@@ -65,10 +65,11 @@ import (
 //     failed verification.
 func newKmsVerifyCmd() *cobra.Command {
 	var (
-		repoURL    string
-		deployment string
-		kekRef     string
-		kekFile    string
+		repoURL          string
+		deployment       string
+		kekRef           string
+		kekFile          string
+		requireEncrypted bool
 	)
 	c := &cobra.Command{
 		Use:   "verify",
@@ -84,8 +85,10 @@ For each manifest, kms verify:
      public key (manifests that don't verify get the loudest
      classification: signature_failed).
   2. Reads the encryption block. Manifests with no encryption block
-     are counted as 'unencrypted' (NOT a failure — that's the
-     operator's policy call).
+     are counted as 'unencrypted' (NOT a failure by default — that's
+     the operator's policy call; pass --require-encrypted for a
+     fleet whose policy is "everything is encrypted", and an
+     unencrypted manifest becomes a listed failure with exit 9).
   3. Resolves the KEK by KEKRef. By default the resolver is the
      local keystore, which knows the "local:default" ref. With
      --kek-ref + --kek-file the operator points at an explicit
@@ -110,10 +113,11 @@ with the resolved KEK, or any manifest signature failed.`,
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return runKmsVerify(cmd, kmsVerifyFlags{
-				repoURL:    repoURL,
-				deployment: deployment,
-				kekRef:     kekRef,
-				kekFile:    kekFile,
+				repoURL:          repoURL,
+				deployment:       deployment,
+				kekRef:           kekRef,
+				kekFile:          kekFile,
+				requireEncrypted: requireEncrypted,
 			})
 		},
 	}
@@ -125,14 +129,17 @@ with the resolved KEK, or any manifest signature failed.`,
 		"restrict to manifests whose KEKRef matches this string (default: all kek_refs)")
 	c.Flags().StringVar(&kekFile, "kek-file", "",
 		"path to KEK bytes for --kek-ref (32 bytes raw); required when --kek-ref is set, not the local-keystore ref, and the local keyring can't resolve the ref")
+	c.Flags().BoolVar(&requireEncrypted, "require-encrypted", false,
+		"treat manifests with no encryption block as failures (exit 9) instead of counting them as an operator policy choice")
 	return c
 }
 
 type kmsVerifyFlags struct {
-	repoURL    string
-	deployment string
-	kekRef     string
-	kekFile    string
+	repoURL          string
+	deployment       string
+	kekRef           string
+	kekFile          string
+	requireEncrypted bool
 }
 
 func runKmsVerify(cmd *cobra.Command, f kmsVerifyFlags) error {
@@ -168,6 +175,7 @@ func runKmsVerify(cmd *cobra.Command, f kmsVerifyFlags) error {
 		KEKResolver:      resolver,
 		DeploymentFilter: f.deployment,
 		KEKRefFilter:     f.kekRef,
+		RequireEncrypted: f.requireEncrypted,
 	})
 	if err != nil {
 		return kmsOpError(err, "kms verify", "kms.verify_failed", nil)
@@ -255,6 +263,9 @@ func summarizeKmsVerify(res *backup.VerifyEnvelopesResult) string {
 	}
 	if res.UnknownScheme > 0 {
 		parts = append(parts, fmt.Sprintf("%d unknown_scheme", res.UnknownScheme))
+	}
+	if res.RequireEncrypted && res.Unencrypted > 0 {
+		parts = append(parts, fmt.Sprintf("%d unencrypted", res.Unencrypted))
 	}
 	return "kms verify: " + strings.Join(parts, ", ") + " (out of " + fmt.Sprintf("%d considered", res.Considered) + ")"
 }

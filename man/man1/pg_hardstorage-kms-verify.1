@@ -28,8 +28,10 @@ Validates the manifest's Ed25519 signature against the local
  classification: signature_failed).
 .IP "  2." 5
 Reads the encryption block. Manifests with no encryption block
- are counted as 'unencrypted' (NOT a failure — that's the
- operator's policy call).
+ are counted as 'unencrypted' (NOT a failure by default — that's
+ the operator's policy call; pass --require-encrypted for a
+ fleet whose policy is "everything is encrypted", and an
+ unencrypted manifest becomes a listed failure with exit 9).
 .IP "  3." 5
 Resolves the KEK by KEKRef. By default the resolver is the
  local keystore, which knows the "local:default" ref. With
@@ -80,6 +82,10 @@ with the resolved KEK, or any manifest signature failed.
 .PP
 \fB--repo\fP=""
 	repository URL (required)
+
+.PP
+\fB--require-encrypted\fP[=false]
+	treat manifests with no encryption block as failures (exit 9) instead of counting them as an operator policy choice
 
 
 .SH OPTIONS INHERITED FROM PARENT COMMANDS

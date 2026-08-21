@@ -293,7 +293,9 @@ func (e *Engine) Execute(ctx context.Context, deployment string, strategy Strate
 			}
 			for _, file := range m.Files {
 				for _, c := range file.Chunks {
-					chunkRefs[c.Hash] = append(chunkRefs[c.Hash], m.BackupID)
+					// One entry per (chunk, backup), not one
+					// per chunk occurrence — see appendRef.
+					chunkRefs[c.Hash] = appendRef(chunkRefs[c.Hash], m.BackupID)
 				}
 			}
 		}
@@ -388,6 +390,25 @@ func finishRun(run *Run, now time.Time) {
 		return
 	}
 	run.Status = StatusOK
+}
+
+// appendRef records backupID as a referrer of one chunk, keeping the
+// slice at one entry per DISTINCT referrer instead of one per chunk
+// OCCURRENCE. The walk that feeds it is manifest-by-manifest, so every
+// append for a given backup is contiguous and a tail comparison is a
+// complete dedupe for that ordering — O(1) per chunk, no per-hash set.
+//
+// The de-duplication is not cosmetic: dedupeIDs already collapses the
+// list at report time, so before this the map held (and kept alive)
+// one string header per reference. A manifest that references one
+// chunk thousands of times — a repeated all-zeroes page, the common
+// case in a large relation — paid thousands of entries for a single
+// name, across every chunk, for the whole fleet walk.
+func appendRef(refs []string, backupID string) []string {
+	if n := len(refs); n > 0 && refs[n-1] == backupID {
+		return refs
+	}
+	return append(refs, backupID)
 }
 
 // dedupeIDs strips repeats from the per-chunk reference list so the

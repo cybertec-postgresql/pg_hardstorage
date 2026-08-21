@@ -41,7 +41,7 @@ JSON is `fedramp`.
 
 | Control | Title | Product feature | Command | Audit event |
 | --- | --- | --- | --- | --- |
-| AU-2 | Audit events | Hash-chained Merkle log; every operator action is an event | `pg_hardstorage audit search ...` | (every event) |
+| AU-2 | Audit events | Hash-chained log; every operator action is an event | `pg_hardstorage audit search ...` | (every event) |
 | AU-3 | Content of audit records | Schema-versioned events with actor, timestamp, action, subject, body | (automatic) | (every event) |
 | AU-4 | Audit storage capacity | Repo capacity report includes audit byte category | `pg_hardstorage capacity report` | (read-only) |
 | AU-5 | Response to audit logging failures | Append failure surfaces via `defaultAppendErrorLogger`; missing head pointer logged | (automatic) | (logged to stderr) |

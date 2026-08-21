@@ -374,4 +374,17 @@ func parseKEKRef(kekRef string) (keyName, versionRef string, err error) {
 // provider's encryption_context: ties the ciphertext to
 // pg_hardstorage so it can't be replayed against an
 // unrelated key reference.
+//
+// Scope of that guarantee, stated plainly: the AAD is a
+// CONSTANT, so it binds the wrapped DEK to "some
+// pg_hardstorage deployment", not to THIS one and not to a
+// particular manifest.  Two deployments sharing one KEK can
+// therefore unwrap each other's DEKs, and a wrapped DEK moved
+// between manifests under the same KEK still unwraps.  The
+// KEK boundary is the real isolation boundary — give each
+// deployment (and each tenant) its own key.  Binding the AAD
+// to (deployment, manifest) would narrow it further but is a
+// wire-format change: every DEK wrapped by an older binary
+// carries the old AAD and would stop unwrapping without a
+// dual-AAD read path.
 func aadBytes() []byte { return []byte("pg_hardstorage") }

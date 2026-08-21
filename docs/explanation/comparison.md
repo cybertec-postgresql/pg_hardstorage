@@ -17,7 +17,7 @@ in learning a new workflow. Here is the reasoning.
 | **Encryption** | optional, external | on by default, envelope encryption, named KMS integration |
 | **Patroni-aware** | manual failover handling | automatic leader-following with permanent slots |
 | **Coordination** | local state files | multi-host with PG advisory locks, K8s Leases; no extra daemon needed |
-| **Compliance** | external toolchain | built-in WORM, FIPS, Merkle audit chain, cosign attestation |
+| **Compliance** | external toolchain | built-in WORM, FIPS, hash-chained audit log, cosign attestation |
 
 ## pg_hardstorage vs WAL-G
 

@@ -428,7 +428,32 @@ func (s *Store) Append(ctx context.Context, ev *Event) error {
 	// correct PrevHash and strict forward progress: each iteration
 	// advances seq past a slot we observed taken, so the loop is bounded
 	// by the number of concurrent appenders.
-	for {
+	//
+	// Two guards keep a pathological repo from turning that bounded
+	// retry into an unkillable hot loop: every iteration honours ctx
+	// cancellation, and the relink helper forces the sequence
+	// strictly forward even when the winning event's body claims a
+	// stale Sequence (a hand-edited or half-migrated event whose body
+	// and key disagree would otherwise send us back to a slot we
+	// already know is taken, forever). maxAppendAttempts is the
+	// backstop for anything neither guard anticipated.
+	const maxAppendAttempts = 1024
+	relink := func(winner *Event) {
+		prevHash = winner.Hash
+		if next := winner.Sequence + 1; next > seq {
+			seq = next
+			return
+		}
+		seq++
+	}
+	for attempt := 0; ; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if attempt >= maxAppendAttempts {
+			return fmt.Errorf("audit: append %q: gave up after %d sequence collisions (shard %q, seq %d) — chain contention or an event body whose sequence disagrees with its key",
+				ev.Action, maxAppendAttempts, shard, seq)
+		}
 		ev.PrevHash = prevHash
 		ev.Sequence = seq
 
@@ -456,8 +481,7 @@ func (s *Store) Append(ctx context.Context, ev *Event) error {
 			// writing. The post-Put read-back below still covers the
 			// concurrent-writer window between this probe and our Put.
 			if existing, gerr := s.getByKey(ctx, key); gerr == nil {
-				prevHash = existing.Hash
-				seq = existing.Sequence + 1
+				relink(existing)
 				continue
 			}
 		}
@@ -512,8 +536,7 @@ func (s *Store) Append(ctx context.Context, ev *Event) error {
 		if gerr != nil {
 			return gerr
 		}
-		prevHash = winner.Hash
-		seq = winner.Sequence + 1
+		relink(winner)
 	}
 }
 

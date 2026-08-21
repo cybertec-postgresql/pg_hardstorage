@@ -184,7 +184,7 @@ pg_hardstorage audit append kms.shred \
 | Art. 17(2) — communication of erasure to recipients | Cross-region replicas hold the same wrapped DEKs; KEK destruction propagates implicitly. Replica audit chain records `kms.shred`. | `kms.shred` (replicated) |
 | Art. 30 — record of processing activities | Hash-chained audit log; `audit verify-chain` proves untampered. | `audit.*` |
 | Art. 32(1)(a) — encryption of personal data | AES-256-GCM per chunk (AES-256-GCM-SIV planned; FIPS-validated GCM in FIPS build). | `backup.create` (records `encryption.scheme`) |
-| Art. 32(1)(b) — confidentiality, integrity | Ed25519-signed manifests, Merkle audit chain. | `backup.create`, `audit.*` |
+| Art. 32(1)(b) — confidentiality, integrity | Ed25519-signed manifests, hash-chained audit log. | `backup.create`, `audit.*` |
 
 ---
 

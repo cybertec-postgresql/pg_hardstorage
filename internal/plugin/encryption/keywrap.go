@@ -27,6 +27,15 @@ const WrappedKeyLen = NonceLen + KeyLen + 16
 // reads (e.g. the GC pass that walks every manifest's chunks). The
 // integrity guarantee we need is "this DEK was wrapped under THIS
 // KEK", which the AEAD tag provides without AAD.
+//
+// What stops an envelope from being transplanted between manifests
+// under the same KEK is therefore NOT this AEAD tag — it is the
+// manifest's Ed25519 signature, which covers the encryption block.
+// Moving a wrapped DEK into another manifest invalidates that
+// signature, and every read path verifies it (ManifestStore.List /
+// readVerified, VerifyEnvelopes). An attacker who holds the signing
+// key needs no envelope tricks, so AAD would buy nothing there
+// either.
 func Wrap(kek [KeyLen]byte, dek [KeyLen]byte) ([]byte, error) {
 	block, err := aes.NewCipher(kek[:])
 	if err != nil {

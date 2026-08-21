@@ -30,7 +30,7 @@ The framework string in the report's JSON is `soc2`.
 | CC6.7 | Restricted access to information assets | Per-tenant KEK + RBAC scopes (RBAC enforced server-side / SCIM-provisioned; no operator CLI verb) | (server-side) | (server-side) |
 | CC6.8 | Detection and prevention of unauthorised software | SLSA L3 build provenance + cosign signatures on every release | (build-time) | (cosign attest) |
 | CC7.1 | Detection of system anomalies | Anomaly score (Z-score over 30-day baseline) per backup | `pg_hardstorage backup ...` | `anomaly.detected` |
-| CC7.2 | System events logged in tamper-evident chain | Hash-chained Merkle audit log | `pg_hardstorage audit verify-chain` | (every event) |
+| CC7.2 | System events logged in tamper-evident chain | Hash-chained audit log | `pg_hardstorage audit verify-chain` | (every event) |
 | CC7.3 | Evaluation of detected events | Insider-threat scanner + audit search | `pg_hardstorage insider scan` | `insider.scan` |
 | CC7.4 | Incident response and containment | Runbooks R1–R7; structured `doctor` remediation | `pg_hardstorage doctor` | `doctor.suggested_fix` |
 | CC8.1 | Authorise and document changes | n-of-m approval workflow on destructive ops | `pg_hardstorage approval request ...` | `approval.request`, `approval.approve` |

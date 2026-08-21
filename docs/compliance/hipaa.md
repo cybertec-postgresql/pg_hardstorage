@@ -42,7 +42,7 @@ JSON is `hipaa`.
 | §164.312(a)(2)(ii) | Emergency access procedure | JIT tokens + n-of-m approval | `pg_hardstorage jit issue ...`, `approval request ...` | `jit.issue`, `approval.request` |
 | §164.312(a)(2)(iii) | Automatic logoff | JIT tokens auto-expire (max 24h) | (automatic) | `jit.issue` |
 | §164.312(a)(2)(iv) | Encryption and decryption (Addressable) | AES-256-GCM per chunk (AES-256-GCM-SIV planned) | (automatic) | `backup.create` records `encryption.scheme` |
-| §164.312(b) | Audit controls | Hash-chained Merkle audit log | `pg_hardstorage audit verify-chain` | (every event) |
+| §164.312(b) | Audit controls | Hash-chained audit log | `pg_hardstorage audit verify-chain` | (every event) |
 | §164.312(c)(1) | Integrity | Ed25519-signed manifests + chunk SHA round-trip | `pg_hardstorage verify ...` | `verify.run` |
 | §164.312(c)(2) | Mechanism to authenticate ePHI | Manifest signatures + audit chain hashing | `pg_hardstorage audit verify-chain` | `verify.manifest_signature` (on fail) |
 | §164.312(d) | Person or entity authentication | mTLS for control plane ↔ agent; Ed25519 keypair per operator | (config) | (auth failures captured) |

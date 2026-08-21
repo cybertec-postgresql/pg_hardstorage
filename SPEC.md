@@ -142,7 +142,7 @@ PG 15+. WAL transport prefers the **PostgreSQL replication protocol over a datab
 - **Partial / table-level restore** — restore selected tables into a running database without touching the rest.
 - **Hot-standby restore** — continuously-updating read-only replica fed entirely from the backup pipeline.
 - **Synchronous backup target** — opt-in RPO=0 by acting as a `synchronous_standby_names` candidate.
-- **Hash-chained Merkle audit log** with periodic transparency-log anchoring.
+- **Hash-chained audit log** with periodic transparency-log anchoring.
 - **HSM / PKCS#11** for the most paranoid environments.
 - **Legal hold**, **data residency pinning**, **data classification tags**.
 - **n-of-m approvals** for destructive operations.
@@ -538,7 +538,7 @@ Audit of the original design surfaced these missing pieces. Many are now impleme
 | --- | --- | --- |
 | **PKCS#11 / HSM** support | Implemented | `internal/plugin/kms/pkcs11/` — nCipher, Thales, AWS CloudHSM, YubiHSM. |
 | **Threshold signing (k-of-n)** for backup attestations | Implemented | `internal/threshold/` — multi-party signing for highest-assurance manifests. |
-| **Hash-chained Merkle audit log** | Implemented | `internal/audit/`, `internal/chain/` — each audit event includes the prior event's hash → tamper-evident. Periodic anchor commits to Rekor / a customer-managed transparency log planned. |
+| **Hash-chained audit log** | Implemented | `internal/audit/`, `internal/chain/` — each audit event includes the prior event's hash → tamper-evident. Periodic anchor commits to Rekor / a customer-managed transparency log planned. |
 | **Customer-managed key (CMK) BYOK** with attested rotation | Implemented | Already implicit in KMS plugin; explicit BYOK story documented. |
 
 ### Data lifecycle & legal
@@ -782,7 +782,7 @@ pg_hardstorage
 ├── cost          report [--since 30d]
 ├── capacity      report [--horizon 90d]
 ├── kms           rotate | shred | inspect | hsm-status
-├── audit         search [filters] | verify-chain  # Merkle chain integrity
+├── audit         search [filters] | verify-chain  # hash chain integrity
 ├── fleet         search --query 'table:public.orders lsn>0/...'
 ├── server        # run control plane
 ├── agent         # run agent (Patroni configured per-deployment in YAML)
@@ -1555,7 +1555,7 @@ What we log for every LLM session:
 
 | Captured | Where |
 | --- | --- |
-| Every prompt sent to the model (post-redaction, full text under privacy mode) | Audit event `llm.prompt`, hash-chained into the Merkle audit log |
+| Every prompt sent to the model (post-redaction, full text under privacy mode) | Audit event `llm.prompt`, hash-chained into the audit log |
 | Every tool call the model made + its arguments + its result | `llm.tool_call`, hash-chained |
 | Every model response in full | `llm.response`, hash-chained |
 | Every command the model suggested + the preview output | `llm.suggestion` |
@@ -1567,7 +1567,7 @@ What we log for every LLM session:
 | Token usage per turn | `llm.tokens` |
 | Hand-offs to human (Jira ticket id, Slack thread url) | `llm.escalated` |
 
-All of these append to the same hash-chained Merkle audit log used for everything else, sink-fanned-out to every configured Sink, and (when WORM is configured) anchored to S3 Object Lock and a transparency log (Rekor) on the standard cadence. The chain is verifiable post-hoc with `pg_hardstorage audit verify-chain --since <ts>` — tamper-evident.
+All of these append to the same hash-chained audit log used for everything else, sink-fanned-out to every configured Sink, and (when WORM is configured) written under S3 Object Lock. Chain heads are anchored on the standard cadence to the self-hosted, storage-backed transparency log that ships today; anchoring to an external witness (Rekor) is roadmap behind the same interface. The chain is verifiable post-hoc with `pg_hardstorage audit verify-chain --since <ts>` — tamper-evident.
 
 The user can produce a **signed evidence bundle** for any session:
 
@@ -1577,7 +1577,7 @@ Wrote signed evidence bundle to ./session-20260428T1423-db1-restore.evidence.tar
   - transcript.ndjson         (every prompt, tool call, response, in order)
   - tool_results/             (raw JSON of each tool call's return)
   - executed_commands.ndjson  (every command actually run, exit code, duration)
-  - audit_chain_proof.json    (Merkle proof: this session's events anchor at chain pos 1428..1547)
+  - audit_chain_proof.json    (chain proof: this session's events anchor at chain pos 1428..1547)
   - skill_used.yaml           (the exact skill file at the version used)
   - skill_signature.sig       (cosign signature)
   - model_metadata.json       (provider, model id, model version, model fingerprint)
@@ -2219,7 +2219,7 @@ reflects what is actually implemented today vs what remains.
 - REST API + gRPC + cobra CLI + `init` wizard + `doctor` + `status` +
   interactive `restore`.
 - mTLS + token auth. FIPS build variant (`GOEXPERIMENT=boringcrypto`).
-- Prometheus metrics, structured JSON logs, Merkle-hash-chained audit log.
+- Prometheus metrics, structured JSON logs, hash-chained audit log.
 - Coordination: JSON state files (single-host) + PG advisory locks (small
   fleet) + K8s Leases (in-cluster). No etcd dependency, no embedded SQLite.
 - Sinks: `slack`, `webhook`, `syslog`, `pagerduty`, `email`, `cef`,
@@ -2249,7 +2249,7 @@ reflects what is actually implemented today vs what remains.
   linted+golden-tested in CI); skills `ask`/`explain`/`restore`/`incident`/
   `runbook`/`postmortem`; `--on-error-llm` auto-launch; privacy modes;
   mandatory `preview_command` before suggested mutations, replay-protected
-  `execute_command`; Merkle-hash-chained audit; signed exportable evidence
+  `execute_command`; hash-chained audit; signed exportable evidence
   bundles.
 - Testkit: `pg_hardstorage_testkit` binary; topology providers `local-docker`,
   `testcontainers`, `kind`, `ssh-inventory`; deterministic load engine with
@@ -2296,7 +2296,7 @@ reflects what is actually implemented today vs what remains.
 10. **Natural-language time parser misinterpretation** — restore preview is mandatory before execution. `--confirm` required for actual mutation.
 11. **Per-tenant KMS at 1000-tenant scale** — AWS KMS grants are per-key. Open: single-key + encryption context vs key-per-tenant trade-off.
 12. **Logical decoding caveats** — DDL not captured by default (improving in PG 18); slot is primary-only (changing in newer PG); high primary CPU cost. We refuse to mark a deployment "backed up" on logical-only.
-13. **Merkle audit-chain anchoring cadence** — per-event hashing is cheap; transparency-log anchoring needs throttling to avoid runaway Rekor costs. Default: hourly anchor.
+13. **Audit-chain anchoring cadence** — per-event hashing is cheap; transparency-log anchoring needs throttling to avoid runaway Rekor costs. Default: hourly anchor.
 14. **HSM availability** — PKCS#11 path adds a hard external dependency. Mitigation: HSM is opt-in; default is cloud KMS or local AES-GCM.
 15. **PG advisory lock TTL** — PG advisory locks are session-bound, not TTL-bound. Coordination layer wraps them in a heartbeat goroutine; agent crash releases the session and the lock is auto-released. Document the implication: advisory locks survive ungraceful network partitions only as long as the TCP keepalive does.
 
@@ -2373,7 +2373,7 @@ reflects what is actually implemented today vs what remains.
 - [internal/obs/metrics/](internal/obs/metrics/) — dependency-free Prometheus registry + `/metrics` exposition
 - [internal/obs/resilience/metrics.go](internal/obs/resilience/metrics.go)
 - [internal/fips/fips.go](internal/fips/fips.go) — BoringCrypto FIPS build variant
-- [internal/audit/](internal/audit/) — Merkle-hash-chained audit log
+- [internal/audit/](internal/audit/) — hash-chained audit log
 - [internal/llm/](internal/llm/) — LLM assistant subsystem (chat, tools, safety, privacy, MCP, skills, evidence)
 - [api/openapi.yaml](api/openapi.yaml) — OpenAPI 3.1 REST API specification
 - [proto/](proto/) — protobuf definitions (gRPC)

@@ -36,8 +36,11 @@ restorability of existing backups.
 
 - Manifest signatures: Ed25519, public key embedded.
 - Chunk encryption: AES-256-GCM, per-backup DEK, KEK at rest.
-- KMS plugins: AWS KMS in v0.1; GCP KMS, Azure Key Vault, Vault
-  Transit, PKCS#11/HSM, TPM in v0.5+.
+- KMS plugins shipping today: AWS KMS, GCP KMS, Azure Key Vault,
+  Vault Transit, PKCS#11/HSM (registered in
+  `internal/cli/plugins_register.go`), plus the local keyring.
+  TPM-backed key custody is NOT implemented — do not plan a
+  deployment around it.
 - All release artefacts are cosign-signed (Sigstore keyless via
   GitHub Actions OIDC). Verify before deploying — the README contains
   a worked example.

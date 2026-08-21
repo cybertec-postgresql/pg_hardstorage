@@ -121,6 +121,19 @@ type VerifyEnvelopesOptions struct {
 	// the old ref").
 	KEKRefFilter string
 
+	// RequireEncrypted turns "this manifest has no encryption block"
+	// from a counter into a finding: unencrypted manifests land in
+	// Failures and AnyBroken reports true.
+	//
+	// The default (false) is right for a fleet that is unencrypted by
+	// choice. It is wrong for a fleet whose policy is "everything is
+	// encrypted": there, a manifest that lost its encryption block —
+	// a downgrade, an operator who ran one backup with the wrong
+	// config, a hostile rewrite that strips the envelope to make the
+	// chunks readable — is exactly the event the audit exists to
+	// catch, and the default posture reports it as a clean run.
+	RequireEncrypted bool
+
 	// OnProgress fires per finding (after classification). Optional.
 	// Synchronous; do not block.
 	OnProgress func(VerifyEnvelopeFinding)
@@ -135,6 +148,10 @@ type VerifyEnvelopesResult struct {
 
 	DeploymentFilter string `json:"deployment_filter,omitempty"`
 	KEKRefFilter     string `json:"kek_ref_filter,omitempty"`
+
+	// RequireEncrypted echoes the option that produced this result, so
+	// a stored JSON body records the policy the run was judged under.
+	RequireEncrypted bool `json:"require_encrypted,omitempty"`
 
 	// Considered counts every manifest we attempted to classify
 	// (including ones filtered out by KEKRefFilter, which appear under
@@ -158,10 +175,15 @@ type VerifyEnvelopesResult struct {
 }
 
 // AnyBroken reports whether any finding indicates an envelope break.
-// Unencrypted manifests are not "broken" — they're a policy concern
-// the operator handles. Skipped manifests are explicitly excluded.
+// Unencrypted manifests are not "broken" by default — they're a policy
+// concern the operator handles — but count as breaks when the run was
+// made under RequireEncrypted. Skipped manifests are always excluded.
 func (r *VerifyEnvelopesResult) AnyBroken() bool {
-	return r.KEKUnknown+r.WrappedDEKCorrupt+r.UnwrapFailed+r.UnknownScheme+r.SignatureFailed > 0
+	broken := r.KEKUnknown + r.WrappedDEKCorrupt + r.UnwrapFailed + r.UnknownScheme + r.SignatureFailed
+	if r.RequireEncrypted {
+		broken += r.Unencrypted
+	}
+	return broken > 0
 }
 
 // VerifyEnvelopes runs one fleet-wide envelope check against sp.
@@ -182,6 +204,7 @@ func VerifyEnvelopes(ctx context.Context, sp storage.StoragePlugin, opts VerifyE
 		StartedAt:        time.Now().UTC(),
 		DeploymentFilter: opts.DeploymentFilter,
 		KEKRefFilter:     opts.KEKRefFilter,
+		RequireEncrypted: opts.RequireEncrypted,
 	}
 	finish := func() {
 		res.StoppedAt = time.Now().UTC()
@@ -260,6 +283,10 @@ func classifyEnvelope(res *VerifyEnvelopesResult, opts VerifyEnvelopesOptions, d
 		}
 		f.Status = EnvelopeStatusUnencrypted
 		res.Unencrypted++
+		if opts.RequireEncrypted {
+			f.Reason = "manifest has no encryption block and the run requires encryption"
+			recordFinding(res, f)
+		}
 		emitFinding(opts, f)
 		return
 	}

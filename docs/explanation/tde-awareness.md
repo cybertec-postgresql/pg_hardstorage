@@ -188,7 +188,7 @@ require zero changes:
 | `START_REPLICATION ... LOGICAL` (CDC) | Logical decoding is a server-side operation that emits row-level changes; ciphertext stops at the buffer manager. |
 | `IDENTIFY_SYSTEM` | A server function call returning plaintext text columns. |
 | FastCDC chunker | Content-defined splits; doesn't assume page boundaries or header layouts. |
-| Manifest signing / Merkle audit chain | Operates on our own bytes, not on PG's. |
+| Manifest signing / audit chain | Operates on our own bytes, not on PG's. |
 | Repository-side envelope encryption (KEK + DEK) | Orthogonal: encrypts whatever bytes the chunker fed it.  TDE source + repo encryption is defence in depth, both layers active. |
 | Incremental BASE_BACKUP (PG 17+) | PG's `summarize_wal` runs on plaintext WAL inside the server; the wire delivery is plaintext.  TDE doesn't interact with the incremental protocol. |
 

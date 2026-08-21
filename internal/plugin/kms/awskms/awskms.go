@@ -213,6 +213,14 @@ func (p *Provider) KEKRef() string { return p.kekRef }
 func (p *Provider) FIPSMode() bool { return p.fipsMode }
 
 // WrapDEK implements kms.Provider.
+//
+// EncryptionContext is a constant, so it binds the ciphertext
+// to "some pg_hardstorage deployment" rather than to this one
+// or to a specific manifest: anyone holding the same CMK can
+// unwrap. Per-deployment / per-tenant KEKs are what isolate
+// one deployment's DEKs from another's — see the note on
+// gcpkms.aadBytes for why narrowing the context is a
+// wire-format change rather than a one-line edit.
 func (p *Provider) WrapDEK(ctx context.Context, dek []byte) ([]byte, error) {
 	if err := p.assertOpen(); err != nil {
 		return nil, err

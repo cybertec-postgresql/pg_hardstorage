@@ -186,7 +186,7 @@ GET  /v1/kms/inspect                                 # keyring summary (v0.5+)
 
 ```
 GET  /v1/audit                                       # search; filter by since/action/deployment (v0.5+)
-POST /v1/audit/verify-chain                          # walk Merkle chain (v0.5+)
+POST /v1/audit/verify-chain                          # walk hash chain (v0.5+)
 ```
 
 ### Doctor

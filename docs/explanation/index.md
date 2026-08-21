@@ -46,7 +46,7 @@ SPEC is the source of truth and we want to know — file an issue.
   Transparent Data Encryption (CYBERTEC PGEE, pg_tde, EDB TDE):
   the one config flag, what does and doesn't change under TDE,
   the failure modes if it's forgotten.
-- [Audit chain](audit-chain.md) — hash-chained Merkle audit log,
+- [Audit chain](audit-chain.md) — hash-chained audit log,
   transparency-log anchoring, what `audit verify-chain` actually
   checks.
 - [LLM safety stack](llm-safety-stack.md) — the five gates

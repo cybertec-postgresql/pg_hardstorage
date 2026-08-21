@@ -11,6 +11,76 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ## [Unreleased]
 
+### Security
+
+- **`audit verify-bundle` now binds the recorded signer to the key that
+  validates the bundle.** An audit-evidence bundle carries the events, a
+  detached signature, and the public key in the same tarball, so the
+  signature alone only ever proved "signed by whoever ships inside this
+  file". An attacker who rewrote the events could re-sign them under their
+  own key, drop in their own `public_key.pem`, and leave the operator's
+  `public_key_fingerprint` untouched in `bundle.json` — the bundle verified
+  and the identity an auditor reads was the victim's. `VerifyBundle` now
+  refuses a bundle whose bundled key does not hash to the fingerprint the
+  manifest records. Honest bundles are unaffected; a bundle produced before
+  this change still verifies, because the exporter has always written the
+  matching fingerprint.
+
+### Fixed
+
+- **The audit-chain append loop can no longer spin forever.** `Store.Append`
+  claims its sequence slot with a conditional put and relinks onto the
+  winner when it loses the race. If a slot's stored event body reported a
+  sequence at or below the one just attempted — a hand-edited event, a
+  half-migrated legacy chain, an object restored into the wrong slot — the
+  relink sent the loop back to the same occupied slot indefinitely, in a
+  goroutine that held no lock and ignored cancellation. The loop now forces
+  the sequence strictly forward, honours context cancellation on every
+  iteration, and gives up after 1024 collisions with a diagnosable error.
+- **Auxiliary WAL archive files (`.history`, `.backup`) get the same
+  split-brain check segment manifests already get.** `PushAuxiliaryFile`
+  treated "an object already exists at this key" as an idempotent
+  `archive_command` retry without comparing content. Two clusters sharing a
+  deployment name (a cloned datadir, a restored copy still archiving) write
+  the same key with different bodies, so PG was told "archived" while the
+  repo held the other cluster's timeline history — invisible until a restore
+  read the wrong parent timeline. Conflicting content now fails with
+  `splitbrain.content_mismatch`; identical bytes remain an idempotent
+  success.
+- **Integrity runs hold one referrer entry per backup, not per chunk
+  reference.** The fleet-wide chunk→referrers map appended a backup ID for
+  every chunk *occurrence*, so a manifest referencing one chunk thousands of
+  times (a repeated all-zeroes page) paid thousands of entries for a single
+  name — across every chunk, for the whole walk — only for the report to
+  collapse them. Reported output is unchanged.
+
+### Added
+
+- **`kms verify --require-encrypted`.** For a fleet whose policy is
+  "everything is encrypted", a manifest that lost its encryption block is
+  the event the audit exists to catch; the default posture counts it as an
+  operator policy choice and exits 0. With the flag, unencrypted manifests
+  are listed in `failures` and the command exits 9. The result body records
+  the policy it was judged under.
+
+### Changed
+
+- **Documentation: the audit log is a linear hash chain, not a Merkle
+  tree.** SPEC, glossary, compliance mappings, and the explanation pages
+  described the chain as "Merkle" and its export as a "Merkle proof". The
+  implementation stores each event's predecessor hash the way git stores
+  commits, and `audit export` ships a chain proof (head pointer plus the
+  window's edge hashes), not an inclusion proof against a tree root. The
+  tamper-evidence property is unchanged; what a third-party verifier
+  recomputes is not.
+- **Documentation: transparency-log anchoring and KMS provider coverage now
+  match the runtime.** The shipped transparency log is the self-hosted,
+  storage-backed one; external Rekor anchoring stays roadmap and is no
+  longer described as a live cadence. `SECURITY.md` lists the KMS providers
+  actually registered (AWS, GCP, Azure Key Vault, Vault Transit, PKCS#11,
+  plus the local keyring) and states plainly that TPM-backed custody is not
+  implemented.
+
 ## [1.2.4] — 2026-08-19
 
 ### Fixed

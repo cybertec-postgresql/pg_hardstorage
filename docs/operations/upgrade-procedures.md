@@ -129,7 +129,7 @@ audit log marker so the chain shows continuity across the rotation.
 
 ## Audit chain continuity across upgrades
 
-The audit log is a Merkle hash chain — each event's `hash` field
+The audit log is a hash chain — each event's `hash` field
 includes the previous event's hash, so any tamper or omission is
 detectable.
 

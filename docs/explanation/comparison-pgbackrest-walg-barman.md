@@ -48,7 +48,7 @@ time to earn equivalent confidence.
 | **Dedup** | Cross-backup, cross-deployment, cross-tenant-ish | Within incremental chain | Page-delta | Within chain |
 | **Encryption default** | AES-256-GCM envelope, on by default | Optional, configurable | Optional | Optional |
 | **KMS support** | AWS / GCP / Azure / Vault / HSM | Per-deployment | AWS / GCP / Azure | Per-deployment |
-| **Audit log** | Hash-chained Merkle, transparency-anchored (v0.5+) | Standard log file | Standard log file | Standard log file |
+| **Audit log** | Hash-chained, transparency-anchored (v0.5+) | Standard log file | Standard log file | Standard log file |
 | **WORM** | First-class (S3 Object Lock, Azure immutable, NetApp SnapLock) | Backend-dependent | Backend-dependent | Backend-dependent |
 | **FIPS build** | `pg-hardstorage-fips` flavour | Build-time | Build-time | Build-time |
 | **Patroni integration** | REST-aware + permanent_slots + dual-slot + sync-target | Config integration | Patroni `bootstrap.method` | Standard PG replication |

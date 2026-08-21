@@ -109,7 +109,7 @@ information-asset register entry should record:
 | Classification | Per-deployment via `classify` |
 | Encryption | AES-256-GCM per chunk (AES-256-GCM-SIV planned) |
 | Retention | Per `retention` policy in deployment config |
-| Audit | Hash-chained Merkle log; quarterly bundle export |
+| Audit | Hash-chained log; quarterly bundle export |
 | Region | Per `residency` policy |
 
 The audit evidence bundle is the assets-and-controls

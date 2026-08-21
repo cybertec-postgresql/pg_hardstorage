@@ -469,7 +469,7 @@ mode more permissive than 0600 (the `cp -r` footgun).
 
 ## 8. Audit log
 
-Append-only Merkle hash chain. Each event is a canonical-JSON record;
+Append-only hash chain. Each event is a canonical-JSON record;
 the hash links to the previous event's hash, so any tamper is
 detectable.
 

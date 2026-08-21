@@ -81,4 +81,5 @@ core.*
 # above); anchored to root so they don't shadow the corresponding
 # cmd/* packages.
 /pg_hardstorage
+/review/
 /pg_hardstorage_testkit

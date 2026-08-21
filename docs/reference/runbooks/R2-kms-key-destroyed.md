@@ -121,7 +121,7 @@ unrecoverable backups become readable again.
   range.
 - Notify per organisational policy. If this was unintentional and
   customer-impacting data is lost, that is a breach event.
-- Tighten key custody: HSM/PKCS#11/TPM-sealed keys (v0.5+) or
-  cloud-KMS-backed KEKs prevent single-host key loss.
+- Tighten key custody: HSM/PKCS#11-sealed keys (TPM sealing is not
+  implemented) or cloud-KMS-backed KEKs prevent single-host key loss.
 - Add a check to `doctor`-driven alerting that flags missing
   keyring files immediately rather than at next read.

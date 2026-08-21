@@ -437,14 +437,46 @@ func PushAuxiliaryFile(ctx context.Context, sp storage.StoragePlugin, path strin
 	}
 	if err := storage.CommitExclusive(ctx, sp, key, body, putOpts); err != nil {
 		if errors.Is(err, storage.ErrAlreadyExists) {
-			// Idempotent: PG retried archive_command after a
-			// previous success; the existing object is the
-			// authoritative copy.  Treat as success.
-			return key, kind, nil
+			// Something already sits at this key.  A genuine
+			// archive_command retry re-pushes the SAME bytes and is
+			// an idempotent success — but two clusters that share a
+			// deployment name (cloned datadir, a restored copy still
+			// archiving) write DIFFERENT `.history` / `.backup`
+			// bodies to the identical key.  Returning success there
+			// tells PG the file is archived when the repo actually
+			// holds someone else's copy, and the divergence is
+			// invisible until a restore reads the wrong timeline
+			// history.  Compare before claiming success — the same
+			// posture commitManifestStandalone already takes for
+			// segment manifests.
+			return key, kind, verifyExistingAuxiliaryFile(ctx, sp, key, body)
 		}
 		return "", kind, fmt.Errorf("walsink push: commit aux file: %w", err)
 	}
 	return key, kind, nil
+}
+
+// verifyExistingAuxiliaryFile reads the object already at key and
+// compares it byte-for-byte against body.  Returns nil iff they match
+// (true idempotent re-push); otherwise a structured error using the
+// same `splitbrain.*` code prefixes verifyExistingManifest emits, so
+// the CLI's error routing and the operator's runbook cover both paths
+// with one vocabulary.
+func verifyExistingAuxiliaryFile(ctx context.Context, sp storage.StoragePlugin, key string, body []byte) error {
+	rc, err := sp.Get(ctx, key)
+	if err != nil {
+		return fmt.Errorf("splitbrain.read_failed: existing auxiliary file %q present but unreadable: %w", key, err)
+	}
+	defer rc.Close()
+	existing, err := io.ReadAll(rc)
+	if err != nil {
+		return fmt.Errorf("splitbrain.read_failed: read existing auxiliary file %q: %w", key, err)
+	}
+	if !bytes.Equal(existing, body) {
+		return fmt.Errorf("splitbrain.content_mismatch: auxiliary file %q already archived with different content (%d bytes on repo, %d bytes pushed); split-brain or external corruption",
+			key, len(existing), len(body))
+	}
+	return nil
 }
 
 // readAuxiliaryFile slurps an auxiliary file in full, refusing anything larger

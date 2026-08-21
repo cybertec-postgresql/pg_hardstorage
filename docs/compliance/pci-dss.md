@@ -71,7 +71,7 @@ PCI Type II reports. `pg_hardstorage` contributes:
 | 10.2.1.5 | Logs include authentication mechanism changes | KEK rotation + key changes recorded | `pg_hardstorage kms rotate` | `kms.rotate` |
 | 10.2.1.6 | Logs include init / stop of audit logs | Control-plane startup is logged as `control_plane.starting`; there is no discrete audit-chain stop event | (automatic) | `control_plane.starting` |
 | 10.3 | Log records contain timestamps | RFC3339 UTC timestamp on every event | (automatic) | (every event) |
-| 10.5 | Audit logs cannot be modified | Hash-chained Merkle log + WORM bucket support | `pg_hardstorage audit verify-chain` | `verify.audit_chain_broken` (on fail) |
+| 10.5 | Audit logs cannot be modified | Hash-chained log + WORM bucket support | `pg_hardstorage audit verify-chain` | `verify.audit_chain_broken` (on fail) |
 | 10.5.4 | Logs of public-facing components retained | WORM retention via S3 Object Lock / Azure immutable blob | (config) | (WORM-locked on write) |
 | 10.6 | Time synchronisation | UTC timestamps; NTP recommended in operator guide | (operator) | — |
 | 10.7 | Investigate logs at least daily | Insider-threat scanner runs against audit log | `pg_hardstorage insider scan` | `insider.scan` |

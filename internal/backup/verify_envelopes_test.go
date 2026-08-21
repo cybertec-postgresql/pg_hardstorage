@@ -381,3 +381,75 @@ func TestVerifyEnvelopes_ContextCancellation(t *testing.T) {
 		t.Errorf("err = %v, want context.Canceled", err)
 	}
 }
+
+// TestVerifyEnvelopes_RequireEncrypted: for a fleet whose policy is
+// "everything is encrypted", a manifest that lost its encryption block
+// is the finding the audit exists to surface — a downgrade, a run with
+// the wrong config, or a rewrite that strips the envelope to leave the
+// chunks readable. Under RequireEncrypted it becomes a listed failure
+// and AnyBroken (→ exit 9) reports it.
+func TestVerifyEnvelopes_RequireEncrypted(t *testing.T) {
+	w := setupRotateWorld(t)
+	kek := mkKEK(t)
+	w.commitEncrypted(t, "db1", "db1.full.A", kek, "test:v1", 1)
+	w.commitUnencrypted(t, "db1", "db1.full.plain", 2)
+
+	res, err := backup.VerifyEnvelopes(context.Background(), w.sp, backup.VerifyEnvelopesOptions{
+		Verifier:         w.verifier,
+		KEKResolver:      constResolver(kek),
+		RequireEncrypted: true,
+	})
+	if err != nil {
+		t.Fatalf("VerifyEnvelopes: %v", err)
+	}
+	if res.OK != 1 || res.Unencrypted != 1 {
+		t.Fatalf("OK = %d, Unencrypted = %d; want 1 and 1", res.OK, res.Unencrypted)
+	}
+	if !res.AnyBroken() {
+		t.Error("AnyBroken = false; an unencrypted manifest under --require-encrypted is a break")
+	}
+	if !res.RequireEncrypted {
+		t.Error("result should record the policy it was judged under")
+	}
+	var found bool
+	for _, f := range res.Failures {
+		if f.BackupID == "db1.full.plain" {
+			found = true
+			if f.Status != backup.EnvelopeStatusUnencrypted {
+				t.Errorf("status = %q, want %q", f.Status, backup.EnvelopeStatusUnencrypted)
+			}
+			if f.Reason == "" {
+				t.Error("failure carries no reason; the operator can't tell why it was listed")
+			}
+		}
+	}
+	if !found {
+		t.Errorf("unencrypted manifest missing from Failures: %+v", res.Failures)
+	}
+	// The encrypted manifest is not dragged in with it.
+	if len(res.Failures) != 1 {
+		t.Errorf("Failures = %d entries, want 1: %+v", len(res.Failures), res.Failures)
+	}
+}
+
+// TestVerifyEnvelopes_RequireEncrypted_CleanFleet: the flag is a policy
+// assertion, not a new failure mode — an all-encrypted fleet still
+// passes.
+func TestVerifyEnvelopes_RequireEncrypted_CleanFleet(t *testing.T) {
+	w := setupRotateWorld(t)
+	kek := mkKEK(t)
+	w.commitEncrypted(t, "db1", "db1.full.A", kek, "test:v1", 1)
+	w.commitEncrypted(t, "db1", "db1.full.B", kek, "test:v1", 2)
+
+	res, err := backup.VerifyEnvelopes(context.Background(), w.sp, backup.VerifyEnvelopesOptions{
+		Verifier:         w.verifier,
+		KEKResolver:      constResolver(kek),
+		RequireEncrypted: true,
+	})
+	if err != nil {
+		t.Fatalf("VerifyEnvelopes: %v", err)
+	}
+	if res.AnyBroken() {
+		t.Errorf("AnyBroken = true on an all-encrypted fleet: %+v", res.Failures)
+	}
+}

@@ -216,7 +216,7 @@ graph TD
     Ts[llm.tokens<br/>per turn]
     E[llm.escalated<br/>where to]
 
-    P --> Chain[(Hash-chained<br/>Merkle audit log)]
+    P --> Chain[(Hash-chained<br/>audit log)]
     T --> Chain
     R --> Chain
     S --> Chain
@@ -229,7 +229,7 @@ graph TD
 ```
 
 Everything in the diagram appends to the same hash-chained
-Merkle log that everything else in the system uses (see [the
+log that everything else in the system uses (see [the
 audit chain](audit-chain.md)).  Sinks fan out where configured.
 WORM and transparency-log anchoring apply.
 
@@ -250,7 +250,7 @@ Wrote signed evidence bundle to ./session-20260428T1423-db1-restore.evidence.tar
   - transcript.ndjson         (every prompt, tool call, response, in order)
   - tool_results/             (raw JSON of each tool call's return)
   - executed_commands.ndjson  (every command actually run, exit code, duration)
-  - audit_chain_proof.json    (Merkle proof: this session's events anchor at chain pos 1428..1547)
+  - audit_chain_proof.json    (chain proof: this session's events anchor at chain pos 1428..1547)
   - skill_used.yaml           (the exact skill file at the version used)
   - skill_signature.sig       (Ed25519 signature, agent keyring)
   - model_metadata.json       (provider, model id, model version, model fingerprint)
@@ -261,7 +261,7 @@ The bundle is what an admin shows in a post-incident review or a
 regulatory audit.  Independent verifiability — no trust required
 in our software's good-faith reporting.
 
-The Merkle proof in `audit_chain_proof.json` ties the session's
+The chain proof in `audit_chain_proof.json` ties the session's
 events to specific positions in the global audit chain.  An
 auditor can re-verify the chain (`audit verify-chain --repo
 <url>`), confirm the session's events are in the chain, and confirm

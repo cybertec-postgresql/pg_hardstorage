@@ -27,8 +27,10 @@ For each manifest, kms verify:
      public key (manifests that don't verify get the loudest
      classification: signature_failed).
   2. Reads the encryption block. Manifests with no encryption block
-     are counted as 'unencrypted' (NOT a failure — that's the
-     operator's policy call).
+     are counted as 'unencrypted' (NOT a failure by default — that's
+     the operator's policy call; pass --require-encrypted for a
+     fleet whose policy is "everything is encrypted", and an
+     unencrypted manifest becomes a listed failure with exit 9).
   3. Resolves the KEK by KEKRef. By default the resolver is the
      local keystore, which knows the "local:default" ref. With
      --kek-ref + --kek-file the operator points at an explicit
@@ -63,6 +65,7 @@ pg_hardstorage kms verify [flags]
       --kek-file string     path to KEK bytes for --kek-ref (32 bytes raw); required when --kek-ref is set, not the local-keystore ref, and the local keyring can't resolve the ref
       --kek-ref string      restrict to manifests whose KEKRef matches this string (default: all kek_refs)
       --repo string         repository URL (required)
+      --require-encrypted   treat manifests with no encryption block as failures (exit 9) instead of counting them as an operator policy choice
 ```
 
 ### Options inherited from parent commands

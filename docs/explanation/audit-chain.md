@@ -1,10 +1,10 @@
 ---
 title: Audit chain
-description: Hash-chained Merkle audit log, transparency-log anchoring, and how `audit verify-chain` proves nothing was rewritten.
+description: Hash-chained audit log, transparency-log anchoring, and how `audit verify-chain` proves nothing was rewritten.
 tags:
   - audit
   - compliance
-  - merkle
+  - hash-chain
   - tamper-evidence
 ---
 
@@ -275,7 +275,7 @@ post-incident replay can show the full timeline without
 correlating across separate logs.
 
 The exportable evidence bundle (`pg_hardstorage llm
-export-session`) includes a Merkle proof that the session's
+export-session`) includes a chain proof that the session's
 events anchor at specific positions in the chain, signed with
 the agent's Ed25519 keyring.  An auditor can verify the session is exactly what the
 chain says it was, with no trust in the binary's good-faith

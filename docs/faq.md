@@ -476,7 +476,7 @@ binary.  Index:
 
 #### Does it produce SOC 2 evidence?
 
-Yes — the audit log is hash-chained Merkle, periodically
+Yes — the audit log is hash-chained, periodically
 anchored to a self-hosted, storage-backed transparency log.
 External-witness anchoring (a real Rekor / Sigstore backend)
 is on the roadmap and drops in behind the same interface.
@@ -527,7 +527,7 @@ controls and lists which feature satisfies each:
 `pg_hardstorage llm export-session <id>` for an LLM-
 assisted operation, `pg_hardstorage audit export-bundle`
 for the audit chain itself.  Both produce a tarball with
-the events, the Merkle proof, the signing keys' public
+the events, the chain proof, the signing keys' public
 material, and a cosign signature on the bundle.  See
 [audit evidence bundles](compliance/audit-evidence-bundles.md).
 

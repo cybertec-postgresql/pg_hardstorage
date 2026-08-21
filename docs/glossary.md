@@ -72,7 +72,7 @@ backups and release binaries carry attestations.  See
 
 #### Audit chain
 
-The append-only, hash-chained Merkle log of every
+The append-only, hash-chained log of every
 significant event (backup committed, restore started, KMS
 rotated, LLM session opened, …).  Periodic anchors land in a
 transparency log (self-hosted today; external Rekor anchoring
@@ -270,7 +270,7 @@ DEK unrecoverable.  See
 A signed, self-contained tarball produced by
 `pg_hardstorage llm export-session` (or the audit
 `export-bundle` command) containing every prompt, tool
-call, response, executed command, and a Merkle proof.
+call, response, executed command, and a chain proof.
 Independently verifiable post-hoc; the artefact a regulator
 sees in a post-incident review.  See
 [audit evidence bundles](compliance/audit-evidence-bundles.md).
@@ -387,9 +387,17 @@ helper's tool surface to any MCP-aware client (Continue,
 Cursor, Zed, Goose, Cline, …).  See the SPEC's
 [LLM helper § MCP](https://github.com/cybertec-postgresql/pg_hardstorage/blob/main/SPEC.md).
 
-#### Merkle audit chain
+#### Merkle
 
-See [audit chain](#audit-chain).
+Not what the audit chain is, despite earlier wording in
+these docs.  The audit log is a LINEAR hash chain — each
+event stores the hash of the event before it, the way git
+stores commits — not a Merkle tree, and `audit export` ships
+a chain proof (head pointer plus the window's edge hashes),
+not an inclusion proof against a tree root.  The tamper-
+evidence property is the same; the shape, and therefore what
+a verifier recomputes, is not.  See
+[audit chain](#audit-chain).
 
 #### `--on-error-llm`
 
@@ -705,10 +713,15 @@ sight; PITR across a failover boundary depends on it.
 
 #### Transparency log
 
-A public, append-only log (Rekor by default) that anchors
-audit chain hashes externally so tampering becomes
-detectable from outside the system being audited.  See
-[audit chain](explanation/audit-chain.md).
+An append-only log that anchors audit-chain hashes outside
+the system being audited, so tampering stays detectable even
+when the repo operator is the attacker.  What ships today is
+the self-hosted, storage-backed log (anchors land in the repo
+at `audit/anchors/`); anchoring to an EXTERNAL witness such
+as Rekor is roadmap and drops in behind the same interface.
+Self-hosted anchors bound how far back a repo-level attacker
+can rewrite, but they do not give the outside-witness
+property.  See [audit chain](explanation/audit-chain.md).
 
 #### TDE (Transparent Data Encryption)
 

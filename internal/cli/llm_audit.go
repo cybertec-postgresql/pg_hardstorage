@@ -33,7 +33,7 @@ func buildAuditEmitter(ctx context.Context, repoURL string) (chat.AuditEmitter, 
 }
 
 // auditChainEmitter wraps an audit.Store so chat.Session events
-// flow into the hash-chained Merkle audit log.  Every prompt,
+// flow into the hash-chained audit log.  Every prompt,
 // tool call, tool result, response and error gets one
 // audit.Event whose Action is one of the llm.* verbs the
 // session emits.

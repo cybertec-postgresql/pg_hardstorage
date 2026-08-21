@@ -660,6 +660,23 @@ func VerifyBundle(r io.Reader) (*BundleManifest, error) {
 	if !ed25519.Verify(pub, canon, sigBytes) {
 		return nil, errors.New("audit: signature verification failed")
 	}
+
+	// Bind the recorded signer identity to the key that actually
+	// validated the signature. Without this the fingerprint in
+	// bundle.json is decorative: a hostile re-signer swaps in their
+	// own public_key.pem, re-signs the tampered bodies, and leaves
+	// the victim's fingerprint in the manifest — the bundle verifies
+	// and an auditor comparing the PRINTED fingerprint against a
+	// known-good one is fooled. The signature only proves "signed by
+	// whoever ships in this tarball"; the fingerprint match is what
+	// makes the identity claim checkable.
+	if fp := manifest.PublicKeyFingerprint; fp != "" {
+		if actual := publicKeyFingerprint(pub); actual != fp {
+			return nil, fmt.Errorf(
+				"audit: bundle public_key.pem fingerprint %s does not match the manifest's recorded signer %s (bundle re-signed under a different key?)",
+				actual, fp)
+		}
+	}
 	return &manifest, nil
 }
 
