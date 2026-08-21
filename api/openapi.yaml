@@ -3,8 +3,10 @@
 # This document is the canonical OpenAPI 3.1 specification of the
 # pg_hardstorage control-plane REST API.  The actual handlers live
 # in internal/server/routes.go; this spec is hand-maintained to
-# match.  Both ship in the same release; CI gates that the routes
-# enumerated here match the registered handlers.
+# match.  CI lints this file (vacuum); route-truth is gated by
+# internal/server/api_truthfulness_test.go against the markdown API
+# doc, and the schema-level shapes are pinned by the server's own
+# tests (internal/server/*_test.go) — keep the three in sync.
 #
 # Audience: operators integrating with the control plane, third-
 # party tooling (pgBackRest CLI shim, Zalando WAL-G shim, the
@@ -12,7 +14,7 @@
 #
 # Authentication: bearer token (HTTP `Authorization: Bearer <token>`)
 # OR mTLS (the client cert IS the auth — no Authorization header
-# required).  /v1/healthz and /v1/readyz are exempt.
+# required).  /v1/healthz, /v1/readyz and /metrics are exempt.
 #
 # Versioning: this is the v1 contract.  We commit to 24-month
 # backward-compatibility on every shape below.  Additive fields
@@ -112,6 +114,25 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/ReadyzEnvelope" }
 
+  /metrics:
+    get:
+      operationId: getMetrics
+      summary: Prometheus metrics endpoint
+      tags: [Probes]
+      security: []
+      description: |
+        Process-wide metric registry in Prometheus exposition format.
+        Unauthenticated like the health probes so a scraper inside the
+        trust boundary needs no operator credential; every route (this
+        one included) is counted into
+        `pg_hardstorage_http_requests_total`.
+      responses:
+        "200":
+          description: Prometheus text exposition
+          content:
+            text/plain; version=0.0.4:
+              schema: { type: string }
+
   /v1/version:
     get:
       operationId: getVersion
@@ -165,8 +186,11 @@ paths:
       tags: [Jobs]
       description: |
         Body fields ride into Job.Args.  Optional `repo` overrides
-        the default (server.repos[0]).  Optional `type=full|incremental`
-        and `tag=<label>` are honoured by the agent-side executor.
+        the default (server.repos[0]) and is validated against this
+        control plane's configured repo list (400 `usage.bad_repo`
+        otherwise).  Optional executor fields: `fast` (boolean),
+        `label` (string, stamped into the manifest), and
+        `inactivity_timeout` (Go duration string, e.g. "30m").
       requestBody:
         required: false
         content:
@@ -281,11 +305,11 @@ paths:
       parameters:
         - in: query
           name: state
-          schema: { type: string, enum: [pending, running, completed, failed, cancelled] }
-          description: Filter by terminal/non-terminal state
+          schema: { type: string, enum: [queued, running, completed, failed, cancelled] }
+          description: Filter by dispatch lifecycle state
         - in: query
           name: kind
-          schema: { type: string, enum: [backup, restore, verify, audit-anchor] }
+          schema: { type: string, enum: [backup, restore, verify] }
           description: Filter by operation type
         - in: query
           name: deployment
@@ -293,8 +317,11 @@ paths:
           description: Filter by deployment name
         - in: query
           name: limit
-          schema: { type: integer, minimum: 1, maximum: 1000 }
-          description: Cap the returned slice (default unbounded)
+          schema: { type: integer, minimum: 1, maximum: 10000 }
+          description: |
+            Cap the returned slice.  Defaults to 200 when absent;
+            values above 10000 clamp to 10000; malformed or
+            non-positive values return 400 `usage.bad_limit`.
       responses:
         "200":
           description: Job list
@@ -595,20 +622,15 @@ components:
     Agent:
       type: object
       properties:
-        id: { type: string, description: "(host_fqdn, agent_uuid) tuple" }
+        id: { type: string, description: "Agent instance ID (host_fqdn, agent_uuid tuple)" }
         host: { type: string }
-        first_seen: { type: string, format: date-time }
-        last_seen: { type: string, format: date-time }
+        version: { type: string, description: "Agent binary version, reported at heartbeat" }
         deployments:
           type: array
           items: { type: string }
           description: "Deployments this agent will service"
-        kinds:
-          type: array
-          items: { type: string, enum: [backup, restore, verify, audit-anchor] }
-        in_flight:
-          type: integer
-          description: "Jobs currently claimed by this agent"
+        registered_at: { type: string, format: date-time }
+        last_heartbeat: { type: string, format: date-time }
 
     AgentsEnvelope:
       type: object
@@ -628,37 +650,38 @@ components:
 
     HeartbeatRequest:
       type: object
-      required: [agent_id]
+      required: [id, host]
       properties:
-        agent_id: { type: string }
+        id: { type: string }
         host: { type: string }
+        version: { type: string }
         deployments:
           type: array
           items: { type: string }
-        kinds:
-          type: array
-          items: { type: string }
-        version: { type: string }
 
     # --- Jobs ----------------------------------------------------------
     Job:
       type: object
       properties:
         id: { type: string }
-        kind: { type: string, enum: [backup, restore, verify, audit-anchor] }
+        kind: { type: string, enum: [backup, restore, verify] }
         deployment: { type: string }
         repo_url: { type: string }
-        state: { type: string, enum: [pending, running, completed, failed, cancelled] }
+        state: { type: string, enum: [queued, running, completed, failed, cancelled] }
+        assigned_to: { type: string, description: "Agent ID that claimed the job" }
         created_at: { type: string, format: date-time }
-        claimed_at: { type: string, format: date-time }
-        completed_at: { type: string, format: date-time }
-        agent_id: { type: string }
+        updated_at: { type: string, format: date-time }
+        started_at: { type: string, format: date-time, nullable: true, description: "Set when an agent claims the job" }
+        completed_at: { type: string, format: date-time, nullable: true }
         args:
           type: object
           additionalProperties: true
         progress:
           type: array
           items: { $ref: "#/components/schemas/ProgressEvent" }
+        progress_dropped:
+          type: integer
+          description: "Progress events shed to keep the stream bounded (tail retained)"
         result:
           type: object
           additionalProperties: true
@@ -683,11 +706,10 @@ components:
     BackupEnqueueRequest:
       type: object
       properties:
-        repo: { type: string, description: "Override the default repo" }
-        type: { type: string, enum: [full, incremental] }
-        tag: { type: string }
-        ignore_capacity: { type: boolean }
-        capacity_safety_factor: { type: number, format: float }
+        repo: { type: string, description: "Override the default repo (must be a configured repo)" }
+        fast: { type: boolean, description: "Fast backup mode" }
+        label: { type: string, description: "Stamped into the manifest label" }
+        inactivity_timeout: { type: string, description: "Go duration string, e.g. '30m'" }
 
     RestoreEnqueueRequest:
       type: object
@@ -697,13 +719,16 @@ components:
         target_dir: { type: string, description: "Absolute path on the agent host" }
         repo: { type: string }
         allow_overwrite: { type: boolean }
-        to: { type: string, description: "Natural-language PITR target ('5 minutes ago')" }
-        to_lsn: { type: string, description: "Explicit LSN PITR target" }
-        verify_after: { type: boolean }
+        to: { type: string, description: "Natural-language PITR target ('5 minutes ago'). At most one of to/to_lsn/to_name may be set." }
+        to_lsn: { type: string, description: "Explicit LSN PITR target (0/3000028)" }
+        to_name: { type: string, description: "Named restore point PITR target" }
+        to_action: { type: string, enum: [pause, promote, shutdown] }
+        to_timeline: { type: string, description: "'latest' or a positive integer" }
+        to_inclusive: { type: boolean }
+        verify_after: { type: [boolean, string], description: "true = hard gate; also accepts 'auto' | 'skip' | 'require'" }
         tablespace_mapping:
           type: array
           items: { type: string, example: "/old/path=/new/path" }
-        skip_gap_check: { type: boolean }
 
     VerifyEnqueueRequest:
       type: object
@@ -713,8 +738,6 @@ components:
         pg_major: { type: string, example: "17" }
         tempdir: { type: string }
         repo: { type: string }
-        existence_only: { type: boolean }
-        sample_chunks: { type: integer, minimum: 0 }
 
     ClaimRequest:
       type: object
@@ -726,13 +749,13 @@ components:
           items: { type: string }
         kinds:
           type: array
-          items: { type: string }
+          items: { type: string, enum: [backup, restore, verify] }
 
     ProgressEvent:
       type: object
       properties:
         at: { type: string, format: date-time }
-        kind: { type: string, description: "Event class (e.g. progress, chunker_paused)" }
+        op: { type: string, description: "Operation name (e.g. progress, chunker_paused)" }
         body:
           type: object
           additionalProperties: true

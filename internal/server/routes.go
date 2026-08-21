@@ -632,8 +632,9 @@ func (s *Server) handleAgentsHeartbeat(w http.ResponseWriter, r *http.Request) {
 // --- job dispatch ----------------------------------------------------
 
 // handleEnqueueBackup is POST /v1/deployments/<n>/backups. Body is
-// optional; when provided, fields ride into Job.Args so the agent
-// can honour --type=full|incremental, --tag, etc.
+// optional; when provided, fields ride into Job.Args. The agent's
+// BackupExecutor honours `fast`, `label` and `inactivity_timeout`;
+// unknown fields are stored but not acted on.
 func (s *Server) handleEnqueueBackup(w http.ResponseWriter, r *http.Request, deployment string) {
 	// Body is optional for backups. Parse it when present (including
 	// chunked/unknown-length POSTs, which don't set ContentLength); an
