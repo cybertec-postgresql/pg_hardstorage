@@ -194,70 +194,141 @@ func WALPrune(ctx context.Context, sp storage.StoragePlugin, opts WALPruneOption
 		return res, fmt.Errorf("repo wal prune: list segments: %w", err)
 	}
 
-	for _, key := range keys {
-		if err := ctx.Err(); err != nil {
+	// The keys are sorted lexicographically (listWALSegmentKeys), so
+	// they form contiguous per-timeline blocks (the TLI directory is
+	// one path element) and, within a block, 24-char segment names in
+	// WAL order. WAL segments are contiguous within a timeline
+	// (walsink enforces the opening-record gate), so end_lsn is
+	// non-decreasing inside a block. That lets us PROVE the retained
+	// suffix of a block from the ordering alone: binary-search each
+	// block for the last segment whose end_lsn is below the frontier,
+	// and read manifests only for that prefix (the time-floor rule
+	// and the deletion bookkeeping need them). Reading every
+	// manifest on every prune is the cost this removes (perf audit
+	// #3: O(N) object reads where O(prunable + log N) suffice).
+	//
+	// The proof is safe in only one direction, and that is the right
+	// one: a segment past the boundary is only ever KEPT, never
+	// deleted. A violation of the monotonicity premise (corrupt or
+	// lying end_lsn values) can therefore only under-prune, never
+	// over-prune — the data-loss direction is impossible.
+	process := func(block []string) error {
+		// Binary search for the last index whose end_lsn <
+		// frontierLSN (-1 when none). A probe that cannot be read or
+		// parsed aborts the search: probesFailed then routes the
+		// whole block through the full read-each pass, which
+		// accounts the failure exactly as before.
+		boundary := -1
+		probesFailed := false
+		lo, hi := 0, len(block)-1
+		for lo <= hi {
+			mid := (lo + hi) / 2
+			mani, rerr := readSegmentManifest(ctx, sp, block[mid])
+			if rerr != nil {
+				probesFailed = true
+				break
+			}
+			end, perr := pglogrepl.ParseLSN(mani.EndLSN)
+			if perr != nil {
+				probesFailed = true
+				break
+			}
+			if end < frontierLSN {
+				boundary = mid
+				lo = mid + 1
+			} else {
+				hi = mid - 1
+			}
+		}
+
+		for k, key := range block {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			res.SegmentsConsidered++
+			segName := segmentNameFromKey(key)
+
+			// Past the proven boundary the ordering already shows
+			// end_lsn >= frontier: retained, no manifest read.
+			if !probesFailed && k > boundary {
+				res.SegmentsKept++
+				emitWALPruneProgress(opts, segName, "kept",
+					fmt.Sprintf("end_lsn >= frontier %s (proven by segment ordering; manifest not read)", frontierLSN))
+				continue
+			}
+
+			// Read the segment manifest to get its end_lsn + CreatedAt.
+			mani, err := readSegmentManifest(ctx, sp, key)
+			if err != nil {
+				recordWALPruneFailure(res, key, fmt.Errorf("read segment manifest: %w", err))
+				res.SegmentsFailed++
+				emitWALPruneProgress(opts, segName, "failed", err.Error())
+				continue
+			}
+
+			segEnd, err := pglogrepl.ParseLSN(mani.EndLSN)
+			if err != nil {
+				recordWALPruneFailure(res, key, fmt.Errorf("parse end_lsn %q: %w", mani.EndLSN, err))
+				res.SegmentsFailed++
+				emitWALPruneProgress(opts, segName, "failed", err.Error())
+				continue
+			}
+
+			// Primary rule: end_lsn < frontier → candidate.
+			if segEnd >= frontierLSN {
+				res.SegmentsKept++
+				emitWALPruneProgress(opts, segName, "kept",
+					fmt.Sprintf("end_lsn %s >= frontier %s", segEnd, frontierLSN))
+				continue
+			}
+
+			// Time-floor: if KeepFloorTime is set and the segment's
+			// CreatedAt is at-or-after the floor, keep it.
+			if !opts.KeepFloorTime.IsZero() && !mani.CreatedAt.IsZero() &&
+				!mani.CreatedAt.Before(opts.KeepFloorTime) {
+				res.SegmentsKept++
+				res.SegmentsKeptByFloor++
+				emitWALPruneProgress(opts, segName, "kept",
+					fmt.Sprintf("CreatedAt %s >= keep-floor %s",
+						mani.CreatedAt.Format(time.RFC3339), opts.KeepFloorTime.Format(time.RFC3339)))
+				continue
+			}
+
+			if opts.DryRun {
+				res.SegmentsDeleted++
+				res.BytesDeleted += sumChunkLengths(mani.Chunks)
+				emitWALPruneProgress(opts, segName, "would_delete",
+					fmt.Sprintf("end_lsn %s < frontier %s", segEnd, frontierLSN))
+				continue
+			}
+
+			// Real delete — manifest only; chunks are GC's job.
+			if err := sp.Delete(ctx, key); err != nil {
+				recordWALPruneFailure(res, key, fmt.Errorf("delete: %w", err))
+				res.SegmentsFailed++
+				emitWALPruneProgress(opts, segName, "failed", err.Error())
+				continue
+			}
+			res.SegmentsDeleted++
+			res.BytesDeleted += sumChunkLengths(mani.Chunks)
+			emitWALPruneProgress(opts, segName, "deleted", "")
+		}
+		return nil
+	}
+
+	// Contiguous same-TLI runs of the sorted keys; each block is
+	// ordered by segment name, so it is ordered by end_lsn.
+	i := 0
+	for i < len(keys) {
+		j := i + 1
+		for j < len(keys) && tliOfKey(keys[j]) == tliOfKey(keys[i]) {
+			j++
+		}
+		if err := process(keys[i:j]); err != nil {
 			finish()
 			return res, err
 		}
-		res.SegmentsConsidered++
-
-		segName := segmentNameFromKey(key)
-
-		// Read the segment manifest to get its end_lsn + CreatedAt.
-		mani, err := readSegmentManifest(ctx, sp, key)
-		if err != nil {
-			recordWALPruneFailure(res, key, fmt.Errorf("read segment manifest: %w", err))
-			res.SegmentsFailed++
-			emitWALPruneProgress(opts, segName, "failed", err.Error())
-			continue
-		}
-
-		segEnd, err := pglogrepl.ParseLSN(mani.EndLSN)
-		if err != nil {
-			recordWALPruneFailure(res, key, fmt.Errorf("parse end_lsn %q: %w", mani.EndLSN, err))
-			res.SegmentsFailed++
-			emitWALPruneProgress(opts, segName, "failed", err.Error())
-			continue
-		}
-
-		// Primary rule: end_lsn < frontier → candidate.
-		if segEnd >= frontierLSN {
-			res.SegmentsKept++
-			emitWALPruneProgress(opts, segName, "kept",
-				fmt.Sprintf("end_lsn %s >= frontier %s", segEnd, frontierLSN))
-			continue
-		}
-
-		// Time-floor: if KeepFloorTime is set and the segment's
-		// CreatedAt is at-or-after the floor, keep it.
-		if !opts.KeepFloorTime.IsZero() && !mani.CreatedAt.IsZero() &&
-			!mani.CreatedAt.Before(opts.KeepFloorTime) {
-			res.SegmentsKept++
-			res.SegmentsKeptByFloor++
-			emitWALPruneProgress(opts, segName, "kept",
-				fmt.Sprintf("CreatedAt %s >= keep-floor %s",
-					mani.CreatedAt.Format(time.RFC3339), opts.KeepFloorTime.Format(time.RFC3339)))
-			continue
-		}
-
-		if opts.DryRun {
-			res.SegmentsDeleted++
-			res.BytesDeleted += sumChunkLengths(mani.Chunks)
-			emitWALPruneProgress(opts, segName, "would_delete",
-				fmt.Sprintf("end_lsn %s < frontier %s", segEnd, frontierLSN))
-			continue
-		}
-
-		// Real delete — manifest only; chunks are GC's job.
-		if err := sp.Delete(ctx, key); err != nil {
-			recordWALPruneFailure(res, key, fmt.Errorf("delete: %w", err))
-			res.SegmentsFailed++
-			emitWALPruneProgress(opts, segName, "failed", err.Error())
-			continue
-		}
-		res.SegmentsDeleted++
-		res.BytesDeleted += sumChunkLengths(mani.Chunks)
-		emitWALPruneProgress(opts, segName, "deleted", "")
+		i = j
 	}
 
 	finish()
@@ -498,6 +569,19 @@ func segmentNameFromKey(key string) string {
 		return base[i+1:]
 	}
 	return base
+}
+
+// tliOfKey extracts the timeline directory from a key of the form
+// wal/<dep>/<TLI>/<segment>.json (listWALSegmentKeys' layout; the
+// TLI is the third path element). Returns "" when the key is not
+// of that shape; such keys never occur, but a "" group still
+// groups them together harmlessly.
+func tliOfKey(key string) string {
+	parts := strings.Split(key, "/")
+	if len(parts) >= 4 {
+		return parts[2]
+	}
+	return ""
 }
 
 // sumChunkLengths sums the Len of a chunk-ref list (from the

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"iter"
 	"strings"
 	"testing"
@@ -547,5 +548,69 @@ func TestWALPrune_ZeroModTimeTombstoneGraceDisabled(t *testing.T) {
 	if res.FrontierBackupID != "db1.full.live" || res.SegmentsDeleted != 1 {
 		t.Errorf("grace disabled: want live frontier + 1 deleted, got %q / %d",
 			res.FrontierBackupID, res.SegmentsDeleted)
+	}
+}
+
+// countingGetPlugin wraps a StoragePlugin and counts Get calls on
+// WAL segment manifests (wal/…/*.json keys).
+type countingGetPlugin struct {
+	storage.StoragePlugin
+	walGets int
+}
+
+func (c *countingGetPlugin) Get(ctx context.Context, key string) (io.ReadCloser, error) {
+	if strings.HasPrefix(key, "wal/") && strings.HasSuffix(key, ".json") {
+		c.walGets++
+	}
+	return c.StoragePlugin.Get(ctx, key)
+}
+
+// TestWALPrune_RetainedSuffixReadsNoManifests pins perf audit #3:
+// a segment the ordering proves to have end_lsn >= frontier (every
+// segment past the prunable prefix of a timeline block) is retained
+// WITHOUT its manifest being read. With N segments of which P are
+// prunable, manifest GETs are O(P + log N), not N. Pre-fix, every
+// prune read all N manifests.
+func TestWALPrune_RetainedSuffixReadsNoManifests(t *testing.T) {
+	_, sp := newTestRepo(t)
+	defer sp.Close()
+	wrapped := &countingGetPlugin{StoragePlugin: sp}
+
+	// frontier = 0/05000000 (the sole live backup's start_lsn).
+	plantBackupManifest(t, wrapped, "db1", "db1.full.floor",
+		"0/05000000", time.Now().Add(-time.Hour))
+
+	const n = 64
+	// 64 segments in one timeline: names in WAL order, ends
+	// ascending with the name (0/01000000 … 0/40000000). The first 4
+	// (ends < frontier) are prunable; the other 60 are retained.
+	for i := 0; i < n; i++ {
+		end := fmt.Sprintf("0/%08X", (i+1)*0x01000000)
+		name := fmt.Sprintf("00000001%08X", i)
+		plantWALSegManifest(t, wrapped, "db1", 1, name, end, time.Now(), []int64{1024})
+	}
+
+	res, err := repo.WALPrune(context.Background(), wrapped, repo.WALPruneOptions{
+		Deployment: "db1",
+		DryRun:     true,
+	})
+	if err != nil {
+		t.Fatalf("WALPrune: %v", err)
+	}
+	if res.SegmentsDeleted != 4 {
+		t.Fatalf("SegmentsDeleted = %d, want 4", res.SegmentsDeleted)
+	}
+	if res.SegmentsKept != 60 {
+		t.Fatalf("SegmentsKept = %d, want 60", res.SegmentsKept)
+	}
+	if res.SegmentsFailed != 0 {
+		t.Fatalf("SegmentsFailed = %d, want 0 (%v)", res.SegmentsFailed, res.Failures)
+	}
+	// Pre-fix: one manifest read per segment (64 GETs). Post-fix:
+	// reads confined to the prunable prefix + binary-search probes
+	// (O(4 + log 64)).
+	if wrapped.walGets >= n/2 {
+		t.Fatalf("WAL segment manifest GETs = %d, want < %d: the retained suffix was still read segment-by-segment",
+			wrapped.walGets, n/2)
 	}
 }

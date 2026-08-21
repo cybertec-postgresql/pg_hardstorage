@@ -113,8 +113,18 @@ func FuzzWALPruneNeverDeletesWALBelowKeptBackupFrontier(f *testing.F) {
 
 		segEndByName := map[string]pglogrepl.LSN{}
 		ns := int(sraw[0]%12) + 1
+		var lastEnd pglogrepl.LSN
 		for j := 0; j < ns; j++ {
 			end := lsnOf(int(sraw[j%len(sraw)]))
+			// Segment names sort in WAL order and a WAL is contiguous,
+			// so end_lsn is non-decreasing along the names. Enforce that
+			// monotonicity — the premise WALPrune's ordering proof (skip
+			// the retained suffix without reading its manifests) rests
+			// on — while keeping the values random.
+			if end < lastEnd {
+				end = lastEnd + 0x1000000
+			}
+			lastEnd = end
 			name := fmt.Sprintf("seg%04d", j)
 			body, _ := json.Marshal(struct {
 				StartLSN  string    `json:"start_lsn"`
