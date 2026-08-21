@@ -165,49 +165,75 @@ func (c *Chunker) IterCopying(r io.Reader) iter.Seq2[Chunk, error] {
 // silent-corruption risk this iterator's contract carries.
 func (c *Chunker) Iter(r io.Reader) iter.Seq2[Chunk, error] {
 	return func(yield func(Chunk, error) bool) {
-		// Working buffer holds up to max bytes. We refill from r as we
-		// consume chunks. Reused across iterations to avoid GC pressure.
+		// Working buffer holds up to max bytes, with a read cursor:
+		// [0,pos) is consumed (already yielded), [pos,len(buf)) is the
+		// live region, [len(buf),cap(buf)) is free. Reads append at
+		// the end, directly into the buffer's spare capacity.
+		//
+		// The cursor replaces the old per-chunk tail shift
+		// (`buf = append(buf[:0], buf[boundary:]...)`): that moved up
+		// to max bytes to the front after EVERY chunk — ~2.5-3x the
+		// input in memcpys plus a fresh make per refill (perf audit
+		// #7). The cursor advances in place; the buffer compacts only
+		// when the free tail drops below max/2, so compaction costs
+		// one O(max) copy per O(max) input bytes — amortized O(1)
+		// per byte, and no allocation on the hot path.
 		buf := make([]byte, 0, c.max)
+		pos := 0
 		var offset int64
 		eof := false
 
 		for {
-			// Try to fill the buffer to max.
+			// Refill from r into the free tail.
 			if !eof {
-				need := c.max - len(buf)
-				if need > 0 {
-					tmp := make([]byte, need)
-					n, err := io.ReadFull(r, tmp)
-					buf = append(buf, tmp[:n]...)
-					switch {
-					case err == nil:
-						// full read; loop body proceeds
-					case errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF):
-						eof = true
-					default:
-						yield(Chunk{}, err)
-						return
+				// Compact when the free tail is too small to read a
+				// useful amount: move the live region to the front
+				// (shrinking the slice so the free tail is usable).
+				if cap(buf)-len(buf) < c.max/2 {
+					if pos > 0 {
+						copy(buf, buf[pos:])
+						buf = buf[:len(buf)-pos]
+						pos = 0
 					}
+				}
+				n, err := io.ReadFull(r, buf[len(buf):cap(buf)])
+				buf = buf[:len(buf)+n]
+				switch {
+				case err == nil:
+					// full read; loop body proceeds
+				case errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF):
+					eof = true
+				default:
+					yield(Chunk{}, err)
+					return
 				}
 			}
 
-			if len(buf) == 0 {
+			if len(buf) == pos {
 				return // clean EOF
 			}
 
-			// If we're at EOF and buf is shorter than min, emit it as is.
-			if eof && len(buf) <= c.min {
-				if !yield(Chunk{Data: buf, Offset: offset}, nil) {
+			// The live region is everything not yet yielded.
+			live := buf[pos:]
+
+			// If we're at EOF and live is shorter than min, emit it
+			// as is.
+			if eof && len(live) <= c.min {
+				if !yield(Chunk{Data: live, Offset: offset}, nil) {
 					return
 				}
 				return
 			}
 
-			// Find the next boundary in buf. boundary is a length, not
-			// an index: chunk = buf[:boundary].
-			boundary := c.findBoundary(buf)
-			if boundary > len(buf) {
-				boundary = len(buf)
+			// Find the next boundary in live. boundary is a length,
+			// not an index: chunk = live[:boundary]. findBoundary sees
+			// the same bytes the old tail-shift version saw, so the
+			// boundaries — and therefore every chunk hash — are
+			// bit-identical to the previous implementation
+			// (TestIter_BoundariesGolden pins this).
+			boundary := c.findBoundary(live)
+			if boundary > len(live) {
+				boundary = len(live)
 			}
 			// Boundary contract: 0 < boundary <= max, and >= min while
 			// more input remains. A violation here means the CDC math
@@ -215,23 +241,26 @@ func (c *Chunker) Iter(r io.Reader) iter.Seq2[Chunk, error] {
 			// into content hashes and dedup, a drifting boundary
 			// silently regresses dedup repo-wide (or, at 0, loops
 			// forever emitting empty chunks).
-			invariant.Assert(boundary > 0 && boundary <= c.max,
-				"chunk boundary %d outside (0, max=%d]", boundary, c.max)
-			invariant.Assert(eof || boundary >= c.min,
-				"mid-stream chunk boundary %d below min=%d", boundary, c.min)
+			//
+			// The check is guarded so the Assert (and its variadic
+			// argument boxing, which would heap-allocate on the hot
+			// path — ~4 allocations per chunk) runs only on a
+			// violation.
+			if !(boundary > 0 && boundary <= c.max) {
+				invariant.Assert(false, "chunk boundary %d outside (0, max=%d]", boundary, c.max)
+			}
+			if !(eof || boundary >= c.min) {
+				invariant.Assert(false, "mid-stream chunk boundary %d below min=%d", boundary, c.min)
+			}
 
 			// Yield this chunk. Data shares storage with buf; the next
-			// iteration overwrites it, so callers must copy.
-			chunkData := buf[:boundary]
+			// iteration may overwrite it, so callers must copy.
+			chunkData := live[:boundary]
 			if !yield(Chunk{Data: chunkData, Offset: offset}, nil) {
 				return
 			}
 			offset += int64(boundary)
-
-			// Advance the buffer. We move the tail to the front rather
-			// than slicing-with-leftover so subsequent appends fit in
-			// the same allocation.
-			buf = append(buf[:0], buf[boundary:]...)
+			pos += boundary
 		}
 	}
 }

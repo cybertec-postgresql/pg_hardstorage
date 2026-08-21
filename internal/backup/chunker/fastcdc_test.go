@@ -3,9 +3,12 @@ package chunker_test
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"io"
 	mathrand "math/rand"
+	"runtime"
+	rtdebug "runtime/debug"
 	"testing"
 	"unsafe"
 
@@ -286,35 +289,100 @@ func TestIterCopying_DataSurvivesNextIteration(t *testing.T) {
 func TestIter_DataReusesBuffer(t *testing.T) {
 	c := chunker.New()
 	body := randomBytes(t, 4*1024*1024)
-	var firstAddr, lastAddr uintptr
+	var arrEnd uintptr
 	count := 0
 	for ch, err := range c.Iter(bytes.NewReader(body)) {
 		if err != nil {
 			t.Fatalf("iter err: %v", err)
 		}
-		count++
-		if count == 1 {
-			firstAddr = sliceDataAddr(ch.Data)
+		if len(ch.Data) == 0 {
+			continue
 		}
-		lastAddr = sliceDataAddr(ch.Data)
+		// Every chunk is a sub-slice of the single working buffer:
+		// start + cap lands on the same backing-array end for all of
+		// them. (The cursor design moves the live region to the front
+		// periodically, so chunk START addresses are no longer equal —
+		// the shared-array-end is the invariant.)
+		end := uintptr(unsafe.Pointer(&ch.Data[0])) + uintptr(cap(ch.Data))
+		if count == 0 {
+			arrEnd = end
+		} else if end != arrEnd {
+			t.Fatalf("chunk %d does not share the working buffer's backing array (array end %x vs %x): Iter must reuse one buffer across iterations", count, end, arrEnd)
+		}
+		count++
 	}
 	if count < 2 {
 		t.Skipf("test needs at least 2 chunks; got %d", count)
 	}
-	if firstAddr != lastAddr {
-		// Not a hard failure (the buffer can grow under specific
-		// patterns) — but it's a strong signal that no-copy
-		// behaviour changed.  Make it visible.
-		t.Logf("Iter chunks did not share backing memory across all iterations (first=%x last=%x); IterCopying's safety contract assumes the no-copy path keeps reusing the buffer", firstAddr, lastAddr)
-	}
 }
 
-// sliceDataAddr returns the underlying-array address of a slice.
-func sliceDataAddr(b []byte) uintptr {
-	if cap(b) == 0 {
-		return 0
+// goldenBoundaries pins the chunk boundaries (offset + content hash)
+// for a fixed 2 MiB input under the ORIGINAL tail-shift
+// implementation. The perf-audit #7 cursor rewrite must be
+// bit-identical to it: chunk boundaries feed straight into content
+// hashes, so any drift silently regresses dedup against every chunk
+// stored by an older binary. Regenerate ONLY if the boundary
+// semantics intentionally change (a new chunker version).
+var goldenBoundaries = []struct {
+	off  int64
+	hash string
+}{
+	{0, "1d9e9bdb488c6863b1c3de663407858b45d997648ff11fe244416a7ac9d66cd7"},
+	{75004, "78cb81a31677a2721773493bc81a249e3e487d71ad8d8dce7e4f88f9e06e356d"},
+	{161954, "89ac0c3391ffc99b9ab81818dbbcedb429f48042e9b46df4033cd062c720adc7"},
+	{178927, "5865a9744a52ea5fc3147063ef4316903004ff96ef62983fa0456021dd4f65fb"},
+	{222286, "203210efda1fa921d751644b9db6be25f283977a8d4722e4da21ce9f99097b2c"},
+	{227426, "26288f0a60036e014d5a1605ffe66f8ed74d2e02ba6eb706515c69a0ad377c20"},
+	{315903, "de0c86769d6b6233087878d2c107e5bf0cbc6752c1643c2f0981c14391ff7a63"},
+	{384792, "604aac8a49ab0e242517c281c0e8bc2d90140d679c3f729fa562648f58e5d358"},
+	{469812, "c0a9ebdb33fa7ada4703d822ddb8c37046b22a9188207c35b2b27d7a922495fb"},
+	{575269, "d288bf9568c70aeb234585a51f866e8d0e34056a18f6ebc6db66b8545e0a6ba9"},
+	{646482, "231b0e3a8cf1c1bf06f0b9c9b112ce44db6cba457129f0caf26c06efd2bb1970"},
+	{736161, "437dfb5afb943e038a5c8c3ff3c5f2ea199c850a51f436c8ca177687aa89a018"},
+	{795972, "df28b47d01550447382a2151371f8d2055c641b4644e934778ff6013f6aef855"},
+	{877266, "3d2024771721887c2d86fdd523df460fbd29d6b3bb2ee92a24fbe75f92693777"},
+	{909318, "c1f32c854c2f617a513cbe044fb07d2b40ecd206ce327c18b90dea689931834d"},
+	{916650, "d3768e6a70a1d37ce8c0eee8de5557605a23e865de25b9ec484f061ece02780d"},
+	{1007809, "ec87756f4de2636aebdbf46f0459984d378334f6eb540334644c5ea88f9cc14b"},
+	{1074441, "3d7d8c2ee0a9c701e3b789bd326d86bf53edcdb3c0359686a0b8dedd61d7fd0f"},
+	{1182642, "8a283f41f7edcb53e11e35752081a2beb2dd2b752d3d21150afff0a11f5b85b2"},
+	{1274131, "5a9140f42fef38662413a2320c2845264cc087b41d4c39910c3f5d9f58c33aef"},
+	{1352990, "5b5fec4187b9938f0b77cccec4989324a212b5ebb5b0f971e561d2bcfcf16df4"},
+	{1434824, "1589e6aef4befb2a7953a1eda72483e29e99ea65b215c7cd190820574513ed5a"},
+	{1535052, "5d51c352a8fd6356a3f86e236763418cd1175a41a781558f5a180b18c04bb2e3"},
+	{1610345, "a83bbb5a9692e332a532e7b330986f88b81c90ef87970218ac9bd185af302ba1"},
+	{1692970, "2bd7d1a997597a779ad491ca0201fe5bfbcdeed266b995649809888654f534a4"},
+	{1769489, "9580566678216fe3699e30a0aca8dda64c51e119cb92ac8cba790e90341d7349"},
+	{1849171, "88900bfe0284b533f6ef9819ba3743dab6a33ae1c06e01c7d51626d48dc6abff"},
+	{1917171, "3e95d7eca04d05bd59e43dbfb10be6b252eb126deb9176ca523a77fcc7d82268"},
+	{2008131, "21e186b770ea27e16a94c75c8329322a34a27daeef783f324ded00f850478c8f"},
+	{2077607, "bce0bf2a4df485258f1066c808a9b37b0a0c59f8f8e6c422d49525a0404191f3"},
+}
+
+// TestIter_BoundariesGolden verifies the cursor rewrite produces
+// exactly the same chunk boundaries (offsets + content hashes) as the
+// original tail-shift implementation on a fixed input. This is the
+// dedup contract: a chunk produced today must match a chunk produced
+// by the pre-cursor code.
+func TestIter_BoundariesGolden(t *testing.T) {
+	src := mathrand.New(mathrand.NewSource(0x42))
+	body := make([]byte, 2<<20)
+	if _, err := io.ReadFull(src, body); err != nil {
+		t.Fatal(err)
 	}
-	return uintptr(unsafe.Pointer(&b[:1][0]))
+	got := chunkAll(t, chunker.New(), bytes.NewReader(body))
+	if len(got) != len(goldenBoundaries) {
+		t.Fatalf("chunk count = %d, want %d — the cursor rewrite drifted the boundary count", len(got), len(goldenBoundaries))
+	}
+	for i, ch := range got {
+		if ch.Offset != goldenBoundaries[i].off {
+			t.Fatalf("chunk %d offset = %d, want %d — boundary drift vs the pre-cursor implementation", i, ch.Offset, goldenBoundaries[i].off)
+		}
+		sum := sha256.Sum256(ch.Data)
+		if hex.EncodeToString(sum[:]) != goldenBoundaries[i].hash {
+			t.Fatalf("chunk %d (off=%d) hash = %s, want %s — chunk content drifted", i, ch.Offset, hex.EncodeToString(sum[:]), goldenBoundaries[i].hash)
+		}
+	}
 }
 
 func randomBytes(t *testing.T, n int) []byte {
@@ -325,4 +393,32 @@ func randomBytes(t *testing.T, n int) []byte {
 		t.Fatal(err)
 	}
 	return b
+}
+
+// TestIter_NoPerChunkAllocation pins the perf-audit #7 hot-path
+// property: a full 4 MiB stream (~57 chunks at the default 64 KiB
+// average) allocates a small constant — the single working buffer —
+// not one allocation per chunk / per refill. The pre-cursor code
+// measured ~280 allocations on the same stream (a fresh
+// `tmp := make` per refill, plus the per-chunk variadic-argument
+// boxing the guarded Asserts below now avoid).
+//
+// The GC is disabled for the window: GC background workers allocate
+// (sudogs, goroutine stacks) and would pollute the count; restoring
+// 100 is deferred. debug.SetGCPercent(-1) is the standard no-GC test
+// protocol (runtime tests use the same).
+func TestIter_NoPerChunkAllocation(t *testing.T) {
+	rtdebug.SetGCPercent(-1)
+	defer rtdebug.SetGCPercent(100)
+	c := chunker.New()
+	body := randomBytes(t, 4*1024*1024)
+	runtime.GC()
+	var m0, m1 runtime.MemStats
+	runtime.ReadMemStats(&m0)
+	for range c.Iter(bytes.NewReader(body)) {
+	}
+	runtime.ReadMemStats(&m1)
+	if allocs := m1.Mallocs - m0.Mallocs; allocs > 4 {
+		t.Fatalf("Iter allocated %d objects over one 4 MiB stream; want a small constant (one working buffer) — per-chunk/per-refill allocation regression (perf audit #7)", allocs)
+	}
 }
