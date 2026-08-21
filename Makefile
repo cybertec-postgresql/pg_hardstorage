@@ -32,6 +32,7 @@ CGO_ENABLED ?= 0
 # bounds so they fail by name well before this. 15m leaves room for one
 # or two of those to fire and still be reported properly.
 INTEGRATION_TIMEOUT ?= 15m
+STRESS_TIMEOUT ?= 60m
 
 # Pin TMPDIR off /tmp.  Why: /tmp is a tmpfs with a fixed inode
 # ceiling (1 M on most distros).  testcontainers' minio sinks bind-
@@ -80,7 +81,7 @@ $(info pg_hardstorage: TMPDIR=$(TMPDIR) (override: HS_TMPDIR=<path> make ...))
 export TESTCONTAINERS_RYUK_DISABLED ?= true
 
 .PHONY: all help build build-testkit build-fips build-pkcs11 build-firecracker \
-	test test-integration test-all \
+	test test-integration test-stress test-all \
 	test-mutations \
 	check cover vet lint fmt tidy clean install release-snapshot \
 	sync-llm-docs \
@@ -102,6 +103,7 @@ help:
 	@echo ""
 	@echo "  make test               go test -race -count=1 ./..."
 	@echo "  make test-integration   go test -tags=integration ... (Docker required)"
+	@echo "  make test-stress        ordering-sensitive pkgs x$(STRESS_COUNT), no -race (run on arm64 too)"
 	@echo "  make test-all           default + integration suites"
 	@echo "  make test-mutations     run the testkit mutation harness (asserts the"
 	@echo "                          test suite catches deliberately-broken variants"
@@ -333,8 +335,19 @@ build-firecracker: | $(HS_TMPDIR)
 # entirely.  Add a new top-level dir here if and when one ships.
 GO_PKGS ?= ./cmd/... ./compat/... ./dockerfiles/... ./internal/...
 
+# HOST_PLATFORM is printed by every test target. arm64 is a SHIPPED
+# platform (.goreleaser.yaml publishes linux/arm64, darwin/arm64 and an
+# arm64 container image), so "the suite passed" is only a meaningful
+# claim alongside the architecture it passed on. Until this was
+# printed, a green run recorded nothing about where it ran, and an
+# amd64-only fixture image cost the SFTP backend every one of its
+# real-server tests on aarch64 without anything noticing.
+HOST_PLATFORM := $(shell go env GOOS)/$(shell go env GOARCH)
+
 test: | $(HS_TMPDIR)
+	@echo "→ unit tests on $(HOST_PLATFORM)"
 	go test -race -count=1 $(GO_PKGS)
+	@echo "✓ unit tests passed on $(HOST_PLATFORM)"
 
 # Materialise the off-/tmp scratch dir.  Order-only prerequisite
 # (`|`) so a re-stat doesn't trip mtime-based rebuilds.
@@ -345,6 +358,52 @@ $(HS_TMPDIR):
 # Requires a running Docker daemon; tests skip cleanly when Docker
 # is unreachable so this target is safe to run in environments
 # without Docker (it'll simply produce no real coverage there).
+# Packages whose correctness depends on ordering BETWEEN goroutines:
+# the backup lease, the CAS adoption set, the chunker's shared working
+# buffer, the WAL sink's commit path, the audit append loop, and the
+# server's agent registry + readyz cache. 65 files in internal/ use
+# sync/atomic and there are 186 goroutine spawns; this is where a
+# missing happens-before edge lives.
+STRESS_PKGS ?= ./internal/audit/... ./internal/backup/... ./internal/pg/walsink/... \
+	./internal/repo/... ./internal/server/...
+# 10, not a bigger round number. Measured end-to-end on an aarch64
+# NVMe box: internal/repo 816s, internal/backup 462s, everything else
+# under a minute — ~24min for the full pass. Long enough to be a
+# deliberate run, short enough to actually get run.
+#
+# At 50 the same pass ran over two hours and internal/repo blew a
+# 60min per-package timeout inside
+# TestCAS_DedupHintsIsolatedFromCaller, which alone costs 84s per
+# iteration because CAS.PutChunk fsyncs (goroutines parked in
+# fs.syncDir, making progress — slow, not deadlocked).
+#
+# Raise it for a dedicated hunt: STRESS_COUNT=200 overnight finds what
+# 10 does not. Repetition is the whole mechanism here, so the number is
+# a budget decision, not a correctness one.
+STRESS_COUNT ?= 10
+
+# test-stress re-runs the ordering-sensitive packages many times
+# WITHOUT -race, and the omission is the point rather than an oversight.
+#
+# -race is happens-before based: it reports the same set of
+# synchronisation errors on every architecture, so it adds nothing an
+# amd64 run would not already have told us. It also instruments and
+# slows every memory access, which suppresses the very interleavings
+# worth hunting.
+#
+# What differs by architecture is what happens when a missing edge is
+# NOT reported: amd64 is x86-TSO and forgives most reordering, arm64 is
+# weakly ordered and does not. A race that is benign in practice on
+# amd64 can be a real misordering on arm64. Catching that needs the
+# real, uninstrumented scheduler run enough times to lose the race.
+#
+# Run it on BOTH architectures — on amd64 it is a flake hunt, on arm64
+# it is a memory-model hunt.
+test-stress: | $(HS_TMPDIR)
+	@echo "→ ordering stress on $(HOST_PLATFORM): $(STRESS_COUNT) runs, no -race"
+	go test -count=$(STRESS_COUNT) -timeout=$(STRESS_TIMEOUT) $(STRESS_PKGS)
+	@echo "✓ $(STRESS_COUNT) stress runs passed on $(HOST_PLATFORM)"
+
 test-integration: | $(HS_TMPDIR)
 	go test -tags=integration -race -count=1 -timeout=$(INTEGRATION_TIMEOUT) $(GO_PKGS)
 
