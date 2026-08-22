@@ -270,7 +270,43 @@ func (p *Plugin) Get(ctx context.Context, key string) (io.ReadCloser, error) {
 		}
 		return nil, fmt.Errorf("gcs: get %s: %w", key, err)
 	}
-	return r, nil
+	return notFoundOnRead{r}, nil
+}
+
+// notFoundOnRead maps a mid-stream ErrObjectNotExist onto
+// storage.ErrNotFound.
+//
+// Get resolves "missing" at OPEN time, but that is not the only moment
+// it can be answered: NewReader can succeed and the object be deleted
+// before the body is pulled, in which case the GCS client reports
+// ErrObjectNotExist from Read. Unwrapped, that raw client error escapes
+// the plugin and every caller keyed on storage.ErrNotFound stops
+// recognising a plain missing object.
+//
+// It cost a real backup failure. Lease.Acquire already handles the
+// benign race where a holder releases between its failed create and its
+// read — "released between our put and read; one more create try" — but
+// the branch is guarded by errors.Is(rerr, storage.ErrNotFound), so on
+// GCS it never fired. A concurrent release surfaced instead as
+//
+//	backup: a lease for "db1" exists but could not be read:
+//	storage: object doesn't exist
+//
+// which is both a spurious failure and a misleading message: the lease
+// did not exist, and nothing was wrong with reading it. Found by
+// TestLeaseSoak_NeverTwoHolders/gcs under contention.
+//
+// Only the not-found translation happens here; io.EOF and every other
+// error pass through untouched, so this cannot mask an unrelated
+// read failure as a missing object.
+type notFoundOnRead struct{ io.ReadCloser }
+
+func (r notFoundOnRead) Read(p []byte) (int, error) {
+	n, err := r.ReadCloser.Read(p)
+	if err != nil && errors.Is(err, gcs.ErrObjectNotExist) {
+		return n, storage.ErrNotFound
+	}
+	return n, err
 }
 
 // Stat implements storage.StoragePlugin.
