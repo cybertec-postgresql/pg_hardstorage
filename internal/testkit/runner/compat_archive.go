@@ -440,10 +440,25 @@ func resolveShimBinary(shim string) (string, error) {
 // + --repo1-s3-endpoint on archive-push.  Barman's
 // barman-wal-archive takes only the positional <server>
 // <segment-path> — repo discovery happens via deployment
-// config (PG_HARDSTORAGE_CONFIG_DIR).  WAL-G takes only the
+// config (PG_HARDSTORAGE_CONFIG_DIR).  The shim also takes a
+// leading BARMAN_HOST, matching the real tool's three
+// positionals — it is the SSH target upstream ships to, has no
+// meaning for a shim that writes the repo directly, and is
+// accepted purely for argv compatibility (see
+// compat/barman/walarchive.go).  Passing only two silently made
+// every barman scenario unrunnable: the shim is
+// cobra.ExactArgs(3), so it refused with "accepts 3 arg(s),
+// received 2" before any assertion could run.  WAL-G takes only the
 // positional segment path; everything else (WALG_*_PREFIX,
 // PGHOST, PG_HARDSTORAGE_DEPLOYMENT) is env-driven, plumbed
 // in via envExtra at runShim time.
+// barmanHostArgvOnly is the BARMAN_HOST positional. The shim writes
+// the repository directly and never opens an SSH connection, so the
+// value is unused — but it must be PRESENT, because a drop-in
+// replacement has to accept the argv a real archive_command sends
+// ("barman-wal-archive <host> <server> %p").
+const barmanHostArgvOnly = "barman-host-unused-by-shim"
+
 func buildArchivePushArgs(shim, deployment string, fix fixtureKind, segPath, backupPath, historyPath, repoURL, inputDir string) ([][]string, error) {
 	switch shim {
 	case "native":
@@ -526,24 +541,26 @@ func buildArchivePushArgs(shim, deployment string, fix fixtureKind, segPath, bac
 			return [][]string{append(append([]string(nil), base...), historyPath)}, nil
 		}
 	case "barman", "barman-wal-archive":
-		// barman-wal-archive: positional <server> <segment-path>.
-		// Repo URL is auto-injected from pg_hardstorage.yaml
-		// by the shim's deployment-config lookup.
+		// barman-wal-archive: positional <barman-host> <server>
+		// <segment-path>, exactly as the real tool. Repo URL is
+		// auto-injected from pg_hardstorage.yaml by the shim's
+		// deployment-config lookup; barmanHostArgvOnly stands in for
+		// the SSH target the shim ignores.
 		switch fix {
 		case fixtureSegment:
-			return [][]string{{deployment, segPath}}, nil
+			return [][]string{{barmanHostArgvOnly, deployment, segPath}}, nil
 		case fixtureSegmentIdempotent:
 			return [][]string{
-				{deployment, segPath},
-				{deployment, segPath},
+				{barmanHostArgvOnly, deployment, segPath},
+				{barmanHostArgvOnly, deployment, segPath},
 			}, nil
 		case fixtureSegmentPlusBackup:
 			return [][]string{
-				{deployment, segPath},
-				{deployment, backupPath},
+				{barmanHostArgvOnly, deployment, segPath},
+				{barmanHostArgvOnly, deployment, backupPath},
 			}, nil
 		case fixtureHistory:
-			return [][]string{{deployment, historyPath}}, nil
+			return [][]string{{barmanHostArgvOnly, deployment, historyPath}}, nil
 		}
 	}
 	return nil, fmt.Errorf("unsupported shim %q", shim)
