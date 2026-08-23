@@ -69,7 +69,7 @@ steps:
         - "$REPO"
         - "--tables"
         - "public.nonexistent_in_postgres"
-        - "--out"
+        - "--sql-file"
         - "$ARTEFACT_DIR/partial-no-database.sql"
       expect_exit: 6
       timeout: 60s
