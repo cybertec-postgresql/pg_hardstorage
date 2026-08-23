@@ -87,6 +87,11 @@ steps:
         - "$PG_CONN"
         - "--inactivity-timeout"
         - "8s"
+        # Explicit, not incidental: this passed only because 8s happens
+        # to be under the 10s default status cadence. Pin the cadence so
+        # the terminator does not depend on that coincidence.
+        - "--status-interval"
+        - "60s"
       expect_exit: 1
       timeout: 90s
 

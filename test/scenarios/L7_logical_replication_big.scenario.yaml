@@ -64,6 +64,13 @@ steps:
         - "$PG_CONN"
         - "--inactivity-timeout"
         - "12s"
+        # --status-interval MUST exceed the inactivity window, or the
+        # stream never ends. Our own status updates are echoed by the
+        # walsender as keepalives, and a keepalive is traffic: with the
+        # 10s default cadence a 12s window is reset every 10s and can
+        # never elapse, so this step ran until the runner killed it.
+        - "--status-interval"
+        - "60s"
       expect_exit: 1
       timeout: 180s
 

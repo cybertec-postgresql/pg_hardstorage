@@ -349,7 +349,7 @@ flushed before exit.`,
 	c.Flags().DurationVar(&statusInterval, "status-interval", 10*time.Second,
 		"status-update cadence")
 	c.Flags().DurationVar(&inactivityTimeout, "inactivity-timeout", 0,
-		"abort if no message arrives in this duration (0 = streaming default)")
+		"abort if no message arrives in this duration (0 = streaming default). Detects a STUCK connection, not a quiet publication: the walsender echoes each of our status updates with a keepalive, and a keepalive counts as a message — so a value at or above --status-interval never fires on a live but idle stream.")
 	return c
 }
 
