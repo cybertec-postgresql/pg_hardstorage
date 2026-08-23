@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -57,7 +58,9 @@ Options:
   --follow / -f      tail forward (default: print last 100 lines)
   --lines N          how many lines to print initially (default 100)
   --since DUR-OR-TS  start from this point ("24h", "yesterday",
-                     RFC3339); passed verbatim to journalctl
+                     RFC3339). A bare duration means "that long
+                     ago" and is negated for journalctl, which
+                     requires a sign on relative times.
   --unit NAME        override the auto-derived unit name
 
 Requires journalctl on PATH. On non-systemd hosts (macOS, BSD,
@@ -78,10 +81,51 @@ read the agent's stdout directly or wire a logging plugin.`,
 	c.Flags().IntVarP(&lines, "lines", "n", 100,
 		"how many lines to print initially")
 	c.Flags().StringVar(&since, "since", "",
-		"start at this point (24h / yesterday / RFC3339); passed to journalctl")
+		"start at this point (24h / yesterday / RFC3339); a bare duration means that long ago")
 	c.Flags().StringVar(&unit, "unit", "",
 		"override the auto-derived systemd unit name")
 	return c
+}
+
+// journalSince converts a --since value into something journalctl
+// actually accepts.
+//
+// The flag is documented as DUR-OR-TS with "24h" as the FIRST example,
+// and the value was then passed to journalctl untouched. journalctl
+// does not accept a bare duration:
+//
+//	$ journalctl --since 24h
+//	Failed to parse timestamp: 24h
+//
+// so the most obvious way to invoke the flag — the spelling the help
+// text itself suggests — failed, and it surfaced as a generic
+// `internal` error rather than anything pointing at --since.
+//
+// systemd wants a SIGN on a relative time ("-24h", or "24h ago").
+// A bare duration from an operator can only mean "this long ago", so
+// negate it. Every other accepted spelling is left untouched:
+// "yesterday", "now", "2026-08-01 10:00:00", "1 hour ago", and values
+// that already carry a - or + sign.
+//
+// Verified against journalctl 257: every duration time.ParseDuration
+// accepts is accepted by systemd once negated — fractional ("-1.5h"),
+// sub-second ("-300ms", "-100µs") and compound ("-2h45m30s") included
+// — so this cannot turn one rejected value into another.
+func journalSince(since string) string {
+	trimmed := strings.TrimSpace(since)
+	if trimmed == "" {
+		return since
+	}
+	// Already signed: the operator spelled the direction themselves.
+	if trimmed[0] == '-' || trimmed[0] == '+' {
+		return trimmed
+	}
+	// A bare Go duration means "this long ago".
+	if _, err := time.ParseDuration(trimmed); err == nil {
+		return "-" + trimmed
+	}
+	// Anything else is a systemd timestamp spelling; pass it through.
+	return since
 }
 
 func runLogs(cmd *cobra.Command, deployment, overrideUnit, since string, lines int, follow bool) error {
@@ -114,7 +158,7 @@ func runLogs(cmd *cobra.Command, deployment, overrideUnit, since string, lines i
 		args = append(args, "-f")
 	}
 	if since != "" {
-		args = append(args, "--since", since)
+		args = append(args, "--since", journalSince(since))
 	}
 
 	// Mode A: the operator wants tail-style streaming output. We
