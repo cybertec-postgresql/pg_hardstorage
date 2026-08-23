@@ -2,6 +2,7 @@
 package cli
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -182,16 +183,17 @@ func runLogs(cmd *cobra.Command, deployment, overrideUnit, since string, lines i
 			// entries".
 			if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
 				if stderr := strings.TrimSpace(stderrBuf.String()); stderr == "" {
-					return output.NewError("notfound.unit",
-						fmt.Sprintf("logs: no journal entries for unit %q (is the agent running?)",
-							unit))
+					return noEntriesErr(cmd.Context(), unit)
 				} else {
 					return fmt.Errorf("logs: journalctl: %s", stderr)
 				}
 			}
 			return fmt.Errorf("logs: journalctl: %w", err)
 		}
-		return nil
+		// journalctl exited 0. On systemd 255 that covers "unit is
+		// quiet" AND "unit does not exist", so a clean exit is not
+		// proof the unit is real — ask before reporting success.
+		return noEntriesErr(cmd.Context(), unit)
 	}
 
 	// Mode B: structured output (-o json / ndjson). Ask journalctl
@@ -210,8 +212,11 @@ func runLogs(cmd *cobra.Command, deployment, overrideUnit, since string, lines i
 			// otherwise surface the real error + its stderr so
 			// `logs --since garbage` doesn't misreport "no entries".
 			if stderr := strings.TrimSpace(string(exitErr.Stderr)); stderr == "" {
-				return output.NewError("notfound.unit",
-					fmt.Sprintf("logs: no journal entries for unit %q", unit))
+				if nerr := noEntriesErr(cmd.Context(), unit); nerr != nil {
+					return nerr
+				}
+				return d.Result(output.NewResult(cmd.CommandPath()).
+					WithBody(logsBody{Unit: unit}))
 			} else {
 				return fmt.Errorf("logs: journalctl: %s", stderr)
 			}
@@ -219,7 +224,71 @@ func runLogs(cmd *cobra.Command, deployment, overrideUnit, since string, lines i
 		return fmt.Errorf("logs: journalctl: %w", err)
 	}
 	body := logsBody{Unit: unit, Lines: parseJournalJSON(string(out))}
+	if len(body.Lines) == 0 {
+		// Same reasoning as the text path: exit 0 + no lines does not
+		// mean the unit exists.
+		if nerr := noEntriesErr(cmd.Context(), unit); nerr != nil {
+			return nerr
+		}
+	}
 	return d.Result(output.NewResult(cmd.CommandPath()).WithBody(body))
+}
+
+// unitExists reports whether systemd knows the unit, and whether we
+// were able to find out at all.
+//
+// This is the missing half of "no entries" handling. journalctl exits 0
+// with no output BOTH when a unit exists and has simply been quiet AND
+// when the unit does not exist — verified against systemd 255:
+//
+//	journalctl -u systemd-journald.service --since -1us  -> exit 0
+//	journalctl -u no-such-unit.service                   -> exit 0
+//
+// so the exit code cannot separate them and neither can the output.
+// systemctl can: LoadState is "not-found" for a unit systemd has never
+// heard of and "loaded" for one it knows.
+//
+// The second return distinguishes "systemd says loaded" from "we could
+// not ask" (no systemctl on PATH, a container without a system bus, a
+// permission error). Guessing on a failed probe is how the original
+// bug happened, so an unavailable probe reports ok=false and the caller
+// stays silent rather than inventing an answer.
+func unitExists(ctx context.Context, unit string) (exists, ok bool) {
+	bin, err := exec.LookPath("systemctl")
+	if err != nil {
+		return false, false
+	}
+	out, err := exec.CommandContext(ctx, bin,
+		"show", "-p", "LoadState", "--value", unit).Output()
+	if err != nil {
+		return false, false
+	}
+	switch strings.TrimSpace(string(out)) {
+	case "not-found":
+		return false, true
+	case "":
+		return false, false
+	default:
+		// loaded / masked / bad-setting / error: systemd knows of it.
+		return true, true
+	}
+}
+
+// noEntriesErr is the answer to "journalctl gave us nothing".
+//
+// Returns a notfound.unit error ONLY when systemd positively reports
+// the unit as not-found. A unit that exists and is merely quiet is not
+// an error — reporting one would be a worse failure than the silence
+// this replaces, because a healthy agent that simply has not logged
+// recently would look like a missing one. Same when the probe itself
+// is unavailable: nil, and the caller returns an empty result.
+func noEntriesErr(ctx context.Context, unit string) error {
+	if exists, ok := unitExists(ctx, unit); ok && !exists {
+		return output.NewError("notfound.unit",
+			fmt.Sprintf("logs: systemd has no unit %q (LoadState=not-found); "+
+				"check the deployment name, or pass --unit", unit))
+	}
+	return nil
 }
 
 // unitName derives the systemd unit. Empty deployment maps to the
