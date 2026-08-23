@@ -132,7 +132,7 @@ steps:
   - cli_run:
       args: ["backup", "delete", "l3-retention", "$BACKUP_leaf_incr",
              "--repo", "$REPO",
-             "--reason", "L3-incremental-retention-guard: sever chain to test reversibility"]
+             "--reason", "L3-incremental-retention-guard: sever chain to test reversibility", "--yes"]
       expect_exit: 0
 
   # 9. Same dry-run again, JSON output for unambiguous assertion.

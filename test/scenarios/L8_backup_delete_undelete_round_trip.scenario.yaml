@@ -70,6 +70,7 @@ steps:
         - "$REPO"
         - "--reason"
         - "L8 delete-undelete round-trip"
+        - "--yes"
       timeout: 30s
 
   # `list --only-deleted` must surface the tombstone so

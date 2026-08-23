@@ -88,6 +88,7 @@ steps:
         - "$REPO"
         - "--reason"
         - "should be refused by hold"
+        - "--yes"
       expect_exit: 7
       expect_stderr_contains: hold
       timeout: 30s

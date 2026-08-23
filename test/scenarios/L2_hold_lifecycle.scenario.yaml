@@ -99,6 +99,7 @@ steps:
         - "$REPO"
         - "--reason"
         - "scenario probe — should fail because of hold"
+        - "--yes"
       expect_exit: 7
       expect_stderr_contains: "conflict.manifest_held"
 
@@ -137,6 +138,7 @@ steps:
         - "$REPO"
         - "--reason"
         - "scenario teardown"
+        - "--yes"
       expect_exit: 0
 
 cleanup:
