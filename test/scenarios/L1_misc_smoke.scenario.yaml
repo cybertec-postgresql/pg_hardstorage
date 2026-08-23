@@ -127,7 +127,7 @@ steps:
         - "no-such-pg-hardstorage-unit.service"
         - "--lines"
         - "1"
-      expect_exit: 0
+      expect_exit: 6
       timeout: 30s
 
   # 10. runbook generate against a known scenario.

@@ -37,13 +37,16 @@ steps:
       expect_exit: 0
       expect_stdout_contains: "pg_hardstorage"
 
-  # Negative path: a bogus subcommand exits non-zero.  Cobra's
-  # default is exit 1 and a "unknown command" line on stderr.
-  # We don't pin the exact text — that's a Cobra-internal contract
-  # we don't want to brittle-test.
+  # Negative path: a bogus subcommand exits non-zero.  The exit
+  # code is OURS, not Cobra's: internal/output/exitcode.go maps
+  # every usage error to ExitMisuse = 2, and an unknown command is
+  # a usage error.  This expected Cobra's bare default of 1, which
+  # this CLI has never returned.
+  # We don't pin the stderr text — that IS a Cobra-internal
+  # contract we don't want to brittle-test.
   - cli_run:
       args: ["this-subcommand-does-not-exist"]
-      expect_exit: 1
+      expect_exit: 2
 
   # Placeholder substitution: $REPO resolves to the scenario's
   # repo URL (file:// fallback under artefactDir/repo since this
