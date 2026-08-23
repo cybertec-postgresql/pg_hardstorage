@@ -760,6 +760,28 @@ func pgUserFromDSN(dsn string) string {
 // pre-pull via `pg_hardstorage_testkit image pull-pg
 // --version <N>` (or equivalent) before running scenarios; on
 // connected hosts the pull is transparent.
+// hostFileForMount reports whether v names an existing regular file on
+// the host, and returns the path to bind-mount. Directories are
+// excluded: a credential that is a directory would pull an unknown
+// amount of the host filesystem into the sandbox, and no sink uses one.
+func hostFileForMount(v string) (string, bool) {
+	if v == "" || !filepath.IsAbs(v) {
+		return "", false
+	}
+	st, err := os.Stat(v)
+	if err != nil || !st.Mode().IsRegular() {
+		return "", false
+	}
+	abs, err := filepath.Abs(v)
+	if err != nil {
+		return "", false
+	}
+	if canonical, cerr := filepath.EvalSymlinks(abs); cerr == nil {
+		abs = canonical
+	}
+	return abs, true
+}
+
 func startRestoredSandbox(ctx context.Context, name, datadir, version,
 	agentBin, repoURL string, agentEnv map[string]string,
 ) (func(), error) {
@@ -906,6 +928,25 @@ func startRestoredSandbox(ctx context.Context, name, datadir, version,
 		args = append(args, "--network=host")
 		for k, v := range agentEnv {
 			args = append(args, "-e", k+"="+v)
+			// Some sink credentials are FILES, not values. The SDK
+			// credential chains for s3 / azblob / gcs take secrets
+			// inline, so forwarding the variable is enough — but the
+			// sftp plugin's known_hosts is a PATH, and a path handed
+			// to a container that cannot see the file is worse than
+			// useless: PG's restore_command aborts recovery with
+			//
+			//   sftp: load known_hosts /tmp/pg-hs-sftp-knownhosts-*/
+			//   known_hosts: no such file or directory
+			//   FATAL: could not restore file "00000002.history"
+			//
+			// and the sandbox never accepts connections, which the
+			// step then reports as an opaque readiness timeout. Mount
+			// any value that IS an existing host file at the same
+			// absolute path, so the variable means inside the
+			// container what it means outside.
+			if mountable, ok := hostFileForMount(v); ok {
+				args = append(args, "-v", mountable+":"+mountable+":ro,z")
+			}
 		}
 	}
 
