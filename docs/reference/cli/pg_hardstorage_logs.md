@@ -27,7 +27,9 @@ Options:
   --follow / -f      tail forward (default: print last 100 lines)
   --lines N          how many lines to print initially (default 100)
   --since DUR-OR-TS  start from this point ("24h", "yesterday",
-                     RFC3339); passed verbatim to journalctl
+                     RFC3339). A bare duration means "that long
+                     ago" and is negated for journalctl, which
+                     requires a sign on relative times.
   --unit NAME        override the auto-derived unit name
 
 Requires journalctl on PATH. On non-systemd hosts (macOS, BSD,
@@ -44,7 +46,7 @@ pg_hardstorage logs [<deployment>] [flags]
   -f, --follow         tail forward indefinitely (Ctrl-C to stop)
   -h, --help           help for logs
   -n, --lines int      how many lines to print initially (default 100)
-      --since string   start at this point (24h / yesterday / RFC3339); passed to journalctl
+      --since string   start at this point (24h / yesterday / RFC3339); a bare duration means that long ago
       --unit string    override the auto-derived systemd unit name
 ```
 

@@ -26,7 +26,9 @@ Options:
 --follow / -f      tail forward (default: print last 100 lines)
   --lines N          how many lines to print initially (default 100)
   --since DUR-OR-TS  start from this point ("24h", "yesterday",
-                     RFC3339); passed verbatim to journalctl
+                     RFC3339). A bare duration means "that long
+                     ago" and is negated for journalctl, which
+                     requires a sign on relative times.
   --unit NAME        override the auto-derived unit name
 
 .PP
@@ -50,7 +52,7 @@ read the agent's stdout directly or wire a logging plugin.
 
 .PP
 \fB--since\fP=""
-	start at this point (24h / yesterday / RFC3339); passed to journalctl
+	start at this point (24h / yesterday / RFC3339); a bare duration means that long ago
 
 .PP
 \fB--unit\fP=""
