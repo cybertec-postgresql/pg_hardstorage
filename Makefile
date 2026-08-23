@@ -82,6 +82,7 @@ export TESTCONTAINERS_RYUK_DISABLED ?= true
 
 .PHONY: all help build build-testkit build-fips build-pkcs11 build-firecracker \
 	test test-integration test-stress test-all \
+	test-scenarios test-scenarios-lint \
 	test-mutations \
 	check cover vet lint fmt tidy clean install release-snapshot \
 	sync-llm-docs \
@@ -104,6 +105,8 @@ help:
 	@echo "  make test               go test -race -count=1 ./..."
 	@echo "  make test-integration   go test -tags=integration ... (Docker required)"
 	@echo "  make test-stress        ordering-sensitive pkgs x$(STRESS_COUNT), no -race (run on arm64 too)"
+	@echo "  make test-scenarios     run ALL $(words $(ALL_SCENARIOS)) scenarios (SCENARIO_TIER=L2 to narrow)"
+	@echo "  make test-scenarios-lint  schema-check every scenario (no Docker)"
 	@echo "  make test-all           default + integration suites"
 	@echo "  make test-mutations     run the testkit mutation harness (asserts the"
 	@echo "                          test suite catches deliberately-broken variants"
@@ -495,6 +498,55 @@ test-wal-stream-suite: build-testkit | $(HS_TMPDIR)
 # Docker.  Catches schema drift in any of the YAML files
 # without spending the wall-clock budget of a real run.
 .PHONY: test-wal-stream-lint
+# ALL_SCENARIOS is every scenario on disk, not the wal-stream subset.
+#
+# WAL_STREAM_SCENARIOS lists 12 files; test/scenarios/ holds 174. The
+# other 162 were reachable only by invoking the testkit by hand, so
+# nothing routinely executed them and they drifted: a renamed flag
+# (--out -> --sql-file), a confirmation gate added to `backup delete`,
+# an argv contract the shim had always declared, two scenarios pinning
+# CONTRADICTORY exit codes for the same command, and an
+# --inactivity-timeout wider than the status cadence that could never
+# fire. Each was found by running them; none could have been found by
+# not running them.
+ALL_SCENARIOS := $(sort $(wildcard test/scenarios/*.scenario.yaml))
+
+# test-scenarios-lint validates every scenario against the v1 schema.
+# No Docker, no containers, seconds to run — the cheap gate that keeps
+# the corpus parseable even when the full suite is too expensive.
+test-scenarios-lint: build-testkit
+	@set -e; \
+	n=0; \
+	for s in $(ALL_SCENARIOS); do \
+		$(BIN_DIR)/$(TESTKIT) scenario lint "$$s" >/dev/null; \
+		n=$$((n+1)); \
+	done; \
+	echo "lint ok: $$n scenario(s)"
+
+# test-scenarios runs the WHOLE corpus. Needs Docker, the compat shims
+# (build-compat) and, for a few scenarios, host PostgreSQL client tools
+# and the L4 multi-PG testbed image (`make build-multipg-image`).
+#
+# SCENARIO_TIER limits the run: `make test-scenarios SCENARIO_TIER=L2`.
+# Cheapest tiers first so a broad regression surfaces early rather than
+# after the multi-GB L7 seeds.
+SCENARIO_TIER ?=
+test-scenarios: build build-compat build-testkit | $(HS_TMPDIR)
+	@set -e; \
+	if [ -n "$(SCENARIO_TIER)" ]; then \
+		list="$$(ls test/scenarios/$(SCENARIO_TIER)_*.scenario.yaml)"; \
+	else \
+		list=""; \
+		for t in L1 L6 L2 L8 L3 L4 L5 L7; do \
+			list="$$list $$(ls test/scenarios/$$t\_*.scenario.yaml 2>/dev/null)"; \
+		done; \
+	fi; \
+	for s in $$list; do \
+		echo "→ $$s"; \
+		$(BIN_DIR)/$(TESTKIT) scenario run "$$s"; \
+	done; \
+	echo "all scenarios passed"
+
 test-wal-stream-lint: build-testkit
 	@set -e; \
 	for s in $(WAL_STREAM_SCENARIOS); do \
