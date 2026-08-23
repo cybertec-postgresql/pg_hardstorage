@@ -11,6 +11,9 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/output"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/compression"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/compression/none"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/compression/zstd"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo/bundle"
 )
 
@@ -146,7 +149,13 @@ func newRepoBundleImportCmd() *cobra.Command {
 			}
 			defer sp.Close()
 
-			bm, err := bundle.Import(cmd.Context(), f, sp, bundle.ImportOptions{})
+			// Supply the codec set so import verifies each chunk's
+			// content address against its PLAINTEXT. Chunks are stored
+			// zstd-compressed by default, so without this the check can
+			// only cover none-coded chunks — see verifyChunkPayload.
+			bm, err := bundle.Import(cmd.Context(), f, sp, bundle.ImportOptions{
+				Codecs: bundleCodecs(),
+			})
 			if err != nil {
 				return output.NewError("repo.bundle_import_failed",
 					fmt.Sprintf("repo bundle import: %v", err)).Wrap(err)
@@ -228,3 +237,14 @@ func (b repoBundleImportBody) WriteText(w io.Writer) error {
 
 // silence unused in case `context` is dropped by future refactor
 var _ = context.Background
+
+// bundleCodecs is the decoder set `repo bundle import` uses to check a
+// chunk's content address. It mirrors what casdefault registers on a
+// read path: the none codec plus zstd, which is what every repo writes
+// with unless explicitly configured otherwise.
+func bundleCodecs() *compression.CodecRegistry {
+	r := compression.NewRegistry()
+	r.Register(compression.AlgoNone, none.Compressor{})
+	r.Register(compression.AlgoZstd, zstd.NewDefault())
+	return r
+}

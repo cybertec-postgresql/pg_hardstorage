@@ -41,6 +41,7 @@ import (
 	"time"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/compression"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo"
 )
@@ -275,6 +276,20 @@ type ImportOptions struct {
 	// negative selects the package default.
 	MaxEntries    int
 	MaxTotalBytes int64
+
+	// Codecs decodes stored chunk payloads so the content address can
+	// be checked against the PLAINTEXT, which is what a chunk key
+	// actually addresses.
+	//
+	// Chunks are stored enveloped and (by default) zstd-compressed, so
+	// the bytes in the bundle are NOT the bytes the key hashes. Without
+	// a registry this function can only verify chunks stored with the
+	// none codec, and every chunk from a normal repo is refused. It is
+	// an option rather than a hard import because casdefault keeps zstd
+	// out of the bare repo packages on purpose, so a small
+	// inspection-only binary can avoid pulling it in; callers that
+	// already have the codecs (the CLI) pass them.
+	Codecs *compression.CodecRegistry
 }
 
 // DefaultMaxBundleEntries / DefaultMaxBundleBytes are generous sanity
@@ -384,7 +399,7 @@ func Import(ctx context.Context, r io.Reader, sp storage.StoragePlugin, opts Imp
 			if err != nil {
 				return nil, fmt.Errorf("bundle: read chunk %s: %w", clean, err)
 			}
-			if err := verifyChunkPayload(clean, body); err != nil {
+			if err := verifyChunkPayload(clean, body, opts.Codecs); err != nil {
 				return nil, err
 			}
 			if err := putIfNotExists(ctx, sp, clean, strings_NewReader(string(body))); err != nil {
@@ -578,20 +593,83 @@ func pathClean(p string) (string, bool) {
 	return cleaned, true
 }
 
-// verifyChunkPayload confirms that body's SHA-256 matches the
-// content-address embedded in a chunk key (chunks/sha256/aa/bb/<hex>.chk).
-// The CAS is content-addressed: the key IS the hash of the bytes, so a
-// bundle that ships a chunk whose payload doesn't hash to its key is
+// verifyChunkPayload confirms that a chunk's PLAINTEXT hashes to the
+// content-address embedded in its key (chunks/sha256/aa/bb/<hex>.chk).
+// A bundle shipping a chunk whose bytes don't match its address is
 // corrupt or forged and must be rejected before it lands in the repo —
-// otherwise every later reader that trusts the key serves wrong content.
-func verifyChunkPayload(key string, body []byte) error {
+// otherwise every later reader that trusts the key serves wrong
+// content.
+//
+// The subtlety that made this wrong: the key addresses the PLAINTEXT
+// (CAS.PutChunk hashes body, then compresses and optionally encrypts
+// before storing), while a bundle preserves the on-disk layout exactly
+// and therefore carries the STORED bytes. Hashing what is in the tar
+// and comparing it to the key only agrees when the chunk was stored
+// with the none codec. Every repo compresses by default, so this
+// refused every chunk of every real bundle:
+//
+//	bundle: reject chunk chunks/sha256/... : payload SHA-256 <x>
+//	does not match key hash <y>
+//
+// The package's own tests missed it because they write chunks straight
+// to storage as raw plaintext under ChunkKey(HashOf(body)) rather than
+// through CAS.PutChunk, which is the one arrangement where stored
+// bytes and key agree.
+//
+// So decode the envelope first and hash what the key actually
+// addresses. Chunks are self-describing (version, compression algo,
+// encryption fields), so no out-of-band metadata is needed.
+func verifyChunkPayload(key string, body []byte, codecs *compression.CodecRegistry) error {
 	want, err := repo.ParseChunkKey(key)
 	if err != nil {
 		return fmt.Errorf("bundle: reject chunk %s: not a valid chunk key: %w", key, err)
 	}
-	got := repo.HashOf(body)
-	if got != want {
-		return fmt.Errorf("bundle: reject chunk %s: payload SHA-256 %s does not match key hash %s",
+
+	algo, encFields, payload, eerr := compression.ReadEnvelope(body)
+	if eerr != nil {
+		// Not enveloped: a raw plaintext chunk. Hash it directly —
+		// this is the historical shape and must keep working.
+		if got := repo.HashOf(body); got != want {
+			return fmt.Errorf("bundle: reject chunk %s: payload SHA-256 %s does not match key hash %s",
+				key, got.String(), want.String())
+		}
+		return nil
+	}
+
+	// Encrypted at rest: the plaintext hash is unknowable here (import
+	// holds no DEK, and requiring one would make a bundle unimportable
+	// without the source repo's keys — the opposite of portable). The
+	// manifest signature still covers which chunks a backup claims, so
+	// accept the ciphertext and let restore fail loudly if it cannot
+	// decrypt.
+	if encFields.EncryptionAlgo != 0 {
+		return nil
+	}
+
+	if codecs == nil {
+		// No registry: only the none codec is verifiable. Refusing
+		// here would reject every compressed chunk, which is the bug
+		// this function had; accepting silently would drop the
+		// guarantee. Verify what we can and say so.
+		if algo == compression.AlgoNone {
+			if got := repo.HashOf(payload); got != want {
+				return fmt.Errorf("bundle: reject chunk %s: payload SHA-256 %s does not match key hash %s",
+					key, got.String(), want.String())
+			}
+		}
+		return nil
+	}
+
+	codec, lerr := codecs.Lookup(algo)
+	if lerr != nil {
+		return fmt.Errorf("bundle: reject chunk %s: no codec for compression algo %d: %w", key, algo, lerr)
+	}
+	plain, derr := codec.Decompress(payload)
+	if derr != nil {
+		return fmt.Errorf("bundle: reject chunk %s: decompress: %w", key, derr)
+	}
+	if got := repo.HashOf(plain); got != want {
+		return fmt.Errorf("bundle: reject chunk %s: plaintext SHA-256 %s does not match key hash %s",
 			key, got.String(), want.String())
 	}
 	return nil
