@@ -175,11 +175,13 @@ func TestBackup_InterruptedByAFailover_FailsHonestly(t *testing.T) {
 			repoDir)
 	}
 
+	triggeredAt := time.Since(backupStart)
 	t.Logf("switching over while the backup is in flight (%s elapsed)",
-		time.Since(backupStart).Truncate(time.Millisecond))
+		triggeredAt.Truncate(time.Millisecond))
 	_ = switchover(t, ctx, topo, topo.ConnString())
+	switchoverReturnedAt := time.Since(backupStart)
 	t.Logf("switchover returned at %s into the backup",
-		time.Since(backupStart).Truncate(time.Millisecond))
+		switchoverReturnedAt.Truncate(time.Millisecond))
 
 	var res backupOutcome
 	select {
@@ -190,15 +192,33 @@ func TestBackup_InterruptedByAFailover_FailsHonestly(t *testing.T) {
 	backupRan := time.Since(backupStart)
 	t.Logf("=== measured: backup exited %d after %s ===", res.code, backupRan.Truncate(time.Millisecond))
 
-	// The demotion has to land mid-transfer for this to mean anything.
-	// If the backup ended within a second of the switchover returning,
-	// it may simply have finished first — say so rather than banking a
-	// pass on a scenario that did not occur.
-	if backupRan < 6*time.Second {
-		t.Errorf("the backup ran only %s; the switchover was triggered at 4s, so the "+
-			"demotion cannot have landed mid-transfer. Seed more data — this test is not "+
-			"exercising the case it describes.", backupRan.Truncate(time.Millisecond))
+	// The demotion has to land mid-transfer for this to mean anything,
+	// so compare against WHEN THE SWITCHOVER ACTUALLY FIRED rather
+	// than a constant.
+	//
+	// This guard used to read `backupRan < 6*time.Second` and blame a
+	// trigger "at 4s" — both left over from the fixed-sleep design
+	// this test had before the trigger became evidence-based. The
+	// trigger now fires as soon as bytes are landing, which on a fast
+	// host is ~2s, so a backup that ran 4.5s HAD overlapped: the
+	// stale constants failed a run that proved exactly what the test
+	// exists to prove (observed 2026-08-24: triggered 2.377s, backup
+	// exited at 4.562s, refused cleanly, no phantom entry — reported
+	// as a failure anyway).
+	//
+	// The backup must still have been running when we triggered the
+	// switchover. Anything after that is a real overlap: a backup that
+	// dies DURING the demotion is the very case under test.
+	if backupRan <= triggeredAt {
+		t.Errorf("the backup ran %s but the switchover was not triggered until %s, so the "+
+			"demotion cannot have landed mid-transfer. Raise PGHS_FAILOVER_SEED_ROWS — this "+
+			"run is not exercising the case the test describes.",
+			backupRan.Truncate(time.Millisecond), triggeredAt.Truncate(time.Millisecond))
 	}
+	t.Logf("overlap confirmed: triggered at %s, switchover returned at %s, backup ended at %s",
+		triggeredAt.Truncate(time.Millisecond),
+		switchoverReturnedAt.Truncate(time.Millisecond),
+		backupRan.Truncate(time.Millisecond))
 
 	// Whatever it decided, `list` is the operator's view of
 	// reality and must agree with it.
