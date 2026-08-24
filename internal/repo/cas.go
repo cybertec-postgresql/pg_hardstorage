@@ -206,6 +206,57 @@ type adoptGuard struct {
 	mu       sync.Mutex
 	resolved bool
 	err      error
+
+	// multiKEK records whether this repository holds shared-DEK
+	// objects for MORE THAN ONE KEKRef, and whether we have looked.
+	//
+	// The one-probe shortcut above rests on "the check is a property
+	// of (repo, DEK)". That is true of a repository whose chunks were
+	// all written under one KEK, and FALSE of a mixed one — which is
+	// the configuration this guard exists for. In a mixed repo the
+	// answer depends on WHICH chunk is adopted, so a first adoption
+	// that happens to hit a readable chunk resolved the guard OK and
+	// every later foreign-DEK adoption sailed through unchecked. The
+	// backup then committed a manifest referencing chunks it cannot
+	// decrypt: exit 0, failure at restore — precisely the outcome the
+	// guard was written to prevent, reached by adopting in a different
+	// order.
+	//
+	// So verify the premise instead of assuming it. One LIST of the
+	// shared-DEK prefix says whether the repo is single-KEK; if it is,
+	// nothing changes and dedup keeps its cost profile. If it is not,
+	// every adoption is checked, because in a mixed repo that is the
+	// only answer worth having.
+	multiKEK      bool
+	multiKEKKnown bool
+}
+
+// sharedDEKPrefix mirrors sharedkey.sharedDEKPrefix — one object per
+// KEKRef that has minted a shared DEK in this repository. Duplicated
+// rather than imported because repo cannot depend on repo/sharedkey
+// (sharedkey imports storage and is layered above the CAS); the
+// constant is part of the on-disk layout and changes with it.
+const sharedDEKPrefix = "keys/shared-dek/"
+
+// repoIsMultiKEK reports whether the repository holds shared-DEK
+// objects for more than one KEKRef.
+//
+// Conservative on failure: a LIST error returns false, keeping the
+// cheap path rather than failing a backup over a listing blip. That
+// weakens detection in a repo we could not read, which is strictly
+// better than today's behaviour and never worse.
+func (c *CAS) repoIsMultiKEK(ctx context.Context) bool {
+	n := 0
+	for _, err := range c.sp.List(ctx, sharedDEKPrefix) {
+		if err != nil {
+			return false
+		}
+		n++
+		if n > 1 {
+			return true
+		}
+	}
+	return false
 }
 
 // defaultSeenCacheLimit bounds the positive cache on every CAS unless
@@ -762,8 +813,20 @@ func (c *CAS) ensureAdoptable(ctx context.Context, hash Hash) error {
 	}
 	c.adopt.mu.Lock()
 	defer c.adopt.mu.Unlock()
-	if c.adopt.resolved {
+
+	// A recorded REFUSAL is always conclusive and always cached: the
+	// repository holds chunks this DEK cannot read, and that does not
+	// stop being true.
+	if c.adopt.resolved && c.adopt.err != nil {
 		return c.adopt.err
+	}
+	if !c.adopt.multiKEKKnown {
+		c.adopt.multiKEK = c.repoIsMultiKEK(ctx)
+		c.adopt.multiKEKKnown = true
+	}
+	// A recorded SUCCESS generalises only in a single-KEK repository.
+	if c.adopt.resolved && !c.adopt.multiKEK {
+		return nil
 	}
 
 	_, err := c.GetChunkBytes(ctx, hash)
