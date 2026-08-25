@@ -42,6 +42,23 @@ func ParseDurationDays(s string) (time.Duration, error) {
 	case '+':
 		trimmed = trimmed[1:]
 	}
+	// A bare sign is not a duration. Without this the loop below
+	// consumes nothing, the delegation to time.ParseDuration is skipped
+	// because there is no remainder, and "+" or "-" returns 0 with no
+	// error — so `--tombstone-grace -` would silently DISABLE the grace
+	// period instead of being rejected. time.ParseDuration refuses both.
+	// (Found by FuzzParseDurationDays_AgreesWithStdlib.)
+	if trimmed == "" {
+		return 0, fmt.Errorf("invalid duration %q", s)
+	}
+	// ...and neither is a doubled sign. We strip one, and
+	// time.ParseDuration would strip another from the remainder, so
+	// "++0h" and "+-1h" would be accepted here while the stdlib
+	// rejects them. Refuse rather than widen what a duration means.
+	// (Found by FuzzParseDurationDays_AgreesWithStdlib.)
+	if trimmed[0] == '+' || trimmed[0] == '-' {
+		return 0, fmt.Errorf("invalid duration %q", s)
+	}
 
 	var total time.Duration
 	rest := trimmed
