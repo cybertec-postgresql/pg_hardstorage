@@ -14,8 +14,13 @@
 //	endpoint      S3-compatible endpoint (MinIO, R2). Without this we
 //	              talk to AWS S3.
 //	path_style    "true" forces path-style addressing (bucket in path,
-//	              not host). Required for MinIO/localstack with non-DNS
-//	              bucket names.
+//	              not host); "false" forces virtual-hosted addressing
+//	              (bucket in the hostname). Unset, a custom ?endpoint=
+//	              defaults to path-style — right for MinIO/localstack
+//	              with non-DNS bucket names, wrong for Alibaba Cloud
+//	              OSS, which refuses path-style outright. Set it
+//	              explicitly when the default does not suit the
+//	              backend.
 //	storage_class default StorageClass for Put when none is set per-request.
 //	conditional_put "native" vouches that a custom ?endpoint= enforces
 //	              `If-None-Match: *` atomically (MinIO ≥ RELEASE.2024,
@@ -38,6 +43,7 @@ import (
 	"iter"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -115,7 +121,37 @@ func (p *Plugin) Open(ctx context.Context, cfg storage.StorageConfig) error {
 	q := cfg.URL.Query()
 	region := q.Get("region")
 	endpoint := q.Get("endpoint")
-	pathStyle := q.Get("path_style") == "true"
+	// Addressing style: an EXPLICIT path_style wins; otherwise a custom
+	// endpoint defaults to path-style.
+	//
+	// The default exists because MinIO/localstack are usually reached
+	// with bucket names that are not DNS-valid, where virtual-hosted
+	// addressing cannot work. But it used to be applied as
+	// `pathStyle || endpoint != ""`, which made the parameter
+	// one-way: with a custom endpoint set, path_style=false could not
+	// turn it off, and there was no way to reach virtual-hosted style
+	// at all. Alibaba Cloud OSS REQUIRES virtual-hosted addressing and
+	// answers path-style with
+	//
+	//	403 SecondLevelDomainForbidden: Please use virtual hosted
+	//	style to access.
+	//
+	// so every OSS repository failed at `repo init` with no way out
+	// (issue #52).
+	//
+	// A non-boolean value is refused rather than silently read as
+	// false — `path_style=1` quietly meaning "no" is how an operator
+	// ends up debugging a 403 that their URL says should not happen.
+	usePathStyle := endpoint != ""
+	if raw := q.Get("path_style"); raw != "" {
+		v, perr := strconv.ParseBool(raw)
+		if perr != nil {
+			return fmt.Errorf("s3: path_style=%q is not a boolean; want true or false "+
+				"(true = bucket in the path, required by MinIO/localstack with non-DNS "+
+				"bucket names; false = virtual-hosted, required by Alibaba Cloud OSS)", raw)
+		}
+		usePathStyle = v
+	}
 	storageClass := q.Get("storage_class")
 
 	// Conditional-put honesty. AWS S3 enforces `If-None-Match: *`
@@ -217,7 +253,7 @@ func (p *Plugin) Open(ctx context.Context, cfg storage.StorageConfig) error {
 		if endpoint != "" {
 			o.BaseEndpoint = aws.String(endpoint)
 		}
-		o.UsePathStyle = pathStyle || endpoint != ""
+		o.UsePathStyle = usePathStyle
 	})
 
 	p.client = client

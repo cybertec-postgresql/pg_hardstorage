@@ -159,8 +159,19 @@ pg_hardstorage doctor                     # validates every configured deploymen
 For S3:
 - Verify the credential chain: `aws sts get-caller-identity` from
   the same shell.
-- Inspect endpoint and `path_style`: MinIO and other S3-compatible
-  stores almost always need `?endpoint=https://...&path_style=true`.
+- Inspect endpoint and `path_style`. MinIO, localstack and most
+  S3-compatible stores want `?endpoint=https://...&path_style=true`,
+  and a custom `?endpoint=` defaults to path-style for that reason.
+  Some backends require the opposite: **Alibaba Cloud OSS refuses
+  path-style outright**, with
+
+  ```
+  403 SecondLevelDomainForbidden: Please use virtual hosted style to access.
+  ```
+
+  Add `&path_style=false` to force virtual-hosted addressing (the
+  bucket goes in the hostname). The parameter is explicit in both
+  directions — whatever you set wins over the endpoint default.
 - Check the bucket region matches the URL's `?region=` parameter.
 
 For filesystem repos:

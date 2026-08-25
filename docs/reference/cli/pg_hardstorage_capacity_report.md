@@ -43,7 +43,7 @@ pg_hardstorage capacity report [flags]
 
 ```
   -h, --help               help for report
-      --horizon duration   projection horizon (Go duration syntax; default 90d) (default 2160h0m0s)
+      --horizon duration   projection horizon; accepts d/w as well as Go duration syntax (default 90d) (default 2160h0m0s)
       --repo string        repository URL — must already exist (required)
 ```
 

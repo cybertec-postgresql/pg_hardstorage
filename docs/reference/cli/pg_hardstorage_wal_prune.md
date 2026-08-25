@@ -41,7 +41,7 @@ pg_hardstorage wal prune <deployment> [flags]
 ```
       --apply                      actually delete the candidate segments (default: dry-run)
   -h, --help                       help for prune
-      --keep-since duration        keep WAL segments newer than now-<duration> regardless of the LSN rule (e.g. 14d → 336h)
+      --keep-since duration        keep WAL segments newer than now-<duration> regardless of the LSN rule (e.g. 14d) (default 0s)
       --repo string                repository URL (file://, s3://, ...) — must already exist (required)
       --tombstone-grace duration   keep a just-tombstoned backup's WAL until its tombstone ages past this, so a backup undelete within the window can still recover it (matches repo gc); pass 0 to disable (default 24h0m0s)
 ```

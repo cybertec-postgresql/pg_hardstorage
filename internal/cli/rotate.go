@@ -79,7 +79,7 @@ chunk-GC pass that reaps unreferenced bytes lands).`,
 	c.Flags().IntVar(&opts.keepWeekly, "keep-weekly", 4, "GFS: backups kept per ISO week")
 	c.Flags().IntVar(&opts.keepMonthly, "keep-monthly", 12, "GFS: backups kept per UTC month")
 	c.Flags().IntVar(&opts.keepYearly, "keep-yearly", 5, "GFS: backups kept per UTC year")
-	c.Flags().DurationVar(&opts.keepFor, "keep-for", 30*24*time.Hour, "simple: keep every backup younger than this")
+	DurationDaysVar(c.Flags(), &opts.keepFor, "keep-for", 30*24*time.Hour, "simple: keep every backup younger than this (accepts d/w, e.g. 30d)")
 	c.Flags().IntVar(&opts.keepFulls, "keep-fulls", 14, "count: keep the N most recent fulls")
 	c.Flags().BoolVar(&opts.apply, "apply", false, "actually soft-delete (default: dry-run)")
 	return c

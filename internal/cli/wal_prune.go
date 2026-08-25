@@ -71,9 +71,9 @@ gc --apply' afterwards to reclaim the now-orphan chunk bytes.`,
 	_ = c.MarkFlagRequired("repo")
 	c.Flags().BoolVar(&apply, "apply", false,
 		"actually delete the candidate segments (default: dry-run)")
-	c.Flags().DurationVar(&keepSince, "keep-since", 0,
-		"keep WAL segments newer than now-<duration> regardless of the LSN rule (e.g. 14d → 336h)")
-	c.Flags().DurationVar(&tombstoneGrace, "tombstone-grace", repo.DefaultTombstoneGracePeriod,
+	DurationDaysVar(c.Flags(), &keepSince, "keep-since", 0,
+		"keep WAL segments newer than now-<duration> regardless of the LSN rule (e.g. 14d)")
+	DurationDaysVar(c.Flags(), &tombstoneGrace, "tombstone-grace", repo.DefaultTombstoneGracePeriod,
 		"keep a just-tombstoned backup's WAL until its tombstone ages past this, so a backup undelete within the window can still recover it (matches repo gc); pass 0 to disable")
 	return c
 }

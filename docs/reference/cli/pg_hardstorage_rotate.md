@@ -52,7 +52,7 @@ pg_hardstorage rotate [<deployment>] [flags]
       --apply               actually soft-delete (default: dry-run)
   -h, --help                help for rotate
       --keep-daily int      GFS: backups kept per UTC day (default 7)
-      --keep-for duration   simple: keep every backup younger than this (default 720h0m0s)
+      --keep-for duration   simple: keep every backup younger than this (accepts d/w, e.g. 30d) (default 720h0m0s)
       --keep-fulls int      count: keep the N most recent fulls (default 14)
       --keep-monthly int    GFS: backups kept per UTC month (default 12)
       --keep-weekly int     GFS: backups kept per ISO week (default 4)

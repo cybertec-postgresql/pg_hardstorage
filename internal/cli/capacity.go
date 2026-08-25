@@ -58,8 +58,8 @@ Default horizon: 90d. Override with --horizon (Go duration syntax;
 	c.Flags().StringVar(&repoURL, "repo", "",
 		"repository URL — must already exist (required)")
 	_ = c.MarkFlagRequired("repo")
-	c.Flags().DurationVar(&horizon, "horizon", capacity.DefaultHorizon,
-		"projection horizon (Go duration syntax; default 90d)")
+	DurationDaysVar(c.Flags(), &horizon, "horizon", capacity.DefaultHorizon,
+		"projection horizon; accepts d/w as well as Go duration syntax (default 90d)")
 	return c
 }
 
