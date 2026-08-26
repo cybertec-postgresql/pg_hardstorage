@@ -502,7 +502,13 @@ func buildDrillTask(name string, dep config.DeploymentConfig, kmsCfg config.KMSC
 	// rather than surfacing at 03:00 as a drill failure event.
 	tsRemap, tsErr := restore.ParseTablespaceRemap(dep.Drill.TablespaceMapping)
 	if tsErr != nil {
-		return nil, fmt.Errorf("drill.tablespace_mapping: %w", tsErr)
+		// Prose, not "ns.leaf:" — that shape is the project's convention
+		// for an emitted error CODE (see splitbrain.*), and a code has
+		// to be documented in error-codes.md so an operator can look it
+		// up. This is a config-parse failure at task-build time, not a
+		// structured code, so it names the YAML path without claiming a
+		// namespace that does not exist.
+		return nil, fmt.Errorf("invalid drill.tablespace_mapping for deployment %q: %w", name, tsErr)
 	}
 	return &schedule.Task{
 		Name:     "drill:" + name,
