@@ -2216,7 +2216,14 @@ func streamAttempt(
 	}
 	synced = sink.SyncedLSN()
 	buffered = sink.BufferedLSN()
-	return streamErr, synced, buffered, startLSN, timeline, identityID, nil
+	// The timeline reported back is the one that was STREAMED, not the
+	// one the server sits on. They differ only while the reconnect is
+	// walking the chain after a promotion, and there the caller pairs
+	// this with synced_lsn in the stop summary and the
+	// stopped_with_unarchived_wal warning — an LSN from one timeline
+	// labelled with another would send an operator looking for the
+	// un-archived WAL on a timeline that never held it.
+	return streamErr, synced, buffered, startLSN, streamTLI, identityID, nil
 }
 
 // resolveInactivityTimeout translates the streamer's CLI flags into
