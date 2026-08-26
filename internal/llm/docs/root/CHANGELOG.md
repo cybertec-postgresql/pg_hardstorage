@@ -63,6 +63,35 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **`recovery drill` could overwrite live tablespaces (issue #53).** The
+  drill restores into a temporary directory it creates and removes, so it
+  reads as a safe rehearsal — but a NON-DEFAULT tablespace is restored to
+  the absolute path recorded in the manifest, not under that directory. On
+  the host the backup came from, that path is the live tablespace, so
+  drilling such a backup overwrote production data from the very command
+  meant to prove the backup was sound. `restore` has `--tablespace-mapping`
+  for this; the drill had no way to accept one. It now refuses a backup
+  with non-default tablespaces unless a mapping covers it, naming the paths
+  at risk, and refuses before any bytes are written.
+- **Alibaba Cloud OSS repositories could not be created (issue #52).**
+  `repo init 's3://…?endpoint=https://oss-….aliyuncs.com'` failed with
+  `403 SecondLevelDomainForbidden: Please use virtual hosted style to
+  access.` The addressing style was resolved as `path_style || endpoint
+  != ""`, so a custom endpoint forced path-style and `path_style=false`
+  could not turn it off — virtual-hosted addressing was unreachable. The
+  parameter is now explicit in both directions; a custom endpoint still
+  DEFAULTS to path-style, which is what MinIO and localstack need. A
+  non-boolean value is refused rather than read as false.
+- **`--keep-for 30d` and two more flags rejected the day units their own
+  help advertised (issue #52).** `time.ParseDuration` has no day unit, so
+  `rotate --keep-for 30d`, `capacity report --horizon 90d` and
+  `wal prune --keep-since 14d` all failed with `unknown unit "d"` — the
+  last had even had its help amended to tell operators to convert by hand
+  ("e.g. 14d → 336h"). Duration flags on those commands, plus
+  `wal prune --tombstone-grace`, now accept `d` and `w`. Days are 24h and
+  weeks are 7 days: wall-clock, not calendar, so a retention window means
+  the same thing whenever it runs. Plain Go durations are unchanged.
+
 - **The audit-chain append loop can no longer spin forever.** `Store.Append`
   claims its sequence slot with a conditional put and relinks onto the
   winner when it loses the race. If a slot's stored event body reported a
@@ -147,6 +176,16 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Added
 
+- **`recovery drill --tablespace-mapping`**, same syntax as `restore`:
+  `--tablespace-mapping=<old-abs-path>=<new-abs-path>`, repeatable.
+- **Per-deployment `drill:` configuration** for the SCHEDULED drill —
+  `tablespace_mapping`, `skip_verify`, `temp_base`. The scheduled drill
+  previously ran with fixed defaults and no way to influence it, which
+  left an operator whose backups carry non-default tablespaces unable to
+  drill safely at all. Parsed when the task is built, so a malformed
+  mapping stops the agent from registering a task that could only ever
+  fail, instead of surfacing at 03:00 as a drill failure.
+
 - **`kms verify --require-encrypted`.** For a fleet whose policy is
   "everything is encrypted", a manifest that lost its encryption block is
   the event the audit exists to catch; the default posture counts it as an
@@ -155,6 +194,15 @@ keeps reading that version for at least 24 months after a successor lands.
   the policy it was judged under.
 
 ### Changed
+
+- **A scheduled or manual `recovery drill` of a backup with non-default
+  tablespaces now FAILS unless a mapping is supplied.** Previously it
+  proceeded and wrote over the recorded tablespace locations. Deployments
+  affected by this need `drill.tablespace_mapping` in their configuration
+  (or `--tablespace-mapping` on the command line); until then the drill
+  reports the paths it would have overwritten and stops. **A drill that
+  appeared to pass before may now fail — that is the bug surfacing, not a
+  regression.**
 
 - **Documentation: the audit log is a linear hash chain, not a Merkle
   tree.** SPEC, glossary, compliance mappings, and the explanation pages
