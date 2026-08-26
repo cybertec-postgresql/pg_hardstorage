@@ -124,23 +124,47 @@ func ParseHistory(content []byte) ([]Switch, error) {
 	return out, nil
 }
 
-// Containing returns the timeline whose WAL contains lsn, given the
-// history of timeline current (as returned by ParseHistory) and
-// current itself as the fallback.
+// segmentStart rounds an LSN down to the start of the segment holding
+// it. Division rather than a mask: wal_segment_size is always a power
+// of two in practice, but nothing here needs to depend on that.
+func segmentStart(lsn pglogrepl.LSN, segSize int64) pglogrepl.LSN {
+	if segSize <= 0 {
+		return lsn
+	}
+	return pglogrepl.LSN(uint64(lsn) / uint64(segSize) * uint64(segSize))
+}
+
+// Containing returns the timeline to stream from to make progress
+// past lsn, given the history of timeline current and current itself
+// as the fallback.
 //
-// A switchpoint is the EXCLUSIVE end of its timeline: an LSN equal to
-// a switchpoint is the first byte of the timeline that follows. That
-// boundary is what makes a resuming streamer advance instead of
-// looping — having archived timeline 27 right up to its switchpoint,
-// the next resume lands exactly ON it and resolves to 28, then 29, one
-// reconnect per promotion, until it reaches the live timeline.
+// The obvious rule — "the timeline whose range covers lsn" — is
+// subtly wrong at a boundary, and wrongly enough to hang the stream.
+// A promotion is not a clean cut: PostgreSQL COPIES the old timeline's
+// last partial segment to the new timeline's name, so the bytes
+// between the last segment boundary and the switchpoint exist under
+// BOTH names, and the new timeline's first segment is a whole one that
+// continues past the fork. The old timeline's copy is a dead end — its
+// walsender stops at the switchpoint, mid-segment, and our sink
+// commits only at segment boundaries, so nothing is archived and the
+// next resume asks for the very same tail. That is a livelock, not a
+// slow path: measured as five consecutive no-progress attempts ending
+// in CopyDone before the streamer's own backstop stopped it.
+//
+// So a historic timeline is worth streaming only when it has at least
+// one WHOLE segment left to give — when lsn sits in a strictly
+// earlier segment than the switchpoint. Otherwise the next timeline
+// holds those same bytes in a segment that can actually be completed,
+// and the walk moves on. Every reconnect then commits at least one
+// segment, which is what makes the chain terminate.
 //
 // An empty history (timeline 1, or a file we could not fetch) yields
 // current, which is the pre-existing behaviour: on a cluster that has
 // never failed over there is no other answer, and on one we cannot
 // read the history for, guessing an ancestor would be worse than
 // letting PostgreSQL refuse.
-func Containing(history []Switch, current uint32, lsn pglogrepl.LSN) uint32 {
+func Containing(history []Switch, current uint32, lsn pglogrepl.LSN, segSize int64) uint32 {
+	from := segmentStart(lsn, segSize)
 	for _, e := range history {
 		// Defensive: a history file for timeline N should list only
 		// ancestors. An entry at or above N is nonsense; ignoring it
@@ -150,7 +174,7 @@ func Containing(history []Switch, current uint32, lsn pglogrepl.LSN) uint32 {
 		if e.Timeline >= current {
 			continue
 		}
-		if lsn < e.SwitchPoint {
+		if from < segmentStart(e.SwitchPoint, segSize) {
 			return e.Timeline
 		}
 	}

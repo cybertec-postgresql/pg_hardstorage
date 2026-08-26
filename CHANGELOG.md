@@ -82,7 +82,11 @@ keeps reading that version for at least 24 months after a successor lands.
   was already capturing (and, until now, only ever storing); PostgreSQL
   serves it forward and ends the stream at the branch point, and the
   existing reconnect walks the chain one promotion at a time up to the live
-  timeline. Segments are also filed under the timeline they belong to rather
+  timeline. A timeline is only streamed when it has at least one whole
+  segment left before its branch point: PostgreSQL copies the old timeline's
+  last partial segment to the new timeline's name at promotion, so streaming
+  the old copy would stop mid-segment, commit nothing, and resume at the
+  identical position forever. Segments are also filed under the timeline they belong to rather
   than the one the server happens to be on. Caught by the chaos gate after a
   DCS demotion storm left the streamer reconnecting through two promotions.
   Present since v1.0.0 and reachable since v1.2.4.

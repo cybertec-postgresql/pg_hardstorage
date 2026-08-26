@@ -55,6 +55,7 @@ func resolveStreamTimeline(
 	deployment string,
 	serverTLI uint32,
 	startLSN pglogrepl.LSN,
+	segSize int64,
 	emit func(*output.Event),
 ) uint32 {
 	if store == nil || serverTLI <= 1 {
@@ -85,7 +86,7 @@ func resolveStreamTimeline(
 		warn(err.Error())
 		return serverTLI
 	}
-	chosen := timeline.Containing(hist, serverTLI, startLSN)
+	chosen := timeline.Containing(hist, serverTLI, startLSN, segSize)
 	if chosen != serverTLI && emit != nil {
 		emit(output.NewEvent(output.SeverityInfo, "wal.timeline", "streaming_historic").
 			WithSubject(output.Subject{Deployment: deployment, Timeline: chosen}).

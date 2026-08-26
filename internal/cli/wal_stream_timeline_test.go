@@ -35,6 +35,8 @@ func collectEvents() (func(*output.Event), *[]*output.Event) {
 	return func(e *output.Event) { got = append(got, e) }, &got
 }
 
+const seg16 = 16 << 20
+
 func mustLSN(t *testing.T, s string) pglogrepl.LSN {
 	t.Helper()
 	v, err := pglogrepl.ParseLSN(s)
@@ -54,7 +56,7 @@ func TestResolveStreamTimeline_ResumeBelowForkOpensTheOldTimeline(t *testing.T) 
 	emit, events := collectEvents()
 
 	got := resolveStreamTimeline(context.Background(), h, "db1", 29,
-		mustLSN(t, "0/A1000000"), emit)
+		mustLSN(t, "0/A1000000"), seg16, emit)
 
 	if got != 27 {
 		t.Fatalf("stream timeline = %d, want 27 — opening on %d asks for segment "+
@@ -81,7 +83,7 @@ func TestResolveStreamTimeline_CaughtUpStreamStaysOnTheLiveTimeline(t *testing.T
 	emit, events := collectEvents()
 
 	got := resolveStreamTimeline(context.Background(), h, "db1", 29,
-		mustLSN(t, "0/A7000000"), emit)
+		mustLSN(t, "0/A7000000"), seg16, emit)
 
 	if got != 29 {
 		t.Fatalf("stream timeline = %d, want 29", got)
@@ -107,7 +109,7 @@ func TestResolveStreamTimeline_DegradedPathsKeepThePreExistingBehaviour(t *testi
 	} {
 		t.Run(name, func(t *testing.T) {
 			emit, events := collectEvents()
-			got := resolveStreamTimeline(context.Background(), tc.store, "db1", tc.serverTLI, lsn, emit)
+			got := resolveStreamTimeline(context.Background(), tc.store, "db1", tc.serverTLI, lsn, seg16, emit)
 			if got != tc.serverTLI {
 				t.Fatalf("got %d, want the server's timeline %d — guessing an ancestor "+
 					"when we cannot read the history is worse than letting PG refuse",
@@ -130,7 +132,7 @@ func TestResolveStreamTimeline_DegradedPathsKeepThePreExistingBehaviour(t *testi
 // stream that may have no dispatcher wired yet.
 func TestResolveStreamTimeline_NilEmit(t *testing.T) {
 	h := &fakeHistory{err: errors.New("boom")}
-	if got := resolveStreamTimeline(context.Background(), h, "db1", 29, 0, nil); got != 29 {
+	if got := resolveStreamTimeline(context.Background(), h, "db1", 29, 0, seg16, nil); got != 29 {
 		t.Fatalf("got %d, want 29", got)
 	}
 }
@@ -139,7 +141,7 @@ func TestResolveStreamTimeline_NilEmit(t *testing.T) {
 // carries the whole ancestry, so one read answers for every LSN.
 func TestResolveStreamTimeline_ReadsOnlyTheCurrentTimelinesHistory(t *testing.T) {
 	h := &fakeHistory{bodies: map[uint32]string{29: "27\t0/A3079D40\tr\n"}}
-	resolveStreamTimeline(context.Background(), h, "db1", 29, mustLSN(t, "0/A1000000"), nil)
+	resolveStreamTimeline(context.Background(), h, "db1", 29, mustLSN(t, "0/A1000000"), seg16, nil)
 	if len(h.asked) != 1 || h.asked[0] != 29 {
 		t.Fatalf("fetched %v, want exactly [29]", h.asked)
 	}

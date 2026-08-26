@@ -2060,7 +2060,8 @@ func streamAttempt(
 	// WAL still sitting on disk under the older timeline's name.
 	// Caught by the chaos gate after a demotion storm left the streamer
 	// reconnecting across two promotions.
-	streamTLI := resolveStreamTimeline(repoCtx, historyStore(sp), opts.deployment, timeline, startLSN, emit)
+	streamTLI := resolveStreamTimeline(repoCtx, historyStore(sp), opts.deployment, timeline, startLSN,
+		walsink.NormSegmentSize(opts.segmentSize), emit)
 
 	// opts.durability was validated by runWalStream, so the error
 	// here cannot fire — resolve it again to avoid threading the
