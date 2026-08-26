@@ -48,6 +48,7 @@ package topology
 import (
 	"context"
 	"fmt"
+	"math"
 	"math/rand"
 	"os"
 	"os/exec"
@@ -97,9 +98,31 @@ func TestChaosSoak_RestoreProof(t *testing.T) {
 	}
 	seed := time.Now().UnixNano()
 	if v := os.Getenv("PGHS_CHAOS_SEED"); v != "" {
-		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
-			seed = n
+		// Refuse an unusable seed rather than quietly running a
+		// different one.
+		//
+		// The parse error used to be discarded, so an out-of-range or
+		// malformed PGHS_CHAOS_SEED left the auto-selected seed in
+		// place and the soak ran a DIFFERENT fault ordering than the
+		// operator asked for. This file promises the opposite —
+		// "PGHS_CHAOS_SEED=<seed> re-runs the same schedule" — and the
+		// promise is the whole reason the seed is printed on every run:
+		// somebody chasing a chaos failure sets it to reproduce, gets
+		// an unrelated schedule, concludes the failure is not
+		// reproducible, and drops a real bug.
+		//
+		// Caught by passing a seed drawn as an unsigned 64-bit value:
+		// 17327145514990876780 is above math.MaxInt64, so ParseInt
+		// failed and the run silently used its own seed.
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			t.Fatalf("PGHS_CHAOS_SEED=%q is not usable as a seed: %v\n"+
+				"It must be a signed 64-bit integer (%d..%d) — note that an unsigned "+
+				"64-bit value from /dev/urandom can exceed the maximum. Refusing rather "+
+				"than running a different schedule than you asked for.",
+				v, err, int64(math.MinInt64), int64(math.MaxInt64))
 		}
+		seed = n
 	}
 	rng := rand.New(rand.NewSource(seed))
 	t.Logf("chaos soak: budget=%dm seed=%d (re-run with PGHS_CHAOS_SEED=%d)", minutes, seed, seed)
