@@ -416,6 +416,21 @@ func TestChaosSoak_RestoreProof(t *testing.T) {
 	t.Logf("round backups: %d/%d succeeded", roundBackupsOK, round)
 	t.Logf("fault schedule (%d rounds): %s", round, strings.Join(faultLog, ","))
 
+	// Which streamer paths did this run actually reach?
+	//
+	// The stream log is otherwise read ONLY in the failure branch
+	// below, which makes a PASSING soak silent about coverage — and
+	// that silence is misleading. The cross-timeline resume (a
+	// streamer that fell behind across a promotion and must walk the
+	// timeline chain back up to the live one) is the most fragile
+	// path this soak touches, and whether it gets exercised is a
+	// matter of TIMING, not of the seed: replaying one schedule
+	// reached timeline 29 on one run and timeline 4 on another, and a
+	// third never fell far enough behind to reach the path at all.
+	// A green run that never entered it proves nothing about it, so
+	// say so out loud rather than let the tick be read as coverage.
+	t.Logf("stream path coverage: %s", streamCoverage(scratch+"/stream.log"))
+
 	// The streamer must still be ALIVE after every fault (a crash or a
 	// silent exit is a soak failure in itself).
 	select {
@@ -728,4 +743,42 @@ func repoRootForChaos(t *testing.T) string {
 		t.Fatal("runtime.Caller failed")
 	}
 	return filepath.Clean(filepath.Join(filepath.Dir(here), "..", "..", ".."))
+}
+
+// streamCoverage summarises which streamer paths a soak reached, so a
+// passing run reports coverage instead of only the absence of
+// failure. Counting log markers is deliberately crude: it needs to
+// keep working when the events around it change, and a wrong count is
+// a misleading note in a passing test rather than a false failure.
+func streamCoverage(path string) string {
+	body, err := os.ReadFile(path)
+	if err != nil {
+		return "unavailable: " + err.Error()
+	}
+	log := string(body)
+	var parts []string
+	for _, c := range []struct{ label, marker string }{
+		{"reconnects", "wal.stream.reconnecting"},
+		{"cross-timeline resumes", "wal.timeline.streaming_historic"},
+		{"histories captured", "wal.timeline.history_captured"},
+		{"behind-restart-lsn warnings", "start_behind_slot_restart_lsn"},
+		{"recycled-WAL refusals", "already been removed"},
+	} {
+		parts = append(parts, fmt.Sprintf("%s=%d", c.label, strings.Count(log, c.marker)))
+	}
+	// The highest timeline the stream ever opened on: how far the
+	// cluster actually promoted, which is what decides whether the
+	// cross-timeline path was reachable at all.
+	hi := 0
+	for _, f := range strings.Fields(log) {
+		v, ok := strings.CutPrefix(f, "timeline=")
+		if !ok {
+			continue
+		}
+		if n, cerr := strconv.Atoi(v); cerr == nil && n > hi {
+			hi = n
+		}
+	}
+	parts = append(parts, fmt.Sprintf("max timeline=%d", hi))
+	return strings.Join(parts, ", ")
 }
