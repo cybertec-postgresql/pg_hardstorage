@@ -72,6 +72,14 @@ func setupDrillWorld(t *testing.T) *drillWorld {
 // errors.
 func (w *drillWorld) commitDrillBackup(t *testing.T, deployment string, stoppedAt time.Time, bytes int64) string {
 	t.Helper()
+	return w.commitDrillBackupWithTablespaces(t, deployment, stoppedAt, bytes)
+}
+
+// commitDrillBackupWithTablespaces commits a backup whose manifest
+// declares extra NON-DEFAULT tablespaces at the given absolute paths.
+// Those are the ones a restore writes outside the target directory.
+func (w *drillWorld) commitDrillBackupWithTablespaces(t *testing.T, deployment string, stoppedAt time.Time, bytes int64, tsPaths ...string) string {
+	t.Helper()
 	cas := casdefault.New(w.sp)
 	if bytes <= 0 {
 		bytes = 16
@@ -99,7 +107,7 @@ func (w *drillWorld) commitDrillBackup(t *testing.T, deployment string, stoppedA
 		StartedAt:        stoppedAt.Add(-30 * time.Second),
 		StoppedAt:        stoppedAt,
 		BackupLabel:      "START WAL LOCATION: 0/3000028\n",
-		Tablespaces:      []backup.Tablespace{{OID: 1663, Location: "pg_default"}},
+		Tablespaces:      drillTablespaces(tsPaths),
 		Files: []backup.FileEntry{{
 			Path: "data/" + id, Size: int64(len(body)), Mode: 0o600,
 			Chunks: []backup.ChunkRef{{Hash: info.Hash, Offset: 0, Len: int64(len(body))}},
@@ -740,4 +748,14 @@ func TestDrill_AbsolutePathOnly(t *testing.T) {
 	if err := recovery.DrillTargetCleanupForTest(""); err != nil {
 		t.Errorf("empty path is no-op: %v", err)
 	}
+}
+
+// drillTablespaces builds the manifest's tablespace list: always the
+// default, plus one entry per supplied absolute path.
+func drillTablespaces(paths []string) []backup.Tablespace {
+	out := []backup.Tablespace{{OID: 1663, Location: "pg_default"}}
+	for i, p := range paths {
+		out = append(out, backup.Tablespace{OID: uint32(20000 + i), Location: p})
+	}
+	return out
 }

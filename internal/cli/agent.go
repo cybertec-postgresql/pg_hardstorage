@@ -32,6 +32,7 @@ import (
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/recovery"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/restore"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/schedule"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/version"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/wal/follower"
@@ -496,11 +497,23 @@ func buildDrillTask(name string, dep config.DeploymentConfig, kmsCfg config.KMSC
 	if err != nil {
 		return nil, err
 	}
+	// Parse the mapping at BUILD time, not at fire time: a typo should
+	// stop the agent from registering a task that can only ever fail,
+	// rather than surfacing at 03:00 as a drill failure event.
+	tsRemap, tsErr := restore.ParseTablespaceRemap(dep.Drill.TablespaceMapping)
+	if tsErr != nil {
+		return nil, fmt.Errorf("drill.tablespace_mapping: %w", tsErr)
+	}
 	return &schedule.Task{
 		Name:     "drill:" + name,
 		Schedule: sched,
 		Run: func(ctx context.Context) error {
-			opts := recovery.DrillOptions{Verifier: verifier}
+			opts := recovery.DrillOptions{
+				Verifier:           verifier,
+				TablespaceRemap:    tsRemap,
+				SkipVerifyEntirely: dep.Drill.SkipVerify,
+				TempBaseDir:        dep.Drill.TempBase,
+			}
 			// Wire the keystore exactly like the CLI drill command does —
 			// without a KEKResolver/DEKUnwrapper every drill against an
 			// encrypted repo fails instantly at the restore phase.

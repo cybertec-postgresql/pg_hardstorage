@@ -232,6 +232,12 @@ type DeploymentConfig struct {
 	// Schedule declares the recurring tasks for this deployment.
 	Schedule DeploymentSchedule `yaml:"schedule,omitempty"`
 
+	// Drill tunes the SCHEDULED recovery drill. The interactive
+	// `recovery drill` command takes the same settings as flags; this
+	// is how an unattended drill gets them, since nobody is at a
+	// terminal when the scheduler fires (issue #53).
+	Drill DrillConfig `yaml:"drill,omitempty"`
+
 	// Retention overrides the default retention policy. v0.1 ships
 	// with a hard-coded GFS default; this is forward-compat scaffolding.
 	Retention RetentionConfig `yaml:"retention,omitempty"`
@@ -436,6 +442,33 @@ type SLOConfig struct {
 	// this is informational;+ correlates with verifier sandbox
 	// restore timings.
 	RTOSeconds int64 `yaml:"rto_seconds,omitempty" json:"rto_seconds,omitempty"`
+}
+
+// DrillConfig carries the settings a scheduled recovery drill needs.
+//
+// Without it the scheduled drill ran with defaults and no way to
+// change them, so a deployment whose backups carry non-default
+// tablespaces could not be drilled safely at all: the drill refuses
+// such a backup rather than restoring over the live tablespace, and
+// there was nowhere to put the mapping that would make it safe.
+type DrillConfig struct {
+	// TablespaceMapping redirects non-default tablespaces, one
+	// "<old-abs-path>=<new-abs-path>" per entry — the same syntax as
+	// `restore --tablespace-mapping`. REQUIRED for a deployment whose
+	// backups contain non-default tablespaces; without it the drill
+	// refuses rather than overwrite the recorded locations.
+	TablespaceMapping []string `yaml:"tablespace_mapping,omitempty" json:"tablespace_mapping,omitempty"`
+
+	// SkipVerify runs the restore but not pg_verifybackup, yielding a
+	// "partial" verdict. For fleets where the verify step is too
+	// expensive to run on every drill; the restore itself — the part
+	// that proves the backup is materialisable — still happens.
+	SkipVerify bool `yaml:"skip_verify,omitempty" json:"skip_verify,omitempty"`
+
+	// TempBase is the parent directory for the drill's temporary
+	// target. Default: the system temp dir. Useful when /tmp is too
+	// small for a real data directory.
+	TempBase string `yaml:"temp_base,omitempty" json:"temp_base,omitempty"`
 }
 
 // DeploymentSchedule lists per-task schedule specs.
@@ -973,6 +1006,19 @@ func mergeDeployment(existing, overlay DeploymentConfig) DeploymentConfig {
 	}
 	if overlay.Schedule.Drill.Every != "" || overlay.Schedule.Drill.DailyAt != "" || overlay.Schedule.Drill.At != "" {
 		existing.Schedule.Drill = overlay.Schedule.Drill
+	}
+	// Drill settings merge field-by-field rather than wholesale: an
+	// overlay that sets only skip_verify must not silently drop a
+	// tablespace_mapping from the base, because losing the mapping
+	// turns a safe scheduled drill into a refused one.
+	if len(overlay.Drill.TablespaceMapping) > 0 {
+		existing.Drill.TablespaceMapping = overlay.Drill.TablespaceMapping
+	}
+	if overlay.Drill.SkipVerify {
+		existing.Drill.SkipVerify = overlay.Drill.SkipVerify
+	}
+	if overlay.Drill.TempBase != "" {
+		existing.Drill.TempBase = overlay.Drill.TempBase
 	}
 	if overlay.Patroni.URL != "" {
 		existing.Patroni.URL = overlay.Patroni.URL

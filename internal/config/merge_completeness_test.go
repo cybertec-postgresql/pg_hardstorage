@@ -34,6 +34,11 @@ func TestMergeDeployment_CarriesEveryField(t *testing.T) {
 			Drill:       ScheduleSpec{DailyAt: "03:00"},
 			AuditAnchor: ScheduleSpec{Every: "30m"},
 		},
+		Drill: DrillConfig{
+			TablespaceMapping: []string{"/srv/over/ts=/var/tmp/over/ts"},
+			SkipVerify:        true,
+			TempBase:          "/var/tmp/over",
+		},
 		Retention:      RetentionConfig{Policy: "gfs", KeepDaily: 9, KeepWeekly: 8, KeepMonthly: 60, KeepYearly: 20, KeepFor: "720h", KeepFulls: 7},
 		Classification: "restricted",
 		Residency:      []string{"eu"},

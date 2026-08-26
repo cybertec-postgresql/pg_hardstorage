@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup"
@@ -122,6 +123,21 @@ type DrillOptions struct {
 	// TempBaseDir is the parent directory under which the drill
 	// creates its temporary target dir.  Default os.TempDir().
 	TempBaseDir string
+
+	// TablespaceRemap redirects non-default tablespaces away from the
+	// absolute paths recorded in the manifest.
+	//
+	// The drill restores the data directory into a temp dir it owns and
+	// removes afterwards, so it reads as non-destructive — but a
+	// non-default tablespace is restored to ITS OWN absolute path, not
+	// under the target. Run on the host the backup came from, that path
+	// is the LIVE tablespace, and the drill overwrites production data
+	// while presenting itself as a rehearsal (issue #53).
+	//
+	// Empty is safe because Drill REFUSES a backup with non-default
+	// tablespaces unless a remap covers it; it does not silently fall
+	// back to the recorded locations.
+	TablespaceRemap restore.TablespaceRemap
 
 	// KeepTargetDir, when true, leaves the temporary target dir
 	// in place after the drill.  The DrillReport carries the
@@ -347,6 +363,25 @@ func Drill(ctx context.Context, repoURL string, deployment string, opts DrillOpt
 		}()
 	}
 
+	// A drill must never write outside the temp dir it owns.
+	//
+	// Non-default tablespaces restore to the absolute path in the
+	// manifest, so on the source host they land on the live data. The
+	// drill is scheduled unattended (`schedule --task drill`), which
+	// means nobody is watching when it happens. Refuse rather than
+	// clobber: an operator who wants the drill can supply a mapping,
+	// and one who forgets gets an error instead of a destroyed
+	// tablespace.
+	if outside := restore.NonDefaultTablespaces(manifest); len(outside) > 0 && opts.TablespaceRemap.Empty() {
+		return nil, fmt.Errorf(
+			"recovery drill: backup %s has %d non-default tablespace(s) (%s) that would be "+
+				"restored to their ORIGINAL absolute paths, overwriting whatever is there — "+
+				"on the source host that is the live tablespace. Pass --tablespace-mapping "+
+				"to redirect each one into scratch space (same syntax as `restore`), or drill "+
+				"this backup on a host that does not hold those paths",
+			manifest.BackupID, len(outside), strings.Join(outside, ", "))
+	}
+
 	// Phase 3: restore.
 	restoreStart := time.Now().UTC()
 	restoreFn := opts.restoreFn
@@ -354,15 +389,16 @@ func Drill(ctx context.Context, repoURL string, deployment string, opts DrillOpt
 		restoreFn = restore.Restore
 	}
 	res, restoreErr := restoreFn(ctx, restore.Options{
-		RepoURL:    repoURL,
-		Deployment: deployment,
-		BackupID:   manifest.BackupID,
-		TargetDir:  targetDir,
-		Verifier:   opts.Verifier,
-		KEKForRef:  opts.KEKResolver,
-		UnwrapDEK:  opts.DEKUnwrapper,
-		OnEvent:    opts.OnEvent,
-		Actor:      "recovery-drill",
+		RepoURL:         repoURL,
+		Deployment:      deployment,
+		BackupID:        manifest.BackupID,
+		TargetDir:       targetDir,
+		TablespaceRemap: opts.TablespaceRemap,
+		Verifier:        opts.Verifier,
+		KEKForRef:       opts.KEKResolver,
+		UnwrapDEK:       opts.DEKUnwrapper,
+		OnEvent:         opts.OnEvent,
+		Actor:           "recovery-drill",
 	})
 	restorePhase := DrillPhase{
 		Name:      "restore",

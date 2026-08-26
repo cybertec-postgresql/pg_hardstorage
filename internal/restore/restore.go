@@ -1386,6 +1386,33 @@ func tablespaceDestRoots(m *backup.Manifest, remap TablespaceRemap) map[uint32]s
 	return out
 }
 
+// NonDefaultTablespaces returns the absolute locations a restore of m
+// would write to OUTSIDE the target directory, one per tablespace.
+//
+// A restore places the main data directory under TargetDir, but a
+// non-default tablespace lives at the absolute path recorded in the
+// manifest and is restored THERE unless a remap redirects it. On the
+// host the backup came from, that path is the live tablespace — so a
+// restore without a mapping overwrites production data.
+//
+// Exported so callers that must refuse rather than clobber (the
+// recovery drill) apply the same rule tablespaceDestRoots uses to
+// choose destinations, instead of re-deriving "non-default" and
+// drifting from it.
+func NonDefaultTablespaces(m *backup.Manifest) []string {
+	if m == nil {
+		return nil
+	}
+	var out []string
+	for _, ts := range m.Tablespaces {
+		if ts.OID == 0 || !filepath.IsAbs(ts.Location) {
+			continue
+		}
+		out = append(out, ts.Location)
+	}
+	return out
+}
+
 // parseTablespaceMapLinePath extracts the PATH from a single
 // "<oid> <path>\n" tablespace_map line.  Returns "" when the line is
 // malformed.  Used by tablespaceDestRoots to read back a remapped

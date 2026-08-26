@@ -13,6 +13,7 @@ import (
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/output"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/paths"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/recovery"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/restore"
 )
 
 // newRecoveryDrillCmd implements `recovery drill <deployment>`.
@@ -41,6 +42,7 @@ func newRecoveryDrillCmd() *cobra.Command {
 		pgMajor            string
 		sandboxImage       string
 		tempBaseDir        string
+		tablespaceMapping  []string
 		keepTargetDir      bool
 		allowSkipVerify    bool
 		skipVerifyEntirely bool
@@ -92,6 +94,7 @@ For Docker-free runs, pass --skip-verify; the report's RTO actual
 				pgMajor:            pgMajor,
 				sandboxImage:       sandboxImage,
 				tempBaseDir:        tempBaseDir,
+				tablespaceMapping:  tablespaceMapping,
 				keepTargetDir:      keepTargetDir,
 				allowSkipVerify:    allowSkipVerify,
 				skipVerifyEntirely: skipVerifyEntirely,
@@ -111,6 +114,10 @@ For Docker-free runs, pass --skip-verify; the report's RTO actual
 		"override sandbox PG major version (default: derive from manifest)")
 	c.Flags().StringVar(&sandboxImage, "image", "",
 		"override 'postgres:<major>' sandbox image (air-gapped)")
+	c.Flags().StringArrayVar(&tablespaceMapping, "tablespace-mapping", nil,
+		"redirect a tablespace: --tablespace-mapping=<old-abs-path>=<new-abs-path> (repeatable). "+
+			"Required when the backup has non-default tablespaces: without it they would be "+
+			"restored to their original absolute paths, overwriting live data on the source host")
 	c.Flags().StringVar(&tempBaseDir, "temp-base", "",
 		"parent directory for the temporary target dir (default: $TMPDIR)")
 	c.Flags().BoolVar(&keepTargetDir, "keep", false,
@@ -143,6 +150,7 @@ type recoveryDrillFlags struct {
 	pgMajor            string
 	sandboxImage       string
 	tempBaseDir        string
+	tablespaceMapping  []string
 	keepTargetDir      bool
 	allowSkipVerify    bool
 	skipVerifyEntirely bool
@@ -181,12 +189,21 @@ func runRecoveryDrill(cmd *cobra.Command, deployment string, f recoveryDrillFlag
 		return output.NewError("internal", err.Error()).Wrap(err)
 	}
 
+	// Parse at the usage layer so a typo'd mapping is a clean usage
+	// error before any storage round-trip — same posture as `restore`.
+	tsRemap, tsErr := restore.ParseTablespaceRemap(f.tablespaceMapping)
+	if tsErr != nil {
+		return output.NewError("usage.bad_tablespace_mapping",
+			fmt.Sprintf("recovery drill: %v", tsErr)).Wrap(output.ErrUsage)
+	}
+
 	opts := recovery.DrillOptions{
 		Verifier:           verifier,
 		BackupID:           f.backupID,
 		PGMajor:            f.pgMajor,
 		SandboxImage:       f.sandboxImage,
 		TempBaseDir:        f.tempBaseDir,
+		TablespaceRemap:    tsRemap,
 		KeepTargetDir:      f.keepTargetDir,
 		AllowSkipVerify:    f.allowSkipVerify,
 		SkipVerifyEntirely: f.skipVerifyEntirely,

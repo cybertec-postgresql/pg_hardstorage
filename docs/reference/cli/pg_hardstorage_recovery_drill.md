@@ -54,20 +54,21 @@ pg_hardstorage recovery drill <deployment> [flags]
 ### Options
 
 ```
-      --allow-skip-verify   accept a Partial verdict when pg_verifybackup skips
-      --backup-id string    explicit backup ID to drill against (default: latest)
-      --format string       output format: json | markdown (default "json")
-  -h, --help                help for drill
-      --image string        override 'postgres:<major>' sandbox image (air-gapped)
-      --keep                keep the temporary target dir after the drill (for inspection)
-      --no-encryption       don't wire the local-keystore KEK resolver (drill an unencrypted backup or one whose KEK lives elsewhere)
-      --no-history          suppress the auto-persist of a slim drill history entry into recovery/drills/
-      --operator string     record the operator identity in the history entry (free-form; cron jobs typically pass scheduler:<task-id>)
-      --pg-major string     override sandbox PG major version (default: derive from manifest)
-      --repo string         repository URL (required)
-      --rto-seconds int     RTO target in seconds for actual-vs-target comparison
-      --skip-verify         don't run the sandbox verify at all (Docker-free run)
-      --temp-base string    parent directory for the temporary target dir (default: $TMPDIR)
+      --allow-skip-verify                accept a Partial verdict when pg_verifybackup skips
+      --backup-id string                 explicit backup ID to drill against (default: latest)
+      --format string                    output format: json | markdown (default "json")
+  -h, --help                             help for drill
+      --image string                     override 'postgres:<major>' sandbox image (air-gapped)
+      --keep                             keep the temporary target dir after the drill (for inspection)
+      --no-encryption                    don't wire the local-keystore KEK resolver (drill an unencrypted backup or one whose KEK lives elsewhere)
+      --no-history                       suppress the auto-persist of a slim drill history entry into recovery/drills/
+      --operator string                  record the operator identity in the history entry (free-form; cron jobs typically pass scheduler:<task-id>)
+      --pg-major string                  override sandbox PG major version (default: derive from manifest)
+      --repo string                      repository URL (required)
+      --rto-seconds int                  RTO target in seconds for actual-vs-target comparison
+      --skip-verify                      don't run the sandbox verify at all (Docker-free run)
+      --tablespace-mapping stringArray   redirect a tablespace: --tablespace-mapping=<old-abs-path>=<new-abs-path> (repeatable). Required when the backup has non-default tablespaces: without it they would be restored to their original absolute paths, overwriting live data on the source host
+      --temp-base string                 parent directory for the temporary target dir (default: $TMPDIR)
 ```
 
 ### Options inherited from parent commands
