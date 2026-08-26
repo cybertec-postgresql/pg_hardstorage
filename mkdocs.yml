@@ -316,6 +316,7 @@ nav:
   - Glossary: glossary.md
   - Release notes:
       - release-notes/index.md
+      - "v1.3": release-notes/v1.3.md
       - "v1.2": release-notes/v1.2.md
       - "v1.1": release-notes/v1.1.md
       - "v1.0": release-notes/v1.0.md

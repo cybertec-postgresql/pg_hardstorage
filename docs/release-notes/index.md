@@ -13,6 +13,13 @@ operator deciding whether to upgrade.
 
 ## Releases
 
+- **[v1.3](v1.3.md)** — the unrun-tests release.  A scenario corpus
+  where 162 of 174 files were wired into no target, and what running
+  them found: an air-gap bundle feature that never worked for any
+  compressed repository, and a recovery drill that could overwrite live
+  tablespaces.  Adds `recovery drill --tablespace-mapping`, a
+  per-deployment `drill:` block, and day/week units on the retention
+  duration flags.
 - **[v1.2](v1.2.md)** — the failover release.  A chaos gate that
   drives real Patroni faults (DCS outages, compound storms,
   retention janitors mid-storm) and then restores and boots the
