@@ -65,6 +65,28 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **`wal stream` no longer stops permanently when it resumes across a
+  promotion.** A streamer that fell more than one segment behind and then
+  reconnected after a failover computed the right resume LSN — the previous
+  timeline's frontier — but opened `START_REPLICATION` on the timeline
+  `IDENTIFY_SYSTEM` reported, the new one. A WAL segment file is named for
+  both an LSN and a timeline, so this asked for a file such as
+  `0000001D00000000000000A1`: timeline 29, at an offset below where timeline
+  29 forked. That file has never existed and never can. PostgreSQL cannot
+  tell "recycled" from "never created" and answers `requested WAL segment
+  ... has already been removed`, which is correctly classified as terminal —
+  so the streamer stopped for good, and the message sent the operator
+  hunting for recycled WAL while the bytes were still on disk under the
+  older timeline's name. The stream now opens on the timeline that actually
+  contains the resume point, parsed from the `.history` file the streamer
+  was already capturing (and, until now, only ever storing); PostgreSQL
+  serves it forward and ends the stream at the branch point, and the
+  existing reconnect walks the chain one promotion at a time up to the live
+  timeline. Segments are also filed under the timeline they belong to rather
+  than the one the server happens to be on. Caught by the chaos gate after a
+  DCS demotion storm left the streamer reconnecting through two promotions.
+  Present since v1.0.0 and reachable since v1.2.4.
+
 - **`recovery drill` could overwrite live tablespaces (issue #53).** The
   drill restores into a temporary directory it creates and removes, so it
   reads as a safe rehearsal — but a NON-DEFAULT tablespace is restored to

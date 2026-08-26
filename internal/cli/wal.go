@@ -2050,13 +2050,29 @@ func streamAttempt(
 		recordPreStreamGap(repoCtx, d, sp, opts, timeline, startLSN)
 	}
 
+	// WHICH timeline does startLSN live on? Nearly always the one the
+	// server just reported — but resolveStartLSN's cross-timeline arm
+	// can hand back a frontier that predates this timeline's fork, and
+	// naming the current timeline for such an LSN asks PostgreSQL for a
+	// segment file that has never existed. It answers "already been
+	// removed" (it cannot tell recycled from never-created), which is
+	// classified as terminal, and the streamer stops for good with the
+	// WAL still sitting on disk under the older timeline's name.
+	// Caught by the chaos gate after a demotion storm left the streamer
+	// reconnecting across two promotions.
+	streamTLI := resolveStreamTimeline(repoCtx, historyStore(sp), opts.deployment, timeline, startLSN, emit)
+
 	// opts.durability was validated by runWalStream, so the error
 	// here cannot fire — resolve it again to avoid threading the
 	// mode through streamAttempt's already-long signature.
 	durabilityMode, _ := resolveDurability(opts.durability)
 	sink, err := walsink.New(cas, sp, walsink.Options{
-		Deployment:       opts.deployment,
-		Timeline:         timeline,
+		Deployment: opts.deployment,
+		// The timeline being STREAMED, which is what these segments
+		// belong to — not necessarily the one the server is on.
+		// Labelling old-timeline WAL with the new timeline's id would
+		// file it under a lineage it was never part of.
+		Timeline:         streamTLI,
 		SystemIdentifier: identityID,
 		SegmentSize:      opts.segmentSize,
 		// Hand the sink the position we are about to ask PG for, so it
@@ -2143,7 +2159,7 @@ func streamAttempt(
 	// (deployment, timeline) before this attempt opened.  Cheap
 	// one-shot lookup at startup; failures degrade to omitting the
 	// field rather than blocking the start (issue #42).
-	if lastLSN, found, err := inventory.HighestArchivedLSN(repoCtx, sp, opts.deployment, timeline); err == nil && found {
+	if lastLSN, found, err := inventory.HighestArchivedLSN(repoCtx, sp, opts.deployment, streamTLI); err == nil && found {
 		body["last_lsn_in_repo"] = lastLSN.String()
 	}
 	// Encryption posture: true when a local KEK engaged shared-DEK
@@ -2154,10 +2170,13 @@ func streamAttempt(
 	if encInfo != nil {
 		body["encryption_type"] = encInfo.Scheme
 	}
+	if streamTLI != timeline {
+		body["server_timeline"] = timeline
+	}
 	emit(output.NewEvent(output.SeverityInfo, "wal.stream", "starting").
 		WithSubject(output.Subject{
 			Deployment: opts.deployment,
-			Timeline:   timeline,
+			Timeline:   streamTLI,
 		}).
 		WithBody(body))
 
@@ -2170,7 +2189,7 @@ func streamAttempt(
 	if opts.verbose && opts.statusInterval > 0 {
 		ticker := newWalStreamProgressTicker(
 			opts.statusInterval, sink, emit,
-			opts.deployment, timeline, startLSN)
+			opts.deployment, streamTLI, startLSN)
 		ticker.Start(onceCtx)
 		defer ticker.Stop()
 	}
@@ -2178,7 +2197,7 @@ func streamAttempt(
 	streamErr = replication.Stream(onceCtx, streamConn, replication.StreamOptions{
 		Slot:                 opts.slotName,
 		StartLSN:             startLSN,
-		Timeline:             timeline,
+		Timeline:             streamTLI,
 		StatusUpdateInterval: opts.statusInterval,
 		InactivityTimeout:    resolveInactivityTimeout(opts),
 	}, sink)
