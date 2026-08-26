@@ -144,6 +144,16 @@ debugging a scenario interactively.`,
 			if err != nil {
 				return err
 			}
+			// A skip is not a pass and not a failure. Exit 0 so a
+			// suite is not permanently red over a prerequisite nobody
+			// can supply by changing code, but say so on stderr — a
+			// silent skip is how coverage disappears without anyone
+			// noticing, which is the failure mode that left 162 of the
+			// 174 scenarios unrun in the first place.
+			if res.Skipped {
+				fmt.Fprintf(cmd.ErrOrStderr(), "SKIP %s: %s\n", res.Scenario, res.SkipReason)
+				return nil
+			}
 			if !res.Pass {
 				return fmt.Errorf("scenario failed: %s", res.Failure)
 			}

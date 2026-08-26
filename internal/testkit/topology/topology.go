@@ -127,6 +127,23 @@ type stubTopology struct {
 
 func newStub(name, reason string) *stubTopology { return &stubTopology{name: name, reason: reason} }
 
+// Unimplemented reports whether t is a placeholder for a provider this
+// build does not ship, and why.
+//
+// Up() on a stub errors so a caller that ignores this cannot silently
+// no-op — but a TEST RUNNER needs the distinction the error alone does
+// not carry: "the product is broken" versus "this build cannot run
+// this scenario". Reporting the second as a failure is how a suite
+// acquires a permanently-red baseline, and a permanently-red baseline
+// is how a real regression goes unnoticed.
+func Unimplemented(t Topology) (string, bool) {
+	st, ok := t.(*stubTopology)
+	if !ok {
+		return "", false
+	}
+	return st.reason, true
+}
+
 // Name returns the not-yet-implemented provider name.
 func (s *stubTopology) Name() string { return s.name }
 

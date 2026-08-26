@@ -72,6 +72,14 @@ type Result struct {
 	AssertResults []assert.Result `json:"asserts"`
 	Pass          bool            `json:"pass"`
 	Failure       string          `json:"failure,omitempty"`
+
+	// Skipped marks a scenario this HOST or BUILD cannot run — an
+	// unimplemented topology provider, a missing host tool. Distinct
+	// from Pass=false, which means the code under test misbehaved.
+	// Callers treat a skip as "not evidence", never as "evidence of
+	// correctness"; Pass stays false so nothing counts a skip as proof.
+	Skipped    bool   `json:"skipped,omitempty"`
+	SkipReason string `json:"skip_reason,omitempty"`
 }
 
 // StepResult records the outcome of one step.
@@ -186,6 +194,18 @@ func Run(ctx context.Context, sc *scenario.Scenario, opts RunOptions) (*Result, 
 		}()
 	}
 
+	// Prerequisites the scenario cannot supply for itself. Checked
+	// BEFORE any container starts, so a skip costs nothing.
+	for _, tool := range sc.Requires.HostTools {
+		if _, lerr := exec.LookPath(tool); lerr != nil {
+			res.Skipped = true
+			res.SkipReason = fmt.Sprintf("requires %q on PATH: %v", tool, lerr)
+			emit(opts.Out, "scenario.skipped", map[string]any{"reason": res.SkipReason})
+			res.finish(opts.Out, artefactDir)
+			return res, nil
+		}
+	}
+
 	dsn := os.Getenv("PG_HARDSTORAGE_TESTKIT_DSN")
 	var topo topology.Topology
 	if !opts.SkipTopology {
@@ -194,6 +214,17 @@ func Run(ctx context.Context, sc *scenario.Scenario, opts RunOptions) (*Result, 
 			res.Failure = err.Error()
 			res.finish(opts.Out, artefactDir)
 			return res, err
+		}
+		// A provider this build does not ship cannot exercise anything.
+		// Skip rather than fail: the scenario is written for a feature
+		// that has not landed, which is not a defect in the code it
+		// would have tested.
+		if reason, stub := topology.Unimplemented(t); stub {
+			res.Skipped = true
+			res.SkipReason = fmt.Sprintf("topology %q: %s", sc.Topology.Provider, reason)
+			emit(opts.Out, "scenario.skipped", map[string]any{"reason": res.SkipReason})
+			res.finish(opts.Out, artefactDir)
+			return res, nil
 		}
 		topo = t
 		emit(opts.Out, "topology.up.starting", map[string]any{"provider": topo.Name()})

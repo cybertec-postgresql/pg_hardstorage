@@ -21,11 +21,27 @@ import (
 const SchemaScenario = "pg_hardstorage.scenario.v1"
 
 // Scenario is the parsed YAML.
+// Requires lists a scenario's external prerequisites.
+type Requires struct {
+	// HostTools are executables that must be on PATH. Used by
+	// scenarios driving commands that shell out to local PostgreSQL
+	// binaries (`partial dump` restores into a sandbox via pg_ctl),
+	// which no container can stand in for the way a one-shot tool can.
+	HostTools []string `yaml:"host_tools,omitempty"`
+}
+
 type Scenario struct {
 	Schema      string `yaml:"schema"`
 	Name        string `yaml:"name"`
 	Tier        string `yaml:"tier,omitempty"`
 	Description string `yaml:"description,omitempty"`
+
+	// Requires declares prerequisites this scenario cannot supply for
+	// itself. Unmet ones SKIP the scenario rather than fail it: a host
+	// without PostgreSQL server binaries is not a defect in
+	// pg_hardstorage, and reporting it as one leaves the suite
+	// permanently red for a reason nobody can fix by changing code.
+	Requires Requires `yaml:"requires,omitempty"`
 
 	Topology Topology `yaml:"topology"`
 	// Sink is the storage backend the scenario's repo lives

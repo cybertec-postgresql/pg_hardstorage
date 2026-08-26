@@ -28,6 +28,16 @@
 # covered only by TestPartialDump_HasDatabaseFlag (a --help
 # presence check); a real routing test awaits framework support.
 schema: pg_hardstorage.scenario.v1
+
+# `partial dump` restores into a sandbox and drives it with pg_ctl, so
+# it needs PostgreSQL SERVER binaries on the host. Unlike psql or
+# pg_combinebackup — one-shot tools a container can stand in for — a
+# server has to run where the data directory is, so there is no shim.
+# On a host without them the scenario cannot run at all, which is not a
+# defect in pg_hardstorage: skip rather than report a failure nobody
+# can fix by changing code.
+requires:
+  host_tools: [pg_ctl]
 name: L3-partial-dump-database-flag
 tier: L3
 description: |
