@@ -24,7 +24,7 @@ pg_hardstorage dsa list [flags]
       --article string      filter by article (art_15_access | art_17_erasure | other)
   -h, --help                help for list
       --repo string         repository URL (required)
-      --since string        only reports generated at/after this RFC3339 timestamp
+      --since string        only reports generated at/after this time (RFC3339 absolute or duration like 24h, 7d)
       --subject-id string   filter by subject (the value is hashed before matching, so the same opaque ID can be used as on locate)
       --tenant string       filter by tenant
 ```

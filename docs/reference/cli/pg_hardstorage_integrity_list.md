@@ -24,7 +24,7 @@ pg_hardstorage integrity list [flags]
       --deployment string   filter by deployment scope
   -h, --help                help for list
       --repo string         repository URL (required)
-      --since string        only runs that started at/after this RFC3339 timestamp (e.g. 2026-04-01T00:00:00Z)
+      --since string        only runs that started at/after this time (RFC3339 absolute or duration like 24h, 7d)
       --status string       filter by run status: ok | found_issues | error
 ```
 

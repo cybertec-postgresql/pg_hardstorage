@@ -217,7 +217,7 @@ func newDsaListCmd() *cobra.Command {
 	c.Flags().StringVar(&repoURL, "repo", "", "repository URL (required)")
 	_ = c.MarkFlagRequired("repo")
 	c.Flags().StringVar(&since, "since", "",
-		"only reports generated at/after this RFC3339 timestamp")
+		"only reports generated at/after this time (RFC3339 absolute or duration like 24h, 7d)")
 	c.Flags().StringVar(&tenant, "tenant", "",
 		"filter by tenant")
 	c.Flags().StringVar(&article, "article", "",
@@ -231,7 +231,12 @@ func runDsaList(cmd *cobra.Command, repoURL, since, tenant, article, subject str
 	d := DispatcherFrom(cmd)
 	filter := dsa.ListFilter{Tenant: tenant}
 	if since != "" {
-		t, err := time.Parse(time.RFC3339, since)
+		// parseSinceUntil: the same grammar as `audit list --since` —
+		// RFC3339 absolute or a duration (day units included). These
+		// three list commands were the only --since flags in the
+		// binary that took RFC3339 ONLY, so the spelling that worked
+		// everywhere else was rejected here.
+		t, err := parseSinceUntil(since)
 		if err != nil {
 			return output.NewError("usage.bad_flag",
 				fmt.Sprintf("dsa list: --since: %v", err)).Wrap(output.ErrUsage)

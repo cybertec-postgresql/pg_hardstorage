@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"io"
 	"sort"
-	"strconv"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -453,48 +452,13 @@ func parseSinceUntil(s string) (time.Time, error) {
 	// time.ParseDuration only knows up to hours, so it rejects any "d".
 	// Rewrite a leading day count into hours before parsing so both
 	// "7d" and combined forms like "7d12h" work as documented.
-	if d, ok := parseDurationWithDays(s); ok {
+	if d, err := ParseDurationDays(s); err == nil {
 		return time.Now().UTC().Add(-d), nil
 	}
 	if t, err := time.Parse(time.RFC3339, s); err == nil {
 		return t.UTC(), nil
 	}
 	return time.Time{}, fmt.Errorf("expected RFC3339 timestamp or duration like 24h / 7d; got %q", s)
-}
-
-// parseDurationWithDays extends time.ParseDuration with a day unit: a
-// leading "<int>d" is converted to the equivalent hours and any
-// remaining duration ("12h30m") is appended. Returns ok=false when the
-// input isn't a recognisable duration (so the caller can fall back to
-// timestamp parsing).
-func parseDurationWithDays(s string) (time.Duration, bool) {
-	// Plain time.ParseDuration first — the common case (24h, 90m).
-	if d, err := time.ParseDuration(s); err == nil {
-		return d, true
-	}
-	// Look for a "<digits>d" prefix.
-	i := 0
-	for i < len(s) && s[i] >= '0' && s[i] <= '9' {
-		i++
-	}
-	if i == 0 || i >= len(s) || s[i] != 'd' {
-		return 0, false
-	}
-	days, err := strconv.Atoi(s[:i])
-	if err != nil {
-		return 0, false
-	}
-	dayPart := time.Duration(days) * 24 * time.Hour
-	rest := s[i+1:]
-	if rest == "" {
-		return dayPart, true
-	}
-	// Anything after the day component must be a normal duration.
-	tail, err := time.ParseDuration(rest)
-	if err != nil {
-		return 0, false
-	}
-	return dayPart + tail, true
 }
 
 func newAuditVerifyChainCmd() *cobra.Command {

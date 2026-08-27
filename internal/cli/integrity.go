@@ -221,7 +221,7 @@ func newIntegrityListCmd() *cobra.Command {
 	c.Flags().StringVar(&repoURL, "repo", "", "repository URL (required)")
 	_ = c.MarkFlagRequired("repo")
 	c.Flags().StringVar(&since, "since", "",
-		"only runs that started at/after this RFC3339 timestamp (e.g. 2026-04-01T00:00:00Z)")
+		"only runs that started at/after this time (RFC3339 absolute or duration like 24h, 7d)")
 	c.Flags().StringVar(&statusF, "status", "",
 		"filter by run status: ok | found_issues | error")
 	c.Flags().StringVar(&deployment, "deployment", "",
@@ -233,7 +233,12 @@ func runIntegrityList(cmd *cobra.Command, repoURL, since, statusF, deployment st
 	d := DispatcherFrom(cmd)
 	filter := integrity.ListFilter{Deployment: deployment}
 	if since != "" {
-		t, err := time.Parse(time.RFC3339, since)
+		// parseSinceUntil: the same grammar as `audit list --since` —
+		// RFC3339 absolute or a duration (day units included). These
+		// three list commands were the only --since flags in the
+		// binary that took RFC3339 ONLY, so the spelling that worked
+		// everywhere else was rejected here.
+		t, err := parseSinceUntil(since)
 		if err != nil {
 			return output.NewError("usage.bad_flag",
 				fmt.Sprintf("integrity list: --since: %v", err)).Wrap(output.ErrUsage)

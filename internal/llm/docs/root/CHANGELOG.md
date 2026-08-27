@@ -65,6 +65,21 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **Four more flags rejected duration spellings their own docs or siblings
+  used.** The `--keep-for 30d` fix (above) missed: `repo gc
+  --tombstone-grace`, which is documented by `wal prune` as its twin
+  ("matches repo gc") and must hold the same value — yet `2d` parsed on
+  prune and errored on gc, inviting exactly the drift that breaks `backup
+  undelete`; `repo gc --min-chunk-age` (same command, same retention
+  scale); `gameday report --since`, whose help text advertises "default
+  90d" while the parser rejected `90d`; and `dsa list` / `integrity list` /
+  `insider list --since`, the only `--since` flags in the binary that took
+  RFC3339 only, so the `7d` that works on `audit`, `compliance`, and
+  `recovery drill history` was refused. All now accept the same grammar
+  (RFC3339 where a timestamp makes sense, durations with day/week units),
+  and the two parallel day-duration parsers were consolidated into the
+  fuzz-hardened one.
+
 - **`repo replicate` could commit a manifest over a chunk a concurrent
   `repo gc` on the replica had just swept.** Replicate adopts chunks already
   present at the destination by `Stat` — and until the manifest lands there,

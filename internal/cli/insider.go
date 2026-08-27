@@ -227,7 +227,7 @@ func newInsiderListCmd() *cobra.Command {
 	c.Flags().StringVar(&repoURL, "repo", "", "repository URL (required)")
 	_ = c.MarkFlagRequired("repo")
 	c.Flags().StringVar(&since, "since", "",
-		"only scans started at/after this RFC3339 timestamp")
+		"only scans started at/after this time (RFC3339 absolute or duration like 24h, 7d)")
 	c.Flags().StringVar(&minSev, "min-severity", "",
 		"only scans whose highest finding ≥ this severity")
 	c.Flags().StringVar(&tenant, "tenant", "",
@@ -244,7 +244,12 @@ func runInsiderList(cmd *cobra.Command, repoURL, since, minSev, tenant string, f
 		HasFindingsOnly: findings,
 	}
 	if since != "" {
-		t, err := time.Parse(time.RFC3339, since)
+		// parseSinceUntil: the same grammar as `audit list --since` —
+		// RFC3339 absolute or a duration (day units included). These
+		// three list commands were the only --since flags in the
+		// binary that took RFC3339 ONLY, so the spelling that worked
+		// everywhere else was rejected here.
+		t, err := parseSinceUntil(since)
 		if err != nil {
 			return output.NewError("usage.bad_flag",
 				fmt.Sprintf("insider list: --since: %v", err)).Wrap(output.ErrUsage)

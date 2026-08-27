@@ -257,7 +257,7 @@ scenario. --limit caps the per-scenario detail list.`,
 	_ = c.MarkFlagRequired("repo")
 	c.Flags().StringVar(&scenario, "scenario", "",
 		"only report on this scenario (default: every gameday.run event)")
-	c.Flags().DurationVar(&since, "since", 90*24*time.Hour,
+	DurationDaysVar(c.Flags(), &since, "since", 90*24*time.Hour,
 		"only include events at-or-after now-since (default 90d; pass 0 for unbounded)")
 	c.Flags().IntVar(&limit, "limit", 50,
 		"max events to include in the per-scenario detail list (0 = all)")

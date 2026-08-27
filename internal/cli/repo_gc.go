@@ -95,9 +95,15 @@ only. See ` + "`" + `pg_hardstorage approval` + "`" + `.`,
 		"actually delete the orphan chunks (default: dry-run)")
 	c.Flags().StringVar(&requireApproval, "require-approval", "",
 		"approval request ID that must be in approved state for repo.gc + this URL (n-of-m gate; --apply only)")
-	c.Flags().DurationVar(&tombstoneGrace, "tombstone-grace", repo.DefaultTombstoneGracePeriod,
+	// Day-aware for the same reason as wal prune's twin flag: the two
+	// grace values are meant to be THE SAME VALUE (prune keeps a
+	// tombstoned backup's WAL while gc keeps its chunks — if they
+	// drift, undelete breaks), and prune's help even says "matches
+	// repo gc". A pair of flags that must agree but accept different
+	// spellings of the same duration invites exactly that drift.
+	DurationDaysVar(c.Flags(), &tombstoneGrace, "tombstone-grace", repo.DefaultTombstoneGracePeriod,
 		"minimum tombstone age before the manifest's chunks become GC candidates (defends Undelete-after-delete; pass 0 to disable)")
-	c.Flags().DurationVar(&minChunkAge, "min-chunk-age", repo.DefaultOrphanMinAge,
+	DurationDaysVar(c.Flags(), &minChunkAge, "min-chunk-age", repo.DefaultOrphanMinAge,
 		"minimum age an unreferenced chunk (and stale staging file) must reach before --apply reaps it; defends an in-flight backup whose manifest hasn't committed yet (pass 0 to disable)")
 	return c
 }

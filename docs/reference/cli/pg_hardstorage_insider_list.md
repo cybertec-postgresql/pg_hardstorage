@@ -24,7 +24,7 @@ pg_hardstorage insider list [flags]
   -h, --help                  help for list
       --min-severity string   only scans whose highest finding ≥ this severity
       --repo string           repository URL (required)
-      --since string          only scans started at/after this RFC3339 timestamp
+      --since string          only scans started at/after this time (RFC3339 absolute or duration like 24h, 7d)
       --tenant string         only scans scoped to this tenant
       --with-findings         only scans that have at least one finding
 ```
