@@ -50,7 +50,7 @@ pg_hardstorage wal stream <deployment> [flags]
       --allow-system-identifier-change   proceed even when the cluster's pg_control system identifier differs from the deployment's already-archived WAL (the pg_upgrade / clone / restore signature). By default this is refused to stop two clusters' WAL being interleaved under one lineage; set it only when deliberately continuing the deployment onto a new cluster
       --durability string                WAL durability: per-segment (one syncfs per 16 MiB segment, the fast default) | per-chunk (fsync every chunk — slower, the 'fsync every object' opt-in) (default "per-segment")
   -h, --help                             help for stream
-      --inactivity-timeout duration      abort the stream if no message arrives in this duration (0 = streaming default of 5 minutes; default tolerates the default PG wal_sender_timeout=60s with a 10× margin)
+      --inactivity-timeout duration      abort the stream if no message arrives in this duration (0 = streaming default of 5 minutes; default tolerates the default PG wal_sender_timeout=60s with a 10× margin) (default 0s)
       --kek string                       KEK reference for WAL encryption under a cloud KMS (e.g. aws-kms://...); MUST match the deployment's base-backup KEKRef. Local-KEK encryption is automatic when a keyring kek.bin is present.
       --kms-config stringToString        cloud KMS provider config (region/endpoint/credentials); only consulted when --kek is a cloud scheme — the same values base backups use. (default [])
       --max-reconnect-backoff duration   upper bound on the auto-reconnect backoff (initial 1s, doubles on each failure) (default 30s)

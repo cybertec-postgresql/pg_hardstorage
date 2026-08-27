@@ -35,7 +35,7 @@ pg_hardstorage patroni follow [flags]
 ### Options
 
 ```
-      --duration duration   how long to run; 0 = until SIGINT
+      --duration duration   how long to run; 0 = until SIGINT (default 0s)
   -h, --help                help for follow
       --interval duration   poll cadence (default 5s; matches Patroni's default leader TTL window) (default 5s)
       --password string     HTTP basic-auth password (optional)

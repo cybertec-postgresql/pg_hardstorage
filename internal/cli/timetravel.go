@@ -102,7 +102,7 @@ that diverges from production.`,
 	c.Flags().StringVar(&deployment, "deployment", "", "source deployment (required)")
 	c.Flags().StringVar(&target, "target", "", "target data directory (required)")
 	c.Flags().StringVar(&at, "at", "", "target time/LSN (RFC3339, natural language, or LSN; required)")
-	c.Flags().DurationVar(&ttl, "ttl", timetravel.DefaultTTL, "session expiry; cleanup will reap past this")
+	DurationDaysVar(c.Flags(), &ttl, "ttl", timetravel.DefaultTTL, "session expiry; cleanup will reap past this")
 	c.Flags().BoolVar(&force, "force", false, "permit a non-empty --target")
 	return c
 }

@@ -43,6 +43,7 @@ import (
 // issues but the command exits 0 — operators who script `doctor`
 // for a healthcheck use the flag; humans browsing the report don't.
 func newRealDoctorCmd() *cobra.Command {
+	var drillMaxAge time.Duration
 	c := &cobra.Command{
 		Use:          "doctor [<deployment>]",
 		Short:        "Run health checks and suggest fixes",
@@ -54,7 +55,7 @@ func newRealDoctorCmd() *cobra.Command {
 	c.Flags().Bool("exit-on-issues", false,
 		"exit with code 10 (ExitDoctorIssues) when the report contains issues at warning+ severity; "+
 			"useful for cron / k8s liveness probes")
-	c.Flags().Duration("drill-max-age", defaultDrillMaxAge,
+	DurationDaysVar(c.Flags(), &drillMaxAge, "drill-max-age", defaultDrillMaxAge,
 		"maximum age of the last SUCCESSFUL recovery drill before doctor escalates recovery.drill_stale (CRITICAL)")
 	return c
 }
@@ -101,6 +102,8 @@ func runDoctor(cmd *cobra.Command, _ []string) error {
 		report.ExpiredHolds, report.Issues = appendExpiredHoldChecks(cmd.Context(), cfg, report.Issues)
 		report.PGVersions, report.Issues = appendPGVersionChecks(cmd.Context(), cfg, report.Issues)
 		report.ManifestSig, report.Issues = appendManifestSignatureChecks(cmd.Context(), cfg, report.Issues)
+		// GetDuration works with the day-aware Value too: its Type() is
+		// "duration" and String() renders stdlib format.
 		drillMaxAge, _ := cmd.Flags().GetDuration("drill-max-age")
 		report.Drills, report.Issues = appendDrillChecks(cmd.Context(), cfg, drillMaxAge, report.Issues)
 	}

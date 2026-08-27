@@ -98,7 +98,7 @@ The repository must already exist — create it with ` + "`" + `pg_hardstorage r
 		"safety multiplier for the capacity pre-flight (default 1.1 = 110% of projected); ignored under --ignore-capacity")
 	c.Flags().BoolVar(&opts.allowConcurrent, "allow-concurrent", false,
 		"skip the per-deployment backup lease and allow a second backup of the same deployment to run concurrently (doubles load on the source)")
-	c.Flags().DurationVar(&opts.stallTimeout, "stall-timeout", 0,
+	DurationDaysVar(c.Flags(), &opts.stallTimeout, "stall-timeout", 0,
 		"abort with backup.io_starved if no progress event for this long (0 = disabled; soak drivers pin 5m)")
 	c.Flags().BoolVarP(&opts.verbose, "verbose", "v", false,
 		"emit one line per regular file as it commits to the CAS — file path, "+

@@ -192,7 +192,7 @@ func newApprovalRequestCmd() *cobra.Command {
 	c.Flags().StringVar(&reason, "reason", "", "free-form reason for the destructive op")
 	c.Flags().StringVar(&tenant, "tenant", "", "tenant scope")
 	c.Flags().IntVar(&threshold, "threshold", 2, "number of distinct approvals required (≥ 1)")
-	c.Flags().DurationVar(&ttl, "ttl", 24*time.Hour, "how long this request stays approvable")
+	DurationDaysVar(c.Flags(), &ttl, "ttl", 24*time.Hour, "how long this request stays approvable")
 	c.Flags().StringArrayVar(&approverKeys, "approver-key", nil,
 		"path to an approver's ed25519 public-key PEM (repeatable; need at least --threshold)")
 	return c

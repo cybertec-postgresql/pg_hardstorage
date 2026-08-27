@@ -829,7 +829,7 @@ func newRepairChunksCmd() *cobra.Command {
 		"list manifests that reference chunks the storage doesn't have")
 	c.Flags().BoolVar(&apply, "apply", false,
 		"with --orphans: actually delete the orphans (default: dry-run)")
-	c.Flags().DurationVar(&minChunkAge, "min-chunk-age", repo.DefaultOrphanMinAge,
+	DurationDaysVar(c.Flags(), &minChunkAge, "min-chunk-age", repo.DefaultOrphanMinAge,
 		"minimum age an unreferenced chunk must reach before --apply reaps it; defends an in-flight backup whose manifest hasn't committed yet (pass 0 to disable)")
 	return c
 }

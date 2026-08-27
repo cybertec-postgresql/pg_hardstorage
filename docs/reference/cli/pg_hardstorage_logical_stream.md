@@ -36,7 +36,7 @@ pg_hardstorage logical stream <name> [flags]
 
 ```
   -h, --help                          help for stream
-      --inactivity-timeout duration   abort if no message arrives in this duration (0 = streaming default). Detects a STUCK connection, not a quiet publication: the walsender echoes each of our status updates with a keepalive, and a keepalive counts as a message — so a value at or above --status-interval never fires on a live but idle stream.
+      --inactivity-timeout duration   abort if no message arrives in this duration (0 = streaming default). Detects a STUCK connection, not a quiet publication: the walsender echoes each of our status updates with a keepalive, and a keepalive counts as a message — so a value at or above --status-interval never fires on a live but idle stream. (default 0s)
       --pg-connection string          libpq connection string for the source PG (required)
       --start-lsn string              explicit start LSN (default: 0/0 — let the slot drive)
       --status-interval duration      status-update cadence (default 10s)

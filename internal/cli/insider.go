@@ -85,9 +85,9 @@ Exit codes:
 	}
 	c.Flags().StringVar(&repoURL, "repo", "", "repository URL (required)")
 	_ = c.MarkFlagRequired("repo")
-	c.Flags().DurationVar(&baseline, "baseline", insider.DefaultBaselineDuration,
+	DurationDaysVar(c.Flags(), &baseline, "baseline", insider.DefaultBaselineDuration,
 		"baseline window length (e.g. 720h for 30d)")
-	c.Flags().DurationVar(&target, "target", insider.DefaultTargetDuration,
+	DurationDaysVar(c.Flags(), &target, "target", insider.DefaultTargetDuration,
 		"target window length (e.g. 24h)")
 	c.Flags().StringVar(&tenant, "tenant", "",
 		"restrict scan to one tenant (default: every tenant)")

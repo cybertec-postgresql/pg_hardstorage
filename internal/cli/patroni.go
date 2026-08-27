@@ -190,9 +190,9 @@ Stops on SIGINT or when --duration elapses (0 = forever).`,
 	_ = c.MarkFlagRequired("url")
 	c.Flags().StringVar(&user, "user", "", "HTTP basic-auth username (optional)")
 	c.Flags().StringVar(&password, "password", "", "HTTP basic-auth password (optional)")
-	c.Flags().DurationVar(&interval, "interval", patroni.DefaultFollowInterval,
+	DurationDaysVar(c.Flags(), &interval, "interval", patroni.DefaultFollowInterval,
 		"poll cadence (default 5s; matches Patroni's default leader TTL window)")
-	c.Flags().DurationVar(&duration, "duration", 0,
+	DurationDaysVar(c.Flags(), &duration, "duration", 0,
 		"how long to run; 0 = until SIGINT")
 	return c
 }

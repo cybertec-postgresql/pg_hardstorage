@@ -50,10 +50,10 @@ pg_hardstorage gameday run <scenario> [flags]
 ```
       --deployment string         deployment to target (scenario-dependent)
       --dry-run                   print the planned action; don't inject the fault
-      --fault-duration duration   how long the fault is held active (scenario default applies if 0)
+      --fault-duration duration   how long the fault is held active (scenario default applies if 0) (default 0s)
   -h, --help                      help for run
       --patroni-url string        Patroni REST base URL for patroni_failover; overrides the deployment's patroni.url
-      --recover-within duration   upper bound for recovery (scenario default applies if 0)
+      --recover-within duration   upper bound for recovery (scenario default applies if 0) (default 0s)
       --repo string               repository URL (scenario-dependent)
 ```
 

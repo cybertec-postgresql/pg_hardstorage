@@ -8,6 +8,8 @@ package cli
 
 import (
 	"testing"
+
+	"github.com/spf13/cobra"
 )
 
 func TestRemoveTargetSpellings_Interchangeable(t *testing.T) {
@@ -23,6 +25,20 @@ func TestRemoveTargetSpellings_Interchangeable(t *testing.T) {
 		c := tc.build()
 		if err := c.ParseFlags([]string{tc.other}); err != nil {
 			t.Errorf("%T: the sibling spelling %s was rejected: %v", c, tc.other, err)
+		}
+	}
+}
+
+func TestPGConnectionSpelling_WorksOnDeploymentCommands(t *testing.T) {
+	// Twenty-odd commands say --pg-connection; deployment add/edit
+	// alone said --connection. Both must parse on both.
+	for _, build := range []func() *cobra.Command{newDeploymentAddCmd, newDeploymentEditCmd} {
+		c := build()
+		if err := c.ParseFlags([]string{"--pg-connection", "host=x"}); err != nil {
+			t.Errorf("%s: --pg-connection rejected: %v", c.Name(), err)
+		}
+		if f := c.Flags().Lookup("connection"); f == nil || f.Value.String() != "host=x" {
+			t.Errorf("%s: --pg-connection did not land on --connection", c.Name())
 		}
 	}
 }

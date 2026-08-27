@@ -115,7 +115,7 @@ Optional:
 	_ = c.MarkFlagRequired("scope")
 	c.Flags().StringVar(&reason, "reason", "", "operator-supplied justification (required)")
 	_ = c.MarkFlagRequired("reason")
-	c.Flags().DurationVar(&duration, "duration", time.Hour,
+	DurationDaysVar(c.Flags(), &duration, "duration", time.Hour,
 		"token TTL (1m..24h); default 1h")
 	c.Flags().StringVar(&tenant, "tenant", "", "scope the token to one tenant")
 	c.Flags().StringVar(&issuedBy, "issued-by", "", "record the issuer's identity")

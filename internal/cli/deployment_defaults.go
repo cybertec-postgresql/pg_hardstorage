@@ -193,6 +193,17 @@ func deploymentKMSResolver(kmsCfg map[string]string) func(kekRef string) map[str
 // exactly as before. Path/config-load failures are non-fatal — Cobra's
 // required-flag check then fires just as it did previously.
 func resolveDeploymentDefaultsPreRun(cmd *cobra.Command, args []string) error {
+	// Never back-fill the deployment CRUD commands: `deployment
+	// add/edit` WRITE the catalogue this hook reads from, and their
+	// --connection flag (reachable as --pg-connection via the
+	// spelling alias) is the value being edited, not an input to
+	// default. Filling it from config marks the flag Changed, which
+	// `edit` reads as "the operator passed a new DSN" — it then
+	// re-probes a connection nobody touched and fails the edit when
+	// the host is unreachable.
+	if strings.HasPrefix(cmd.CommandPath(), cmd.Root().Name()+" deployment") {
+		return nil
+	}
 	fl := cmd.Flags()
 	repoF := fl.Lookup("repo")
 	pgF := fl.Lookup("pg-connection")

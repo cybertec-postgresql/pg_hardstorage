@@ -65,6 +65,23 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **Every duration flag now accepts day and week units, enforced by an
+  invariant test.** The `--keep-for 30d` class was fixed twice in this
+  release and regrew between the fixes (`repair --min-chunk-age` diverged
+  from `repo gc --min-chunk-age` within hours of the latter's fix), so the
+  policy is now uniform — all ~35 duration flags parse `d`/`w` — and a test
+  walks the entire command tree asserting it, so a new flag that rejects
+  `1d` fails CI on the day it is added. The walk immediately found a sixth
+  instance the hand audit missed: `doctor --drill-max-age`. Companion
+  invariants pin flag-name/type consistency across commands (with an
+  explicit, reasoned allowlist) and the shared `--since` grammar's
+  presence in help texts. `--remove-target`/`--remove-targets` and
+  `--connection`/`--pg-connection` are now interchangeable spellings on
+  the commands that had one but not the other; the config back-fill that
+  fills `--pg-connection` from the deployment catalogue now skips the
+  `deployment` CRUD commands, which write that catalogue rather than
+  consume it.
+
 - **Four more flags rejected duration spellings their own docs or siblings
   used.** The `--keep-for 30d` fix (above) missed: `repo gc
   --tombstone-grace`, which is documented by `wal prune` as its twin

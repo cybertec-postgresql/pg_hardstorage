@@ -1271,9 +1271,9 @@ Resume LSN is determined automatically:
 		"replication slot name (default: pg_hardstorage_<deployment>)")
 	c.Flags().StringVar(&opts.startLSN, "start-lsn", "",
 		"explicit start LSN (e.g. 0/3000000); overrides resume-from-repo logic")
-	c.Flags().DurationVar(&opts.statusInterval, "status-interval", 10*time.Second,
+	DurationDaysVar(c.Flags(), &opts.statusInterval, "status-interval", 10*time.Second,
 		"how often to send Standby Status Updates to PostgreSQL")
-	c.Flags().DurationVar(&opts.inactivityTimeout, "inactivity-timeout", 0,
+	DurationDaysVar(c.Flags(), &opts.inactivityTimeout, "inactivity-timeout", 0,
 		"abort the stream if no message arrives in this duration (0 = streaming default of 5 minutes; default tolerates the default PG wal_sender_timeout=60s with a 10× margin)")
 	c.Flags().BoolVar(&opts.noInactivityTimeout, "no-inactivity-timeout", false,
 		"disable the client-side inactivity watchdog entirely; required when the source PG has wal_sender_timeout=0 (PG never sends keepalives, so the client's read deadline is the wrong place to detect hangs — issue #12)")
@@ -1285,7 +1285,7 @@ Resume LSN is determined automatically:
 		"stream without a replication slot (UNSAFE — PG can recycle WAL out from under the streamer; use only for archive-only setups that retain WAL another way)")
 	c.Flags().BoolVar(&opts.noReconnect, "no-reconnect", false,
 		"exit on stream connection break instead of reconnecting; default behaviour reconnects with exponential backoff (1s → 30s) using EnsureSlot resume — survives Patroni failovers and PG bounces transparently")
-	c.Flags().DurationVar(&opts.maxReconnectBackoff, "max-reconnect-backoff", 30*time.Second,
+	DurationDaysVar(c.Flags(), &opts.maxReconnectBackoff, "max-reconnect-backoff", 30*time.Second,
 		"upper bound on the auto-reconnect backoff (initial 1s, doubles on each failure)")
 	c.Flags().StringVar(&opts.durability, "durability", "per-segment",
 		"WAL durability: per-segment (one syncfs per 16 MiB segment, the fast default) "+

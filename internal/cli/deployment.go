@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/config"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/output"
@@ -217,6 +218,7 @@ func newDeploymentAddCmd() *cobra.Command {
 		},
 	}
 	c.Flags().StringVar(&conn, "connection", "", "libpq connection string (required)")
+	acceptPGConnectionSpelling(c)
 	_ = c.MarkFlagRequired("connection")
 	c.Flags().StringVar(&repo, "repo", "", "repository URL (required)")
 	_ = c.MarkFlagRequired("repo")
@@ -369,6 +371,7 @@ is not editable via flags — use a YAML edit for that case.`,
 		},
 	}
 	c.Flags().StringVar(&conn, "connection", "", "libpq connection string")
+	acceptPGConnectionSpelling(c)
 	c.Flags().StringVar(&repo, "repo", "", "repository URL")
 	c.Flags().StringVar(&tenant, "tenant", "", "tenant scope")
 	c.Flags().StringVar(&schedBackup, "schedule-backup", "", "backup schedule expression")
@@ -654,4 +657,18 @@ func (b deploymentTestBody) WriteText(w io.Writer) error {
 	fmt.Fprintf(bw, "  Timeline:   %d", b.Timeline)
 	_, err := io.WriteString(w, bw.String())
 	return err
+}
+
+// acceptPGConnectionSpelling makes --pg-connection work wherever
+// --connection is declared. Twenty-odd commands take the DSN as
+// --pg-connection; deployment add/edit alone said --connection. Both
+// names are now accepted here, --help keeps the declared one, and no
+// script breaks.
+func acceptPGConnectionSpelling(c *cobra.Command) {
+	c.Flags().SetNormalizeFunc(func(f *pflag.FlagSet, name string) pflag.NormalizedName {
+		if name == "pg-connection" {
+			return pflag.NormalizedName("connection")
+		}
+		return pflag.NormalizedName(name)
+	})
 }

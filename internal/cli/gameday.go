@@ -125,9 +125,9 @@ Use 'gameday list' to see registered scenarios.`,
 		"repository URL (scenario-dependent)")
 	c.Flags().StringVar(&patroniURL, "patroni-url", "",
 		"Patroni REST base URL for patroni_failover; overrides the deployment's patroni.url")
-	c.Flags().DurationVar(&recoverWithin, "recover-within", 0,
+	DurationDaysVar(c.Flags(), &recoverWithin, "recover-within", 0,
 		"upper bound for recovery (scenario default applies if 0)")
-	c.Flags().DurationVar(&faultDuration, "fault-duration", 0,
+	DurationDaysVar(c.Flags(), &faultDuration, "fault-duration", 0,
 		"how long the fault is held active (scenario default applies if 0)")
 	c.Flags().BoolVar(&dryRun, "dry-run", false,
 		"print the planned action; don't inject the fault")

@@ -57,7 +57,7 @@ pg_hardstorage backup <deployment> [flags]
       --no-encrypt                         force unencrypted backup even when a KEK file is present
       --pg-connection string               libpq connection string for the source PostgreSQL (required)
       --repo string                        repository URL (file://, s3://, ...) — must already exist (required)
-      --stall-timeout duration             abort with backup.io_starved if no progress event for this long (0 = disabled; soak drivers pin 5m)
+      --stall-timeout duration             abort with backup.io_starved if no progress event for this long (0 = disabled; soak drivers pin 5m) (default 0s)
       --tde tde:                           declare the source PostgreSQL has Transparent Data Encryption enabled (CYBERTEC PGEE, pg_tde, EDB TDE). Stamps source_tde on the manifest so a later restore refuses a vanilla-PG target and skips plaintext verify. Also honoured via the deployment's tde: block in pg_hardstorage.yaml. Backup itself works with or without this — BASE_BACKUP delivers plaintext over the wire — the flag only records the source posture for restore-time safety.
       --tde-engine string                  free-form TDE engine label stamped on the manifest (e.g. cybertec_enterprise, pg_tde, edb_tde); implies --tde
       --tde-key-ref string                 opaque operator key-set reference stamped on the manifest for forensic/migration purposes; implies --tde
