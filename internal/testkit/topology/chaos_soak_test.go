@@ -244,7 +244,8 @@ func TestChaosSoak_RestoreProof(t *testing.T) {
 	}()
 
 	// Fault rounds until the budget expires.
-	faults := []string{"none", "switchover", "pause_leader", "backup_burst", "dcs_outage", "compound_storm", "janitor_sweep"}
+	faults := []string{"none", "switchover", "pause_leader", "backup_burst", "dcs_outage", "compound_storm", "janitor_sweep", "deep_lag"}
+	deepLagFired := 0
 	deadline := time.Now().Add(time.Duration(minutes) * time.Minute)
 	round := 0
 	roundBackupsOK := 0
@@ -252,6 +253,16 @@ func TestChaosSoak_RestoreProof(t *testing.T) {
 	for time.Now().Before(deadline) {
 		round++
 		fault := faults[rng.Intn(len(faults))]
+		// deep_lag is guaranteed at least once per soak: whether the
+		// random schedule reaches the cross-timeline resume was a
+		// matter of TIMING for every previous run (the first coverage
+		// line measured: 120 reconnects, promotions up to timeline 26,
+		// cross-timeline resumes = 0). The override replaces the drawn
+		// fault AFTER the draw, so rng consumption — and therefore
+		// seed replay of every other round — is unchanged.
+		if round == 6 {
+			fault = "deep_lag"
+		}
 		faultLog = append(faultLog, fault)
 		t.Logf("round %d: fault=%s", round, fault)
 
@@ -267,6 +278,35 @@ func TestChaosSoak_RestoreProof(t *testing.T) {
 				// check below catches it.
 				time.Sleep(20 * time.Second)
 			}
+		case "deep_lag":
+			// The one fault that DETERMINISTICALLY exercises the
+			// cross-timeline resume walk: stop the streamer (SIGSTOP —
+			// the process survives, its position freezes), force whole
+			// segments of WAL past its frontier, promote TWICE, then
+			// let it continue. On resume the archive frontier sits
+			// whole segments below the first fork, so the streamer
+			// must walk timeline history to catch up — the exact path
+			// whose absence from every previous soak's coverage line
+			// motivated this fault. The soak-end assertion checks the
+			// walk actually ran.
+			deepLagFired++
+			_ = stream.Process.Signal(syscall.SIGSTOP)
+			for i := 0; i < 2; i++ {
+				forceWALSegments(ctx, p, 3)
+				if leader := p.findLeaderName(ctx); leader != "" {
+					if err := p.switchover(ctx, leader); err != nil {
+						t.Logf("  deep_lag switchover %d failed (tolerated): %v", i+1, err)
+					}
+					time.Sleep(20 * time.Second)
+				}
+			}
+			forceWALSegments(ctx, p, 2)
+			_ = stream.Process.Signal(syscall.SIGCONT)
+			t.Logf("  deep_lag: streamer resumed after 2 promotions with forced segment turnover")
+			// Give the resumed streamer time to notice the dead
+			// connection, reconnect, and start the walk before the
+			// next fault lands on top of it.
+			time.Sleep(15 * time.Second)
 		case "pause_leader":
 			if leader := p.findLeaderName(ctx); leader != "" {
 				for _, n := range p.nodes {
@@ -430,6 +470,15 @@ func TestChaosSoak_RestoreProof(t *testing.T) {
 	// A green run that never entered it proves nothing about it, so
 	// say so out loud rather than let the tick be read as coverage.
 	t.Logf("stream path coverage: %s", streamCoverage(scratch+"/stream.log"))
+	if deepLagFired > 0 {
+		logs, _ := os.ReadFile(scratch + "/stream.log")
+		if !strings.Contains(string(logs), "streaming_historic") {
+			t.Errorf("deep_lag fired %d time(s) but the stream never entered the cross-timeline "+
+				"resume path (no wal.timeline.streaming_historic in stream.log) — either the fault "+
+				"no longer creates the lag it exists to create, or the resume walk regressed",
+				deepLagFired)
+		}
+	}
 
 	// The streamer must still be ALIVE after every fault (a crash or a
 	// silent exit is a soak failure in itself).
@@ -781,4 +830,31 @@ func streamCoverage(path string) string {
 	}
 	parts = append(parts, fmt.Sprintf("max timeline=%d", hi))
 	return strings.Join(parts, ", ")
+}
+
+// forceWALSegments makes the current leader finish n WAL segments:
+// a small write so the segment is non-empty, then pg_switch_wal. The
+// deep_lag fault uses this to guarantee the stopped streamer's
+// archive frontier falls WHOLE segments behind the coming fork —
+// without it, a promotion copies the last partial segment to the new
+// timeline's name and a caught-up streamer resumes by luck, never
+// entering the cross-timeline walk.
+func forceWALSegments(ctx context.Context, p *patroniLocalDocker, n int) {
+	leader := p.findLeaderName(ctx)
+	if leader == "" {
+		return
+	}
+	for _, node := range p.nodes {
+		out, err := exec.Command("docker", "exec", node.container, "hostname").CombinedOutput()
+		if err != nil || strings.TrimSpace(string(out)) != leader {
+			continue
+		}
+		for i := 0; i < n; i++ {
+			_ = exec.CommandContext(ctx, "docker", "exec",
+				"-e", "PGPASSWORD="+patroniSuperPassword, node.container,
+				"psql", "-U", "postgres", "-qc",
+				"insert into churn values (-1, 'seg') on conflict (id) do update set pad='seg'; select pg_switch_wal();").Run()
+		}
+		return
+	}
 }
