@@ -278,6 +278,26 @@ func runPatroniFailover(ctx context.Context, opts RunOptions) (*Result, error) {
 		r.Pass = false
 		return r, nil
 	}
+	// "recreated" fails EVEN AT gap_bytes=0. The drill audits
+	// CONFIGURATION — can this cluster's slot survive a promotion? —
+	// and a recreated slot answers no: the reconciler rebuilt it at
+	// the new leader's position, and only a quiet WAL window kept the
+	// gap at zero this time. Passing on the quiet case is a verdict
+	// that depends on how busy the database happened to be during the
+	// drill, for a misconfiguration that does not: the next failover
+	// under load strands WAL. Caught live by the patroni gate's
+	// hollow-pass meta-test, which ran the drill on a cluster with no
+	// permanent_slots during a quiet window and watched it pass.
+	if after.Outcome == "recreated" {
+		r.Failure = "the replication slot did not survive the promotion (outcome=recreated, " +
+			"gap_bytes=0): the new leader rebuilt it at its own position, and only a quiet " +
+			"WAL window kept the gap at zero this time — under load the same failover " +
+			"strands WAL between the old confirmed LSN and the rebuilt slot. Declare the " +
+			"slot in Patroni's permanent_slots (slots: {<name>: {type: physical}}) so it " +
+			"survives promotions, then re-run the drill."
+		r.Pass = false
+		return r, nil
+	}
 	if baseline != nil && baseline.GapBytes > 0 {
 		r.Evidence = append(r.Evidence, Event{
 			At:   time.Now().UTC(),

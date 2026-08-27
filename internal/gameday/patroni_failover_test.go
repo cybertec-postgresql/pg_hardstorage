@@ -188,3 +188,37 @@ func TestPatroniFailover_UnmeasuredIsDeferredNotAPass(t *testing.T) {
 			"this test is closing.")
 	}
 }
+
+// The quiet-window hollow pass: a recreated slot with gap_bytes=0 must
+// FAIL. The drill audits configuration — can the slot survive a
+// promotion? — and "recreated" answers no; zero gap only means the
+// database was quiet between the last confirm and the switchover.
+// Passing here made the drill's verdict depend on how busy the cluster
+// happened to be during the drill, for a misconfiguration that does
+// not: caught live by the patroni gate's hollow-pass meta-test, which
+// ran the drill on a cluster with no permanent_slots during a quiet
+// window and watched it pass.
+func TestPatroniFailover_FailsWhenSlotRecreatedEvenWithZeroGap(t *testing.T) {
+	calls := 0
+	res := run(t, gameday.RunOptions{
+		Patroni: &fakePatroni{leaders: []string{"node-1", "node-2"}},
+		ObserveSlot: func(context.Context) (*gameday.SlotObservation, error) {
+			calls++
+			if calls == 1 {
+				return &gameday.SlotObservation{Outcome: "found"}, nil
+			}
+			return &gameday.SlotObservation{Outcome: "recreated", GapBytes: 0}, nil
+		},
+		RecoverWithin: 10 * time.Second,
+	})
+	if res.Pass {
+		t.Fatal("drill passed on a recreated slot because the WAL window happened to be " +
+			"quiet — the permanent_slots misconfiguration is present regardless of " +
+			"traffic, and the next failover under load strands WAL")
+	}
+	for _, want := range []string{"recreated", "permanent_slots"} {
+		if !strings.Contains(res.Failure, want) {
+			t.Errorf("failure text should mention %q so the operator can act, got %q", want, res.Failure)
+		}
+	}
+}

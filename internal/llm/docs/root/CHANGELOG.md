@@ -65,6 +65,18 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **The gameday failover drill no longer passes a cluster whose slot did
+  not survive the promotion.** The drill failed only on `gap_bytes > 0` or
+  a missing slot, so `outcome=recreated` with a zero gap — the reconciler
+  rebuilt the slot at the new leader's position during a quiet WAL window —
+  passed. That verdict depended on how busy the database happened to be
+  during the drill, for a misconfiguration (no `permanent_slots`) that does
+  not: the next failover under load strands WAL. `recreated` now fails
+  regardless of gap, with the `permanent_slots` remedy in the message.
+  Caught by the patroni gate's own hollow-pass meta-test, which ran the
+  drill against a misconfigured cluster during a quiet window and watched
+  it pass.
+
 - **`repo bundle import` closes its side of the dedup-vs-GC race.** A chunk
   the import adopts (already present in the destination repo, so nothing is
   rewritten) is an orphan there until a manifest from the bundle claims it —
