@@ -8,6 +8,7 @@ package runner_test
 import (
 	"context"
 	"crypto/rand"
+	"encoding/json"
 	"errors"
 	"sync"
 	"sync/atomic"
@@ -17,7 +18,6 @@ import (
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup/runner"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/pg/testkit"
-	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo"
 )
 
@@ -87,14 +87,36 @@ func TestIntegration_BackupLease_RefusesConcurrentSameDeployment(t *testing.T) {
 		t.Errorf("the rest should be refused with ErrBackupInProgress; got %d of %d", refused.Load(), N-1)
 	}
 
-	// The lease must be released once the winner completed.
+	// The lease must be RELEASED once the winner completed — which
+	// since the two-holder fix means a released TOMBSTONE, not an
+	// absent key: Release overwrites rather than deletes, because a
+	// deleted lease re-opens the claim-free create-if-absent path
+	// mid-succession (see leaseBody.Released). What "released" must
+	// mean to a caller is exactly two things, asserted below: the
+	// stored body says so, and a follow-up backup can acquire.
 	_, sp, err := repo.Open(ctx, repoURL)
 	if err != nil {
 		t.Fatalf("repo open: %v", err)
 	}
 	defer sp.Close()
-	if _, err := sp.Stat(ctx, "leases/db1/backup.json"); !errors.Is(err, storage.ErrNotFound) {
-		t.Errorf("backup lease should be released after the backup; stat err = %v (want ErrNotFound)", err)
+	rc, gerr := sp.Get(ctx, "leases/db1/backup.json")
+	if gerr != nil {
+		t.Fatalf("read lease after backup: %v (the released tombstone must remain)", gerr)
+	}
+	var tomb struct {
+		Released  bool      `json:"released"`
+		ExpiresAt time.Time `json:"expires_at"`
+	}
+	derr := json.NewDecoder(rc).Decode(&tomb)
+	_ = rc.Close()
+	if derr != nil {
+		t.Fatalf("decode lease tombstone: %v", derr)
+	}
+	if !tomb.Released {
+		t.Errorf("lease not marked released after the backup: %+v", tomb)
+	}
+	if time.Now().UTC().Before(tomb.ExpiresAt) {
+		t.Errorf("released tombstone still reads unexpired (expires %s)", tomb.ExpiresAt)
 	}
 
 	// A sequential backup afterwards succeeds (the lease is free again).
