@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	stdjson "encoding/json"
+	"io"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -259,10 +260,17 @@ func TestRepairScrub_HealCorruptReplica_Unverified(t *testing.T) {
 	body := []byte("the-real-bytes")
 	h, envelope := hw.commitChunkedManifest(t, "db1", "20260430T1300Z.000", body)
 
-	// Plant a DIFFERENT corrupt envelope at the replica (bit-rot on the
-	// replica too) — distinct from the primary's corruption so heal does
-	// not short-circuit on a bytes-equal AlreadyOK.
-	badReplica := append([]byte("replica-rot-"), envelope...)
+	// Plant a corrupt-but-VALID envelope at the replica: same header,
+	// one payload byte flipped. This is what real replica bit-rot
+	// inside the ciphertext looks like, and it is the case this test
+	// exists for — heal cannot see it (no DEK), installs it, and the
+	// CLI's plaintext reverify catches it as heal_unverified. Rot that
+	// breaks the envelope HEADER is a different case now: heal itself
+	// refuses it before overwriting anything (heal_incomplete;
+	// TestRepairScrub_HealUnparseableReplica_Incomplete below). The
+	// previous fixture prefixed garbage onto the envelope, which was
+	// header rot — testing the old conflation of the two.
+	badReplica := append([]byte(nil), envelope...)
 	badReplica[len(badReplica)-1] ^= 0xFF
 	plantAtReplica(t, hw, repo.ChunkKey(h), badReplica)
 
@@ -402,5 +410,47 @@ func TestRepairScrub_HealNonexistentReplica(t *testing.T) {
 	}
 	if !strings.Contains(stderr, "notfound.repo") {
 		t.Errorf("expected notfound.repo on missing replica:\n%s", stderr)
+	}
+}
+
+// TestRepairScrub_HealUnparseableReplica_Incomplete: replica rot that
+// breaks the envelope HEADER is refused by heal itself — before
+// anything is overwritten — and surfaces as heal_incomplete rather
+// than heal_unverified. The distinction matters to the operator: an
+// unverified heal installed bytes that need re-checking; an
+// incomplete one installed nothing and the replica needs repairing
+// first. The primary's corrupt copy must be exactly as scrub found
+// it, because a heal that fails must never leave less than it found.
+func TestRepairScrub_HealUnparseableReplica_Incomplete(t *testing.T) {
+	hw := newHealWorld(t)
+	body := []byte("the-real-bytes")
+	h, _ := hw.commitChunkedManifest(t, "db1", "20260430T1300Z.000", body)
+
+	// Header rot: not an envelope at all.
+	plantAtReplica(t, hw, repo.ChunkKey(h), []byte("\xffnot-an-envelope"))
+	primaryRot := []byte("totally-bogus-garbage-bytes")
+	corruptPrimaryChunk(t, hw, h, primaryRot)
+
+	stdout, stderr, exit := runCmd(t,
+		"repair", "scrub",
+		"--repo", hw.repoURL,
+		"--heal", "--replica", hw.replicaURL,
+		"--output", "json")
+	if exit != int(output.ExitVerifyFailed) {
+		t.Fatalf("unparseable-replica heal must exit %d; got %d\nstdout=%s\nstderr=%s",
+			int(output.ExitVerifyFailed), exit, stdout, stderr)
+	}
+	if !strings.Contains(stdout+stderr, "verify.heal_incomplete") {
+		t.Errorf("expected verify.heal_incomplete, got:\n%s\n%s", stdout, stderr)
+	}
+	// Nothing was installed: the primary still holds its own rot.
+	rc, err := hw.sp.Get(context.Background(), repo.ChunkKey(h))
+	if err != nil {
+		t.Fatalf("primary chunk vanished during a refused heal: %v", err)
+	}
+	got, _ := io.ReadAll(rc)
+	_ = rc.Close()
+	if !bytes.Equal(got, primaryRot) {
+		t.Errorf("primary chunk modified by a refused heal: %q", got)
 	}
 }
