@@ -28,6 +28,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage/fs"
@@ -198,6 +199,20 @@ type fanOutStorage struct {
 	storage.StoragePlugin
 	inflight atomic.Int64
 	max      atomic.Int64
+
+	// rendezvous, when non-nil, makes concurrency a FORCED question
+	// instead of an observed one: each Stat parks until a second Stat
+	// is in flight (or the timeout says none is coming). Merely
+	// observing max-in-flight was a timing assertion — on a loaded
+	// box (soak 24's stress phase, STRESS_COUNT repetition) every
+	// local-fs Stat completed before the scheduler started the next
+	// goroutine, the gate looked serial, and the test failed against
+	// correct code. With the rendezvous a serial implementation
+	// CANNOT pass (its single Stat waits alone until the timeout) and
+	// a concurrent one cannot fail (two workers park together and
+	// release each other), whatever the scheduler does.
+	rendezvous      chan struct{}
+	rendezvousTried atomic.Int64
 }
 
 func (f *fanOutStorage) Stat(ctx context.Context, key string) (storage.ObjectInfo, error) {
@@ -205,6 +220,18 @@ func (f *fanOutStorage) Stat(ctx context.Context, key string) (storage.ObjectInf
 		f.max.Store(cur)
 	}
 	defer f.inflight.Add(-1)
+	// Only the first few Stats rendezvous, and none once overlap is
+	// already proven: a serial gate then fails in ~4 timeouts instead
+	// of one per chunk, and a concurrent gate pays the cost once.
+	if f.rendezvous != nil && f.max.Load() < 2 && f.rendezvousTried.Add(1) <= 4 {
+		select {
+		case f.rendezvous <- struct{}{}: // a partner was parked — both proceed
+		case <-f.rendezvous: // we un-park a partner
+		case <-time.After(5 * time.Second):
+			// No second Stat ever arrived: serial. Fall through — the
+			// max-in-flight assertion reports it as the failure.
+		}
+	}
 	return f.StoragePlugin.Stat(ctx, key)
 }
 
@@ -247,9 +274,11 @@ func TestVerifyAdoptedChunks_StatsFanOut(t *testing.T) {
 		t.Fatalf("AdoptedHashes = %d, want %d — fixture did not adopt", got, n)
 	}
 
+	sp.rendezvous = make(chan struct{})
 	if err := verifyAdoptedChunks(ctx, sp, cas); err != nil {
 		t.Fatalf("gate refused a healthy backup: %v", err)
 	}
+	sp.rendezvous = nil
 	if got := sp.max.Load(); got < 2 {
 		t.Errorf("max in-flight Stats = %d, want >1: the gate verified %d chunks serially", got, n)
 	}
