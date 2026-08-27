@@ -11,7 +11,7 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ## [Unreleased]
 
-## [1.3.0] — 2026-08-26
+## [1.3.0] — 2026-08-27
 
 ### Security
 
