@@ -134,3 +134,60 @@ func indexOf(s, sub string) int {
 	}
 	return -1
 }
+
+// TestFindGaps_CrossTimelineResumeHandoffIsNotAGap pins the archive
+// shape the cross-timeline resume produces against the gap detector.
+//
+// When a streamer falls behind and walks the timeline chain back up,
+// each timeline contributes only the WHOLE segments it had left
+// before its branch point, and the next timeline continues from the
+// segment containing that branch — because PostgreSQL copies the old
+// timeline's last partial segment under the new timeline's name when
+// it promotes. findGaps documents exactly this as the no-gap case
+// ("the new timeline's first archived segment is the one containing
+// the branch LSN, so it lands at or just after the old timeline's
+// last"), and the resume walk is the code that has to keep it true.
+//
+// Getting this wrong is silent in the worst way: an archive that
+// looks complete to `wal audit` but is not, or a correct archive that
+// trips the gap gate on every failover.
+func TestFindGaps_CrossTimelineResumeHandoffIsNotAGap(t *testing.T) {
+	// The chaos gate's geometry: timeline 27 ended inside segment A3,
+	// timeline 28 inside A6, live on 29.
+	segs := []walSegment{
+		{Timeline: 27, SegmentNumber: 0xA1},
+		{Timeline: 27, SegmentNumber: 0xA2},
+		{Timeline: 28, SegmentNumber: 0xA3},
+		{Timeline: 28, SegmentNumber: 0xA4},
+		{Timeline: 28, SegmentNumber: 0xA5},
+		{Timeline: 29, SegmentNumber: 0xA6},
+		{Timeline: 29, SegmentNumber: 0xA7},
+	}
+	if got := findGaps(segs); len(got) != 0 {
+		t.Fatalf("the cross-timeline resume hand-off was reported as %d gap(s): %+v\n"+
+			"This shape is what a streamer walking the timeline chain produces, and "+
+			"findGaps documents it as the contiguous case.", len(got), got)
+	}
+}
+
+// The counterpart: a promotion that genuinely lost WAL must still be
+// caught. If the hand-off case above were made gap-free by loosening
+// the check rather than by the archive being correct, this would go
+// quiet too — and a hole straddling a failover is the one an HA
+// deployment is most likely to have.
+func TestFindGaps_LostWALAcrossAPromotionIsStillAGap(t *testing.T) {
+	segs := []walSegment{
+		{Timeline: 27, SegmentNumber: 0xA1},
+		{Timeline: 27, SegmentNumber: 0xA2},
+		// A3, A4 never archived — the streamer was dead across the
+		// promotion and resumed too late.
+		{Timeline: 28, SegmentNumber: 0xA5},
+	}
+	got := findGaps(segs)
+	if len(got) != 1 {
+		t.Fatalf("expected exactly one gap, got %d: %+v", len(got), got)
+	}
+	if got[0].StartSegment != 0xA3 || got[0].EndSegment != 0xA4 {
+		t.Errorf("gap = segments %X..%X, want A3..A4", got[0].StartSegment, got[0].EndSegment)
+	}
+}
