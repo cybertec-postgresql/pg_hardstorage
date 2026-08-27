@@ -3,6 +3,7 @@ package backup
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"net/url"
 	"strings"
@@ -75,9 +76,21 @@ func TestLease_ReleaseFreesIt(t *testing.T) {
 	if err := l.Release(ctx); err != nil {
 		t.Fatalf("release: %v", err)
 	}
-	// Key must be gone.
-	if _, err := sp.Stat(ctx, backupLeaseKey("db1")); !errors.Is(err, storage.ErrNotFound) {
-		t.Errorf("lease key still present after release: %v", err)
+	// The key STAYS — as a released tombstone, never a deletion. A
+	// delete re-opens the claim-free create-if-absent path
+	// mid-succession, which is how the lease soak produced two
+	// holders on S3 (reclaimer past its recheck + holder's delete +
+	// fresh acquirer's create). What "frees it" means is the
+	// tombstone below plus the successful re-acquire.
+	tomb, err := readLeaseBody(ctx, sp, "db1")
+	if err != nil {
+		t.Fatalf("read lease after release: %v", err)
+	}
+	if !tomb.Released {
+		t.Errorf("release did not mark the lease Released; body: %+v", tomb)
+	}
+	if clk.now().Before(tomb.ExpiresAt) {
+		t.Errorf("released tombstone still reads as unexpired (expires %s)", tomb.ExpiresAt)
 	}
 	// And a fresh acquire works.
 	if _, err := AcquireBackupLease(ctx, sp, "db1", LeaseOptions{Owner: "agent-B", now: clk.now}); err != nil {
@@ -168,4 +181,18 @@ func TestLease_CorruptLeaseRefused(t *testing.T) {
 	if !strings.Contains(err.Error(), "could not be read") {
 		t.Fatalf("unexpected error: %v", err)
 	}
+}
+
+// readLeaseBody decodes the stored lease object for assertions.
+func readLeaseBody(ctx context.Context, sp storage.StoragePlugin, deployment string) (leaseBody, error) {
+	rc, err := sp.Get(ctx, backupLeaseKey(deployment))
+	if err != nil {
+		return leaseBody{}, err
+	}
+	defer rc.Close()
+	var b leaseBody
+	if err := json.NewDecoder(rc).Decode(&b); err != nil {
+		return leaseBody{}, err
+	}
+	return b, nil
 }

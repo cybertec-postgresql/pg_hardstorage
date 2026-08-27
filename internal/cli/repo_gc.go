@@ -518,6 +518,7 @@ func findLiveBackupLeases(ctx context.Context, sp storage.StoragePlugin, now tim
 		var lease struct {
 			Deployment string    `json:"deployment"`
 			ExpiresAt  time.Time `json:"expires_at"`
+			Released   bool      `json:"released"`
 		}
 		derr := json.NewDecoder(io.LimitReader(rc, 1<<20)).Decode(&lease)
 		_ = rc.Close()
@@ -528,7 +529,7 @@ func findLiveBackupLeases(ctx context.Context, sp storage.StoragePlugin, now tim
 			// failure direction.
 			return nil, fmt.Errorf("parse lease %s: %w", info.Key, derr)
 		}
-		if now.Before(lease.ExpiresAt) {
+		if !lease.Released && now.Before(lease.ExpiresAt) {
 			name := lease.Deployment
 			if name == "" {
 				name = strings.TrimSuffix(strings.TrimPrefix(info.Key, "leases/"), "/backup.json")

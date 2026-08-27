@@ -119,7 +119,30 @@ type leaseBody struct {
 	Owner      string    `json:"owner"`
 	AcquiredAt time.Time `json:"acquired_at"`
 	ExpiresAt  time.Time `json:"expires_at"`
+
+	// Released marks a lease its holder gave back: Release OVERWRITES
+	// the object with this tombstone — same Owner/AcquiredAt (the
+	// grant identity), ExpiresAt set to the release instant — instead
+	// of deleting it. Deletion was the hole in the succession
+	// discipline: every overwrite of a stale lease must first win the
+	// grant-keyed break claim, but a DELETE re-opened the fast
+	// create-if-absent path, which needs no claim — so a reclaimer
+	// (claim in hand) and a fresh acquirer (create in hand) could both
+	// win the same succession, and two backups of one deployment ran
+	// concurrently. The lease soak caught it on S3: "2 holders at
+	// once". With the tombstone, the object never disappears, every
+	// successor goes through the same claim, and create-if-absent is
+	// only ever satisfied by a repository that never held this lease.
+	Released   bool      `json:"released,omitempty"`
+	ReleasedAt time.Time `json:"released_at,omitzero"`
 }
+
+// reclaimEchoRetries bounds the reclaim verify loop above: how many
+// times a claim-holding reclaimer re-asserts its body over the
+// previous holder's late one-shot writes before giving up. Two
+// stragglers (a Release and a doomed Renew) is the realistic maximum;
+// three re-puts is comfortably past it.
+const reclaimEchoRetries = 3
 
 // defaultLeaseSettle is the post-write verification window used by the
 // stale-break and renew paths (see the settle-verify comments below).
@@ -152,6 +175,7 @@ type LeaseOptions struct {
 var (
 	leaseHookAfterStaleRecheck func() // between the stale recheck and the overwrite
 	leaseHookBeforeRenewPut    func() // between Renew's expiry check and its put
+	leaseHookAfterReclaimPut   func() // between the reclaim overwrite and its settle-verify
 )
 
 // Lease is a held per-deployment backup lease.  Renew extends it,
@@ -251,7 +275,7 @@ func AcquireBackupLease(ctx context.Context, sp storage.StoragePlugin, deploymen
 		}
 		return nil, fmt.Errorf("backup: a lease for %q exists but could not be read: %w", deployment, rerr)
 	}
-	if now().Before(existing.ExpiresAt) {
+	if !existing.Released && now().Before(existing.ExpiresAt) {
 		return nil, fmt.Errorf("%w (held by %q, acquired %s, expires %s)",
 			ErrBackupInProgress, existing.Owner,
 			existing.AcquiredAt.Format(time.RFC3339), existing.ExpiresAt.Format(time.RFC3339))
@@ -323,7 +347,7 @@ func AcquireBackupLease(ctx context.Context, sp storage.StoragePlugin, deploymen
 		return nil, fmt.Errorf("backup: recheck stale lease for %q: %w", deployment, rcerr)
 	}
 	if recheck.Owner != existing.Owner || !recheck.AcquiredAt.Equal(existing.AcquiredAt) ||
-		now().Before(recheck.ExpiresAt) {
+		(!recheck.Released && now().Before(recheck.ExpiresAt)) {
 		// Someone else already broke + retook it (or the holder revived).
 		return nil, ErrBackupInProgress
 	}
@@ -338,8 +362,34 @@ func AcquireBackupLease(ctx context.Context, sp storage.StoragePlugin, deploymen
 	if err := l.put(ctx, body, false); err != nil {
 		return nil, fmt.Errorf("backup: retake stale lease for %q: %w", deployment, err)
 	}
-	if err := l.settleVerify(ctx, body); err != nil {
-		return nil, err
+	if leaseHookAfterReclaimPut != nil {
+		leaseHookAfterReclaimPut()
+	}
+	// The verify loop: we hold the grant's break claim — the SOLE
+	// right to succeed this lease — so the only writes that can land
+	// on top of ours are one-shot stragglers from the previous
+	// holder's process: its Release tombstone (read-checked against a
+	// body that was still its own when it looked) or a Renew that will
+	// itself abort on its own settle-verify. Both carry the victim's
+	// grant identity, both are finite, so re-asserting our body a
+	// bounded number of times converges. A body carrying a DIFFERENT
+	// grant identity means a genuine successor — that must never be
+	// overwritten, and with the claim in hand it also cannot happen;
+	// treat it as defeat, not as an invariant violation, because an
+	// operator can always delete objects by hand.
+	for attempt := 0; ; attempt++ {
+		obs, verr := l.settleVerifyObserved(ctx, body)
+		if verr == nil {
+			break
+		}
+		if attempt < reclaimEchoRetries && errors.Is(verr, ErrBackupInProgress) &&
+			obs.Owner == recheck.Owner && obs.AcquiredAt.Equal(recheck.AcquiredAt) {
+			if perr := l.put(ctx, body, false); perr != nil {
+				return nil, fmt.Errorf("backup: retake stale lease for %q: %w", deployment, perr)
+			}
+			continue
+		}
+		return nil, verr
 	}
 	l.setBody(body)
 	return l, nil
@@ -349,23 +399,33 @@ func AcquireBackupLease(ctx context.Context, sp storage.StoragePlugin, deploymen
 // still carries our fencing token. Returns ErrBackupInProgress when a
 // competing writer won.
 func (l *Lease) settleVerify(ctx context.Context, mine leaseBody) error {
+	_, err := l.settleVerifyObserved(ctx, mine)
+	return err
+}
+
+// settleVerifyObserved is settleVerify returning what it read, so the
+// reclaim path can distinguish a genuine competing successor from the
+// previous holder's LATE ECHO (its one-shot Release tombstone landing
+// on top of our fresh lease) — the echo carries the victim's own grant
+// identity, a real rival carries a new one.
+func (l *Lease) settleVerifyObserved(ctx context.Context, mine leaseBody) (leaseBody, error) {
 	if l.settle > 0 {
 		t := time.NewTimer(l.settle)
 		defer t.Stop()
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return leaseBody{}, ctx.Err()
 		case <-t.C:
 		}
 	}
 	cur, err := l.read(ctx)
 	if err != nil {
-		return fmt.Errorf("backup: verify lease for %q after write: %w", l.deployment, err)
+		return leaseBody{}, fmt.Errorf("backup: verify lease for %q after write: %w", l.deployment, err)
 	}
 	if cur.Owner != mine.Owner || !cur.AcquiredAt.Equal(mine.AcquiredAt) {
-		return ErrBackupInProgress
+		return cur, ErrBackupInProgress
 	}
-	return nil
+	return cur, nil
 }
 
 // Renew extends the lease's expiry by its TTL.  It first confirms we
@@ -464,9 +524,25 @@ func (l *Lease) Release(ctx context.Context) error {
 		return fmt.Errorf("backup: release lease for %q: %w", l.deployment, err)
 	}
 	if cur.Owner != mine.Owner || !cur.AcquiredAt.Equal(mine.AcquiredAt) {
-		return nil // superseded — not ours to delete
+		return nil // superseded — not ours to release
 	}
-	if err := l.sp.Delete(ctx, backupLeaseKey(l.deployment)); err != nil && !errors.Is(err, storage.ErrNotFound) {
+	// Overwrite with a tombstone; NEVER delete. See leaseBody.Released
+	// for the full account: a delete re-opens the claim-free
+	// create-if-absent path mid-succession, and the lease soak
+	// demonstrated two holders through exactly that gap (a reclaimer
+	// past its recheck + our delete + a fresh acquirer's create). The
+	// tombstone keeps every future transition on the one grant-keyed
+	// break claim. This write is itself read-check-then-write and can
+	// land on a reclaimer that overtook us between our read above and
+	// now — the reclaimer's settle-verify handles that echo (it holds
+	// the grant's break claim, so re-asserting its body is its
+	// exclusive right).
+	now := l.now().UTC()
+	tomb := mine
+	tomb.ExpiresAt = now
+	tomb.Released = true
+	tomb.ReleasedAt = now
+	if err := l.put(ctx, tomb, false); err != nil {
 		return fmt.Errorf("backup: release lease for %q: %w", l.deployment, err)
 	}
 	return nil

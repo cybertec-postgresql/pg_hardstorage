@@ -65,6 +65,22 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **Two backups of one deployment could hold the backup lease at once.**
+  The lease's succession discipline requires every overwrite of a stale
+  lease to first win a grant-keyed break claim — but `Release` DELETED the
+  lease object, which re-opened the claim-free create-if-absent fast path
+  mid-succession: a reclaimer past its staleness recheck, the stalled
+  holder's late release, and a fresh acquirer's create could interleave so
+  that both the reclaimer and the acquirer held the lease simultaneously
+  (the randomized lease soak caught it on S3: "2 holders at once").
+  Concurrent backups are the precondition for the dedup-vs-GC race family
+  every commit gate exists to prevent. `Release` now overwrites the lease
+  with a released tombstone that preserves the grant identity, so every
+  successor — reclaimer or fresh acquirer — funnels through the same break
+  claim, and create-if-absent admits exactly one; the reclaim verify loop
+  re-asserts over the previous holder's finite late writes. The gc lease
+  scan skips released tombstones explicitly.
+
 - **The gameday failover drill no longer passes a cluster whose slot did
   not survive the promotion.** The drill failed only on `gap_bytes > 0` or
   a missing slot, so `outcome=recreated` with a zero gap — the reconciler

@@ -271,14 +271,18 @@ func TestLease_BreakClaimIsNotMistakenForALease(t *testing.T) {
 			claims++
 		}
 	}
-	if leases != 0 {
-		t.Errorf("Release left %d lease object(s) behind", leases)
+	// Exactly one lease object remains — the released TOMBSTONE
+	// (Release overwrites, never deletes; see leaseBody.Released) —
+	// and it must not read as live to the gc lease scan.
+	if leases != 1 {
+		t.Errorf("lease objects after release = %d, want exactly 1 (the released tombstone)", leases)
 	}
 	if claims == 0 {
 		t.Fatal("no break claim was written; the break was not made exclusive")
 	}
-	// The suffix gc filters on must not match a claim.
-	if claims > 0 && leases > 0 {
-		t.Errorf("a break claim is indistinguishable from a lease to a /backup.json filter")
+	// The claims live under their own sub-prefix; the /backup.json
+	// suffix gc filters on must match only the lease object itself.
+	if claims+1 != leases+claims {
+		t.Errorf("claim/lease key shapes overlap")
 	}
 }
