@@ -547,6 +547,25 @@ test-scenarios: build build-compat build-testkit | $(HS_TMPDIR)
 	done; \
 	echo "all scenarios passed"
 
+# --- coverage-instrumented end-to-end -------------------------------
+#
+# The dead-corner report: which shipped functions does NOTHING execute?
+# `logs --since` was broken for a year because the answer for it was
+# "nothing" and no one knew. coverage-e2e builds the CLI with -cover,
+# runs the scenario corpus against that binary (GOCOVERDIR collects
+# per-process profiles; PG_HARDSTORAGE_BIN points the testkit at it),
+# and scripts/coverage-deadcorners.sh intersects the result with the
+# package-test profile: a function at zero in BOTH is unwitnessed code.
+# The committed baseline test/coverage/deadcorners-baseline.txt is a
+# ratchet — the list may only shrink (coverage-ratchet target).
+COVER_DIR ?= $(HS_TMPDIR)/e2e-cover
+
+coverage-e2e: build-compat build-testkit | $(HS_TMPDIR)
+	@set -e; 	mkdir -p $(COVER_DIR)/covdata; 	go build -cover -o $(COVER_DIR)/pg_hardstorage.cov ./cmd/pg_hardstorage; 	go test ./... -count=1 -coverprofile=$(COVER_DIR)/unit.cov -coverpkg=./internal/... >/dev/null; 	export PG_HARDSTORAGE_BIN=$(COVER_DIR)/pg_hardstorage.cov GOCOVERDIR=$(COVER_DIR)/covdata; 	for t in L1 L6 L2 L8 L3 L4 L5 L7; do 		for s in $$(ls test/scenarios/$$t\_*.scenario.yaml 2>/dev/null); do 			echo "→ $$s"; $(BIN_DIR)/$(TESTKIT) scenario run "$$s"; 		done; 	done; 	scripts/coverage-deadcorners.sh $(COVER_DIR)/unit.cov $(COVER_DIR)/covdata
+
+coverage-ratchet: coverage-e2e
+	@scripts/coverage-deadcorners.sh $(COVER_DIR)/unit.cov $(COVER_DIR)/covdata 		--diff test/coverage/deadcorners-baseline.txt
+
 test-wal-stream-lint: build-testkit
 	@set -e; \
 	for s in $(WAL_STREAM_SCENARIOS); do \
