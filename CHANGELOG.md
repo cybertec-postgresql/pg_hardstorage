@@ -65,6 +65,22 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **`repo replicate` could commit a manifest over a chunk a concurrent
+  `repo gc` on the replica had just swept.** Replicate adopts chunks already
+  present at the destination by `Stat` — and until the manifest lands there,
+  an adopted chunk is an orphan on the replica with whatever old mtime
+  history left it, which is exactly what `repo gc --apply` sweeps (the age
+  floor only protects young writes). A sweep in the window between adoption
+  and manifest commit — a window spanning the rest of the copy — produced a
+  replica that reports successful replication but fails restore on a missing
+  chunk. The backup path has guarded this same race at commit time since the
+  dedup work (`verifyAdoptedChunks`); replicate now does the equivalent:
+  before committing a manifest that is new at the destination, every adopted
+  chunk is re-checked and a vanished one is re-copied from the source (the
+  new `chunks_recopied` counter records it firing). Re-running replicate over
+  an up-to-date replica costs one extra `Stat` per manifest and nothing per
+  chunk, because an already-committed manifest pins its chunks against gc.
+
 - **`wal stream` no longer stops permanently when it resumes across a
   promotion.** A streamer that fell more than one segment behind and then
   reconnected after a failover computed the right resume LSN — the previous

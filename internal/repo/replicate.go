@@ -115,7 +115,12 @@ type ReplicateResult struct {
 	ChunksCopied     int `json:"chunks_copied"`
 	ChunksSkipped    int `json:"chunks_skipped"` // already at dst
 	ChunksMissing    int `json:"chunks_missing"` // referenced but absent at src
-	ChunksFailed     int `json:"chunks_failed"`
+	// ChunksRecopied counts adopted chunks that VANISHED from dst
+	// between adoption and manifest commit and were copied again by
+	// the commit-time re-verify — direct evidence the replica-side gc
+	// race fired. Zero on healthy runs.
+	ChunksRecopied int `json:"chunks_recopied,omitempty"`
+	ChunksFailed   int `json:"chunks_failed"`
 
 	WALManifestsConsidered int `json:"wal_manifests_considered,omitempty"`
 	WALManifestsCopied     int `json:"wal_manifests_copied,omitempty"`
@@ -363,16 +368,25 @@ func replicateManifest(ctx context.Context, src, dst storage.StoragePlugin, key,
 	// and (once the src copy is later GC'd) permanently invisible to
 	// `repo replicate verify`, which walks src listings only.
 	chunksOK := true
+	var adopted []Hash
 	for _, h := range hashes {
 		if err := ctx.Err(); err != nil {
 			return
 		}
-		if !copyChunk(ctx, src, dst, h, opts, res) {
+		switch copyChunk(ctx, src, dst, h, opts, res) {
+		case chunkFailed:
 			chunksOK = false
+		case chunkAdopted:
+			adopted = append(adopted, h)
 		}
 	}
 	if !chunksOK {
 		recordReplicateFailure(res, key, errors.New("manifest withheld from replica: one or more referenced chunks failed to copy (see chunk failures above); re-run replicate after fixing the source"))
+		res.ManifestsFailed++
+		return
+	}
+	if !reverifyAdopted(ctx, src, dst, key, adopted, opts, res) {
+		recordReplicateFailure(res, key, errors.New("manifest withheld from replica: an adopted chunk vanished from the replica before the manifest committed (concurrent `repo gc --apply` on the replica?) and could not be re-copied; re-run replicate"))
 		res.ManifestsFailed++
 		return
 	}
@@ -411,16 +425,25 @@ func replicateWALManifest(ctx context.Context, src, dst storage.StoragePlugin, k
 		return
 	}
 	chunksOK := true
+	var adopted []Hash
 	for _, h := range hashes {
 		if err := ctx.Err(); err != nil {
 			return
 		}
-		if !copyChunk(ctx, src, dst, h, opts, res) {
+		switch copyChunk(ctx, src, dst, h, opts, res) {
+		case chunkFailed:
 			chunksOK = false
+		case chunkAdopted:
+			adopted = append(adopted, h)
 		}
 	}
 	if !chunksOK {
 		recordReplicateFailure(res, key, errors.New("wal manifest withheld from replica: one or more referenced chunks failed to copy"))
+		res.WALManifestsFailed++
+		return
+	}
+	if !reverifyAdopted(ctx, src, dst, key, adopted, opts, res) {
+		recordReplicateFailure(res, key, errors.New("wal manifest withheld from replica: an adopted chunk vanished from the replica before the manifest committed (concurrent `repo gc --apply` on the replica?) and could not be re-copied; re-run replicate"))
 		res.WALManifestsFailed++
 		return
 	}
@@ -523,14 +546,112 @@ func bumpKeyFailed(res *ReplicateResult, kind keyKind) {
 	}
 }
 
+// reverifyAdopted is the manifest-commit-time gate for the
+// dedup-vs-GC race, on the REPLICA side.
+//
+// The writer side has exactly this gate already: CAS tracks every
+// chunk a backup adopted rather than wrote (cas.go: "an adopted chunk
+// is old by definition — an orphan from an expired tombstone whose
+// content reappears today gets a dedup hit that touches no object and
+// refreshes no mtime"), and verifyAdoptedChunks (backup/runner)
+// re-Stats the set at manifest-commit time. Replicate adopts by Stat
+// in the same way and, until this function, trusted the adoption for
+// the entire remainder of the copy: every skipped chunk is an orphan
+// AT DST until the manifest lands, so a concurrent `repo gc --apply`
+// on the replica could sweep it — gc's age floor only protects young
+// mtimes, and an adopted chunk's mtime is whatever history left
+// behind. The manifest then committed over the hole: replication
+// reports success, restore-from-replica fails on a missing chunk.
+//
+// Scope: the race exists only when the manifest is NEW at dst. One
+// already committed there pins its chunks in gc's reference walk, so
+// re-running replicate over an up-to-date replica costs one manifest
+// Stat and nothing per chunk. Verification is skipped for DryRun
+// (nothing commits) and re-checks only ADOPTED chunks — ones this run
+// wrote are young and inside gc's age floor, the same argument the
+// backup path makes.
+//
+// A vanished chunk is re-copied from src rather than failing the
+// manifest: src is authoritative and the re-put makes the mtime
+// young, closing the window for that chunk. Only when the re-copy
+// itself fails is the manifest withheld. A transient Stat error is
+// not evidence of loss (the chunk was present at adoption) and
+// deliberately does not block — the identical posture to
+// verifyAdoptedChunks.
+func reverifyAdopted(ctx context.Context, src, dst storage.StoragePlugin, manifestKey string, adopted []Hash, opts ReplicateOptions, res *ReplicateResult) bool {
+	if len(adopted) == 0 || opts.DryRun {
+		return true
+	}
+	switch _, err := dst.Stat(ctx, manifestKey); {
+	case err == nil:
+		return true // manifest already at dst: its references pin the chunks
+	case errors.Is(err, storage.ErrNotFound):
+		// new manifest — the race is live; verify below
+	default:
+		// Cannot tell whether the manifest pins the chunks; verify.
+	}
+	ok := true
+	for _, h := range adopted {
+		if ctx.Err() != nil {
+			return false
+		}
+		chunkKey := ChunkKey(h)
+		switch _, err := dst.Stat(ctx, chunkKey); {
+		case err == nil:
+			continue
+		case errors.Is(err, storage.ErrNotFound):
+			// swept — fall through to re-copy
+		default:
+			continue // transient; present at adoption, not evidence of loss
+		}
+		cb, rerr := readKey(ctx, src, chunkKey)
+		if rerr != nil {
+			recordReplicateFailure(res, chunkKey, fmt.Errorf("adopted chunk vanished from replica; re-read src: %w", rerr))
+			res.ChunksMissing++
+			ok = false
+			continue
+		}
+		putOpts := storage.PutOptions{IfNotExists: true, ContentLength: int64(len(cb))}
+		putOpts.RetainUntil, putOpts.RetentionMode = opts.retentionPut()
+		if _, perr := dst.Put(ctx, chunkKey, bytes.NewReader(cb), putOpts); perr != nil && !errors.Is(perr, storage.ErrAlreadyExists) {
+			recordReplicateFailure(res, chunkKey, fmt.Errorf("adopted chunk vanished from replica; re-copy: %w", perr))
+			res.ChunksFailed++
+			ok = false
+			continue
+		}
+		res.ChunksRecopied++
+		res.BytesCopied += int64(len(cb))
+	}
+	return ok
+}
+
+// chunkOutcome is copyChunk's report on one chunk reference.
+type chunkOutcome int
+
+const (
+	// chunkFailed: the chunk is NOT durably present at dst. Callers
+	// MUST NOT commit a manifest at dst that references it — a
+	// manifest over missing chunks is a DR replica that lies about
+	// restorability.
+	chunkFailed chunkOutcome = iota
+	// chunkCopied: this run wrote the chunk to dst. Its mtime is
+	// young, so gc's --min-chunk-age floor protects it until the
+	// manifest lands.
+	chunkCopied
+	// chunkAdopted: the chunk was already at dst and this run is
+	// TRUSTING its presence without having written it — a stat hit,
+	// or an IfNotExists put lost to a concurrent writer. Until the
+	// manifest lands at dst, such a chunk is an ORPHAN there, and if
+	// it is older than gc's age floor a concurrent `repo gc --apply`
+	// on the replica can sweep it. Same taxonomy as CAS.adopted
+	// (cas.go) — and the same obligation: re-verify at
+	// manifest-commit time.
+	chunkAdopted
+)
+
 // copyChunk handles one chunk reference. Stats dst first (cheap),
 // pulls from src + writes to dst on miss. Updates res.
-// copyChunk reports whether the chunk is DURABLY PRESENT at dst
-// after the call (copied, already there, or dry-run-would-copy).
-// Callers MUST NOT commit a manifest at dst unless every referenced
-// chunk returned true — a manifest over missing chunks is a DR
-// replica that lies about restorability.
-func copyChunk(ctx context.Context, src, dst storage.StoragePlugin, h Hash, opts ReplicateOptions, res *ReplicateResult) bool {
+func copyChunk(ctx context.Context, src, dst storage.StoragePlugin, h Hash, opts ReplicateOptions, res *ReplicateResult) chunkOutcome {
 	res.ChunksConsidered++
 	chunkKey := ChunkKey(h)
 
@@ -538,13 +659,13 @@ func copyChunk(ctx context.Context, src, dst storage.StoragePlugin, h Hash, opts
 	switch _, err := dst.Stat(ctx, chunkKey); {
 	case err == nil:
 		res.ChunksSkipped++
-		return true
+		return chunkAdopted
 	case errors.Is(err, storage.ErrNotFound):
 		// fall through to copy
 	default:
 		recordReplicateFailure(res, chunkKey, fmt.Errorf("stat dst: %w", err))
 		res.ChunksFailed++
-		return false
+		return chunkFailed
 	}
 
 	// Pull from src.
@@ -555,12 +676,12 @@ func copyChunk(ctx context.Context, src, dst storage.StoragePlugin, h Hash, opts
 		// damage report.
 		recordReplicateFailure(res, chunkKey, fmt.Errorf("read src: %w", err))
 		res.ChunksMissing++
-		return false
+		return chunkFailed
 	}
 	if opts.DryRun {
 		res.ChunksCopied++
 		res.BytesCopied += int64(len(cb))
-		return true
+		return chunkCopied
 	}
 	putOpts := storage.PutOptions{IfNotExists: true, ContentLength: int64(len(cb))}
 	putOpts.RetainUntil, putOpts.RetentionMode = opts.retentionPut()
@@ -569,16 +690,17 @@ func copyChunk(ctx context.Context, src, dst storage.StoragePlugin, h Hash, opts
 	case err == nil:
 		res.ChunksCopied++
 		res.BytesCopied += int64(len(cb))
-		return true
+		return chunkCopied
 	case errors.Is(err, storage.ErrAlreadyExists):
-		// Race: a concurrent replicate run won the put. Treat as a
-		// skip — both copies have the same bytes (CAS contract).
+		// Race: a concurrent writer won the put. Both copies have the
+		// same bytes (CAS contract), but the bytes at dst are THEIRS,
+		// not ours — adopted, same as a stat hit.
 		res.ChunksSkipped++
-		return true
+		return chunkAdopted
 	default:
 		recordReplicateFailure(res, chunkKey, fmt.Errorf("put dst: %w", err))
 		res.ChunksFailed++
-		return false
+		return chunkFailed
 	}
 }
 
