@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/output"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/paths"
@@ -212,6 +213,7 @@ func newTimeTravelDestroyCmd() *cobra.Command {
 	}
 	c.Flags().BoolVar(&removeTarget, "remove-target", false,
 		"also rm -rf the data directory")
+	acceptRemoveTargetSpellings(c)
 	return c
 }
 
@@ -240,7 +242,33 @@ func newTimeTravelCleanupCmd() *cobra.Command {
 	}
 	c.Flags().BoolVar(&removeTargets, "remove-targets", false,
 		"also rm -rf each reaped session's data dir")
+	acceptRemoveTargetSpellings(c)
 	return c
+}
+
+// acceptRemoveTargetSpellings makes --remove-target and
+// --remove-targets interchangeable on c.
+//
+// `standby destroy` and `timetravel destroy` named the flag in the
+// singular (one session, one data dir); `timetravel cleanup` in the
+// plural (it reaps every expired session). Both names are honest for
+// their own command — but an operator scripting the destroy alongside
+// the cleanup has no reason to remember which is which, and the
+// failure is a usage error at 3am. Cobra's flag normalization maps
+// whichever spelling the user typed onto the one the command
+// declares, so both work everywhere and --help still shows each
+// command's semantically-honest name.
+func acceptRemoveTargetSpellings(c *cobra.Command) {
+	declared := "remove-target"
+	if c.Flags().Lookup("remove-targets") != nil {
+		declared = "remove-targets"
+	}
+	c.Flags().SetNormalizeFunc(func(f *pflag.FlagSet, name string) pflag.NormalizedName {
+		if name == "remove-target" || name == "remove-targets" {
+			return pflag.NormalizedName(declared)
+		}
+		return pflag.NormalizedName(name)
+	})
 }
 
 // --- helpers ---------------------------------------------------------

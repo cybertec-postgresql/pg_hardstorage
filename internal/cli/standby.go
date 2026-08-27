@@ -208,6 +208,7 @@ func newStandbyDestroyCmd() *cobra.Command {
 	}
 	c.Flags().BoolVar(&removeTarget, "remove-target", false,
 		"also rm -rf the data directory")
+	acceptRemoveTargetSpellings(c)
 	return c
 }
 
