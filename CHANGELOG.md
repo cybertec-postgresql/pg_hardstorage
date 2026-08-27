@@ -65,6 +65,18 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **`repo bundle import` closes its side of the dedup-vs-GC race.** A chunk
+  the import adopts (already present in the destination repo, so nothing is
+  rewritten) is an orphan there until a manifest from the bundle claims it —
+  and a concurrent `repo gc --apply`, whose delete list can predate that
+  manifest, could sweep it mid-import. The import then reported success over
+  a manifest whose chunk was gone. The backup runner, the WAL sink and
+  `repo replicate` all re-check adopted chunks at commit time; import now
+  does too. The tar is single-pass, so a swept chunk cannot be rewritten in
+  place — the import fails loudly naming the chunks, and re-running it heals
+  (the manifests are in place, so the re-run writes the missing chunks for
+  real and gc can no longer orphan them).
+
 - **Every duration flag now accepts day and week units, enforced by an
   invariant test.** The `--keep-for 30d` class was fixed twice in this
   release and regrew between the fixes (`repair --min-chunk-age` diverged

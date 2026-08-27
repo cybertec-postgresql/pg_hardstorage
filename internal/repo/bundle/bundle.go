@@ -325,6 +325,7 @@ func Import(ctx context.Context, r io.Reader, sp storage.StoragePlugin, opts Imp
 	var bm Manifest
 	var entryCount int
 	var totalBytes int64
+	var adoptedChunks []string
 
 	for {
 		hdr, err := tr.Next()
@@ -402,8 +403,12 @@ func Import(ctx context.Context, r io.Reader, sp storage.StoragePlugin, opts Imp
 			if err := verifyChunkPayload(clean, body, opts.Codecs); err != nil {
 				return nil, err
 			}
-			if err := putIfNotExists(ctx, sp, clean, strings_NewReader(string(body))); err != nil {
+			adopted, err := putIfNotExists(ctx, sp, clean, strings_NewReader(string(body)))
+			if err != nil {
 				return nil, fmt.Errorf("bundle: write chunk %s: %w", clean, err)
+			}
+			if adopted {
+				adoptedChunks = append(adoptedChunks, clean)
 			}
 		case strings.HasPrefix(clean, "manifests/") || strings.HasPrefix(clean, "wal/"):
 			// Manifest, replica, attestation, WAL file, or
@@ -428,10 +433,10 @@ func Import(ctx context.Context, r io.Reader, sp storage.StoragePlugin, opts Imp
 				if _, verr := backup.ParseAndVerify(body, opts.Verifier); verr != nil {
 					return nil, fmt.Errorf("bundle: reject %s: manifest signature verification failed: %w", clean, verr)
 				}
-				if err := putIfNotExists(ctx, sp, clean, strings_NewReader(string(body))); err != nil {
+				if _, err := putIfNotExists(ctx, sp, clean, strings_NewReader(string(body))); err != nil {
 					return nil, fmt.Errorf("bundle: write %s: %w", clean, err)
 				}
-			} else if err := putIfNotExists(ctx, sp, clean, tr); err != nil {
+			} else if _, err := putIfNotExists(ctx, sp, clean, tr); err != nil {
 				return nil, fmt.Errorf("bundle: write %s: %w", clean, err)
 			}
 		default:
@@ -442,6 +447,35 @@ func Import(ctx context.Context, r io.Reader, sp storage.StoragePlugin, opts Imp
 	}
 	if bm.Schema == "" {
 		return nil, errors.New("bundle: archive did not contain bundle.json")
+	}
+
+	// Import-side half of the dedup-vs-GC gate. An adopted chunk was
+	// an orphan in THIS repo until a manifest from this bundle claimed
+	// it, and gc --apply computes its delete list from a reference
+	// snapshot that can predate that manifest: a sweep running
+	// concurrently with the import can delete the chunk after we
+	// adopted it. The backup runner, the walsink and replicate all
+	// close their side of this race by re-checking adopted chunks at
+	// commit time; import is a committer too. The tar has been
+	// consumed, so a vanished chunk cannot be rewritten here — instead
+	// FAIL LOUDLY naming it. The remedy is simply re-running the
+	// import: it is idempotent, the manifests are already in place,
+	// and the re-run finds the chunk absent and writes it for real.
+	var swept []string
+	for _, key := range adoptedChunks {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if _, err := sp.Stat(ctx, key); err != nil && isNotFound(err) {
+			swept = append(swept, key)
+		}
+	}
+	if len(swept) > 0 {
+		return nil, fmt.Errorf("bundle: %d chunk(s) this import adopted (already present, not rewritten) "+
+			"vanished before the import finished — a concurrent `repo gc --apply` swept them: %s; "+
+			"re-run the import: it is idempotent, and the re-run will write the missing chunks for real "+
+			"(their manifests are now in place, so gc can no longer treat them as orphans)",
+			len(swept), strings.Join(swept, ", "))
 	}
 	return &bm, nil
 }
@@ -541,23 +575,33 @@ func copyChunk(ctx context.Context, sp storage.StoragePlugin, tw *tar.Writer, ke
 // the API level, we Stat first and skip on hit.  Tolerates a
 // race where the same key is written twice concurrently —
 // chunks are content-addressed so a duplicate write is safe.
-func putIfNotExists(ctx context.Context, sp storage.StoragePlugin, key string, r io.Reader) error {
+// putIfNotExists writes key idempotently and reports whether the
+// object was ADOPTED — already present, so this import is trusting
+// bytes it did not write. Adopted chunks matter to the import gate
+// below: until the importing manifest is visible to a gc reference
+// walk, a pre-existing chunk is an orphan with an OLD mtime, which is
+// exactly what `repo gc --apply` sweeps (its age floor protects only
+// young writes). Same taxonomy as CAS.adopted and replicate's
+// chunkAdopted.
+func putIfNotExists(ctx context.Context, sp storage.StoragePlugin, key string, r io.Reader) (adopted bool, _ error) {
 	if _, err := sp.Stat(ctx, key); err == nil {
 		// Already present — drain the reader and skip.
 		_, _ = io.Copy(io.Discard, r)
-		return nil
+		return true, nil
 	} else if !isNotFound(err) {
-		return err
+		return false, err
 	}
 	body, err := io.ReadAll(r)
 	if err != nil {
-		return err
+		return false, err
 	}
 	_, err = sp.Put(ctx, key, strings_NewReader(string(body)), storage.PutOptions{IfNotExists: true})
 	if isAlreadyExists(err) {
-		return nil
+		// Lost the put to a concurrent writer: their bytes, not ours —
+		// adopted, as in the CAS.
+		return true, nil
 	}
-	return err
+	return false, err
 }
 
 // isNotFound checks the Storage plugin's "key absent" error
