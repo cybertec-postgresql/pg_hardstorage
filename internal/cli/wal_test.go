@@ -452,7 +452,12 @@ func TestSleepBackoff_ZeroDurationDoesNotBlock(t *testing.T) {
 	if !got {
 		t.Error("sleepBackoff(ctx, 0) returned false on healthy ctx")
 	}
-	if time.Since(start) > 100*time.Millisecond {
+	// 2s, not 100ms: the property is "does not block" — the failure
+	// this catches is sleeping a real backoff (seconds). A saturated
+	// stress box can deschedule a goroutine past 100ms around a no-op
+	// call, which is how soak 24 taught us that tight wall-clock
+	// budgets in shared phases are flake bait, not assertions.
+	if time.Since(start) > 2*time.Second {
 		t.Error("sleepBackoff(ctx, 0) blocked unexpectedly")
 	}
 }

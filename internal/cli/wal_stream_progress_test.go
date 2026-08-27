@@ -253,8 +253,13 @@ func TestWalStreamProgressTicker_StopBlocksUntilGoroutineExits(t *testing.T) {
 	// waiting for the next tick).
 	stopStart := time.Now()
 	tk.Stop()
-	if elapsed := time.Since(stopStart); elapsed > 100*time.Millisecond {
-		t.Errorf("Stop took %s, expected <100ms", elapsed)
+	// 2s, not 100ms: what this catches is Stop waiting on the NEXT
+	// TICK (or deadlocking) instead of short-circuiting the select —
+	// failures measured in the ticker interval, not milliseconds. On
+	// a loaded stress box the goroutine may simply not be scheduled
+	// for >100ms after the close; that is the machine, not the code.
+	if elapsed := time.Since(stopStart); elapsed > 2*time.Second {
+		t.Errorf("Stop took %s, expected prompt short-circuit", elapsed)
 	}
 }
 
