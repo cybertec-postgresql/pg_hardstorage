@@ -57,12 +57,12 @@ func TestHeal_CannotDetectACorruptReplica(t *testing.T) {
 	dst, replica := twoRepos(t)
 
 	body := []byte("the-original-chunk-bytes")
-	h := putChunk(t, replica, body)
+	h := putChunk(t, replica, env(body))
 
 	// Corrupt both sides: the replica with one pattern, the local copy
 	// with another, so the heal genuinely rewrites the local bytes.
-	corruptChunkAt(t, replica, h, []byte("REPLICA-IS-ALSO-CORRUPT"))
-	corruptChunkAt(t, dst, h, []byte("locally-corrupt-differently"))
+	corruptChunkAt(t, replica, h, env([]byte("REPLICA-IS-ALSO-CORRUPT")))
+	corruptChunkAt(t, dst, h, env([]byte("locally-corrupt-differently")))
 
 	res, err := repo.Heal(context.Background(), dst, replica, []repo.Hash{h}, repo.HealOptions{})
 	if err != nil {
@@ -70,7 +70,7 @@ func TestHeal_CannotDetectACorruptReplica(t *testing.T) {
 	}
 
 	got := readChunkBytes(t, dst, h)
-	if bytes.Equal(got, body) {
+	if bytes.Equal(got, env(body)) {
 		t.Fatalf("the chunk came back correct, which this test's premise says is impossible: " +
 			"both copies were corrupted, so there was no good source to heal from. The " +
 			"fixture is wrong and the assertion below would be meaningless.")
@@ -103,9 +103,9 @@ func TestHeal_CannotDetectACorruptReplica(t *testing.T) {
 func TestHeal_PostWriteVerifyComparesTheWriteAgainstItself(t *testing.T) {
 	dst, replica := twoRepos(t)
 	body := []byte("original")
-	h := putChunk(t, replica, body)
-	corruptChunkAt(t, replica, h, []byte("garbage-from-the-replica"))
-	corruptChunkAt(t, dst, h, []byte("garbage-local"))
+	h := putChunk(t, replica, env(body))
+	corruptChunkAt(t, replica, h, env([]byte("garbage-from-the-replica")))
+	corruptChunkAt(t, dst, h, env([]byte("garbage-local")))
 
 	res, err := repo.Heal(context.Background(), dst, replica, []repo.Hash{h},
 		repo.HealOptions{SkipVerify: false})
@@ -116,7 +116,7 @@ func TestHeal_PostWriteVerifyComparesTheWriteAgainstItself(t *testing.T) {
 		t.Errorf("Healed=%d with post-write verify ON; the check compares the readback "+
 			"against the replica's bytes, so garbage in, garbage verified", res.Healed)
 	}
-	if got := readChunkBytes(t, dst, h); !bytes.Equal(got, []byte("garbage-from-the-replica")) {
+	if got := readChunkBytes(t, dst, h); !bytes.Equal(got, env([]byte("garbage-from-the-replica"))) {
 		t.Errorf("dst holds %q; the replica's bytes should have been installed verbatim", got)
 	}
 }

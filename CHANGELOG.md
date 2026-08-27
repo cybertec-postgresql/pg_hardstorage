@@ -65,6 +65,20 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **An interrupted `repair heal` can no longer leave a chunk missing, and a
+  rotted replica can no longer "heal" a local chunk with unparseable
+  bytes.** Heal replaced a corrupt local chunk by delete-then-conditional-
+  put — the conditional put forced the delete, and a crash between the two
+  left the chunk absent, strictly worse than the corruption heal set out to
+  fix (the delete also failed outright on WORM repositories, where a
+  retention-locked chunk refuses deletion). The replacement is one atomic
+  overwrite put; a delete-counting test pins that nothing on the heal path
+  deletes, ever. Heal also now refuses replica bytes that do not parse as a
+  chunk envelope, naming the replica side in the failure — plaintext
+  verification still belongs to the key-holding layer above
+  (`verify.heal_unverified`), but installing provably-broken bytes is
+  refusable without keys, and now is.
+
 - **A backup-lease succession whose claim winner died is now diagnosable.**
   The break-claim design accepts one wedge: a reclaimer that wins the
   grant's claim and crashes before its takeover leaves every future backup

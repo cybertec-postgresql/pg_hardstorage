@@ -10,6 +10,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/compression"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
 )
 
@@ -225,6 +226,22 @@ func healOne(ctx context.Context, dst, replica storage.StoragePlugin, h Hash, op
 		}
 	}
 
+	// 3b. The replica's bytes must at least be a well-formed chunk
+	//     envelope before they are allowed to REPLACE anything. Heal
+	//     cannot verify the plaintext hash keylessly (that needs the
+	//     DEK; the read path does it on every Get), but an envelope
+	//     that does not even parse is truncation or rot at the
+	//     replica — and healing FROM it would overwrite the local
+	//     copy with provably-broken bytes while reporting success.
+	//     The failure names the replica so the operator repairs the
+	//     right side.
+	if _, _, _, perr := compression.ReadEnvelope(replicaBytes); perr != nil {
+		res.Failed++
+		recordHealFailure(res, h, fmt.Errorf("replica copy is not a valid chunk envelope (heal it first, or from a different replica): %w", perr))
+		emitProgress(opts, h, "failed")
+		return
+	}
+
 	if opts.DryRun {
 		res.Healed++
 		res.BytesCopied += int64(len(replicaBytes))
@@ -232,38 +249,33 @@ func healOne(ctx context.Context, dst, replica storage.StoragePlugin, h Hash, op
 		return
 	}
 
-	// 4. Delete the (presumably corrupt) local copy. Idempotent —
-	//    Delete on a missing key is a no-op.
-	if err := dst.Delete(ctx, chunkKey); err != nil {
-		res.Failed++
-		recordHealFailure(res, h, fmt.Errorf("delete local: %w", err))
-		emitProgress(opts, h, "failed")
-		return
-	}
-
-	// 5. Write the replica's bytes at the canonical key.
+	// 4. Replace the corrupt local copy with ONE atomic overwrite Put.
+	//    The previous shape was delete-then-Put(IfNotExists) — the
+	//    conditional put forced the delete (it would have no-op'd
+	//    against the corrupt object), and the delete opened a crash
+	//    window in which the chunk existed NOWHERE locally: corrupt
+	//    became absent, which is strictly worse (an interrupted heal
+	//    left less than it found). A plain Put is an atomic replace on
+	//    every backend (fs stages to a tmp file, fsyncs and renames;
+	//    object stores replace atomically on PUT), so there is no
+	//    window and nothing to delete — which also means healing no
+	//    longer fails outright on WORM repos where the delete of a
+	//    retention-locked chunk is refused. Concurrent heals of the
+	//    same chunk write identical replica bytes; last-writer-wins
+	//    over identical content is a no-op.
 	_, err = dst.Put(ctx, chunkKey, bytes.NewReader(replicaBytes), storage.PutOptions{
-		IfNotExists:   true, // race-safe: a concurrent heal can't double-write
 		ContentLength: int64(len(replicaBytes)),
 	})
-	switch {
-	case err == nil:
-		// good
-	case errors.Is(err, storage.ErrAlreadyExists):
-		// Race: a concurrent heal already wrote it. The bytes are
-		// the same (replica is the source of truth), so this is
-		// effectively a no-op AlreadyOK. Bump Healed anyway since
-		// we contributed to the result.
-	default:
+	if err != nil {
 		res.Failed++
 		recordHealFailure(res, h, fmt.Errorf("put local: %w", err))
 		emitProgress(opts, h, "failed")
 		return
 	}
 
-	// Re-apply the repo's WORM lock to the healed chunk. The Put above used
-	// IfNotExists, which carries no retention, so on a compliance repo the
-	// fresh chunk would otherwise be deletable. Empty mode → Compliance;
+	// Re-apply the repo's WORM lock to the healed chunk. The overwrite
+	// Put above carries no retention, so on a compliance repo the fresh
+	// chunk would otherwise be deletable. Empty mode → Compliance;
 	// non-WORM backends return ErrUnsupported, which we ignore.
 	if !opts.RetainUntil.IsZero() {
 		mode := opts.RetentionMode

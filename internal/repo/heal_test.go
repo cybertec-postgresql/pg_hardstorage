@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/compression"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage/fs"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo"
@@ -51,14 +52,24 @@ func readChunkBytes(t *testing.T, sp storage.StoragePlugin, h repo.Hash) []byte 
 
 // TestHeal_HappyPath: corrupt one chunk locally, replica still has
 // good bytes, heal restores it.
+
+// env wraps body the way every real repository stores a chunk: as a
+// chunk ENVELOPE (none-codec here). Heal now refuses to copy replica
+// bytes that do not even parse as an envelope, so fixtures that model
+// "corrupt but plausibly a chunk" must be envelope-shaped; only the
+// parse-rot test writes raw garbage on purpose.
+func env(body []byte) []byte {
+	return compression.WriteEnvelopeV1(compression.AlgoNone, body)
+}
+
 func TestHeal_HappyPath(t *testing.T) {
 	dst, replica := twoRepos(t)
 	body := []byte("hello-heal")
-	h := putChunk(t, replica, body)
+	h := putChunk(t, replica, env(body))
 
 	// Plant a CORRUPTED copy at dst (simulating bit-rot after a
 	// successful initial backup + replicate).
-	corruptChunkAt(t, dst, h, []byte("garbage-bytes-xx"))
+	corruptChunkAt(t, dst, h, env([]byte("garbage-bytes-xx")))
 
 	res, err := repo.Heal(context.Background(), dst, replica, []repo.Hash{h}, repo.HealOptions{})
 	if err != nil {
@@ -72,8 +83,8 @@ func TestHeal_HappyPath(t *testing.T) {
 	}
 	// Confirm dst now has the correct bytes.
 	got := readChunkBytes(t, dst, h)
-	if !bytes.Equal(got, body) {
-		t.Errorf("post-heal local bytes wrong: got %q want %q", got, body)
+	if !bytes.Equal(got, env(body)) {
+		t.Errorf("post-heal local bytes wrong: got %q want %q", got, env(body))
 	}
 }
 
@@ -82,9 +93,9 @@ func TestHeal_HappyPath(t *testing.T) {
 func TestHeal_AlreadyOK(t *testing.T) {
 	dst, replica := twoRepos(t)
 	body := []byte("already-clean")
-	h := putChunk(t, replica, body)
+	h := putChunk(t, replica, env(body))
 	// Plant the same bytes at dst.
-	putRaw(t, dst, repo.ChunkKey(h), body)
+	putRaw(t, dst, repo.ChunkKey(h), env(body))
 
 	res, err := repo.Heal(context.Background(), dst, replica, []repo.Hash{h}, repo.HealOptions{})
 	if err != nil {
@@ -106,7 +117,7 @@ func TestHeal_NotAtReplica(t *testing.T) {
 	h := repo.HashOf(body)
 	// Only the dst has this hash, with corrupted bytes — and the
 	// replica doesn't have it at all.
-	corruptChunkAt(t, dst, h, []byte("definitely-not-the-right-bytes"))
+	corruptChunkAt(t, dst, h, env([]byte("definitely-not-the-right-bytes")))
 
 	res, err := repo.Heal(context.Background(), dst, replica, []repo.Hash{h}, repo.HealOptions{})
 	if err != nil {
@@ -123,7 +134,7 @@ func TestHeal_NotAtReplica(t *testing.T) {
 	}
 	// Local bytes still corrupt (heal doesn't make things worse).
 	got := readChunkBytes(t, dst, h)
-	if bytes.Equal(got, body) {
+	if bytes.Equal(got, env(body)) {
 		t.Errorf("local bytes were silently restored despite NotAtReplica")
 	}
 }
@@ -132,8 +143,8 @@ func TestHeal_NotAtReplica(t *testing.T) {
 func TestHeal_DryRun(t *testing.T) {
 	dst, replica := twoRepos(t)
 	body := []byte("dry-run-payload")
-	h := putChunk(t, replica, body)
-	corruptChunkAt(t, dst, h, []byte("bad"))
+	h := putChunk(t, replica, env(body))
+	corruptChunkAt(t, dst, h, env([]byte("bad")))
 
 	res, err := repo.Heal(context.Background(), dst, replica, []repo.Hash{h},
 		repo.HealOptions{DryRun: true})
@@ -148,7 +159,7 @@ func TestHeal_DryRun(t *testing.T) {
 	}
 	// Local bytes unchanged (still corrupt).
 	got := readChunkBytes(t, dst, h)
-	if bytes.Equal(got, body) {
+	if bytes.Equal(got, env(body)) {
 		t.Errorf("dry-run wrote bytes to dst")
 	}
 }
@@ -208,7 +219,7 @@ func TestHeal_NilPlugins(t *testing.T) {
 func TestHeal_Multiple(t *testing.T) {
 	dst, replica := twoRepos(t)
 	bodyA := []byte("heal-me-A")
-	hA := putChunk(t, replica, bodyA)
+	hA := putChunk(t, replica, env(bodyA))
 	corruptChunkAt(t, dst, hA, []byte("bad-A"))
 
 	bodyB := []byte("not-at-replica-B")
@@ -236,8 +247,8 @@ func TestHeal_Multiple(t *testing.T) {
 func TestHeal_OnProgress(t *testing.T) {
 	dst, replica := twoRepos(t)
 	body := []byte("progress")
-	h := putChunk(t, replica, body)
-	corruptChunkAt(t, dst, h, []byte("bad"))
+	h := putChunk(t, replica, env(body))
+	corruptChunkAt(t, dst, h, env([]byte("bad")))
 
 	var outcomes []string
 	_, err := repo.Heal(context.Background(), dst, replica, []repo.Hash{h},
@@ -262,8 +273,8 @@ func TestHeal_OnProgress(t *testing.T) {
 func TestHeal_PostWriteVerify(t *testing.T) {
 	dst, replica := twoRepos(t)
 	body := []byte("post-write-verify")
-	h := putChunk(t, replica, body)
-	corruptChunkAt(t, dst, h, []byte("bad"))
+	h := putChunk(t, replica, env(body))
+	corruptChunkAt(t, dst, h, env([]byte("bad")))
 
 	res, err := repo.Heal(context.Background(), dst, replica, []repo.Hash{h},
 		repo.HealOptions{SkipVerify: false})
@@ -297,7 +308,7 @@ func (s *healRetentionSP) SetRetention(ctx context.Context, key string, until ti
 func TestHeal_AppliesWORMLock(t *testing.T) {
 	dst, replica := twoRepos(t)
 	body := []byte("good chunk bytes for healing")
-	h := putChunk(t, replica, body)
+	h := putChunk(t, replica, env(body))
 	// dst holds CORRUPT bytes at the same key, so heal rewrites it.
 	putRaw(t, dst, repo.ChunkKey(h), []byte("corrupt-local-copy"))
 
