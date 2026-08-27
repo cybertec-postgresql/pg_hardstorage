@@ -365,7 +365,16 @@ func isFamilyMember(path, basePath string) bool {
 // Mirrors restore.materializeFile but lives here to keep partial
 // independent of the restore package's full-restore ceremony
 // (preflight, checkpoint resumption, recovery signals).
-func materialiseOneFile(ctx context.Context, cas *repo.CAS, target string, f *backup.FileEntry) (int64, error) {
+// materialiseOneFile's returns are NAMED for the deferred Close-error
+// capture below: with unnamed returns the deferred assignment to err
+// is dead code — it mutates a local after the return values were
+// already fixed, so a Close failure reported success. The full
+// restore path (restore.materializeFile) had the same defer with
+// named returns and a comment saying exactly why; this mirror copied
+// the defer without them. Post-Sync the data is already durable, so
+// the lie was about fd bookkeeping rather than bytes — but a restore
+// path does not get to report success it did not verify.
+func materialiseOneFile(ctx context.Context, cas *repo.CAS, target string, f *backup.FileEntry) (bytesWritten int64, err error) {
 	full, err := safeJoinTarget(target, f.Path)
 	if err != nil {
 		return 0, err
@@ -377,11 +386,10 @@ func materialiseOneFile(ctx context.Context, cas *repo.CAS, target string, f *ba
 	if mode == 0 {
 		mode = 0o600
 	}
-	dst, err := os.OpenFile(full, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, mode)
-	if err != nil {
-		return 0, fmt.Errorf("open destination: %w", err)
+	dst, oerr := os.OpenFile(full, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, mode)
+	if oerr != nil {
+		return 0, fmt.Errorf("open destination: %w", oerr)
 	}
-	var bytesWritten int64
 	defer func() {
 		if cerr := dst.Close(); cerr != nil && err == nil {
 			err = fmt.Errorf("close destination: %w", cerr)
@@ -391,9 +399,9 @@ func materialiseOneFile(ctx context.Context, cas *repo.CAS, target string, f *ba
 		if err := ctx.Err(); err != nil {
 			return bytesWritten, err
 		}
-		body, err := cas.GetChunkBytes(ctx, ref.Hash)
-		if err != nil {
-			return bytesWritten, fmt.Errorf("fetch chunk %s: %w", ref.Hash, err)
+		body, gerr := cas.GetChunkBytes(ctx, ref.Hash)
+		if gerr != nil {
+			return bytesWritten, fmt.Errorf("fetch chunk %s: %w", ref.Hash, gerr)
 		}
 		if int64(len(body)) != ref.Len {
 			return bytesWritten, fmt.Errorf("chunk %s len mismatch: got %d, want %d",
@@ -411,8 +419,8 @@ func materialiseOneFile(ctx context.Context, cas *repo.CAS, target string, f *ba
 				"the manifest's chunks are out of order; refusing to write a byte-scrambled file",
 				ref.Hash, ref.Offset, bytesWritten)
 		}
-		if _, err := dst.Write(body); err != nil {
-			return bytesWritten, fmt.Errorf("write chunk %s: %w", ref.Hash, err)
+		if _, werr := dst.Write(body); werr != nil {
+			return bytesWritten, fmt.Errorf("write chunk %s: %w", ref.Hash, werr)
 		}
 		bytesWritten += int64(len(body))
 	}
@@ -420,8 +428,8 @@ func materialiseOneFile(ctx context.Context, cas *repo.CAS, target string, f *ba
 		return bytesWritten, fmt.Errorf("size mismatch: chunks total %d, manifest says %d",
 			bytesWritten, f.Size)
 	}
-	if err := dst.Sync(); err != nil {
-		return bytesWritten, fmt.Errorf("fsync: %w", err)
+	if serr := dst.Sync(); serr != nil {
+		return bytesWritten, fmt.Errorf("fsync: %w", serr)
 	}
 	return bytesWritten, nil
 }
