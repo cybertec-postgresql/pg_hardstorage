@@ -106,6 +106,7 @@ func runDoctor(cmd *cobra.Command, _ []string) error {
 		// "duration" and String() renders stdlib format.
 		drillMaxAge, _ := cmd.Flags().GetDuration("drill-max-age")
 		report.Drills, report.Issues = appendDrillChecks(cmd.Context(), cfg, drillMaxAge, report.Issues)
+		report.Issues = appendLeaseWedgeChecks(cmd.Context(), cfg, report.Issues)
 	}
 
 	// Recompute Healthy from the FINAL issue set. buildDoctorReport
@@ -1438,4 +1439,54 @@ func (b *bufWriter) printf(format string, args ...any) {
 		return
 	}
 	_, b.err = fmt.Fprintf(b.w, format, args...)
+}
+
+// appendLeaseWedgeChecks looks for wedged backup-lease successions:
+// a reclaimer won the grant's break claim and died before its
+// overwrite, so the stale lease stays on disk, the claim is consumed,
+// and every future acquire — and therefore every backup — reports
+// "backup in progress" forever with nothing saying why. The lease
+// design accepts this wedge (an auto-heal would need a second-order
+// claim protocol whose own races dwarf the problem it solves), which
+// makes surfacing it doctor's job: the operator deletes exactly the
+// named claim object, and the next acquire re-claims and recovers.
+func appendLeaseWedgeChecks(ctx context.Context, cfg *config.LoadResult, issues []doctorIssue) []doctorIssue {
+	names := make([]string, 0, len(cfg.Config.Deployments))
+	for name := range cfg.Config.Deployments {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	now := time.Now().UTC()
+	for _, name := range names {
+		dep := cfg.Config.Deployments[name]
+		if dep.Repo == "" {
+			continue
+		}
+		_, sp, err := repo.Open(ctx, dep.Repo)
+		if err != nil {
+			continue // repo.unreachable already surfaced by appendRepoChecks
+		}
+		w, ierr := backup.InspectLeaseSuccession(ctx, sp, name, now)
+		sp.Close()
+		if ierr != nil || w == nil {
+			continue // best-effort, like the other doctor probes
+		}
+		issues = append(issues, doctorIssue{
+			Severity: output.SeverityCritical,
+			Code:     "backup.lease_succession_wedged",
+			Message: fmt.Sprintf("deployment %q: backup-lease succession is wedged — %q won the "+
+				"break claim for the stale lease (owner %q, acquired %s) at %s and never completed "+
+				"the takeover; every backup of this deployment has been failing with "+
+				"\"backup in progress\" since",
+				name, w.Breaker, w.LeaseOwner,
+				w.LeaseAcquiredAt.Format(time.RFC3339), w.ClaimedAt.Format(time.RFC3339)),
+			Suggestion: &output.Suggestion{
+				Human: fmt.Sprintf("confirm no backup of %q is actually running, then delete the "+
+					"consumed break claim %q from the repository — the next acquire re-claims and "+
+					"recovers. Do NOT delete the lease object %q itself.",
+					name, w.ClaimKey, w.LeaseKey),
+			},
+		})
+	}
+	return issues
 }

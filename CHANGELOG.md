@@ -65,6 +65,16 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **A backup-lease succession whose claim winner died is now diagnosable.**
+  The break-claim design accepts one wedge: a reclaimer that wins the
+  grant's claim and crashes before its takeover leaves every future backup
+  of that deployment failing with "backup in progress", indefinitely, with
+  nothing saying why. `doctor` now detects the state (stale lease + its
+  consumed claim older than an hour) as CRITICAL `backup.lease_succession_wedged`,
+  naming the exact claim object to delete and warning against touching the
+  lease itself. `repair chunks --apply` also gained `repo gc`'s second
+  lease scan, closing its re-collect window to the same width.
+
 - **Two backups of one deployment could hold the backup lease at once.**
   The lease's succession discipline requires every overwrite of a stale
   lease to first win a grant-keyed break claim — but `Release` DELETED the

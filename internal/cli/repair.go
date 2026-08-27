@@ -911,6 +911,26 @@ func runRepairChunks(cmd *cobra.Command, repoURL string, orphans, apply bool, mi
 				return output.NewError("repair.collect_refs_failed",
 					fmt.Sprintf("repair chunks: re-collect references before delete: %v", rerr)).Wrap(rerr)
 			}
+			// Second lease scan — parity with `repo gc --apply` (its
+			// "part 3"): the scan above ran BEFORE the re-collect, and
+			// the re-collect is a full manifest walk that can take
+			// minutes on a large repository. A backup that starts
+			// during it acquires its lease after the first scan and
+			// can dedup-adopt an orphan this sweep is about to
+			// delete. Scanning again shrinks the unguarded window
+			// from the re-collect's duration to the delete loop
+			// itself; the remaining sliver is closed from the other
+			// side by the writer's commit-time adopted-chunk re-stat.
+			if live, lerr := findLiveBackupLeases(cmd.Context(), sp, time.Now().UTC()); lerr != nil {
+				return output.NewError("repair.lease_scan_failed",
+					fmt.Sprintf("repair chunks: re-scan backup leases: %v", lerr)).Wrap(lerr)
+			} else if len(live) > 0 {
+				return output.NewError("repair.live_backup_lease",
+					fmt.Sprintf("repair chunks: a backup started during the reference re-collect (lease for: %s); refusing to sweep", strings.Join(live, ", "))).
+					WithSuggestion(&output.Suggestion{
+						Human: "the in-flight backup may have deduplicated against chunks this sweep would delete — re-run after it finishes",
+					})
+			}
 			cas := casdefault.New(sp)
 			deleted := 0
 			for _, h := range hashes {
