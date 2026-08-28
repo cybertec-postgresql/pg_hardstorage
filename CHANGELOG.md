@@ -11,7 +11,7 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ## [Unreleased]
 
-## [Unreleased]
+## [1.3.1] — 2026-08-28
 
 ### Fixed
 
