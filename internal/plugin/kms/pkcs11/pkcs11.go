@@ -321,6 +321,17 @@ func (p *Provider) WrapDEK(ctx context.Context, dek []byte) ([]byte, error) {
 		if err != nil {
 			return nil, fmt.Errorf("pkcs11: aes-gcm wrap: %w", err)
 		}
+		// Store-side sanity: AES-GCM ciphertext is EXACTLY
+		// plaintext+tag. PKCS#11 middleware speaks a C buffer
+		// protocol whose classic failure is a short or empty output
+		// buffer returned without error — and a short wrap STORED
+		// here is a DEK nothing can ever unwrap: every backup under
+		// it is unrecoverable from write time on. Same store-side
+		// posture as gcpkms's CRC checks: refuse provably-broken
+		// bytes before they become the key of record.
+		if len(ct) != len(dek)+aesGCMTagLen {
+			return nil, fmt.Errorf("pkcs11: aes-gcm wrap returned %d bytes, want exactly %d (plaintext+tag) — refusing to store a wrapped DEK the token provably cannot unwrap", len(ct), len(dek)+aesGCMTagLen)
+		}
 		// Frame: IV || ciphertext+tag.
 		envelope := make([]byte, 0, aesGCMIVLen+len(ct))
 		envelope = append(envelope, iv...)
@@ -330,6 +341,12 @@ func (p *Provider) WrapDEK(ctx context.Context, dek []byte) ([]byte, error) {
 		ct, err := p.client.Encrypt(ctx, p.mechanism, p.keyLbl, nil, dek)
 		if err != nil {
 			return nil, fmt.Errorf("pkcs11: rsa-oaep wrap: %w", err)
+		}
+		// RSA ciphertext length equals the modulus size, which this
+		// layer does not know — but empty or sub-plaintext output is
+		// broken middleware under every real modulus.
+		if len(ct) <= len(dek) {
+			return nil, fmt.Errorf("pkcs11: rsa-oaep wrap returned %d bytes for a %d-byte DEK — refusing to store a wrapped DEK the token provably cannot unwrap", len(ct), len(dek))
 		}
 		return ct, nil
 	default:

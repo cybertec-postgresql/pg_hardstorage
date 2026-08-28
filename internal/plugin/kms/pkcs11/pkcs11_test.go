@@ -32,6 +32,7 @@ type fakeAESHSM struct {
 	decryptCalls int
 
 	forceEncryptErr  error
+	truncateEncrypt  bool
 	forceDecryptErr  error
 	forceDestroyErr  error
 	forceDescribeErr error
@@ -71,7 +72,13 @@ func (f *fakeAESHSM) Encrypt(_ context.Context, mech pkcs11.Mechanism, label str
 	if err != nil {
 		return nil, err
 	}
-	return gcm.Seal(nil, iv, plaintext, nil), nil
+	ct := gcm.Seal(nil, iv, plaintext, nil)
+	if f.truncateEncrypt {
+		// The classic PKCS#11 middleware failure: a short output
+		// buffer returned without error.
+		ct = ct[:len(ct)/2]
+	}
+	return ct, nil
 }
 
 func (f *fakeAESHSM) Decrypt(_ context.Context, mech pkcs11.Mechanism, label string, iv, ciphertext []byte) ([]byte, error) {
@@ -504,5 +511,24 @@ func TestBuilder_AcceptsValidMechanismFromCfg(t *testing.T) {
 	// valid value through.
 	if !strings.Contains(err.Error(), "-tags pkcs11") {
 		t.Errorf("expected stub-build refusal (mechanism gate let valid value through); got %v", err)
+	}
+}
+
+// A short wrap STORED is a DEK nothing can ever unwrap. The provider
+// must refuse it at wrap time — the store-side posture every KMS
+// backend now shares (gcpkms verifies CRCs; here the GCM length
+// identity is the contract).
+func TestWrapDEK_RefusesShortHSMOutput(t *testing.T) {
+	cli := newFakeAESHSM("db-kek")
+	cli.truncateEncrypt = true
+	p, err := pkcs11.NewWithClient(sampleKEKRef, cli)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.WrapDEK(context.Background(), make([]byte, 32)); err == nil {
+		t.Fatal("WrapDEK stored a truncated HSM output — every backup under that DEK " +
+			"would be unrecoverable from write time on")
+	} else if !strings.Contains(err.Error(), "refusing to store") {
+		t.Errorf("error should carry the store-refusal rationale: %v", err)
 	}
 }

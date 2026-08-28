@@ -15,6 +15,16 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **`pkcs11://` KEKs refuse short HSM wrap output at store time.** AES-GCM
+  ciphertext is exactly plaintext+tag, and PKCS#11 middleware's classic
+  failure is a short output buffer returned without error — which, stored
+  as the wrapped DEK, is a key nothing can ever unwrap. The GCM length
+  identity (and an emptiness bound for RSA-OAEP) is now enforced before
+  anything is stored, matching the store-side posture of the GCP CRC
+  checks. Vault Transit was audited for the same class and needs nothing:
+  its client already refuses nil/empty ciphertext, and the JSON transport
+  rejects garbled bodies wholesale.
+
 - **GCP KMS responses are now integrity-verified (CRC32C).** The GCP KMS
   API contract makes end-to-end response integrity the client's
   responsibility; `gcp-kms://` KEKs sent and checked no CRC32C fields at
