@@ -93,3 +93,36 @@ func TestMarkdown_RendererMetadata(t *testing.T) {
 		t.Error("markdown is not TTY-friendly")
 	}
 }
+
+// TestMarkdown_DocURLSchemeGated: a non-http(s) DocURL must render as
+// inline code, not a clickable link — markdown viewed in a browser
+// executes javascript:/data: link schemes (XSS). The HTML renderer
+// gates this same field; markdown must match.
+func TestMarkdown_DocURLSchemeGated(t *testing.T) {
+	for _, tc := range []struct {
+		url      string
+		wantLink bool
+	}{
+		{"https://docs/ok", true},
+		{"http://docs/ok", true},
+		{"javascript:alert(1)", false},
+		{"data:text/html,<script>alert(1)</script>", false},
+		{"file:///etc/passwd", false},
+	} {
+		r := markdown.New()
+		res := output.NewResult("x").WithError(output.NewError("c",
+			"m").WithSuggestion(&output.Suggestion{DocURL: tc.url}))
+		var buf bytes.Buffer
+		if err := r.RenderResult(&buf, res); err != nil {
+			t.Fatal(err)
+		}
+		got := buf.String()
+		isLink := strings.Contains(got, "[docs]("+tc.url+")")
+		if isLink != tc.wantLink {
+			t.Errorf("DocURL %q: rendered as link=%v, want %v\n%s", tc.url, isLink, tc.wantLink, got)
+		}
+		if !tc.wantLink && !strings.Contains(got, "docs: `"+tc.url+"`") {
+			t.Errorf("DocURL %q: unsafe scheme not rendered as inline code:\n%s", tc.url, got)
+		}
+	}
+}

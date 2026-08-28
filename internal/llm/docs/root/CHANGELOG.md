@@ -13,6 +13,15 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **Markdown renderer: `DocURL` link targets are now scheme-gated like the
+  HTML renderer's.** The markdown output emitted `[docs](<DocURL>)` with the
+  raw suggestion URL, while the HTML renderer gates the *same* field through
+  an http(s) allowlist — so markdown rendered in a browser turned a
+  `javascript:`/`data:`/`file:` DocURL into a clickable XSS/exfiltration
+  link. Non-http(s) schemes now render as inline code, matching HTML. The
+  CSV renderer's formula-injection guard and the HTML renderer's escaping
+  were audited in the same pass and are correct.
+
 - **Email audit sink: CRLF in an event field can no longer inject mail
   headers.** The `Subject` line is built from the event's Component, Op and
   deployment name and written straight into the RFC 5322 header block with

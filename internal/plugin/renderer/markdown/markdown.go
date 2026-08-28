@@ -80,7 +80,16 @@ func (r *Renderer) RenderResult(w io.Writer, res *output.Result) error {
 				fmt.Fprintf(bw, ">\n> ```sh\n> %s\n> ```\n", res.Error.Suggestion.Command)
 			}
 			if res.Error.Suggestion.DocURL != "" {
-				fmt.Fprintf(bw, ">\n> [docs](%s)\n", res.Error.Suggestion.DocURL)
+				// Scheme-gate the link target exactly as the HTML
+				// renderer does for this same field: markdown rendered
+				// in a browser turns [docs](javascript:...) or a
+				// data:/file: URL into clickable XSS. Only http(s)
+				// becomes a link; anything else renders as inline code.
+				if u := res.Error.Suggestion.DocURL; isSafeHTTPURL(u) {
+					fmt.Fprintf(bw, ">\n> [docs](%s)\n", u)
+				} else {
+					fmt.Fprintf(bw, ">\n> docs: `%s`\n", u)
+				}
 			}
 		}
 		fmt.Fprintln(bw, "")
@@ -164,4 +173,13 @@ func writeFencedJSON(w io.Writer, body any) error {
 	}
 	_, err = io.WriteString(w, "\n```\n")
 	return err
+}
+
+// isSafeHTTPURL reports whether s is an http(s) URL — the only schemes
+// safe to emit as a markdown link target, since markdown rendered in a
+// browser executes javascript:/data: link schemes. Mirrors the HTML
+// renderer's identical gate for the same Suggestion.DocURL field.
+func isSafeHTTPURL(s string) bool {
+	low := strings.ToLower(s)
+	return strings.HasPrefix(low, "http://") || strings.HasPrefix(low, "https://")
 }
