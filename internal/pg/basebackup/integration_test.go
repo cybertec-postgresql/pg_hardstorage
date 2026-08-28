@@ -12,6 +12,7 @@ package basebackup_test
 import (
 	"context"
 	"errors"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -143,24 +144,39 @@ func TestIntegration_BaseBackup_NoManifest(t *testing.T) {
 	}
 }
 
+// cancelOnDataSink cancels the context from INSIDE the first data
+// callback, so the cancellation is mid-stream BY CONSTRUCTION rather
+// than by timer. The previous shape slept 50ms and cancelled from a
+// goroutine — which lost the race on an idle machine, where a tiny
+// test backup finishes in under 50ms: the backup returned nil and the
+// test failed expecting context.Canceled. Twenty-six loaded soak runs
+// never saw it (load kept the backup slower than the timer); the
+// first quiet-machine run did. A test that needs the machine to be
+// busy is the same defect class as one that needs it to be idle.
+type cancelOnDataSink struct {
+	*countingSink
+	cancel context.CancelFunc
+	once   sync.Once
+}
+
+func (s *cancelOnDataSink) OnTablespaceData(idx int, data []byte) error {
+	s.once.Do(s.cancel)
+	return s.countingSink.OnTablespaceData(idx, data)
+}
+
 func TestIntegration_BaseBackup_CtxCancelMidStream(t *testing.T) {
 	c := connect(t)
 
-	// Cancel after 50ms. The backup is still streaming; we should see
-	// context.Canceled return promptly.
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go func() {
-		time.Sleep(50 * time.Millisecond)
-		cancel()
-	}()
+	sink := &cancelOnDataSink{countingSink: newCountingSink(), cancel: cancel}
 
 	start := time.Now()
 	_, err := basebackup.Run(ctx, c, basebackup.Options{
 		Label:    "hsctl-test-cancel",
 		Fast:     true,
 		Manifest: true,
-	}, newCountingSink())
+	}, sink)
 	elapsed := time.Since(start)
 
 	if !errors.Is(err, context.Canceled) {
