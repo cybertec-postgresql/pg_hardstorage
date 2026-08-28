@@ -6,9 +6,13 @@ name: CI
 # paid macos+windows runners for signal a release tag
 # already provides once per release. The recommended
 # developer flow is now `make ci` locally before tagging.
+# Manual-only. The tag trigger was removed after v1.3.0: the full
+# multi-PG matrix duplicated the local release gate (11 phases, all
+# 174 scenarios — the actual release qualifier) while burning hosted
+# minutes the org's spending cap then killed mid-run anyway, reporting
+# failure against commits that were 26-soaks green. Releases are gated
+# locally; run this by hand when an on-GitHub datapoint is wanted.
 on:
-  push:
-    tags: ["v*"]
   workflow_dispatch:
 
 # Cancel in-progress runs for the same ref — a force-push or rebase
