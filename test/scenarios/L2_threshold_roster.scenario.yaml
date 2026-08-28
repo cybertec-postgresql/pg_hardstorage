@@ -28,6 +28,13 @@
 # Wall-clock budget: ~10s.
 
 schema: pg_hardstorage.scenario.v1
+# This scenario shells out to psql. On the soak hosts a containerised
+# shim satisfies it; on a pristine host the honest outcome is a SKIP
+# naming the missing tool, not a failure — the coverage-e2e baseline
+# run failed here on exactly that (psql_not_found on a host with no
+# shim PATH).
+requires:
+  host_tools: [psql]
 name: L2-threshold-roster
 tier: L2
 description: |
