@@ -459,7 +459,16 @@ func (s *Sink) formatFrame(ev *output.Event) ([]byte, error) {
 		return nil, fmt.Errorf("syslog: marshal event: %w", err)
 	}
 
-	sd := fmt.Sprintf(`[pgh@32473 component=%q op=%q]`, component, op)
+	// RFC 5424 §6.3.3 mandates escaping ", \ and ] inside an
+	// SD-PARAM value. Go's %q escapes " and \ (and control chars)
+	// but NOT ] — a printable ASCII byte it passes through — so a ]
+	// in component/op would terminate this structured-data element
+	// early: malformed SD / SD injection in a security feed, the same
+	// class as the CEF header gap. Escape the three RFC characters
+	// (plus newline/CR, which %q also handled and octet-counting
+	// transports safely regardless) explicitly.
+	sd := fmt.Sprintf(`[pgh@32473 component="%s" op="%s"]`,
+		escapeSDValue(component), escapeSDValue(op))
 
 	// MSGID per RFC 5424 §6.2.7 is at most 32 PRINTUSASCII chars and
 	// is meant to identify the TYPE of message (TCPIN, TLSPIN, …),
@@ -480,6 +489,19 @@ func (s *Sink) formatFrame(ev *output.Event) ([]byte, error) {
 		return []byte(fmt.Sprintf("%d %s", len(msg), msg)), nil
 	}
 	return nil, fmt.Errorf("syslog: unknown protocol %q", s.protocol)
+}
+
+// escapeSDValue escapes an RFC 5424 SD-PARAM value: the three
+// characters the spec requires (", \, ]) plus newline/CR for feed
+// robustness. Backslash first so the later escapes' backslashes are
+// not doubled.
+func escapeSDValue(s string) string {
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	s = strings.ReplaceAll(s, `"`, `\"`)
+	s = strings.ReplaceAll(s, `]`, `\]`)
+	s = strings.ReplaceAll(s, "\n", `\n`)
+	s = strings.ReplaceAll(s, "\r", `\r`)
+	return s
 }
 
 // nilDash returns "-" for empty strings, per the 5424 NILVALUE rule.

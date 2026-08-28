@@ -527,3 +527,62 @@ func TestSyslog_TLS_RejectsBadMinVersion(t *testing.T) {
 		t.Errorf("expected min_version error; got %v", err)
 	}
 }
+
+// TestSyslog_SDValueEscapesRFC5424Chars: a ] in component/op must be
+// escaped, or it terminates the structured-data element early — SD
+// injection in a security feed. RFC 5424 §6.3.3 mandates escaping
+// ", \ and ]; Go's %q (the old impl) passed ] through.
+func TestSyslog_SDValueEscapesRFC5424Chars(t *testing.T) {
+	addr, recv := startTCPServer(t)
+	s, err := syslog.NewFromSpec(output.SinkSpec{Name: "s", Plugin: "syslog", Config: map[string]any{
+		"protocol": "tcp", "address": addr, "facility": "local6",
+		"app_name": "t", "hostname": "h", "min_severity": "info", "timeout": "2s",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Open(context.Background(), nil); err != nil {
+		t.Fatal(err)
+	}
+	// A ] and a " smuggled through op.
+	ev := output.NewEvent(output.SeverityWarning, "comp", `op] injected="x`)
+	if err := s.Emit(context.Background(), ev); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+
+	got := <-recv
+	// The raw ] must not appear inside the value unescaped: the SD
+	// element must contain exactly one closing ] (its own terminator),
+	// preceded by the escaped forms.
+	if !strings.Contains(got, `\]`) {
+		t.Errorf("] not escaped in SD value; got: %s", got)
+	}
+	if !strings.Contains(got, `\"`) {
+		t.Errorf(`" not escaped in SD value; got: %s`, got)
+	}
+	// The SD block runs from "[pgh@32473 " to the FIRST unescaped ].
+	// With correct escaping that terminator is the real one, so
+	// everything up to it is a single well-formed element — assert the
+	// injected close-bracket did not create a premature terminator by
+	// checking the op payload survives on the value side of it.
+	sdStart := strings.Index(got, "[pgh@32473 ")
+	if sdStart < 0 {
+		t.Fatalf("no SD block: %s", got)
+	}
+	// Count unescaped ] in the SD region up to the JSON body start.
+	region := got[sdStart:]
+	jsonAt := strings.Index(region, ` {`)
+	if jsonAt > 0 {
+		region = region[:jsonAt]
+	}
+	unescaped := 0
+	for i := 0; i < len(region); i++ {
+		if region[i] == ']' && (i == 0 || region[i-1] != '\\') {
+			unescaped++
+		}
+	}
+	if unescaped != 1 {
+		t.Errorf("SD element has %d unescaped ] (want exactly 1 terminator) — injection split it:\n%s", unescaped, got)
+	}
+}

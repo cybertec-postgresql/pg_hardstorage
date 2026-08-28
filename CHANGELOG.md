@@ -13,6 +13,16 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **Syslog audit sink: `]` in a structured-data value can no longer
+  terminate the SD element early.** The RFC 5424 SD-PARAM block was built
+  with Go's `%q`, which escapes `"` and `\` but not `]` — a printable byte
+  it passes through — while the spec (§6.3.3) mandates escaping all three.
+  A `]` reaching `component`/`op` closed the structured-data element
+  prematurely: malformed SD / injection in a security feed, the same class
+  as the CEF header fix. Values are now escaped per the RFC (`"`, `\`, `]`,
+  plus newline/CR). Octet-counted TCP framing already protected the frame
+  boundary; this protects the SD element within it.
+
 - **CEF audit sink: newlines in a header field can no longer split one
   event into several.** `cefHeaderEscape` escaped `\` and `|` but not
   newline/CR, while the extension escaper (correctly) did — and CEF is
