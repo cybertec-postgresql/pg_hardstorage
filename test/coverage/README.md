@@ -1,8 +1,14 @@
 # Coverage dead-corner baseline
 
 `deadcorners-baseline.txt` is the committed list of shipped functions
-with zero executions across both the package test suite and the
+with zero executions across both the package test suite — INCLUDING
+integration-tagged tests, which the release gate runs every soak and
+which are therefore legitimate witnesses — and the
 coverage-instrumented end-to-end scenario run (`make coverage-e2e`).
+The first baseline was cut without the integration tag and
+over-reported (jobs_pg and postverify, both integration-covered,
+appeared dead); a function on this list now has genuinely nothing
+anywhere that executes it.
 
 It is a **ratchet**: `make coverage-ratchet` fails if any function is
 unwitnessed now that was not on the baseline. Shrinking the list is
