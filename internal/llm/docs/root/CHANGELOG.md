@@ -11,6 +11,22 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ## [Unreleased]
 
+## [Unreleased]
+
+### Fixed
+
+- **GCP KMS responses are now integrity-verified (CRC32C).** The GCP KMS
+  API contract makes end-to-end response integrity the client's
+  responsibility; `gcp-kms://` KEKs sent and checked no CRC32C fields at
+  all, so an `Encrypt` response corrupted in transit would have been
+  stored as the wrapped DEK — making every backup under that DEK
+  unrecoverable, silently, from write time on. Requests now carry the
+  plaintext/AAD CRCs (the server rejects mismatches), and responses are
+  refused unless the server confirmed our CRCs and the returned
+  ciphertext/plaintext matches its own. Found by the dead-corner coverage
+  baseline: both cloud KMS backends had zero local execution, and the
+  omission sat exactly there.
+
 ## [1.3.0] — 2026-08-27
 
 ### Security

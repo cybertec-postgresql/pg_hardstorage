@@ -50,12 +50,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"strings"
 	"sync"
 
 	gcpkmsv1 "cloud.google.com/go/kms/apiv1"
 	kmspb "cloud.google.com/go/kms/apiv1/kmspb"
 	"google.golang.org/api/option"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/airgap"
 	stdkms "github.com/cybertec-postgresql/pg_hardstorage/internal/kms"
@@ -212,6 +214,13 @@ func (p *Provider) FIPSMode() bool { return p.fipsMode }
 // WrapDEK implements kms.Provider.  Encrypt routes to the
 // CryptoKey's primary version when no version is specified
 // in the KEKRef.
+
+// castagnoli is the CRC32C polynomial GCP KMS uses for its
+// end-to-end integrity fields.
+var castagnoli = crc32.MakeTable(crc32.Castagnoli)
+
+func crc32c(b []byte) int64 { return int64(crc32.Checksum(b, castagnoli)) }
+
 func (p *Provider) WrapDEK(ctx context.Context, dek []byte) ([]byte, error) {
 	if err := p.assertOpen(); err != nil {
 		return nil, err
@@ -222,13 +231,34 @@ func (p *Provider) WrapDEK(ctx context.Context, dek []byte) ([]byte, error) {
 		// encrypt under that exact version.
 		keyForEncrypt = p.keyName + "/cryptoKeyVersions/" + p.versionRef
 	}
+	// End-to-end integrity is the CLIENT's job in the GCP KMS API
+	// contract: the request carries the plaintext's CRC32C (the
+	// server rejects a mismatch), and the response carries both the
+	// server's confirmation that it saw our CRCs and the CRC of the
+	// ciphertext it returns. Skipping the response checks means a
+	// corrupted Encrypt response gets STORED as the wrapped DEK —
+	// and every backup under that DEK is unrecoverable, silently, at
+	// write time. Found by the dead-corner audit: this path had zero
+	// local execution, and the omission with it.
+	aad := aadBytes()
 	out, err := p.client.Encrypt(ctx, &kmspb.EncryptRequest{
-		Name:                        keyForEncrypt,
-		Plaintext:                   dek,
-		AdditionalAuthenticatedData: aadBytes(),
+		Name:                              keyForEncrypt,
+		Plaintext:                         dek,
+		AdditionalAuthenticatedData:       aad,
+		PlaintextCrc32C:                   wrapperspb.Int64(crc32c(dek)),
+		AdditionalAuthenticatedDataCrc32C: wrapperspb.Int64(crc32c(aad)),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("gcp-kms: Encrypt: %w", err)
+	}
+	if !out.GetVerifiedPlaintextCrc32C() {
+		return nil, fmt.Errorf("gcp-kms: Encrypt response integrity: server did not confirm the plaintext CRC — the request may have been corrupted in transit; refusing to store a wrapped DEK produced from it")
+	}
+	if !out.GetVerifiedAdditionalAuthenticatedDataCrc32C() {
+		return nil, fmt.Errorf("gcp-kms: Encrypt response integrity: server did not confirm the AAD CRC")
+	}
+	if out.GetCiphertextCrc32C() == nil || crc32c(out.Ciphertext) != out.GetCiphertextCrc32C().GetValue() {
+		return nil, fmt.Errorf("gcp-kms: Encrypt response integrity: ciphertext CRC mismatch — the wrapped DEK was corrupted in transit; storing it would make every backup under this DEK unrecoverable")
 	}
 	return out.Ciphertext, nil
 }
@@ -240,13 +270,23 @@ func (p *Provider) UnwrapDEK(ctx context.Context, wrapped []byte) ([]byte, error
 	if err := p.assertOpen(); err != nil {
 		return nil, err
 	}
+	aad := aadBytes()
 	out, err := p.client.Decrypt(ctx, &kmspb.DecryptRequest{
-		Name:                        p.keyName,
-		Ciphertext:                  wrapped,
-		AdditionalAuthenticatedData: aadBytes(),
+		Name:                              p.keyName,
+		Ciphertext:                        wrapped,
+		AdditionalAuthenticatedData:       aad,
+		CiphertextCrc32C:                  wrapperspb.Int64(crc32c(wrapped)),
+		AdditionalAuthenticatedDataCrc32C: wrapperspb.Int64(crc32c(aad)),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", stdkms.ErrUnwrap, err)
+	}
+	// A DEK corrupted in the response would fail loudly one layer
+	// down (every chunk's AEAD open), but failing HERE names the
+	// actual culprit instead of presenting as repository-wide
+	// corruption.
+	if out.GetPlaintextCrc32C() == nil || crc32c(out.Plaintext) != out.GetPlaintextCrc32C().GetValue() {
+		return nil, fmt.Errorf("%w: Decrypt response integrity: plaintext CRC mismatch — the DEK was corrupted in transit", stdkms.ErrUnwrap)
 	}
 	return out.Plaintext, nil
 }

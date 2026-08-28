@@ -6,7 +6,10 @@ import (
 	"strings"
 	"testing"
 
+	"hash/crc32"
+
 	kmspb "cloud.google.com/go/kms/apiv1/kmspb"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 
 	stdkms "github.com/cybertec-postgresql/pg_hardstorage/internal/kms"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/kms/gcpkms"
@@ -14,25 +17,47 @@ import (
 
 // fakeGCPKMS implements gcpkms.Client without contacting GCP.
 type fakeGCPKMS struct {
-	encryptName   string
-	encryptCipher []byte
-	decryptCipher []byte
-	decryptPlain  []byte
-	decryptErr    error
-	destroyName   string
-	destroyErr    error
-	getName       string
-	getResp       *kmspb.CryptoKey
-	closed        bool
+	encryptName         string
+	encryptCipher       []byte
+	decryptCipher       []byte
+	decryptPlain        []byte
+	decryptErr          error
+	corruptEncrypt      bool
+	unverifiedPlaintext bool
+	corruptDecrypt      bool
+	destroyName         string
+	destroyErr          error
+	getName             string
+	getResp             *kmspb.CryptoKey
+	closed              bool
 }
+
+// crc32c mirrors the provider's helper (external test package).
+var castagnoliT = crc32.MakeTable(crc32.Castagnoli)
+
+func crc32c(b []byte) int64 { return int64(crc32.Checksum(b, castagnoliT)) }
 
 func (f *fakeGCPKMS) Encrypt(_ context.Context, in *kmspb.EncryptRequest, _ ...any) (*kmspb.EncryptResponse, error) {
 	f.encryptName = in.Name
 	// Simple round-trip: prepend "ENC:" so Decrypt can verify.
-	return &kmspb.EncryptResponse{
-		Name:       in.Name,
-		Ciphertext: append([]byte("ENC:"), in.Plaintext...),
-	}, nil
+	ct := append([]byte("ENC:"), in.Plaintext...)
+	resp := &kmspb.EncryptResponse{
+		Name:                    in.Name,
+		Ciphertext:              ct,
+		CiphertextCrc32C:        wrapperspb.Int64(crc32c(ct)),
+		VerifiedPlaintextCrc32C: true,
+		VerifiedAdditionalAuthenticatedDataCrc32C: true,
+	}
+	if f.corruptEncrypt {
+		// Bytes change AFTER the CRC was computed — the in-transit
+		// corruption the client-side check exists to catch.
+		resp.Ciphertext = append([]byte{}, resp.Ciphertext...)
+		resp.Ciphertext[len(resp.Ciphertext)-1] ^= 0xFF
+	}
+	if f.unverifiedPlaintext {
+		resp.VerifiedPlaintextCrc32C = false
+	}
+	return resp, nil
 }
 func (f *fakeGCPKMS) Decrypt(_ context.Context, in *kmspb.DecryptRequest, _ ...any) (*kmspb.DecryptResponse, error) {
 	f.decryptCipher = in.Ciphertext
@@ -42,7 +67,13 @@ func (f *fakeGCPKMS) Decrypt(_ context.Context, in *kmspb.DecryptRequest, _ ...a
 	if !strings.HasPrefix(string(in.Ciphertext), "ENC:") {
 		return nil, errors.New("decrypt: not our ciphertext")
 	}
-	return &kmspb.DecryptResponse{Plaintext: in.Ciphertext[len("ENC:"):]}, nil
+	pt := in.Ciphertext[len("ENC:"):]
+	resp := &kmspb.DecryptResponse{Plaintext: pt, PlaintextCrc32C: wrapperspb.Int64(crc32c(pt))}
+	if f.corruptDecrypt {
+		resp.Plaintext = append([]byte{}, resp.Plaintext...)
+		resp.Plaintext[0] ^= 0xFF
+	}
+	return resp, nil
 }
 func (f *fakeGCPKMS) DestroyCryptoKeyVersion(_ context.Context, in *kmspb.DestroyCryptoKeyVersionRequest, _ ...any) (*kmspb.CryptoKeyVersion, error) {
 	f.destroyName = in.Name
@@ -225,5 +256,51 @@ func TestProvider_RegistryRoundTrip(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("gcp-kms not registered; schemes=%v", schemes)
+	}
+}
+
+// The CRC32C contract, both directions. GCP KMS makes response
+// integrity the CLIENT's job; before these checks existed, a wrapped
+// DEK corrupted in the Encrypt response was STORED — and every backup
+// under that DEK was unrecoverable, silently, from write time on.
+func TestWrapDEK_RefusesACorruptedEncryptResponse(t *testing.T) {
+	f := &fakeGCPKMS{corruptEncrypt: true}
+	p, err := gcpkms.NewWithClient("gcp-kms://projects/x/locations/l/keyRings/r/cryptoKeys/k", f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.WrapDEK(context.Background(), []byte("a-32-byte-dek-for-testing-only!!")); err == nil {
+		t.Fatal("WrapDEK accepted a ciphertext whose CRC does not match — storing it would " +
+			"make every backup under this DEK unrecoverable")
+	} else if !strings.Contains(err.Error(), "integrity") {
+		t.Errorf("error should name the integrity failure: %v", err)
+	}
+}
+
+func TestWrapDEK_RefusesUnverifiedPlaintextCRC(t *testing.T) {
+	f := &fakeGCPKMS{unverifiedPlaintext: true}
+	p, err := gcpkms.NewWithClient("gcp-kms://projects/x/locations/l/keyRings/r/cryptoKeys/k", f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.WrapDEK(context.Background(), []byte("a-32-byte-dek-for-testing-only!!")); err == nil {
+		t.Fatal("WrapDEK accepted a response in which the server never confirmed it saw our plaintext CRC")
+	}
+}
+
+func TestUnwrapDEK_RefusesACorruptedDecryptResponse(t *testing.T) {
+	f := &fakeGCPKMS{}
+	p, err := gcpkms.NewWithClient("gcp-kms://projects/x/locations/l/keyRings/r/cryptoKeys/k", f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrapped, err := p.WrapDEK(context.Background(), []byte("a-32-byte-dek-for-testing-only!!"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.corruptDecrypt = true
+	if _, err := p.UnwrapDEK(context.Background(), wrapped); err == nil {
+		t.Fatal("UnwrapDEK returned a DEK whose CRC does not match — it would surface one " +
+			"layer down as repository-wide AEAD failures instead of naming the transport")
 	}
 }
