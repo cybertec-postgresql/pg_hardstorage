@@ -463,19 +463,34 @@ func (s *Sink) formatSubject(ev *output.Event) string {
 	if len(subj) > maxLen {
 		subj = subj[:maxLen]
 	}
-	return subj
+	return sanitizeHeaderValue(subj)
+}
+
+// sanitizeHeaderValue defuses RFC 5322 header injection: a CR or LF in
+// a header value would let event-derived data (the Subject carries
+// Component, Op and the deployment name) inject arbitrary headers — a
+// forged Bcc, a spoofed From — or split into the body. Bare CR/LF are
+// not legal in an unfolded header value anyway; fold-continuations use
+// CRLF+WSP, which we do not emit. Collapsing both to a space is the
+// safe, lossless-enough defense a mail header wants.
+func sanitizeHeaderValue(s string) string {
+	s = strings.ReplaceAll(s, "\r", " ")
+	s = strings.ReplaceAll(s, "\n", " ")
+	return s
 }
 
 // frame assembles the RFC 5322 message: headers + blank line + body.
 // CRLFs everywhere because the SMTP DATA command is line-oriented.
 func (s *Sink) frame(subject, body string) string {
 	bw := &strings.Builder{}
-	fmt.Fprintf(bw, "From: %s\r\n", s.from)
-	fmt.Fprintf(bw, "To: %s\r\n", strings.Join(s.to, ", "))
+	fmt.Fprintf(bw, "From: %s\r\n", sanitizeHeaderValue(s.from))
+	fmt.Fprintf(bw, "To: %s\r\n", sanitizeHeaderValue(strings.Join(s.to, ", ")))
 	if len(s.cc) > 0 {
-		fmt.Fprintf(bw, "Cc: %s\r\n", strings.Join(s.cc, ", "))
+		fmt.Fprintf(bw, "Cc: %s\r\n", sanitizeHeaderValue(strings.Join(s.cc, ", ")))
 	}
-	fmt.Fprintf(bw, "Subject: %s\r\n", subject)
+	// subject is already sanitized by formatSubject; the call here is
+	// idempotent and documents that this header, too, must be clean.
+	fmt.Fprintf(bw, "Subject: %s\r\n", sanitizeHeaderValue(subject))
 	fmt.Fprintf(bw, "Date: %s\r\n", time.Now().UTC().Format(time.RFC1123Z))
 	fmt.Fprint(bw, "MIME-Version: 1.0\r\n")
 	fmt.Fprint(bw, "Content-Type: text/plain; charset=utf-8\r\n")

