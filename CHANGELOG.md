@@ -11,6 +11,19 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ## [Unreleased]
 
+### Fixed
+
+- **CEF audit sink: newlines in a header field can no longer split one
+  event into several.** `cefHeaderEscape` escaped `\` and `|` but not
+  newline/CR, while the extension escaper (correctly) did — and CEF is
+  line-oriented, so a newline reaching a header field (via an event's
+  Component/Op, which form the CEF signature and name) split one audit
+  record into multiple, i.e. event forgery / log injection in a security
+  feed. The header now escapes newline/CR to match the extension path.
+  Sibling notification sinks are JSON-encoded and escape control
+  characters by construction; CEF was the only delimited-text format
+  with manual escaping.
+
 ## [1.3.1] — 2026-08-28
 
 ### Fixed

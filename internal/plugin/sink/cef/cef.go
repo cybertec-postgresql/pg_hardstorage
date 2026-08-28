@@ -255,6 +255,16 @@ func mapSeverity(s output.Severity) int {
 func cefHeaderEscape(s string) string {
 	s = strings.ReplaceAll(s, `\`, `\\`)
 	s = strings.ReplaceAll(s, `|`, `\|`)
+	// Newlines and carriage returns MUST be escaped here even though
+	// the CEF header spec assumes header fields contain none: CEF is
+	// line-oriented (one event per line), and the header's
+	// eventClassID/eventName derive from event fields (Component, Op),
+	// so an embedded newline would split one audit event into two —
+	// event forgery / log injection in a SECURITY feed. The extension
+	// escaper already guards this; the header must match it or the
+	// weaker of the two paths defines the sink's real safety.
+	s = strings.ReplaceAll(s, "\n", `\n`)
+	s = strings.ReplaceAll(s, "\r", `\r`)
 	return s
 }
 

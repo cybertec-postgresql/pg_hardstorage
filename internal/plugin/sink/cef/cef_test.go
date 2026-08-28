@@ -171,3 +171,37 @@ func itoa(i int) string {
 	}
 	return "10"
 }
+
+// TestCEF_HeaderNewlineDoesNotSplitTheEvent: a newline reaching a
+// HEADER field (via Op → eventClassID/eventName) must be escaped, not
+// emitted raw. CEF is one-event-per-line; a raw newline splits one
+// audit record into two — event forgery in a security feed. The
+// extension path already guards this; the header must too.
+func TestCEF_HeaderNewlineDoesNotSplitTheEvent(t *testing.T) {
+	s, path := newSink(t, map[string]any{"min_severity": "info"})
+	// Op flows into both eventClassID (comp.op) and eventName (op).
+	ev := output.NewEvent(output.SeverityInfo, "comp", "op\nInjectedSecondLine|9|extra")
+	if err := s.Emit(context.Background(), ev); err != nil {
+		t.Fatalf("Emit: %v", err)
+	}
+	s.Close()
+
+	out, _ := os.ReadFile(path)
+	// Exactly one non-empty line — the injection must not have created
+	// a second record.
+	lines := 0
+	for _, ln := range strings.Split(strings.TrimRight(string(out), "\n"), "\n") {
+		if strings.TrimSpace(ln) != "" {
+			lines++
+		}
+	}
+	if lines != 1 {
+		t.Fatalf("newline in a header field split the event into %d lines:\n%s", lines, out)
+	}
+	if strings.Contains(string(out), "op\nInjected") {
+		t.Errorf("raw newline survived into the CEF header:\n%s", out)
+	}
+	if !strings.Contains(string(out), `op\nInjected`) {
+		t.Errorf("newline not escaped as \\n in the header:\n%s", out)
+	}
+}
