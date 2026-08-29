@@ -613,9 +613,26 @@ func digestFailures(r *Run) [32]byte {
 		}
 		return items[i].Reason < items[j].Reason
 	})
+	// Length-prefix every field, matching canonicalRunBytes. The
+	// previous "%s|%s|%s\n" join was ambiguous: a failure Reason is
+	// err.Error(), and Go errors are routinely multi-line (a wrapped
+	// pgx connect error carries embedded newlines), so a reason
+	// containing | or \n let two DIFFERENT failure lists hash
+	// identically — and this digest is folded into the SIGNED run
+	// bytes, so the signature would then fail to unambiguously commit
+	// to the failure list. Length-prefixing removes every delimiter
+	// and makes the encoding injective.
 	hash := sha256.New()
+	writeLP := func(f string) {
+		var lp [8]byte
+		binary.BigEndian.PutUint64(lp[:], uint64(len(f)))
+		hash.Write(lp[:])
+		hash.Write([]byte(f))
+	}
 	for _, it := range items {
-		fmt.Fprintf(hash, "%s|%s|%s\n", it.Section, it.Key, it.Reason)
+		writeLP(it.Section)
+		writeLP(it.Key)
+		writeLP(it.Reason)
 	}
 	var out [32]byte
 	hash.Sum(out[:0])

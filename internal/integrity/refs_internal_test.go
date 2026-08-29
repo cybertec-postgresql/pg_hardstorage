@@ -48,3 +48,43 @@ func TestAppendRef_FeedsDedupeIDs(t *testing.T) {
 		t.Errorf("dedupeIDs = %q; want %q", got, want)
 	}
 }
+
+// TestDigestFailures_DelimiterInjectionCannotCollide: two DIFFERENT
+// failure lists must never produce the same digest, even when a Reason
+// carries the '|'/'\n' that the old delimiter-joined encoding used as
+// field separators. err.Error() is routinely multi-line, so this is
+// reachable with real data; the digest is folded into the SIGNED run,
+// so a collision would let the signature commit to the wrong failure
+// list.
+func TestDigestFailures_DelimiterInjectionCannotCollide(t *testing.T) {
+	// List A: one chunk failure whose Reason embeds newlines/pipes
+	// that, under "%s|%s|%s\n", would reproduce the byte stream of a
+	// two-entry list.
+	runA := &Run{
+		Chunks: ChunkSection{Failures: []ChunkFailure{
+			{ChunkHash: "h1", Reason: "boom\nchunk|h2|other boom"},
+		}},
+	}
+	// List B: two distinct chunk failures whose concatenation under the
+	// old join is byte-identical to A's single entry.
+	runB := &Run{
+		Chunks: ChunkSection{Failures: []ChunkFailure{
+			{ChunkHash: "h1", Reason: "boom"},
+			{ChunkHash: "h2", Reason: "other boom"},
+		}},
+	}
+	if digestFailures(runA) == digestFailures(runB) {
+		t.Fatal("two different failure lists share a digest — the delimiter-injection " +
+			"collision is back, and the signed run no longer commits to its failure list")
+	}
+
+	// Determinism: identical input, identical digest (order-independent
+	// via the internal sort).
+	runC := &Run{Chunks: ChunkSection{Failures: []ChunkFailure{
+		{ChunkHash: "h2", Reason: "other boom"},
+		{ChunkHash: "h1", Reason: "boom"},
+	}}}
+	if digestFailures(runB) != digestFailures(runC) {
+		t.Error("digest is not stable under failure reordering")
+	}
+}
