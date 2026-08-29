@@ -552,7 +552,9 @@ func validateStrategy(s Strategy) error {
 
 // canonicalRunBytes is the byte sequence the operator's signature
 // covers.  Length-prefixed; deterministic across Go runtimes.
-func canonicalRunBytes(r *Run) []byte {
+func canonicalRunBytes(r *Run) []byte { return canonicalRunBytesWith(r, digestFailures) }
+
+func canonicalRunBytesWith(r *Run, digest func(*Run) [32]byte) []byte {
 	var buf strings.Builder
 	buf.WriteString(canonicalSig)
 	buf.WriteByte(0)
@@ -586,7 +588,7 @@ func canonicalRunBytes(r *Run) []byte {
 	// Failures are committed-to via a digest of their canonical
 	// JSON; embedding them in length-prefixed form would explode the
 	// signing input for noisy reports.
-	failureDigest := digestFailures(r)
+	failureDigest := digest(r)
 	buf.Write(failureDigest[:])
 	return []byte(buf.String())
 }
@@ -639,6 +641,38 @@ func digestFailures(r *Run) [32]byte {
 	return out
 }
 
+// digestFailuresLegacy is the pre-fix delimiter-joined digest. Kept
+// ONLY so VerifyRun can still validate integrity runs signed before
+// the length-prefix fix — the canonical format carries no version we
+// could branch on, so verification tries the current encoding first
+// and falls back to this. Never used for signing.
+func digestFailuresLegacy(r *Run) [32]byte {
+	type item struct{ Section, Key, Reason string }
+	items := make([]item, 0, len(r.Manifests.Failures)+len(r.Chunks.Failures))
+	for _, f := range r.Manifests.Failures {
+		items = append(items, item{"manifest", f.Deployment + "/" + f.BackupID, f.Reason})
+	}
+	for _, f := range r.Chunks.Failures {
+		items = append(items, item{"chunk", f.ChunkHash, f.Reason})
+	}
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].Section != items[j].Section {
+			return items[i].Section < items[j].Section
+		}
+		if items[i].Key != items[j].Key {
+			return items[i].Key < items[j].Key
+		}
+		return items[i].Reason < items[j].Reason
+	})
+	hash := sha256.New()
+	for _, it := range items {
+		fmt.Fprintf(hash, "%s|%s|%s\n", it.Section, it.Key, it.Reason)
+	}
+	var out [32]byte
+	hash.Sum(out[:0])
+	return out
+}
+
 // SignRun signs the run with the supplied signer.  Mutates
 // r.PublicKeyFingerprint + r.BodyHash + r.Signature.
 func SignRun(r *Run, signer Signer) error {
@@ -663,11 +697,6 @@ func VerifyRun(r *Run, resolver KeyResolver) error {
 	if r.Signature == "" {
 		return ErrSignatureInvalid
 	}
-	canon := canonicalRunBytes(r)
-	bodyHash := sha256.Sum256(canon)
-	if fmt.Sprintf("%x", bodyHash[:]) != r.BodyHash {
-		return fmt.Errorf("%w: body_hash drift", ErrSignatureInvalid)
-	}
 	pub, err := resolver.PublicKey(r.PublicKeyFingerprint)
 	if err != nil {
 		return fmt.Errorf("integrity: resolve public key: %w", err)
@@ -676,10 +705,20 @@ func VerifyRun(r *Run, resolver KeyResolver) error {
 	if err != nil {
 		return fmt.Errorf("integrity: decode signature: %w", err)
 	}
-	if !ed25519.Verify(pub, canon, sig) {
-		return ErrSignatureInvalid
+	// Try the current (length-prefixed) canonical form, then the
+	// legacy (delimiter-joined) one — a run signed before the digest
+	// fix still verifies, and a new run verifies on the first try. The
+	// canonical bytes carry no format version to branch on, so this
+	// two-attempt verify is how the format evolves without breaking
+	// existing signed attestations.
+	for _, digest := range []func(*Run) [32]byte{digestFailures, digestFailuresLegacy} {
+		canon := canonicalRunBytesWith(r, digest)
+		bodyHash := sha256.Sum256(canon)
+		if fmt.Sprintf("%x", bodyHash[:]) == r.BodyHash && ed25519.Verify(pub, canon, sig) {
+			return nil
+		}
 	}
-	return nil
+	return ErrSignatureInvalid
 }
 
 // ----- ID helpers -----

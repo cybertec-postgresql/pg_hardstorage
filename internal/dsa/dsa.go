@@ -409,7 +409,9 @@ func hashSubjectID(id string) string {
 // canonicalReportBytes is the byte sequence the operator's
 // signature covers.  Length-prefixed; deterministic across Go
 // runtimes; commits to every counter + the affected-backup digest.
-func canonicalReportBytes(r *Report) []byte {
+func canonicalReportBytes(r *Report) []byte { return canonicalReportBytesWith(r, digestAffected) }
+
+func canonicalReportBytesWith(r *Report, digest func(*Report) [32]byte) []byte {
 	var buf strings.Builder
 	buf.WriteString(canonicalSigInput)
 	buf.WriteByte(0)
@@ -438,13 +440,52 @@ func canonicalReportBytes(r *Report) []byte {
 	binary.Write(&buf, binary.BigEndian, int64(r.ManifestsScanned))
 	binary.Write(&buf, binary.BigEndian, int64(r.ManifestsAffected))
 	binary.Write(&buf, binary.BigEndian, int64(r.DeploymentsAffected))
-	digest := digestAffected(r)
-	buf.Write(digest[:])
+	d := digest(r)
+	buf.Write(d[:])
 	return []byte(buf.String())
 }
 
 // digestAffected hashes the affected-backup list in stable order.
 func digestAffected(r *Report) [32]byte {
+	type item struct{ Deployment, BackupID, KEKRef string }
+	items := make([]item, 0, len(r.AffectedBackups))
+	for _, ab := range r.AffectedBackups {
+		items = append(items, item{ab.Deployment, ab.BackupID, ab.KEKRef})
+	}
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].Deployment != items[j].Deployment {
+			return items[i].Deployment < items[j].Deployment
+		}
+		return items[i].BackupID < items[j].BackupID
+	})
+	// Length-prefix every field, matching canonicalReportBytes above.
+	// The "%s|%s|%s\n" join was ambiguous — a KEKRef or deployment
+	// carrying | or \n could make two DIFFERENT affected-backup lists
+	// hash identically, and this digest is folded into the SIGNED
+	// GDPR report, so the signature would fail to unambiguously commit
+	// to which backups a data-subject request touched. Same defect as
+	// integrity.digestFailures; both were cloned from one template.
+	hash := sha256.New()
+	writeLP := func(f string) {
+		var lp [8]byte
+		binary.BigEndian.PutUint64(lp[:], uint64(len(f)))
+		hash.Write(lp[:])
+		hash.Write([]byte(f))
+	}
+	for _, it := range items {
+		writeLP(it.Deployment)
+		writeLP(it.BackupID)
+		writeLP(it.KEKRef)
+	}
+	var out [32]byte
+	hash.Sum(out[:0])
+	return out
+}
+
+// digestAffectedLegacy is the pre-fix delimiter-joined digest, kept
+// only so VerifyReport can validate DSA reports signed before the
+// length-prefix fix. Never used for signing.
+func digestAffectedLegacy(r *Report) [32]byte {
 	type item struct{ Deployment, BackupID, KEKRef string }
 	items := make([]item, 0, len(r.AffectedBackups))
 	for _, ab := range r.AffectedBackups {
@@ -488,11 +529,6 @@ func VerifyReport(r *Report, resolver KeyResolver) error {
 	if r.Signature == "" {
 		return ErrSignatureInvalid
 	}
-	canon := canonicalReportBytes(r)
-	bodyHash := sha256.Sum256(canon)
-	if hex.EncodeToString(bodyHash[:]) != r.BodyHash {
-		return fmt.Errorf("%w: body_hash drift", ErrSignatureInvalid)
-	}
 	pub, err := resolver.PublicKey(r.PublicKeyFingerprint)
 	if err != nil {
 		return fmt.Errorf("dsa: resolve public key: %w", err)
@@ -501,10 +537,17 @@ func VerifyReport(r *Report, resolver KeyResolver) error {
 	if err != nil {
 		return fmt.Errorf("dsa: decode signature: %w", err)
 	}
-	if !ed25519.Verify(pub, canon, sig) {
-		return ErrSignatureInvalid
+	// Current (length-prefixed) form first, then legacy
+	// (delimiter-joined) — a report signed before the digest fix still
+	// verifies; a new one verifies on the first try.
+	for _, digest := range []func(*Report) [32]byte{digestAffected, digestAffectedLegacy} {
+		canon := canonicalReportBytesWith(r, digest)
+		bodyHash := sha256.Sum256(canon)
+		if hex.EncodeToString(bodyHash[:]) == r.BodyHash && ed25519.Verify(pub, canon, sig) {
+			return nil
+		}
 	}
-	return nil
+	return ErrSignatureInvalid
 }
 
 // ----- ID + fingerprint helpers -----

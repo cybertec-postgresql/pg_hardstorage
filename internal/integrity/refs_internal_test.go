@@ -9,6 +9,10 @@ package integrity
 // keeps the invariant honest.
 
 import (
+	"crypto/ed25519"
+	"crypto/sha256"
+	"encoding/base64"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -86,5 +90,52 @@ func TestDigestFailures_DelimiterInjectionCannotCollide(t *testing.T) {
 	}}}
 	if digestFailures(runB) != digestFailures(runC) {
 		t.Error("digest is not stable under failure reordering")
+	}
+}
+
+// localSigner is a package-internal Signer for these tests.
+type localSigner struct{ priv ed25519.PrivateKey }
+
+func (s localSigner) Sign(p []byte) []byte         { return ed25519.Sign(s.priv, p) }
+func (s localSigner) PublicKey() ed25519.PublicKey { return s.priv.Public().(ed25519.PublicKey) }
+
+// TestVerifyRun_AcceptsLegacyDigestSignature: a run signed BEFORE the
+// length-prefix digest fix (delimiter-joined) must still verify —
+// changing the signed bytes without a dual-verify would silently
+// invalidate every persisted integrity attestation (24-month compat).
+// New runs sign with the current digest; verify accepts either.
+func TestVerifyRun_AcceptsLegacyDigestSignature(t *testing.T) {
+	priv := ed25519.NewKeyFromSeed(make([]byte, ed25519.SeedSize))
+	pub := priv.Public().(ed25519.PublicKey)
+	signer := localSigner{priv: priv}
+	resolver := &SingleKeyResolver{Key: pub}
+
+	r := &Run{
+		Schema: SchemaRun, ID: "run-legacy", Status: "completed",
+		Strategy:   Strategy{Mode: "content-full"},
+		Deployment: "db1",
+		Chunks: ChunkSection{Failures: []ChunkFailure{
+			{ChunkHash: "h1", Reason: "boom\nwith|delims"},
+		}},
+	}
+	// Sign using the LEGACY canonical bytes, exactly as old code did.
+	canon := canonicalRunBytesWith(r, digestFailuresLegacy)
+	bh := sha256.Sum256(canon)
+	r.BodyHash = fmt.Sprintf("%x", bh[:])
+	r.PublicKeyFingerprint = publicKeyFingerprint(pub)
+	r.Signature = base64.StdEncoding.EncodeToString(ed25519.Sign(priv, canon))
+
+	if err := VerifyRun(r, resolver); err != nil {
+		t.Fatalf("a legacy-signed run must still verify after the digest fix: %v", err)
+	}
+
+	// A freshly (current-digest) signed run verifies too.
+	r2 := &Run{Schema: SchemaRun, ID: "run-new", Status: "completed",
+		Strategy: Strategy{Mode: "content-full"}, Deployment: "db1"}
+	if err := SignRun(r2, signer); err != nil {
+		t.Fatal(err)
+	}
+	if err := VerifyRun(r2, resolver); err != nil {
+		t.Fatalf("current-signed run failed to verify: %v", err)
 	}
 }
