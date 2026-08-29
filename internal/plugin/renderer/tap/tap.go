@@ -79,13 +79,14 @@ func (r *Renderer) RenderResult(w io.Writer, res *output.Result) error {
 	fmt.Fprintf(bw, "1..%d\n", len(points))
 	for i, p := range points {
 		num := i + 1
+		desc := sanitizeTAPDesc(p.Description)
 		if p.Failed {
-			fmt.Fprintf(bw, "not ok %d - %s\n", num, p.Description)
+			fmt.Fprintf(bw, "not ok %d - %s\n", num, desc)
 			if p.Diagnostic != nil {
 				writeYAMLBlock(bw, p.Diagnostic)
 			}
 		} else {
-			fmt.Fprintf(bw, "ok %d - %s\n", num, p.Description)
+			fmt.Fprintf(bw, "ok %d - %s\n", num, desc)
 		}
 	}
 	_, err := io.WriteString(w, bw.String())
@@ -108,13 +109,25 @@ func (r *Renderer) RenderEvent(w io.Writer, ev *output.Event) error {
 	// Streaming TAP doesn't carry a numbered plan; we use 1 as a
 	// stable index per line so consumers can still parse it.  prove
 	// + jenkins TAP plugin both accept this.
-	if _, err := fmt.Fprintf(w, "%s 1 - [%s] %s\n", verb, ev.SeverityName, desc); err != nil {
+	if _, err := fmt.Fprintf(w, "%s 1 - [%s] %s\n", verb, ev.SeverityName, sanitizeTAPDesc(desc)); err != nil {
 		return err
 	}
 	if failed && ev.Body != nil {
 		writeYAMLBlock(w, eventBodyToMap(ev))
 	}
 	return nil
+}
+
+// sanitizeTAPDesc keeps a TAP test-point description on ONE line. TAP
+// is line-oriented — one "ok/not ok N - desc" per line — and a CR/LF
+// in the description (which derives from an event's Op/Component)
+// would split it into extra lines: injected test points that corrupt
+// the pass/fail count a harness reconciles against the "1..N" plan.
+// Structurally illegal in TAP regardless; collapse to a space.
+func sanitizeTAPDesc(s string) string {
+	s = strings.ReplaceAll(s, "\r", " ")
+	s = strings.ReplaceAll(s, "\n", " ")
+	return s
 }
 
 // ----- helpers -----

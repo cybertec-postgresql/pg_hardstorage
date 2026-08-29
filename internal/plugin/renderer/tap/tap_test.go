@@ -236,3 +236,34 @@ func firstLine(s string) string {
 	}
 	return s
 }
+
+// TestTAP_EventDescriptionCannotInjectLines: a newline in the event's
+// Op (which becomes the TAP description) must not split the "not ok 1
+// - ..." line into extra test-point lines — that would inject fake
+// results and corrupt the count a TAP harness reconciles.
+func TestTAP_EventDescriptionCannotInjectLines(t *testing.T) {
+	var buf bytes.Buffer
+	ev := output.NewEvent(output.SeverityError, "comp", "op\nok 99 - INJECTED\nnot ok 98 - INJECTED")
+	if err := tap.New().RenderEvent(&buf, ev); err != nil {
+		t.Fatalf("RenderEvent: %v", err)
+	}
+	out := buf.String()
+	// Exactly one line begins with ok/not ok.
+	pointLines := 0
+	for _, ln := range strings.Split(strings.TrimRight(out, "\n"), "\n") {
+		if strings.HasPrefix(ln, "ok ") || strings.HasPrefix(ln, "not ok ") {
+			pointLines++
+		}
+	}
+	if pointLines != 1 {
+		t.Fatalf("newline in description injected TAP lines: %d test-point lines (want 1):\n%s", pointLines, out)
+	}
+	// No line may BEGIN with an injected point (the attack) — after
+	// sanitization the "ok 99 ..." text survives only as mid-line
+	// description content on the single real line.
+	for _, ln := range strings.Split(out, "\n") {
+		if strings.HasPrefix(ln, "ok 99") || strings.HasPrefix(ln, "not ok 98") {
+			t.Errorf("injected TAP point reached line start:\n%s", out)
+		}
+	}
+}

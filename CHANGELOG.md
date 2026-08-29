@@ -13,6 +13,15 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **TAP renderer: a newline in a test-point description can no longer inject
+  test lines.** TAP is line-oriented (`ok/not ok N - desc`), and the
+  description derives from an event's Op/Component; a CR/LF in it split one
+  point into several, injecting fake `ok`/`not ok` lines that corrupt the
+  pass/fail count a CI harness reconciles against the `1..N` plan.
+  Descriptions are now kept to one line (CR/LF → space). The JUnit renderer,
+  audited alongside, is safe by construction (`encoding/xml` escapes both
+  the `message` attribute and `,chardata` body).
+
 - **Markdown renderer: `DocURL` link targets are now scheme-gated like the
   HTML renderer's.** The markdown output emitted `[docs](<DocURL>)` with the
   raw suggestion URL, while the HTML renderer gates the *same* field through
