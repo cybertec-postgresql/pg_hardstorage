@@ -9,6 +9,23 @@ on-disk and on-the-wire schema (backup manifests, configuration, output JSON,
 and the on-disk chunk envelope): an agent built against a given schema version
 keeps reading that version for at least 24 months after a successor lands.
 
+## [Unreleased]
+
+### Fixed
+
+- **`azure-kv://` KEKs validate what the vault returns before storing it.**
+  `WrapDEK` stored `resp.Result` unconditionally, so an empty or truncated
+  vault response would have become the stored wrapped DEK — making every
+  backup under it unrecoverable, silently, from write time on. Wrap output
+  no longer than the plaintext is now refused, and `UnwrapDEK` requires a
+  full-length DEK so a bad vault response is named directly instead of
+  surfacing as repository-wide decryption failures. Completes the
+  store-side posture already applied to the GCP (CRC32C) and PKCS#11
+  (length identity) backends; AWS needs none (its SDK contract does not
+  delegate response integrity to the client). The package's round-trip
+  fixture also used a 30-byte "32-byte" DEK, which is why the missing
+  length check went unnoticed — corrected to a real 32-byte key.
+
 ## [1.3.3] — 2026-08-30
 
 ### Fixed

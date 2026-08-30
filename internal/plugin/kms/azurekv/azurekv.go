@@ -63,6 +63,7 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/security/keyvault/azkeys"
 
 	stdkms "github.com/cybertec-postgresql/pg_hardstorage/internal/kms"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/encryption"
 )
 
 // Scheme is the KEKRef scheme this provider claims.  Stable
@@ -281,6 +282,18 @@ func (p *Provider) WrapDEK(ctx context.Context, dek []byte) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("azure-kv: WrapKey: %w", err)
 	}
+	// Store-side sanity, same posture as the gcpkms CRC checks and the
+	// pkcs11 length identity: what we return here BECOMES the stored
+	// wrapped DEK, and a DEK that cannot be unwrapped makes every
+	// backup under it unrecoverable — silently, from write time. The
+	// Azure SDK returns resp.Result without guaranteeing it is
+	// populated on every partial/odd response, so refuse output that
+	// is provably not a wrap: empty, or no longer than the plaintext
+	// it supposedly encrypted (every supported algorithm — RSA-OAEP
+	// and AES key-wrap alike — expands).
+	if len(wrapped) <= len(dek) {
+		return nil, fmt.Errorf("azure-kv: WrapKey returned %d bytes for a %d-byte DEK — refusing to store a wrapped DEK the vault provably cannot unwrap", len(wrapped), len(dek))
+	}
 	return wrapped, nil
 }
 
@@ -292,6 +305,12 @@ func (p *Provider) UnwrapDEK(ctx context.Context, wrapped []byte) ([]byte, error
 	plain, err := p.client.Unwrap(ctx, p.versionRef, p.wrapAlg, wrapped)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", stdkms.ErrUnwrap, err)
+	}
+	// A truncated/empty unwrap would surface one layer down as
+	// repository-wide AEAD failures; failing here names the actual
+	// culprit (the vault response) instead.
+	if len(plain) != encryption.KeyLen {
+		return nil, fmt.Errorf("%w: UnwrapKey returned %d bytes, want a %d-byte DEK", stdkms.ErrUnwrap, len(plain), encryption.KeyLen)
 	}
 	return plain, nil
 }

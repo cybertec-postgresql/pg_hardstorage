@@ -13,24 +13,31 @@ import (
 // fakeAzureKV implements azurekv.Client without contacting
 // the cloud.  Wrap prepends "AZ:"; Unwrap strips it.
 type fakeAzureKV struct {
-	wrapVersion   string
-	wrapAlg       string
-	wrapCipher    []byte
-	unwrapVersion string
-	unwrapAlg     string
-	unwrapCipher  []byte
-	unwrapPlain   []byte
-	unwrapErr     error
-	deleted       bool
-	deleteErr     error
-	describeBody  map[string]any
-	closed        bool
+	wrapVersion    string
+	wrapAlg        string
+	wrapCipher     []byte
+	unwrapVersion  string
+	unwrapAlg      string
+	unwrapCipher   []byte
+	unwrapPlain    []byte
+	unwrapErr      error
+	truncateWrap   bool
+	truncateUnwrap bool
+	deleted        bool
+	deleteErr      error
+	describeBody   map[string]any
+	closed         bool
 }
 
 func (f *fakeAzureKV) Wrap(_ context.Context, version, alg string, dek []byte) ([]byte, error) {
 	f.wrapVersion = version
 	f.wrapAlg = alg
 	out := append([]byte("AZ:"), dek...)
+	if f.truncateWrap {
+		// The vault returned an empty/short Result — the shape a
+		// partial or odd SDK response takes.
+		out = nil
+	}
 	f.wrapCipher = out
 	return out, nil
 }
@@ -45,7 +52,11 @@ func (f *fakeAzureKV) Unwrap(_ context.Context, version, alg string, ct []byte) 
 	if !strings.HasPrefix(string(ct), "AZ:") {
 		return nil, errors.New("unwrap: not our ciphertext")
 	}
-	return ct[len("AZ:"):], nil
+	plain := ct[len("AZ:"):]
+	if f.truncateUnwrap {
+		plain = plain[:len(plain)/2]
+	}
+	return plain, nil
 }
 
 func (f *fakeAzureKV) Delete(_ context.Context) error {
@@ -73,7 +84,7 @@ func TestProvider_WrapUnwrapRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewWithClient: %v", err)
 	}
-	dek := []byte("32-byte-aes-key-padded-here-OK")
+	dek := []byte("32-byte-aes-key-padded-here--32b") // exactly 32 bytes
 	wrapped, err := p.WrapDEK(context.Background(), dek)
 	if err != nil {
 		t.Fatalf("WrapDEK: %v", err)
@@ -230,5 +241,43 @@ func TestProvider_RegistryRoundTrip(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("azure-kv not registered; schemes=%v", schemes)
+	}
+}
+
+// TestWrapDEK_RefusesUnusableVaultOutput: what WrapDEK returns BECOMES
+// the stored wrapped DEK, so output the vault provably cannot unwrap
+// (empty / no longer than the plaintext) must be refused at wrap time
+// rather than stored — every backup under an unusable DEK is
+// unrecoverable, silently, from write time on. Same store-side posture
+// as the gcpkms CRC checks and the pkcs11 length identity.
+func TestWrapDEK_RefusesUnusableVaultOutput(t *testing.T) {
+	cli := &fakeAzureKV{truncateWrap: true}
+	p, err := azurekv.NewWithClient(sampleKeyRef, cli)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.WrapDEK(context.Background(), make([]byte, 32)); err == nil {
+		t.Fatal("WrapDEK stored an empty vault result — the DEK would be unrecoverable")
+	} else if !strings.Contains(err.Error(), "refusing to store") {
+		t.Errorf("error should carry the store-refusal rationale: %v", err)
+	}
+}
+
+// TestUnwrapDEK_RefusesWrongLengthDEK: a truncated unwrap would surface
+// one layer down as repository-wide AEAD failures; failing here names
+// the vault response as the culprit.
+func TestUnwrapDEK_RefusesWrongLengthDEK(t *testing.T) {
+	cli := &fakeAzureKV{}
+	p, err := azurekv.NewWithClient(sampleKeyRef, cli)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrapped, err := p.WrapDEK(context.Background(), make([]byte, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cli.truncateUnwrap = true
+	if _, err := p.UnwrapDEK(context.Background(), wrapped); err == nil {
+		t.Fatal("UnwrapDEK returned a short DEK instead of naming the bad vault response")
 	}
 }
