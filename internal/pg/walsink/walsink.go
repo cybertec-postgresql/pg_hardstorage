@@ -80,7 +80,6 @@ package walsink
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
 	"errors"
 	"fmt"
 	"runtime"
@@ -1020,19 +1019,4 @@ func (s *Sink) commitManifest(ctx context.Context, m *SegmentManifest) error {
 		s.cas.ForgetAdopted(ref.Hash)
 	}
 	return nil
-}
-
-// randSuffix returns a short hex suffix for tmp-file names so
-// concurrent commits (rare here, but possible if multiple agents ever
-// stream the same slot) don't collide on the staging slot.
-func randSuffix() string {
-	var b [8]byte
-	_, _ = rand.Read(b[:])
-	const hex = "0123456789abcdef"
-	out := make([]byte, len(b)*2)
-	for i, c := range b {
-		out[i*2] = hex[c>>4]
-		out[i*2+1] = hex[c&0xf]
-	}
-	return string(out)
 }

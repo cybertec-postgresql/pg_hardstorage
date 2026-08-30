@@ -2248,18 +2248,3 @@ var ErrAlreadyCommitted = errors.New("backup: manifest already committed")
 // (e.g. an undelete operation) should read the body directly via the
 // underlying StoragePlugin.
 var ErrTombstoned = errors.New("backup: manifest tombstoned (soft-deleted)")
-
-// randSuffix returns a short random hex suffix for tmp-file names so
-// concurrent commits don't collide. Using crypto/rand keeps init() free
-// of seed-management concerns; 8 random bytes (16 hex chars) is plenty.
-func randSuffix() string {
-	var b [8]byte
-	_, _ = readRand(b[:])
-	const hex = "0123456789abcdef"
-	out := make([]byte, len(b)*2)
-	for i, c := range b {
-		out[i*2] = hex[c>>4]
-		out[i*2+1] = hex[c&0xf]
-	}
-	return string(out)
-}

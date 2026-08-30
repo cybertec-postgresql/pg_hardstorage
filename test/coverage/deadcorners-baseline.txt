@@ -10,8 +10,6 @@ github.com/cybertec-postgresql/pg_hardstorage/internal/backup/manifest_store.go:
 github.com/cybertec-postgresql/pg_hardstorage/internal/backup/manifest_store.go:1976: Error
 github.com/cybertec-postgresql/pg_hardstorage/internal/backup/manifest_store.go:2008: Error
 github.com/cybertec-postgresql/pg_hardstorage/internal/backup/manifest_store.go:2159: Error
-github.com/cybertec-postgresql/pg_hardstorage/internal/backup/manifest_store.go:2255: randSuffix
-github.com/cybertec-postgresql/pg_hardstorage/internal/backup/rand.go:9: readRand
 github.com/cybertec-postgresql/pg_hardstorage/internal/backup/runner/runner.go:1133: base64Decode
 github.com/cybertec-postgresql/pg_hardstorage/internal/backup/tarsink/tarsink.go:153: WithChunkerFactory
 github.com/cybertec-postgresql/pg_hardstorage/internal/backup/verifybackup/verifybackup.go:295: Reset
@@ -228,7 +226,6 @@ github.com/cybertec-postgresql/pg_hardstorage/internal/patroni/client.go:67: Wit
 github.com/cybertec-postgresql/pg_hardstorage/internal/patroni/follower.go:283: probeSystemIDHTTP
 github.com/cybertec-postgresql/pg_hardstorage/internal/patroni/follower.go:381: String
 github.com/cybertec-postgresql/pg_hardstorage/internal/patroni/follower.go:389: String
-github.com/cybertec-postgresql/pg_hardstorage/internal/pg/walsink/walsink.go:1028: randSuffix
 github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/compression/none/none.go:12: Name
 github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/compression/zstd/zstd.go:70: Name
 github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/external/protocol.go:473: Get
