@@ -1051,14 +1051,53 @@ func mergeDeployment(existing, overlay DeploymentConfig) DeploymentConfig {
 	if overlay.Schedule.AuditAnchor.Every != "" || overlay.Schedule.AuditAnchor.DailyAt != "" || overlay.Schedule.AuditAnchor.At != "" {
 		existing.Schedule.AuditAnchor = overlay.Schedule.AuditAnchor
 	}
-	if overlay.Retention != (RetentionConfig{}) {
-		existing.Retention = overlay.Retention
+	// Retention/TDE/SLO merge FIELD-BY-FIELD, not wholesale — the same
+	// rule (and the same reason) as the Drill block above. A drop-in
+	// that overrides ONE retention dimension must not zero the others:
+	// under wholesale replace, `retention: {keep_monthly: 60}` set
+	// daily/weekly/yearly to 0, which the agent's defaultIfZero then
+	// silently reverts to hardcoded defaults — so a base keep_daily:30
+	// became 7 and dailies 8-30 pruned early. (This is the exact
+	// partial-override case the block's own history cites; wholesale
+	// replace fixed "dropped entirely" but not "partial loses base".)
+	// Zero means "inherit" throughout this system — the config layer
+	// treats 0 as "use default", so no field can legitimately mean
+	// "keep zero", making override-if-nonzero correct.
+	if overlay.Retention.Policy != "" {
+		existing.Retention.Policy = overlay.Retention.Policy
 	}
-	if overlay.TDE != (TDEConfig{}) {
-		existing.TDE = overlay.TDE
+	if overlay.Retention.KeepDaily != 0 {
+		existing.Retention.KeepDaily = overlay.Retention.KeepDaily
 	}
-	if overlay.SLO != (SLOConfig{}) {
-		existing.SLO = overlay.SLO
+	if overlay.Retention.KeepWeekly != 0 {
+		existing.Retention.KeepWeekly = overlay.Retention.KeepWeekly
+	}
+	if overlay.Retention.KeepMonthly != 0 {
+		existing.Retention.KeepMonthly = overlay.Retention.KeepMonthly
+	}
+	if overlay.Retention.KeepYearly != 0 {
+		existing.Retention.KeepYearly = overlay.Retention.KeepYearly
+	}
+	if overlay.Retention.KeepFor != "" {
+		existing.Retention.KeepFor = overlay.Retention.KeepFor
+	}
+	if overlay.Retention.KeepFulls != 0 {
+		existing.Retention.KeepFulls = overlay.Retention.KeepFulls
+	}
+	if overlay.TDE.Enabled {
+		existing.TDE.Enabled = true
+	}
+	if overlay.TDE.Engine != "" {
+		existing.TDE.Engine = overlay.TDE.Engine
+	}
+	if overlay.TDE.KeyRef != "" {
+		existing.TDE.KeyRef = overlay.TDE.KeyRef
+	}
+	if overlay.SLO.RPOSeconds != 0 {
+		existing.SLO.RPOSeconds = overlay.SLO.RPOSeconds
+	}
+	if overlay.SLO.RTOSeconds != 0 {
+		existing.SLO.RTOSeconds = overlay.SLO.RTOSeconds
 	}
 	if len(overlay.Residency) > 0 {
 		existing.Residency = overlay.Residency

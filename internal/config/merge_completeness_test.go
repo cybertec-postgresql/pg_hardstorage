@@ -76,3 +76,37 @@ func TestMergeDeployment_CarriesEveryField(t *testing.T) {
 		}
 	}
 }
+
+// TestMergeDeployment_PartialRetentionPreservesBaseDimensions: a
+// conf.d drop-in that overrides ONE retention dimension must keep the
+// base's other dimensions. Under the old wholesale replace they were
+// zeroed, and the agent's defaultIfZero then silently reverted them to
+// hardcoded defaults — a base keep_daily:30 became 7, pruning dailies
+// 8-30 early. Field-by-field merge (matching the Drill block) fixes it.
+func TestMergeDeployment_PartialRetentionPreservesBaseDimensions(t *testing.T) {
+	base := DeploymentConfig{
+		Retention: RetentionConfig{
+			Policy: "gfs", KeepDaily: 30, KeepWeekly: 8, KeepMonthly: 12, KeepYearly: 5,
+		},
+		TDE: TDEConfig{Enabled: true, Engine: "pg_tde", KeyRef: "k1"},
+		SLO: SLOConfig{RPOSeconds: 300, RTOSeconds: 3600},
+	}
+	// Drop-in overrides ONLY keep_monthly, TDE KeyRef, and RPO.
+	overlay := DeploymentConfig{
+		Retention: RetentionConfig{KeepMonthly: 60},
+		TDE:       TDEConfig{KeyRef: "k2"},
+		SLO:       SLOConfig{RPOSeconds: 120},
+	}
+	got := mergeDeployment(base, overlay)
+
+	want := RetentionConfig{Policy: "gfs", KeepDaily: 30, KeepWeekly: 8, KeepMonthly: 60, KeepYearly: 5}
+	if got.Retention != want {
+		t.Errorf("retention: partial override lost base dimensions\n got: %+v\nwant: %+v", got.Retention, want)
+	}
+	if got.TDE != (TDEConfig{Enabled: true, Engine: "pg_tde", KeyRef: "k2"}) {
+		t.Errorf("TDE: partial override lost base fields: %+v", got.TDE)
+	}
+	if got.SLO != (SLOConfig{RPOSeconds: 120, RTOSeconds: 3600}) {
+		t.Errorf("SLO: partial override lost base RTO: %+v", got.SLO)
+	}
+}

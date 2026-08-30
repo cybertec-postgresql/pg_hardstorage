@@ -9,6 +9,27 @@ on-disk and on-the-wire schema (backup manifests, configuration, output JSON,
 and the on-disk chunk envelope): an agent built against a given schema version
 keeps reading that version for at least 24 months after a successor lands.
 
+## [Unreleased]
+
+### Fixed
+
+- **Signed integrity-run and DSA-report digests are now length-prefixed,
+  removing a canonical-encoding ambiguity — verification stays
+  backward-compatible.** The signed bytes folded in a failure/affected-list
+  digest that joined fields with `%s|%s|%s\n`; a field carrying `|` or `\n`
+  (an err.Error() is routinely multi-line) let two different lists hash
+  identically, so the signature did not unambiguously commit to its
+  contents. New attestations sign with a length-prefixed digest; `VerifyRun`
+  / `VerifyReport` accept either the new or the legacy encoding, so every
+  attestation signed before this release still verifies.
+- **A conf.d drop-in that overrides one retention/TDE/SLO field no longer
+  drops the others.** `mergeDeployment` replaced these structs wholesale, so
+  `retention: {keep_monthly: 60}` in an overlay zeroed the base's
+  daily/weekly/yearly dimensions — which the agent's `defaultIfZero` then
+  reverted to hardcoded defaults, silently weakening a base `keep_daily: 30`
+  to 7 and pruning backups early. They now merge field-by-field, matching
+  the drill-settings block that already did so for the same reason.
+
 ## [1.3.2] — 2026-08-29
 
 ### Fixed
