@@ -154,21 +154,28 @@ type keyedRecord struct {
 // newest-first by DetectedAt. Unparseable records are skipped (see
 // List); callers needing a complete key sweep regardless of
 // parseability use listRawKeys.
-func (s *Store) listKeyed(ctx context.Context, deployment string) ([]keyedRecord, error) {
+func (s *Store) listKeyed(ctx context.Context, deployment string) ([]keyedRecord, int, error) {
 	prefix := prefixFor(deployment)
 	var out []keyedRecord
+	unreadable := 0
 	for info, err := range s.sp.List(ctx, prefix) {
 		if err != nil {
-			return nil, fmt.Errorf("gapstate: list %s: %w", prefix, err)
+			return nil, 0, fmt.Errorf("gapstate: list %s: %w", prefix, err)
 		}
 		if !strings.HasSuffix(info.Key, ".json") {
 			continue
 		}
 		rec, err := s.read(ctx, info.Key)
 		if err != nil {
-			// One corrupt record shouldn't lock out the rest.
-			// Skip; doctor will surface the corruption via the
-			// audit-chain integrity check separately.
+			// One corrupt record must not lock out the rest — but it
+			// must not vanish either. Skipping silently made a
+			// recorded WAL gap invisible to preflightWALGap, the guard
+			// that refuses a PITR crossing a gap; the restore then
+			// proceeds, PG ends recovery at the hole, promotes, and
+			// reports success arbitrarily far behind. The count goes
+			// back to callers so a safety decision can distinguish
+			// "no gaps" from "no gaps I could read".
+			unreadable++
 			continue
 		}
 		out = append(out, keyedRecord{key: info.Key, rec: rec})
@@ -177,7 +184,7 @@ func (s *Store) listKeyed(ctx context.Context, deployment string) ([]keyedRecord
 	sort.SliceStable(out, func(i, j int) bool {
 		return out[i].rec.DetectedAt.After(out[j].rec.DetectedAt)
 	})
-	return out, nil
+	return out, unreadable, nil
 }
 
 // listRawKeys returns every .json gap key under the deployment
@@ -204,18 +211,34 @@ func (s *Store) listRawKeys(ctx context.Context, deployment string) ([]string, e
 // gap-record set per deployment. Practical fleets see at most
 // a handful per failover; safe for `doctor`.
 func (s *Store) List(ctx context.Context, deployment string) ([]Record, error) {
+	out, _, err := s.ListUnreadable(ctx, deployment)
+	return out, err
+}
+
+// ListUnreadable is List plus the number of gap objects under the
+// prefix whose bodies could NOT be parsed.
+//
+// Callers making a safety decision must use this rather than List. A
+// gap record that will not parse is indistinguishable from one that
+// covers the restore target: both mean "there may be a hole here".
+// List's skip-and-continue behaviour is right for display surfaces —
+// one corrupt record should not black out `wal gaps` — but for the
+// PITR pre-flight it silently converted "I cannot read this gap" into
+// "there is no gap", which is the fail-open direction on the guard
+// that exists to stop a silently truncated recovery.
+func (s *Store) ListUnreadable(ctx context.Context, deployment string) ([]Record, int, error) {
 	if deployment == "" {
-		return nil, errors.New("gapstate: empty deployment")
+		return nil, 0, errors.New("gapstate: empty deployment")
 	}
-	keyed, err := s.listKeyed(ctx, deployment)
+	keyed, unreadable, err := s.listKeyed(ctx, deployment)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	out := make([]Record, len(keyed))
 	for i, kr := range keyed {
 		out[i] = kr.rec
 	}
-	return out, nil
+	return out, unreadable, nil
 }
 
 // Latest returns the newest gap record for (deployment, tli),
@@ -278,7 +301,7 @@ func (s *Store) PurgeOrphans(ctx context.Context, deployment string, liveTimelin
 	if liveTimelines == nil || len(liveTimelines) == 0 {
 		return nil, errors.New("gapstate: PurgeOrphans requires a non-empty liveTimelines set; use PurgeAll for fleet-wipe semantics")
 	}
-	all, err := s.listKeyed(ctx, deployment)
+	all, _, err := s.listKeyed(ctx, deployment)
 	if err != nil {
 		return nil, err
 	}

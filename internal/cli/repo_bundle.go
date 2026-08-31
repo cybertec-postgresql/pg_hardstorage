@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/spf13/cobra"
 
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/fsutil"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/output"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/compression"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/compression/none"
@@ -102,6 +104,20 @@ func newRepoBundleExportCmd() *cobra.Command {
 				os.Remove(outPath)
 				return output.NewError("repo.bundle_export_failed",
 					fmt.Sprintf("repo bundle export: close %s: %v", outPath, closeErr)).Wrap(closeErr)
+			}
+			// fsync the parent directory too. Syncing the file's
+			// CONTENTS does not make its directory entry durable, so a
+			// crash right after this command reported success could
+			// leave no bundle at all — and a repo bundle is the
+			// air-gap artefact an operator creates precisely to
+			// survive losing the repository. `audit export-bundle`
+			// already does this for the same reason; this path was the
+			// odd one out. The file is committed by now, so a
+			// dir-fsync failure is surfaced without unlinking.
+			if dirErr := fsutil.SyncDir(filepath.Dir(outPath)); dirErr != nil {
+				return output.NewError("repo.bundle_export_failed",
+					fmt.Sprintf("repo bundle export: fsync parent dir of %s: %v", outPath, dirErr)).
+					Wrap(dirErr)
 			}
 			body := repoBundleExportBody{
 				OutPath:    outPath,

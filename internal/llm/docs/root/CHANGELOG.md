@@ -13,6 +13,30 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **A corrupt WAL-gap record made the PITR gap pre-flight fail open.**
+  `gapstate.List` skipped any gap object whose body would not parse and
+  returned success, so `preflightWALGap` — the guard that refuses a
+  restore whose target lands inside a known WAL gap — saw "no gap" and
+  admitted the restore. PostgreSQL cannot distinguish a hole in the
+  archive from its end, so it ends recovery at the hole, promotes, and
+  reports success arbitrarily far behind: exactly the silent-truncation
+  failure that guard exists to prevent. The skip was justified in the
+  source with "doctor will surface the corruption via the audit-chain
+  integrity check separately", which was not the case — nothing walks
+  `wal/<deployment>/gaps/` for parseability. `List` still skips (one
+  corrupt record must not black out `wal gaps`), but the new
+  `ListUnreadable` reports how many were excluded, and the restore
+  pre-flight now emits `restore.gap_state_unreadable` naming the count,
+  so an operator learns the check ran against an incomplete picture.
+
+- **`repo bundle export` did not fsync the parent directory.** The
+  bundle's contents were synced and its close error checked, but the
+  directory entry was left non-durable, so a crash immediately after the
+  command reported success could leave no bundle at all — and a repo
+  bundle is the air-gap artefact created precisely to survive losing the
+  repository. `audit export-bundle` already synced the parent for this
+  reason; this path was the odd one out.
+
 - **Two more map-ordered outputs made identical runs disagree.**
   `verify`'s `Result.Algorithm` rendered a mixed-checksum backup's
   algorithm set in map order, so the same verification reported

@@ -276,7 +276,7 @@ func preflightWALGap(ctx context.Context, sp storage.StoragePlugin, deployment, 
 		}
 	}
 
-	gaps, err := gapstate.New(sp).List(ctx, deployment)
+	gaps, unreadable, err := gapstate.New(sp).ListUnreadable(ctx, deployment)
 	if err != nil {
 		// Best-effort: surface as a warning event but proceed
 		// with the restore. The manifest already had a chance
@@ -288,6 +288,26 @@ func preflightWALGap(ctx context.Context, sp storage.StoragePlugin, deployment, 
 				WithBody(map[string]any{"error": err.Error()}))
 		}
 		return nil
+	}
+	// A gap record that will not parse used to be dropped by List
+	// without a trace, so the pre-flight below saw "no gap" and let the
+	// restore through. That is the fail-open direction on the one guard
+	// that stops a silently truncated recovery: PG cannot tell a hole
+	// from the end of the archive, so it ends recovery at the hole,
+	// promotes, and reports success arbitrarily far behind. Same
+	// posture as a List error — warn, do not block — but the operator
+	// now learns the pre-flight ran against an incomplete picture.
+	if unreadable > 0 && emit != nil {
+		emit(output.NewEvent(output.SeverityWarning, "restore", "gap_state_unreadable").
+			WithSubject(output.Subject{Deployment: deployment}).
+			WithBody(map[string]any{
+				"unreadable_records": unreadable,
+				"error": fmt.Sprintf("%d WAL-gap record(s) under wal/%s/gaps/ could not be parsed "+
+					"and were excluded from this pre-flight", unreadable, deployment),
+				"hint": "an unreadable gap record is indistinguishable from one covering this " +
+					"target; inspect with `pg_hardstorage wal gaps " + deployment +
+					"` before trusting the result, or re-run with --skip-gap-check to proceed knowingly",
+			}))
 	}
 
 	for _, g := range gaps {
