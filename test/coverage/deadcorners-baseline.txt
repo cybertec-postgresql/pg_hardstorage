@@ -318,8 +318,6 @@ github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage/faultinjec
 github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage/faultinject/faultinject.go:355: Close
 github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage/s3/s3.go:104: Region
 github.com/cybertec-postgresql/pg_hardstorage/internal/repo/cas.go:25: asArray
-github.com/cybertec-postgresql/pg_hardstorage/internal/repo/cas.go:355: WithRegistry
-github.com/cybertec-postgresql/pg_hardstorage/internal/repo/cas.go:383: WithEncryptionRegistry
 github.com/cybertec-postgresql/pg_hardstorage/internal/repo/cas.go:554: HexHash
 github.com/cybertec-postgresql/pg_hardstorage/internal/repo/replicate.go:538: bumpKeyFailed
 github.com/cybertec-postgresql/pg_hardstorage/internal/repo/walprune.go:613: recordWALPruneFailure
