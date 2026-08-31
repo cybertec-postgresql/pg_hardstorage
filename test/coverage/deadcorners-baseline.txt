@@ -308,7 +308,6 @@ github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage/azblob/azb
 github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage/s3/s3.go: Region
 github.com/cybertec-postgresql/pg_hardstorage/internal/repo/cas.go: asArray
 github.com/cybertec-postgresql/pg_hardstorage/internal/repo/cas.go: HexHash
-github.com/cybertec-postgresql/pg_hardstorage/internal/repo/replicate.go: bumpKeyFailed
 github.com/cybertec-postgresql/pg_hardstorage/internal/repo/walprune.go: recordWALPruneFailure
 github.com/cybertec-postgresql/pg_hardstorage/internal/restore/postverify/postverify.go: pgCtlMajor
 github.com/cybertec-postgresql/pg_hardstorage/internal/restore/postverify/postverify.go: pickFreePort

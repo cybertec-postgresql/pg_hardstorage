@@ -302,6 +302,16 @@ func (r repoReplicateBody) WriteText(w io.Writer) error {
 	}
 	fmt.Fprintf(bw, "  Manifests: %d copied · %d skipped · %d tombstoned · %d failed (%d considered)\n",
 		r.ManifestsCopied, r.ManifestsSkipped, r.ManifestsTombstoned, r.ManifestsFailed, r.ManifestsConsidered)
+	// Replica sidecars are reported on their own line rather than
+	// folded into ManifestsFailed: they are best-effort, so they must
+	// not read as primary-replication failures — but a destination
+	// silently missing the copies `repair manifest` recovers from is
+	// exactly the kind of degradation an operator has to be told about.
+	if r.ManifestReplicasFailed > 0 {
+		fmt.Fprintf(bw, "  ✗ Manifest replicas: %d sidecar(s) not copied — the destination lacks "+
+			"the redundant copy `repair manifest` recovers a corrupt primary from\n",
+			r.ManifestReplicasFailed)
+	}
 	fmt.Fprintf(bw, "  Chunks:    %d copied · %d skipped · %d missing · %d failed (%d considered)\n",
 		r.ChunksCopied, r.ChunksSkipped, r.ChunksMissing, r.ChunksFailed, r.ChunksConsidered)
 	if r.IncludeWAL {
@@ -312,13 +322,21 @@ func (r repoReplicateBody) WriteText(w io.Writer) error {
 	}
 	fmt.Fprintf(bw, "  Bytes copied: %s\n", humanBytes(r.BytesCopied))
 	fmt.Fprintf(bw, "  Duration:     %s\n", time.Duration(r.DurationMS)*time.Millisecond)
-	if r.ManifestsFailed == 0 && r.ChunksFailed == 0 && r.ChunksMissing == 0 {
+	if r.ManifestsFailed == 0 && r.ChunksFailed == 0 && r.ChunksMissing == 0 &&
+		r.ManifestReplicasFailed == 0 {
 		fmt.Fprintln(bw, "  ✓ replication clean")
 	} else {
 		fmt.Fprintln(bw, "  ✗ replication had findings — see JSON body for details")
 	}
 	if len(r.Failures) > 0 {
-		fmt.Fprintf(bw, "  First %d failure(s):\n", len(r.Failures))
+		total := r.ManifestsFailed + r.ChunksFailed + r.WALManifestsFailed +
+			r.WALAuxFailed + r.ManifestReplicasFailed
+		if total > len(r.Failures) {
+			fmt.Fprintf(bw, "  First %d of %d failure(s) — the rest are counted above, "+
+				"not listed:\n", len(r.Failures), total)
+		} else {
+			fmt.Fprintf(bw, "  %d failure(s):\n", len(r.Failures))
+		}
 		for _, f := range r.Failures {
 			fmt.Fprintf(bw, "    %s — %s\n", f.Key, f.Err)
 		}

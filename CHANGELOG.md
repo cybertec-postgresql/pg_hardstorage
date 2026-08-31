@@ -13,6 +13,22 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **`repo replicate` counted manifest-replica copy failures nowhere, so a
+  destination missing its entire disaster-recovery layer reported clean.**
+  Replica sidecars (`manifests/_replicas/<id>.manifest.json`) are copied
+  best-effort — a failure there is deliberately not a primary-replication
+  failure — but the failure was recorded only in the per-key `failures`
+  list, which is capped at 50. A run in which every sidecar failed
+  therefore reported `manifests_failed: 0` with 50 truncated entries,
+  and `repo replicate` printed `✓ replication clean` directly above
+  fifty failure lines, while the destination held zero manifest
+  replicas — the redundancy `repair manifest` recovers a corrupt primary
+  from. A new unbounded `manifest_replicas_failed` counter (additive;
+  existing fields keep their meaning) restores the documented posture
+  that only per-key detail is capped, and the text output now names what
+  was lost and states the true failure total instead of labelling a
+  truncated list "First 50 failure(s)".
+
 - **`approval status` no longer panics on a malformed approval record.**
   The status table abbreviated an approver's key fingerprint with an
   unguarded `KeyFingerprint[:12]`, but the Approvals slice is copied out

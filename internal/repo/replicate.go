@@ -111,6 +111,23 @@ type ReplicateResult struct {
 	ManifestsTombstoned int `json:"manifests_tombstoned"` // skipped because src tombstoned
 	ManifestsFailed     int `json:"manifests_failed"`
 
+	// ManifestReplicasFailed counts manifest REPLICA sidecars
+	// (manifests/_replicas/<id>.manifest.json) that could not be
+	// copied to dst. It is separate from ManifestsFailed on purpose:
+	// a replica copy failing is not a primary-replication failure,
+	// so it must not flip the run's headline verdict.
+	//
+	// But it does have to be COUNTED. It was not, and because the
+	// per-key Failures slice is capped at maxReplicateFailures, a run
+	// where every replica sidecar failed reported manifests_failed=0
+	// with 50 truncated failure entries — while the destination held
+	// zero manifest replicas. That is the redundancy `repair manifest`
+	// recovers a corrupt primary from; losing all of it silently is
+	// the opposite of what a replica is for. This counter is
+	// unbounded, matching the documented posture that only per-key
+	// detail is capped.
+	ManifestReplicasFailed int `json:"manifest_replicas_failed,omitempty"`
+
 	ChunksConsidered int `json:"chunks_considered"`
 	ChunksCopied     int `json:"chunks_copied"`
 	ChunksSkipped    int `json:"chunks_skipped"` // already at dst
@@ -504,7 +521,11 @@ func copyKey(ctx context.Context, src, dst storage.StoragePlugin, key string, bo
 		return true
 	default:
 		if bestEffort {
+			// Best-effort failures are not primary-replication
+			// failures, but they are still failures: count them, or
+			// they vanish entirely once Failures hits its cap.
 			recordReplicateFailure(res, key, fmt.Errorf("put dst (best-effort): %w", err))
+			res.ManifestReplicasFailed++
 			return true
 		}
 		recordReplicateFailure(res, key, fmt.Errorf("put dst: %w", err))
