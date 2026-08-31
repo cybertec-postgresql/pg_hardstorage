@@ -108,7 +108,13 @@ keeps reading that version for at least 24 months after a successor lands.
   happens — would OOM the whole sweep. `storage.ReadAllLimited` now
   lives below all of them; metadata reads are capped at 1 GiB (matching
   `backup.MaxManifestBytes`) and chunk-body reads keep their existing
-  256 MiB envelope ceiling.
+  256 MiB envelope ceiling. A follow-up pass closed six more in
+  `internal/pg/walsink` (the split-brain verification reads) and
+  `internal/audit` (events, head pointers and anchors — an oversized
+  object under `audit/` would have OOM-ed `audit verify`, the command
+  whose job is to tell an operator whether their audit log is intact);
+  the auxiliary-file read uses walsink's own documented
+  `MaxAuxiliaryFileSize` rather than the generic cap.
 
 - **`wal prune` reported "Bytes deleted" for bytes it does not delete.**
   The command removes WAL segment *manifests*; the chunks stay until
