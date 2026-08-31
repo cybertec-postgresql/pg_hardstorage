@@ -163,10 +163,28 @@ type Subject struct {
 // doesn't influence its hash) and PrevHash preserved (so tampering
 // with PrevHash invalidates the chain).
 //
-// We use json.MarshalIndent="" to keep the bytes deterministic across
-// Go versions; the encoder's key order is alphabetical for marshalled
-// structs, which gives us stable output without writing a custom
-// canonicalizer.
+// THESE BYTES ARE THE ON-DISK FORMAT. Every event ever written had its
+// hash computed over them, so anything that changes them makes `audit
+// verify` report the entire history as broken — which an operator
+// cannot distinguish from real tampering. In particular:
+//
+//   - encoding/json emits struct fields in DECLARATION ORDER (it sorts
+//     map keys, not struct fields). Reordering Event or Subject is
+//     therefore a breaking format change, not a cosmetic edit. An
+//     earlier version of this comment claimed the order was
+//     alphabetical, which made exactly that edit look safe.
+//   - Adding a field without `omitempty` rewrites the bytes of every
+//     existing event. With `omitempty` on a scalar, absent stays
+//     absent and old events re-marshal identically.
+//   - `omitempty` on Subject is INERT — Go ignores it for structs — so
+//     a subject-less event carries a literal "subject":{} and always
+//     has. Changing Subject to a pointer to "fix" that would drop
+//     those bytes and invalidate every chain on disk.
+//
+// canonical_golden_test.go pins the exact bytes and the resulting
+// hash. A change here should fail that test; if the change is
+// intended it needs a schema version bump and a dual-verify path, not
+// a new golden string.
 func canonicalForHash(ev *Event) ([]byte, error) {
 	clone := *ev
 	clone.Hash = ""
