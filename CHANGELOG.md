@@ -9,6 +9,20 @@ on-disk and on-the-wire schema (backup manifests, configuration, output JSON,
 and the on-disk chunk envelope): an agent built against a given schema version
 keeps reading that version for at least 24 months after a successor lands.
 
+## [Unreleased]
+
+### Fixed
+
+- **`repair chunks` and `repair scrub` no longer drop their hash list
+  silently.** The human-readable renderer printed the hashes only when
+  there were 50 or fewer; past that it printed none and said nothing about
+  the omission. A repository with 51 missing chunks therefore showed
+  strictly *less* than one with 50 — the count, the words "this is a real
+  corruption", and no way to tell a withheld list from an absent one. Both
+  renderers now cap at 50 and state what they held back, pointing at
+  `--json` for the full list (which always carried it). `repair scrub`'s
+  mismatch list, previously uncapped, uses the same rendering.
+
 ## [1.3.4] — 2026-08-31
 
 ### Fixed

@@ -1153,6 +1153,37 @@ type repairChunksBody struct {
 	Chunks   []string `json:"chunks,omitempty"`
 }
 
+// maxHashLines caps how many chunk hashes the human-readable renderers
+// print. The JSON body always carries the full list; text output has to
+// stay readable on a terminal.
+const maxHashLines = 50
+
+// writeHashLines prints up to maxHashLines hashes and — this is the whole
+// point — says so when it printed fewer than there are.
+//
+// The previous rendering dropped the ENTIRE list once it exceeded the cap
+// and said nothing about it, so `repair chunks --missing` against a repo
+// with 51 missing chunks showed strictly less than one with 50: the count,
+// the words "this is a real corruption", and no hashes, with no hint that
+// hashes were available. An operator at 3am has no way to tell a withheld
+// list from an absent one. A cap is fine; a silent cap is not.
+func writeHashLines(bw *strings.Builder, hashes []string) {
+	if len(hashes) == 0 {
+		return
+	}
+	fmt.Fprintln(bw, "  hashes:")
+	shown := hashes
+	if len(shown) > maxHashLines {
+		shown = shown[:maxHashLines]
+	}
+	for _, h := range shown {
+		fmt.Fprintf(bw, "    %s\n", h)
+	}
+	if n := len(hashes) - len(shown); n > 0 {
+		fmt.Fprintf(bw, "    ... +%d more (re-run with --json for the full list)\n", n)
+	}
+}
+
 // WriteText renders the orphan / missing chunk findings as human-readable
 // text to w.
 func (b repairChunksBody) WriteText(w io.Writer) error {
@@ -1172,12 +1203,7 @@ func (b repairChunksBody) WriteText(w io.Writer) error {
 			fmt.Fprintln(bw, "  ✗ this is a real corruption — restores referencing these chunks will fail")
 		}
 	}
-	if len(b.Chunks) > 0 && len(b.Chunks) <= 50 {
-		fmt.Fprintln(bw, "  hashes:")
-		for _, c := range b.Chunks {
-			fmt.Fprintf(bw, "    %s\n", c)
-		}
-	}
+	writeHashLines(bw, b.Chunks)
 	_, err := io.WriteString(w, strings.TrimRight(bw.String(), "\n"))
 	return err
 }
@@ -1208,9 +1234,7 @@ func (b repairScrubBody) WriteText(w io.Writer) error {
 		fmt.Fprintln(bw, "  ✓ no integrity failures")
 	} else {
 		fmt.Fprintf(bw, "  ✗ %d chunk(s) failed integrity check:\n", b.MismatchCount)
-		for _, h := range b.Mismatches {
-			fmt.Fprintf(bw, "    %s\n", h)
-		}
+		writeHashLines(bw, b.Mismatches)
 		if b.HealResult != nil {
 			fmt.Fprintf(bw, "  heal — replica %s\n", b.ReplicaURL)
 			fmt.Fprintf(bw, "    Healed:         %d\n", b.HealResult.Healed)
