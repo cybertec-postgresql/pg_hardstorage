@@ -121,6 +121,15 @@ const defaultInactivityTimeout = 90 * time.Second
 // run on Run's goroutine — they must not block indefinitely.
 type Sink interface {
 	OnTablespaceStart(idx int, info TablespaceInfo) error
+	// OnTablespaceData receives one frame of archive bytes.
+	//
+	// `data` ALIASES the protocol read buffer and is only valid for the
+	// duration of this call — pgproto3 documents its message as "only
+	// valid until the next call to Receive". An implementation MUST
+	// copy the bytes or consume them synchronously. Retaining the slice
+	// for later or handing it to a goroutine that outlives the call
+	// stores whatever the next network read overwrites it with, and the
+	// resulting backup is self-consistent but unrestorable.
 	OnTablespaceData(idx int, data []byte) error
 	OnTablespaceEnd(idx int) error
 }
@@ -419,6 +428,17 @@ func drainMultiplexed(ctx context.Context, reader *streaming.Reader, opts Option
 					streaming.ErrUnexpectedMessage)
 			}
 			typeByte := m.Data[0]
+			// payload ALIASES the protocol read buffer. pgproto3 is
+			// explicit about it: "the returned message is only valid
+			// until the next call to Receive". Every byte of every base
+			// backup arrives this way, so a Sink that queues the slice
+			// for asynchronous work instead of consuming it in the call
+			// would hash and store whatever the next network read left
+			// behind — a backup that succeeds with self-consistent
+			// chunks and fails only at restore, as an unusable datadir.
+			// The Sink contract states the obligation; tarsink's
+			// buffer_aliasing_test.go pins that the shipped sink meets
+			// it.
 			payload := m.Data[1:]
 			switch typeByte {
 			case mplexNewArchive:
