@@ -121,7 +121,6 @@ github.com/cybertec-postgresql/pg_hardstorage/internal/cli/redact.go:236: WriteT
 github.com/cybertec-postgresql/pg_hardstorage/internal/cli/redact.go:262: WriteText
 github.com/cybertec-postgresql/pg_hardstorage/internal/cli/repair.go:1158: WriteText
 github.com/cybertec-postgresql/pg_hardstorage/internal/cli/repair.go:1202: WriteText
-github.com/cybertec-postgresql/pg_hardstorage/internal/cli/repair.go:1503: scrubWALManifestHashes
 github.com/cybertec-postgresql/pg_hardstorage/internal/cli/repair.go:354: WriteText
 github.com/cybertec-postgresql/pg_hardstorage/internal/cli/repair.go:569: randHex8
 github.com/cybertec-postgresql/pg_hardstorage/internal/cli/repair.go:595: WriteText
