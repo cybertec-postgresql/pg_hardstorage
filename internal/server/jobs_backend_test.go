@@ -392,6 +392,95 @@ func runBackendContract(t *testing.T, factory func(t *testing.T) server.JobBacke
 			t.Errorf("AppendProgress nonexistent: got %v, want ErrJobNotFound", err)
 		}
 	})
+
+	// PruneTerminal is an OPTIONAL capability, but every backend that
+	// claims it must mean the same thing by it. The registry sets a 24h
+	// terminalRetention for every backend and sweepTick type-asserts
+	// for the capability, so a backend that quietly lacks it — as the
+	// PG one did — leaves that retention doing nothing while its table
+	// keeps every job ever dispatched. A backend that implements it
+	// with different boundary semantics is worse: pruning is a DELETE,
+	// and the cases below are exactly the ones where getting the
+	// boundary wrong destroys a job record that is still live or still
+	// inside the operator's retention window.
+	t.Run("PruneTerminal", func(t *testing.T) {
+		b := factory(t)
+		ctx := context.Background()
+		pruner, ok := b.(interface {
+			PruneTerminal(context.Context, time.Duration) (int, error)
+		})
+		if !ok {
+			t.Fatalf("%T does not implement PruneTerminal — the registry's terminalRetention "+
+				"silently does nothing for it and its finished jobs accumulate without bound",
+				b)
+		}
+
+		// A queued job and a running job must never be pruned, whatever
+		// the retention: they have no completed_at, and their age is
+		// not the question.
+		queued, err := b.Enqueue(ctx, server.EnqueueOptions{Kind: server.JobBackup, Deployment: "db1"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := b.Enqueue(ctx, server.EnqueueOptions{Kind: server.JobBackup, Deployment: "db2"}); err != nil {
+			t.Fatal(err)
+		}
+		running, err := b.Claim(ctx, server.ClaimOptions{AgentID: "a1", Deployments: []string{"db2"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// A freshly-finished job is inside any sane window.
+		done, err := b.Enqueue(ctx, server.EnqueueOptions{Kind: server.JobBackup, Deployment: "db3"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := b.Claim(ctx, server.ClaimOptions{AgentID: "a1", Deployments: []string{"db3"}}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := b.Complete(ctx, done.ID, server.CompleteOptions{Success: true}); err != nil {
+			t.Fatal(err)
+		}
+
+		// Non-positive retention prunes nothing — "disabled", not
+		// "prune everything". Getting this backwards wipes the table.
+		if n, err := pruner.PruneTerminal(ctx, 0); err != nil || n != 0 {
+			t.Errorf("PruneTerminal(0) = (%d, %v), want (0, nil) — a non-positive retention "+
+				"means pruning is DISABLED, not that everything is expired", n, err)
+		}
+		if n, err := pruner.PruneTerminal(ctx, -time.Hour); err != nil || n != 0 {
+			t.Errorf("PruneTerminal(-1h) = (%d, %v), want (0, nil)", n, err)
+		}
+
+		// A generous window keeps the just-completed job.
+		if n, err := pruner.PruneTerminal(ctx, time.Hour); err != nil || n != 0 {
+			t.Errorf("PruneTerminal(1h) pruned %d job(s) (err %v) — a job that finished "+
+				"moments ago is inside the retention window", n, err)
+		}
+		for _, id := range []string{queued.ID, running.ID, done.ID} {
+			if _, err := b.Get(ctx, id); err != nil {
+				t.Errorf("job %s disappeared while inside the window: %v", id, err)
+			}
+		}
+
+		// A zero-length window expires the finished job and ONLY it.
+		n, err := pruner.PruneTerminal(ctx, time.Nanosecond)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n != 1 {
+			t.Errorf("PruneTerminal pruned %d, want 1 (only the completed job is eligible)", n)
+		}
+		if _, err := b.Get(ctx, done.ID); !errors.Is(err, server.ErrJobNotFound) {
+			t.Errorf("the expired terminal job survived: %v", err)
+		}
+		for _, id := range []string{queued.ID, running.ID} {
+			if _, err := b.Get(ctx, id); err != nil {
+				t.Errorf("a non-terminal job was pruned (%s): %v — queued and running jobs "+
+					"are live work, and deleting one loses it entirely", id, err)
+			}
+		}
+	})
 }
 
 // TestMemoryBackend_Contract runs the shared backend contract against

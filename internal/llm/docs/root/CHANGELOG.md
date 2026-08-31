@@ -13,6 +13,21 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **The Postgres job backend never pruned finished jobs, so a
+  configured retention silently did nothing.** `JobRegistry` sets a 24h
+  `terminalRetention` for every backend and its sweeper asks the backend
+  to prune via an optional-capability type assertion. Only the in-memory
+  backend implemented it — added under "memory-leak audit #2" because
+  its map would otherwise grow for the life of the process — so on the
+  durable backend, which is the one that actually runs for months,
+  `phs.jobs` kept every job ever dispatched and `WithTerminalRetention`
+  was a knob with nothing behind it. `PGBackend.PruneTerminal` now
+  implements the capability with semantics identical to the in-memory
+  one, behind a partial index on terminal rows, and the shared
+  `JobBackend` contract suite — which is what has kept the two backends'
+  claim and completion paths in step — now covers pruning too, so a
+  backend that omits it or gets the retention boundary wrong fails.
+
 - **The logical CDC sink could silently drop records after an
   unacknowledged commit.** `commitManifest` treated `ErrAlreadyExists`
   at a batch's key as proof the batch was already archived

@@ -152,10 +152,18 @@ type CompleteOptions struct {
 // backend; callers that want persistence pass a PGBackend via
 // NewJobRegistryWithBackend.
 // terminalPruner is the OPTIONAL capability a backend implements to
-// bound retained terminal jobs. The in-memory backend implements it (its
-// map would otherwise grow forever — memory-leak audit #2); the PG
-// backend is durable + queryable and can ship its own retention later,
-// so it's not forced onto the JobBackend interface.
+// bound retained terminal jobs. Both shipped backends implement it: the
+// in-memory one since memory-leak audit #2 (its map would otherwise grow
+// for the life of the process), and the PG one because it was the
+// backend that actually runs for months — the registry sets a 24h
+// terminalRetention for EVERY backend, so while PGBackend lacked the
+// method that retention silently did nothing and phs.jobs kept every job
+// ever dispatched.
+//
+// It stays optional rather than joining JobBackend so a third-party or
+// future backend with its own retention story is not forced to
+// reimplement it. Anything added here must honour the same semantics as
+// the two shipped implementations — see TestJobBackend_PruneTerminal.
 type terminalPruner interface {
 	PruneTerminal(ctx context.Context, olderThan time.Duration) (int, error)
 }

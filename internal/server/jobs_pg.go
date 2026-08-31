@@ -79,6 +79,14 @@ CREATE INDEX IF NOT EXISTS jobs_deployment_state
 CREATE INDEX IF NOT EXISTS jobs_running_started
     ON phs.jobs (started_at)
     WHERE state = 'running';
+
+-- PruneTerminal deletes finished jobs past the retention window. The
+-- partial index keeps that a range scan over terminal rows only,
+-- rather than a seq scan of a table whose whole problem is that it
+-- has grown large.
+CREATE INDEX IF NOT EXISTS jobs_terminal_completed
+    ON phs.jobs (completed_at)
+    WHERE state IN ('completed', 'failed', 'cancelled');
 `
 
 // PGBackend is the PostgreSQL-backed JobBackend. It holds a pgxpool
@@ -455,6 +463,39 @@ func (b *PGBackend) Complete(ctx context.Context, id string, opts CompleteOption
 		return nil, ErrClaimLost
 	}
 	return j, nil
+}
+
+// PruneTerminal implements the optional terminalPruner capability.
+//
+// Without it the durable backend was the one that never pruned: the
+// registry sets a 24h terminalRetention for EVERY backend and
+// sweepTick type-asserts for terminalPruner, so on Postgres the
+// retention silently did nothing and phs.jobs kept every job ever
+// dispatched. The in-memory backend has pruned since "memory-leak
+// audit #2" precisely because unbounded growth there was unacceptable;
+// the same growth on the durable backend is the one that actually runs
+// for months.
+//
+// Semantics match MemoryBackend exactly so the two backends cannot
+// drift: a non-positive retention prunes nothing, only terminal states
+// are eligible, a NULL completed_at is never pruned (its age is
+// unknown, so it cannot be shown to be past the window), and the
+// boundary is strictly-older-than the cutoff.
+func (b *PGBackend) PruneTerminal(ctx context.Context, olderThan time.Duration) (int, error) {
+	if olderThan <= 0 {
+		return 0, nil
+	}
+	cutoff := time.Now().UTC().Add(-olderThan)
+	tag, err := b.pool.Exec(ctx, `
+        DELETE FROM phs.jobs
+         WHERE state IN ('completed', 'failed', 'cancelled')
+           AND completed_at IS NOT NULL
+           AND completed_at < $1
+    `, cutoff)
+	if err != nil {
+		return 0, fmt.Errorf("pgbackend: prune terminal: %w", err)
+	}
+	return int(tag.RowsAffected()), nil
 }
 
 // Cancel implements JobBackend.
