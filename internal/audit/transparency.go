@@ -7,7 +7,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	stdio "io"
 	"strings"
 	"time"
 
@@ -190,7 +189,7 @@ func (l *StorageBackedLog) GetAnchor(ctx context.Context, logID string) (*Anchor
 		return nil, err
 	}
 	defer rc.Close()
-	body, err := stdio.ReadAll(rc)
+	body, err := storage.ReadAllLimited(rc, storage.MaxMetadataBytes)
 	if err != nil {
 		return nil, err
 	}

@@ -477,7 +477,7 @@ func collectAnchors(ctx context.Context, sp storage.StoragePlugin, f ListFilters
 		if err != nil {
 			continue
 		}
-		body, err := io.ReadAll(rc)
+		body, err := storage.ReadAllLimited(rc, storage.MaxMetadataBytes)
 		_ = rc.Close()
 		if err != nil {
 			continue

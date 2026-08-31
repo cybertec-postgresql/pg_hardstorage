@@ -468,7 +468,9 @@ func verifyExistingAuxiliaryFile(ctx context.Context, sp storage.StoragePlugin, 
 		return fmt.Errorf("splitbrain.read_failed: existing auxiliary file %q present but unreadable: %w", key, err)
 	}
 	defer rc.Close()
-	existing, err := io.ReadAll(rc)
+	// An auxiliary file has its own documented ceiling; use it rather
+	// than the generic metadata cap.
+	existing, err := storage.ReadAllLimited(rc, MaxAuxiliaryFileSize)
 	if err != nil {
 		return fmt.Errorf("splitbrain.read_failed: read existing auxiliary file %q: %w", key, err)
 	}
@@ -601,7 +603,7 @@ func verifyExistingManifest(ctx context.Context, sp storage.StoragePlugin, key s
 		return fmt.Errorf("splitbrain.read_failed: existing manifest %q present but unreadable: %w", key, err)
 	}
 	defer rc.Close()
-	body, err := io.ReadAll(rc)
+	body, err := storage.ReadAllLimited(rc, storage.MaxMetadataBytes)
 	if err != nil {
 		return fmt.Errorf("splitbrain.read_failed: read existing manifest %q: %w", key, err)
 	}
