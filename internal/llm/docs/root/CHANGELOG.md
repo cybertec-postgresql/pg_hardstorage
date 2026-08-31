@@ -13,6 +13,22 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **Chain protection skipped unparseable manifests, so deleting a
+  backup could orphan a live incremental.** The snapshot that answers
+  "would tombstoning X orphan anything?" reads every live manifest's
+  `parent_backup_id`; a manifest whose body would not parse was skipped
+  with the reasoning "a malformed manifest can't have a usable parent
+  reference". That answers whether the corrupt manifest is usable, not
+  whether deleting something else would strand it — so its parent edge
+  vanished from the graph, `descendants()` came back empty, and
+  `backup delete` tombstoned an anchor with a live child sitting on
+  disk. The child became a dangling `chain.broken_tombstoned` link,
+  discovered at restore. The same function already failed closed when a
+  manifest could not be READ, and `wal prune`'s frontier walk refuses to
+  prune at all rather than risk deleting WAL an undecodable manifest
+  still needs; unparseable was the odd one out. It now refuses too,
+  naming the manifest and pointing at `repair manifest`.
+
 - **`wal prune --keep-since` silently protected nothing when a segment
   manifest had no `created_at`.** The keep-floor answers "is this
   segment newer than the operator's cutoff?" from the manifest's

@@ -1923,9 +1923,32 @@ func (ms *ManifestStore) loadChainSnapshot(ctx context.Context, deployment strin
 		}
 		var s slim
 		if err := json.Unmarshal(body, &s); err != nil {
-			// A malformed manifest can't have a usable parent
-			// reference; skip rather than failing the delete.
-			continue
+			// Fail CLOSED, like the Get failure a few lines above.
+			//
+			// This snapshot answers one question: would tombstoning X
+			// orphan a live incremental that descends from it? A
+			// manifest we cannot parse is one whose parent edge we
+			// cannot see — so skipping it drops that edge from the
+			// graph, descendants() comes back empty, and SoftDelete
+			// tombstones an anchor whose live child is right there on
+			// disk. The child is then an un-restorable dangling link
+			// (chain.broken_tombstoned), discovered at restore.
+			//
+			// The old comment reasoned "a malformed manifest can't
+			// have a usable parent reference", which answers a
+			// different question — whether the manifest is usable —
+			// not whether deleting something else would strand it.
+			//
+			// Same posture as walprune's frontier walk, which refuses
+			// to prune at all rather than risk deleting WAL a manifest
+			// it could not decode still needs. One corrupt manifest
+			// blocking deletes until it is healed is the correct
+			// trade: the alternative silently breaks a chain.
+			return chainSnapshot{}, fmt.Errorf(
+				"backup: chain protection cannot decode manifest %s: %w — refusing to "+
+					"evaluate deletions while a manifest's parent link is unreadable, because "+
+					"a hidden edge means tombstoning its ancestor would orphan it; heal or "+
+					"remove that manifest first (`repair manifest`)", key, err)
 		}
 		if s.ParentBackupID == "" {
 			continue
