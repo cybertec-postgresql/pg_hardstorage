@@ -3,7 +3,6 @@ package inventory
 import (
 	"context"
 	"fmt"
-	"io"
 	"strings"
 
 	"github.com/jackc/pglogrepl"
@@ -46,7 +45,7 @@ func NextArchivedLSNAtOrAfter(ctx context.Context, sp storage.StoragePlugin, dep
 		if gerr != nil {
 			continue // racing janitor; the segment is gone, not a candidate
 		}
-		raw, rerr := io.ReadAll(rc)
+		raw, rerr := storage.ReadAllLimited(rc, storage.MaxMetadataBytes)
 		_ = rc.Close()
 		if rerr != nil {
 			continue

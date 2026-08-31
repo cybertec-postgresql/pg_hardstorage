@@ -9,7 +9,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"sort"
 	"strings"
 	"time"
@@ -546,7 +545,8 @@ func readAll(ctx context.Context, sp storage.StoragePlugin, key string) ([]byte,
 		return nil, err
 	}
 	defer rc.Close()
-	return io.ReadAll(rc)
+	// Compares chunk bodies as well as metadata, so the envelope cap.
+	return storage.ReadAllLimited(rc, MaxChunkEnvelopeBytes)
 }
 
 // chunkKeysFromManifest fetches the manifest at key from src,

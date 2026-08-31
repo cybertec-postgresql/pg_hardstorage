@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	stdio "io"
 	"sort"
 	"strings"
 	"time"
@@ -735,7 +734,10 @@ func readKey(ctx context.Context, sp storage.StoragePlugin, key string) ([]byte,
 		return nil, err
 	}
 	defer rc.Close()
-	return stdio.ReadAll(rc)
+	// readKey serves BOTH metadata and chunk bodies (see the chunkKey
+	// call sites), so it takes the envelope cap rather than the
+	// metadata one.
+	return storage.ReadAllLimited(rc, MaxChunkEnvelopeBytes)
 }
 
 // extractChunkHashes JSON-decodes body and returns every chunk hash it

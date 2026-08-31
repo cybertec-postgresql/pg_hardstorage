@@ -30,7 +30,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	stdio "io"
 	"strconv"
 	"time"
 
@@ -184,7 +183,7 @@ func (s *Store) read(ctx context.Context, key string) ([]byte, error) {
 		return nil, err
 	}
 	defer rc.Close()
-	return stdio.ReadAll(rc)
+	return storage.ReadAllLimited(rc, storage.MaxMetadataBytes)
 }
 
 // MismatchError is returned by Put when the committed bytes for

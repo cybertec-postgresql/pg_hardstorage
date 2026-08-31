@@ -36,7 +36,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	stdio "io"
 	"sort"
 	"strconv"
 	"strings"
@@ -397,7 +396,7 @@ func (s *Store) read(ctx context.Context, key string) (Record, error) {
 		return Record{}, err
 	}
 	defer rc.Close()
-	body, err := stdio.ReadAll(rc)
+	body, err := storage.ReadAllLimited(rc, storage.MaxMetadataBytes)
 	if err != nil {
 		return Record{}, fmt.Errorf("read body: %w", err)
 	}

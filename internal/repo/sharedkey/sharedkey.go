@@ -27,7 +27,6 @@ import (
 	"time"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/invariant"
-	"io"
 	"strings"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/encryption"
@@ -363,7 +362,7 @@ func readWrappedDEK(ctx context.Context, sp storage.StoragePlugin, key, wantKEKR
 		return nil, false
 	}
 	defer rc.Close()
-	body, err := io.ReadAll(rc)
+	body, err := storage.ReadAllLimited(rc, storage.MaxMetadataBytes)
 	if err != nil {
 		return nil, false
 	}

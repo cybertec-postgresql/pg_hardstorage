@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	stdio "io"
 	"time"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
@@ -148,7 +147,7 @@ func AssertWritable(ctx context.Context, sp storage.StoragePlugin) error {
 		return fmt.Errorf("repo: read HSREPO for mode check: %w", err)
 	}
 	defer rc.Close()
-	body, err := stdio.ReadAll(rc)
+	body, err := storage.ReadAllLimited(rc, storage.MaxMetadataBytes)
 	if err != nil {
 		return fmt.Errorf("repo: read HSREPO body for mode check: %w", err)
 	}

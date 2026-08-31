@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	stdio "io"
 	"sort"
 	"strings"
 	"time"
@@ -564,7 +563,7 @@ func readSegmentManifest(ctx context.Context, sp storage.StoragePlugin, key stri
 		return nil, err
 	}
 	defer rc.Close()
-	body, err := stdio.ReadAll(rc)
+	body, err := storage.ReadAllLimited(rc, storage.MaxMetadataBytes)
 	if err != nil {
 		return nil, err
 	}

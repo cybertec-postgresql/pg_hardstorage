@@ -545,7 +545,7 @@ func copyKey(ctx context.Context, sp storage.StoragePlugin, tw *tar.Writer, key 
 		return err
 	}
 	defer rc.Close()
-	body, err := io.ReadAll(rc)
+	body, err := storage.ReadAllLimited(rc, storage.MaxMetadataBytes)
 	if err != nil {
 		return err
 	}
@@ -560,7 +560,9 @@ func copyChunk(ctx context.Context, sp storage.StoragePlugin, tw *tar.Writer, ke
 		return 0, err
 	}
 	defer rc.Close()
-	body, err := io.ReadAll(rc)
+	// A chunk body, not metadata: MaxEntryBytes is the same 256 MiB
+	// ceiling the import side applies per tar entry.
+	body, err := storage.ReadAllLimited(rc, MaxEntryBytes)
 	if err != nil {
 		return 0, err
 	}
@@ -591,7 +593,12 @@ func putIfNotExists(ctx context.Context, sp storage.StoragePlugin, key string, r
 	} else if !isNotFound(err) {
 		return false, err
 	}
-	body, err := io.ReadAll(r)
+	// The import loop already refuses a tar entry whose declared
+	// hdr.Size exceeds MaxEntryBytes, and tar.Reader will not hand out
+	// more than that. Capping here anyway: putIfNotExists takes an
+	// arbitrary io.Reader, so the bound must not depend on every
+	// present and future caller having checked it first.
+	body, err := storage.ReadAllLimited(r, MaxEntryBytes)
 	if err != nil {
 		return false, err
 	}
@@ -743,7 +750,7 @@ func readBundleManifest(ctx context.Context, sp storage.StoragePlugin, deploymen
 		return nil, err
 	}
 	defer rc.Close()
-	body, err := io.ReadAll(rc)
+	body, err := storage.ReadAllLimited(rc, storage.MaxMetadataBytes)
 	if err != nil {
 		return nil, err
 	}

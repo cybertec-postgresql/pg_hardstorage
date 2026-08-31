@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	stdio "io"
 	"sort"
 	"strings"
 	"sync"
@@ -298,7 +297,7 @@ func harvestManifest(ctx context.Context, sp storage.StoragePlugin, key string, 
 		return err
 	}
 	defer rc.Close()
-	body, err := stdio.ReadAll(rc)
+	body, err := storage.ReadAllLimited(rc, storage.MaxMetadataBytes)
 	if err != nil {
 		return err
 	}

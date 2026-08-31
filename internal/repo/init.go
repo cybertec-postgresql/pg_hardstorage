@@ -160,7 +160,7 @@ func Open(ctx context.Context, url string) (*Metadata, storage.StoragePlugin, er
 	}
 	defer rc.Close()
 
-	body, err := stdio.ReadAll(rc)
+	body, err := storage.ReadAllLimited(rc, storage.MaxMetadataBytes)
 	if err != nil {
 		_ = sp.Close()
 		return nil, nil, fmt.Errorf("repo: read HSREPO body: %w", err)

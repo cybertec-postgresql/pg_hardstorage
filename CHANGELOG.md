@@ -13,6 +13,26 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+### Security
+
+- **Repository object reads are now bounded in `internal/repo`,
+  `internal/wal/inventory`, `internal/wal/timeline` and
+  `internal/wal/gapstate`.** The project already refuses unbounded
+  `io.ReadAll` on objects pulled from a repository — `internal/backup`
+  caps manifests, the CAS caps chunk envelopes, `basebackup` caps the
+  streamed manifest, each citing an input-validation audit. Those four
+  packages never got the treatment, not by decision but because
+  `internal/backup` imports `internal/repo`, so they could not reach
+  `backup.ReadAllLimited` without an import cycle — and they are exactly
+  the packages that walk EVERY object in a repository (gc reference
+  collection, replication, bundle export, WAL pruning, archived-LSN
+  inventory). One oversized object under `manifests/` — a misdirected
+  `aws s3 cp`, which `repair index` already documents as a real way that
+  happens — would OOM the whole sweep. `storage.ReadAllLimited` now
+  lives below all of them; metadata reads are capped at 1 GiB (matching
+  `backup.MaxManifestBytes`) and chunk-body reads keep their existing
+  256 MiB envelope ceiling.
+
 - **`wal prune` reported "Bytes deleted" for bytes it does not delete.**
   The command removes WAL segment *manifests*; the chunks stay until
   `repo gc` runs, so immediately after a prune every one of those bytes

@@ -16,7 +16,6 @@ package inventory
 import (
 	"context"
 	"fmt"
-	"io"
 	"strings"
 
 	"github.com/jackc/pglogrepl"
@@ -64,7 +63,7 @@ func HighestArchivedLSN(ctx context.Context, sp storage.StoragePlugin, deploymen
 	if err != nil {
 		return 0, false, fmt.Errorf("inventory: read highest segment manifest %q: %w", maxKey, err)
 	}
-	raw, rerr := io.ReadAll(rc)
+	raw, rerr := storage.ReadAllLimited(rc, storage.MaxMetadataBytes)
 	_ = rc.Close()
 	if rerr != nil {
 		return 0, false, fmt.Errorf("inventory: read %q: %w", maxKey, rerr)
@@ -129,7 +128,7 @@ func FirstWALHoleInRange(ctx context.Context, sp storage.StoragePlugin, deployme
 		if segSize == 0 {
 			// Learn the cluster's segment size from the first manifest.
 			if rc, gerr := sp.Get(ctx, key); gerr == nil {
-				raw, rerr := io.ReadAll(rc)
+				raw, rerr := storage.ReadAllLimited(rc, storage.MaxMetadataBytes)
 				_ = rc.Close()
 				if rerr == nil {
 					if m, perr := walsink.ParseSegmentManifest(raw); perr == nil && walsink.ValidSegmentSize(m.SegmentSize) {
