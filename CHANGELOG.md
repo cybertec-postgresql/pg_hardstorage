@@ -13,6 +13,19 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **A corrupt `segment_size` in a WAL manifest crashed the commands
+  that read it.** `SegmentsPerLog` is `4 GiB / segment_size`, and
+  `SegmentFileName` takes `segNum % SegmentsPerLog(...)`. PostgreSQL
+  caps `wal_segment_size` at 1 GiB so the quotient is never zero for a
+  real cluster — but the value also arrives from stored manifests
+  (`wal fetch` passes `Manifest.SegmentSize` straight through), and a
+  manifest declaring more than 4 GiB made the quotient zero and panicked
+  the process with "integer divide by zero". `wal list` and `wal verify`
+  died on exactly the corrupt manifest they exist to inspect.
+  `SegmentsPerLog` now floors at 1, and `wal fetch` refuses a manifest
+  whose recorded segment size is not one PostgreSQL can have — the check
+  `wal list` and the WAL inventory already applied.
+
 ### Security
 
 - **Repository object reads are now bounded in `internal/repo`,

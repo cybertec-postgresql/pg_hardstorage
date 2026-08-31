@@ -587,6 +587,18 @@ func runWalFetch(cmd *cobra.Command, opts walFetchOptions) error {
 	// on the cluster's wal_segment_size. Using the segNum from
 	// parseSegmentNameForFetch (which assumes the 16 MiB default) would
 	// falsely reject every non-default-size cluster here.
+	// Refuse a manifest whose recorded segment size is not one PG can
+	// have. segment_number is derived from it, so a bogus size yields a
+	// bogus expectation and the mismatch below would blame the caller's
+	// segment name for a manifest that is itself corrupt — pointing the
+	// operator at the wrong thing during a WAL fetch. wal_list applies
+	// the same check when it reads a size off disk.
+	if !walsink.ValidSegmentSize(m.SegmentSize) {
+		return output.NewError("wal.fetch.bad_manifest",
+			fmt.Sprintf("wal fetch: manifest records segment_size=%d, which no PostgreSQL "+
+				"cluster can have (must be a power of two from 1 MiB to 1 GiB) — the manifest "+
+				"is corrupt", m.SegmentSize))
+	}
 	_, expectedSegNum, _ := walsink.ParseSegmentName(opts.segmentName, m.SegmentSize)
 	if m.SegmentNumber != expectedSegNum {
 		// No .Wrap here: err is nil at this point (ParseSegmentManifest

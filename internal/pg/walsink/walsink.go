@@ -158,7 +158,26 @@ func pipelineDepthFor(segSize int64) int {
 // size must be valid (a power-of-two divisor of 4 GiB); callers pass a
 // value resolved through NormSegmentSize.
 func SegmentsPerLog(segmentSize int64) uint64 {
-	return uint64(0x100000000) / uint64(NormSegmentSize(segmentSize))
+	// The floor of 1 is what stops a divide-by-zero. PostgreSQL caps
+	// wal_segment_size at 1 GiB, so 0x1_0000_0000 / s is at least 4 for
+	// any value PG can produce — but this value also arrives from
+	// on-disk manifests (cli/wal.go passes Manifest.SegmentSize
+	// straight through), and a corrupt or hand-edited manifest
+	// declaring more than 4 GiB made this return 0. SegmentFileName
+	// then evaluated segNum % 0 and panicked the process with
+	// "integer divide by zero" — `wal list` and `wal verify` die on
+	// exactly the corrupt manifest they exist to inspect.
+	//
+	// Above 4 GiB PG's naming scheme has no meaning anyway (the log id
+	// IS the high 32 bits of the LSN, so a segment cannot span more
+	// than one log), which is why callers reading a size off disk
+	// should reject it via ValidSegmentSize rather than rely on this
+	// floor. The floor is here so that a caller who does not is left
+	// with a wrong name rather than a crashed process.
+	if per := uint64(0x100000000) / uint64(NormSegmentSize(segmentSize)); per > 0 {
+		return per
+	}
+	return 1
 }
 
 // Pipeline tunables. These bound the streamer's in-flight memory and
