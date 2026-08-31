@@ -23,8 +23,11 @@ package verifybackup
 
 import (
 	"bytes"
+	"context"
 	"encoding/hex"
 	"hash"
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -162,5 +165,51 @@ func TestNewHasher_DigestWidths(t *testing.T) {
 	}
 	if _, err := newHasher("MD5"); err == nil {
 		t.Error("an algorithm PG does not document must hard-fail, not verify as opaque-ok")
+	}
+}
+
+// Result.Algorithm is JSON output and part of a restore's recorded
+// evidence. A backup whose files carry mixed checksum algorithms —
+// rare, but possible when pg_basebackup's --manifest-checksums changes
+// mid-run — rendered its algorithm set in map order, so the same
+// verification produced "mixed:CRC32C,SHA256" on one run and
+// "mixed:SHA256,CRC32C" on the next. Evidence that cannot be diffed
+// against itself is not evidence.
+func TestVerify_MixedAlgorithmStringIsStable(t *testing.T) {
+	manifest := []byte(`{
+	  "PostgreSQL-Backup-Manifest-Version": 1,
+	  "Files": [
+	    {"Path": "a", "Size": 0, "Checksum-Algorithm": "SHA256",
+	     "Checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"},
+	    {"Path": "b", "Size": 0, "Checksum-Algorithm": "CRC32C", "Checksum": "00000000"},
+	    {"Path": "c", "Size": 0, "Checksum-Algorithm": "SHA512",
+	     "Checksum": "cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e"}
+	  ]
+	}`)
+	dir := t.TempDir()
+	for _, name := range []string{"a", "b", "c"} {
+		if err := os.WriteFile(filepath.Join(dir, name), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	first := ""
+	for i := 0; i < 100; i++ {
+		res, err := Verify(context.Background(), manifest, dir)
+		if err != nil {
+			t.Fatalf("Verify: %v", err)
+		}
+		if i == 0 {
+			first = res.Algorithm
+			continue
+		}
+		if res.Algorithm != first {
+			t.Fatalf("run %d reported %q, the first run reported %q — the mixed-algorithm "+
+				"string depends on map iteration order, so the same verification cannot be "+
+				"diffed against itself", i, res.Algorithm, first)
+		}
+	}
+	if want := "mixed:CRC32C,SHA256,SHA512"; first != want {
+		t.Errorf("Algorithm = %q, want %q (sorted)", first, want)
 	}
 }

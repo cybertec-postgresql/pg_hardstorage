@@ -56,6 +56,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 )
 
@@ -177,10 +178,17 @@ func Verify(ctx context.Context, manifestBytes []byte, dataDir string) (*Result,
 		// Mixed: rare in practice (operators rarely change
 		// pg_basebackup's --manifest-checksums mid-run) but
 		// possible.  Surface it.
-		var keys []string
+		// Sorted: this string lands in the verify Result, which is
+		// JSON output and part of a restore's recorded evidence.
+		// Ranging the map made "mixed:CRC32C,SHA256" and
+		// "mixed:SHA256,CRC32C" both valid renderings of the same
+		// backup, so the same verification could not be diffed
+		// against itself between runs.
+		keys := make([]string, 0, len(algos))
 		for k := range algos {
 			keys = append(keys, k)
 		}
+		sort.Strings(keys)
 		res.Algorithm = "mixed:" + strings.Join(keys, ",")
 	}
 	return res, nil

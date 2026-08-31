@@ -13,6 +13,17 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **Two more map-ordered outputs made identical runs disagree.**
+  `verify`'s `Result.Algorithm` rendered a mixed-checksum backup's
+  algorithm set in map order, so the same verification reported
+  `mixed:SHA256,CRC32C,SHA512` on one run and
+  `mixed:SHA512,SHA256,CRC32C` on the next — evidence recorded by a
+  restore that cannot be diffed against itself. And `config check`'s
+  "did you mean" suggestion resolved edit-distance ties, and its
+  substring fallback, by whichever candidate map iteration happened to
+  reach first, so two operators typing the same config typo were pointed
+  at two different settings. Both now order their candidates.
+
 - **`backup graph` rendered differently between identical runs when the
   chain contained a cycle.** The cycle breaker's own comment promised a
   "deterministic break point", but detectCycles chose its DFS entry

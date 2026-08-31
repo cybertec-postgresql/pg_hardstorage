@@ -394,11 +394,21 @@ func yamlFields(t reflect.Type) map[string]reflect.StructField {
 	return out
 }
 
+// fieldNames returns the valid field names, SORTED.
+//
+// suggest breaks ties with `d < bestD` — strictly less — so the first
+// name at the minimum edit distance wins, and its substring fallback
+// returns the first match outright. Ranging the map made both of those
+// "first" a coin flip: two operators typing the same config typo were
+// told to try two different field names. Sorting makes the suggestion
+// a function of the input, which is the least an operator can ask of
+// advice they are about to act on.
 func fieldNames(fields map[string]reflect.StructField) []string {
 	out := make([]string, 0, len(fields))
 	for n := range fields {
 		out = append(out, n)
 	}
+	sort.Strings(out)
 	return out
 }
 
