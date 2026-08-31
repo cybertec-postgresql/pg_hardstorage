@@ -10,9 +10,6 @@ github.com/cybertec-postgresql/pg_hardstorage/internal/backup/manifest_store.go:
 github.com/cybertec-postgresql/pg_hardstorage/internal/backup/manifest_store.go: SetDefaultReplicaErrorLogger
 github.com/cybertec-postgresql/pg_hardstorage/internal/backup/runner/runner.go: base64Decode
 github.com/cybertec-postgresql/pg_hardstorage/internal/backup/tarsink/tarsink.go: WithChunkerFactory
-github.com/cybertec-postgresql/pg_hardstorage/internal/backup/verifybackup/verifybackup.go: BlockSize
-github.com/cybertec-postgresql/pg_hardstorage/internal/backup/verifybackup/verifybackup.go: Reset
-github.com/cybertec-postgresql/pg_hardstorage/internal/backup/verifybackup/verifybackup.go: Size
 github.com/cybertec-postgresql/pg_hardstorage/internal/capacity/capacity.go: fitLinear
 github.com/cybertec-postgresql/pg_hardstorage/internal/capacity/capacity.go: sampleWindowSeconds
 github.com/cybertec-postgresql/pg_hardstorage/internal/chain/dot.go: sortedRootsByID
