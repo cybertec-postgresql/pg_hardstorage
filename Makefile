@@ -336,7 +336,13 @@ build-firecracker: | $(HS_TMPDIR)
 # failed]" with zero packages tested.  Listing the four real top-
 # level package roots keeps go test out of test-runs/, bin/, .git/
 # entirely.  Add a new top-level dir here if and when one ships.
-GO_PKGS ?= ./cmd/... ./compat/... ./dockerfiles/... ./internal/...
+#
+# ./test/coverage/... holds the tests for the coverage ratchet's own
+# comparison logic — the release gate should not be the one thing in
+# the repo that never gets checked.  It is listed explicitly rather
+# than as ./test/... because test/ also holds scenario YAML, fixtures
+# and soak scratch that go list has no business walking.
+GO_PKGS ?= ./cmd/... ./compat/... ./dockerfiles/... ./internal/... ./test/coverage/...
 
 # HOST_PLATFORM is printed by every test target. arm64 is a SHIPPED
 # platform (.goreleaser.yaml publishes linux/arm64, darwin/arm64 and an

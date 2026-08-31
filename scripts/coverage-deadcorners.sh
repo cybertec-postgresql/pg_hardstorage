@@ -56,13 +56,10 @@ grep -vE '_test\.go|/testkit/|/cmd/pg_hardstorage_testkit/' "$TMP/dead.txt" > "$
 echo "== dead corners (zero executions in unit AND e2e): $(wc -l < "$TMP/dead-shipped.txt") functions =="
 cat "$TMP/dead-shipped.txt"
 
+# The ratchet comparison lives in its own script so it can be tested
+# against plain fixture files; see scripts/coverage-ratchet-diff.sh for
+# why it matches on file+function rather than file:line.
 if [ -n "$BASELINE" ]; then
-  NEW="$(comm -13 <(sort -u "$BASELINE") <(sort -u "$TMP/dead-shipped.txt") || true)"
-  if [ -n "$NEW" ]; then
-    echo
-    echo "RATCHET VIOLATION — functions newly unwitnessed vs baseline:"
-    echo "$NEW"
-    exit 1
-  fi
-  echo "ratchet ok: no new dead corners vs baseline"
+  echo
+  "$(dirname "$0")/coverage-ratchet-diff.sh" "$BASELINE" "$TMP/dead-shipped.txt"
 fi
