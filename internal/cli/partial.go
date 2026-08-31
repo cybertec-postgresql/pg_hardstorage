@@ -560,8 +560,62 @@ func runPartialRestore(cmd *cobra.Command, deployment string, f partialRestoreFl
 			fmt.Sprintf("partial restore: %v", err)).Wrap(err)
 	}
 
+	// Dual-stream, same shape as `repo replicate`: render the body
+	// first so monitoring always gets the counters, then let the exit
+	// code carry whether the extraction was complete.
 	body := partialRestoreBody{RestoreResult: *res}
-	return d.Result(output.NewResult(cmd.CommandPath()).WithBody(body))
+	if rerr := d.Result(output.NewResult(cmd.CommandPath()).WithBody(body)); rerr != nil {
+		return rerr
+	}
+	return partialRestoreIncomplete(res)
+}
+
+// partialRestoreIncomplete turns "some requested table produced no
+// files" into a non-zero exit.
+//
+// Factored out so the contract is unit-testable, and applied for the
+// reason repo replicate already documents: previously any partial
+// failure exited 0, so a scripted `partial restore && <use the data>`
+// proceeded on an empty target directory. A recovery command that
+// extracted nothing for a table the operator named must not report
+// success.
+//
+// Scope: NotInBackup only. NotFound — a table absent from the catalog —
+// deliberately keeps its exit-0 behaviour, which
+// TestPartialRestore_NotFoundTable_PropagatesNotFound pins: a
+// multi-table run that names one typo still extracts the rest and
+// reports the absence in the body. That is an existing, tested
+// decision and not one to change from here.
+//
+// The two are not equivalent from the operator's side. A NotFound
+// table is absent from their own input's premises — they named
+// something that does not exist, and the body says so. A NotInBackup
+// table exists and they had every reason to expect its data; what
+// diverged is the tool's own resolution (live catalog) from the
+// backup's contents. Nothing in their input hints at it, which is
+// exactly why it needs the exit code.
+//
+// If the asymmetry is unwanted, unifying them is a one-line change plus
+// updating that test — a product call, not a bug fix.
+//
+// `partial inspect` is unaffected; it is a "would this work?" preview
+// and reporting an absence is its job.
+func partialRestoreIncomplete(res *partial.RestoreResult) error {
+	if res == nil || len(res.NotInBackup) == 0 {
+		return nil
+	}
+	return output.NewError("partial.restore_incomplete",
+		fmt.Sprintf("partial restore: nothing was extracted for table(s) present in the "+
+			"catalog but absent from this backup: %s. The files that WERE extracted are in "+
+			"the target dir and the body above lists them; this exit code exists so a "+
+			"scripted run does not proceed as though the data is there",
+			strings.Join(res.NotInBackup, ", "))).
+		WithSuggestion(&output.Suggestion{
+			Human: "a table missing from THIS backup usually means it was rewritten after the " +
+				"backup was taken (VACUUM FULL, CLUSTER, TRUNCATE, a rewriting ALTER TABLE) — " +
+				"the relfilenode is resolved against the live catalog. Restore from an older " +
+				"backup, or pass the historical relfilenode with --relfilenode-map.",
+		})
 }
 
 // resolveLatestBackupID walks the manifest store and returns the

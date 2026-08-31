@@ -137,7 +137,11 @@ keeps reading that version for at least 24 months after a successor lands.
   ways out (an older backup, or the historical relfilenode via
   `--relfilenode-map`). A heap that lands while its TOAST relfilenode is
   missing is reported too: that one restores a table looking populated
-  with every out-of-line value gone.
+  with every out-of-line value gone. The command now also exits non-zero
+  in that case, so a scripted `partial restore && <use the data>` does
+  not proceed over an empty target directory — the same reasoning
+  `repo replicate` carries. A table missing from the *catalog* keeps its
+  existing exit-0 behaviour, which is separately tested.
 
 - **`partial restore` listed the files it wrote in map-iteration
   order**, so the reported `heap_files`/`toast_files` and the order
