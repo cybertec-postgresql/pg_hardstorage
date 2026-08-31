@@ -9,6 +9,7 @@ import (
 	stdfs "io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -87,9 +88,29 @@ type RestoreResult struct {
 	FilesWritten int                   `json:"files_written"`
 	BytesWritten int64                 `json:"bytes_written"`
 	NotFound     []string              `json:"not_found,omitempty"`
-	StartedAt    time.Time             `json:"started_at"`
-	StoppedAt    time.Time             `json:"stopped_at"`
-	DurationMS   int64                 `json:"duration_ms"`
+
+	// NotInBackup lists tables that WERE resolved to a relfilenode but
+	// whose files are absent from this backup — nothing was extracted
+	// for them.
+	//
+	// This is distinct from NotFound, which means the table is not in
+	// the catalog at all (a typo). Here the table exists; its bytes
+	// simply are not in THIS backup, because the relfilenode is
+	// resolved against the LIVE catalog while the files come from the
+	// backup, and the two diverge the moment the relation is rewritten
+	// — VACUUM FULL, CLUSTER, TRUNCATE, a rewriting ALTER TABLE. All
+	// routine.
+	//
+	// Before this field existed the condition was reported as a clean
+	// success with an empty target directory: a recovery tool told an
+	// operator it had extracted their table and had not. The remedies
+	// differ too — an older backup, or the historical relfilenode via
+	// --relfilenode-map — so it is reported separately rather than
+	// folded into NotFound.
+	NotInBackup []string  `json:"not_in_backup,omitempty"`
+	StartedAt   time.Time `json:"started_at"`
+	StoppedAt   time.Time `json:"stopped_at"`
+	DurationMS  int64     `json:"duration_ms"`
 }
 
 // RestoreTableMapping records what was extracted for one table.
@@ -223,6 +244,11 @@ func Restore(ctx context.Context, opts RestoreOptions) (*RestoreResult, error) {
 		mapping.HeapBytes = heapBytes
 		res.FilesWritten += len(heapWritten)
 		res.BytesWritten += heapBytes
+		if len(heapWritten) == 0 {
+			// Resolved to a relfilenode, but this backup has no file
+			// under it. Say so — see RestoreResult.NotInBackup.
+			res.NotInBackup = append(res.NotInBackup, rfn.Qualified)
+		}
 
 		// TOAST family (if present).
 		if rfn.ToastPath != "" {
@@ -237,6 +263,13 @@ func Restore(ctx context.Context, opts RestoreOptions) (*RestoreResult, error) {
 			mapping.ToastBytes = toastBytes
 			res.FilesWritten += len(toastWritten)
 			res.BytesWritten += toastBytes
+			if len(toastWritten) == 0 && len(heapWritten) > 0 {
+				// The heap landed but its TOAST relfilenode is absent:
+				// the table restores looking populated with every
+				// out-of-line value missing. Worse than an empty
+				// extraction, because it looks like it worked.
+				res.NotInBackup = append(res.NotInBackup, rfn.Qualified+" (toast)")
+			}
 		}
 		res.Mappings = append(res.Mappings, mapping)
 	}
@@ -307,14 +340,25 @@ func materialiseRelfilenodeFamily(
 	// Then any sibling that matches the family pattern. We walk
 	// all known paths once rather than enumerating every possible
 	// suffix (segment counts can be unbounded).
-	for path, entry := range byPath {
+	//
+	// Collected and SORTED before materialising: byPath is a map, so
+	// ranging it directly made both the write order and the reported
+	// HeapFiles/ToastFiles list depend on Go's randomised iteration.
+	// That list is output — two runs over one backup could not be
+	// diffed, and the segment files were written in a different order
+	// every time.
+	siblings := make([]string, 0, 8)
+	for path := range byPath {
 		if path == basePath {
 			continue
 		}
-		if !isFamilyMember(path, basePath) {
-			continue
+		if isFamilyMember(path, basePath) {
+			siblings = append(siblings, path)
 		}
-		n, err := materialiseOneFile(ctx, cas, target, entry)
+	}
+	sort.Strings(siblings)
+	for _, path := range siblings {
+		n, err := materialiseOneFile(ctx, cas, target, byPath[path])
 		if err != nil {
 			return written, totalBytes, err
 		}

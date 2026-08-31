@@ -645,6 +645,18 @@ func (b partialRestoreBody) WriteText(w io.Writer) error {
 	if len(b.NotFound) > 0 {
 		fmt.Fprintf(bw, "  Not found:     %s\n", strings.Join(b.NotFound, ", "))
 	}
+	// Distinct from "not found": these tables WERE resolved, but this
+	// backup holds no file at their relfilenode, so nothing was
+	// extracted for them. Without the line the command reports a clean
+	// success over an empty target directory.
+	if len(b.NotInBackup) > 0 {
+		fmt.Fprintf(bw, "  ✗ Not in this backup: %s\n", strings.Join(b.NotInBackup, ", "))
+		fmt.Fprintln(bw, "    Nothing was extracted for them. The relfilenode is resolved "+
+			"against the LIVE catalog while the files come from the backup, so the two "+
+			"diverge after a VACUUM FULL, CLUSTER, TRUNCATE or rewriting ALTER TABLE. "+
+			"Use an older backup, or pass the historical relfilenode with "+
+			"--relfilenode-map.")
+	}
 	if len(b.Mappings) > 0 {
 		fmt.Fprintln(bw, "  Mappings:")
 		mw := tabwriter.NewWriter(bw, 0, 4, 2, ' ', 0)

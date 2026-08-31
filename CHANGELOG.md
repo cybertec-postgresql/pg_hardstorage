@@ -121,6 +121,29 @@ keeps reading that version for at least 24 months after a successor lands.
   headers are attacker-controlled and a file-size bound does not
   constrain what a bomb expands to.
 
+- **`partial restore` reported success after extracting nothing when a
+  table had been rewritten since the backup.** A table's relfilenode is
+  resolved against the *live* catalog (`pg_relation_filepath` on a real
+  connection) while its files come from the *backup*, and the two
+  diverge the moment the relation is rewritten — VACUUM FULL, CLUSTER,
+  TRUNCATE, a rewriting ALTER TABLE. The family walk then looked up a
+  path the manifest does not contain, found nothing, and returned no
+  error: the operator asked a recovery tool to extract a table, got an
+  empty target directory, and an exit code saying it worked. The only
+  signal was `files_written: 0`, against a result that otherwise read as
+  clean. The new `not_in_backup` field reports it — kept distinct from
+  `not_found`, which means the table is absent from the catalog and has
+  a different remedy — and the text output names the cause and the two
+  ways out (an older backup, or the historical relfilenode via
+  `--relfilenode-map`). A heap that lands while its TOAST relfilenode is
+  missing is reported too: that one restores a table looking populated
+  with every out-of-line value gone.
+
+- **`partial restore` listed the files it wrote in map-iteration
+  order**, so the reported `heap_files`/`toast_files` and the order
+  segments were written to disk changed between runs over the same
+  backup. Now sorted.
+
 ### Security
 
 - **Repository object reads are now bounded in `internal/repo`,
