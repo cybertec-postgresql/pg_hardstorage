@@ -72,6 +72,8 @@ import (
 	"strings"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/invariant"
 )
 
 // SchemaRules is the YAML schema string carried in the rules
@@ -166,6 +168,25 @@ type Plan struct {
 // audit-event body so a future restore can reproduce
 // identical redactions.
 func NewPlan(rules *Rules) (*Plan, error) {
+	if rules == nil {
+		return nil, errors.New("redact: nil rules")
+	}
+	// Validate here as well as in ParseRules. ParseRules is the only
+	// caller today, but NewPlan is the constructor and takes a *Rules a
+	// caller can build in Go — and the failure mode of an unvalidated
+	// strategy is not an error, it is SILENT NON-REDACTION: the SQL
+	// builder has no way to signal "I do not know this strategy" and
+	// its fallback emits the column unchanged. For a tool whose job is
+	// keeping PII out of a non-production environment, that is the one
+	// outcome that must be impossible by construction rather than by
+	// every caller remembering to parse first.
+	for table, tr := range rules.Tables {
+		for col, strat := range tr.Columns {
+			if err := strat.Validated(); err != nil {
+				return nil, fmt.Errorf("redact: %s.%s: %w", table, col, err)
+			}
+		}
+	}
 	salt := make([]byte, 16)
 	if _, err := rand.Read(salt); err != nil {
 		return nil, fmt.Errorf("redact: salt: %w", err)
@@ -428,11 +449,22 @@ func strategyToSQLExpr(s Strategy, col, saltHex string) string {
 		return fmt.Sprintf("%s", quoteString(strings.TrimPrefix(string(s), "constant:")))
 	case strings.HasPrefix(string(s), "regex:"):
 		parts := strings.SplitN(string(s)[len("regex:"):], ":", 2)
-		if len(parts) != 2 {
-			return q
-		}
+		// Unreachable: Strategy.Validated rejects a regex without both
+		// halves, and both ParseRules and NewPlan run it. Assert rather
+		// than fall through, because the old fallback returned the
+		// column expression unchanged — the UPDATE would run, report
+		// success, and leave the PII in place.
+		invariant.Assert(len(parts) == 2,
+			"redact: regex strategy %q reached SQL generation without a replacement half; "+
+				"Strategy.Validated should have rejected it", s)
 		return fmt.Sprintf("regexp_replace(%s, %s, %s, 'g')", q, quoteString(parts[0]), quoteString(parts[1]))
 	}
+	// Same reasoning: an unknown strategy previously emitted the bare
+	// column, so a typo'd or future strategy name silently redacted
+	// nothing while the run reported success.
+	invariant.Assert(false,
+		"redact: unknown strategy %q reached SQL generation; Strategy.Validated should have "+
+			"rejected it", s)
 	return q
 }
 
