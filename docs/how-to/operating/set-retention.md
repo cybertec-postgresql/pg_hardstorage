@@ -48,6 +48,7 @@ each bucket's nominee at most once.
 retention:
   policy: simple
   keep_for: 30d        # keep every backup younger than this duration
+                       # (Go duration syntax plus `d` days / `w` weeks)
 ```
 
 Best when storage is cheap and you'd rather not reason about

@@ -41,6 +41,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/durationx"
 )
 
 // Schedule is a stateless predictor: given an instant, what is the
@@ -102,7 +104,11 @@ func Parse(s Spec) (Schedule, error) {
 
 	switch {
 	case s.Every != "":
-		d, err := time.ParseDuration(s.Every)
+		// durationx, not time.ParseDuration: `every: 1d` is the
+		// natural way to write a daily schedule, and an operator who
+		// has learned that `keep_for: 30d` works will write it. The
+		// stdlib parser rejects it with "unknown unit d" (issue #54).
+		d, err := durationx.Parse(s.Every)
 		if err != nil {
 			return nil, fmt.Errorf("schedule: every %q: %w", s.Every, err)
 		}

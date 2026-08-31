@@ -13,6 +13,31 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **`retention.keep_for` in `pg_hardstorage.yaml` rejected the `d` and
+  `w` units the documentation tells you to use** ([#54]). The CLI grew a
+  day/week-aware duration parser for [#52] — because its own help text
+  advertised `--keep-for 30d` and the flag refused it — but the YAML
+  loader kept calling `time.ParseDuration`. So `rotate --keep-for 3d`
+  worked while `keep_for: 3d` in the config did not:
+
+      retention.keep_for "7w": time: unknown unit "w" in duration "7w"
+
+  Four operator-facing documents show `keep_for: 30d`, so anyone
+  following them hit it. The agent logged `task.add_failed` at
+  **warning** and carried on, which meant retention silently stopped
+  running for that deployment rather than failing loudly.
+
+  The parser now lives in `internal/durationx` and is shared by the flag
+  path and the config path, so they cannot drift again — `internal/
+  schedule` could not import `internal/cli`, which is what made a shared
+  parser impossible before. `schedule.every` and `patroni.interval` take
+  the same parser: `every: 1d` is the natural way to write a daily
+  schedule and failed identically. Every value that parsed before parses
+  the same way; this only widens what is accepted.
+
+  [#54]: https://github.com/cybertec-postgresql/pg_hardstorage/issues/54
+  [#52]: https://github.com/cybertec-postgresql/pg_hardstorage/issues/52
+
 - **The Postgres job backend never pruned finished jobs, so a
   configured retention silently did nothing.** `JobRegistry` sets a 24h
   `terminalRetention` for every backend and its sweeper asks the backend

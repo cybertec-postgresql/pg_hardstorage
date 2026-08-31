@@ -60,6 +60,19 @@ deployments:
       keep_for: 30d
 ```
 
+### Duration values
+
+Every duration in this file — `retention.keep_for`, `schedule.every`,
+`patroni.interval` — accepts Go's duration syntax (`h`, `m`, `s`, and
+smaller) **plus** `d` for days and `w` for weeks, and combinations such
+as `1w2d`. Days are exactly 24 hours and weeks exactly 7 days; this is
+wall-clock arithmetic, so a retention window does not shift with DST.
+
+Before v1.3.5 the config loader accepted only Go's syntax while the
+equivalent command-line flags accepted `d`/`w`, so `keep_for: 30d` —
+the spelling shown above and in the operator guide — was rejected and
+the agent silently skipped that deployment's rotate task (issue #54).
+
 Once this file is in place, every invocation that operates on
 `prod` uses these defaults — you can run
 

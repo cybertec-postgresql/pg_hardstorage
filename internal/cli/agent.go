@@ -733,7 +733,10 @@ func buildRetentionPolicy(c config.RetentionConfig) (retention.Policy, error) {
 	case "simple":
 		dur := 30 * 24 * time.Hour
 		if c.KeepFor != "" {
-			parsed, err := time.ParseDuration(c.KeepFor)
+			// ParseDurationDays, not time.ParseDuration: the docs
+			// advertise `keep_for: 30d` in four places and the stdlib
+			// parser rejects it (issue #54).
+			parsed, err := ParseDurationDays(c.KeepFor)
 			if err != nil {
 				return nil, fmt.Errorf("retention.keep_for %q: %w", c.KeepFor, err)
 			}
@@ -1113,7 +1116,12 @@ func parsePatroniInterval(s string) (time.Duration, error) {
 	if strings.TrimSpace(s) == "" {
 		return 0, nil
 	}
-	return time.ParseDuration(s)
+	// Same parser as every other duration an operator writes in
+	// pg_hardstorage.yaml. A poll cadence in days is not a sensible
+	// value, but "unknown unit d" is not a sensible way to say so, and
+	// an operator who has learned that `keep_for: 30d` works will
+	// reasonably try it here.
+	return ParseDurationDays(s)
 }
 
 // patroniDSNFor returns a DSNFor closure that splices Patroni's
