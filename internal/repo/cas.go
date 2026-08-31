@@ -864,7 +864,26 @@ func (c *CAS) HasChunk(ctx context.Context, hash Hash) (bool, error) {
 	_, err := c.sp.Stat(ctx, ChunkKey(hash))
 	switch {
 	case err == nil:
-		c.markSeen(hash)
+		// Deliberately NOT markSeen. Every entry in the positive cache
+		// must mean "present AND readable by THIS CAS's DEK", because
+		// PutChunk's fast path returns Deduped straight out of it
+		// without consulting ensureAdoptable. Every other writer
+		// upholds that: the hint path and the ErrAlreadyExists path
+		// check adoptability first, a successful Put is our own bytes,
+		// and GetChunkBytes caches only after a verified read.
+		//
+		// A bare Stat proves presence, not readability. Caching on it
+		// would let a caller that asks "is this chunk here?" before
+		// writing prime the cache with a chunk written under a
+		// DIFFERENT KEKRef's DEK; the next PutChunk would dedup against
+		// it and commit a manifest referencing chunks it cannot
+		// decrypt — the backup exits 0 and fails at restore, which is
+		// precisely what the adopt guard exists to prevent, reached by
+		// another door. Nothing calls HasChunk today, so the door was
+		// shut by accident; this keeps it shut by construction.
+		//
+		// The cost of not caching is one extra Stat on a later
+		// reference, behind the IfNotExists Put backstop.
 		return true, nil
 	case errors.Is(err, storage.ErrNotFound):
 		return false, nil

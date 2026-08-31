@@ -40,6 +40,20 @@ keeps reading that version for at least 24 months after a successor lands.
   whose recorded segment size is not one PostgreSQL can have — the check
   `wal list` and the WAL inventory already applied.
 
+- **Hardening: `CAS.HasChunk` could prime the dedup cache past the
+  cross-DEK adopt guard.** `PutChunk`'s fast path returns "deduplicated"
+  straight out of the in-memory positive cache without re-checking that
+  the chunk is readable under this backup's DEK — sound only because
+  every writer that populates the cache checks adoptability first.
+  `HasChunk` did not: it cached on a bare `Stat`, which proves presence,
+  not readability. A caller asking "is this chunk here?" before writing
+  would have primed the cache with a chunk written under a different
+  KEKRef's DEK, and the next `PutChunk` would deduplicate against it —
+  committing a manifest referencing chunks it cannot decrypt, so the
+  backup exits 0 and fails only at restore. **No code path called
+  `HasChunk`, so no release was affected**; the door was shut by
+  accident rather than by design, and is now shut by construction.
+
 ### Security
 
 - **Repository object reads are now bounded in `internal/repo`,
