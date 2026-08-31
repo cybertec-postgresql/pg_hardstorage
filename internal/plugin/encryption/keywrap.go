@@ -94,8 +94,15 @@ func Unwrap(kek [KeyLen]byte, wrapped []byte) ([KeyLen]byte, error) {
 	return dek, nil
 }
 
-// GenerateDEK draws a 32-byte random key from crypto/rand. Convenience
-// for the runner, which generates a fresh DEK for every backup.
+// GenerateDEK draws a 32-byte random key from crypto/rand.
+//
+// Its one caller is sharedkey.ResolveOrMint, which mints a DEK ONCE per
+// (deployment, KEK) and every backup, WAL segment and logical CDC batch
+// under that KEKRef then reuses it — the plaintext-hash CAS deduplicates
+// across all three, so a second writer must be able to decrypt the
+// first's envelope (issue #28). An earlier version of this comment said
+// "the runner ... generates a fresh DEK for every backup", which
+// describes the behaviour that bug was about.
 func GenerateDEK() ([KeyLen]byte, error) {
 	var dek [KeyLen]byte
 	if _, err := rand.Read(dek[:]); err != nil {
