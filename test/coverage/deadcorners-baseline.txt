@@ -317,14 +317,6 @@ github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage/faultinjec
 github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage/faultinject/faultinject.go:350: Barrier
 github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage/faultinject/faultinject.go:355: Close
 github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage/s3/s3.go:104: Region
-github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage/throttle/throttle.go:271: Open
-github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage/throttle/throttle.go:299: List
-github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage/throttle/throttle.go:304: Delete
-github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage/throttle/throttle.go:311: RenameIfNotExists
-github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage/throttle/throttle.go:316: SetRetention
-github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage/throttle/throttle.go:322: Capabilities
-github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage/throttle/throttle.go:328: Barrier
-github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage/throttle/throttle.go:333: Close
 github.com/cybertec-postgresql/pg_hardstorage/internal/repo/cas.go:25: asArray
 github.com/cybertec-postgresql/pg_hardstorage/internal/repo/cas.go:355: WithRegistry
 github.com/cybertec-postgresql/pg_hardstorage/internal/repo/cas.go:383: WithEncryptionRegistry
