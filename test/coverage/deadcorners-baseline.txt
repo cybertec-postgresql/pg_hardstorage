@@ -2,7 +2,6 @@ github.com/cybertec-postgresql/pg_hardstorage/internal/agent/controlplane.go: Ex
 github.com/cybertec-postgresql/pg_hardstorage/internal/agent/controlplane.go: SetStderrSink
 github.com/cybertec-postgresql/pg_hardstorage/internal/agent/restore_executor.go: parsePositiveUint32
 github.com/cybertec-postgresql/pg_hardstorage/internal/agent/verify_executor.go: trimToTwoLines
-github.com/cybertec-postgresql/pg_hardstorage/internal/backup/chunker/fastcdc.go: Sizes
 github.com/cybertec-postgresql/pg_hardstorage/internal/backup/manifest_store.go: currentReplicaErrorLogger
 github.com/cybertec-postgresql/pg_hardstorage/internal/backup/manifest_store.go: Error
 github.com/cybertec-postgresql/pg_hardstorage/internal/backup/manifest_store.go: Error
