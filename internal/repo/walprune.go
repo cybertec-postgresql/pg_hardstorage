@@ -103,12 +103,29 @@ type WALPruneResult struct {
 	// when no floor was set.
 	KeepFloor string `json:"keep_floor,omitempty"`
 
-	SegmentsConsidered  int   `json:"segments_considered"`
-	SegmentsDeleted     int   `json:"segments_deleted"`
-	SegmentsKept        int   `json:"segments_kept"`
-	SegmentsKeptByFloor int   `json:"segments_kept_by_floor,omitempty"`
-	SegmentsFailed      int   `json:"segments_failed"`
-	BytesDeleted        int64 `json:"bytes_deleted"`
+	SegmentsConsidered  int `json:"segments_considered"`
+	SegmentsDeleted     int `json:"segments_deleted"`
+	SegmentsKept        int `json:"segments_kept"`
+	SegmentsKeptByFloor int `json:"segments_kept_by_floor,omitempty"`
+	SegmentsFailed      int `json:"segments_failed"`
+	// BytesDeleted is the sum of ChunkRef.Len over the pruned
+	// segments' manifests — i.e. the LOGICAL, plaintext size of the
+	// WAL those manifests referenced.
+	//
+	// It is not a measure of space reclaimed by this command, and the
+	// text renderer no longer implies that it is. Three reasons, each
+	// independent: this operation deletes segment MANIFESTS only (the
+	// chunks are `repo gc`'s job, so immediately after a prune those
+	// bytes are all still on disk); chunks are stored compressed and
+	// enveloped, so the on-disk figure is smaller than the plaintext
+	// one; and chunks are content-addressed and deduplicated, so a
+	// chunk still referenced by a live segment is never removed at
+	// all. An operator sizing a volume off this number would be
+	// over-estimating what a prune frees in all three directions.
+	//
+	// The field keeps its name and meaning under the 24-month schema
+	// commitment; what changed is that the rendering says what it is.
+	BytesDeleted int64 `json:"bytes_deleted"`
 
 	Failures []WALPruneFailure `json:"failures,omitempty"`
 }

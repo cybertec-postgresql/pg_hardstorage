@@ -13,6 +13,19 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **`wal prune` reported "Bytes deleted" for bytes it does not delete.**
+  The command removes WAL segment *manifests*; the chunks stay until
+  `repo gc` runs, so immediately after a prune every one of those bytes
+  is still on disk. The figure is also the plaintext sum of
+  `ChunkRef.Len`, while chunks are stored compressed and enveloped, and
+  chunks are content-addressed so one still referenced by a live segment
+  is never removed at all — the number over-stated the saving in three
+  independent directions while implying it had already happened. An
+  operator could decide not to expand a volume on the strength of it.
+  The `bytes_deleted` JSON field keeps its name and meaning under the
+  schema commitment and is now documented; the text output reports it as
+  logical WAL unreferenced, with the chunks still on disk.
+
 - **A corrupt WAL-gap record made the PITR gap pre-flight fail open.**
   `gapstate.List` skipped any gap object whose body would not parse and
   returned success, so `preflightWALGap` — the guard that refuses a

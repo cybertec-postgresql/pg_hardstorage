@@ -160,8 +160,17 @@ func (b walPruneBody) WriteText(w io.Writer) error {
 		fmt.Fprintf(bw, "  Kept by floor:   %d (newer than --keep-since cutoff)\n",
 			b.SegmentsKeptByFloor)
 	}
-	fmt.Fprintf(bw, "  Bytes %s: %s\n",
-		map[bool]string{true: "would-delete", false: "deleted     "}[b.DryRun],
+	// NOT "bytes deleted". This command removes segment manifests; the
+	// chunks stay until `repo gc` runs. The figure is also the
+	// plaintext sum of ChunkRef.Len, while chunks are stored
+	// compressed and enveloped and are deduplicated — so a chunk a
+	// live segment still references is never removed at all. Calling
+	// it "deleted" invited an operator to size a volume off a number
+	// that over-states the saving in three independent directions,
+	// and to believe the space was already back when nothing had been
+	// freed yet.
+	fmt.Fprintf(bw, "  WAL unreferenced: %s (logical size; the chunks are still on disk, and are "+
+		"compressed and deduplicated so `repo gc` will free less than this)\n",
 		humanBytes(b.BytesDeleted))
 	fmt.Fprintf(bw, "  Duration:        %d ms\n", b.DurationMS)
 	if b.SegmentsFailed > 0 {
