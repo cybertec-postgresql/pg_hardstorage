@@ -175,6 +175,18 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Security
 
+- **`threshold roster list` / `roster show` rendered a planted roster
+  identically to a legitimate one.** Both fetched without a trust
+  anchor, so a roster an attacker wrote into the repository — their own
+  keypair, their own members, their own threshold — displayed exactly
+  like one the operator created. Each entry now carries `trusted`, and
+  the text output labels it. Deliberately NOT fixed by anchoring the
+  fetch: `RosterStore.Get` fails for an untrusted roster and `List`
+  skips entries whose `Get` fails, so anchoring would have silently
+  omitted the planted roster from the very command an operator would use
+  to spot it. Showing it labelled is the useful behaviour; hiding it is
+  not. A regression test covers that specific wrong turn.
+
 - **`threshold attest show` reported "quorum met" under a roster the
   operator never created.** The three read paths that consult a roster
   are `attest sign`, `attest verify` and `attest show`. The first two

@@ -952,3 +952,90 @@ func TestThresholdAttestShow_TrustedRosterStillVerifies(t *testing.T) {
 			v.QuorumMet, v.ValidDistinct)
 	}
 }
+
+// A planted roster must be VISIBLE, not hidden and not normalised.
+//
+// Anchoring these display commands the way `attest show` is anchored
+// would be the wrong fix: RosterStore.Get fails on an untrusted roster
+// and List skips entries whose Get fails, so `roster list` would
+// silently omit the planted one — hiding the attack from the command an
+// operator would use to spot it. They fetch unanchored and label trust
+// per entry instead.
+func TestThresholdRosterList_MarksForgedRosterUntrusted(t *testing.T) {
+	w := newReadWorld(t)
+	mustCreateRosterLocal(t, w, "prod-admins", "Production")
+	plantForgedRoster(t, w, "forged")
+
+	stdout, _, exit := runCLI(t, "threshold", "roster", "list",
+		"--repo", w.repoURL, "-o", "json")
+	if exit != int(output.ExitOK) {
+		t.Fatalf("exit = %d\n%s", exit, stdout)
+	}
+	var v struct {
+		Entries []struct {
+			ID      string `json:"id"`
+			Trusted bool   `json:"trusted"`
+		} `json:"entries"`
+	}
+	bodyOf(t, stdout, &v)
+
+	byID := map[string]bool{}
+	for _, e := range v.Entries {
+		byID[e.ID] = e.Trusted
+	}
+	if _, listed := byID["forged"]; !listed {
+		t.Fatal("the planted roster was omitted from `roster list` — an operator has no way " +
+			"to discover it, which is worse than showing it unlabelled")
+	}
+	if byID["forged"] {
+		t.Error("the planted roster is reported as trusted; it was signed by a key this " +
+			"operator does not control")
+	}
+	if !byID["prod-admins"] {
+		t.Error("a roster this operator created is reported as untrusted")
+	}
+}
+
+func TestThresholdRosterShow_MarksForgedRosterUntrusted(t *testing.T) {
+	w := newReadWorld(t)
+	plantForgedRoster(t, w, "forged")
+
+	stdout, _, exit := runCLI(t, "threshold", "roster", "show", "forged",
+		"--repo", w.repoURL, "-o", "json")
+	if exit != int(output.ExitOK) {
+		t.Fatalf("show should still render the roster; exit = %d\n%s", exit, stdout)
+	}
+	var v struct {
+		ID        string `json:"id"`
+		Threshold int    `json:"threshold"`
+		Trusted   bool   `json:"trusted"`
+	}
+	bodyOf(t, stdout, &v)
+	if v.Trusted {
+		t.Error("`roster show` presented a roster created by an attacker's key as trusted — " +
+			"an operator reading its membership and threshold has no signal that the whole " +
+			"document is theirs to choose")
+	}
+	if v.ID != "forged" || v.Threshold != 1 {
+		t.Errorf("the roster itself should still be rendered for forensics: %+v", v)
+	}
+}
+
+// The honest case must keep reporting trusted, or the label is noise.
+func TestThresholdRosterShow_LocalRosterIsTrusted(t *testing.T) {
+	w := newReadWorld(t)
+	mustCreateRosterLocal(t, w, "prod-admins", "Production")
+
+	stdout, _, exit := runCLI(t, "threshold", "roster", "show", "prod-admins",
+		"--repo", w.repoURL, "-o", "json")
+	if exit != int(output.ExitOK) {
+		t.Fatalf("exit = %d\n%s", exit, stdout)
+	}
+	var v struct {
+		Trusted bool `json:"trusted"`
+	}
+	bodyOf(t, stdout, &v)
+	if !v.Trusted {
+		t.Error("a roster created by this operator's own key is reported untrusted")
+	}
+}

@@ -274,7 +274,7 @@ func runThresholdRosterCreate(cmd *cobra.Command, id string, f thresholdRosterCr
 			"roster_hash":  threshold.RosterHash(r),
 		},
 	})
-	body := rosterBody(r)
+	body := rosterBody(r, signer.PublicKey())
 	return d.Result(output.NewResult(cmd.CommandPath()).WithBody(body))
 }
 
@@ -300,6 +300,14 @@ func runThresholdRosterList(cmd *cobra.Command, repoURL string) error {
 		return err
 	}
 	defer sp.Close()
+	// Fetch UNANCHORED on purpose: an anchored Get fails for an
+	// untrusted roster and List skips it, which would hide a planted
+	// roster rather than surface it. Trust is reported per entry
+	// instead — this command is how an operator notices one.
+	signer, _, serr := loadSignerForThreshold()
+	if serr != nil {
+		return serr
+	}
 	rs, err := threshold.NewRosterStore(sp).List(cmd.Context())
 	if err != nil {
 		return output.NewError("threshold.list_failed",
@@ -307,7 +315,7 @@ func runThresholdRosterList(cmd *cobra.Command, repoURL string) error {
 	}
 	body := rosterListBody{Count: len(rs)}
 	for _, r := range rs {
-		body.Entries = append(body.Entries, *rosterBody(r))
+		body.Entries = append(body.Entries, *rosterBody(r, signer.PublicKey()))
 	}
 	return d.Result(output.NewResult(cmd.CommandPath()).WithBody(body))
 }
@@ -335,6 +343,12 @@ func runThresholdRosterShow(cmd *cobra.Command, repoURL, id string) error {
 		return err
 	}
 	defer sp.Close()
+	// Unanchored for the same reason as `roster list`: show the roster
+	// that is actually there, and label whether the operator created it.
+	signer, _, serr := loadSignerForThreshold()
+	if serr != nil {
+		return serr
+	}
 	r, err := threshold.NewRosterStore(sp).Get(cmd.Context(), id)
 	if err != nil {
 		if errors.Is(err, threshold.ErrRosterNotFound) {
@@ -344,7 +358,7 @@ func runThresholdRosterShow(cmd *cobra.Command, repoURL, id string) error {
 		return output.NewError("threshold.get_failed",
 			fmt.Sprintf("threshold roster show: %v", err)).Wrap(err)
 	}
-	return d.Result(output.NewResult(cmd.CommandPath()).WithBody(rosterBody(r)))
+	return d.Result(output.NewResult(cmd.CommandPath()).WithBody(rosterBody(r, signer.PublicKey())))
 }
 
 // ----- attest -----
@@ -711,9 +725,21 @@ type rosterView struct {
 	CreatedBy                   string             `json:"created_by"`
 	CreatorPublicKeyFingerprint string             `json:"creator_public_key_fingerprint"`
 	Hash                        string             `json:"hash"`
+
+	// Trusted reports whether this roster was created by the local
+	// operator's key. A roster an attacker wrote into the repository is
+	// self-consistent by construction — own keypair, own members, own
+	// threshold — so listing or showing it without this field renders
+	// it identically to one the operator created.
+	//
+	// The listing deliberately still INCLUDES untrusted rosters:
+	// anchoring the fetch would make RosterStore.Get fail and List skip
+	// them, which hides a planted roster instead of surfacing it. These
+	// commands are how an operator would notice one.
+	Trusted bool `json:"trusted"`
 }
 
-func rosterBody(r *threshold.Roster) *rosterView {
+func rosterBody(r *threshold.Roster, trusted ...ed25519.PublicKey) *rosterView {
 	v := &rosterView{
 		ID:                          r.ID,
 		Description:                 r.Description,
@@ -722,6 +748,7 @@ func rosterBody(r *threshold.Roster) *rosterView {
 		CreatedBy:                   r.CreatedBy,
 		CreatorPublicKeyFingerprint: r.CreatorPublicKeyFingerprint,
 		Hash:                        threshold.RosterHash(r),
+		Trusted:                     threshold.VerifyRosterTrusted(r, trusted...) == nil,
 	}
 	for _, m := range r.Members {
 		v.Members = append(v.Members, rosterMemberView{
@@ -747,6 +774,12 @@ func (v rosterView) WriteText(w io.Writer) error {
 	fmt.Fprintf(bw, "  Created at:  %s\n", v.CreatedAt.Format(time.RFC3339))
 	fmt.Fprintf(bw, "  Created by:  %s (%s)\n", v.CreatedBy, v.CreatorPublicKeyFingerprint)
 	fmt.Fprintf(bw, "  Hash:        %s\n", v.Hash)
+	if v.Trusted {
+		fmt.Fprintln(bw, "  Trust:       ✓ created by this operator's key")
+	} else {
+		fmt.Fprintln(bw, "  Trust:       ✗ NOT created by this operator's key — treat its "+
+			"membership and threshold as unverified")
+	}
 	fmt.Fprintln(bw, "  Members:")
 	tw := tabwriter.NewWriter(bw, 0, 4, 2, ' ', 0)
 	for _, m := range v.Members {
