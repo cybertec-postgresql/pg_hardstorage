@@ -9,7 +9,7 @@ on-disk and on-the-wire schema (backup manifests, configuration, output JSON,
 and the on-disk chunk envelope): an agent built against a given schema version
 keeps reading that version for at least 24 months after a successor lands.
 
-## [1.3.5] — 2026-08-31
+## [1.3.5] — 2026-09-01
 
 ### Fixed
 
@@ -174,6 +174,26 @@ keeps reading that version for at least 24 months after a successor lands.
   backup. Now sorted.
 
 ### Security
+
+- **`threshold attest show` reported "quorum met" under a roster the
+  operator never created.** The three read paths that consult a roster
+  are `attest sign`, `attest verify` and `attest show`. The first two
+  anchor the roster to the local operator key — `attest verify` even
+  carries the reasoning: *"a 'quorum met' verdict is only meaningful
+  under a roster this operator created. A forged roster (even one whose
+  signatures all check out against its own members) must not verify as
+  satisfied."* `attest show` computes and prints the same `quorum_met`
+  verdict and fetched its roster with no anchor at all. Someone able to
+  write to the repository plants a self-consistent roster — their own
+  keypair, themselves the sole member, threshold 1 — signs an
+  attestation under it, and the command an auditor runs to *check* the
+  attestation confirms it. `sign` and `verify` each had a forged-roster
+  test; `show` had none. It is now anchored like its siblings, and
+  because it is also a forensics tool it still renders — but marked
+  `roster_untrusted`, with every signature unverified and no verdict
+  claimed. Enforcement was never affected: the attestation gate that
+  actually blocks destructive operations always set the trust anchor.
+  This was the human-facing verification surface.
 
 - **Repository object reads are now bounded in `internal/repo`,
   `internal/wal/inventory`, `internal/wal/timeline` and

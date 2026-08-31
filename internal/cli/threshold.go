@@ -621,6 +621,16 @@ func newThresholdAttestShowCmd() *cobra.Command {
 
 func runThresholdAttestShow(cmd *cobra.Command, repoURL, kind, id string) error {
 	d := DispatcherFrom(cmd)
+	// Anchor the roster to the local operator key, exactly as `attest
+	// verify` does. This command computes and prints the SAME
+	// quorum_met verdict, and that verdict is only meaningful under a
+	// roster this operator created — a forged roster whose signatures
+	// all check out against its own members must not read as satisfied.
+	// The anchoring reasoning was applied to verify and missed here.
+	signer, _, err := loadSignerForThreshold()
+	if err != nil {
+		return err
+	}
 	_, sp, err := openRepo(cmd.Context(), repoURL)
 	if err != nil {
 		return err
@@ -636,15 +646,20 @@ func runThresholdAttestShow(cmd *cobra.Command, repoURL, kind, id string) error 
 		return output.NewError("threshold.load_failed",
 			fmt.Sprintf("threshold attest show: %v", err)).Wrap(err)
 	}
-	r, err := threshold.NewRosterStore(sp).Get(cmd.Context(), att.Header.RosterID)
+	r, err := threshold.NewRosterStore(sp).
+		WithTrustedKeys(signer.PublicKey()).
+		Get(cmd.Context(), att.Header.RosterID)
 	if err != nil {
-		// We still want to render the attestation even if the roster
-		// is missing — useful for forensics.  Mark every signature as
-		// "roster-unavailable".
+		// Still render the attestation — this command is useful for
+		// forensics precisely when something is wrong. But render it
+		// UNVERIFIED and claim no quorum: an untrusted roster is
+		// exactly the case where a verdict would be misleading rather
+		// than merely absent.
 		body := thresholdShowBody{
 			Header:          att.Header,
 			Signatures:      renderSignaturesUnverified(att.Signatures),
 			RosterAvailable: false,
+			RosterUntrusted: errors.Is(err, threshold.ErrRosterUntrusted),
 		}
 		return d.Result(output.NewResult(cmd.CommandPath()).WithBody(body))
 	}
@@ -835,6 +850,14 @@ type thresholdShowBody struct {
 	ValidDistinct   int                          `json:"valid_distinct,omitempty"`
 	QuorumMet       bool                         `json:"quorum_met"`
 	RosterAvailable bool                         `json:"roster_available"`
+
+	// RosterUntrusted is set when the roster exists but was not created
+	// by this operator's key. Signatures are then rendered unverified
+	// and no quorum verdict is claimed: a roster an attacker wrote is
+	// self-consistent by construction (they generate a keypair, name
+	// themselves the sole member, set threshold 1 and sign it), so
+	// "quorum met" under it means nothing.
+	RosterUntrusted bool `json:"roster_untrusted,omitempty"`
 }
 
 // WriteText renders the attestation header plus per-signature verification
@@ -854,6 +877,14 @@ func (b thresholdShowBody) WriteText(w io.Writer) error {
 			verdict = "✓ quorum met"
 		}
 		fmt.Fprintf(bw, "  Verdict:       %s\n", verdict)
+	} else if b.RosterUntrusted {
+		fmt.Fprintln(bw, "  ✗ Roster:      UNTRUSTED — present in the repo but not created by "+
+			"this operator's key")
+		fmt.Fprintln(bw, "                 No quorum verdict is shown. A roster an attacker "+
+			"wrote is self-consistent by")
+		fmt.Fprintln(bw, "                 construction — own keypair, sole member, threshold "+
+			"1 — so \"quorum met\" under it")
+		fmt.Fprintln(bw, "                 would mean nothing. Signatures below are UNVERIFIED.")
 	} else {
 		fmt.Fprintln(bw, "  Roster:        unavailable (skipping per-signature verification)")
 	}

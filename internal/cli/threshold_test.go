@@ -819,3 +819,136 @@ func mustSignAttestation(t *testing.T, w *readWorld, rosterID, kind, id, hash st
 
 // _ ensures encoding/json import lands even if no test directly uses it.
 var _ = stdjson.Marshal
+
+// plantForgedAttestation writes a forged roster AND a complete quorum
+// attestation under it — the full repo-write attacker setup, factored
+// out of TestThresholdAttestVerify_ForgedRosterRefused so the show path
+// can be held to the same standard.
+func plantForgedAttestation(t *testing.T, w *readWorld) {
+	t.Helper()
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	atk := bobSigner{pub: pub, priv: priv}
+	forged := threshold.NewRoster("forged", "forged", 1,
+		[]threshold.Member{threshold.NewMember("mallory@evil", pub)},
+		time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC))
+	if err := threshold.SignRoster(forged, atk, "mallory@evil"); err != nil {
+		t.Fatal(err)
+	}
+	if err := threshold.NewRosterStore(w.sp).Put(context.Background(), forged); err != nil {
+		t.Fatal(err)
+	}
+	subject := threshold.AttestationSubject{
+		Kind: "backup_manifest", ID: "db1.full.x", Hash: "deadbeef",
+	}
+	now := time.Date(2026, 6, 1, 13, 0, 0, 0, time.UTC)
+	sig, err := threshold.SignAttestation(subject, forged, atk, "", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	as := threshold.NewAttestationStore(w.sp)
+	if err := as.PutHeader(context.Background(), &threshold.AttestationHeader{
+		Schema: threshold.SchemaAttestationHeader, Subject: subject,
+		RosterID: forged.ID, RosterHash: threshold.RosterHash(forged),
+		Threshold: forged.Threshold, CreatedAt: now.Truncate(time.Second),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := as.PutSignature(context.Background(), sig); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestThresholdAttestShow_ForgedRosterClaimsNoQuorum closes the third
+// read path.
+//
+// `attest sign` and `attest verify` were both trust-anchored, each with
+// its own forged-roster test. `attest show` was not — and it computes
+// and prints the SAME quorum_met verdict:
+//
+//	body.QuorumMet = met >= r.Threshold
+//
+// against a roster fetched with no trust anchor. A repo-write attacker
+// plants a self-consistent roster — own keypair, sole member, threshold
+// 1 — signs an attestation under it, and `attest show` reported
+// "✓ quorum met". That is the command an auditor runs to CHECK, so the
+// wrong answer there is worse than no answer.
+//
+// Show still renders (it is a forensics tool, useful precisely when
+// something is wrong), but unverified and with no verdict.
+func TestThresholdAttestShow_ForgedRosterClaimsNoQuorum(t *testing.T) {
+	w := newReadWorld(t)
+	plantForgedAttestation(t, w)
+
+	stdout, _, exit := runCLI(t, "threshold", "attest", "show",
+		"backup_manifest", "db1.full.x",
+		"--repo", w.repoURL, "-o", "json")
+	if exit != int(output.ExitOK) {
+		t.Fatalf("show should still render for forensics; exit = %d\n%s", exit, stdout)
+	}
+	var v struct {
+		QuorumMet       bool `json:"quorum_met"`
+		RosterAvailable bool `json:"roster_available"`
+		RosterUntrusted bool `json:"roster_untrusted"`
+		Signatures      []struct {
+			Valid bool `json:"valid"`
+		} `json:"signatures"`
+	}
+	bodyOf(t, stdout, &v)
+
+	if v.QuorumMet {
+		t.Error("`attest show` reported quorum MET under a roster this operator did not " +
+			"create — an attacker who can write to the repo plants a roster naming only " +
+			"themselves with threshold 1, and the command an auditor runs to check the " +
+			"attestation confirms it")
+	}
+	if !v.RosterUntrusted {
+		t.Error("the untrusted roster was not flagged; an operator reading this output has " +
+			"no way to tell it apart from a missing roster")
+	}
+	if v.RosterAvailable {
+		t.Error("an untrusted roster must not be reported as available for verification")
+	}
+	for i, s := range v.Signatures {
+		if s.Valid {
+			t.Errorf("signature %d rendered VALID against an untrusted roster", i)
+		}
+	}
+}
+
+// The honest case must be unaffected: a roster this operator created
+// still yields a real verdict, or the fix would have broken the command.
+func TestThresholdAttestShow_TrustedRosterStillVerifies(t *testing.T) {
+	w := newReadWorld(t)
+	mustCreateRosterLocal(t, w, "prod-admins", "Production")
+	if _, _, exit := runCLI(t, "threshold", "attest", "sign",
+		"backup_manifest", "db1.full.ok",
+		"--repo", w.repoURL, "--hash", "deadbeef",
+		"--roster", "prod-admins", "-o", "json"); exit != int(output.ExitOK) {
+		t.Fatalf("sign exit = %d", exit)
+	}
+
+	stdout, _, exit := runCLI(t, "threshold", "attest", "show",
+		"backup_manifest", "db1.full.ok",
+		"--repo", w.repoURL, "-o", "json")
+	if exit != int(output.ExitOK) {
+		t.Fatalf("exit = %d\n%s", exit, stdout)
+	}
+	var v struct {
+		QuorumMet       bool `json:"quorum_met"`
+		RosterAvailable bool `json:"roster_available"`
+		RosterUntrusted bool `json:"roster_untrusted"`
+		ValidDistinct   int  `json:"valid_distinct"`
+	}
+	bodyOf(t, stdout, &v)
+	if !v.RosterAvailable || v.RosterUntrusted {
+		t.Errorf("a locally-created roster must verify normally: available=%v untrusted=%v",
+			v.RosterAvailable, v.RosterUntrusted)
+	}
+	if !v.QuorumMet || v.ValidDistinct != 1 {
+		t.Errorf("quorum should be met by the operator's own signature: met=%v distinct=%d",
+			v.QuorumMet, v.ValidDistinct)
+	}
+}
