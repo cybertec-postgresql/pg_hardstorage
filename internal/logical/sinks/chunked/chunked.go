@@ -288,14 +288,92 @@ func (s *Sink) commitManifest(ctx context.Context, m *SegmentManifest) error {
 	}
 	if err := storage.CommitExclusive(ctx, s.sp, key, body, putOpts); err != nil {
 		if errors.Is(err, storage.ErrAlreadyExists) {
-			// Idempotent: a previous flush at this start_lsn
-			// already committed this batch. Chunks deduplicated
-			// naturally; the existing manifest is correct.
-			return nil
+			return s.reconcileExisting(ctx, key, m)
 		}
 		return fmt.Errorf("chunked: commit manifest: %w", err)
 	}
 	return nil
+}
+
+// reconcileExisting decides whether an ErrAlreadyExists at this batch's
+// key is genuinely idempotent.
+//
+// It is idempotent only when the manifest already there covers AT LEAST
+// what we were about to commit. That used to be assumed:
+//
+//	// Idempotent: a previous flush at this start_lsn
+//	// already committed this batch. ... the existing manifest is
+//	// correct.
+//
+// CommitExclusive makes a single attempt and never retries, so
+// ErrAlreadyExists means an EARLIER flush put that key there — and
+// between the two the stream kept delivering. flushLocked keeps the
+// buffer and startLSN on error (correct: retry later), so the retry's
+// batch has the same start_lsn but MORE records and a higher end_lsn.
+// Treating that as idempotent made flushLocked advance syncedLSN to the
+// new end and drop the buffer, while the manifest on disk covered only
+// the earlier, shorter batch. The records in between were left in the
+// CAS referenced by nothing — gc reaps them — and the slot's
+// confirmed_flush_lsn moved past them so PG released the WAL. Silent
+// loss, reported as success.
+//
+// The trigger is ordinary for object storage: a PUT that lands
+// server-side and then fails on the response.
+//
+// When the coverage is short we refuse and keep everything: the buffer
+// stays, syncedLSN does not move, nothing is dropped. That stalls the
+// stream rather than losing from it, which is the right way round, and
+// the error says what to do. We cannot instead commit just the
+// uncovered tail: a logical record's end_lsn is WALStart+len(Data), a
+// synthetic value, so buffer offsets do not map back to LSNs and the
+// batch cannot be split at the boundary.
+func (s *Sink) reconcileExisting(ctx context.Context, key string, m *SegmentManifest) error {
+	existing, err := s.readSegmentManifest(ctx, key)
+	if err != nil {
+		return fmt.Errorf("chunked: a manifest already exists at %s and could not be read to "+
+			"confirm it covers this batch; refusing to treat the collision as idempotent "+
+			"(that would drop the buffered records): %w", key, err)
+	}
+	haveEnd, herr := pglogrepl.ParseLSN(existing.EndLSN)
+	wantEnd, werr := pglogrepl.ParseLSN(m.EndLSN)
+	if herr != nil || werr != nil {
+		return fmt.Errorf("chunked: a manifest already exists at %s with an unparseable "+
+			"end_lsn (have %q, want %q); refusing to treat the collision as idempotent",
+			key, existing.EndLSN, m.EndLSN)
+	}
+	if haveEnd >= wantEnd {
+		// Genuinely idempotent: the same batch, or a superset of it,
+		// is already committed. Chunks are content-addressed, so the
+		// ones we just wrote are the same objects.
+		return nil
+	}
+	return fmt.Errorf("chunked: the manifest at %s covers only up to %s (%d records) but this "+
+		"batch reaches %s (%d records) — an earlier commit landed without being acknowledged "+
+		"and the stream has advanced since. Refusing to report success: doing so would drop "+
+		"the %d uncovered record(s) from the archive and move the slot past them. The "+
+		"buffered records are retained and syncedLSN is unchanged. Resolve by removing the "+
+		"short manifest at %s once you have confirmed it is a lost-acknowledgement artefact, "+
+		"then the full batch commits on the next flush",
+		key, existing.EndLSN, existing.Records, m.EndLSN, m.Records,
+		m.Records-existing.Records, key)
+}
+
+// readSegmentManifest reads and decodes the segment manifest at key.
+func (s *Sink) readSegmentManifest(ctx context.Context, key string) (*SegmentManifest, error) {
+	rc, err := s.sp.Get(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	defer rc.Close()
+	body, err := storage.ReadAllLimited(rc, storage.MaxMetadataBytes)
+	if err != nil {
+		return nil, err
+	}
+	var out SegmentManifest
+	if err := json.Unmarshal(body, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
 }
 
 // SegmentPath is the canonical repo key for a logical-stream batch.

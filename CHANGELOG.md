@@ -13,6 +13,26 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **The logical CDC sink could silently drop records after an
+  unacknowledged commit.** `commitManifest` treated `ErrAlreadyExists`
+  at a batch's key as proof the batch was already archived
+  ("Idempotent: a previous flush at this start_lsn already committed
+  this batch"). `CommitExclusive` makes a single attempt and never
+  retries, so that collision means an *earlier* flush wrote the key —
+  and the stream kept delivering in between. Because a failed flush
+  correctly retains its buffer and `start_lsn`, the retry carried the
+  same start with **more** records; the collision was reported as
+  success, `syncedLSN` advanced to the new end, and the buffer was
+  dropped. The uncovered records were left in the CAS referenced by no
+  manifest (so `repo gc` reaps them) while the slot's
+  `confirmed_flush_lsn` moved past them and PostgreSQL released the WAL
+  — gone from the archive, reported as archived. The trigger is ordinary
+  for object storage: a PUT that lands server-side then fails on the
+  response. The sink now confirms the existing manifest covers at least
+  this batch before accepting the collision, and otherwise refuses
+  without advancing `syncedLSN` or dropping the buffer — a visible stall
+  instead of silent loss.
+
 - **Chain protection skipped unparseable manifests, so deleting a
   backup could orphan a live incremental.** The snapshot that answers
   "would tombstoning X orphan anything?" reads every live manifest's
