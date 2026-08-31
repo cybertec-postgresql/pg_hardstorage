@@ -160,6 +160,11 @@ func (b walPruneBody) WriteText(w io.Writer) error {
 		fmt.Fprintf(bw, "  Kept by floor:   %d (newer than --keep-since cutoff)\n",
 			b.SegmentsKeptByFloor)
 	}
+	if b.SegmentsKeptByUnknownAge > 0 {
+		fmt.Fprintf(bw, "  ⚠ Unknown age:   %d segment(s) had no usable created_at and were kept "+
+			"rather than deleted — the keep-floor cannot be evaluated for them; inspect those "+
+			"segment manifests\n", b.SegmentsKeptByUnknownAge)
+	}
 	// NOT "bytes deleted". This command removes segment manifests; the
 	// chunks stay until `repo gc` runs. The figure is also the
 	// plaintext sum of ChunkRef.Len, while chunks are stored

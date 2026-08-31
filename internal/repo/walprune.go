@@ -106,7 +106,16 @@ type WALPruneResult struct {
 	SegmentsDeleted     int `json:"segments_deleted"`
 	SegmentsKept        int `json:"segments_kept"`
 	SegmentsKeptByFloor int `json:"segments_kept_by_floor,omitempty"`
-	SegmentsFailed      int `json:"segments_failed"`
+
+	// SegmentsKeptByUnknownAge counts the subset of SegmentsKeptByFloor
+	// retained because the manifest carried no usable created_at — we
+	// could not prove the segment predates the keep-floor, so it stayed.
+	// Reported separately because it is a signal about the REPOSITORY
+	// (legacy or damaged segment manifests), not about retention policy:
+	// an operator watching prune stop reclaiming space deserves the
+	// reason rather than having to infer it.
+	SegmentsKeptByUnknownAge int `json:"segments_kept_by_unknown_age,omitempty"`
+	SegmentsFailed           int `json:"segments_failed"`
 	// BytesDeleted is the sum of ChunkRef.Len over the pruned
 	// segments' manifests — i.e. the LOGICAL, plaintext size of the
 	// WAL those manifests referenced.
@@ -298,15 +307,36 @@ func WALPrune(ctx context.Context, sp storage.StoragePlugin, opts WALPruneOption
 				continue
 			}
 
-			// Time-floor: if KeepFloorTime is set and the segment's
-			// CreatedAt is at-or-after the floor, keep it.
-			if !opts.KeepFloorTime.IsZero() && !mani.CreatedAt.IsZero() &&
-				!mani.CreatedAt.Before(opts.KeepFloorTime) {
+			// Time-floor: if KeepFloorTime is set, keep the segment
+			// unless we can PROVE it predates the floor.
+			//
+			// An unknown CreatedAt — a legacy manifest without the
+			// field, or one whose producer renamed the tag — used to
+			// skip this branch entirely, so `--keep-since 7d` silently
+			// stopped protecting anything and the LSN rule deleted WAL
+			// the operator had explicitly asked to retain. Unknown means
+			// unknown: we cannot show the segment is older than the
+			// floor, so it stays.
+			//
+			// This is the posture gc already takes on the same kind of
+			// decision — "When ModTime is the zero value (backend
+			// doesn't expose it) we conservatively treat the tombstone
+			// as YOUNG (still in grace) so silent data loss is
+			// impossible". Two deletion paths in one repository must not
+			// disagree about which way an unknown timestamp rounds.
+			if !opts.KeepFloorTime.IsZero() &&
+				(mani.CreatedAt.IsZero() || !mani.CreatedAt.Before(opts.KeepFloorTime)) {
 				res.SegmentsKept++
 				res.SegmentsKeptByFloor++
-				emitWALPruneProgress(opts, segName, "kept",
-					fmt.Sprintf("CreatedAt %s >= keep-floor %s",
-						mani.CreatedAt.Format(time.RFC3339), opts.KeepFloorTime.Format(time.RFC3339)))
+				reason := fmt.Sprintf("CreatedAt %s >= keep-floor %s",
+					mani.CreatedAt.Format(time.RFC3339), opts.KeepFloorTime.Format(time.RFC3339))
+				if mani.CreatedAt.IsZero() {
+					res.SegmentsKeptByUnknownAge++
+					reason = fmt.Sprintf("CreatedAt unknown; keeping under the %s keep-floor "+
+						"rather than deleting WAL we cannot prove is old",
+						opts.KeepFloorTime.Format(time.RFC3339))
+				}
+				emitWALPruneProgress(opts, segName, "kept", reason)
 				continue
 			}
 

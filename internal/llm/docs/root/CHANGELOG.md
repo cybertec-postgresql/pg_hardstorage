@@ -13,6 +13,20 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **`wal prune --keep-since` silently protected nothing when a segment
+  manifest had no `created_at`.** The keep-floor answers "is this
+  segment newer than the operator's cutoff?" from the manifest's
+  `created_at`; an unknown timestamp skipped the branch entirely, so the
+  LSN rule went ahead and deleted WAL the operator had explicitly asked
+  to retain. `repo gc` already decided which way an unknown timestamp
+  rounds, in the same repository for the same kind of decision — "When
+  ModTime is the zero value (backend doesn't expose it) we
+  conservatively treat the tombstone as YOUNG ... so silent data loss is
+  impossible" — and the two deletion paths disagreed. Unknown now means
+  kept, and the new `segments_kept_by_unknown_age` counter (additive)
+  plus a text-output warning tell an operator why prune stopped
+  reclaiming space instead of leaving them to infer it.
+
 - **A corrupt `segment_size` in a WAL manifest crashed the commands
   that read it.** `SegmentsPerLog` is `4 GiB / segment_size`, and
   `SegmentFileName` takes `segNum % SegmentsPerLog(...)`. PostgreSQL
