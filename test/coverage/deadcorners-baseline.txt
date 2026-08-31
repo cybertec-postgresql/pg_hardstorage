@@ -309,13 +309,6 @@ github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/sink/teams/teams.g
 github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/sink/teams/teams.go:92: Open
 github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/sink/webhook/webhook.go:116: Name
 github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage/azblob/azblob.go:593: accountNameFromURL
-github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage/faultinject/faultinject.go:271: Open
-github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage/faultinject/faultinject.go:295: Stat
-github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage/faultinject/faultinject.go:326: RenameIfNotExists
-github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage/faultinject/faultinject.go:334: SetRetention
-github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage/faultinject/faultinject.go:343: Capabilities
-github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage/faultinject/faultinject.go:350: Barrier
-github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage/faultinject/faultinject.go:355: Close
 github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage/s3/s3.go:104: Region
 github.com/cybertec-postgresql/pg_hardstorage/internal/repo/cas.go:25: asArray
 github.com/cybertec-postgresql/pg_hardstorage/internal/repo/cas.go:554: HexHash
