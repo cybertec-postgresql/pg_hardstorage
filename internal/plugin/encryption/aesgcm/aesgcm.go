@@ -1,33 +1,61 @@
 // Package aesgcm implements encryption.Encryptor with AES-256-GCM.
 //
-// Every Encrypt call draws a fresh 96-bit nonce from crypto/rand. The
-// AES-GCM nonce-uniqueness invariant therefore holds with
-// overwhelming probability up to ~2^32 messages per key (NIST's
-// recommendation; we never approach that bound for a single backup's
-// chunks even at 100+ TB scale).
+// Every Encrypt call draws a fresh 96-bit nonce from crypto/rand.
+// nonce_test.go pins that: GCM has NO nonce-misuse resistance, so a
+// reused nonce under one key leaks the XOR of the plaintexts and yields
+// the authentication subkey, allowing tag forgery. It is catastrophic,
+// not degraded.
 //
 // AEAD authentication: the 16-byte GCM tag is appended to the
 // ciphertext by Encrypt and consumed by Decrypt. A failed tag check
 // surfaces as encryption.ErrAuthenticationFailed.
 //
-// Why AES-GCM and not AES-GCM-SIV (the spec's preferred default)?
+// # How many messages one key may encrypt
 //
-//   - GCM-SIV (RFC 8452) provides nonce-misuse resistance — accidental
-//     nonce reuse degrades only the affected messages rather than
-//     leaking the key. That property is valuable, but Go's standard
-//     library doesn't ship a GCM-SIV implementation. The third-party
-//     options we'd vendor are small but unaudited; for a v0.1 we
-//     prefer the stdlib path.
+// The DEK is NOT per backup. internal/repo/sharedkey mints one shared
+// DEK per (deployment, KEK) and every base backup, WAL segment and
+// logical CDC batch under that KEKRef reuses it — and `kms rotate`
+// re-wraps that same DEK rather than replacing it (replacing it would
+// strand chunks the plaintext-hash CAS deduplicates against). So the
+// relevant count is every chunk ever encrypted in the repository, for
+// its whole life, not one backup's.
 //
-//   - With crypto/rand-derived nonces, the practical risk of nonce
-//     reuse is essentially zero (birthday bound at 2^48 per key for
-//     96-bit nonces). The spec's GCM-SIV preference is a defence-
-//     in-depth measure, not a correctness requirement.
+// With random 96-bit nonces the collision probability after n
+// encryptions is about n^2 / 2^97:
 //
-// GCM-SIV ships alongside the AWS KMS plugin, behind an
-// algorithm-selection flag. v0.1 backups encrypted with AES-GCM
-// remain readable forever (24-month forward-compat commitment for
-// the on-disk envelope).
+//	n = 2^32   ~2^-33      NIST SP 800-38D's recommended ceiling for
+//	                       random IVs; ~256 TiB of unique post-dedup
+//	                       data at the 64 KiB default chunk average
+//	n = 2^43.5 ~2^-10      ~768 PiB of unique data
+//	n = 2^48   ~1/2        the birthday point — catastrophic
+//
+// The margin is large even against a repository-lifetime key, which is
+// why AES-GCM is acceptable here. Stating the numbers rather than the
+// conclusion so a reader can check it against their own scale: an
+// earlier version of this comment scoped the bound to "a single
+// backup's chunks", which is the wrong denominator for a shared DEK,
+// and cited 2^48 as the reassuring figure when 2^48 is the point at
+// which collision is roughly even money.
+//
+// Nothing counts encryptions per DEK. At the volumes above that is a
+// defensible omission, not an oversight — but it is an omission, and a
+// deployment that concentrates many large clusters under one KEKRef
+// shortens the denominator.
+//
+// # Why AES-GCM and not AES-GCM-SIV
+//
+// GCM-SIV (RFC 8452) is nonce-misuse resistant and is the SPEC's
+// preferred default, but Go's standard library does not ship it and the
+// third-party options are unaudited. It is NOT implemented in this
+// codebase: encryption.AlgorithmID registers only AlgoNone and
+// AlgoAESGCM. The operator-facing docs describe it correctly as
+// planned; an earlier version of this comment claimed it already
+// shipped "behind an algorithm-selection flag", which was untrue and
+// contradicted every other document.
+//
+// v0.1 backups encrypted with AES-GCM remain readable forever (the
+// 24-month forward-compat commitment for the on-disk envelope), so
+// adding GCM-SIV later is additive.
 package aesgcm
 
 import (

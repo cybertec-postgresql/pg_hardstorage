@@ -37,8 +37,9 @@
 // promises.
 //
 // v0.1 ships AES-256-GCM with a random 96-bit nonce per chunk.
-// AES-256-GCM-SIV (RFC 8452, the spec's preferred default) requires
-// a third-party library; that and AWS KMS support are+.
+// AES-256-GCM-SIV (RFC 8452, the spec's preferred default) requires a
+// third-party library and is not implemented; only AlgoNone and
+// AlgoAESGCM are registered below.
 package encryption
 
 import (
