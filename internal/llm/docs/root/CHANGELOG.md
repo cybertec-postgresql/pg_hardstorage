@@ -9,6 +9,47 @@ on-disk and on-the-wire schema (backup manifests, configuration, output JSON,
 and the on-disk chunk envelope): an agent built against a given schema version
 keeps reading that version for at least 24 months after a successor lands.
 
+## [Unreleased]
+
+### Fixed
+
+- **`repo replicate` counted manifest-replica copy failures nowhere, so a
+  destination missing its entire disaster-recovery layer reported clean.**
+  Replica sidecars (`manifests/_replicas/<id>.manifest.json`) are copied
+  best-effort — a failure there is deliberately not a primary-replication
+  failure — but the failure was recorded only in the per-key `failures`
+  list, which is capped at 50. A run in which every sidecar failed
+  therefore reported `manifests_failed: 0` with 50 truncated entries,
+  and `repo replicate` printed `✓ replication clean` directly above
+  fifty failure lines, while the destination held zero manifest
+  replicas — the redundancy `repair manifest` recovers a corrupt primary
+  from. A new unbounded `manifest_replicas_failed` counter (additive;
+  existing fields keep their meaning) restores the documented posture
+  that only per-key detail is capped, and the text output now names what
+  was lost and states the true failure total instead of labelling a
+  truncated list "First 50 failure(s)".
+
+- **`approval status` no longer panics on a malformed approval record.**
+  The status table abbreviated an approver's key fingerprint with an
+  unguarded `KeyFingerprint[:12]`, but the Approvals slice is copied out
+  of the on-disk request verbatim — no signature filter, no field
+  validation — so a record whose `key_fingerprint` was shorter than 12
+  characters (a truncated write, a hand-edited file, an empty field)
+  crashed the command with an index-out-of-range. That is the command an
+  operator runs to find out why a request is not approved, so it has to
+  display the malformed record rather than die on it. Short fingerprints
+  now render in full and an absent one is named explicitly.
+
+- **`repair chunks` and `repair scrub` no longer drop their hash list
+  silently.** The human-readable renderer printed the hashes only when
+  there were 50 or fewer; past that it printed none and said nothing about
+  the omission. A repository with 51 missing chunks therefore showed
+  strictly *less* than one with 50 — the count, the words "this is a real
+  corruption", and no way to tell a withheld list from an absent one. Both
+  renderers now cap at 50 and state what they held back, pointing at
+  `--json` for the full list (which always carried it). `repair scrub`'s
+  mismatch list, previously uncapped, uses the same rendering.
+
 ## [1.3.4] — 2026-08-31
 
 ### Fixed
