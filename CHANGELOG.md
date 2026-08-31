@@ -105,6 +105,22 @@ keeps reading that version for at least 24 months after a successor lands.
   `HasChunk`, so no release was affected**; the door was shut by
   accident rather than by design, and is now shut by construction.
 
+- **`audit verify-bundle` decompressed an untrusted archive without any
+  bound.** The command is pointed at a file the operator *received* — an
+  auditor's copy, a partner's export, evidence attached to a ticket —
+  and it piped `gzip.NewReader` straight into `tar.NewReader`, read
+  every entry with an unbounded `io.ReadAll`, and held them all in a
+  map. A few-megabyte tarball expanding to hundreds of gigabytes, or one
+  carrying millions of tiny entries, exhausted the machine running the
+  verification. A path-traversal check was already present, so hostile
+  input had been considered; the size dimension had not. The
+  repo-bundle importer has carried entry-count, per-entry and
+  whole-bundle caps since input-validation audit #4 — this sibling path,
+  the one that takes files from outside, now has the same. The limit
+  rides on the *decompressed* stream rather than the file, because tar
+  headers are attacker-controlled and a file-size bound does not
+  constrain what a bomb expands to.
+
 ### Security
 
 - **Repository object reads are now bounded in `internal/repo`,

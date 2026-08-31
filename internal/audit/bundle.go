@@ -569,6 +569,22 @@ func publicKeyFingerprint(pub ed25519.PublicKey) string {
 	return hex.EncodeToString(sum[:8])
 }
 
+// Bounds on what VerifyBundle will decompress. An audit bundle holds a
+// fixed handful of files (events.ndjson, anchors.ndjson,
+// chain_proof.json, bundle.json, public_key.pem, README.md,
+// signature.sig), so these are generous ceilings rather than tuned
+// limits — high enough that no real bundle approaches them, finite
+// enough that a hostile one cannot exhaust the machine.
+//
+// The repo-bundle importer has carried equivalent caps since
+// input-validation audit #4; this path did not, and it is the one an
+// operator points at a file somebody else produced.
+const (
+	MaxBundleEntries          = 1024
+	MaxBundleEntryBytes int64 = 1 << 30 // 1 GiB
+	MaxBundleBytes      int64 = 4 << 30 // 4 GiB decompressed, whole bundle
+)
+
 // VerifyBundle reads + verifies a bundle.  Auditors run this to
 // reproduce the bundle's claims independently.
 //
@@ -593,9 +609,24 @@ func VerifyBundle(r io.Reader) (*BundleManifest, error) {
 		return nil, fmt.Errorf("audit: open gzip: %w", err)
 	}
 	defer gz.Close()
-	tr := tar.NewReader(gz)
+
+	// Bound the DECOMPRESSED stream, not the file on disk. This is the
+	// gzip-bomb guard: `audit verify-bundle` is pointed at a file the
+	// operator received — an auditor's copy, a partner's export — so a
+	// few-MB tarball that expands to hundreds of GB must fail rather
+	// than exhaust the machine. Tar headers cannot be trusted for this
+	// (hdr.Size is attacker-controlled), so the limit rides on actual
+	// bytes read. The +1 makes "at the limit" distinguishable from
+	// "over it" instead of truncating silently — and a silent
+	// truncation would be worse than a refusal here, since a short read
+	// changes the canonical signing input and would surface as a
+	// signature failure, pointing an operator at the wrong problem.
+	limited := io.LimitReader(gz, MaxBundleBytes+1)
+	tr := tar.NewReader(limited)
 
 	files := map[string][]byte{}
+	var total int64
+	entries := 0
 	for {
 		hdr, err := tr.Next()
 		if errors.Is(err, io.EOF) {
@@ -609,9 +640,24 @@ func VerifyBundle(r io.Reader) (*BundleManifest, error) {
 		if strings.Contains(hdr.Name, "..") || filepath.IsAbs(hdr.Name) {
 			return nil, fmt.Errorf("audit: bundle contains suspicious path %q", hdr.Name)
 		}
-		body, err := io.ReadAll(tr)
+		entries++
+		if entries > MaxBundleEntries {
+			return nil, fmt.Errorf("audit: bundle has more than %d entries; refusing to "+
+				"verify a bundle that could exhaust memory (a real audit bundle has a "+
+				"handful of files)", MaxBundleEntries)
+		}
+		body, err := io.ReadAll(io.LimitReader(tr, MaxBundleEntryBytes+1))
 		if err != nil {
 			return nil, fmt.Errorf("audit: tar read body %q: %w", hdr.Name, err)
+		}
+		if int64(len(body)) > MaxBundleEntryBytes {
+			return nil, fmt.Errorf("audit: bundle entry %q exceeds the %d-byte limit",
+				hdr.Name, MaxBundleEntryBytes)
+		}
+		total += int64(len(body))
+		if total > MaxBundleBytes {
+			return nil, fmt.Errorf("audit: bundle decompresses to more than %d bytes; "+
+				"refusing (decompression bomb or corrupt archive)", MaxBundleBytes)
 		}
 		files[hdr.Name] = body
 	}
