@@ -12,7 +12,6 @@ github.com/cybertec-postgresql/pg_hardstorage/internal/backup/tarsink/tarsink.go
 github.com/cybertec-postgresql/pg_hardstorage/internal/capacity/capacity.go: fitLinear
 github.com/cybertec-postgresql/pg_hardstorage/internal/capacity/capacity.go: sampleWindowSeconds
 github.com/cybertec-postgresql/pg_hardstorage/internal/chain/dot.go: sortedRootsByID
-github.com/cybertec-postgresql/pg_hardstorage/internal/chain/graph.go: removeChild
 github.com/cybertec-postgresql/pg_hardstorage/internal/chain/markdown.go: fallbackOrDash
 github.com/cybertec-postgresql/pg_hardstorage/internal/chain/markdown.go: severityWeight
 github.com/cybertec-postgresql/pg_hardstorage/internal/cli/agent.go: patroniDSNFor

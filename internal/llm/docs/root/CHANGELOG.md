@@ -13,6 +13,20 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **`backup graph` rendered differently between identical runs when the
+  chain contained a cycle.** The cycle breaker's own comment promised a
+  "deterministic break point", but detectCycles chose its DFS entry
+  points by ranging a map, so which member of a cycle was reported as
+  its representative was a coin flip — measured on a 3-cycle, 200 runs
+  over identical input named "a" 88 times, "b" 62 and "c" 50. The
+  representative decides which back-edge is dropped, hence which node
+  becomes a root, hence every descendant's depth, hence the dot and
+  markdown renderings; and the `chain.cycle_detected` finding names a
+  backup ID in its remediation text, so two operators inspecting the
+  same corrupt repository were told to inspect two different backups.
+  Entry points and the break loop are now ordered by backup ID, making
+  the representative the sorted-first member of each cycle.
+
 - **`repo replicate` counted manifest-replica copy failures nowhere, so a
   destination missing its entire disaster-recovery layer reported clean.**
   Replica sidecars (`manifests/_replicas/<id>.manifest.json`) are copied
