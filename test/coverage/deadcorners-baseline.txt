@@ -23,9 +23,8 @@ github.com/cybertec-postgresql/pg_hardstorage/internal/cli/agent.go:110: runAgen
 github.com/cybertec-postgresql/pg_hardstorage/internal/cli/agent.go:1132: patroniDSNFor
 github.com/cybertec-postgresql/pg_hardstorage/internal/cli/approval.go:620: WriteText
 github.com/cybertec-postgresql/pg_hardstorage/internal/cli/approval.go:645: WriteText
-github.com/cybertec-postgresql/pg_hardstorage/internal/cli/approval.go:680: WriteText
-github.com/cybertec-postgresql/pg_hardstorage/internal/cli/approval.go:725: WriteText
-github.com/cybertec-postgresql/pg_hardstorage/internal/cli/approval.go:751: WriteText
+github.com/cybertec-postgresql/pg_hardstorage/internal/cli/approval.go:748: WriteText
+github.com/cybertec-postgresql/pg_hardstorage/internal/cli/approval.go:774: WriteText
 github.com/cybertec-postgresql/pg_hardstorage/internal/cli/audit_export.go:363: WriteText
 github.com/cybertec-postgresql/pg_hardstorage/internal/cli/audit.go:652: WriteText
 github.com/cybertec-postgresql/pg_hardstorage/internal/cli/audit.go:677: WriteText

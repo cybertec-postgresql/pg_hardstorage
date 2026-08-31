@@ -677,6 +677,29 @@ type approvalStatusBody struct {
 
 // WriteText renders the request status, including each recorded approval, as
 // human-readable text to w.
+// shortFingerprint abbreviates an approver key fingerprint for the
+// status table.
+//
+// The abbreviation used to be an unguarded a.KeyFingerprint[:12], but
+// the Approvals slice is copied verbatim out of the on-disk request —
+// no signature filter, no length check — so an approval record whose
+// key_fingerprint is shorter than 12 characters (a truncated write, a
+// hand-edited file, an empty field) panicked `approval status` with an
+// index-out-of-range. That is the command an operator runs to find out
+// why a request is not approved; it has to be able to display the
+// malformed record rather than die on it.
+func shortFingerprint(fp string) string {
+	const shown = 12
+	switch {
+	case fp == "":
+		return "(no key fingerprint)"
+	case len(fp) <= shown:
+		return fp
+	default:
+		return fp[:shown] + "…"
+	}
+}
+
 func (b approvalStatusBody) WriteText(w io.Writer) error {
 	bw := &strings.Builder{}
 	fmt.Fprintf(bw, "approval %s\n", b.ID)
@@ -696,7 +719,7 @@ func (b approvalStatusBody) WriteText(w io.Writer) error {
 		for _, a := range b.Approvals {
 			id := a.Approver
 			if id == "" {
-				id = a.KeyFingerprint[:12] + "…"
+				id = shortFingerprint(a.KeyFingerprint)
 			}
 			fmt.Fprintf(tw, "    %s\t%s\t%s\n", a.At.Format(time.RFC3339), id, a.Reason)
 		}

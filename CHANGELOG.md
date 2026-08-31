@@ -13,6 +13,17 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **`approval status` no longer panics on a malformed approval record.**
+  The status table abbreviated an approver's key fingerprint with an
+  unguarded `KeyFingerprint[:12]`, but the Approvals slice is copied out
+  of the on-disk request verbatim — no signature filter, no field
+  validation — so a record whose `key_fingerprint` was shorter than 12
+  characters (a truncated write, a hand-edited file, an empty field)
+  crashed the command with an index-out-of-range. That is the command an
+  operator runs to find out why a request is not approved, so it has to
+  display the malformed record rather than die on it. Short fingerprints
+  now render in full and an absent one is named explicitly.
+
 - **`repair chunks` and `repair scrub` no longer drop their hash list
   silently.** The human-readable renderer printed the hashes only when
   there were 50 or fewer; past that it printed none and said nothing about
