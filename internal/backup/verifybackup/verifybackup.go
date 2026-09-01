@@ -115,6 +115,22 @@ func (f *pgManifestFile) resolvePath() (string, error) {
 // missing the verifybackup defence layer.
 var ErrNoManifest = errors.New("verifybackup: no PG backup_manifest captured (pre-backup?)")
 
+// ErrEmptyManifest signals a backup_manifest that parses and declares a
+// version but lists no files.
+//
+// This is refused rather than passed, because passing it is the one
+// outcome that must never happen here: Verify's whole loop is over
+// m.Files, so a zero-file manifest returns FilesChecked=0 with no error
+// and the caller emits "verifybackup_ok". A restore's only in-process
+// integrity gate would report success having hashed nothing.
+//
+// No real cluster produces one — a PG datadir's manifest lists hundreds
+// of files — so a manifest in this shape means whatever wrote it is
+// broken. On the chain path that writer is the pg_combinebackup we just
+// ran, and catching a merge that produced nonsense is exactly what the
+// gate is for.
+var ErrEmptyManifest = errors.New("verifybackup: backup_manifest lists no files; nothing to verify")
+
 // Result summarises what was checked.  Returned even on
 // error so callers can record progress in the audit log.
 type Result struct {
@@ -143,6 +159,9 @@ func Verify(ctx context.Context, manifestBytes []byte, dataDir string) (*Result,
 	}
 	if m.Version == 0 {
 		return nil, errors.New("verifybackup: backup_manifest has no PostgreSQL-Backup-Manifest-Version field")
+	}
+	if len(m.Files) == 0 {
+		return nil, ErrEmptyManifest
 	}
 
 	res := &Result{}

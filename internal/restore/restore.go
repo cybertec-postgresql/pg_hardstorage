@@ -679,6 +679,16 @@ func Restore(ctx context.Context, opts Options) (res *Result, err error) {
 				WithBody(map[string]any{
 					"reason": "backup pre-dates Manifest.PGBackupManifest field; in-process verifybackup unavailable",
 				}))
+		} else if errors.Is(err, verifybackup.ErrEmptyManifest) {
+			// Deliberately a failure, not a skip. An absent manifest is
+			// a legacy backup; a manifest that PARSES and lists nothing
+			// is a broken one, and letting it through would emit
+			// "verifybackup_ok" over a gate that hashed zero files.
+			return nil, output.NewError("restore.verifybackup_empty_manifest",
+				fmt.Sprintf("restore: %v", err)).Wrap(err).
+				WithSuggestion(&output.Suggestion{
+					Human: "the backup's captured PG backup_manifest lists no files, so the restore's integrity gate cannot check anything. Verify the source backup (`pg_hardstorage verify <deployment> <backup-id>`) before trusting this datadir.",
+				})
 		} else {
 			return nil, output.NewError("restore.verifybackup_failed",
 				fmt.Sprintf("restore: %v", err)).Wrap(err)
@@ -1969,6 +1979,17 @@ func restoreIncrementalChain(ctx context.Context, opts Options, sp storage.Stora
 				emit(output.NewEvent(output.SeverityNotice, "restore", "verifybackup_skipped_no_manifest").
 					WithSubject(output.Subject{Deployment: leaf.Deployment, BackupID: leaf.BackupID}).
 					WithBody(map[string]any{"reason": "merged output has no backup_manifest; in-process verifybackup unavailable"}))
+			} else if errors.Is(vberr, verifybackup.ErrEmptyManifest) {
+				// pg_combinebackup wrote this manifest moments ago,
+				// describing the datadir it just produced. If it lists
+				// no files the merge is broken, which is precisely what
+				// this gate exists to catch — so it fails rather than
+				// reporting "verifybackup_ok, 0 files checked".
+				return nil, output.NewError("restore.verifybackup_empty_manifest",
+					fmt.Sprintf("restore chain: %v", vberr)).Wrap(vberr).
+					WithSuggestion(&output.Suggestion{
+						Human: "pg_combinebackup produced a backup_manifest listing no files, so the merged datadir could not be verified. Do not start PostgreSQL against it; re-run the chain restore and check the pg_combinebackup version and stderr.",
+					})
 			} else {
 				return nil, output.NewError("restore.verifybackup_failed",
 					fmt.Sprintf("restore chain: %v", vberr)).Wrap(vberr)

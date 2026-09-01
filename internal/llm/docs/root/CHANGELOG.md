@@ -13,6 +13,33 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **A restore's integrity gate reported success after checking zero
+  files.** `verifybackup.Verify` is a loop over the PG
+  `backup_manifest`'s file list, so a manifest that parses, carries a
+  version and lists no files ran to completion with
+  `files_checked: 0` and no error — and both restore call sites turned
+  that into a `verifybackup_ok` event. The restore's only in-process
+  integrity check announced a pass over a datadir it had never opened.
+
+  The reachable path is the chain restore. It reads `backup_manifest`
+  from `pg_combinebackup`'s *output* — a file written by an external
+  tool during that very run, not a signed artefact — and the gate's job
+  is stated as "catching a missing / truncated / corrupted file the
+  merge produced". A merge broken enough to emit a degenerate manifest
+  is exactly the case that slipped past.
+
+  `Verify` now refuses a zero-file manifest with a distinct
+  `ErrEmptyManifest`. No real cluster produces one (a PG datadir's
+  manifest lists hundreds of files), so refusing costs nothing; the
+  shape only appears when whatever wrote it is broken. An *absent*
+  manifest stays a skip — legacy backups predate the field — and the
+  two sentinels are deliberately kept distinguishable, since the
+  restore paths treat one as a skip and the other as
+  `restore.verifybackup_empty_manifest`.
+
+  The vacuous-pass path had no test coverage at all, which is why it
+  went unnoticed: no existing test broke when it was closed.
+
 - **The repository KEK could be handed out before it was safely on
   disk.** `LoadOrGenerateKEK` generated the key, wrote it, fsynced it —
   and closed the file with a bare `defer f.Close()`. Close(2) is where a
