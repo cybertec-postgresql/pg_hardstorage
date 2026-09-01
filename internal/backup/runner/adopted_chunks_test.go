@@ -77,7 +77,7 @@ func TestVerifyAdoptedChunks_SweptAdoptionRefusesCommit(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	gateErr := verifyAdoptedChunks(context.Background(), sp, cas)
+	_, gateErr := verifyAdoptedChunks(context.Background(), sp, cas)
 	if gateErr == nil {
 		t.Fatal("the commit gate passed with an adopted chunk deleted.\n\n" +
 			"The manifest would commit referencing a chunk that no longer exists — a " +
@@ -106,7 +106,7 @@ func TestVerifyAdoptedChunks_IntactAdoptionCommits(t *testing.T) {
 	if _, err := cas.PutChunk(context.Background(), orphan); err != nil {
 		t.Fatal(err)
 	}
-	if err := verifyAdoptedChunks(context.Background(), sp, cas); err != nil {
+	if _, err := verifyAdoptedChunks(context.Background(), sp, cas); err != nil {
 		t.Fatalf("gate refused a healthy backup: %v", err)
 	}
 }
@@ -129,7 +129,7 @@ func TestVerifyAdoptedChunks_WrittenChunksAreNotStatted(t *testing.T) {
 	if err := sp.Delete(context.Background(), repo.ChunkKey(repo.HashOf(body))); err != nil {
 		t.Fatal(err)
 	}
-	if err := verifyAdoptedChunks(context.Background(), sp, cas); err != nil {
+	if _, err := verifyAdoptedChunks(context.Background(), sp, cas); err != nil {
 		t.Fatalf("the gate Statted a chunk this run WROTE: %v\n\n"+
 			"Written chunks are the age floor's job. Gating on them makes every backup "+
 			"pay a full existence sweep and re-fails on transient losses the floor "+
@@ -275,7 +275,7 @@ func TestVerifyAdoptedChunks_StatsFanOut(t *testing.T) {
 	}
 
 	sp.rendezvous = make(chan struct{})
-	if err := verifyAdoptedChunks(ctx, sp, cas); err != nil {
+	if _, err := verifyAdoptedChunks(ctx, sp, cas); err != nil {
 		t.Fatalf("gate refused a healthy backup: %v", err)
 	}
 	sp.rendezvous = nil
@@ -304,7 +304,7 @@ func TestVerifyAdoptedChunks_CancelledContextStops(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	err := verifyAdoptedChunks(ctx, sp, cas)
+	_, err := verifyAdoptedChunks(ctx, sp, cas)
 	if !errors.Is(err, context.Canceled) {
 		t.Errorf("gate on a cancelled context = %v, want context.Canceled", err)
 	}

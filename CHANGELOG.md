@@ -13,6 +13,31 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **The dedup-vs-GC commit gate claimed a guarantee it did not
+  deliver.** `verifyAdoptedChunks` re-Stats every chunk an incremental
+  backup deduplicated against rather than wrote, and refuses the commit
+  if one is gone. Both its header and its call site state the property
+  in absolute terms — *"Both are timing guards; this one is not —
+  whatever the interleaving, a manifest only commits over chunks that
+  were present after the last of them was adopted."*
+
+  That was not true. A `Stat` failing for a reason **other** than
+  not-found — a 503 storm, a throttled bucket, which is precisely the
+  condition under which a backup and a `repo gc --apply` are most
+  likely to be racing — hit a branch that did nothing at all. The
+  chunk's presence went unconfirmed, the gate returned `nil`, and the
+  manifest committed as though fully verified.
+
+  Proceeding is the right call and is kept: refusing would trade a
+  *possible* gap for a certain one — no new backup at all. What was
+  wrong is reporting a gate as passed when part of it never ran. The
+  count is now returned and the run emits
+  `backup.adopted_chunks_unverified` at Warning severity, and the two
+  comments now say what is actually guaranteed. A not-found remains a
+  hard refusal — that distinction is pinned by a test, since letting the
+  new counter absorb it would swallow the exact failure the gate exists
+  for.
+
 - **`backup graph` invented a broken chain out of a corrupt manifest.**
   `BuildGraph` skips manifests that fail signature verification or
   cannot be read — right, since one corrupt manifest must not hide the

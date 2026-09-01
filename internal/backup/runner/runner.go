@@ -876,9 +876,31 @@ func Take(ctx context.Context, opts TakeOptions) (*Result, error) {
 	// Both are timing guards; this one is not — whatever the
 	// interleaving, a manifest only commits over chunks that were
 	// present after the last of them was adopted.
-	if err := verifyAdoptedChunks(ctx, sp, cas); err != nil {
+	//
+	// With one honest exception: a Stat that fails for a reason OTHER
+	// than not-found (a 503 storm, a throttled backend) leaves that
+	// chunk's presence assumed rather than confirmed, and the backup
+	// still commits — refusing would trade a possible gap for a certain
+	// one. So the guarantee above holds for every chunk the gate could
+	// actually reach, and the count of the ones it could not is
+	// surfaced rather than folded into a clean pass.
+	unchecked, err := verifyAdoptedChunks(ctx, sp, cas)
+	if err != nil {
 		span.SetStatus(codes.Error, err.Error())
 		return nil, err
+	}
+	if unchecked > 0 {
+		emit(output.NewEvent(output.SeverityWarning, "backup", "adopted_chunks_unverified").
+			WithSubject(output.Subject{Deployment: opts.Deployment, BackupID: backupID}).
+			WithBody(map[string]any{
+				"unchecked": unchecked,
+				"adopted":   len(cas.AdoptedHashes()),
+				"reason": "the dedup-vs-GC gate could not confirm every chunk this backup " +
+					"deduplicated against; those Stats failed for a reason other than not-found. " +
+					"The backup committed anyway (refusing would trade a possible gap for a certain " +
+					"one), but its adopted chunks are not fully proven present. Run " +
+					"`pg_hardstorage verify` against this backup once the backend is healthy.",
+			}))
 	}
 
 	commitCtx, commitSpan := tracing.Tracer().Start(ctx, "manifest.commit",
@@ -1277,14 +1299,15 @@ const statVerifyConcurrency = 32
 // without a running PostgreSQL: the race it closes is between storage
 // operations, not database ones.
 
-func verifyAdoptedChunks(ctx context.Context, sp storage.StoragePlugin, cas *repo.CAS) error {
+func verifyAdoptedChunks(ctx context.Context, sp storage.StoragePlugin, cas *repo.CAS) (int, error) {
 	adopted := cas.AdoptedHashes()
 	if len(adopted) == 0 {
-		return nil
+		return 0, nil
 	}
 	var (
-		mu      sync.Mutex
-		missing []string
+		mu        sync.Mutex
+		missing   []string
+		unchecked int
 	)
 	// The Stats fan out: the gate reads nothing this run wrote, so
 	// the only shared state is the missing-list append. The bounded
@@ -1310,18 +1333,27 @@ func verifyAdoptedChunks(ctx context.Context, sp storage.StoragePlugin, cas *rep
 				// certain one. The chunk was present at adopt time, so
 				// proceed — the post-commit verify and scrub remain the
 				// wider nets.
+				//
+				// It is counted, though. Proceeding is a judgement about
+				// what to DO; it is not a licence to report the gate as
+				// having passed. Every chunk in this bucket is one whose
+				// presence was assumed rather than confirmed, and the
+				// caller has to be able to say so.
+				mu.Lock()
+				unchecked++
+				mu.Unlock()
 			}
 			return nil
 		})
 	}
 	if err := g.Wait(); err != nil {
-		return err
+		return unchecked, err
 	}
 	if len(missing) > 0 {
 		if len(missing) > 8 {
 			missing = append(missing[:8], fmt.Sprintf("… and %d more", len(missing)-8))
 		}
-		return fmt.Errorf("backup: %d chunk(s) this backup deduplicated against were deleted "+
+		return unchecked, fmt.Errorf("backup: %d chunk(s) this backup deduplicated against were deleted "+
 			"before the manifest could commit (a concurrent `repo gc --apply` swept them as "+
 			"orphans): %s — refusing to commit a manifest that is already unrestorable. "+
 			"Re-run the backup: the retry writes these chunks fresh, and the new mtime puts "+
@@ -1329,7 +1361,7 @@ func verifyAdoptedChunks(ctx context.Context, sp storage.StoragePlugin, cas *rep
 			"windows, or rely on its live-lease refusal by not disabling leases",
 			len(missing), strings.Join(missing, ", "))
 	}
-	return nil
+	return unchecked, nil
 }
 
 func readGapsForManifest(ctx context.Context, sp storage.StoragePlugin, deployment string) ([]backup.WALGap, error) {
