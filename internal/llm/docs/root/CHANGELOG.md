@@ -13,6 +13,31 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **Retention deleted a backup precisely because it could not tell how
+  old it was.** Every policy dates a manifest by `stopped_at`, and the
+  zero time is not a date — it is the absence of one. Read as a date it
+  means year 1, i.e. infinitely old, which is the worst possible
+  reading for the one operation in this package that destroys data:
+  `SimplePolicy` put it before any cutoff and `CountPolicy` sorted it
+  last past `keep_fulls`, so both selected it for deletion. (GFS gave
+  it a year-1 bucket of its own and kept it — accidentally, not on
+  principle.)
+
+  `Manifest.Validate` does not require `stopped_at`, and it runs only
+  at commit, so a manifest in this shape can be committed and is never
+  re-checked afterwards. The rest of the tree already takes the
+  conservative side of exactly this question — `wal prune`'s keep-floor
+  treats an unknown `created_at` as too-new-to-delete, and the
+  recovery-window and reporting paths all guard with `IsZero`.
+  Retention was the outlier, and it is the destructive one.
+
+  A single guard in `finalize` — the choke point every policy runs
+  through, including any added later — now keeps an undatable manifest
+  and records the reason `undatable`, so `rotate --dry-run` shows the
+  operator the backup and prompts them to find out why it has no stop
+  time. Datable backups outside the window are still deleted; the
+  guard does not turn retention off.
+
 - **A restore's integrity gate reported success after checking zero
   files.** `verifybackup.Verify` is a loop over the PG
   `backup_manifest`'s file list, so a manifest that parses, carries a

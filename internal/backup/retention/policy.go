@@ -122,6 +122,7 @@ func finalize(d *Decision, sorted []*backup.Manifest) {
 		d.addReason(newest.BackupID, "newest")
 	}
 
+	keepUndatable(d, sorted)
 	promoteChainParents(d, sorted)
 
 	for _, m := range sorted {
@@ -129,6 +130,39 @@ func finalize(d *Decision, sorted []*backup.Manifest) {
 			d.Keep = append(d.Keep, m)
 		} else {
 			d.Delete = append(d.Delete, m)
+		}
+	}
+}
+
+// keepUndatable keeps any manifest whose StoppedAt is the zero time.
+//
+// Every policy here dates a manifest by StoppedAt, and the zero time is
+// not a date — it is the absence of one. Treated as a date it reads as
+// year 1, i.e. infinitely old, which is the worst possible reading for
+// the one operation in this package that DESTROYS data: SimplePolicy
+// put it before any cutoff and CountPolicy sorted it last, so both
+// deleted a backup precisely because they could not tell how old it
+// was. (GFS gave it a year-1 bucket of its own and kept it, which is
+// accidental rather than principled.)
+//
+// Manifest.Validate does not require StoppedAt, so a manifest in this
+// shape can be committed; and Validate runs only at commit, so one
+// already in a repo is never re-checked. The rest of the tree already
+// takes the conservative side of exactly this question — wal prune's
+// keep-floor treats an unknown created_at as too-new-to-delete, and the
+// recovery-window and reporting paths all guard with IsZero. Retention
+// was the outlier, and it is the one that deletes.
+//
+// The reason token is deliberately visible: `rotate --dry-run` shows
+// the operator "undatable" next to the backup, which is a prompt to go
+// and find out why a manifest has no stop time.
+func keepUndatable(d *Decision, sorted []*backup.Manifest) {
+	for _, m := range sorted {
+		if !m.StoppedAt.IsZero() {
+			continue
+		}
+		if _, ok := d.Reasons[m.BackupID]; !ok {
+			d.addReason(m.BackupID, "undatable")
 		}
 	}
 }
