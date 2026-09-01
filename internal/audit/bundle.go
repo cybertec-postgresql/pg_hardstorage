@@ -3,6 +3,7 @@ package audit
 
 import (
 	"archive/tar"
+	"bytes"
 	"compress/gzip"
 	"context"
 	"crypto/ed25519"
@@ -77,6 +78,12 @@ type BundleManifest struct {
 	// SignatureAlgorithm is the canonical algorithm name for
 	// the detached signature in signature.sig.
 	SignatureAlgorithm string `json:"signature_algorithm"`
+
+	// Integrity is populated by VerifyBundle, not by the exporter: it
+	// records what the chain-segment checks established about THIS
+	// verification run. It is deliberately not part of the signed
+	// manifest — a bundle cannot vouch for its own verification.
+	Integrity *BundleIntegrity `json:"integrity,omitempty"`
 }
 
 // BundleFilters mirrors audit.ListFilters but JSON-stable.
@@ -723,7 +730,130 @@ func VerifyBundle(r io.Reader) (*BundleManifest, error) {
 				actual, fp)
 		}
 	}
+
+	// Chain integrity of the bundled segment.
+	//
+	// The signature proves the tarball is the one the key holder
+	// produced. It says nothing about whether the events INSIDE it form
+	// a valid chain — and `audit verify-bundle` told the operator, in
+	// its own help text, that it "asserts the bundle's ed25519
+	// signature is valid + the chain segment is contiguous". Only the
+	// first half was implemented. The manifest's HeadHash was printed
+	// on success without ever being compared to anything, and a bundle
+	// exported from an already-broken chain verified clean.
+	//
+	// The data needed has always been in the bundle; the design just
+	// left the walk to the auditor ("An auditor walks events.ndjson and
+	// asserts each event's prev_hash matches the prior event's hash").
+	// Doing it in code is strictly better than asking a human to.
+	integ, ierr := verifyBundleEvents(files, &manifest)
+	if ierr != nil {
+		return nil, ierr
+	}
+	manifest.Integrity = &integ
 	return &manifest, nil
+}
+
+// BundleIntegrity records what the chain-segment checks established.
+//
+// LinkageAsserted is the field that matters for honesty: a bundle
+// exported with action/deployment filters holds a NON-contiguous slice
+// of the chain, so consecutive included events legitimately do not link
+// and contiguity cannot be asserted from the bundle alone. Reporting
+// that as "contiguous" would be a lie; reporting it as a break would
+// condemn every filtered bundle. It is reported as what it is.
+type BundleIntegrity struct {
+	EventsChecked   int  `json:"events_checked"`
+	LinkageAsserted bool `json:"linkage_asserted"`
+	// SequenceGaps counts places where the next event's sequence is not
+	// prior+1 — expected for a filtered export, and the reason linkage
+	// could not be asserted.
+	SequenceGaps int `json:"sequence_gaps,omitempty"`
+	// HeadHashMatched is true when the bundle's last event is the chain
+	// head the manifest records and their hashes agree. False when the
+	// window ended before the head, which is normal.
+	HeadHashMatched bool `json:"head_hash_matched"`
+}
+
+// verifyBundleEvents re-hashes every event in events.ndjson and, where
+// the segment is sequence-contiguous, checks the prev_hash linkage.
+//
+// A recomputed-hash mismatch is always a hard failure: it is
+// independent of any filter and means the bytes the operator signed do
+// not match the event they claim to be.
+func verifyBundleEvents(files map[string][]byte, manifest *BundleManifest) (BundleIntegrity, error) {
+	var integ BundleIntegrity
+	body, ok := files["events.ndjson"]
+	if !ok {
+		// Nothing to check; a bundle may legitimately carry no events
+		// (an empty window). EventCount must agree.
+		if manifest.EventCount != 0 {
+			return integ, fmt.Errorf("audit: bundle.json declares %d event(s) but events.ndjson is absent",
+				manifest.EventCount)
+		}
+		integ.LinkageAsserted = true
+		return integ, nil
+	}
+
+	var events []*Event
+	for _, line := range bytes.Split(body, []byte("\n")) {
+		if len(bytes.TrimSpace(line)) == 0 {
+			continue
+		}
+		var ev Event
+		if err := json.Unmarshal(line, &ev); err != nil {
+			return integ, fmt.Errorf("audit: bundle events.ndjson: %w", err)
+		}
+		events = append(events, &ev)
+	}
+	if manifest.EventCount != len(events) {
+		return integ, fmt.Errorf("audit: bundle.json declares %d event(s) but events.ndjson holds %d",
+			manifest.EventCount, len(events))
+	}
+	integ.EventsChecked = len(events)
+
+	for _, ev := range events {
+		recomputed, err := ComputeHash(ev)
+		if err != nil {
+			return integ, fmt.Errorf("audit: bundle event %s: %w", ev.ID, err)
+		}
+		if recomputed != ev.Hash {
+			return integ, fmt.Errorf("audit: bundle event %s does not hash to its recorded value "+
+				"(recomputed %s, recorded %s) — the signed bytes and the event disagree",
+				ev.ID, short12(recomputed), short12(ev.Hash))
+		}
+	}
+
+	// Linkage, only where the slice is genuinely consecutive.
+	integ.LinkageAsserted = true
+	for i := 1; i < len(events); i++ {
+		if events[i].Sequence != events[i-1].Sequence+1 {
+			integ.SequenceGaps++
+			integ.LinkageAsserted = false
+			continue
+		}
+		if events[i].PrevHash != events[i-1].Hash {
+			return integ, fmt.Errorf("audit: bundle chain break at sequence %d: event %s "+
+				"records prev_hash %s but the preceding event hashes to %s",
+				events[i].Sequence, events[i].ID,
+				short12(events[i].PrevHash), short12(events[i-1].Hash))
+		}
+	}
+
+	// If the window reaches the chain head the manifest recorded, the
+	// last event's hash must be it.
+	if manifest.HeadHash != "" && len(events) > 0 {
+		last := events[len(events)-1]
+		if last.Sequence == manifest.HeadSequence {
+			if last.Hash != manifest.HeadHash {
+				return integ, fmt.Errorf("audit: bundle's last event is at the recorded head "+
+					"sequence %d but hashes to %s, not the manifest's head_hash %s",
+					manifest.HeadSequence, short12(last.Hash), short12(manifest.HeadHash))
+			}
+			integ.HeadHashMatched = true
+		}
+	}
+	return integ, nil
 }
 
 // loadEd25519FromPEM extracts the ed25519 public key from a PEM

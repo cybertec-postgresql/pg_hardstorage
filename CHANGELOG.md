@@ -13,6 +13,32 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **`audit verify-bundle` claimed to check the chain and did not.** Its
+  own help text read *"Asserts the bundle's ed25519 signature is valid
+  **+ the chain segment is contiguous**"*. Only the first half existed:
+  the command verified the signature, schema, algorithm and signer
+  fingerprint, and never opened `events.ndjson`. It then printed
+  `✓ Bundle verified` alongside the manifest's head hash — a value it
+  had compared against nothing.
+
+  The signature proves the tarball is the one the key holder produced.
+  It says nothing about whether the events inside form a valid chain,
+  so a bundle exported from an already-broken chain verified clean and
+  the auditor receiving it was told the segment was contiguous.
+
+  The data was always in the bundle; the design left the walk to a
+  human — *"An auditor walks events.ndjson and asserts each event's
+  prev_hash matches the prior event's hash"*. It is now done in code.
+  Every event is re-hashed (a mismatch is a hard failure regardless of
+  filters), and prev_hash linkage is checked wherever the segment is
+  sequence-contiguous.
+
+  A filtered export holds a genuinely non-contiguous slice, so linkage
+  cannot be asserted from it. That is reported as what it is rather
+  than claimed as contiguity or condemned as a break — blessing a
+  broken bundle and condemning every filtered one are both wrong, and
+  each is pinned by its own test.
+
 - **The audit chain could not detect the most obvious tamper.**
   `VerifyChain`'s checks are all internal to the events that are still
   there: each event's hash recomputes, each `prev_hash` matches the

@@ -301,9 +301,18 @@ func (b auditExportBundleBody) WriteText(w io.Writer) error {
 func newAuditVerifyBundleCmd() *cobra.Command {
 	var format string
 	c := &cobra.Command{
-		Use:          "verify-bundle <path>",
-		Short:        "Verify a signed audit evidence bundle",
-		Long:         `Asserts the bundle's ed25519 signature is valid + the chain segment is contiguous. Returns the bundle manifest on success.`,
+		Use:   "verify-bundle <path>",
+		Short: "Verify a signed audit evidence bundle",
+		Long: `Asserts the bundle's ed25519 signature is valid, that its recorded
+signer fingerprint matches the key that validated it, that every event
+in events.ndjson re-hashes to its recorded value, and — when the
+bundled segment is sequence-contiguous — that each event's prev_hash
+links to the one before it.
+
+A bundle exported with filters holds a NON-contiguous slice of the
+chain, so linkage cannot be asserted from the bundle alone; the result
+reports that explicitly rather than implying a contiguity it did not
+check. Returns the bundle manifest on success.`,
 		Args:         cobra.ExactArgs(1),
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -375,6 +384,20 @@ func (b auditVerifyBundleBody) WriteText(w io.Writer) error {
 		fmt.Fprintf(bw, "  Signed by:    sha256:%s (ed25519)\n", m.PublicKeyFingerprint)
 	}
 	fmt.Fprintf(bw, "  Events:       %d\n", m.EventCount)
+	if in := m.Integrity; in != nil {
+		switch {
+		case in.LinkageAsserted:
+			fmt.Fprintf(bw, "  Chain:        %d event(s) re-hashed, segment contiguous\n",
+				in.EventsChecked)
+		default:
+			fmt.Fprintf(bw, "  Chain:        %d event(s) re-hashed; %d sequence gap(s), so "+
+				"contiguity could NOT be asserted from this bundle (a filtered export)\n",
+				in.EventsChecked, in.SequenceGaps)
+		}
+		if in.HeadHashMatched {
+			fmt.Fprintln(bw, "  Head:         last event matches the recorded chain head")
+		}
+	}
 	if m.AnchorCount > 0 {
 		fmt.Fprintf(bw, "  Anchors:      %d\n", m.AnchorCount)
 	}
