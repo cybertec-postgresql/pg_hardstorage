@@ -13,6 +13,33 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **Air-gapped mode made the SFTP and SCP storage backends unusable.**
+  `Policy.EndpointAllowed` refuses unrecognised URL schemes before any
+  host classification runs, and `sftp`/`scp` were missing from the
+  recognised list — but both backends hand it their whole repo URL
+  (`sftp://host/path`). So with `airgap.mode: strict` every SFTP and SCP
+  repo was refused outright, including hosts the operator had put in
+  `airgap.allowlist`, and including RFC1918 addresses:
+
+      sftp://10.0.0.5/backups
+      airgap: endpoint not allowed in air-gapped mode: scheme "sftp"
+      is not recognised by the air-gap policy
+
+  while that same error told the operator to "add it to
+  airgap.allowlist or use a loopback/RFC1918 address" — two remedies
+  that could not work. An air-gapped site pulling backups to an
+  internal NAS over SFTP is a mainstream configuration for exactly this
+  deployment shape, so the combination that failed is the likely one.
+  The refusal was fail-closed, so this was never a security hole; it
+  made a documented feature combination impossible.
+
+  Both schemes now fall through to host classification, which is a
+  *check*, not an allowance: a public SFTP host is still refused.
+  Object-store schemes (`s3`, `gs`, `azblob`) are deliberately left
+  unrecognised — their URL host is the bucket name, not a network host,
+  and those backends already submit their real https endpoint
+  separately.
+
 - **`retention.keep_for` in `pg_hardstorage.yaml` rejected the `d` and
   `w` units the documentation tells you to use** ([#54]). The CLI grew a
   day/week-aware duration parser for [#52] — because its own help text

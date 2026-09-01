@@ -175,8 +175,28 @@ func (p Policy) EndpointAllowed(rawURL string) error {
 		// No scheme — try host-only parse.
 	case "file", "unix", "fd", "stdio":
 		return nil
-	case "http", "https", "grpc", "grpc+tls", "tcp", "tcp+tls", "tls", "syslog", "syslog+tls":
+	case "http", "https", "grpc", "grpc+tls", "tcp", "tcp+tls", "tls", "syslog", "syslog+tls",
+		"sftp", "scp":
 		// fall through to host classification
+		//
+		// sftp/scp are here because the sftp and scp storage backends
+		// pass their whole repo URL to this function. Without them the
+		// default branch refused every SFTP/SCP repo outright — before
+		// any host classification ran — so air-gapped mode made those
+		// two backends unusable no matter what. Even
+		// "sftp://10.0.0.5/backups" was refused, while the error text
+		// told the operator to "use a loopback/RFC1918 address". An
+		// air-gapped site reaching an internal NAS over SFTP is a
+		// mainstream configuration, not an edge case.
+		//
+		// Falling through is a CHECK, not an allowance: the host still
+		// has to be allowlisted, loopback, or RFC1918.
+		//
+		// Object-store schemes (s3, gs, azblob) are deliberately NOT
+		// added. Their URL host is the BUCKET name, not a network host,
+		// so classifying it would be meaningless; those backends
+		// already pass their real https endpoint to this function
+		// separately.
 	default:
 		// Unknown scheme — refuse. Better to surface than to silently allow.
 		return fmt.Errorf("%w: scheme %q is not recognised by the air-gap policy (URL %q)",
