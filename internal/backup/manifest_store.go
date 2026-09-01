@@ -1599,9 +1599,27 @@ func (ms *ManifestStore) Undelete(ctx context.Context, deployment, backupID stri
 	}
 	recheck, rcErr := ms.recheckResurrected(ctx, m)
 	if rcErr != nil {
-		// Transient verification failure is not evidence of loss; the
-		// chunks were present moments ago. Leave the manifest live.
-		return true, nil
+		// The re-check could not run. The manifest is already visible
+		// and stays visible: rolling back means another write to the
+		// same backend that just failed us, and a half-undone undelete
+		// is worse than a visible one.
+		//
+		// But it does NOT come back as a plain success. Falling back on
+		// the pre-flight's verdict is precisely the reasoning the
+		// comment above rejects — the pre-flight ran before the
+		// visibility point, and a concurrent `repo gc --apply` sweeping
+		// in that window is the entire reason this second check exists.
+		// CheckChunkExistence deliberately refuses to guess on a
+		// backend error ("answering missing would be wrong"), and
+		// swallowing that here converted its honest "I cannot tell"
+		// into "verified good": the operator saw restored=true, the
+		// audit chain recorded a resurrection, and nothing anywhere
+		// said the integrity gate had been skipped.
+		return true, &UndeleteUnverifiedError{
+			Deployment: deployment,
+			BackupID:   backupID,
+			Cause:      rcErr,
+		}
 	}
 	if !recheck.AllPresent() {
 		// Restore the prior state with the ORIGINAL marker bytes so
@@ -2042,6 +2060,40 @@ var ErrUndeleteChunksMissing = errors.New("backup: undelete chunks missing")
 // Is implements errors.Is so the typed error matches the sentinel.
 func (e *UndeleteChunksMissingError) Is(target error) bool {
 	return target == ErrUndeleteChunksMissing
+}
+
+// UndeleteUnverifiedError reports that a backup WAS resurrected but the
+// post-visibility chunk re-check could not be completed.
+//
+// The manifest is live — callers must treat this as a state change that
+// happened, not as a failure to act — but the integrity gate that
+// normally backs an undelete did not run, so the resurrected backup has
+// not been shown to be restorable.
+//
+// It is a distinct type from UndeleteChunksMissingError on purpose:
+// "the chunks are gone" and "I could not find out whether the chunks
+// are gone" call for different operator responses. The first is
+// terminal without --force; the second is a retry.
+type UndeleteUnverifiedError struct {
+	Deployment string
+	BackupID   string
+	Cause      error
+}
+
+func (e *UndeleteUnverifiedError) Error() string {
+	return fmt.Sprintf("backup: %s/%s was resurrected, but its chunks could not be re-checked "+
+		"afterwards, so it is not known to be restorable: %v",
+		e.Deployment, e.BackupID, e.Cause)
+}
+
+func (e *UndeleteUnverifiedError) Unwrap() error { return e.Cause }
+
+// ErrUndeleteUnverified is the sentinel for errors.Is checks against
+// UndeleteUnverifiedError.
+var ErrUndeleteUnverified = errors.New("backup: undelete not verified")
+
+func (e *UndeleteUnverifiedError) Is(target error) bool {
+	return target == ErrUndeleteUnverified
 }
 
 // OrphanedIncrementalError is returned by Commit when an incremental

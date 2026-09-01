@@ -235,6 +235,7 @@ func runBackupUndelete(cmd *cobra.Command, deployment string, ids []string, repo
 
 	outcomeByID := make(map[string]backupUndeleteOutcome, len(ids))
 	restoredIDs := make([]string, 0, len(ids))
+	unverifiedIDs := make([]string, 0, len(ids))
 	for _, id := range ordered {
 		if _, skip := skipDueToMissing[id]; skip {
 			outcomeByID[id] = backupUndeleteOutcome{
@@ -256,6 +257,17 @@ func runBackupUndelete(cmd *cobra.Command, deployment string, ids []string, repo
 			// tombstone in place.
 			restored, uerr = store.Undelete(cmd.Context(), deployment, id)
 		}
+		var unverified *backup.UndeleteUnverifiedError
+		if errors.As(uerr, &unverified) {
+			// The backup IS live — this is a state change that
+			// happened, so it must be recorded and audited like any
+			// other resurrection. What did NOT happen is the
+			// verification, and the run exits non-zero at the end so
+			// the operator cannot mistake it for a clean undelete.
+			unverifiedIDs = append(unverifiedIDs, id)
+			uerr = nil
+			restored = true
+		}
 		if uerr != nil {
 			var cm *backup.UndeleteChunksMissingError
 			if errors.As(uerr, &cm) {
@@ -271,8 +283,9 @@ func runBackupUndelete(cmd *cobra.Command, deployment string, ids []string, repo
 				fmt.Sprintf("backup undelete: %s/%s: %v", deployment, id, uerr)).Wrap(uerr)
 		}
 		oc := backupUndeleteOutcome{
-			BackupID: id,
-			Restored: restored,
+			BackupID:         id,
+			Restored:         restored,
+			ChunksUnverified: unverified != nil,
 		}
 		if restored {
 			restoredIDs = append(restoredIDs, id)
@@ -310,6 +323,12 @@ func runBackupUndelete(cmd *cobra.Command, deployment string, ids []string, repo
 			"requested":    ids,
 			"already_live": len(ids) - len(restoredIDs),
 		}
+		// The audit chain must show that some of those resurrections
+		// were never integrity-checked; an entry that looks identical
+		// to a verified one would misrepresent what happened.
+		if len(unverifiedIDs) > 0 {
+			body["chunks_unverified"] = unverifiedIDs
+		}
 		audit.NewStoreWithRetention(sp, repoMeta.WORM).AppendOrLog(cmd.Context(), &audit.Event{
 			Action: "backup.undelete",
 			Subject: audit.Subject{
@@ -322,13 +341,34 @@ func runBackupUndelete(cmd *cobra.Command, deployment string, ids []string, repo
 		})
 	}
 
-	return d.Result(output.NewResult(cmd.CommandPath()).WithBody(backupUndeleteBody{
+	body := backupUndeleteBody{
 		Deployment:  deployment,
 		Reason:      auditReason,
 		Outcomes:    results,
 		Restored:    restoredIDs,
 		ChunkChecks: chunkChecks,
-	}))
+	}
+	if len(unverifiedIDs) > 0 {
+		body.ChunksUnverified = unverifiedIDs
+	}
+	if rerr := d.Result(output.NewResult(cmd.CommandPath()).WithBody(body)); rerr != nil {
+		return rerr
+	}
+	// Body first (the resurrections really happened and the operator
+	// needs the per-ID detail), then a non-zero exit. The verify.*
+	// namespace is what operators wire ExitVerifyFailed to, and this is
+	// a verification that did not run — reporting it as a clean
+	// undelete is the one outcome that must not happen.
+	if len(unverifiedIDs) > 0 {
+		return output.NewError("verify.undelete_unverified",
+			fmt.Sprintf("backup undelete: %d backup(s) were resurrected but their chunks could not be re-checked afterwards, so they are not known to be restorable: %s",
+				len(unverifiedIDs), strings.Join(unverifiedIDs, ", "))).
+			WithSuggestion(&output.Suggestion{
+				Human:   "the manifests are live. The post-visibility chunk check hit a backend error rather than a missing chunk, so it could not tell whether a concurrent `repo gc --apply` swept them. Re-run the chunk check once the backend is healthy.",
+				Command: "pg_hardstorage repo check --repo " + repoURL,
+			})
+	}
+	return nil
 }
 
 // backupUndeleteBody is the v1-stable result. Outcomes preserves
@@ -344,6 +384,10 @@ type backupUndeleteBody struct {
 	Outcomes    []backupUndeleteOutcome `json:"outcomes"`
 	Restored    []string                `json:"restored"`
 	ChunkChecks []chunkCheckRow         `json:"chunk_checks,omitempty"`
+	// ChunksUnverified lists resurrected IDs whose post-visibility
+	// chunk re-check could not run. They are live but not known to be
+	// restorable. Additive v1 field.
+	ChunksUnverified []string `json:"chunks_unverified,omitempty"`
 }
 
 type backupUndeleteOutcome struct {
@@ -354,6 +398,13 @@ type backupUndeleteOutcome struct {
 	// absent. Distinguished from "already live" so an operator
 	// reading the JSON sees the right reason.
 	ChunksMissing bool `json:"chunks_missing,omitempty"`
+	// ChunksUnverified is true when the backup WAS resurrected but the
+	// post-visibility chunk re-check could not run (a backend error,
+	// not a missing chunk). The manifest is live; it is simply not
+	// known to be restorable. Distinguished from both "restored" and
+	// "chunks_missing" so a JSON consumer is not told the integrity
+	// gate passed when it never ran. Additive v1 field.
+	ChunksUnverified bool `json:"chunks_unverified,omitempty"`
 	// WALGapRecorded is the "start..end" LSN window persisted as a
 	// gap record because the archived WAL after this backup's stop
 	// was pruned while it was tombstoned. Empty when forward

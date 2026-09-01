@@ -13,6 +13,39 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **`backup undelete` reported "verified and restored" when the
+  verification had not run.** Undelete re-checks the manifest's chunks
+  *after* the marker flip, because the pre-flight ran while the backup
+  was still hidden and a concurrent `repo gc --apply` sweeping in that
+  window is the whole reason the second check exists.
+  `CheckChunkExistence` is careful about the difference between "the
+  chunk is gone" and "I cannot reach the backend" — on a real backend
+  error it refuses to guess, because "answering missing would be
+  wrong". Undelete then threw that distinction away:
+
+      recheck, rcErr := ms.recheckResurrected(ctx, m)
+      if rcErr != nil {
+          // Transient verification failure is not evidence of loss
+          return true, nil
+      }
+
+  A backend error came back as a plain success. The operator saw
+  `restored: true`, the audit chain recorded a resurrection
+  indistinguishable from a checked one, and nothing anywhere said the
+  integrity gate had been skipped. The justification — "the chunks were
+  present moments ago" — is the pre-flight's evidence, which is exactly
+  the reasoning the surrounding comment rejects.
+
+  The manifest still stays live: rolling it back means another write to
+  the backend that just failed, and a half-undone undelete is worse
+  than a visible one. What changed is that the caller is told. Undelete
+  returns a new `UndeleteUnverifiedError` — deliberately distinct from
+  `UndeleteChunksMissingError`, since "the chunks are gone" is terminal
+  without `--force` while "I could not find out" is a retry — and
+  `backup undelete` records the resurrection, stamps
+  `chunks_unverified` on the result body and the audit event, and then
+  exits `verify.undelete_unverified` rather than 0.
+
 - **A `--deployment` filter that matched nothing produced a clean
   verdict.** `kms verify` and `repo replicate verify` both scope their
   walk by building a key prefix out of the flag —
