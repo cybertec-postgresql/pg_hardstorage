@@ -938,7 +938,30 @@ type VerifyResult struct {
 	HashMismatches []string `json:"hash_mismatches,omitempty"` // event IDs whose recomputed hash disagrees with stored
 	ChainBreaks    []string `json:"chain_breaks,omitempty"`    // event IDs whose PrevHash != prior event's Hash (within its shard)
 	Misfiled       []string `json:"misfiled,omitempty"`        // event IDs filed under a shard their scope doesn't imply (relocation signal)
-	OK             bool     `json:"ok"`
+
+	// Truncated reports shards whose head pointer records a head the
+	// event files no longer contain — the chain has been cut off at the
+	// end, or its head event replaced.
+	//
+	// Interior deletions already surface as ChainBreaks: removing event
+	// N leaves N+1's prev_hash dangling. Removing the TAIL leaves
+	// nothing dangling, so the remaining events form a perfectly valid
+	// shorter chain and every other check passes. That is the easiest
+	// and most likely tamper — the events an attacker wants gone are
+	// the ones recording what they just did — and it was invisible.
+	Truncated []string `json:"truncated,omitempty"`
+
+	// HeadPointerMissing reports non-empty shards with no head pointer,
+	// which means the truncation check above could not run.
+	//
+	// This is a finding rather than a shrug precisely because it is the
+	// attacker's next move: if a missing pointer were benign, deleting
+	// the tail AND the pointer would restore the clean verdict. A
+	// verification that could not run must not report as one that
+	// passed.
+	HeadPointerMissing []string `json:"head_pointer_missing,omitempty"`
+
+	OK bool `json:"ok"`
 }
 
 // VerifyChain walks every event in commit order, recomputing hashes
@@ -965,7 +988,8 @@ func (s *Store) VerifyChain(ctx context.Context) (VerifyResult, error) {
 			return res, err
 		}
 	}
-	res.OK = len(res.HashMismatches) == 0 && len(res.ChainBreaks) == 0 && len(res.Misfiled) == 0
+	res.OK = len(res.HashMismatches) == 0 && len(res.ChainBreaks) == 0 && len(res.Misfiled) == 0 &&
+		len(res.Truncated) == 0 && len(res.HeadPointerMissing) == 0
 	return res, nil
 }
 
@@ -1021,7 +1045,59 @@ func (s *Store) verifyShard(ctx context.Context, shard string, res *VerifyResult
 			res.ChainBreaks = append(res.ChainBreaks, l.id)
 		}
 	}
+
+	// Tail check. Everything above is internal to the events that are
+	// STILL THERE, so it cannot see events that are not: delete the last
+	// N and the remainder is a valid shorter chain. The head pointer is
+	// the only record of where the chain reached, so compare against it.
+	//
+	// Compared on max SEQUENCE, not on event count: WORM retention
+	// prunes the OLDEST events while sequence numbers keep climbing, so
+	// a count-based check would fire on every pruned chain (see
+	// HeadKeyForShard's note). A pruned chain still has its true head.
+	if len(links) == 0 {
+		return nil // empty shard: nothing to truncate
+	}
+	head := links[len(links)-1]
+	hp, hperr := s.readHeadPointer(ctx, shard)
+	if hperr != nil {
+		return hperr
+	}
+	switch {
+	case hp == nil:
+		res.HeadPointerMissing = append(res.HeadPointerMissing, shardLabel(shard))
+	case hp.Sequence > head.seq:
+		res.Truncated = append(res.Truncated, fmt.Sprintf(
+			"%s: head pointer records sequence %d (event %s), but the highest event present is %d — %d event(s) missing from the end of the chain",
+			shardLabel(shard), hp.Sequence, hp.EventID, head.seq, hp.Sequence-head.seq))
+	case hp.Sequence == head.seq && hp.Hash != head.hash:
+		// Same sequence, different hash: the head event was REPLACED.
+		// Its own hash can be recomputed consistently by whoever
+		// rewrote it, and there is no following event whose prev_hash
+		// would disagree — the pointer is the only witness.
+		res.Truncated = append(res.Truncated, fmt.Sprintf(
+			"%s: head event at sequence %d hashes to %s, but the head pointer recorded %s — the head event has been replaced",
+			shardLabel(shard), head.seq, short12(head.hash), short12(hp.Hash)))
+	}
 	return nil
+}
+
+// shardLabel renders a shard name for operator-facing findings; the
+// global chain has the empty name.
+func shardLabel(shard string) string {
+	if shard == "" {
+		return "global chain"
+	}
+	return "shard " + strconv.Quote(shard)
+}
+
+// short12 truncates a hex hash for messages without losing the ability
+// to tell two apart.
+func short12(h string) string {
+	if len(h) <= 12 {
+		return h
+	}
+	return h[:12] + "…"
 }
 
 // Anchor walks the chain to find the head event, computes its hash

@@ -492,17 +492,21 @@ func runAuditVerifyChain(cmd *cobra.Command, repoURL string) error {
 			fmt.Sprintf("audit verify-chain: %v", err)).Wrap(err)
 	}
 	body := auditVerifyBody{
-		EventsChecked:  res.EventsChecked,
-		HashMismatches: res.HashMismatches,
-		ChainBreaks:    res.ChainBreaks,
-		OK:             res.OK,
+		EventsChecked:      res.EventsChecked,
+		HashMismatches:     res.HashMismatches,
+		ChainBreaks:        res.ChainBreaks,
+		Misfiled:           res.Misfiled,
+		Truncated:          res.Truncated,
+		HeadPointerMissing: res.HeadPointerMissing,
+		OK:                 res.OK,
 	}
 	if !res.OK {
 		// verify.* namespace → ExitVerifyFailed (9). Tampered audit
 		// log is a real corruption finding.
 		return output.NewError("verify.audit_chain_broken",
-			fmt.Sprintf("audit verify-chain: %d hash mismatch(es), %d chain break(s) across %d event(s)",
-				len(res.HashMismatches), len(res.ChainBreaks), res.EventsChecked)).
+			fmt.Sprintf("audit verify-chain: %d hash mismatch(es), %d chain break(s), %d misfiled, %d truncation finding(s), %d shard(s) with no head pointer, across %d event(s)",
+				len(res.HashMismatches), len(res.ChainBreaks), len(res.Misfiled),
+				len(res.Truncated), len(res.HeadPointerMissing), res.EventsChecked)).
 			WithSuggestion(&output.Suggestion{
 				Human:   "the audit log has been tampered with or storage corruption has hit it. Investigate the audit/ prefix in the repo.",
 				Command: "pg_hardstorage audit search --repo " + repoURL + " --limit 100",
@@ -749,7 +753,15 @@ type auditVerifyBody struct {
 	EventsChecked  int      `json:"events_checked"`
 	HashMismatches []string `json:"hash_mismatches,omitempty"`
 	ChainBreaks    []string `json:"chain_breaks,omitempty"`
-	OK             bool     `json:"ok"`
+	// Misfiled, Truncated and HeadPointerMissing were computed by
+	// VerifyChain but never carried into the result body, so a chain
+	// that failed ONLY on one of them exited 9 with a body and a
+	// message that both listed zero findings. An operator was told the
+	// verification failed and shown nothing that failed.
+	Misfiled           []string `json:"misfiled,omitempty"`
+	Truncated          []string `json:"truncated,omitempty"`
+	HeadPointerMissing []string `json:"head_pointer_missing,omitempty"`
+	OK                 bool     `json:"ok"`
 }
 
 // WriteText renders the chain-verify outcome — including any hash mismatches
@@ -768,6 +780,17 @@ func (b auditVerifyBody) WriteText(w io.Writer) error {
 		if len(b.ChainBreaks) > 0 {
 			fmt.Fprintf(bw, "  ✗ %d chain break(s): %s\n",
 				len(b.ChainBreaks), strings.Join(b.ChainBreaks, ", "))
+		}
+		if len(b.Misfiled) > 0 {
+			fmt.Fprintf(bw, "  ✗ %d misfiled event(s): %s\n",
+				len(b.Misfiled), strings.Join(b.Misfiled, ", "))
+		}
+		for _, tr := range b.Truncated {
+			fmt.Fprintf(bw, "  ✗ %s\n", tr)
+		}
+		for _, hp := range b.HeadPointerMissing {
+			fmt.Fprintf(bw, "  ✗ %s: no head pointer, so the chain's end could not be "+
+				"checked — deleting it is how a tail truncation is hidden\n", hp)
 		}
 	}
 	_, err := io.WriteString(w, strings.TrimRight(bw.String(), "\n"))

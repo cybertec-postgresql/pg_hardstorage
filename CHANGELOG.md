@@ -13,6 +13,45 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **The audit chain could not detect the most obvious tamper.**
+  `VerifyChain`'s checks are all internal to the events that are still
+  there: each event's hash recomputes, each `prev_hash` matches the
+  prior event's hash, each event sits in the shard its scope implies.
+
+  Deleting an event in the *middle* therefore surfaces immediately —
+  event N+1's `prev_hash` is left dangling. Deleting the events at the
+  *end* leaves nothing dangling: the remainder is a perfectly valid,
+  shorter chain, and every check passes. Measured on a six-event chain
+  with the last two event files removed:
+
+      intact:     checked=6 ok=true breaks=0 mismatches=0
+      truncated:  checked=4 ok=true breaks=0 mismatches=0 misfiled=0
+
+  That is the easiest tamper there is, and the one with the clearest
+  motive: the events worth deleting are the ones recording what you
+  just did, and those are always at the end. `audit verify-chain`
+  answered `ok`.
+
+  The head pointer is the only record of where the chain reached, so
+  the tail is now checked against it — including the case where the
+  head event was *replaced* with self-consistent content, which no
+  internal check can see because there is no following event to
+  disagree. Deleting the pointer as well does not restore the clean
+  verdict: a missing pointer on a non-empty shard is itself a finding,
+  because the check could not run and "could not run" is not "passed".
+  The comparison is on highest *sequence*, not on event count — WORM
+  retention prunes the oldest events while sequences climb, and a
+  count-based check would fire on every pruned chain in the fleet.
+
+- **`audit verify-chain` reported findings it had computed but never
+  showed.** `Misfiled` — the relocated-event tamper signal — was
+  computed by `VerifyChain` and dropped on the floor by the CLI body.
+  A chain failing only that check exited 9 with a message reading
+  "0 hash mismatch(es), 0 chain break(s)": the operator was told
+  verification failed and shown nothing that failed. All finding
+  classes are now carried into the body, the text renderer, and the
+  error summary.
+
 - **`partial inspect` answered "yes, 0 bytes" for a table it could not
   extract.** The command exists to answer, in its own package doc's
   words, *"would my partial restore work, and how big is it?"* — before
