@@ -1928,6 +1928,14 @@ func restoreIncrementalChain(ctx context.Context, opts Options, sp storage.Stora
 		return nil, output.NewError("restore.combine_finalize",
 			fmt.Sprintf("restore chain: finalize merged output into %q: %v", opts.TargetDir, err)).Wrap(err)
 	}
+	// pg_combinebackup fsyncs the datadir's contents, but nothing
+	// fsyncs the dentry this rename created in the PARENT. A power
+	// loss between here and the operator starting PG would take the
+	// finished datadir with it and leave the staging name behind.
+	if err := fsutil.SyncDir(filepath.Dir(opts.TargetDir)); err != nil {
+		return nil, output.NewError("restore.combine_finalize",
+			fmt.Sprintf("restore chain: fsync parent of %q: %v", opts.TargetDir, err)).Wrap(err)
+	}
 
 	// pg_combinebackup succeeded — flag chainSucceeded so the
 	// deferred staging-cleanup runs.  Failures past this point

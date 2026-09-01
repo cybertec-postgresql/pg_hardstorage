@@ -24,6 +24,7 @@ package cli
 
 import (
 	"fmt"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/fsutil"
 	"io"
 	"os"
 	"path/filepath"
@@ -123,6 +124,18 @@ func runKeyringInstall(cmd *cobra.Command, from, to string) error {
 				fmt.Sprintf("keyring install: copy %s: %v", f.Name, err)).Wrap(err)
 		}
 		_ = in.Close()
+		// fsync before the rename. io.Copy + Close pushes the bytes no
+		// further than the page cache, so a power loss can land the
+		// rename with a zero-length or partial key file behind it —
+		// and a truncated private key is worse than a missing one:
+		// LoadOrGenerate sees both halves present, fails to parse, and
+		// refuses to start rather than regenerating.
+		if err := out.Sync(); err != nil {
+			_ = out.Close()
+			_ = os.Remove(tmp)
+			return output.NewError("keyring.install_failed",
+				fmt.Sprintf("keyring install: fsync %q: %v", tmp, err)).Wrap(err)
+		}
 		if err := out.Close(); err != nil {
 			_ = os.Remove(tmp)
 			return output.NewError("keyring.install_failed",
@@ -141,6 +154,15 @@ func runKeyringInstall(cmd *cobra.Command, from, to string) error {
 				fmt.Sprintf("keyring install: rename to %q: %v", dst, err)).Wrap(err)
 		}
 		installed = append(installed, f.Name)
+	}
+	// And the parent dentry list once, after the loop: file fsync does
+	// not cover the renames. Without it the installed keyring can
+	// vanish on a power loss even though every file was synced.
+	if len(installed) > 0 {
+		if err := fsutil.SyncDir(to); err != nil {
+			return output.NewError("keyring.install_failed",
+				fmt.Sprintf("keyring install: fsync %q: %v", to, err)).Wrap(err)
+		}
 	}
 	if len(installed) == 0 {
 		return output.NewError("keyring.install_empty_source",

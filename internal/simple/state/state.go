@@ -12,6 +12,7 @@ package state
 import (
 	"errors"
 	"fmt"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/fsutil"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -79,12 +80,24 @@ func Save(configDir string, s *State) error {
 		return fmt.Errorf("simple state: marshal: %w", err)
 	}
 	dst := filepath.Join(configDir, FileName)
+	// A stale <dst>.tmp from a crashed write is expected here and must
+	// not wedge the flow, so this does not use fsutil.WriteFileAtomic
+	// (whose O_EXCL deliberately refuses one). Everything else about
+	// the dance is the same, including the parent fsync os.WriteFile +
+	// os.Rename leaves out: without it a power loss can drop the
+	// rename and Load() comes back with a state file older than the
+	// deployments it describes.
 	tmp := dst + ".tmp"
-	if err := os.WriteFile(tmp, body, 0o600); err != nil {
+	_ = os.Remove(tmp)
+	if err := fsutil.WriteFileSync(tmp, body, 0o600); err != nil {
 		return fmt.Errorf("simple state: write %s: %w", tmp, err)
 	}
 	if err := os.Rename(tmp, dst); err != nil {
+		_ = os.Remove(tmp)
 		return fmt.Errorf("simple state: rename %s → %s: %w", tmp, dst, err)
+	}
+	if err := fsutil.SyncDir(configDir); err != nil {
+		return fmt.Errorf("simple state: fsync %s: %w", configDir, err)
 	}
 	return nil
 }

@@ -13,6 +13,43 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **Seven hand-rolled atomic writes never fsynced the parent
+  directory, so their renames could be lost to a power loss** — among
+  them the manifest-signing keypair and the installed KEK. POSIX
+  `fsync(fd)` flushes a file's data and inode but *not* the parent
+  directory's dentry list, so `rename(2)` can be reported as successful
+  and still vanish across a hard reboot. `internal/fsutil` exists
+  precisely so call sites don't re-implement that dance; seven of them
+  re-implemented it anyway and every copy dropped the same final step:
+
+  - `internal/backup/keystore` — the Ed25519 manifest-signing keypair.
+    Lose those two renames and the next `LoadOrGenerate` produces a
+    *different* key, so every manifest signed with the old one stops
+    verifying. Lose only one of the two and the tool refuses to start
+    at all ("manage the pair together"). The keyring directory's own
+    creation is now durable too — fsyncing files inside a directory
+    that is itself not on disk buys nothing.
+  - `keyring install` — copied the private key, KEK and public key with
+    `io.Copy` and never called `Sync` at all. A truncated private key
+    is worse than a missing one: both halves look present, the PEM
+    fails to parse, and the agent refuses to start.
+  - `restore` chain finalize — the completed `pg_combinebackup` datadir
+    is moved into place with one rename; nothing flushed the parent.
+  - `restore` resume checkpoint, `simple` deployment state, and the
+    `simple setup` rewrite of the operator's `pg_hardstorage.yaml` —
+    the last two also used `os.WriteFile`, which fsyncs nothing, so a
+    crash could leave the previous config gone and a zero-length file
+    in its place.
+  - `internal/llm/history`, whose comment claimed "repo-grade
+    atomicity".
+
+  Six copies of one omission is a missing guard, not six mistakes, so
+  the fix ships with one: an AST check in `internal/fsutil` fails the
+  build if any function under `internal/` or `cmd/` calls `os.Rename`
+  without also syncing a directory. It is deliberately coarse — it
+  cannot prove the *right* directory was synced, only that the author
+  considered it — and carries a short exemption list with reasons.
+
 - **Air-gapped mode made the SFTP and SCP storage backends unusable.**
   `Policy.EndpointAllowed` refuses unrecognised URL schemes before any
   host classification runs, and `sftp`/`scp` were missing from the

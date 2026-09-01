@@ -22,6 +22,7 @@ import (
 	"path/filepath"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/fsutil"
 )
 
 // File names within the keyring directory.
@@ -126,18 +127,32 @@ func generate(keyringDir, privPath, pubPath string) (*backup.Signer, *backup.Ver
 	if err := os.MkdirAll(keyringDir, 0o700); err != nil {
 		return nil, nil, fmt.Errorf("keystore: mkdir %s: %w", keyringDir, err)
 	}
+	// The keyring directory's own dentry has to reach disk too: if it
+	// is lost, the keypair inside it is lost with it, however durably
+	// the two files themselves were written.
+	if err := fsutil.SyncDir(filepath.Dir(keyringDir)); err != nil {
+		return nil, nil, fmt.Errorf("keystore: fsync parent of %s: %w", keyringDir, err)
+	}
 
 	privPEM, pubPEM, err := backup.GenerateKeypair(rand.Reader)
 	if err != nil {
 		return nil, nil, err
 	}
 
+	// fsutil.WriteFileAtomic, not a local tmp+rename: it adds the
+	// SyncDir(parent) that a hand-rolled version keeps forgetting.
+	// Losing the rename of the manifest-signing keypair to a power
+	// loss is not recoverable — the next LoadOrGenerate makes a
+	// DIFFERENT key and every manifest signed with the old one stops
+	// verifying, or (if only one of the two renames survives) refuses
+	// to start at all with "manage the pair together".
+	//
 	// Public key first — it's the less sensitive write; failures here
 	// don't leave a dangling private key on disk.
-	if err := writeFileAtomic(pubPath, pubPEM, 0o644); err != nil {
+	if err := fsutil.WriteFileAtomic(pubPath, pubPEM, 0o644); err != nil {
 		return nil, nil, fmt.Errorf("keystore: write public key: %w", err)
 	}
-	if err := writeFileAtomic(privPath, privPEM, 0o600); err != nil {
+	if err := fsutil.WriteFileAtomic(privPath, privPEM, 0o600); err != nil {
 		// Roll back the public-key write so a retry can regenerate cleanly.
 		_ = os.Remove(pubPath)
 		return nil, nil, fmt.Errorf("keystore: write private key: %w", err)
@@ -163,39 +178,4 @@ func generate(keyringDir, privPath, pubPath string) (*backup.Signer, *backup.Ver
 		return nil, nil, fmt.Errorf("keystore: re-parse generated public key: %w", err)
 	}
 	return signer, verifier, nil
-}
-
-// writeFileAtomic writes data to path with the given mode via a
-// tmp+rename. On the same filesystem the rename is atomic, so a crash
-// mid-write never leaves a half-written file at path.
-//
-// We use O_EXCL on the tmp open so concurrent writers don't trample
-// each other; if a tmp from a previous crashed write is in the way we
-// surface the error rather than silently trusting it.
-func writeFileAtomic(path string, data []byte, mode fs.FileMode) error {
-	tmp := path + ".tmp"
-	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode)
-	if err != nil {
-		return err
-	}
-	cleanup := func() { _ = os.Remove(tmp) }
-	if _, err := f.Write(data); err != nil {
-		_ = f.Close()
-		cleanup()
-		return err
-	}
-	if err := f.Sync(); err != nil {
-		_ = f.Close()
-		cleanup()
-		return err
-	}
-	if err := f.Close(); err != nil {
-		cleanup()
-		return err
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		cleanup()
-		return err
-	}
-	return nil
 }

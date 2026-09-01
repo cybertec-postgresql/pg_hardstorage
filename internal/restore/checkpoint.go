@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/fsutil"
 	"os"
 	"path/filepath"
 	"sort"
@@ -189,6 +190,13 @@ func (w *CheckpointWriter) flushLocked() error {
 	if err := os.Rename(tmp, w.path); err != nil {
 		_ = os.Remove(tmp)
 		return fmt.Errorf("checkpoint: rename %s -> %s: %w", tmp, w.path, err)
+	}
+	// fsync the parent: f.Sync() above flushed the checkpoint's data
+	// and inode, but not the dentry the rename created. Without this
+	// a power loss can take the rename with it and resume reads a
+	// checkpoint older than the files already on disk.
+	if err := fsutil.SyncDir(filepath.Dir(w.path)); err != nil {
+		return fmt.Errorf("checkpoint: fsync parent of %s: %w", w.path, err)
 	}
 	w.dirty = false
 	return nil

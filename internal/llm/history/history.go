@@ -54,6 +54,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/fsutil"
 	"io"
 	"os"
 	"path/filepath"
@@ -460,7 +461,11 @@ func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
 	if err := os.Chmod(tmp.Name(), mode); err != nil {
 		return err
 	}
-	return os.Rename(tmp.Name(), path)
+	if err := os.Rename(tmp.Name(), path); err != nil {
+		return err
+	}
+	// "Repo-grade" means the parent dentry too, not just the file.
+	return fsutil.SyncDir(dir)
 }
 
 // splitNonEmpty splits b on '\n' and discards empty trailing

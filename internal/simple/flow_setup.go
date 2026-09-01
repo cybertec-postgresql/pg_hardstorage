@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/fsutil"
 	"os"
 	"path/filepath"
 	"strings"
@@ -341,11 +342,23 @@ func persistDeployment(env *Env, name, pgConn, repoURL string) error {
 	if err != nil {
 		return err
 	}
+	// This replaces the operator's whole pg_hardstorage.yaml. An
+	// os.WriteFile + os.Rename pair fsyncs neither the content nor the
+	// parent dentry, so a power loss here can leave the config missing
+	// or (rename durable, content not) zero-length — with the previous
+	// config already gone. A stale tmp from an earlier crashed setup
+	// is removed rather than refused: setup is interactive and
+	// single-writer, and wedging it on leftover state helps nobody.
 	tmp := cfgPath + ".tmp"
-	if err := os.WriteFile(tmp, out, 0o644); err != nil {
+	_ = os.Remove(tmp)
+	if err := fsutil.WriteFileSync(tmp, out, 0o644); err != nil {
 		return err
 	}
-	return os.Rename(tmp, cfgPath)
+	if err := os.Rename(tmp, cfgPath); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return fsutil.SyncDir(filepath.Dir(cfgPath))
 }
 
 // mappingChild returns the value child of a mapping node by key,
