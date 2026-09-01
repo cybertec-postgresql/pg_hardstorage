@@ -14,10 +14,12 @@ import (
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage/fs"
 )
 
-// plantWALSegment plants a tiny manifest at the canonical
-// wal/<dep>/<TLI>/<24-char>.json key. The body contents don't
-// matter for gap detection — scanWALSegments only parses the key,
-// not the body.
+// plantWALSegment plants a segment manifest at the canonical
+// wal/<dep>/<TLI>/<24-char>.json key.
+//
+// Gap detection reads only the KEY, but the body still has to be a real
+// manifest: scanWALSegments reads one to learn the cluster's
+// wal_segment_size, and every segment NUMBER is derived from it.
 func plantWALSegment(t *testing.T, repoURL, deployment string, tli uint32, segNum uint64) {
 	t.Helper()
 	u, err := url.Parse(repoURL)
@@ -32,7 +34,25 @@ func plantWALSegment(t *testing.T, repoURL, deployment string, tli uint32, segNu
 
 	segName := walsink.SegmentFileName(tli, segNum, walsink.SegmentSize)
 	key := walsink.SegmentPath(deployment, tli, segName)
-	body := []byte(`{"schema":"pg_hardstorage.walsink.v1","segment_name":"` + segName + `"}`)
+	// The schema string here used to read "pg_hardstorage.walsink.v1",
+	// which is not the constant (walsink.Schema is
+	// "pg_hardstorage.wal_segment.v1"). ParseSegmentManifest rejected
+	// every one of these fixtures, so the whole `wal audit` suite was
+	// silently exercising the "no manifest could be read" fallback
+	// rather than the normal path — invisible while the fallback
+	// happened to guess the same 16 MiB the fixture used. Build a real
+	// manifest so these tests exercise what production does.
+	body, merr := stdjson.Marshal(walsink.SegmentManifest{
+		Schema:        walsink.Schema,
+		Deployment:    deployment,
+		Timeline:      tli,
+		SegmentNumber: segNum,
+		SegmentName:   segName,
+		SegmentSize:   walsink.SegmentSize,
+	})
+	if merr != nil {
+		t.Fatal(merr)
+	}
 	if _, err := sp.Put(context.Background(), key,
 		bytes.NewReader(body),
 		storage.PutOptions{ContentLength: int64(len(body))}); err != nil {

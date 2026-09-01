@@ -133,3 +133,42 @@ func TestRepoReplicateVerify_KnownDeploymentStillRuns(t *testing.T) {
 		t.Errorf("Verdict = %q, want consistent", view.Verdict)
 	}
 }
+
+// `integrity run` is the sharpest case of the same trap, because its
+// result does not just print — it is SIGNED with the operator's key and
+// persisted under integrity/runs/<id>.json, which the command's own
+// help describes as the artefact "an auditor can prove the repo was
+// intact at any historical attest time" with.
+//
+// A --deployment that names nothing walked nothing: Manifests.Total 0,
+// no failures, StatusOK, exit 0 — and that clean attestation was then
+// signed and durably stored. A typo would mint evidence of an integrity
+// check that examined zero manifests.
+func TestIntegrityRun_UnknownDeploymentIsRefusedNotAttested(t *testing.T) {
+	w := newReadWorld(t)
+	commitVerifiableBackup(t, w, "db1", 0, []byte("a"))
+
+	stdout, errb, exit := runCLI(t, "integrity", "run",
+		"--repo", w.repoURL, "--deployment", "db-typo",
+		"--strategy", "manifests-only", "-o", "json")
+	if exit == int(output.ExitOK) {
+		t.Fatalf("an unknown --deployment produced a clean integrity attestation:\n%s", stdout)
+	}
+	if !strings.Contains(errb, "usage.unknown_deployment") {
+		t.Errorf("expected usage.unknown_deployment, got:\n%s", errb)
+	}
+}
+
+// And the real deployment still attests, or the guard has broken the
+// command it protects.
+func TestIntegrityRun_KnownDeploymentStillAttests(t *testing.T) {
+	w := newReadWorld(t)
+	commitVerifiableBackup(t, w, "db1", 0, []byte("a"))
+
+	stdout, errb, exit := runCLI(t, "integrity", "run",
+		"--repo", w.repoURL, "--deployment", "db1",
+		"--strategy", "manifests-only", "-o", "json")
+	if exit != int(output.ExitOK) {
+		t.Fatalf("exit = %d for a real deployment\n%s\n%s", exit, stdout, errb)
+	}
+}

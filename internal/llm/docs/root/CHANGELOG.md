@@ -13,6 +13,49 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **One unreadable object decided the cluster's WAL segment size.**
+  `scanWALSegments` derives every segment *number* from
+  `wal_segment_size` (`segNum = logID * 4GiB/size + segInLog`), and it
+  learned that size by opening exactly one manifest — whichever the
+  backend listed first — falling back silently to the 16 MiB default if
+  that single `Get`, read or parse failed. A transient 503 or one torn
+  object therefore decided the numbering for the whole command.
+
+  The fallback is not a small error. On a 64 MiB cluster, assuming
+  16 MiB spreads consecutive segments across a 256-stride grid, so
+  `wal audit` reports a fabricated 192-segment gap at every log-id
+  boundary — exit 9 plus a `wal.gap_detected` event written into the
+  audit chain, on every cron run. On a 1 MiB cluster the assumption
+  *collides* distinct segments onto one number, which can **mask a real
+  gap** — the worse direction, and silent.
+
+  The size is cluster-wide and constant, so any readable manifest
+  answers it; several are now probed (bounded, since it answers a
+  constant). When none can be read the command refuses rather than
+  presenting the default as a fact. A manifest that parses but records
+  no `segment_size` stays a legacy manifest, where the default is the
+  right and historical answer — refusing there would break every repo
+  written before the field existed.
+
+- **The `wal audit` test fixtures had never produced a parseable
+  manifest.** `plantWALSegment` wrote `"schema":
+  "pg_hardstorage.walsink.v1"`; the constant is
+  `"pg_hardstorage.wal_segment.v1"`. Every fixture manifest was
+  rejected, so the entire `wal audit` suite had been exercising the
+  "no manifest could be read" fallback rather than the normal path —
+  invisible for as long as the fallback happened to guess the same
+  16 MiB the fixture used. The fixture now builds a real manifest.
+
+- **`integrity run --deployment <typo>` minted a signed attestation
+  that checked nothing.** Same trap as `kms verify` and `repo replicate
+  verify`, but the sharpest instance: the result is not merely printed,
+  it is signed with the operator's key and persisted under
+  `integrity/runs/<id>.json` — the artefact the command's own help
+  describes as how "an auditor can prove the repo was intact at any
+  historical attest time". An unknown name walked nothing, reported
+  `Total: 0` with no failures and `StatusOK`, and that clean
+  attestation was durably stored.
+
 - **`audit verify-anchor` asked the event whether it had been
   tampered with.** The command's whole purpose is proving the local
   chain has not been rewritten since it was externally witnessed. It

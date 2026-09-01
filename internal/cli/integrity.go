@@ -144,6 +144,20 @@ func runIntegrityRun(cmd *cobra.Command, f integrityRunFlags) error {
 		Verifier:  verifier,
 		CAS:       cas,
 	})
+	// A --deployment that names nothing walks nothing: Total=0, no
+	// failures, StatusOK — and unlike the other verdict commands this
+	// result is then SIGNED and persisted under integrity/runs/<id>.json
+	// as the attestation "an auditor can prove the repo was intact at
+	// any historical attest time". A typo would mint durable evidence of
+	// an integrity check that examined zero manifests.
+	//
+	// Checked on the NAME, not on the resulting count: a deployment
+	// whose backups have all been tombstoned legitimately has zero live
+	// manifests, and refusing that would block a valid attestation.
+	if derr := requireDeploymentExists(cmd.Context(), sp, "integrity run", f.deployment); derr != nil {
+		return derr
+	}
+
 	run, err := eng.Execute(cmd.Context(), f.deployment, strategy, f.note)
 	if err != nil {
 		if errors.Is(err, integrity.ErrInvalidStrategy) {

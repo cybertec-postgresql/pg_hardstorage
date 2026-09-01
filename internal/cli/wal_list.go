@@ -160,11 +160,26 @@ func scanWALSegments(ctx context.Context, sp storage.StoragePlugin, deployment s
 	// Read it from any one segment's manifest — it is cluster-wide and
 	// constant — and compute every entry with it. Falls back to the
 	// 16 MiB default when no manifest is readable.
-	firstKey := ""
-	if len(raws) > 0 {
-		firstKey = raws[0].key
+	keys := make([]string, 0, len(raws))
+	for _, r := range raws {
+		keys = append(keys, r.key)
 	}
-	segSize := deploymentSegmentSize(ctx, sp, firstKey)
+	segSize, readAny := deploymentSegmentSize(ctx, sp, keys)
+	if len(raws) > 0 && !readAny {
+		// Every candidate manifest was unreadable, so the cluster's
+		// wal_segment_size is genuinely unknown. Do NOT proceed on the
+		// 16 MiB default: segment NUMBERS are derived from it, so on a
+		// cluster using any other supported size every number is wrong
+		// and so is everything computed from them. See the error text.
+		return nil, output.NewError("wal.segment_size_unknown",
+			fmt.Sprintf("wal: %d segment manifest(s) for %q are present but none of the first %d "+
+				"could be fetched or parsed, so the cluster's wal_segment_size is unknown and "+
+				"segment numbering cannot be computed",
+				len(raws), deployment, maxSegmentSizeProbes)).
+			WithSuggestion(&output.Suggestion{
+				Human: "assuming the 16 MiB default here would produce confidently-wrong segment numbers on a cluster using any other size — fabricated gaps at every log-id boundary, or real gaps masked by colliding numbers. Check the backend is reachable and run `pg_hardstorage repo scrub` against the wal/ prefix.",
+			})
+	}
 
 	out := make([]walSegment, 0, len(raws))
 	for _, r := range raws {
@@ -192,24 +207,77 @@ func scanWALSegments(ctx context.Context, sp storage.StoragePlugin, deployment s
 // segment manifest at anyKey. The size is cluster-wide and constant, so
 // one manifest is representative. Returns the 16 MiB default when the
 // key is empty, unreadable, or records an invalid size.
-func deploymentSegmentSize(ctx context.Context, sp storage.StoragePlugin, anyKey string) int64 {
-	if anyKey == "" {
-		return walsink.DefaultSegmentSize
+// maxSegmentSizeProbes bounds how many manifests deploymentSegmentSize
+// will open looking for a readable one. The value is cluster-wide and
+// constant, so the first readable manifest answers it; the retries
+// exist so ONE unreadable object cannot decide the answer.
+const maxSegmentSizeProbes = 8
+
+// deploymentSegmentSize reads the cluster's wal_segment_size from any
+// readable segment manifest. The second return says whether ANY
+// candidate manifest could be fetched and parsed at all — which is a
+// different question from whether one carried a usable size.
+//
+// The distinction matters. A manifest that parses but records no
+// segment_size (or an invalid one) is a LEGACY manifest, written before
+// the field existed; the 16 MiB default is the right and historical
+// assumption there, and refusing would break every old repo. A manifest
+// that cannot be fetched or parsed at all tells us nothing, and
+// assuming the default is a guess dressed as a fact.
+//
+// It probes several keys rather than one. The value is cluster-wide, so
+// any readable manifest gives it — but the previous version tried
+// exactly one key (whichever the backend happened to list first) and
+// silently fell back to the 16 MiB default when that one Get, read or
+// parse failed. A single transient 503 or one torn object therefore
+// decided the segment size for the whole command.
+//
+// That fallback is not a small error, because segment NUMBERS are
+// derived from the size (segNum = logID * 4GiB/size + segInLog):
+//
+//   - on a 64 MiB cluster, assuming 16 MiB spreads consecutive segments
+//     across a 256-stride grid and `wal audit` reports a fabricated
+//     192-segment gap at every log-id boundary — exiting 9 and writing
+//     a wal.gap_detected event into the audit chain on every cron run;
+//   - on a 1 MiB cluster the assumption COLLIDES distinct segments onto
+//     the same number, which can mask a real gap. That direction is
+//     worse, and it is silent.
+//
+// Callers must act on the bool rather than take the default on trust.
+func deploymentSegmentSize(ctx context.Context, sp storage.StoragePlugin, keys []string) (size int64, readAny bool) {
+	probes := 0
+	for _, key := range keys {
+		if key == "" {
+			continue
+		}
+		if probes >= maxSegmentSizeProbes {
+			break
+		}
+		probes++
+		rc, err := sp.Get(ctx, key)
+		if err != nil {
+			continue
+		}
+		raw, rerr := io.ReadAll(rc)
+		_ = rc.Close()
+		if rerr != nil {
+			continue
+		}
+		m, perr := walsink.ParseSegmentManifest(raw)
+		if perr != nil {
+			continue
+		}
+		// Parsed. Whatever it says about the size, the backend is
+		// readable and we are not guessing blind.
+		readAny = true
+		if walsink.ValidSegmentSize(m.SegmentSize) {
+			return m.SegmentSize, true
+		}
+		// Legacy manifest with no recorded size: keep probing in case a
+		// newer sibling carries one, but the default is already a
+		// defensible answer.
 	}
-	rc, err := sp.Get(ctx, anyKey)
-	if err != nil {
-		return walsink.DefaultSegmentSize
-	}
-	raw, rerr := io.ReadAll(rc)
-	_ = rc.Close()
-	if rerr != nil {
-		return walsink.DefaultSegmentSize
-	}
-	m, perr := walsink.ParseSegmentManifest(raw)
-	if perr != nil || !walsink.ValidSegmentSize(m.SegmentSize) {
-		return walsink.DefaultSegmentSize
-	}
-	return m.SegmentSize
+	return walsink.DefaultSegmentSize, readAny
 }
 
 func countGaps(segs []walSegment) int {
