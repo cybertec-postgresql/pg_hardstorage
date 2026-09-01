@@ -231,7 +231,15 @@ func (m *Manager) resolveBackup(ctx context.Context, repoURL, deployment, backup
 		// "snapshot" lexically, an OLDER incremental_lsn outranked a
 		// NEWER full and the standby seeded from the wrong (earlier)
 		// backup — diverging from what `restore <dep> latest` picks.
-		id, lerr := restore.ResolveLatest(ctx, rs.sp, deployment, verifier)
+		id, skipped, lerr := restore.ResolveLatestDetailed(ctx, rs.sp, deployment, verifier)
+		if lerr == nil && skipped > 0 {
+			// A standby seeded from the wrong backup diverges from its
+			// primary silently and stays that way, so an unrankable
+			// manifest is not something to shrug at here: refuse and
+			// make the operator name the backup. Unlike a restore,
+			// creating a standby is not an emergency path.
+			return "", 0, fmt.Errorf("standby: %s", restore.LatestSkippedWarning(deployment, id, skipped))
+		}
 		if lerr != nil {
 			if errors.Is(lerr, restore.ErrNoBackupsFound) {
 				return "", 0, fmt.Errorf("standby: no committed backups for deployment %q", deployment)

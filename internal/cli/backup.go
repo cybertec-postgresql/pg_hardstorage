@@ -379,7 +379,16 @@ func loadIncrementalConfig(ctx context.Context, repoURL, deployment, parentID st
 	// `--incremental-from latest`, and it matches the operator's
 	// expectation that "latest" is a universal stable handle.
 	if strings.EqualFold(strings.TrimSpace(parentID), "latest") {
-		resolved, err := restore.ResolveLatest(ctx, sp, deployment, verifier)
+		resolved, skipped, err := restore.ResolveLatestDetailed(ctx, sp, deployment, verifier)
+		if err == nil && skipped > 0 {
+			// The resolved backup becomes this incremental's PARENT
+			// and anchors the whole chain. Building on the wrong
+			// anchor is not something a later verify can undo, so
+			// refuse rather than warn.
+			return nil, output.NewError("verify.latest_unrankable",
+				fmt.Sprintf("backup --incremental-from=latest: %s",
+					restore.LatestSkippedWarning(deployment, resolved, skipped)))
+		}
 		if err != nil {
 			if errors.Is(err, restore.ErrNoBackupsFound) {
 				return nil, output.NewError("notfound.backup",

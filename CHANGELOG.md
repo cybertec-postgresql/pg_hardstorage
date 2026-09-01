@@ -13,6 +13,41 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **"Restore the latest backup" could silently restore an older one.**
+  `ResolveLatest` ranks manifests by `stopped_at` and skips any that
+  fail signature verification or cannot be fetched. Skipping is
+  deliberate and stays — one corrupt old manifest must not stop an
+  operator finding a newer good backup, least of all mid-recovery — but
+  the skip was **silent**.
+
+  A manifest that fails to verify yields no `stopped_at`, so it cannot
+  be ranked, so it may have been *newer* than the winner.
+  `restore <dep> latest` then restored an older backup while the
+  operator believed they had asked for the newest, and nothing said
+  otherwise. The failure is worst in exactly the case that causes it:
+  the newest manifest being the corrupt one.
+
+  `ResolveLatestDetailed` now returns the skipped count alongside the
+  ID (`ResolveLatest` keeps its signature and behaviour, so the change
+  is additive), and all five callers act on it — differently, because
+  the right answer differs:
+
+  - `restore` **warns and proceeds**, emitting
+    `restore.latest_resolved_with_skips` at Warning severity before the
+    restore runs. Recovery must not be blocked by a metadata anomaly.
+  - `standby create`, the agent's restore executor, and
+    `backup --incremental-from=latest` **refuse**. None is an emergency
+    path, and each would otherwise bake the wrong choice in — a standby
+    diverges silently and stays diverged, an agent restore has nobody
+    watching, and an incremental's parent anchors the whole chain.
+  - The agent's verify executor **proceeds but records the count**:
+    "the latest backup verifies" and "the latest *readable* backup
+    verifies" are different results, and the second is a finding.
+
+  The count cannot be narrowed to "only the ones that might have been
+  newer" — establishing that would mean reading the manifest that just
+  failed to read.
+
 - **`backup undelete` reported "verified and restored" when the
   verification had not run.** Undelete re-checks the manifest's chunks
   *after* the marker flip, because the pre-flight ran while the backup

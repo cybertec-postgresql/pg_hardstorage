@@ -121,12 +121,22 @@ func (e *VerifyExecutor) Execute(ctx context.Context, job *ControlPlaneJob, prog
 
 	// Resolve "latest" at claim time — same posture as restore.
 	if backupID == "latest" {
-		id, err := restore.ResolveLatest(ctx, sp, job.Deployment, e.verifier)
+		id, skipped, err := restore.ResolveLatestDetailed(ctx, sp, job.Deployment, e.verifier)
 		if err != nil {
 			return nil, fmt.Errorf("verify-executor: resolve latest: %w", err)
 		}
 		backupID = id
-		progress(map[string]any{"op": "verify.latest_resolved", "body": map[string]any{"backup_id": id}})
+		// Verify is a read-only check, so it proceeds — but the
+		// progress record has to say which claim it is making: "the
+		// latest backup verifies" and "the latest READABLE backup
+		// verifies" are different results, and the second one is a
+		// finding in its own right.
+		body := map[string]any{"backup_id": id}
+		if skipped > 0 {
+			body["skipped_manifests"] = skipped
+			body["warning"] = restore.LatestSkippedWarning(job.Deployment, id, skipped)
+		}
+		progress(map[string]any{"op": "verify.latest_resolved", "body": body})
 	}
 
 	// Read the manifest now so we can derive PG major and surface a

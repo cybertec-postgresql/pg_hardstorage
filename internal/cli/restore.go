@@ -301,9 +301,25 @@ func runRestore(cmd *cobra.Command, opts restoreOpts) error {
 			autoResolved = true
 			resolvedFrom = "time"
 		} else {
-			resolved, err := resolveLatestFromRepo(cmd.Context(), opts.repoURL, opts.deployment, verifier)
+			resolved, skipped, err := resolveLatestFromRepo(cmd.Context(), opts.repoURL, opts.deployment, verifier)
 			if err != nil {
 				return err
+			}
+			// "latest" was answered from the manifests that could be
+			// READ. A manifest that fails verification yields no
+			// StoppedAt, so it cannot be ranked — and may have been
+			// newer than the winner. Restoring an older backup while
+			// the operator believes they asked for the newest is a
+			// silently wrong recovery, so say so before the restore
+			// runs and name the way out (an explicit backup ID).
+			if skipped > 0 {
+				_ = d.Event(cmd.Context(), output.NewEvent(output.SeverityWarning, "restore", "latest_resolved_with_skips").
+					WithSubject(output.Subject{Deployment: opts.deployment}).
+					WithBody(map[string]any{
+						"chosen":            resolved,
+						"skipped_manifests": skipped,
+						"reason":            restore.LatestSkippedWarning(opts.deployment, resolved, skipped),
+					}))
 			}
 			backupID = resolved
 			autoResolved = true
@@ -650,28 +666,28 @@ func validateRestoreTargets(opts *restoreOpts) error {
 // resolveLatestFromRepo opens the repo's storage layer and calls
 // restore.ResolveLatest, mapping errors to structured output errors
 // the CLI consumer can act on.
-func resolveLatestFromRepo(ctx context.Context, repoURL, deployment string, verifier *backup.Verifier) (string, error) {
+func resolveLatestFromRepo(ctx context.Context, repoURL, deployment string, verifier *backup.Verifier) (string, int, error) {
 	_, sp, err := repo.Open(ctx, repoURL)
 	if err != nil {
 		if errors.Is(err, repo.ErrNotARepo) {
-			return "", output.NewError("notfound.repo",
+			return "", 0, output.NewError("notfound.repo",
 				fmt.Sprintf("restore: no pg_hardstorage repository at %s", repoURL)).Wrap(err)
 		}
 		if errors.Is(err, storage.ErrUnknownScheme) {
-			return "", output.NewError("usage.unknown_scheme", err.Error()).Wrap(output.ErrUsage)
+			return "", 0, output.NewError("usage.unknown_scheme", err.Error()).Wrap(output.ErrUsage)
 		}
-		return "", fmt.Errorf("restore: open repo: %w", err)
+		return "", 0, fmt.Errorf("restore: open repo: %w", err)
 	}
 	defer sp.Close()
 
-	id, err := restore.ResolveLatest(ctx, sp, deployment, verifier)
+	id, skipped, err := restore.ResolveLatestDetailed(ctx, sp, deployment, verifier)
 	if err != nil {
 		if errors.Is(err, restore.ErrNoBackupsFound) {
-			return "", restore.FormatNoBackupsError(deployment)
+			return "", skipped, restore.FormatNoBackupsError(deployment)
 		}
-		return "", fmt.Errorf("restore: resolve latest: %w", err)
+		return "", skipped, fmt.Errorf("restore: resolve latest: %w", err)
 	}
-	return id, nil
+	return id, skipped, nil
 }
 
 // resolveBackupForTimeFromRepo opens the repo's storage layer

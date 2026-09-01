@@ -172,15 +172,24 @@ func (e *RestoreExecutor) Execute(ctx context.Context, job *ControlPlaneJob, pro
 		if err != nil {
 			return nil, fmt.Errorf("restore-executor: open repo: %w", err)
 		}
-		var id string
+		var (
+			id      string
+			skipped int
+		)
 		if !targetTime.IsZero() {
 			id, err = restore.ResolveBackupForTime(ctx, sp, job.Deployment, targetTime, e.verifier)
 		} else {
-			id, err = restore.ResolveLatest(ctx, sp, job.Deployment, e.verifier)
+			id, skipped, err = restore.ResolveLatestDetailed(ctx, sp, job.Deployment, e.verifier)
 		}
 		sp.Close()
 		if err != nil {
 			return nil, fmt.Errorf("restore-executor: resolve latest: %w", err)
+		}
+		// Nobody is watching an agent-driven restore resolve its
+		// target, so a warning would go nowhere: refuse instead. The
+		// control plane can re-dispatch with an explicit backup_id.
+		if skipped > 0 {
+			return nil, fmt.Errorf("restore-executor: %s", restore.LatestSkippedWarning(job.Deployment, id, skipped))
 		}
 		backupID = id
 	}
