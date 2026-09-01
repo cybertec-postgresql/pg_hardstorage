@@ -137,6 +137,15 @@ func runRepoReplicateVerify(cmd *cobra.Command, f repoReplicateVerifyFlags) erro
 	}
 	defer dstSP.Close()
 
+	// Same trap as `kms verify`: the walk is scoped by building
+	// "manifests/<deployment>/backups/", so an unknown name lists
+	// nothing and the verdict comes back consistent — "the replica has
+	// everything" — with exit 0. Validate against the SOURCE repo,
+	// which is the side the deployment has to exist on.
+	if err := requireDeploymentExists(cmd.Context(), srcSP, "repo replicate verify", f.deployment); err != nil {
+		return err
+	}
+
 	res, err := repo.VerifyReplicate(cmd.Context(), srcSP, dstSP, repo.ReplicateVerifyOptions{
 		Deployment: f.deployment,
 		IncludeWAL: f.includeWAL,

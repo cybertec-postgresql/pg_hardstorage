@@ -9,6 +9,36 @@ on-disk and on-the-wire schema (backup manifests, configuration, output JSON,
 and the on-disk chunk envelope): an agent built against a given schema version
 keeps reading that version for at least 24 months after a successor lands.
 
+## [Unreleased]
+
+### Fixed
+
+- **A `--deployment` filter that matched nothing produced a clean
+  verdict.** `kms verify` and `repo replicate verify` both scope their
+  walk by building a key prefix out of the flag —
+  `manifests/<deployment>/backups/` — so an unknown name lists nothing,
+  every counter lands on zero, nothing is classified as broken, and the
+  command exits 0. `kms verify` printed the operator's own typo back as
+  the scope it had checked; `repo replicate verify` answered
+  `consistent` — "the replica has everything" — having compared
+  nothing. A compliance job pointed at a renamed or retired deployment
+  reports green forever, which is the worst failure mode a scheduled
+  check can have: it is indistinguishable from working.
+
+  Both now validate the name against the repo's deployments before the
+  walk and refuse an unknown one with `usage.unknown_deployment`,
+  listing the real names so a typo is obvious. The check is on the
+  NAME, deliberately, and not on the resulting count — zero manifests
+  is also the correct answer for a deployment that exists and has had
+  every backup tombstoned, and refusing on an empty walk would break
+  that legitimate run. It is not extended to `--kek-ref`: for the
+  post-rotation audit that flag serves ("what is still wrapped under
+  the old ref?"), zero matches is the success condition.
+
+  Listing commands (`audit search`, `forecast`, `compliance`) are
+  deliberately left alone — an empty filtered view is a legitimate
+  answer there and no pass/fail is claimed.
+
 ## [1.3.5] — 2026-09-01
 
 ### Fixed

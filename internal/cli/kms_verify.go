@@ -170,6 +170,13 @@ func runKmsVerify(cmd *cobra.Command, f kmsVerifyFlags) error {
 	}
 	defer sp.Close()
 
+	// A --deployment that matches nothing walks an empty prefix and
+	// reports a clean fleet with exit 0. Check the name before the
+	// walk, not the count after it.
+	if err := requireDeploymentExists(cmd.Context(), sp, "kms verify", f.deployment); err != nil {
+		return err
+	}
+
 	res, err := backup.VerifyEnvelopes(cmd.Context(), sp, backup.VerifyEnvelopesOptions{
 		Verifier:         verifier,
 		KEKResolver:      resolver,
