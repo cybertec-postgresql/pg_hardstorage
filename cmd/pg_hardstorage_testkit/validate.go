@@ -114,7 +114,15 @@ fleet.`,
 			if err != nil {
 				return fmt.Errorf("validate: open events.ndjson: %w", err)
 			}
-			defer eventsFile.Close()
+			// Closed explicitly at the end of the run (below) so a
+			// close-time write error is reported rather than dropped;
+			// the deferred close is the crash-path backstop only.
+			eventsClosed := false
+			defer func() {
+				if !eventsClosed {
+					_ = eventsFile.Close()
+				}
+			}()
 			emitFile := makeNDJSONEmitter(eventsFile)
 
 			// OnEvent fans out to NDJSON stdout + pushgateway +
@@ -134,6 +142,18 @@ fleet.`,
 				pg.AnnotateCellMetadata(e.Name, e.OS, e.PG)
 			}
 
+			//nolint:gocritic // closeEvents is called on every exit path below.
+			closeEvents := func() error {
+				if eventsClosed {
+					return nil
+				}
+				eventsClosed = true
+				if cerr := eventsFile.Close(); cerr != nil {
+					return fmt.Errorf("validate: close events.ndjson: %w", cerr)
+				}
+				return nil
+			}
+
 			rep, err := validate.Run(cmd.Context(), validate.RunOptions{
 				Project:  project,
 				Seed:     seed,
@@ -151,7 +171,15 @@ fleet.`,
 				SetupConcurrency: setupConcurrency,
 			})
 			if err != nil {
+				_ = closeEvents()
 				return err
+			}
+			// events.ndjson is the post-mortem source of truth, so its
+			// close-time error is surfaced rather than dropped by a
+			// deferred Close: a truncated tail would silently rewrite
+			// what the run appeared to do.
+			if cerr := closeEvents(); cerr != nil {
+				return cerr
 			}
 
 			// Stamp fleet summary into the report.

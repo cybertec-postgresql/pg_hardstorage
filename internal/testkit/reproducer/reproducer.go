@@ -151,8 +151,14 @@ func (b *Bundle) WriteToFile(path string) error {
 	if err != nil {
 		return err
 	}
-	defer f.Close()
-	return b.Write(f)
+	if err := b.Write(f); err != nil {
+		_ = f.Close()
+		return err
+	}
+	// Checked, not deferred: Close is where the last buffered write
+	// surfaces ENOSPC, and a bundle that reports success but is a
+	// truncated tar is discovered only when someone tries to replay it.
+	return f.Close()
 }
 
 // writeMetadata copies every MetadataPaths entry into the tar

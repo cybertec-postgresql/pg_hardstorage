@@ -13,6 +13,37 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **The repository KEK could be handed out before it was safely on
+  disk.** `LoadOrGenerateKEK` generated the key, wrote it, fsynced it —
+  and closed the file with a bare `defer f.Close()`. Close(2) is where a
+  delayed-allocation, quota-bound or network filesystem finally reports
+  ENOSPC/EDQUOT for writes the kernel accepted earlier, and that error
+  was discarded. It also never fsynced the keyring directory, so the
+  newly-created `kek.bin` dentry could be lost outright to a power cut.
+
+  The consequence is the worst one this project has: the function
+  returns the KEK *in memory*, the caller immediately uses it to wrap
+  the shared DEK, and every chunk of the backup is sealed under it. If
+  the on-disk copy never landed, that backup is encrypted with a key
+  that exists nowhere — and nothing detects it at the time. The backup
+  verifies, the manifest commits, the operator gets exit 0. The loss
+  surfaces at the one moment it cannot be tolerated. Both the Close and
+  the directory fsync are now checked, and `ShredKEK` fsyncs the
+  directory after the unlink so a crypto-shred is durable too.
+
+  Two smaller instances of the same shape went with it: the reproducer
+  bundle writer (`WriteToFile`) and the testkit soak's
+  `events.ndjson` — both could report success over a truncated file.
+
+  A second AST guard in `internal/fsutil` now fails the build when a
+  file opened for writing has its Close *only* deferred and discarded.
+  It is scoped tightly to that shape, so the legitimate neighbours stay
+  quiet: a writer handed to its owner (`checkpoint.NewWriter`,
+  `cef.Sink`), a Close on a failure path that is already returning the
+  error, and the deferred-capture-through-the-named-return idiom the
+  restore materialisers use all pass. The guard did not exist for the
+  rename fix above because a `create` has no rename to catch.
+
 - **Seven hand-rolled atomic writes never fsynced the parent
   directory, so their renames could be lost to a power loss** — among
   them the manifest-signing keypair and the installed KEK. POSIX

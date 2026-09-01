@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/fsutil"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/encryption"
 )
 
@@ -91,8 +92,18 @@ func LoadOrGenerateKEK(keyringDir string) ([encryption.KeyLen]byte, bool, error)
 	}
 
 	// Generate fresh.
+	//
+	// Every step below is checked, because this function returns an
+	// in-memory KEK that the caller immediately uses to wrap a DEK and
+	// encrypt a backup. If the on-disk copy did not actually make it to
+	// stable storage, that backup is sealed under a key that exists
+	// nowhere — unrecoverable, with nothing to notice at the time. A
+	// dropped Close error or an unflushed parent dentry is enough.
 	if err := os.MkdirAll(keyringDir, 0o700); err != nil {
 		return zero, false, fmt.Errorf("keystore: mkdir %s: %w", keyringDir, err)
+	}
+	if err := fsutil.SyncDir(filepath.Dir(keyringDir)); err != nil {
+		return zero, false, fmt.Errorf("keystore: fsync parent of %s: %w", keyringDir, err)
 	}
 	var kek [encryption.KeyLen]byte
 	if _, err := rand.Read(kek[:]); err != nil {
@@ -103,14 +114,31 @@ func LoadOrGenerateKEK(keyringDir string) ([encryption.KeyLen]byte, bool, error)
 	if err != nil {
 		return zero, false, fmt.Errorf("keystore: create %s: %w", path, err)
 	}
-	defer f.Close()
 	if _, err := f.Write(kek[:]); err != nil {
+		_ = f.Close()
 		_ = os.Remove(path)
 		return zero, false, fmt.Errorf("keystore: write %s: %w", path, err)
 	}
 	if err := f.Sync(); err != nil {
+		_ = f.Close()
 		_ = os.Remove(path)
 		return zero, false, fmt.Errorf("keystore: fsync %s: %w", path, err)
+	}
+	// Checked, not deferred. Close is where a delayed-allocation or
+	// network filesystem reports ENOSPC/EDQUOT, and a deferred Close
+	// discards that: the caller would go on to encrypt a backup under a
+	// KEK whose file was never written.
+	if err := f.Close(); err != nil {
+		_ = os.Remove(path)
+		return zero, false, fmt.Errorf("keystore: close %s: %w", path, err)
+	}
+	// f.Sync() flushed the KEK's bytes and inode but not the dentry
+	// that O_CREATE added to the keyring directory, so without this the
+	// file can vanish entirely on a power loss. (The repo's
+	// rename/SyncDir guard does not cover this site: there is no rename
+	// here, just a create.)
+	if err := fsutil.SyncDir(keyringDir); err != nil {
+		return zero, false, fmt.Errorf("keystore: fsync %s: %w", keyringDir, err)
 	}
 	return kek, true, nil
 }
@@ -185,6 +213,15 @@ func ShredKEK(keyringDir string) error {
 	}
 	if err := os.Remove(path); err != nil {
 		return fmt.Errorf("keystore: unlink %s: %w", path, err)
+	}
+	// Make the unlink durable. The zero-overwrite above is already
+	// fsynced and is what actually makes the key unrecoverable, so a
+	// lost unlink leaves an inert file rather than a live KEK — but
+	// this function's contract is "the path stops being readable", and
+	// a crypto-shred is exactly the operation where an operator is
+	// entitled to that being true after a reboot.
+	if err := fsutil.SyncDir(keyringDir); err != nil {
+		return fmt.Errorf("keystore: fsync %s after shred: %w", keyringDir, err)
 	}
 	return nil
 }
