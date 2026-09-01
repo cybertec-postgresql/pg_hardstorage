@@ -80,6 +80,17 @@ type Graph struct {
 	// 1 = full only; 2 = full + 1 incremental; etc.
 	MaxChainDepth int `json:"max_chain_depth"`
 
+	// UnreadableCount is the number of manifests the walk could not
+	// verify or read, and therefore could not place in the graph.
+	//
+	// Non-zero means the topology below is INCOMPLETE. That matters
+	// most for what it does to the rest of the answer: a child whose
+	// parent was skipped has no parent link, so it is reported as an
+	// orphan — "its parent is deleted or never existed" — when the
+	// parent is in fact present and merely unverifiable. The operator
+	// is sent looking for a missing manifest instead of a corrupt one.
+	UnreadableCount int `json:"unreadable_count,omitempty"`
+
 	// Issues are integrity findings: orphans, missing parents,
 	// cycles, mixed timelines, etc.
 	Issues []GraphIssue `json:"issues,omitempty"`
@@ -200,6 +211,11 @@ func BuildGraph(ctx context.Context, sp storage.StoragePlugin, deployment string
 	store := backup.NewManifestStore(sp)
 
 	byID := map[string]*Node{}
+	// unreadable counts manifests skipped because they would not verify
+	// or read. Skipping is right — one corrupt manifest must not hide
+	// the rest of the topology — but it cannot be silent: see
+	// Graph.UnreadableCount.
+	unreadable := 0
 	if opts.IncludeTombstoned {
 		for entry, lerr := range store.ListIncludingTombstoned(ctx, deployment, opts.Verifier) {
 			if err := ctx.Err(); err != nil {
@@ -207,6 +223,7 @@ func BuildGraph(ctx context.Context, sp storage.StoragePlugin, deployment string
 				return g, err
 			}
 			if lerr != nil {
+				unreadable++
 				continue
 			}
 			n := manifestToNode(entry.Manifest, opts.IncludeTombstoned)
@@ -220,11 +237,27 @@ func BuildGraph(ctx context.Context, sp storage.StoragePlugin, deployment string
 				return g, err
 			}
 			if lerr != nil {
+				unreadable++
 				continue
 			}
 			n := manifestToNode(m, false)
 			byID[n.BackupID] = n
 		}
+	}
+
+	// Record the skips BEFORE anything derived from the topology, so a
+	// reader meets "this graph is incomplete" ahead of the orphan and
+	// missing-parent findings that an incomplete graph manufactures.
+	g.UnreadableCount = unreadable
+	if unreadable > 0 {
+		g.Issues = append(g.Issues, GraphIssue{
+			Severity: "critical",
+			Code:     "chain.manifests_unreadable",
+			Message: fmt.Sprintf("%d manifest(s) for %q could not be verified or read and are missing from this graph; "+
+				"any orphan or missing-parent finding below may be an artefact of that rather than a real gap",
+				unreadable, deployment),
+			Suggestion: "run `pg_hardstorage repo check` — a manifest that fails signature verification is potential tampering, not a chain problem",
+		})
 	}
 
 	// Wire parent/child links.

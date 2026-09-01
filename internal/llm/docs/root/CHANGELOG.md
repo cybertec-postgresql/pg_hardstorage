@@ -13,6 +13,33 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **`backup graph` invented a broken chain out of a corrupt manifest.**
+  `BuildGraph` skips manifests that fail signature verification or
+  cannot be read — right, since one corrupt manifest must not hide the
+  rest of the topology, and `backup graph` is often the first thing an
+  operator runs when something looks wrong. But the skip was silent, and
+  silence here does not merely omit: it *fabricates*.
+
+  A child whose parent was skipped gets no parent link, so it is
+  reported as an orphan. With the parent manifest corrupted, the graph
+  emitted:
+
+      critical  chain.orphaned_incremental
+      incremental "db1.incremental_lsn…" references parent
+      "db1.full.f…" which is not present in the visible set
+      → the parent has been deleted (or never committed) …
+        Check `list --include-deleted` or `repo audit`
+
+  The parent is present. It is sitting right there, merely unverifiable.
+  The operator is sent hunting for a deletion that never happened,
+  instead of at a manifest that fails signature verification — the wrong
+  repair, and the wrong urgency.
+
+  The graph now carries `unreadable_count` and records a critical
+  `chain.manifests_unreadable` finding, deliberately appended *before*
+  the orphan findings an incomplete graph manufactures, so the
+  explanation is read ahead of the symptom.
+
 - **The PITR time-target resolver had the same silent skip, and it
   bites harder.** `ResolveBackupForTime` answers "the *latest* backup at
   or before the target" — the seed PG replays forward from — and skipped
