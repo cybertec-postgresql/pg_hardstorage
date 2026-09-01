@@ -13,6 +13,41 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **The bit-rot scrub examined the same chunks on every run, forever.**
+  Both scrub commands describe themselves as sampling —
+  `repo scrub` "samples N% of the repo's referenced chunks", default
+  `--sample-percent 1`, recommended "for hourly cron"; `repair scrub`
+  "samples N chunks (default 1000)". Neither did.
+
+  The walk is fully deterministic (deployments sorted, manifests in key
+  order — which is chronological — chunks in file order) and it simply
+  stopped once `limit` chunks had been sampled. So every run re-hashed
+  the identical prefix: at the documented default, the **oldest backups
+  of the alphabetically-first deployment**, hour after hour. The newest
+  backups — the ones an operator would actually restore from — were
+  never scrubbed at all, and neither was any other deployment. Bit rot
+  outside that fixed slice was invisible to the only tool whose job is
+  to find it, while the output reported a sample percent that reads as
+  rotating coverage.
+
+  Runs now advance through the repo, one window per hour, so
+  `ceil(total/limit)` runs cover every referenced chunk exactly once —
+  about four days at the documented 1%-hourly default. `--full` and any
+  run whose limit already covers the repo are untouched, and the chosen
+  window is reported so an operator can watch coverage advance.
+
+- **A scrub that could not read a single manifest reported a clean
+  repo.** Found while building the fixture for the rotation fix above:
+  an early version signed its manifest with an ad-hoc keypair, so the
+  manifest walk rejected it, skipped it, and the scrub returned
+  `sampled 0, mismatches 0, err nil` over eight referenced chunks — a
+  clean bill of health for a repo it had never looked inside. The skip
+  itself is right; the silence was not. The old comment reasoned that
+  unreadable manifests "will surface in other tools (verify, list)",
+  which is true and beside the point: the operator running scrub is
+  running it *as* their integrity check. Unverifiable manifests are now
+  counted, reported, and exit `verify.scrub_unverifiable_manifests`.
+
 - **The dedup-vs-GC commit gate claimed a guarantee it did not
   deliver.** `verifyAdoptedChunks` re-Stats every chunk an incremental
   backup deduplicated against rather than wrote, and refuses the commit

@@ -287,7 +287,7 @@ func TestScrubManifestAware_PropagatesWALListError(t *testing.T) {
 	setTestKeyringHome(t)
 
 	faulty := walListFaultSP{StoragePlugin: sp}
-	_, _, err := scrubManifestAware(ctx, faulty, 0)
+	_, _, err := scrubManifestAware(ctx, faulty, 0, 0)
 	if err == nil {
 		t.Fatal("expected the injected wal/ List error to propagate, got nil")
 	}

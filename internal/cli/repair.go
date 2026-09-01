@@ -1035,7 +1035,7 @@ func runRepairScrub(cmd *cobra.Command, repoURL string, limit int, heal bool, re
 	// silently treated every encrypted chunk as a mismatch (the
 	// decryptor lookup failed and the loop counted the failure as
 	// a "mismatch") — that's the bug this rewrite fixes.
-	res, refsTotal, err := scrubManifestAware(cmd.Context(), sp, limit)
+	res, refsTotal, err := scrubManifestAware(cmd.Context(), sp, limit, scrubWindowIndex(time.Now()))
 	if err != nil {
 		return output.NewError("repair.scrub_failed",
 			fmt.Sprintf("repair scrub: %v", err)).Wrap(err)
@@ -1257,6 +1257,20 @@ type scrubResultAgg struct {
 	OK         int
 	Bytes      int64
 	Mismatches []repo.Hash
+
+	// WindowStart / WindowCount describe WHICH slice of the repo this
+	// run examined. A sampling scrub that always picks the same slice
+	// is not sampling; these make the rotation visible so an operator
+	// can see coverage advance run over run.
+	WindowStart int
+	WindowCount int
+
+	// UnverifiableManifests counts manifests the walk could not verify
+	// or read, and therefore could not scrub the chunks of. A scrub
+	// that skipped every manifest in the repo otherwise reports
+	// "sampled 0, 0 mismatches" — a clean bill of health over a repo
+	// it never looked inside.
+	UnverifiableManifests int
 }
 
 // hashListForMsg renders a hash slice for an error message, capping the
@@ -1384,7 +1398,46 @@ func reverifyChunksPlaintext(ctx context.Context, sp storage.StoragePlugin, targ
 // Returns the aggregate result, the count of distinct hashes the
 // scrub would have walked at limit=0 (the "referenced total" header
 // the operator sees), and any storage / iteration error.
-func scrubManifestAware(ctx context.Context, sp storage.StoragePlugin, limit int) (scrubResultAgg, int, error) {
+// scrubWindowIndex converts a wall-clock instant into the rotation
+// index a scrub run uses. One window per hour, matching the hourly
+// cron the --sample-percent help text recommends.
+func scrubWindowIndex(now time.Time) int { return int(now.UTC().Unix() / 3600) }
+
+// scrubWindowStart picks which contiguous slice of the repo's chunks a
+// run examines, so consecutive runs advance through the whole repo.
+//
+// Without this, both scrub commands re-examined the SAME chunks on
+// every run. The walk is deterministic — deployments sorted, manifests
+// in key (chronological) order, chunks in file order — and it simply
+// stopped once `limit` chunks had been sampled. So `repo scrub` at its
+// documented default (1%, hourly) permanently re-hashed the oldest
+// backups of the alphabetically-first deployment and never looked at
+// anything else. The newest backups, the ones an operator would
+// actually restore from, were never scrubbed at all; neither was any
+// other deployment. Both commands describe this as "sampling", and the
+// output reports a sample percent, which reads as coverage that
+// rotates. It did not rotate.
+//
+// windows = ceil(total/limit), so a full cycle covers every referenced
+// chunk exactly once: 100 hourly runs at 1%, ~4 days. The final window
+// of a cycle is short when total is not a multiple of limit, which is
+// correct rather than something to pad.
+//
+// Returns 0 whenever the run covers everything anyway (limit <= 0, or
+// limit >= total), so --full and small repos are unaffected.
+func scrubWindowStart(total, limit, windowIndex int) (start, windows int) {
+	if limit <= 0 || total <= 0 || limit >= total {
+		return 0, 1
+	}
+	windows = (total + limit - 1) / limit
+	w := windowIndex % windows
+	if w < 0 {
+		w += windows
+	}
+	return w * limit, windows
+}
+
+func scrubManifestAware(ctx context.Context, sp storage.StoragePlugin, limit, windowIndex int) (scrubResultAgg, int, error) {
 	var agg scrubResultAgg
 	seen := make(map[repo.Hash]struct{})
 
@@ -1396,11 +1449,24 @@ func scrubManifestAware(ctx context.Context, sp storage.StoragePlugin, limit int
 	}
 	distinctRefs := refs.Len()
 
+	start, windows := scrubWindowStart(distinctRefs, limit, windowIndex)
+	agg.WindowStart, agg.WindowCount = start, windows
+
+	// ordinal counts distinct candidate chunks in deterministic walk
+	// order. The run verifies the ones in [start, start+limit); the
+	// ones before start are skipped rather than stopping the walk, so
+	// later runs reach later chunks.
+	ordinal := 0
 	verifyChunk := func(cas *repo.CAS, h repo.Hash) {
 		if _, dup := seen[h]; dup {
 			return
 		}
 		seen[h] = struct{}{}
+		idx := ordinal
+		ordinal++
+		if idx < start {
+			return
+		}
 		if limit > 0 && agg.Sampled >= limit {
 			return
 		}
@@ -1441,8 +1507,16 @@ func scrubManifestAware(ctx context.Context, sp storage.StoragePlugin, limit int
 	for _, dep := range deployments {
 		for m, merr := range ms.List(ctx, dep, verifier) {
 			if merr != nil {
-				// Skip un-readable manifests — they'll surface in
-				// other tools (verify, list).  Don't fail the scrub.
+				// Skip un-readable manifests: one bad manifest must not
+				// stop the rest of the repo being scrubbed. But COUNT
+				// them. The old comment said they would "surface in
+				// other tools (verify, list)", which is true and beside
+				// the point — the operator running scrub is running it
+				// as their bit-rot check, and a scrub that skipped every
+				// manifest in the repo still reported "sampled 0, 0
+				// mismatches": a clean bill of health over a repo it
+				// never looked inside.
+				agg.UnverifiableManifests++
 				continue
 			}
 			if limit > 0 && agg.Sampled >= limit {
