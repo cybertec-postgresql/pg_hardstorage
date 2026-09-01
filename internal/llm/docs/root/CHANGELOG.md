@@ -13,6 +13,27 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **`audit verify-anchor` asked the event whether it had been
+  tampered with.** The command's whole purpose is proving the local
+  chain has not been rewritten since it was externally witnessed. It
+  compared `anchor.ChainHeadHash` against `ev.Hash` — a field read out
+  of the stored JSON. Rewriting an event's content while leaving that
+  field at the anchored value therefore passed:
+
+      before rewrite:  VerifyAnchor ok=true
+      action changed:  VerifyAnchor ok=true   mismatch=""
+                       VerifyChain  ok=false  hashMismatches=1
+
+  `VerifyChain` recomputes and caught it; `VerifyAnchor` did not. The
+  externally-witnessed check — the strongest claim the system makes —
+  was weaker than the internal one.
+
+  The hash is now recomputed before either comparison, and the two
+  failures stay distinct: an event that does not hash to its own
+  recorded value has been *rewritten in place*, while one that is
+  self-consistent but differs from the anchor is *not the event that
+  was witnessed*. They point at different investigations.
+
 - **`audit verify-bundle` claimed to check the chain and did not.** Its
   own help text read *"Asserts the bundle's ed25519 signature is valid
   **+ the chain segment is contiguous**"*. Only the first half existed:

@@ -1258,9 +1258,27 @@ func (s *Store) VerifyAnchor(ctx context.Context, log TransparencyLog, logID str
 	}
 	res.LocalHeadHash = ev.Hash
 	res.LocalHeadSequence = ev.Sequence
-	if ev.Hash != a.ChainHeadHash {
+
+	// Recompute before comparing. Event.Hash is a field read out of the
+	// stored JSON, so comparing it to the anchor asks the event whether
+	// it has been tampered with. Rewriting the content and leaving the
+	// Hash field at the anchored value defeated that: VerifyAnchor
+	// reported ok=true over an event whose action had been changed,
+	// while VerifyChain — which does recompute — flagged it. The
+	// externally-witnessed check, the strongest claim this system
+	// makes, was the weaker of the two.
+	recomputed, herr := ComputeHash(ev)
+	if herr != nil {
+		return res, fmt.Errorf("audit: recompute hash of anchored event %s: %w", ev.ID, herr)
+	}
+	if recomputed != ev.Hash {
+		res.Mismatch = fmt.Sprintf("event at anchored sequence %d does not hash to its own recorded value (content hashes to %s, event records %s) — the event has been rewritten in place",
+			a.HeadSequence, recomputed, ev.Hash)
+		return res, nil
+	}
+	if recomputed != a.ChainHeadHash {
 		res.Mismatch = fmt.Sprintf("hash mismatch at sequence %d: local=%s anchor=%s",
-			a.HeadSequence, ev.Hash, a.ChainHeadHash)
+			a.HeadSequence, recomputed, a.ChainHeadHash)
 		return res, nil
 	}
 	res.OK = true
