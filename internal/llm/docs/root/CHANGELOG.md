@@ -13,6 +13,29 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **`partial inspect` answered "yes, 0 bytes" for a table it could not
+  extract.** The command exists to answer, in its own package doc's
+  words, *"would my partial restore work, and how big is it?"* — before
+  the operator commits to the restore. It resolves each table's
+  relfilenode against the **live** catalog and matches that path
+  against a **backup's** manifest, and those two disagree whenever the
+  relation was rewritten after the backup was taken: `VACUUM FULL`,
+  `CLUSTER`, `TRUNCATE`, a rewriting `ALTER TABLE`. All routine.
+
+  When they disagreed, no `FileEntry` matched and the mapping was left
+  at `heap_bytes: 0, heap_chunks: 0, heap_segments: 0,
+  not_found: false` — reported as a table that *is* in the backup and
+  happens to be empty. `partial restore` already learned to call this
+  `NotInBackup`; the view an operator consults **first** still said the
+  restore would work.
+
+  The mapping now carries `not_in_backup`, rendered both as a row
+  marker and a summary line naming the likely cause and the two
+  remedies (an older backup, or `--relfilenode-map`). The
+  discriminator is segment count, not byte count: an empty table still
+  has a heap file in the manifest, so keying on bytes would flag every
+  empty table and send operators chasing a rewrite that never happened.
+
 - **The bit-rot scrub examined the same chunks on every run, forever.**
   Both scrub commands describe themselves as sampling —
   `repo scrub` "samples N% of the repo's referenced chunks", default

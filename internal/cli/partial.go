@@ -216,6 +216,11 @@ func matchManifestPaths(m *backup.Manifest, rfns []partial.Relfilenode) []partia
 			if rfn.ToastPath != "" {
 				matchPaths(&entry.ToastBytes, &entry.ToastChunks, &entry.ToastSegments, m, rfn.ToastPath)
 			}
+			// Zero SEGMENTS, not zero bytes: an empty table still has a
+			// heap file in the manifest (a FileEntry of size 0), so a
+			// segment count of zero means the path is genuinely absent
+			// from this backup rather than the relation being empty.
+			entry.NotInBackup = entry.HeapSegments == 0
 		}
 		out = append(out, entry)
 	}
@@ -324,6 +329,20 @@ type partialTableMapping struct {
 	ToastChunks   int    `json:"toast_chunks,omitempty"`
 	ToastSegments int    `json:"toast_segments,omitempty"`
 	NotFound      bool   `json:"not_found,omitempty"`
+
+	// NotInBackup marks a table that resolved to a relfilenode in the
+	// LIVE catalog but whose heap is absent from THIS backup. Mirrors
+	// RestoreResult.NotInBackup, and for the same reason: without it,
+	// `partial inspect` — the view whose stated job is answering
+	// "would my partial restore work, and how big is it?" — answered
+	// "yes, 0 bytes" for a table the restore cannot produce.
+	//
+	// The usual cause is routine: the relation was rewritten after the
+	// backup (VACUUM FULL, CLUSTER, TRUNCATE, a rewriting ALTER
+	// TABLE), so the live relfilenode is not the one in the backup.
+	// Distinct from NotFound (absent from the catalog) because the
+	// remedy differs: an older backup, or --relfilenode-map.
+	NotInBackup bool `json:"not_in_backup,omitempty"`
 }
 
 // WriteText renders the per-relation inspect result — heap and toast file
@@ -349,6 +368,21 @@ func (b partialInspectBody) WriteText(w io.Writer) error {
 	if err := tw.Flush(); err != nil {
 		return err
 	}
+	var notInBackup []string
+	for _, m := range b.TableMappings {
+		if m.NotInBackup {
+			notInBackup = append(notInBackup, m.Qualified)
+		}
+	}
+	if len(notInBackup) > 0 {
+		fmt.Fprintf(bw, "\n  ✗ Not in this backup: %s\n"+
+			"    These tables exist in the live catalog but their heap files are absent from\n"+
+			"    this backup — usually because the relation was rewritten after it was taken\n"+
+			"    (VACUUM FULL / CLUSTER / TRUNCATE / a rewriting ALTER TABLE). A partial\n"+
+			"    restore would extract nothing for them. Use an older backup, or pass the\n"+
+			"    historical relfilenode via --relfilenode-map.\n",
+			strings.Join(notInBackup, ", "))
+	}
 	if len(b.TableMappings) > 0 {
 		bw.WriteString("\n  Table mappings:\n")
 		mw := tabwriter.NewWriter(bw, 0, 4, 2, ' ', 0)
@@ -356,6 +390,13 @@ func (b partialInspectBody) WriteText(w io.Writer) error {
 		for _, m := range b.TableMappings {
 			if m.NotFound {
 				fmt.Fprintf(mw, "    %s\t(not in pg_class)\t-\t-\t-\n", m.Qualified)
+				continue
+			}
+			if m.NotInBackup {
+				// The row that used to read "…  0 B  0  -", which is
+				// indistinguishable from an empty table.
+				fmt.Fprintf(mw, "    %s\t%s (NOT IN THIS BACKUP)\t-\t-\t-\n",
+					m.Qualified, m.HeapPath)
 				continue
 			}
 			toastInfo := "-"
