@@ -13,6 +13,31 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **The PITR time-target resolver had the same silent skip, and it
+  bites harder.** `ResolveBackupForTime` answers "the *latest* backup at
+  or before the target" — the seed PG replays forward from — and skipped
+  unverifiable manifests exactly the way `ResolveLatest` did, using the
+  count only to decide whether *every* manifest had failed.
+
+  Here the skipped manifest may be precisely the one that would have
+  won: the closest seed below the target. Falling back to an older one
+  is not a neutral substitution — PG then replays every WAL segment
+  between that older `stop_lsn` and the target, which is a longer span,
+  more time, and more chance of meeting a pruned or gap-recorded stretch
+  of archive.
+
+  It also corrupted the other half of the answer.
+  `NoBackupBeforeTimeError` told the operator "the deployment has N
+  manifest(s), but every one was taken AFTER your `--to` target" — a
+  claim about the *deployment* derived only from the manifests that
+  happened to be readable. That message now says what it actually knows
+  and points at `repo check` first.
+
+  `ResolveBackupForTimeDetailed` returns the skipped count
+  (`ResolveBackupForTime` keeps its signature); `restore` warns before
+  running and the agent's restore executor refuses, matching the
+  `latest` path.
+
 - **"Restore the latest backup" could silently restore an older one.**
   `ResolveLatest` ranks manifests by `stopped_at` and skips any that
   fail signature verification or cannot be fetched. Skipping is

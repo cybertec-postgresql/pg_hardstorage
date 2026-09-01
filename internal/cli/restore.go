@@ -293,9 +293,24 @@ func runRestore(cmd *cobra.Command, opts restoreOpts) error {
 		// most-recent backup whose stop_time ≤ the SAME target
 		// instant buildRecovery arms below.
 		if opts.toTime != "" {
-			resolved, err := resolveBackupForTimeFromRepo(cmd.Context(), opts.repoURL, opts.deployment, targetTime, verifier)
+			resolved, skipped, err := resolveBackupForTimeFromRepo(cmd.Context(), opts.repoURL, opts.deployment, targetTime, verifier)
 			if err != nil {
 				return err
+			}
+			// The answer is "the LATEST backup at or before the
+			// target", so a manifest that could not be ranked may be
+			// exactly the one that would have won — a closer seed,
+			// meaning less WAL to replay. Say so before the restore
+			// runs; same posture as the `latest` path.
+			if skipped > 0 {
+				_ = d.Event(cmd.Context(), output.NewEvent(output.SeverityWarning, "restore", "time_target_resolved_with_skips").
+					WithSubject(output.Subject{Deployment: opts.deployment}).
+					WithBody(map[string]any{
+						"chosen":            resolved,
+						"skipped_manifests": skipped,
+						"target":            targetTime.UTC().Format(time.RFC3339),
+						"reason":            restore.TimeTargetSkippedWarning(opts.deployment, resolved, skipped, targetTime),
+					}))
 			}
 			backupID = resolved
 			autoResolved = true
@@ -695,32 +710,32 @@ func resolveLatestFromRepo(ctx context.Context, repoURL, deployment string, veri
 // resolveLatestFromRepo with structured error mapping for the
 // time-target case (no backup before target → structured
 // notfound.backup_before_time + Suggestion).
-func resolveBackupForTimeFromRepo(ctx context.Context, repoURL, deployment string, target time.Time, verifier *backup.Verifier) (string, error) {
+func resolveBackupForTimeFromRepo(ctx context.Context, repoURL, deployment string, target time.Time, verifier *backup.Verifier) (string, int, error) {
 	_, sp, err := repo.Open(ctx, repoURL)
 	if err != nil {
 		if errors.Is(err, repo.ErrNotARepo) {
-			return "", output.NewError("notfound.repo",
+			return "", 0, output.NewError("notfound.repo",
 				fmt.Sprintf("restore: no pg_hardstorage repository at %s", repoURL)).Wrap(err)
 		}
 		if errors.Is(err, storage.ErrUnknownScheme) {
-			return "", output.NewError("usage.unknown_scheme", err.Error()).Wrap(output.ErrUsage)
+			return "", 0, output.NewError("usage.unknown_scheme", err.Error()).Wrap(output.ErrUsage)
 		}
-		return "", fmt.Errorf("restore: open repo: %w", err)
+		return "", 0, fmt.Errorf("restore: open repo: %w", err)
 	}
 	defer sp.Close()
 
-	id, err := restore.ResolveBackupForTime(ctx, sp, deployment, target, verifier)
+	id, skipped, err := restore.ResolveBackupForTimeDetailed(ctx, sp, deployment, target, verifier)
 	if err == nil {
-		return id, nil
+		return id, skipped, nil
 	}
 	if errors.Is(err, restore.ErrNoBackupsFound) {
-		return "", restore.FormatNoBackupsError(deployment)
+		return "", skipped, restore.FormatNoBackupsError(deployment)
 	}
 	var noTime *restore.NoBackupBeforeTimeError
 	if errors.As(err, &noTime) {
-		return "", restore.FormatNoBackupBeforeTimeError(noTime)
+		return "", skipped, restore.FormatNoBackupBeforeTimeError(noTime)
 	}
-	return "", fmt.Errorf("restore: resolve backup for target time: %w", err)
+	return "", skipped, fmt.Errorf("restore: resolve backup for target time: %w", err)
 }
 
 // validateExplicitBackupForTime guards against the "operator

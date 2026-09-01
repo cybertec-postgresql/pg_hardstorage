@@ -177,7 +177,7 @@ func (e *RestoreExecutor) Execute(ctx context.Context, job *ControlPlaneJob, pro
 			skipped int
 		)
 		if !targetTime.IsZero() {
-			id, err = restore.ResolveBackupForTime(ctx, sp, job.Deployment, targetTime, e.verifier)
+			id, skipped, err = restore.ResolveBackupForTimeDetailed(ctx, sp, job.Deployment, targetTime, e.verifier)
 		} else {
 			id, skipped, err = restore.ResolveLatestDetailed(ctx, sp, job.Deployment, e.verifier)
 		}
@@ -189,6 +189,10 @@ func (e *RestoreExecutor) Execute(ctx context.Context, job *ControlPlaneJob, pro
 		// target, so a warning would go nowhere: refuse instead. The
 		// control plane can re-dispatch with an explicit backup_id.
 		if skipped > 0 {
+			if !targetTime.IsZero() {
+				return nil, fmt.Errorf("restore-executor: %s",
+					restore.TimeTargetSkippedWarning(job.Deployment, id, skipped, targetTime))
+			}
 			return nil, fmt.Errorf("restore-executor: %s", restore.LatestSkippedWarning(job.Deployment, id, skipped))
 		}
 		backupID = id
