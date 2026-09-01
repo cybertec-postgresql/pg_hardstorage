@@ -175,6 +175,19 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Security
 
+- **`jit list` could report a revoked break-glass token as active.** The
+  revocation lookup dropped its error — `revoked, _ := s.IsRevoked(...)`
+  — so a failed probe defaulted to "not revoked" and the entry's
+  effective status came back `active`. Because the status filter runs on
+  that value, `jit list --status active` would list a token whose
+  revocation could not be confirmed alongside genuinely live ones. That
+  is the surface an operator uses to confirm a revocation took effect
+  during an incident, and it failed in the permissive direction.
+  Enforcement was never affected — `VerifyAt` propagates the same error
+  and refuses the token — which is why the reporting gap could sit here
+  unnoticed. Entries now carry `revocation_unknown` and report status
+  `unknown` rather than a status that implies the token is usable.
+
 - **`threshold roster list` / `roster show` rendered a planted roster
   identically to a legitimate one.** Both fetched without a trust
   anchor, so a roster an attacker wrote into the repository — their own

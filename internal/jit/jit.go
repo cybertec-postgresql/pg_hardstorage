@@ -157,6 +157,10 @@ const (
 	StatusNotYetActive Status = "not_yet_active"
 	// StatusExpired — past NotAfter; no longer authoritative.
 	StatusExpired Status = "expired"
+	// StatusUnknown — the revocation list could not be consulted, so
+	// the token cannot be characterised. Deliberately not "active":
+	// an undetermined revocation state must not read as usable.
+	StatusUnknown Status = "unknown"
 	// StatusRevoked — explicitly revoked via the revocation list
 	// before its natural expiry.
 	StatusRevoked Status = "revoked"
@@ -695,8 +699,8 @@ func (s *Store) List(ctx context.Context, f ListFilter) ([]*ListEntry, error) {
 		}
 		// Resolve revocation status once for the entry's
 		// effective status.
-		revoked, _ := s.IsRevoked(ctx, id)
-		entry := &ListEntry{Token: t, Revoked: revoked}
+		revoked, rerr := s.IsRevoked(ctx, id)
+		entry := &ListEntry{Token: t, Revoked: revoked, RevocationUnknown: rerr != nil}
 		entry.EffectiveStatus = entry.computeEffectiveStatus(now)
 		// Filter.
 		if f.Principal != "" && t.Principal != f.Principal {
@@ -722,11 +726,31 @@ type ListEntry struct {
 	Token           *Token `json:"token"`
 	Revoked         bool   `json:"revoked"`
 	EffectiveStatus Status `json:"effective_status"`
+
+	// RevocationUnknown is set when the revocation list could not be
+	// consulted for this token. The check's error used to be dropped
+	// (`revoked, _ := s.IsRevoked(...)`), so a failed lookup defaulted
+	// to "not revoked" and a REVOKED token rendered as active — and
+	// `jit list --status active` included it, because the filter runs
+	// on EffectiveStatus.
+	//
+	// That is the reporting surface an operator uses to confirm a
+	// break-glass revocation took effect during an incident, and it was
+	// failing in the permissive direction. Enforcement was never
+	// affected: VerifyAt propagates the same error and refuses the
+	// token.
+	RevocationUnknown bool `json:"revocation_unknown,omitempty"`
 }
 
 func (e *ListEntry) computeEffectiveStatus(now time.Time) Status {
 	if e.Revoked {
 		return StatusRevoked
+	}
+	if e.RevocationUnknown {
+		// Do not claim a status that implies the token is usable when
+		// we could not determine whether it was revoked. Reporting the
+		// permissive answer is what made a revoked token look active.
+		return StatusUnknown
 	}
 	return e.Token.Status(now)
 }
