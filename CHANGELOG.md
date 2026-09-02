@@ -13,6 +13,37 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **Storage middlewares dropped the free-space capability, silently
+  switching off the disk-space gate.** The optional-capability pattern
+  is a type assertion: `RegionOf` asks whether the plugin implements
+  `RegionAware`, `FreeSpaceOf` asks whether it implements
+  `FreeSpaceAware`. A wrapper that does not implement one does *not*
+  fall through to the inner plugin — it fails the assertion, and the
+  helper returns its "backend does not support this" answer. The
+  wrapper answers on behalf of a backend that would have answered
+  differently.
+
+  Both middlewares (`throttle`, `faultinject`) forwarded `Region` and
+  neither forwarded `FreeSpace`. Only the `fs` plugin implements
+  `FreeSpace`, so wrapping it turned a backend that *has* a disk-space
+  probe into one reporting it unsupported, and `capacity.Preflight`
+  recorded `PreflightUnsupported` with the note "backend does not expose
+  free-space probe" — true of an object store, false here.
+  `repo replicate --bwlimit` wraps its destination in `throttle`, so the
+  shape is live even though no caller runs the pre-flight on a
+  replication destination today.
+
+  Both now delegate through `storage.FreeSpaceOf`, exactly as `Region`
+  delegates through `RegionOf`, with compile-time assertions for every
+  optional interface. A new tree-wide guard derives both sides from
+  source — the optional interfaces are the `…Aware` interfaces declared
+  in package `storage`, the middlewares are the types under
+  `internal/plugin/storage` holding a `StoragePlugin` field — so a new
+  optional interface or a new middleware is covered the day it lands.
+  That the existing code forwarded one of the two members is the
+  argument for the guard: the pattern was understood and a member was
+  still missed.
+
 - **An unreadable approval subtracted itself from "pending approvals".**
   `approval.Store.List` fetched each listed request and swallowed every
   failure with a bare `continue` — a body that would not decode, an auth
