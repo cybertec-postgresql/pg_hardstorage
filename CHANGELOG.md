@@ -13,6 +13,45 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **The cluster-identity defence was armed only in its own unit test.**
+  `patroni.FollowerOptions.ExpectedSystemID` makes the WAL follower
+  refuse to follow a leader whose cluster reports a different
+  `system_identifier` — *"misconfigured fleet — refusing to follow a
+  different cluster's leader"*. `internal/patroni` has had that logic,
+  and a test for it, since audit #24, whose own comment records that
+  the field had previously been "stored but never read".
+
+  It was still never **written**. A tree-wide search found
+  `ExpectedSystemID` in exactly one place outside the follower:
+  `internal/patroni/follower_test.go`. `Coordinator.Run` built its
+  options with `Client`, `Interval`, `OnEvent` and `OnPollError`, and
+  `follower.Options` had no field to carry it — so end to end the
+  defence never ran.
+
+  An agent pointed at the wrong Patroni endpoint therefore followed that
+  cluster's leader, reconciled **this** deployment's replication slots
+  against it, and persisted WAL-gap records computed from a foreign
+  cluster's `restart_lsn` into `wal/<deployment>/gaps/` — records the
+  PITR pre-flight then honours, refusing restores over ranges that were
+  never gaps here.
+
+  The agent now supplies the identifier from the repo's own record. When
+  no committed backup carries one yet the defence stays inactive and
+  says so (`patroni.identity_guard_inactive`), because a silently
+  disabled defence is the bug being fixed.
+
+- **A self-disabled WAL follower looked like a transient blip.** The
+  identity mismatch is permanent — `poll` returns early forever after —
+  but it was reported only through `OnPollError`, landing in
+  `patroni_poll_failed` at **Warning**: the same event and severity as
+  one failed HTTP call, fired exactly once. Monitoring saw a warning
+  then silence, indistinguishable from recovery, while failover-gap
+  detection had stopped for good. `Disable` also does not close
+  `Done()`, so `Coordinator.Run` kept waiting and the agent kept
+  reporting a healthy follower. It now emits `follower_disabled` at
+  Error severity on the transition, and carries the reason into the
+  final `stopped` event.
+
 - **The post-restore catalog probe passed over destroyed catalogs
   whenever psql printed anything.** `probeSelect1` — twenty lines above
   `probeCatalogs` in the same file — documents the hazard precisely:

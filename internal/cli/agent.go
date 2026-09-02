@@ -1030,16 +1030,51 @@ func startPatroniFollowers(ctx context.Context, d *output.Dispatcher, deps map[s
 		// shutdown.
 		spForCoord := sp
 		deploymentForCoord := name
+
+		// Arm the cluster-identity defence from the repo's own record.
+		//
+		// patroni.FollowerOptions.ExpectedSystemID makes the follower
+		// refuse to follow a different cluster's leader, and it has had
+		// a test since audit #24 — but nothing in production ever set
+		// it, so end to end the defence never ran. An agent pointed at
+		// the wrong Patroni endpoint would follow that cluster's
+		// leader, reconcile THIS deployment's slots against it, and
+		// persist WAL-gap records derived from a foreign cluster's
+		// LSNs into wal/<deployment>/gaps/ — records that then make
+		// restore refuse PITR over ranges that were never gaps here.
+		//
+		// When the repo cannot tell us the identifier (a deployment
+		// with no committed backup yet) the defence stays inactive, and
+		// we SAY so rather than leave it quietly off: a defence that is
+		// silently disabled is the thing being fixed.
+		expectedSysID, haveSysID, sysErr := deploymentRecordedSysID(ctx, sp, name)
+		switch {
+		case sysErr != nil:
+			_ = d.Event(ctx, output.NewEvent(output.SeverityWarning, "agent", "patroni.identity_guard_unavailable").
+				WithSubject(output.Subject{Deployment: name}).
+				WithBody(map[string]any{
+					"error":  sysErr.Error(),
+					"impact": "the follower will not verify that the Patroni endpoint belongs to this cluster",
+				}))
+		case !haveSysID:
+			_ = d.Event(ctx, output.NewEvent(output.SeverityNotice, "agent", "patroni.identity_guard_inactive").
+				WithSubject(output.Subject{Deployment: name}).
+				WithBody(map[string]any{
+					"reason": "no committed backup records a system_identifier for this deployment yet, so the follower cannot verify the Patroni endpoint belongs to this cluster. It arms itself after the first backup.",
+				}))
+		}
+
 		coord, cerr := follower.New(follower.Options{
-			Client:        client,
-			SlotName:      slotName,
-			Slots:         slots,
-			Deployment:    name,
-			TimelineStore: ts,
-			GapStore:      gs,
-			DSNFor:        dsnFor,
-			Interval:      interval,
-			OnEvent:       func(ev *output.Event) { _ = d.Event(ctx, ev) },
+			Client:           client,
+			ExpectedSystemID: expectedSysID,
+			SlotName:         slotName,
+			Slots:            slots,
+			Deployment:       name,
+			TimelineStore:    ts,
+			GapStore:         gs,
+			DSNFor:           dsnFor,
+			Interval:         interval,
+			OnEvent:          func(ev *output.Event) { _ = d.Event(ctx, ev) },
 			LastConfirmedLSN: func(leader patroni.LeaderEndpoint) pglogrepl.LSN {
 				lsn, err := archiveFrontierForLeader(ctx, spForCoord, deploymentForCoord, leader.Timeline)
 				if err != nil {

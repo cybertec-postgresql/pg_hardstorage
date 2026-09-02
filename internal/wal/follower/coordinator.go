@@ -170,6 +170,19 @@ type Options struct {
 	// patroni.DefaultFollowInterval.
 	Interval time.Duration
 
+	// ExpectedSystemID, when non-empty, locks the follower to one
+	// PostgreSQL cluster: a Patroni endpoint reporting a different
+	// system_identifier disables leader-following rather than reconcile
+	// slots and write WAL-gap records against a foreign cluster.
+	//
+	// patroni.FollowerOptions has had this defence, and a test for it,
+	// since audit #24 — but nothing in production ever populated it, so
+	// end to end it never ran. Threading it through here is what arms
+	// it. Empty keeps the defence inactive, which is the honest default
+	// for a caller that genuinely cannot determine the identifier; the
+	// agent says so out loud rather than leaving it silently off.
+	ExpectedSystemID string
+
 	// OnEvent receives Coordinator events. Optional; nil
 	// discards. Synchronously called on the polling goroutine,
 	// so callbacks must return promptly. Use this to fan out to
@@ -260,8 +273,9 @@ func New(opts Options) (*Coordinator, error) {
 // + timeline-capture pipeline.
 func (c *Coordinator) Run(ctx context.Context) error {
 	f, err := patroni.Start(ctx, patroni.FollowerOptions{
-		Client:   c.opts.Client,
-		Interval: c.opts.Interval,
+		Client:           c.opts.Client,
+		Interval:         c.opts.Interval,
+		ExpectedSystemID: c.opts.ExpectedSystemID,
 		OnEvent: func(ev patroni.LeaderChange) {
 			c.handleLeaderChange(ctx, ev)
 		},
@@ -299,10 +313,64 @@ func (c *Coordinator) Run(ctx context.Context) error {
 			"slot_count": len(slotNames),
 			"interval":   c.effectiveInterval().String(),
 		}))
+	// Watch for the follower disabling itself while we wait.
+	//
+	// Follower.Disable is the cluster-identity kill-switch: on a
+	// system-identifier mismatch it stops polling permanently ("refusing
+	// to follow a different cluster's leader"). It reports that through
+	// OnPollError, which lands in patroni_poll_failed at WARNING — the
+	// same event and the same severity as one failed HTTP call — and
+	// then, because poll() returns early forever after, it never fires
+	// again.
+	//
+	// So a fleet misconfiguration that permanently stops failover-gap
+	// detection looked exactly like a transient blip that recovered: one
+	// warning, then silence. Meanwhile Done() never closes (Disable does
+	// not stop the loop), so Run kept waiting and the agent kept
+	// reporting a healthy follower.
+	//
+	// Emit once, on the transition, at Error severity and under its own
+	// op so it cannot be confused with a poll blip.
+	disabledSeen := false
+	watch := time.NewTicker(c.effectiveInterval())
+	defer watch.Stop()
+	for !disabledSeen {
+		select {
+		case <-f.Done():
+			c.emitStopped(f)
+			return nil
+		case <-watch.C:
+			if reason, off := f.DisabledReason(); off {
+				disabledSeen = true
+				c.emit(output.NewEvent(output.SeverityError, "wal.follower", "follower_disabled").
+					WithSubject(output.Subject{Deployment: c.opts.Deployment}).
+					WithBody(map[string]any{
+						"reason": reason,
+						"impact": "leader changes are no longer observed for this deployment, so a Patroni failover will not be detected and no WAL-gap record will be written. Restores will not know about WAL lost across the failover.",
+					}))
+			}
+		}
+	}
+
 	<-f.Done()
-	c.emit(output.NewEvent(output.SeverityInfo, "wal.follower", "stopped").
-		WithSubject(output.Subject{Deployment: c.opts.Deployment}))
+	c.emitStopped(f)
 	return nil
+}
+
+// emitStopped reports the follower's exit, carrying the disabled reason
+// when it had one so a post-mortem does not have to correlate two
+// events to learn the follower stopped watching long before it stopped.
+func (c *Coordinator) emitStopped(f *patroni.Follower) {
+	body := map[string]any{}
+	if reason, off := f.DisabledReason(); off {
+		body["disabled_reason"] = reason
+	}
+	ev := output.NewEvent(output.SeverityInfo, "wal.follower", "stopped").
+		WithSubject(output.Subject{Deployment: c.opts.Deployment})
+	if len(body) > 0 {
+		ev = ev.WithBody(body)
+	}
+	c.emit(ev)
 }
 
 // handleLeaderChange is the per-event dispatcher. Public method
