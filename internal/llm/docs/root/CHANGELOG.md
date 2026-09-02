@@ -13,6 +13,48 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **The GDPR locator dropped manifests it could not read, in a signed
+  compliance report, and its own comment said otherwise.**
+  `dsa.Locate` had:
+
+      if err != nil {
+          // One bad manifest doesn't kill the whole scan; but
+          // we record it (the operator should investigate).
+          continue
+      }
+
+  Nothing was recorded. `manifests_scanned` counts only what *was*
+  read, so the shortfall was invisible.
+
+  That matters more here than almost anywhere else. The report is
+  signed, persisted at `dsa/reports/<id>.json`, and described by the
+  package doc as the artefact "an Article 15 disclosure can later be
+  cited and re-verified" with. Under **Article 15** it is a signed
+  disclosure that may omit a backup holding the subject's data while
+  claiming to enumerate every affected one. Under **Article 17** it
+  names which KEKs to shred — so a backup omitted from it keeps its
+  KEK, the subject's data *survives the erasure request*, and there is
+  a signed artefact on file saying the request was handled.
+
+  Skipping is still right; one corrupt manifest must not abort a
+  compliance scan. The count is now recorded as `manifests_unreadable`,
+  rendered with an explicit warning that the enumeration is incomplete,
+  and **covered by the signature** so it cannot be stripped from a
+  report that carried it.
+
+  It is signed only when non-zero, which keeps the 24-month
+  compatibility commitment exact: a clean report produces byte-identical
+  signing input to one written before the field existed, so every stored
+  report still verifies. A golden test pins those bytes — signing the
+  field unconditionally would silently invalidate every stored Article
+  15 disclosure, and no sign-then-verify test can catch that because
+  both sides would agree on the new format.
+
+  `dsa locate --deployment <typo>` is also now refused: it would
+  otherwise walk nothing and mint a signed report enumerating zero
+  affected backups, which under Article 17 is the instruction to shred
+  nothing, filed as evidence.
+
 - **Six functions that choose a backup discarded unreadable manifests
   silently — and a guard so there is no seventh.** A manifest that fails
   verification yields no timestamps and cannot be ranked, so a picker

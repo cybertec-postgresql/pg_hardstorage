@@ -163,6 +163,16 @@ func runDsaLocate(cmd *cobra.Command, f dsaLocateFlags) error {
 	if err != nil {
 		return err
 	}
+	// A --deployment naming nothing would walk nothing and produce a
+	// SIGNED report enumerating zero affected backups — which under
+	// Article 17 is the instruction to shred nothing, filed as evidence
+	// that the request was handled. Checked on the name, not the count:
+	// a deployment whose backups are all tombstoned legitimately has
+	// none.
+	if derr := requireDeploymentExists(cmd.Context(), sp, "dsa locate", f.deployment); derr != nil {
+		return derr
+	}
+
 	ms := backup.NewManifestStore(sp)
 	loc := dsa.NewLocator(ms, verifier)
 	report, err := loc.Locate(cmd.Context(), opts)
@@ -412,6 +422,15 @@ func (b dsaReportBody) WriteText(w io.Writer) error {
 		fmt.Fprintf(bw, "  Signed by:           %s\n", r.PublicKeyFingerprint)
 	}
 	fmt.Fprintln(bw)
+	if r.ManifestsUnreadable > 0 {
+		fmt.Fprintf(bw, "⚠ %d manifest(s) could not be verified or read and are NOT represented "+
+			"below.\n"+
+			"  This report is therefore not a complete enumeration. Under Article 15 it may omit\n"+
+			"  a backup holding the subject's data; under Article 17 the KEKs it lists are not\n"+
+			"  the full set, so shredding them can leave that data recoverable. Resolve with\n"+
+			"  `pg_hardstorage repo check` and re-run before relying on this report.\n\n",
+			r.ManifestsUnreadable)
+	}
 	fmt.Fprintf(bw, "Scanned %d manifest(s); %d affected across %d deployment(s).\n",
 		r.ManifestsScanned, r.ManifestsAffected, r.DeploymentsAffected)
 

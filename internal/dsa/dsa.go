@@ -135,8 +135,23 @@ type Report struct {
 	WindowEnd   *time.Time `json:"window_end,omitempty"`
 
 	// Counters.
-	ManifestsScanned    int `json:"manifests_scanned"`
-	ManifestsAffected   int `json:"manifests_affected"`
+	ManifestsScanned  int `json:"manifests_scanned"`
+	ManifestsAffected int `json:"manifests_affected"`
+
+	// ManifestsUnreadable counts manifests the scan could not verify or
+	// read, and therefore could not classify.
+	//
+	// Non-zero means this report is NOT a complete enumeration, which
+	// matters more here than almost anywhere else in the tree. Under
+	// Article 15 it is a signed disclosure that may omit a backup
+	// holding the subject's data. Under Article 17 it drives which KEKs
+	// get shredded, so an omitted backup keeps its KEK and the
+	// subject's data SURVIVES the erasure request — with a signed
+	// artefact on file saying the request was handled.
+	//
+	// ManifestsScanned counts only the manifests that were read, so it
+	// cannot reveal the shortfall on its own. Additive field.
+	ManifestsUnreadable int `json:"manifests_unreadable,omitempty"`
 	DeploymentsAffected int `json:"deployments_affected"`
 
 	// Per-deployment rollup.
@@ -279,8 +294,13 @@ func (l *Locator) Locate(ctx context.Context, opts LocateOptions) (*Report, erro
 	for _, d := range deployments {
 		for m, err := range l.manifests.List(ctx, d, l.verifier) {
 			if err != nil {
-				// One bad manifest doesn't kill the whole scan; but
-				// we record it (the operator should investigate).
+				// One bad manifest doesn't kill the whole scan -- but
+				// it is RECORDED, which the previous comment promised
+				// ("we record it (the operator should investigate)")
+				// above a bare continue that recorded nothing. A scan
+				// whose completeness is the entire deliverable cannot
+				// drop entries silently: see Report.ManifestsUnreadable.
+				report.ManifestsUnreadable++
 				continue
 			}
 			report.ManifestsScanned++
@@ -440,6 +460,20 @@ func canonicalReportBytesWith(r *Report, digest func(*Report) [32]byte) []byte {
 	binary.Write(&buf, binary.BigEndian, int64(r.ManifestsScanned))
 	binary.Write(&buf, binary.BigEndian, int64(r.ManifestsAffected))
 	binary.Write(&buf, binary.BigEndian, int64(r.DeploymentsAffected))
+	// Completeness is a material claim about the report, so it is
+	// signed -- otherwise it could be stripped from a report that had
+	// it and the signature would still verify.
+	//
+	// Written ONLY when non-zero, which keeps the 24-month
+	// compatibility commitment exact: a report with nothing unreadable
+	// produces byte-identical signing input to one written before this
+	// field existed, so every previously-signed report still verifies.
+	// A report that DOES carry the field is new by construction, and
+	// stripping it changes the bytes and breaks the signature -- which
+	// is the point.
+	if r.ManifestsUnreadable > 0 {
+		binary.Write(&buf, binary.BigEndian, int64(r.ManifestsUnreadable))
+	}
 	d := digest(r)
 	buf.Write(d[:])
 	return []byte(buf.String())
