@@ -77,6 +77,18 @@ type Session struct {
 	PGVersion  int       `json:"pg_version"`
 	CreatedAt  time.Time `json:"created_at"`
 	ExpiresAt  time.Time `json:"expires_at"`
+
+	// SeedSkippedManifests counts manifests that could not be verified
+	// or read while choosing this session's seed backup.
+	//
+	// Non-zero means the seed is the best of the manifests that COULD
+	// be read, not necessarily the best that exists: an unreadable
+	// manifest yields no stopped_at and cannot be ranked, so one closer
+	// to the requested moment may have been passed over. The session is
+	// still usable — PG simply replays more WAL from an older seed —
+	// but a feature whose entire purpose is "show me the database as of
+	// moment X" must not be quiet about having guessed. Additive field.
+	SeedSkippedManifests int `json:"seed_skipped_manifests,omitempty"`
 }
 
 // IsExpired reports whether the session's TTL has elapsed.
@@ -199,7 +211,7 @@ func (m *Manager) Create(ctx context.Context, opts CreateOptions) (*Session, err
 	// We resolve it ourselves: walk manifests, pick the latest with
 	// StoppedAt <= target.
 
-	pickedID, pgVersion, err := m.pickBackupForTarget(ctx, opts.RepoURL, opts.Deployment, atTime, atLSN, opts.Verifier)
+	pickedID, pgVersion, seedSkipped, err := m.pickBackupForTarget(ctx, opts.RepoURL, opts.Deployment, atTime, atLSN, opts.Verifier)
 	if err != nil {
 		return nil, err
 	}
@@ -258,6 +270,8 @@ func (m *Manager) Create(ctx context.Context, opts CreateOptions) (*Session, err
 		PGVersion:  pgVersion,
 		CreatedAt:  now,
 		ExpiresAt:  now.Add(ttl),
+
+		SeedSkippedManifests: seedSkipped,
 	}
 	state.Sessions = append(state.Sessions, s)
 	if err := m.saveStateLocked(state); err != nil {
@@ -276,10 +290,25 @@ func (m *Manager) Create(ctx context.Context, opts CreateOptions) (*Session, err
 // stop_lsn = target_unreachable) even though a suitable older
 // backup sat in the repo: the feature's primary use case was
 // inoperative.
-func (m *Manager) pickBackupForTarget(ctx context.Context, repoURL, deployment string, target time.Time, targetLSN string, verifier *backup.Verifier) (string, int, error) {
+// pickBackupForTarget chooses the seed backup: the newest manifest that
+// stops at or before the requested moment (or LSN).
+//
+// The third return is the number of manifests that could not be
+// evaluated. Skipping them is right — one corrupt manifest must not
+// stop a forensic session being opened — but it used to be silent AND
+// uncounted, which made two different lies possible:
+//
+//   - if the manifest closest below the target was the unreadable one,
+//     an OLDER seed was chosen and nothing said so;
+//   - if EVERY manifest was unreadable, bestID stayed empty and the
+//     error told the operator "no committed backup of %q is at-or-before
+//     %s" — that no backup exists that far back, when backups exist and
+//     merely could not be verified. They would conclude their retention
+//     window is too short and stop looking.
+func (m *Manager) pickBackupForTarget(ctx context.Context, repoURL, deployment string, target time.Time, targetLSN string, verifier *backup.Verifier) (string, int, int, error) {
 	rs, err := openManifestStore(ctx, repoURL)
 	if err != nil {
-		return "", 0, err
+		return "", 0, 0, err
 	}
 	defer rs.Close()
 
@@ -288,7 +317,7 @@ func (m *Manager) pickBackupForTarget(ctx context.Context, repoURL, deployment s
 	if targetLSN != "" {
 		parsed, perr := pglogrepl.ParseLSN(targetLSN)
 		if perr != nil {
-			return "", 0, fmt.Errorf("timetravel: parse target LSN %q: %w", targetLSN, perr)
+			return "", 0, 0, fmt.Errorf("timetravel: parse target LSN %q: %w", targetLSN, perr)
 		}
 		lsnTarget = parsed
 		haveLSN = true
@@ -297,8 +326,10 @@ func (m *Manager) pickBackupForTarget(ctx context.Context, repoURL, deployment s
 	var bestID string
 	var bestStopped time.Time
 	var bestVersion int
+	skipped := 0
 	for mm, lerr := range rs.store.List(ctx, deployment, verifier) {
 		if lerr != nil || mm == nil {
+			skipped++
 			continue
 		}
 		if !target.IsZero() && mm.StoppedAt.After(target) {
@@ -306,7 +337,15 @@ func (m *Manager) pickBackupForTarget(ctx context.Context, repoURL, deployment s
 		}
 		if haveLSN {
 			stop, serr := pglogrepl.ParseLSN(mm.StopLSN)
-			if serr != nil || stop > lsnTarget {
+			if serr != nil {
+				// An unparseable stop_lsn is not the same as "stops
+				// past the target"; it is a manifest we could not
+				// evaluate, and it belongs in the same count rather
+				// than being folded into the ordinary skip.
+				skipped++
+				continue
+			}
+			if stop > lsnTarget {
 				continue
 			}
 		}
@@ -317,18 +356,25 @@ func (m *Manager) pickBackupForTarget(ctx context.Context, repoURL, deployment s
 		}
 	}
 	if bestID == "" {
+		// Say which of the two situations this is. "There is no backup
+		// that far back" and "there may well be, but none of them could
+		// be read" send an operator in opposite directions.
+		if skipped > 0 {
+			return "", 0, skipped, fmt.Errorf("timetravel: no usable seed backup for %q: %d manifest(s) could not be verified or read, so whether one covers the requested point is unknown — run `pg_hardstorage repo check` before concluding the window does not reach back that far",
+				deployment, skipped)
+		}
 		switch {
 		case haveLSN:
-			return "", 0, fmt.Errorf("timetravel: no committed backup of %q stops at-or-before LSN %s — the oldest backup already ends past the requested point",
+			return "", 0, 0, fmt.Errorf("timetravel: no committed backup of %q stops at-or-before LSN %s — the oldest backup already ends past the requested point",
 				deployment, targetLSN)
 		case target.IsZero():
-			return "", 0, fmt.Errorf("timetravel: no committed backups for deployment %q", deployment)
+			return "", 0, 0, fmt.Errorf("timetravel: no committed backups for deployment %q", deployment)
 		default:
-			return "", 0, fmt.Errorf("timetravel: no committed backup of %q is at-or-before %s",
+			return "", 0, 0, fmt.Errorf("timetravel: no committed backup of %q is at-or-before %s",
 				deployment, target.Format(time.RFC3339))
 		}
 	}
-	return bestID, bestVersion, nil
+	return bestID, bestVersion, skipped, nil
 }
 
 // List returns every recorded session, sorted by name. Set

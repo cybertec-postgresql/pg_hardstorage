@@ -315,6 +315,11 @@ func (b timeTravelCreateBody) WriteText(w io.Writer) error {
 	fmt.Fprintf(bw, "✓ timetravel %s provisioned\n", b.Session.Name)
 	fmt.Fprintf(bw, "  Deployment:   %s\n", b.Session.Deployment)
 	fmt.Fprintf(bw, "  Backup:       %s\n", b.Session.BackupID)
+	if n := b.Session.SeedSkippedManifests; n > 0 {
+		fmt.Fprintf(bw, "  ⚠ Seed:       %d manifest(s) could not be verified or read while "+
+			"choosing the seed\n                backup, so a closer one may have been passed "+
+			"over. This session\n                is usable; run `pg_hardstorage repo check`.\n", n)
+	}
 	fmt.Fprintf(bw, "  Target:       %s\n", b.Session.TargetDir)
 	if !b.Session.TargetTime.IsZero() {
 		fmt.Fprintf(bw, "  Recovery to:  %s\n", b.Session.TargetTime.Format(time.RFC3339))

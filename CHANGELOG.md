@@ -13,6 +13,35 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **`timetravel` chose its seed backup by silently discarding manifests
+  it could not read, and then misdescribed why.**
+  `pickBackupForTarget` is the third copy of "find the newest backup at
+  or before X" in the tree; the other two at least tracked a skip count,
+  while this one had `if lerr != nil || mm == nil { continue }` with no
+  bookkeeping at all. Two distinct wrong answers followed.
+
+  If the manifest closest below the target was the unreadable one, an
+  **older** seed was chosen and nothing said so — PG then replays more
+  WAL to reach the requested moment, in the feature whose entire purpose
+  is "show me the database as of moment X".
+
+  If **every** manifest was unreadable, the error read *"no committed
+  backup of `db1` is at-or-before `<time>`"* — telling the operator no
+  backup exists that far back, when backups exist and merely could not
+  be verified. That sends them to conclude their retention window is too
+  short and stop looking, which is the opposite of the truth.
+
+  Skips are now counted and surfaced on the session
+  (`seed_skipped_manifests`, rendered by `timetravel create`), and the
+  no-usable-seed error says which of the two situations it is. A
+  manifest whose `stop_lsn` will not parse counts as unevaluated rather
+  than as "stops past the target" — `Manifest.Validate` accepts a
+  malformed `stop_lsn` (it compares LSNs only when both parse), so such
+  a manifest verifies and commits cleanly and the branch is reachable.
+  Manifests legitimately filtered for being newer than the target are
+  *not* counted: they were read and evaluated, and counting them would
+  make every ordinary session warn.
+
 - **GC's tombstone set was keyed on the backup ID alone, so a
   tombstone in one deployment suppressed a live manifest in another.**
   `CollectReferences` built the set from

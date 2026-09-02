@@ -65,7 +65,7 @@ func TestPickBackupForTarget_LSNSelectsOlderBackup(t *testing.T) {
 	mgr := NewManager(filepath.Join(t.TempDir(), "state.json"), "/usr/bin/true")
 
 	// Target between the two stops → MUST pick the older backup.
-	id, _, err := mgr.pickBackupForTarget(context.Background(), repoURL, "db1", time.Time{}, "0/6000000", verifier)
+	id, _, _, err := mgr.pickBackupForTarget(context.Background(), repoURL, "db1", time.Time{}, "0/6000000", verifier)
 	if err != nil {
 		t.Fatalf("pick: %v", err)
 	}
@@ -74,7 +74,7 @@ func TestPickBackupForTarget_LSNSelectsOlderBackup(t *testing.T) {
 	}
 
 	// Target past both stops → the newest works.
-	id, _, err = mgr.pickBackupForTarget(context.Background(), repoURL, "db1", time.Time{}, "0/A000000", verifier)
+	id, _, _, err = mgr.pickBackupForTarget(context.Background(), repoURL, "db1", time.Time{}, "0/A000000", verifier)
 	if err != nil {
 		t.Fatalf("pick past-both: %v", err)
 	}
@@ -83,7 +83,7 @@ func TestPickBackupForTarget_LSNSelectsOlderBackup(t *testing.T) {
 	}
 
 	// Target before every stop → structured refusal, not a wrong pick.
-	_, _, err = mgr.pickBackupForTarget(context.Background(), repoURL, "db1", time.Time{}, "0/2000000", verifier)
+	_, _, _, err = mgr.pickBackupForTarget(context.Background(), repoURL, "db1", time.Time{}, "0/2000000", verifier)
 	if err == nil || !strings.Contains(err.Error(), "at-or-before LSN") {
 		t.Errorf("too-early target: err = %v, want at-or-before refusal", err)
 	}
