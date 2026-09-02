@@ -13,6 +13,51 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **The repository audit's approval rollup counted nothing it claimed to
+  count.** `summarizeApprovals` documented itself as classifying the
+  approval lifecycle — "counts the lifecycle states … Pending /
+  approved / expired / revoked" — and did not. It counted keys and
+  returned `Total` alone; the four state fields were never assigned by
+  any code path. The discarded clock parameter (`_ time.Time`) was the
+  shape of the missing work: two of the four states are time-dependent.
+
+  Because the fields are `omitempty` they did not render as zero — they
+  vanished, so a repository with unresolved privileged operations
+  audited as a bare `{"total":4}`. This report is compliance evidence;
+  "0 pending approvals" asserts that every privileged operation has been
+  resolved by someone.
+
+  Classification now delegates to `approval.StatusOf`, newly exported so
+  the audit uses the same derivation the approval store uses for its own
+  filtering and gating rather than a second copy of the rules. The old
+  comment declined to import the approval package fearing an import
+  cycle; there is none. Two further honesty fixes ride along:
+  `Unreadable` counts bodies that list but will not load (dropping them
+  let a corrupt or tampered request vanish from the record), and
+  `Incomplete`/`Error` mark a walk that failed partway, which previously
+  rendered exactly like a repository with no approvals at all.
+
+- **The soak gate reported every unrevertable fault as recovered.**
+  `FaultStats.RecoveryFails` is rendered by the report
+  (`- Recovery failures: %d`) and was incremented by nothing anywhere in
+  the tree; the `recovery_failed` event was consumed by no aggregation,
+  no report field and no gate check. Every soak printed zero regardless.
+
+  Worse, the `fault_recovered` emit sat outside the error branch, so a
+  fault that could not be undone emitted `recovery_failed` and then
+  `fault_recovered` immediately behind it. `fault_recovered` is one of
+  the three ops the watch TUI paints as healthy, and being last it
+  became the cell's `LastOp` — a cell still sitting in the degraded
+  state the fault created displayed green for the rest of the run, while
+  every later failure in it looked like a product bug rather than a
+  poisoned environment.
+
+  `fault_recovered` is now emitted only when the revert succeeded,
+  `CellReport.RecoveryFails` counts genuine revert failures per cell,
+  and the orchestrator rolls them into `FaultStats.RecoveryFails`.
+  Deadline-aborted recoveries remain excluded — a cancelled call during
+  teardown is not a cleanup failure.
+
 - **A progress report could make the agent that sent it look absent.**
   `AppendProgress` set `Job.UpdatedAt` from `ProgressEvent.At`. That
   field arrives in the agent's JSON body — `handleJobProgress` decodes
