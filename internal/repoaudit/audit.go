@@ -42,6 +42,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/approval"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/audit"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
@@ -236,7 +237,24 @@ type ApprovalSummary struct {
 	Approved int `json:"approved,omitempty"`
 	Expired  int `json:"expired,omitempty"`
 	Revoked  int `json:"revoked,omitempty"`
-	Total    int `json:"total"`
+
+	// Unreadable counts approval bodies that were listed but could not
+	// be fetched or parsed. They are counted rather than skipped: a
+	// request whose body will not load has an UNKNOWN lifecycle
+	// position, and folding it into Pending would assert one.
+	Unreadable int `json:"unreadable,omitempty"`
+
+	// Incomplete is set when the walk itself failed partway, with Error
+	// carrying the reason. Without it a failed listing produced an
+	// absent section, indistinguishable from a repository that has no
+	// approvals at all.
+	Incomplete bool   `json:"incomplete,omitempty"`
+	Error      string `json:"error,omitempty"`
+
+	// Total is every approval body listed. Pending + Approved +
+	// Expired + Revoked + Unreadable == Total whenever Incomplete is
+	// false.
+	Total int `json:"total"`
 }
 
 // ChainSummary aggregates the audit-log chain state.
@@ -661,26 +679,37 @@ func summarizeChain(ctx context.Context, sp storage.StoragePlugin, now time.Time
 }
 
 // summarizeApprovals walks the approvals/ prefix and counts the
-// lifecycle states. Same iteration shape as approval.Store.List but
-// without the per-request fetch — we only need the lifecycle
-// counter. Pending / approved / expired / revoked.
+// lifecycle states: pending / approved / expired / revoked, plus the
+// bodies that would not load.
 //
-// To keep the read cheap we still do per-request fetches (the
-// classification depends on the full body's ApproverKeys + Approvals
-// + RevokedAt), via the existing Store.List which Search-vs-Get
-// path is already implemented. For very large approval volumes
-// operators pass --no-approvals.
-func summarizeApprovals(ctx context.Context, sp storage.StoragePlugin, _ time.Time) (*ApprovalSummary, error) {
-	// We don't take a hard dependency on the approval package here
-	// because that would create a layer issue (approval depends on
-	// audit, audit on backup; repoaudit imports backup + audit; if
-	// we add approval, we have to be careful not to introduce a
-	// cycle). The approval-lifecycle aggregation is computed by a
-	// stand-alone walker below.
-	keys := 0
+// It previously counted keys and returned Total alone, while this
+// comment described the classification as done. Because the four state
+// fields are omitempty, they did not read as zero in the report -- they
+// vanished from the JSON, so an audit of a repository with unresolved
+// approvals rendered a bare {"total":N} and an auditor reading the
+// struct saw "0 pending". For a report whose purpose is compliance
+// evidence, that is a claim that every approval is resolved.
+//
+// Classification is delegated to approval.StatusOf, the same derivation
+// the approval store uses for its own filtering and gating, so the two
+// cannot drift. It is time-dependent (expiry), which is why now is a
+// parameter -- it used to be accepted and discarded.
+//
+// The per-request Get makes this O(requests) fetches; --no-approvals
+// (opts.SkipApprovals) remains the escape hatch for very large volumes.
+func summarizeApprovals(ctx context.Context, sp storage.StoragePlugin, now time.Time) (*ApprovalSummary, error) {
+	store := approval.NewStore(sp)
+	out := &ApprovalSummary{}
 	for info, err := range sp.List(ctx, "approvals/") {
 		if err != nil {
-			return nil, err
+			// Report the walk as INCOMPLETE rather than returning nil.
+			// The caller records a nil summary by omitting the section
+			// entirely, which reads identically to "this repository has
+			// no approvals" -- the one thing an auditor must not
+			// conclude from a listing that failed halfway.
+			out.Incomplete = true
+			out.Error = err.Error()
+			return out, fmt.Errorf("repoaudit: list approvals: %w", err)
 		}
 		if !strings.HasSuffix(info.Key, ".json") {
 			continue
@@ -692,12 +721,30 @@ func summarizeApprovals(ctx context.Context, sp storage.StoragePlugin, _ time.Ti
 		if strings.Count(rel, "/") > 0 {
 			continue
 		}
-		keys++
+		out.Total++
+
+		id := strings.TrimSuffix(rel, ".json")
+		req, gerr := store.Get(ctx, id)
+		if gerr != nil {
+			// Counted, not skipped. A body that will not load has an
+			// unknown status; folding it into Pending (or dropping it,
+			// as this walk used to) would state a lifecycle position
+			// the repository does not support.
+			out.Unreadable++
+			continue
+		}
+		switch approval.StatusOf(req, now) {
+		case approval.StatusApproved:
+			out.Approved++
+		case approval.StatusExpired:
+			out.Expired++
+		case approval.StatusRevoked:
+			out.Revoked++
+		default:
+			out.Pending++
+		}
 	}
-	if keys == 0 {
-		return &ApprovalSummary{}, nil
-	}
-	return &ApprovalSummary{Total: keys}, nil
+	return out, nil
 }
 
 // indexHoldsByDeployment groups a flat slice of Holds.

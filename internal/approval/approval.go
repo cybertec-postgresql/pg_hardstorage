@@ -620,6 +620,23 @@ func VerifyApprovals(req *Request) (int, error) {
 
 // computeStatus derives the status from the request's persisted
 // fields and the current time.
+// StatusOf reports r's lifecycle status as of now.
+//
+// Exported so callers outside this package (the repository audit's
+// approval rollup) classify requests with the SAME derivation the store
+// uses for its own filtering and gating, rather than reimplementing the
+// rules and drifting from them. The verdict is derived, never read from
+// a stored field: revoked wins, then quorum, then expiry.
+//
+// A nil request is StatusPending — the zero request has no votes, no
+// revocation and no deadline, which is what "pending" means.
+func StatusOf(r *Request, now time.Time) Status {
+	if r == nil {
+		return StatusPending
+	}
+	return computeStatus(r, now)
+}
+
 func computeStatus(r *Request, now time.Time) Status {
 	if r.RevokedAt != nil {
 		return StatusRevoked
