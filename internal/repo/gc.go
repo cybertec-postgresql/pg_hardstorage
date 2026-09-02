@@ -178,10 +178,26 @@ func CollectReferencesWithOptions(ctx context.Context, sp storage.StoragePlugin,
 				continue
 			}
 		}
-		// Extract backup_id from manifests/<dep>/backups/<id>/manifest.json.tombstone
+		// Key on DEPLOYMENT + backup id, from
+		// manifests/<dep>/backups/<id>/manifest.json.tombstone.
+		//
+		// The id alone is not a safe key. Nothing relates a manifest's
+		// BackupID to its Deployment — Manifest.Validate requires both
+		// to be non-empty and never compares them — so keying on the id
+		// made a tombstone in one deployment suppress a LIVE manifest
+		// carrying the same id in another. That manifest's chunks would
+		// drop out of the reference set and `repo gc --apply` would
+		// delete the data of a backup nobody deleted, in a different
+		// deployment.
+		//
+		// The runner's generated ids ("<dep>.<type>.<ts>.<rand>") make a
+		// collision impossible in normal use, but the safety of the most
+		// destructive path here should not rest on a naming convention
+		// that is nowhere enforced. Scoping the key costs nothing and
+		// imposes no id format, so custom or legacy ids keep working.
 		parts := strings.Split(info.Key, "/")
 		if len(parts) >= 4 {
-			tombstoned[parts[3]] = struct{}{}
+			tombstoned[parts[1]+"/"+parts[3]] = struct{}{}
 		}
 	}
 
@@ -199,7 +215,7 @@ func CollectReferencesWithOptions(ctx context.Context, sp storage.StoragePlugin,
 		parts := strings.Split(info.Key, "/")
 		// manifests/<dep>/backups/<id>/manifest.json → 5 parts
 		if len(parts) >= 5 {
-			if _, dead := tombstoned[parts[3]]; dead {
+			if _, dead := tombstoned[parts[1]+"/"+parts[3]]; dead {
 				continue
 			}
 		}

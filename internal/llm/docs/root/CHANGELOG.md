@@ -13,6 +13,28 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **GC's tombstone set was keyed on the backup ID alone, so a
+  tombstone in one deployment suppressed a live manifest in another.**
+  `CollectReferences` built the set from
+  `manifests/<dep>/backups/<id>/manifest.json.tombstone` using only the
+  id, then skipped any live manifest whose id was in it. A live
+  manifest in a different deployment sharing that id therefore dropped
+  out of the reference set — its chunks looked unreferenced, and
+  `repo gc --apply` would delete the data of a backup nobody deleted.
+
+  Nothing enforces the relationship this relied on: `Manifest.Validate`
+  requires `BackupID` and `Deployment` each to be non-empty and never
+  compares them. The runner's generated ids
+  (`<deployment>.<type>.<ts>.<rand>`) make a collision impossible in
+  normal use, so this is a latent invariant rather than a live
+  regression — but the safety of the most destructive path in the
+  repository rested on a naming convention, two lines below a comment
+  claiming "silent data loss is impossible".
+
+  The key is now deployment-scoped, which makes the property structural
+  and imposes no id format, so custom or legacy ids written by an
+  integration keep working.
+
 - **One unreadable object decided the cluster's WAL segment size.**
   `scanWALSegments` derives every segment *number* from
   `wal_segment_size` (`segNum = logID * 4GiB/size + segInLog`), and it
