@@ -403,6 +403,84 @@ func runBackendContract(t *testing.T, factory func(t *testing.T) server.JobBacke
 	// and the cases below are exactly the ones where getting the
 	// boundary wrong destroys a job record that is still live or still
 	// inside the operator's retention window.
+	// Progress is bounded on both backends, and Job.ProgressDropped
+	// exists so that bound is not silent: its doc says the counter
+	// "records how many were shed" (memory-leak audit #3).
+	//
+	// This case lives in the CONTRACT rather than beside either
+	// implementation because the divergence it catches was invisible
+	// exactly where the tests were: MemoryBackend had the cap and the
+	// counter, PGBackend got the cap from bug #23 and not the counter,
+	// and each was tested on its own terms so nothing compared them. A
+	// backend that trims silently is a backend that loses the record of
+	// what an agent did to a cluster.
+	t.Run("ProgressCap_CountsWhatItDropped", func(t *testing.T) {
+		b := factory(t)
+		ctx := context.Background()
+		// Mirrors the unexported maxProgressEvents; both backends must
+		// agree on it, which is itself part of the contract.
+		const bound = 1000
+		const over = 50
+
+		j, err := b.Enqueue(ctx, server.EnqueueOptions{Kind: server.JobBackup, Deployment: "db1"})
+		if err != nil {
+			t.Fatalf("enqueue: %v", err)
+		}
+		if _, err := b.Claim(ctx, server.ClaimOptions{AgentID: "a1", Deployments: []string{"db1"}}); err != nil {
+			t.Fatalf("claim: %v", err)
+		}
+		for i := 0; i < bound+over; i++ {
+			if err := b.AppendProgress(ctx, j.ID, server.ProgressEvent{
+				At: time.Now().UTC(), Op: "tick",
+			}); err != nil {
+				t.Fatalf("append %d: %v", i, err)
+			}
+		}
+		got, err := b.Get(ctx, j.ID)
+		if err != nil {
+			t.Fatalf("get: %v", err)
+		}
+		if len(got.Progress) != bound {
+			t.Fatalf("progress = %d events, want capped at %d", len(got.Progress), bound)
+		}
+		if got.ProgressDropped != over {
+			t.Fatalf("ProgressDropped = %d, want %d.\n\n%d events were discarded to hold "+
+				"the cap and the record says none were. The counter exists so the truncation "+
+				"is not silent; a backend that trims without it loses the record of what the "+
+				"agent did.", got.ProgressDropped, over, over)
+		}
+	})
+
+	t.Run("ProgressUnderCap_DropsNothing", func(t *testing.T) {
+		b := factory(t)
+		ctx := context.Background()
+		j, err := b.Enqueue(ctx, server.EnqueueOptions{Kind: server.JobBackup, Deployment: "db1"})
+		if err != nil {
+			t.Fatalf("enqueue: %v", err)
+		}
+		if _, err := b.Claim(ctx, server.ClaimOptions{AgentID: "a1", Deployments: []string{"db1"}}); err != nil {
+			t.Fatalf("claim: %v", err)
+		}
+		for i := 0; i < 25; i++ {
+			if err := b.AppendProgress(ctx, j.ID, server.ProgressEvent{
+				At: time.Now().UTC(), Op: "tick",
+			}); err != nil {
+				t.Fatalf("append %d: %v", i, err)
+			}
+		}
+		got, err := b.Get(ctx, j.ID)
+		if err != nil {
+			t.Fatalf("get: %v", err)
+		}
+		if got.ProgressDropped != 0 {
+			t.Errorf("ProgressDropped = %d with 25 events appended; a counter that fires "+
+				"below the cap makes every healthy job look lossy", got.ProgressDropped)
+		}
+		if len(got.Progress) != 25 {
+			t.Errorf("progress = %d events, want 25", len(got.Progress))
+		}
+	})
+
 	t.Run("PruneTerminal", func(t *testing.T) {
 		b := factory(t)
 		ctx := context.Background()
