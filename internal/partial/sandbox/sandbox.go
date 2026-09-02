@@ -396,6 +396,20 @@ func buildPGDumpArgs(socketDir, user, database string, tables []string, dataOnly
 	if dataOnly {
 		args = append(args, "--data-only")
 	}
+	// --strict-names makes pg_dump fail when ANY --table pattern matches
+	// nothing. Without it pg_dump only errors when NO pattern matches at
+	// all, so a request for three tables where one is missing dumps the
+	// other two and exits 0 -- and the operator receives a dump they
+	// believe holds three.
+	//
+	// That is the realistic shape, not the exotic one: a typo in a table
+	// name, or a table created after the backup was taken and therefore
+	// absent from the sandbox. The all-missing case already errored
+	// (issue #97), which is exactly why the partial-match case was easy
+	// to miss.
+	//
+	// PG 9.6+; this tool targets 14+.
+	args = append(args, "--strict-names")
 	for _, t := range tables {
 		args = append(args, "--table="+t)
 	}

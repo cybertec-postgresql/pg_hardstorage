@@ -13,6 +13,28 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **`partial dump` silently omitted tables that were not there.**
+  `buildPGDumpArgs` emits one `--table=<name>` per requested table, and
+  `pg_dump` errors with "no matching tables were found" only when **no**
+  pattern matches anything. When *some* match it dumps those, exits 0,
+  and says nothing about the rest.
+
+  So `partial dump --tables public.a,public.b,public.c` where only
+  `public.a` exists produced a dump of `public.a`, exit 0, and an
+  operator holding a file they believed contained three tables. The
+  causes are ordinary — a typo, or a table created after the backup was
+  taken and therefore absent from the sandbox.
+
+  The all-missing case was already guarded: `runPartialDump`'s
+  zero-byte check, added for issue #97, catches "pg_dump produced no
+  output". That guard is what made the partial-match case easy to miss —
+  the obvious half was covered, so the gap looked closed.
+
+  `--strict-names` (PG 9.6+; this tool targets 14+) makes `pg_dump` fail
+  when **any** pattern matches nothing, which is the general form of the
+  same check. The zero-byte guard stays as belt-and-braces for older
+  `pg_dump` builds.
+
 - **The cluster-identity defence was armed only in its own unit test.**
   `patroni.FollowerOptions.ExpectedSystemID` makes the WAL follower
   refuse to follow a leader whose cluster reports a different
