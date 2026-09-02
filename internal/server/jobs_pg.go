@@ -59,8 +59,14 @@ CREATE TABLE IF NOT EXISTS phs.jobs (
     completed_at    TIMESTAMPTZ,
     progress        JSONB NOT NULL DEFAULT '[]'::jsonb,
     result          JSONB,
-    failure         TEXT NOT NULL DEFAULT ''
+    failure         TEXT NOT NULL DEFAULT '',
+    progress_dropped BIGINT NOT NULL DEFAULT 0
 );
+
+-- Added after phs.jobs shipped, so CREATE TABLE IF NOT EXISTS alone
+-- would leave existing installs without it.
+ALTER TABLE phs.jobs
+    ADD COLUMN IF NOT EXISTS progress_dropped BIGINT NOT NULL DEFAULT 0;
 
 -- claim() picks the oldest queued job matching agent's deployment +
 -- kind filters; this index makes that walk an index scan + LIMIT 1
@@ -191,7 +197,7 @@ func (b *PGBackend) Get(ctx context.Context, id string) (*Job, error) {
 	row := b.pool.QueryRow(ctx, `
         SELECT id, kind, deployment, repo_url, args,
                state, assigned_to, created_at, updated_at,
-               started_at, completed_at, progress, result, failure
+               started_at, completed_at, progress, result, failure, progress_dropped
         FROM phs.jobs
         WHERE id = $1
     `, id)
@@ -229,7 +235,7 @@ func (b *PGBackend) List(ctx context.Context, opts ListOptions) ([]Job, error) {
 	q := `
         SELECT id, kind, deployment, repo_url, args,
                state, assigned_to, created_at, updated_at,
-               started_at, completed_at, progress, result, failure
+               started_at, completed_at, progress, result, failure, progress_dropped
         FROM phs.jobs
     `
 	if len(where) > 0 {
@@ -346,7 +352,7 @@ func (b *PGBackend) claimRow(ctx context.Context, q pgQuerier, opts ClaimOptions
          )
         RETURNING id, kind, deployment, repo_url, args,
                   state, assigned_to, created_at, updated_at,
-                  started_at, completed_at, progress, result, failure
+                  started_at, completed_at, progress, result, failure, progress_dropped
     `, opts.AgentID, now, deployments, kinds, opts.MaxConcurrent)
 	j, err := scanJob(row)
 	if err != nil {
@@ -398,6 +404,19 @@ func (b *PGBackend) AppendProgress(ctx context.Context, id string, ev ProgressEv
                     WHERE e.ord > jsonb_array_length(progress || $1::jsonb) - $4
                )
            END,
+               -- Count what the trim above discarded.
+               --
+               -- Job.ProgressDropped exists so the truncation "isn't
+               -- silent" (memory-leak audit #3) and MemoryBackend
+               -- maintains it. This backend got the BOUND from that
+               -- audit but not its companion counter, so on the durable
+               -- backend -- the one that actually runs for months --
+               -- progress was trimmed with no record, and
+               -- progress_dropped read 0 forever. An operator reading a
+               -- long job's progress saw the last N events and nothing
+               -- to say earlier ones had been shed.
+               progress_dropped = progress_dropped
+                   + GREATEST(jsonb_array_length(progress || $1::jsonb) - $4, 0),
                updated_at = $2
          WHERE id = $3
            AND state = 'running'
@@ -446,7 +465,7 @@ func (b *PGBackend) Complete(ctx context.Context, id string, opts CompleteOption
          WHERE id = $5
         RETURNING id, kind, deployment, repo_url, args,
                   state, assigned_to, created_at, updated_at,
-                  started_at, completed_at, progress, result, failure
+                  started_at, completed_at, progress, result, failure, progress_dropped
     `, string(state), result, failure, now, id)
 	j, err := scanJob(row)
 	if err != nil {
@@ -511,7 +530,7 @@ func (b *PGBackend) Cancel(ctx context.Context, id, reason string) (*Job, error)
          WHERE id = $3
         RETURNING id, kind, deployment, repo_url, args,
                   state, assigned_to, created_at, updated_at,
-                  started_at, completed_at, progress, result, failure
+                  started_at, completed_at, progress, result, failure, progress_dropped
     `, failure, now, id)
 	j, err := scanJob(row)
 	if err != nil {
@@ -573,6 +592,7 @@ func scanJob(row interface {
 		&j.ID, &kind, &j.Deployment, &j.RepoURL, &argsBody,
 		&state, &j.AssignedTo, &j.CreatedAt, &j.UpdatedAt,
 		&startedAt, &completedAt, &progBody, &resultBody, &j.Failure,
+		&j.ProgressDropped,
 	); err != nil {
 		return nil, err
 	}

@@ -13,6 +13,27 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **The durable job backend trimmed progress history silently.**
+  `Job.ProgressDropped` exists for one stated reason: progress is
+  bounded, and the counter "records how many were shed" so "the
+  truncation isn't silent" (memory-leak audit #3). `MemoryBackend`
+  maintains it.
+
+  `PGBackend` received the **bound** from that audit — bug #23 added the
+  matching 1000-event cap — but not its companion counter. There was no
+  `progress_dropped` column, nothing incremented it, and `scanJob` left
+  it zero. So on the backend that actually runs for months, a long job's
+  progress was trimmed with no record, and an operator reading it saw
+  the most recent events with nothing to say earlier ones had existed.
+  For a backup or restore, that array is the record of what the agent
+  did.
+
+  Same shape as `PruneTerminal` in the same file: a bound added to the
+  in-memory backend, and the durable one inheriting the bound without
+  the honesty that came with it. The column is added with
+  `ADD COLUMN IF NOT EXISTS` so existing installs migrate, and the
+  increment rides the same single `UPDATE` as the trim.
+
 - **Azure Blob and GCS implement WORM and declared that they did not,
   so every WORM backup on them was refused.** `Capabilities().WORM` is
   not documentation — two safety gates read it and refuse when it is
