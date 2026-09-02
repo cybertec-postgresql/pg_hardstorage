@@ -30,6 +30,7 @@ import (
 	stdfs "io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -374,7 +375,8 @@ func Restore(ctx context.Context, opts Options) (res *Result, err error) {
 	if err := preflightTarget(opts.TargetDir, opts.AllowOverwrite, m.SystemIdentifier, opts.AllowForeignCluster); err != nil {
 		return nil, err
 	}
-	if err := preflightTablespaceTargets(opts.TablespaceRemap, opts.AllowOverwrite); err != nil {
+	if err := preflightTablespaceTargets(
+		tablespaceDestinations(m, opts.TablespaceRemap), opts.AllowOverwrite); err != nil {
 		return nil, err
 	}
 	if err := os.MkdirAll(opts.TargetDir, 0o700); err != nil {
@@ -1071,17 +1073,36 @@ func clearDirContents(dir string) error {
 	return nil
 }
 
-// preflightTablespaceTargets guards the EXTERNAL tablespace
-// directories a restore redirects data into (the New side of each
-// --tablespace-mapping). preflightTarget only protects the main PGDATA;
-// without this, a restore could overwrite another live/wanted cluster's
-// tablespace at the remap target, and a chain restore's
-// pg_combinebackup requires those dirs to be empty/absent anyway. A
-// non-empty target is refused unless allowOverwrite; with --force the
-// dir is cleared (same contract as the main target). Absent or empty
-// dirs pass untouched. See data-loss audit round 3, path #2.
-func preflightTablespaceTargets(remap TablespaceRemap, allowOverwrite bool) error {
-	for _, dir := range remap.AppliedPaths() {
+// preflightTablespaceTargets guards the EXTERNAL directories a restore
+// writes tablespace data into. preflightTarget only protects the main
+// PGDATA; without this, a restore could overwrite another live/wanted
+// cluster's tablespace, and a chain restore's pg_combinebackup requires
+// those dirs to be empty/absent anyway. A non-empty target is refused
+// unless allowOverwrite; with --force the dir is cleared (same contract
+// as the main target). Absent or empty dirs pass untouched.
+//
+// It takes every resolved destination, not just the New side of each
+// --tablespace-mapping. A tablespace the operator did NOT remap is
+// restored to the absolute path recorded in the manifest — the source
+// host's path — and that path can very well exist on this host: a
+// re-restore into the same layout, a staging refresh, or simply two
+// clusters using a conventional location. Guarding only remap targets
+// left those completely unchecked:
+//
+//   - without --force the restore silently wrote over whatever was
+//     there, so the SAFE invocation could still clobber tablespace data
+//     while PGDATA itself was correctly refused;
+//   - with --force the directory was not cleared, so files from the
+//     previous occupant survived alongside the restored ones — the
+//     mixed, silently-corrupt result that clearing the main target
+//     exists to prevent;
+//   - and none of it noticed a LIVE cluster, because the running-
+//     postmaster check reads postmaster.pid from PGDATA and a
+//     tablespace directory does not have one.
+//
+// See data-loss audit round 3, path #2.
+func preflightTablespaceTargets(dirs []string, allowOverwrite bool) error {
+	for _, dir := range dirs {
 		info, err := os.Stat(dir)
 		if err != nil {
 			if errors.Is(err, stdfs.ErrNotExist) {
@@ -1374,6 +1395,34 @@ func writeTablespaceSymlinks(target string, tsDests map[uint32]string) error {
 	return nil
 }
 
+// tablespaceDestinations lists every external directory this restore
+// will write tablespace data into: the resolved destination of each
+// tablespace in the manifest (remapped or not), plus any --tablespace-
+// mapping target the operator named that this manifest does not use —
+// they asked for it to be the destination, so it is guarded too.
+//
+// Sorted and de-duplicated so the preflight's error ordering does not
+// depend on map iteration.
+func tablespaceDestinations(m *backup.Manifest, remap TablespaceRemap) []string {
+	seen := map[string]struct{}{}
+	for _, dir := range tablespaceDestRoots(m, remap) {
+		if dir != "" {
+			seen[dir] = struct{}{}
+		}
+	}
+	for _, dir := range remap.AppliedPaths() {
+		if dir != "" {
+			seen[dir] = struct{}{}
+		}
+	}
+	out := make([]string, 0, len(seen))
+	for dir := range seen {
+		out = append(out, dir)
+	}
+	sort.Strings(out)
+	return out
+}
+
 func tablespaceDestRoots(m *backup.Manifest, remap TablespaceRemap) map[uint32]string {
 	out := make(map[uint32]string, len(m.Tablespaces))
 	for _, ts := range m.Tablespaces {
@@ -1642,7 +1691,8 @@ func restoreIncrementalChain(ctx context.Context, opts Options, sp storage.Stora
 	// External tablespace targets pg_combinebackup writes into must be
 	// empty/absent too — and must not silently clobber a foreign
 	// cluster's tablespace. See round-3 #2.
-	if err := preflightTablespaceTargets(opts.TablespaceRemap, opts.AllowOverwrite); err != nil {
+	if err := preflightTablespaceTargets(
+		tablespaceDestinations(leaf, opts.TablespaceRemap), opts.AllowOverwrite); err != nil {
 		return nil, err
 	}
 

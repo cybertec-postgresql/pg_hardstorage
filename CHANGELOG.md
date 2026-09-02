@@ -13,6 +13,36 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **A restore could overwrite a tablespace outside PGDATA without
+  `--force`.** `preflightTablespaceTargets` iterated
+  `remap.AppliedPaths()` — the *New* side of each
+  `--tablespace-mapping`. A tablespace the operator did **not** remap is
+  restored to the absolute path recorded in the manifest, i.e. the
+  source host's path, and that path can exist on the target host: a
+  re-restore into the same layout, a staging refresh, or two clusters
+  sharing a conventional location such as
+  `/var/lib/postgresql/tablespaces/fast`.
+
+  Those destinations were unchecked entirely:
+
+  - **without `--force`** the restore silently wrote over whatever was
+    there — so the *safe* invocation could clobber data outside PGDATA
+    while PGDATA itself was correctly refused;
+  - **with `--force`** the directory was not cleared, so the previous
+    occupant's files survived alongside the restored ones. That is the
+    mixed, silently-corrupt result `clearDirContents` exists to prevent,
+    in its own words "stale files from a previous occupant mixed with
+    the restore: a silently-corrupt datadir";
+  - and nothing noticed a **live** cluster, because the
+    running-postmaster check reads `postmaster.pid` from PGDATA and a
+    tablespace directory does not have one.
+
+  The preflight now takes every resolved destination — each
+  tablespace's actual restore path, remapped or not, plus any mapping
+  target the operator named that this manifest does not use. Same
+  contract as the main target: refused when non-empty, cleared under
+  `--force`, absent or empty dirs untouched.
+
 - **The GDPR locator dropped manifests it could not read, in a signed
   compliance report, and its own comment said otherwise.**
   `dsa.Locate` had:

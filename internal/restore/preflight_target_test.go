@@ -246,11 +246,11 @@ func TestPreflightTarget_EmptyExpectedIDUnderForceProceeds(t *testing.T) {
 func TestPreflightTablespaceTargets(t *testing.T) {
 	// Absent dir → pass (pg_combinebackup / PG will create it).
 	missing := filepath.Join(t.TempDir(), "nope")
-	if err := preflightTablespaceTargets(TablespaceRemap{{Old: "/old", New: missing}}, false); err != nil {
+	if err := preflightTablespaceTargets([]string{missing}, false); err != nil {
 		t.Errorf("absent tablespace target should pass: %v", err)
 	}
 	// Empty dir → pass.
-	if err := preflightTablespaceTargets(TablespaceRemap{{Old: "/old", New: t.TempDir()}}, false); err != nil {
+	if err := preflightTablespaceTargets([]string{t.TempDir()}, false); err != nil {
 		t.Errorf("empty tablespace target should pass: %v", err)
 	}
 	// Non-empty without --force → refuse.
@@ -258,7 +258,7 @@ func TestPreflightTablespaceTargets(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(nonEmpty, "other_cluster_ts"), []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	err := preflightTablespaceTargets(TablespaceRemap{{Old: "/old", New: nonEmpty}}, false)
+	err := preflightTablespaceTargets([]string{nonEmpty}, false)
 	if err == nil {
 		t.Fatal("non-empty tablespace target must be refused without --force")
 	}
@@ -267,7 +267,7 @@ func TestPreflightTablespaceTargets(t *testing.T) {
 		t.Errorf("code = %v, want preflight.tablespace_not_empty", err)
 	}
 	// Non-empty WITH --force → cleared.
-	if err := preflightTablespaceTargets(TablespaceRemap{{Old: "/old", New: nonEmpty}}, true); err != nil {
+	if err := preflightTablespaceTargets([]string{nonEmpty}, true); err != nil {
 		t.Fatalf("--force should clear the tablespace target: %v", err)
 	}
 	if entries, _ := os.ReadDir(nonEmpty); len(entries) != 0 {
