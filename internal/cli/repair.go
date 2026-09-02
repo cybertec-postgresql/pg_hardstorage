@@ -1095,6 +1095,10 @@ func runRepairScrub(cmd *cobra.Command, repoURL string, limit int, heal bool, re
 	healRes, herr := repo.Heal(cmd.Context(), sp, replicaSP, healTargets, repo.HealOptions{
 		RetainUntil:   healUntil,
 		RetentionMode: healMode,
+		// Same decoder set `repo bundle import` uses to check a chunk's
+		// content address; without it heal cannot tell a rotted replica
+		// copy from a good one and would copy the rot in.
+		Codecs: bundleCodecs(),
 	})
 	if herr != nil {
 		return output.NewError("repair.heal_failed",

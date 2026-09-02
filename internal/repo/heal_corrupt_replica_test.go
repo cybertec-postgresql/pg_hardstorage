@@ -42,17 +42,26 @@ import (
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo"
 )
 
-// TestHeal_CannotDetectACorruptReplica records the limitation.
+// TestHeal_CannotDetectACorruptReplica records what remains of the
+// limitation now that heal CAN verify content addresses.
 //
 // Both sides hold wrong bytes for hash h — what a replicate of an
 // already-rotted source produces. Heal reports Healed because from
-// where it stands the copy succeeded; only a caller with the DEK can
-// say otherwise.
+// where it stands the copy succeeded.
 //
-// If this test ever starts failing because Healed is 0, heal has gained
-// the ability to verify plaintext. That would be a real improvement —
-// and the CLI's reverifyChunksPlaintext could then be reconsidered, but
-// only then.
+// The boundary has since moved. Given a codec registry, heal decodes an
+// UNENCRYPTED envelope and refuses a replica copy that does not hash to
+// the address it is filed under (see heal_content_address_test.go), and
+// the CLI now passes that registry. What survives is this case: no
+// registry supplied, so no content check is possible — and, in
+// production, encrypted chunks, whose plaintext hash needs a DEK heal
+// does not hold.
+//
+// So reverifyChunksPlaintext in internal/cli/repair.go is still
+// required: it builds a per-manifest CAS and therefore checks the
+// encrypted chunks heal must take on trust. It is now a backstop for a
+// narrower set of chunks rather than for all of them, and every chunk
+// it still has to cover is counted in HealResult.HealedUnverified.
 func TestHeal_CannotDetectACorruptReplica(t *testing.T) {
 	dst, replica := twoRepos(t)
 
@@ -78,14 +87,21 @@ func TestHeal_CannotDetectACorruptReplica(t *testing.T) {
 
 	if res.Healed != 1 {
 		t.Errorf("Healed=%d, want 1.\n\n"+
-			"This test records that repo.Heal CANNOT see a corrupt replica: the chunk key is "+
-			"a plaintext SHA, the stored object is an encrypted envelope, and heal holds no "+
-			"DEK. A change here means heal gained plaintext verification — good, but the "+
-			"CLI's reverifyChunksPlaintext was written on the assumption it had not, so "+
-			"revisit that too.", res.Healed)
+			"With no codec registry passed, heal has nothing to check the content address "+
+			"against, so it copies and reports success. Heal WITH a registry refuses this "+
+			"(heal_content_address_test.go); encrypted chunks remain uncheckable here at "+
+			"any setting, which is why reverifyChunksPlaintext still exists.", res.Healed)
 	}
 	if res.Failed != 0 {
-		t.Errorf("Failed=%d, want 0 — heal has no basis on which to fail here", res.Failed)
+		t.Errorf("Failed=%d, want 0 — with no codec registry heal has no basis on which "+
+			"to fail here", res.Failed)
+	}
+	// The heal it just performed was unchecked, and the report says so.
+	if res.HealedUnverified != 1 {
+		t.Errorf("HealedUnverified=%d, want 1 — this is exactly the chunk "+
+			"reverifyChunksPlaintext still has to cover, and the result must mark it "+
+			"rather than let it sit inside a clean-looking Healed count",
+			res.HealedUnverified)
 	}
 	t.Logf("recorded: heal reports Healed=%d for a chunk that is still corrupt; "+
 		"detecting this is internal/cli/repair.go's reverifyChunksPlaintext, "+

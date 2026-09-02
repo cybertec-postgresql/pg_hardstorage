@@ -48,6 +48,23 @@ type HealOptions struct {
 	// deletable. Zero RetainUntil → no lock (non-WORM repo).
 	RetainUntil   time.Time
 	RetentionMode storage.WORMMode
+
+	// Codecs, when non-nil, lets Heal verify that an UNENCRYPTED
+	// replica chunk actually hashes to the address it is stored under
+	// before that chunk is allowed to overwrite the local copy.
+	//
+	// Without it Heal checks only that the envelope parses, so a
+	// replica whose payload is itself rotted -- corrupt in a way that
+	// still forms a valid envelope -- is copied over the primary and
+	// counted as "healed". The damage surfaces later, at restore,
+	// where GetChunkBytes does verify the plaintext hash: the operator
+	// is told the repository was repaired and finds out otherwise when
+	// they need it.
+	//
+	// bundle.Import, the other path that writes chunks into a
+	// repository from an outside source, takes the same registry for
+	// the same reason (see verifyChunkPayload).
+	Codecs *compression.CodecRegistry
 }
 
 // HealProgress is the per-hash callback shape.
@@ -72,8 +89,18 @@ type HealResult struct {
 	ReplicaURL string `json:"replica_url,omitempty"`
 	DryRun     bool   `json:"dry_run"`
 
-	Considered   int `json:"considered"`
-	Healed       int `json:"healed"`
+	Considered int `json:"considered"`
+	Healed     int `json:"healed"`
+
+	// HealedUnverified is the subset of Healed whose CONTENT could not
+	// be checked against its content address: encrypted chunks (the
+	// plaintext hash needs the DEK, which this storage-layer pass does
+	// not hold) and any chunk healed without a codec registry. Those
+	// chunks were written and read back intact, but "the bytes I wrote
+	// landed" is a weaker claim than "this chunk is the chunk it
+	// claims to be", and the report should not blur the two.
+	HealedUnverified int `json:"healed_unverified,omitempty"`
+
 	AlreadyOK    int `json:"already_ok"`     // local copy verified clean (didn't need a heal)
 	NotAtReplica int `json:"not_at_replica"` // replica is missing this chunk
 	Failed       int `json:"failed"`
@@ -235,15 +262,61 @@ func healOne(ctx context.Context, dst, replica storage.StoragePlugin, h Hash, op
 	//     copy with provably-broken bytes while reporting success.
 	//     The failure names the replica so the operator repairs the
 	//     right side.
-	if _, _, _, perr := compression.ReadEnvelope(replicaBytes); perr != nil {
+	algo, encFields, payload, perr := compression.ReadEnvelope(replicaBytes)
+	if perr != nil {
 		res.Failed++
 		recordHealFailure(res, h, fmt.Errorf("replica copy is not a valid chunk envelope (heal it first, or from a different replica): %w", perr))
 		emitProgress(opts, h, "failed")
 		return
 	}
 
+	// 3c. If the chunk is unencrypted and we hold the codecs, confirm
+	//     the replica's bytes actually ARE the chunk h names before
+	//     letting them overwrite anything. A parseable envelope is not
+	//     an intact one: rot inside the compressed payload leaves the
+	//     header perfectly well-formed. Healing from such a copy
+	//     replaces local corruption with remote corruption and reports
+	//     success, and the mismatch only surfaces at restore, where
+	//     GetChunkBytes checks the plaintext hash on every read.
+	//
+	//     Encrypted chunks cannot be checked here -- the plaintext hash
+	//     needs the DEK, and requiring keys would make heal unusable
+	//     for the operator who has storage access but not KMS. Those
+	//     are counted in HealedUnverified instead of being silently
+	//     folded into a clean-sounding Healed.
+	contentVerified := false
+	if !encFields.IsEncrypted() && opts.Codecs != nil {
+		codec, lerr := opts.Codecs.Lookup(algo)
+		if lerr != nil {
+			res.Failed++
+			recordHealFailure(res, h, fmt.Errorf("no codec for replica chunk (algo=%d): %w", algo, lerr))
+			emitProgress(opts, h, "failed")
+			return
+		}
+		plain, derr := codec.Decompress(payload)
+		if derr != nil {
+			res.Failed++
+			recordHealFailure(res, h, fmt.Errorf("replica copy will not decompress, so it is not the chunk it is filed under (heal from a different replica): %w", derr))
+			emitProgress(opts, h, "failed")
+			return
+		}
+		if got := HashOf(plain); got != h {
+			res.Failed++
+			recordHealFailure(res, h, fmt.Errorf(
+				"replica copy does not match its own content address (stored under %s, hashes to %s) — "+
+					"healing from it would copy the replica's corruption into this repository and report success",
+				h, got))
+			emitProgress(opts, h, "failed")
+			return
+		}
+		contentVerified = true
+	}
+
 	if opts.DryRun {
 		res.Healed++
+		if !contentVerified {
+			res.HealedUnverified++
+		}
 		res.BytesCopied += int64(len(replicaBytes))
 		emitProgress(opts, h, "healed")
 		return
@@ -311,6 +384,9 @@ func healOne(ctx context.Context, dst, replica storage.StoragePlugin, h Hash, op
 	}
 
 	res.Healed++
+	if !contentVerified {
+		res.HealedUnverified++
+	}
 	res.BytesCopied += int64(len(replicaBytes))
 	emitProgress(opts, h, "healed")
 }
