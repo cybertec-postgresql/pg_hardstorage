@@ -13,6 +13,36 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **An unreadable approval subtracted itself from "pending approvals".**
+  `approval.Store.List` fetched each listed request and swallowed every
+  failure with a bare `continue` — a body that would not decode, an auth
+  failure, a transient storage error. `status` renders the result as a
+  flat `Pending approvals: 0`, so a repository whose approval listing
+  could not be read told the operator, on the primary at-a-glance
+  screen, that nothing awaited sign-off. No tampering is required to
+  reach it; a network blip mid-listing is enough.
+
+  `Store.Get` already draws the right line one level down for approver
+  votes — "a deleted approver key mid-list is benign; surface only
+  genuine failures" — and the outer walk simply never applied it. It
+  does now: `ErrNotFound` means the request was deleted between the
+  listing and the fetch and is skipped; anything else returns, with the
+  partial results alongside the error so best-effort callers keep what
+  was readable.
+
+  `status` distinguishes the two answers, printing
+  `Pending approvals: at least N — THE LISTING COULD NOT BE READ IN FULL`
+  and setting a new `pending_approvals_unknown` JSON field. The field is
+  additive and `omitempty`, so a healthy run's output is byte-identical
+  to before and the 24-month output-schema window is untouched.
+
+  Also in `approval list`: statuses were computed by re-fetching every
+  request `List` had just fetched (2N round trips) and recomputing
+  against a fresh `time.Now()`, so a row could display a status
+  contradicting the `--status` filter it had matched moments earlier.
+  It now classifies the request already in hand, with one clock for the
+  whole listing.
+
 - **The repository audit's approval rollup counted nothing it claimed to
   count.** `summarizeApprovals` documented itself as classifying the
   approval lifecycle — "counts the lifecycle states … Pending /
