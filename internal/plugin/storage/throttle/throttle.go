@@ -339,5 +339,28 @@ func (t *Throttle) Region() string {
 	return storage.RegionOf(t.inner)
 }
 
-// Compile-time assertions that we satisfy StoragePlugin.
-var _ storage.StoragePlugin = (*Throttle)(nil)
+// FreeSpace delegates via storage.FreeSpaceOf so the capacity
+// pre-flight sees through the wrapper.
+//
+// Without this the wrapper ANSWERED for the backend instead of
+// forwarding: FreeSpaceOf type-asserts FreeSpaceAware, a Throttle that
+// did not implement it failed the assertion, and the pre-flight
+// recorded PreflightUnsupported with the note "backend does not expose
+// free-space probe". That note would be false -- the fs plugin does
+// expose one -- and the disk-space gate would silently not run purely
+// because a bandwidth limit was configured. Region had this same
+// forwarding for the residency check; FreeSpace was simply missed.
+func (t *Throttle) FreeSpace(ctx context.Context) (storage.FreeSpaceInfo, error) {
+	return storage.FreeSpaceOf(ctx, t.inner)
+}
+
+// Compile-time assertions that we satisfy StoragePlugin and forward
+// every optional capability interface. A middleware that drops one
+// turns a backend that HAS the capability into one that reports it
+// unsupported, which reads as "this backend cannot" rather than "we
+// hid it".
+var (
+	_ storage.StoragePlugin  = (*Throttle)(nil)
+	_ storage.RegionAware    = (*Throttle)(nil)
+	_ storage.FreeSpaceAware = (*Throttle)(nil)
+)

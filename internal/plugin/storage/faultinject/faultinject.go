@@ -360,8 +360,22 @@ func (m *Middleware) Region() string {
 	return storage.RegionOf(m.inner)
 }
 
-// Compile-time assertion that we satisfy StoragePlugin.
-var _ storage.StoragePlugin = (*Middleware)(nil)
+// FreeSpace delegates via storage.FreeSpaceOf so the capacity
+// pre-flight sees through the wrapper -- the same reason Region
+// delegates via RegionOf. A test or gameday that wraps the fs plugin
+// here would otherwise find the capacity gate silently skipped, and so
+// would never exercise it.
+func (m *Middleware) FreeSpace(ctx context.Context) (storage.FreeSpaceInfo, error) {
+	return storage.FreeSpaceOf(ctx, m.inner)
+}
+
+// Compile-time assertions that we satisfy StoragePlugin and forward
+// every optional capability interface.
+var (
+	_ storage.StoragePlugin  = (*Middleware)(nil)
+	_ storage.RegionAware    = (*Middleware)(nil)
+	_ storage.FreeSpaceAware = (*Middleware)(nil)
+)
 
 // ErrInjected is the canonical sentinel an operator can use as a
 // rule's Err when they want a recognisable "this came from fault
