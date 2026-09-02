@@ -93,6 +93,21 @@ func (p *Plugin) Name() string { return "gcs" }
 // Capabilities implements storage.StoragePlugin.
 func (p *Plugin) Capabilities() storage.Capabilities {
 	return storage.Capabilities{
+		// WORM: GCS object retention (ObjectRetention), applied inline by Put and
+		// separately by SetRetention.
+		//
+		// This was false while both were fully implemented, and the
+		// declaration is what the safety gates read: CAS.PutChunk marks
+		// itself retentionUnenforceable and REFUSES every chunk when
+		// retention is configured on a backend that reports no WORM
+		// (cas.go), and Replicate refuses a WORM-configured destination
+		// for the same reason. So a compliance operator on this backend
+		// could not take a WORM backup at all, was told their backend
+		// cannot enforce WORM -- which is false -- and the documented
+		// remedy was the flag that DISABLES the guard. Training an
+		// operator to run with the WORM footgun-guard permanently off is
+		// worse than the inconvenience it was meant to spare them.
+		WORM:           true,
 		ConditionalPut: true, // native via If: Conditions{DoesNotExist:true}
 		InlineDurable:  true, // a successful object PUT is durable
 	}

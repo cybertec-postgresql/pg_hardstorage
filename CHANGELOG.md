@@ -13,6 +13,39 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **Azure Blob and GCS implement WORM and declared that they did not,
+  so every WORM backup on them was refused.** `Capabilities().WORM` is
+  not documentation — two safety gates read it and refuse when it is
+  false: `CAS.PutChunk` marks itself `retentionUnenforceable` and
+  rejects every chunk when retention is configured on a backend
+  reporting no WORM, and `Replicate` refuses a WORM-configured
+  destination for the same reason. Both exist to stop an operator
+  believing a backup is immutable when it is not.
+
+  A backend that *does* enforce WORM but reports `false` inverts them.
+  `azblob` implements `SetRetention` against Azure's
+  `SetImmutabilityPolicy`, `gcs` against `ObjectRetention`, and both
+  `Put` implementations apply the deadline inline — azblob's carries a
+  comment explaining that the CAS "relies on Put to enforce it". The
+  implementation was complete and deliberate on both. Only the
+  declaration was missing.
+
+  So a compliance operator on Azure or GCS could not take a WORM backup
+  at all, was told their backend cannot enforce WORM — which is false —
+  and the remedy they would reach for is the flag that *disables* the
+  guard. Training an operator to run with the WORM footgun-guard
+  permanently off is worse than the inconvenience it was meant to spare
+  them, and it stays off if they later move to a backend that genuinely
+  cannot enforce it.
+
+  A guard now checks the claim against the implementation: a backend
+  whose `SetRetention` is anything other than an unconditional
+  `return storage.ErrUnsupported` must declare `WORM`, and one that
+  declares it must implement it. Middlewares are skipped by property
+  rather than by name — their `Capabilities` delegates to the wrapped
+  plugin instead of returning a literal, so they cannot misstate
+  anything.
+
 - **`partial dump` silently omitted tables that were not there.**
   `buildPGDumpArgs` emits one `--table=<name>` per requested table, and
   `pg_dump` errors with "no matching tables were found" only when **no**
