@@ -30,3 +30,10 @@ func StartWithStopGuardForTest(ctx context.Context, pgCtl, dataDir string, start
 	_, err = runStart(ctx, pgCtl, startArgs)
 	return err
 }
+
+// ProbeCatalogsForTest exposes probeCatalogs so its output parsing can
+// be driven with a stub `psql` that emits realistic psql diagnostics
+// alongside the result row — the case the probe used to mis-read.
+func ProbeCatalogsForTest(ctx context.Context, psql, dsn string) error {
+	return probeCatalogs(ctx, psql, dsn)
+}

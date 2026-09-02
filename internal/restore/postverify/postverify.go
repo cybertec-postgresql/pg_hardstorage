@@ -52,6 +52,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -761,10 +762,35 @@ func probeCatalogs(ctx context.Context, psql, dsn string) error {
 	if err != nil {
 		return fmt.Errorf("pg_database query: %w (output: %s)", err, truncate(out, 256))
 	}
+	// Read the LAST non-empty token, for the reason probeSelect1 spells
+	// out twenty lines up: CombinedOutput interleaves psql's stderr
+	// NOTICEs and WARNINGs with the result, and the collation-version
+	// mismatch warning is "routine when restoring a container-created
+	// backup onto a host".
+	//
+	// Comparing TrimSpace(out) against "0" did not survive that. With
+	// any diagnostic present the whole blob is neither "0" nor "", so
+	// the check passed — INCLUDING when the count really was 0, which
+	// is the one case this probe exists to catch. The catalog probe
+	// failed open in exactly the situation its sibling was hardened
+	// against, on the same psql invocation, in the same file.
+	//
+	// Parsed as an integer rather than string-compared, so a truncated
+	// or non-numeric answer is a failure instead of a pass.
+	fields := strings.Fields(strings.TrimSpace(string(out)))
+	if len(fields) == 0 {
+		return fmt.Errorf("pg_database returned no result (output: %s)", truncate(out, 256))
+	}
+	last := fields[len(fields)-1]
+	n, convErr := strconv.Atoi(last)
+	if convErr != nil {
+		return fmt.Errorf("pg_database returned %q, not a count (output: %s)",
+			last, truncate(out, 256))
+	}
 	// At least 1 (postgres / template* DBs).  Zero would be
 	// catastrophic and means catalogs are toast.
-	if v := strings.TrimSpace(string(out)); v == "0" || v == "" {
-		return fmt.Errorf("pg_database returned %q (catalogs corrupt?)", v)
+	if n < 1 {
+		return fmt.Errorf("pg_database returned %d connectable database(s) (catalogs corrupt?)", n)
 	}
 	return nil
 }

@@ -13,6 +13,33 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **The post-restore catalog probe passed over destroyed catalogs
+  whenever psql printed anything.** `probeSelect1` — twenty lines above
+  `probeCatalogs` in the same file — documents the hazard precisely:
+
+  > `CombinedOutput` interleaves psql's stderr NOTICEs/WARNINGs (e.g.
+  > the collation-version mismatch warning when a cluster built against
+  > one glibc is started on another — routine when restoring a
+  > container-created backup onto a host) with the query result.
+
+  and reads the *last* non-empty token accordingly. `probeCatalogs`
+  compared the whole trimmed blob against `"0"`. With any diagnostic
+  present that blob is neither `"0"` nor `""`, so the check passed —
+  **including when the count really was 0**, which its own comment
+  calls "catastrophic and means catalogs are toast".
+
+  The failing combination is the ordinary one: restore a
+  container-created backup onto a host, get a collation warning on every
+  connection, and the L3 catalog check silently stops working.
+
+  It now takes the last token and parses it as an integer, so a
+  truncated or non-numeric answer is a failure rather than a pass. The
+  healthy-with-warning case is pinned too — refusing there would break
+  every container-to-host restore.
+
+  Found via the coverage ratchet's own dead-corners list: `probeCatalogs`
+  was recorded as having no test witness.
+
 - **The PITR gap gate degraded silently when it could not read the live
   gap state.** `preflightWALGap` has three consumers of `gapstate`: the
   LSN-target path, the time/name-target refusal, and an advisory
