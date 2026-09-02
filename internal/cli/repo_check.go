@@ -139,6 +139,29 @@ func runRepoCheck(cmd *cobra.Command, repoURL string) error {
 		depReports = append(depReports, dr)
 	}
 
+	// 1b. Orphaned redundancy copies: a manifests/_replicas/<id> entry
+	// whose primary manifest is gone.
+	//
+	// Every commit writes the primary and then a redundancy copy under
+	// manifests/_replicas/, precisely so that "if the primary is lost
+	// (a single misdirected `aws s3 rm`, say), the replica still has
+	// the bytes". `repair manifest <deployment> <backup-id>` restores
+	// the primary from it.
+	//
+	// But that recovery needs a backup ID, and a backup whose primary
+	// is gone appears in NO listing: List walks
+	// manifests/<dep>/backups/, `list`/`status` show nothing, and this
+	// command's LiveManifests count simply gets smaller. The redundancy
+	// was unusable in the exact scenario it exists for, because nothing
+	// told the operator which backups to recover — and `repo check`
+	// reported healthy: true over a repository that had silently lost
+	// backups, with the evidence sitting unexamined one prefix away.
+	orphanedReplicas, err := findOrphanedReplicas(cmd.Context(), sp, store, verifier)
+	if err != nil {
+		return output.NewError("repo.check.replica_walk_failed",
+			fmt.Sprintf("repo check: replica walk: %v", err)).Wrap(err)
+	}
+
 	// 2. Reference completeness across every (non-tombstoned) manifest.
 	refs, err := repo.CollectReferences(cmd.Context(), sp)
 	if err != nil {
@@ -160,6 +183,7 @@ func runRepoCheck(cmd *cobra.Command, repoURL string) error {
 		SignatureFailures: totalSigFailed,
 		ChunkRefs:         refs.Len(),
 		MissingChunks:     len(missing),
+		OrphanedReplicas:  orphanedReplicas,
 		WORM:              meta.WORM,
 		CommitMode:        commitMode,
 	}
@@ -182,7 +206,8 @@ func runRepoCheck(cmd *cobra.Command, repoURL string) error {
 	// exit 0; operators running `repo check` in cron would
 	// silently miss the corruption.  Surfaced by
 	// L8_repo_check_detects_manifest_corruption.
-	body.Healthy = body.MissingChunks == 0 && body.SignatureFailures == 0
+	body.Healthy = body.MissingChunks == 0 && body.SignatureFailures == 0 &&
+		len(body.OrphanedReplicas) == 0
 
 	if body.MissingChunks > 0 {
 		// verify.* is the namespace operators wire ExitVerifyFailed
@@ -195,6 +220,15 @@ func runRepoCheck(cmd *cobra.Command, repoURL string) error {
 			WithSuggestion(&output.Suggestion{
 				Human:   "this is real corruption — restores referencing these chunks will fail. Investigate with `pg_hardstorage repair chunks --missing` before taking new backups.",
 				Command: "pg_hardstorage repair chunks --missing --repo " + repoURL,
+			})
+	}
+	if len(body.OrphanedReplicas) > 0 {
+		return output.NewError("verify.orphaned_replicas",
+			fmt.Sprintf("repo check: %d backup(s) have a redundancy copy under manifests/_replicas/ but no primary manifest: %s",
+				len(body.OrphanedReplicas), strings.Join(body.OrphanedReplicas, ", "))).
+			WithSuggestion(&output.Suggestion{
+				Human:   "the primary manifest was deleted while its redundancy copy survived — which is what that copy is for. Each is recoverable with `repair manifest <deployment> <backup-id>`, which re-verifies the replica's signature before restoring it. Until then these backups are invisible to list/status/restore.",
+				Command: "pg_hardstorage repair manifest <deployment> " + body.OrphanedReplicas[0] + " --repo " + repoURL,
 			})
 	}
 	if body.SignatureFailures > 0 {
@@ -282,8 +316,13 @@ type repoCheckBody struct {
 	SignatureFailures int                   `json:"signature_failures"`
 	ChunkRefs         int                   `json:"chunk_refs"`
 	MissingChunks     int                   `json:"missing_chunks"`
-	MissingHashes     []string              `json:"missing_hashes,omitempty"`
-	Healthy           bool                  `json:"healthy"`
+	// OrphanedReplicas lists backup IDs whose redundancy copy under
+	// manifests/_replicas/ survives but whose primary manifest is gone.
+	// They are invisible to every listing until `repair manifest`
+	// restores the primary, so a repo holding them is not healthy.
+	OrphanedReplicas []string `json:"orphaned_replicas,omitempty"`
+	MissingHashes    []string `json:"missing_hashes,omitempty"`
+	Healthy          bool     `json:"healthy"`
 	// CommitMode reports how this repository publishes manifests:
 	// "conditional_put" (one atomic PUT, nothing deleted) or
 	// "stage_and_rename" (a temporary object, a conditional COPY and a
@@ -334,6 +373,14 @@ func (b repoCheckBody) WriteText(w io.Writer) error {
 		fmt.Fprintln(bw, "                    add ?conditional_put=native to the repo URL.")
 	}
 	fmt.Fprintf(bw, "  Chunk references: %d distinct\n", b.ChunkRefs)
+	if len(b.OrphanedReplicas) > 0 {
+		fmt.Fprintf(bw, "  ✗ %d backup(s) have a redundancy copy but NO primary manifest "+
+			"(invisible to list/status/restore until repaired):\n", len(b.OrphanedReplicas))
+		for _, id := range b.OrphanedReplicas {
+			fmt.Fprintf(bw, "      %s\n", id)
+		}
+		fmt.Fprintln(bw, "    recover each with `pg_hardstorage repair manifest <deployment> <backup-id>`")
+	}
 	if b.MissingChunks == 0 {
 		fmt.Fprintln(bw, "  ✓ Every referenced chunk is present")
 	} else {
@@ -364,4 +411,58 @@ func (b repoCheckBody) WriteText(w io.Writer) error {
 	}
 	_, err := io.WriteString(w, strings.TrimRight(bw.String(), "\n"))
 	return err
+}
+
+// findOrphanedReplicas returns the backup IDs under
+// manifests/_replicas/ that have no primary manifest in any
+// deployment.
+//
+// The replica file is named by backup ID alone, so the deployment is
+// recovered from the manifest body rather than the key — which is also
+// why the check reports IDs and lets `repair manifest` take the
+// deployment from the operator.
+func findOrphanedReplicas(ctx context.Context, sp storage.StoragePlugin, store *backup.ManifestStore, verifier *backup.Verifier) ([]string, error) {
+	deployments, err := store.Deployments(ctx)
+	if err != nil {
+		return nil, err
+	}
+	// Every backup ID that HAS a primary, live or tombstoned. A
+	// tombstoned backup's primary is intact (the tombstone is a
+	// separate marker), so its replica is not orphaned.
+	havePrimary := map[string]struct{}{}
+	for _, dep := range deployments {
+		for info, lerr := range sp.List(ctx, "manifests/"+dep+"/backups/") {
+			if lerr != nil {
+				return nil, lerr
+			}
+			if !strings.HasSuffix(info.Key, "/manifest.json") {
+				continue
+			}
+			parts := strings.Split(info.Key, "/")
+			if len(parts) >= 5 {
+				havePrimary[parts[3]] = struct{}{}
+			}
+		}
+	}
+
+	const prefix = "manifests/_replicas/"
+	const suffix = ".manifest.json"
+	var orphans []string
+	for info, lerr := range sp.List(ctx, prefix) {
+		if lerr != nil {
+			return nil, lerr
+		}
+		if !strings.HasSuffix(info.Key, suffix) {
+			continue
+		}
+		id := strings.TrimSuffix(strings.TrimPrefix(info.Key, prefix), suffix)
+		if id == "" || strings.Contains(id, "/") {
+			continue
+		}
+		if _, ok := havePrimary[id]; !ok {
+			orphans = append(orphans, id)
+		}
+	}
+	sort.Strings(orphans)
+	return orphans, nil
 }

@@ -13,6 +13,32 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **A repository that had silently lost backups reported healthy.**
+  Every commit writes the primary manifest and then a redundancy copy at
+  `manifests/_replicas/<id>.manifest.json`, for the reason the store's
+  own doc gives: *"if the primary is lost (a single misdirected
+  `aws s3 rm`, say), the replica still has the bytes"*.
+  `repair manifest <deployment> <backup-id>` restores the primary from
+  it, re-verifying the signature first.
+
+  But that recovery needs a backup ID, and a backup whose primary is
+  gone appears in **no listing**. `ManifestStore.List` walks
+  `manifests/<dep>/backups/`, so `list`, `status` and `restore` show
+  nothing, and `repo check`'s live-manifest count simply got smaller.
+  Nothing compared the two prefixes. The redundancy was unusable in the
+  exact scenario it exists for: the bytes survived, and no command would
+  tell the operator which backups to recover.
+
+  For a health command that is the sharper half — `repo check` reported
+  `healthy: true` and exit 0 over a repository that had lost backups,
+  with the evidence sitting one prefix away.
+
+  It now reports each orphaned replica by ID, with the recovery command,
+  and refuses to call such a repo healthy. Tombstoned backups are *not*
+  orphans: their primary manifest is intact and the tombstone is a
+  separate marker, so counting them would make every soft-delete look
+  like data loss.
+
 - **A restore could overwrite a tablespace outside PGDATA without
   `--force`.** `preflightTablespaceTargets` iterated
   `remap.AppliedPaths()` — the *New* side of each
