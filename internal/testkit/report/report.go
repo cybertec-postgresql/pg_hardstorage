@@ -47,21 +47,28 @@ type FleetSummary struct {
 
 // CellReport is per-cell outcome.
 type CellReport struct {
-	Name              string        `json:"name"`
-	OS                string        `json:"os"`
-	PG                string        `json:"pg"`
-	Arch              string        `json:"arch"`
-	Role              string        `json:"role"`
-	BackupsTaken      int           `json:"backups_taken"`
-	BackupsFailed     int           `json:"backups_failed"`
-	RestoresAttempted int           `json:"restores_attempted"`
-	RestoresFailed    int           `json:"restores_failed"`
-	FaultsApplied     int           `json:"faults_applied"`
-	IterationsRun     int           `json:"iterations_run"`
-	LastIteration     int           `json:"last_iteration"`
-	UpFor             time.Duration `json:"up_for_nanos"`
-	Pass              bool          `json:"pass"`
-	FirstFailureMsg   string        `json:"first_failure_msg,omitempty"`
+	Name              string `json:"name"`
+	OS                string `json:"os"`
+	PG                string `json:"pg"`
+	Arch              string `json:"arch"`
+	Role              string `json:"role"`
+	BackupsTaken      int    `json:"backups_taken"`
+	BackupsFailed     int    `json:"backups_failed"`
+	RestoresAttempted int    `json:"restores_attempted"`
+	RestoresFailed    int    `json:"restores_failed"`
+	FaultsApplied     int    `json:"faults_applied"`
+
+	// RecoveryFails counts faults that were applied but could NOT be
+	// reverted, leaving the cell in the degraded state the fault
+	// created for every iteration that follows. Deadline-aborted
+	// recoveries are excluded -- those are orchestrator teardown, not
+	// a cleanup failure.
+	RecoveryFails   int           `json:"recovery_fails"`
+	IterationsRun   int           `json:"iterations_run"`
+	LastIteration   int           `json:"last_iteration"`
+	UpFor           time.Duration `json:"up_for_nanos"`
+	Pass            bool          `json:"pass"`
+	FirstFailureMsg string        `json:"first_failure_msg,omitempty"`
 
 	// LoadStats is populated when the cell ran a sustained
 	// background writer or a continuous WAL stream during the

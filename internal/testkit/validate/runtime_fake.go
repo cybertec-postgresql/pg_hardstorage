@@ -46,6 +46,13 @@ type FakeCellRuntime struct {
 
 	FaultErr error
 
+	// RecoveryErr, when set, makes ApplyFault succeed but hand back a
+	// Recovery that FAILS. That is the interesting half: the fault
+	// landed, so the cell is in the degraded state the fault created,
+	// and the revert could not undo it. FaultErr covers the other half
+	// (the fault never landed at all), which leaves the cell healthy.
+	RecoveryErr error
+
 	// Sustained-load and WAL-stream sidecar plumbing.  Tests
 	// flip the *Started bools to simulate a runtime that
 	// successfully launched its sidecar; *Err fields make the
@@ -173,14 +180,17 @@ func (f *FakeCellRuntime) VerifyRestore(ctx context.Context, _ string) error {
 	return nil
 }
 
-// ApplyFault returns FaultErr if set, otherwise
-// inject.NoRecovery.
+// ApplyFault returns FaultErr if set, a failing Recovery if
+// RecoveryErr is set, otherwise inject.NoRecovery.
 func (f *FakeCellRuntime) ApplyFault(_ context.Context, _ string) (inject.Recovery, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.faultCalls++
 	if f.FaultErr != nil {
 		return nil, f.FaultErr
+	}
+	if rerr := f.RecoveryErr; rerr != nil {
+		return func(context.Context) error { return rerr }, nil
 	}
 	return inject.NoRecovery, nil
 }

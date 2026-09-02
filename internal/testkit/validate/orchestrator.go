@@ -139,6 +139,11 @@ func Run(ctx context.Context, opts RunOptions) (*report.Report, error) {
 	// emit.  For v1 we expose totals only.
 	for _, c := range rep.Cells {
 		rep.FaultStats.TotalApplied += c.FaultsApplied
+		// RecoveryFails was rendered by the report ("- Recovery
+		// failures: %d") and incremented by nothing, so every soak
+		// reported zero unrevertable faults regardless of how many
+		// recovery_failed events fired.
+		rep.FaultStats.RecoveryFails += c.RecoveryFails
 	}
 	// Move any cell-attributed failures into rep.Failures so
 	// AddFailure semantics match — but the loop already
@@ -388,8 +393,10 @@ func runCellLoop(
 				case <-ctx.Done():
 				case <-time.After(opts.Loop.HealWindow):
 				}
+				recovered := true
 				if recovery != nil {
 					if rerr := recovery(ctx); rerr != nil {
+						recovered = false
 						if ctx.Err() != nil {
 							// Run-wide deadline elapsed: the
 							// recovery's docker calls were
@@ -406,14 +413,25 @@ func runCellLoop(
 								Op:        "recovery_aborted_at_deadline",
 								Iteration: iter, Err: rerr.Error()})
 						} else {
+							cr.RecoveryFails++
 							emit(Event{Cell: cr.Name,
 								Op:        "recovery_failed",
 								Iteration: iter, Err: rerr.Error()})
 						}
 					}
 				}
-				emit(Event{Cell: cr.Name, Op: "fault_recovered",
-					Iteration: iter, Detail: fault.Action})
+				// Only claim recovery when the revert actually
+				// succeeded. This emit used to be unconditional, so a
+				// fault that could NOT be undone emitted
+				// recovery_failed and then fault_recovered right
+				// behind it -- and fault_recovered is one of the three
+				// ops the watch TUI paints as healthy (tui.go), so it
+				// being LAST made a poisoned cell read green for the
+				// rest of the run.
+				if recovered {
+					emit(Event{Cell: cr.Name, Op: "fault_recovered",
+						Iteration: iter, Detail: fault.Action})
+				}
 			}
 		}
 
