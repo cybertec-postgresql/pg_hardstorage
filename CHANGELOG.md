@@ -13,6 +13,63 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **A progress report could make the agent that sent it look absent.**
+  `AppendProgress` set `Job.UpdatedAt` from `ProgressEvent.At`. That
+  field arrives in the agent's JSON body — `handleJobProgress` decodes
+  it straight off the wire — so it is stamped by a clock on the database
+  host. `UpdatedAt` is what `SweepAbandoned` keys abandonment on.
+
+  So an agent whose clock ran behind the control plane's by more than
+  the claim deadline was reclaimed *by the statement that recorded its
+  progress*, and the job it was actively working failed with
+  `abandoned: agent stopped reporting` — contradicted by the very row
+  the message was written into. From there the documented cascade runs:
+  a second agent claims the same job, two backups run concurrently
+  against one cluster, and the first agent's `Complete` returns
+  `ErrClaimLost`, discarding the finished work.
+
+  This is the same failure the `started_at` → `updated_at` fix
+  addressed, and that fix is intact; it closed the path where a job was
+  reclaimed for running too **long**. This is the path where a job is
+  reclaimed for running on a host whose clock is a few minutes **slow**.
+  Clock skew between a database host and a control plane is ordinary and
+  needs no misbehaviour to arise.
+
+  `AppendProgress` was the only writer of `UpdatedAt` not using the
+  server clock — `Claim`, `Complete`, `Cancel` and `SweepAbandoned` all
+  use `time.Now()` — and the only one taking wire input. Both backends
+  now stamp liveness with the receive clock; `ev.At` still rides
+  verbatim inside the stored event, where it is the agent's real
+  observation timestamp.
+
+- **A signed manifest could say two different things at once.**
+  `ParseAndVerify` does not compare the file on disk against the signed
+  bytes — it cannot, because the attestation lives inside the file. It
+  unmarshals the document, zeroes the attestation and *re-serialises*,
+  then checks that reconstruction against the signature. Anything the
+  struct does not represent falls out of the comparison.
+
+  A repeated object key is exactly that. `encoding/json` binds the last
+  occurrence, so a manifest carrying `"backup_id"` twice parses to the
+  genuine value, re-serialises to the genuine bytes, and **verifies** —
+  while a first-wins JSON reader, or an operator opening the file, sees
+  the other value. `verify` would call such a backup cryptographically
+  sound. `ParseAttestationless` accepted it too, and that is the path
+  `repair attestation` reads through: re-signing an ambiguous document
+  mints a genuine signature over it.
+
+  Both readers now reject a manifest that repeats any object key, nested
+  objects and objects inside arrays included, folding case because Go
+  matches JSON keys to struct fields case-insensitively. The schema has
+  no map fields, so every key is fixed and a repeat is never legitimate.
+
+  Unknown fields remain accepted **by design**, now pinned by a test:
+  `Schema` has been `pg_hardstorage.manifest.v1` since v1.0.0 and is
+  exact-matched on read, yet fields have been added under it
+  (`pg_backup_manifest`, `wal_gaps`). That tolerance is what lets an
+  older binary read a newer repository's manifests, and it is required
+  by the 24-month compatibility window above.
+
 - **The durable job backend trimmed progress history silently.**
   `Job.ProgressDropped` exists for one stated reason: progress is
   bounded, and the counter "records how many were shed" so "the
