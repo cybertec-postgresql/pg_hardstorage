@@ -527,8 +527,15 @@ func pickDrillManifest(ctx context.Context, sp storage.StoragePlugin, deployment
 	target := opts.BackupID
 	if target == "" || target == "latest" {
 		var newest *backup.Manifest
+		skipped := 0
 		for m, lerr := range store.List(ctx, deployment, opts.Verifier) {
 			if lerr != nil {
+				// Counted. A drill exists to answer "could we restore
+				// this deployment right now?"; silently drilling an
+				// OLDER backup than the newest, or reporting "no usable
+				// backups" when several exist and merely do not verify,
+				// answers a different question than the one asked.
+				skipped++
 				continue
 			}
 			if newest == nil || m.StoppedAt.After(newest.StoppedAt) {
@@ -536,6 +543,10 @@ func pickDrillManifest(ctx context.Context, sp storage.StoragePlugin, deployment
 			}
 		}
 		if newest == nil {
+			if skipped > 0 {
+				return nil, fmt.Errorf("recovery: drill: %d manifest(s) for deployment %q exist but none could be verified or read — these are not missing backups, they are backups whose manifests do not verify",
+					skipped, deployment)
+			}
 			return nil, fmt.Errorf("recovery: drill: no usable backups for deployment %q", deployment)
 		}
 		return newest, nil

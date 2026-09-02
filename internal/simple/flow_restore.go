@@ -59,15 +59,31 @@ func (f flowRestore) Run(ctx context.Context, env *Env) error {
 	}
 	store := backup.NewManifestStore(sp)
 	var manifests []*backup.Manifest
+	skipped := 0
 	for m, mErr := range store.List(ctx, dep.Name, verifier) {
-		if mErr == nil {
-			manifests = append(manifests, m)
+		if mErr != nil {
+			skipped++
+			continue
 		}
+		manifests = append(manifests, m)
 	}
 	sp.Close()
 	if len(manifests) == 0 {
+		// "No backups" is the wrong thing to tell someone whose backups
+		// exist but do not verify — most of all in the guided flow,
+		// whose users are least placed to second-guess it.
+		if skipped > 0 {
+			env.Prompter.Printf("  %d backup(s) found, but none of their manifests could be "+
+				"verified or read, so none can be offered for restore.\n", skipped)
+			env.Prompter.Println("  This is not an empty repository. Run `pg_hardstorage repo check`.")
+			return nil
+		}
 		env.Prompter.Println("  no backups to restore.")
 		return nil
+	}
+	if skipped > 0 {
+		env.Prompter.Printf("  note: %d backup(s) are omitted from this list because their "+
+			"manifests could not be verified or read.\n", skipped)
 	}
 	sort.Slice(manifests, func(i, j int) bool { return manifests[i].StartedAt.After(manifests[j].StartedAt) })
 

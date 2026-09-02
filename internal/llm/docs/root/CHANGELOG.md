@@ -13,6 +13,37 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **Six functions that choose a backup discarded unreadable manifests
+  silently — and a guard so there is no seventh.** A manifest that fails
+  verification yields no timestamps and cannot be ranked, so a picker
+  that drops it either returns a *different* backup or reports that none
+  exists. Both were happening:
+
+  | function | what it did |
+  |---|---|
+  | `restore.ResolveLatest` | "latest" resolved to an older backup |
+  | `restore.ResolveBackupForTime` | PITR seeded from further back |
+  | `timetravel.pickBackupForTarget` | seed chosen, then "no backup that far back" |
+  | `verify`'s `pickLatestBackup` | verified an older backup as "latest" |
+  | `recovery drill`'s picker | drilled an older backup than the newest |
+  | `partial`'s two resolvers | "no backups for deployment" over a populated one |
+
+  The first three were fixed in earlier commits, one at a time, before
+  the shape was recognised. This closes the remaining three plus the two
+  `simple` guided flows, whose menus quietly omitted backups and whose
+  empty-state message read "no backups to restore" over a deployment
+  whose backups merely failed verification — the worst place for it,
+  since that flow's users are least placed to second-guess it.
+
+  The guard is deliberately narrow. Reporting and aggregation walks
+  (`cost`, `forecast`, `fleet search`, the compliance sections) may skip
+  an unreadable manifest without ceremony: they summarise a population
+  and one missing row is not a different answer. It fires only on
+  selector-shaped functions, where the skipped manifest is not a missing
+  row but possibly *the answer*. Widening it to every consumer flags 19
+  legitimate sites, which is how a guard earns an exemption list longer
+  than its findings and then gets deleted — pinned as a test case.
+
 - **`timetravel` chose its seed backup by silently discarding manifests
   it could not read, and then misdescribed why.**
   `pickBackupForTarget` is the third copy of "find the newest backup at

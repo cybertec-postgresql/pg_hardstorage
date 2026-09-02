@@ -55,15 +55,29 @@ func (f flowVerify) Run(ctx context.Context, env *Env) error {
 
 	// Build the manifest picker.
 	var manifests []*backup.Manifest
+	skipped := 0
 	for m, mErr := range store.List(ctx, dep.Name, verifier) {
 		if mErr != nil {
+			skipped++
 			continue
 		}
 		manifests = append(manifests, m)
 	}
 	if len(manifests) == 0 {
+		// A verify menu that says "no backups yet" over backups that
+		// fail verification hides the one finding it exists to surface.
+		if skipped > 0 {
+			env.Prompter.Printf("  %d backup(s) found, but none of their manifests could be "+
+				"verified or read — which is itself a verification failure.\n", skipped)
+			env.Prompter.Println("  Run `pg_hardstorage repo check`.")
+			return nil
+		}
 		env.Prompter.Println("  no backups to verify yet.")
 		return nil
+	}
+	if skipped > 0 {
+		env.Prompter.Printf("  note: %d backup(s) are omitted because their manifests could "+
+			"not be verified or read.\n", skipped)
 	}
 	sort.Slice(manifests, func(i, j int) bool { return manifests[i].StartedAt.After(manifests[j].StartedAt) })
 

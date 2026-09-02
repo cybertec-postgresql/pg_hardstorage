@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"sort"
 	"strings"
 	"time"
@@ -292,8 +293,16 @@ func runVerify(cmd *cobra.Command, deployment, backupID, repoURL string, sample 
 func pickLatestBackup(ctx context.Context, store *backup.ManifestStore, deployment string, verifier *backup.Verifier) (string, error) {
 	var latestID string
 	var latestStop time.Time
+	skipped := 0
 	for m, err := range store.List(ctx, deployment, verifier) {
 		if err != nil {
+			// Counted, not merely skipped. A manifest that fails
+			// verification yields no stopped_at and cannot be ranked,
+			// so dropping it silently can hand back an OLDER backup as
+			// "latest" — and if they all fail, "no usable backups"
+			// reads as "you have none" rather than "none of them
+			// verify".
+			skipped++
 			continue
 		}
 		if m.StoppedAt.After(latestStop) {
@@ -302,12 +311,24 @@ func pickLatestBackup(ctx context.Context, store *backup.ManifestStore, deployme
 		}
 	}
 	if latestID == "" {
+		if skipped > 0 {
+			return "", output.NewError("verify.manifests_unverifiable",
+				fmt.Sprintf("verify: %d manifest(s) for deployment %q exist but none could be verified or read, so no backup could be selected",
+					skipped, deployment)).
+				WithSuggestion(&output.Suggestion{
+					Human:   "these are not missing backups — they are backups whose manifests do not verify, which is potential tampering or storage corruption. Investigate before taking a new one.",
+					Command: "pg_hardstorage repo check --repo <url>",
+				})
+		}
 		return "", output.NewError("notfound.backup",
 			fmt.Sprintf("verify: no usable backups for deployment %q", deployment)).
 			WithSuggestion(&output.Suggestion{
 				Human:   "take one with `pg_hardstorage backup " + deployment + "`",
 				Command: "pg_hardstorage backup " + deployment,
 			})
+	}
+	if skipped > 0 {
+		emitVerifyLatestSkipWarning(ctx, deployment, latestID, skipped)
 	}
 	return latestID, nil
 }
@@ -617,4 +638,16 @@ func (b verifyBody) WriteText(w io.Writer) error {
 // inlined to avoid pulling in restore's option machinery.
 func decodeBase64(s string) ([]byte, error) {
 	return base64.StdEncoding.DecodeString(s)
+}
+
+// emitVerifyLatestSkipWarning reports, on stderr, that "latest" was
+// resolved from an incomplete set. `verify` has no dispatcher in this
+// helper's scope, and a silent selection is the thing being fixed, so
+// the note goes where an operator running the command will see it.
+func emitVerifyLatestSkipWarning(_ context.Context, deployment, chosen string, skipped int) {
+	fmt.Fprintf(os.Stderr,
+		"pg_hardstorage: warning: resolving the latest backup for %q skipped %d manifest(s) that "+
+			"could not be verified or read; %q is the newest of the ones that COULD be read, and a "+
+			"skipped manifest may have been newer.\n",
+		deployment, skipped, chosen)
 }

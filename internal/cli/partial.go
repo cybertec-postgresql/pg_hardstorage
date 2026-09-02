@@ -260,11 +260,20 @@ func latestBackupID(cmd *cobra.Command, ms *backup.ManifestStore, deployment str
 	// restore.ResolveLatest and the retention policy).
 	var latest string
 	var latestAt time.Time
+	skipped := 0
 	for m, err := range ms.ListAttestationless(cmd.Context(), deployment) {
 		if err != nil {
+			// Counted. This walk deliberately skips signature
+			// verification (`partial inspect` is a read-only preview),
+			// so an error here is a manifest that would not PARSE or
+			// could not be fetched — and dropping it silently either
+			// picks an older backup to preview or reports "no committed
+			// backups" over a deployment that has several.
+			skipped++
 			continue
 		}
 		if m == nil {
+			skipped++
 			continue
 		}
 		if latest == "" || m.StoppedAt.After(latestAt) ||
@@ -274,6 +283,11 @@ func latestBackupID(cmd *cobra.Command, ms *backup.ManifestStore, deployment str
 		}
 	}
 	if latest == "" {
+		if skipped > 0 {
+			return "", output.NewError("notfound.backup",
+				fmt.Sprintf("partial: %d manifest(s) for deployment %q exist but none could be read — these are not missing backups",
+					skipped, deployment))
+		}
 		return "", output.NewError("notfound.backup",
 			fmt.Sprintf("partial: no committed backups for deployment %q", deployment))
 	}
@@ -664,8 +678,10 @@ func partialRestoreIncomplete(res *partial.RestoreResult) error {
 func resolveLatestBackupID(ctx context.Context, store *backup.ManifestStore, deployment string, verifier *backup.Verifier) (string, error) {
 	var latestID string
 	var latestTS time.Time
+	skipped := 0
 	for m, err := range store.List(ctx, deployment, verifier) {
 		if err != nil {
+			skipped++
 			continue
 		}
 		if m.StoppedAt.After(latestTS) {
@@ -674,6 +690,12 @@ func resolveLatestBackupID(ctx context.Context, store *backup.ManifestStore, dep
 		}
 	}
 	if latestID == "" {
+		if skipped > 0 {
+			// "No backups" and "no backup I could read" send an
+			// operator in opposite directions.
+			return "", fmt.Errorf("%d manifest(s) for deployment %q exist but none could be verified or read",
+				skipped, deployment)
+		}
 		return "", fmt.Errorf("no backups for deployment %q", deployment)
 	}
 	return latestID, nil
