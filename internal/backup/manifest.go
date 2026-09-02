@@ -4,6 +4,7 @@
 package backup
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -368,6 +369,106 @@ func (m *Manifest) Sign(signer *Signer) error {
 	return nil
 }
 
+// ErrAmbiguousManifest reports a manifest whose JSON contains the same
+// object key twice (comparing case-insensitively, the way Go matches
+// keys to struct fields). Such a document has no single meaning: this
+// decoder takes the last occurrence, other JSON readers take the first,
+// and the two disagree about what the backup IS.
+var ErrAmbiguousManifest = errors.New("manifest: ambiguous document")
+
+// rejectDuplicateKeys fails a manifest whose JSON repeats any object
+// key.
+//
+// Why this is checked separately from the signature. Verification does
+// not compare the bytes on disk against the signed bytes — it cannot,
+// because the attestation lives inside the document. It parses the
+// file into a Manifest, zeroes the attestation and RE-SERIALISES, then
+// checks that reconstruction against the signature. Anything the
+// struct does not represent therefore never reaches the comparison.
+//
+// A repeated key is exactly such a thing. encoding/json keeps the LAST
+// occurrence, so a file reading
+//
+//	{"backup_id":"EVIL", ... ,"backup_id":"db1.full.20260428T1200Z"}
+//
+// parses to the genuine ID, re-serialises to the genuine bytes, and
+// verifies — while every first-wins reader of that same file, and any
+// human or tool looking at it, sees EVIL. `verify` would report the
+// backup as cryptographically sound with the on-disk document saying
+// two different things about which backup it is.
+//
+// Unknown fields are deliberately NOT rejected here: Schema has been
+// "pg_hardstorage.manifest.v1" since v1.0.0 and fields have been added
+// under it (PGBackupManifest, WALGaps are both documented as additive),
+// so tolerating them is what lets an older reader read a newer
+// manifest. A duplicate key has no such role — the schema has no map
+// fields, so every key is fixed and appearing twice is never legitimate.
+//
+// Keys are compared case-insensitively because Go's decoder matches
+// them that way: {"backup_id":"a","Backup_ID":"b"} binds b, so the
+// case-variant is the same attack wearing a hat.
+func rejectDuplicateKeys(raw []byte) error {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	if err := checkNoDupKeys(dec, "$"); err != nil {
+		return err
+	}
+	return nil
+}
+
+// checkNoDupKeys consumes exactly one JSON value from dec, recursing
+// through objects and arrays. path is used only to name the offender.
+func checkNoDupKeys(dec *json.Decoder, path string) error {
+	tok, err := dec.Token()
+	if err != nil {
+		// Malformed JSON is the caller's Unmarshal error to report, not
+		// ours; treat it as "nothing to say about duplicates".
+		return nil //nolint:nilerr // parse errors are reported by Unmarshal
+	}
+	delim, ok := tok.(json.Delim)
+	if !ok {
+		return nil // scalar
+	}
+	switch delim {
+	case '{':
+		seen := make(map[string]string) // folded key -> key as written
+		for dec.More() {
+			kt, err := dec.Token()
+			if err != nil {
+				return nil //nolint:nilerr // see above
+			}
+			key, ok := kt.(string)
+			if !ok {
+				return nil
+			}
+			folded := strings.ToLower(key)
+			if prev, dup := seen[folded]; dup {
+				where := path
+				if where == "" {
+					where = "$"
+				}
+				return fmt.Errorf("%w: object %s repeats key %q (also present as %q); "+
+					"this decoder binds the last occurrence and other JSON readers bind the "+
+					"first, so the file does not have one meaning and must not be trusted "+
+					"or re-signed", ErrAmbiguousManifest, where, key, prev)
+			}
+			seen[folded] = key
+			if err := checkNoDupKeys(dec, path+"."+key); err != nil {
+				return err
+			}
+		}
+		_, _ = dec.Token() // closing '}'
+	case '[':
+		for i := 0; dec.More(); i++ {
+			if err := checkNoDupKeys(dec, fmt.Sprintf("%s[%d]", path, i)); err != nil {
+				return err
+			}
+		}
+		_, _ = dec.Token() // closing ']'
+	}
+	return nil
+}
+
 // ParseAttestationless parses on-disk bytes WITHOUT signature
 // verification. Used by `repair attestation` and `repair manifest`
 // — paths whose entire purpose is to deal with a body whose
@@ -376,6 +477,9 @@ func (m *Manifest) Sign(signer *Signer) error {
 // ParseAndVerify; this is the explicit "I know I'm bypassing the
 // signature check" surface.
 func ParseAttestationless(raw []byte) (*Manifest, error) {
+	if err := rejectDuplicateKeys(raw); err != nil {
+		return nil, err
+	}
 	var m Manifest
 	if err := json.Unmarshal(raw, &m); err != nil {
 		return nil, fmt.Errorf("manifest: parse: %w", err)
@@ -395,6 +499,9 @@ func ParseAttestationless(raw []byte) (*Manifest, error) {
 // the case where a manifest is signed by a key the caller hasn't
 // pre-trusted — a genuine signature, but not by the right party.
 func ParseAndVerify(raw []byte, verifier *Verifier) (*Manifest, error) {
+	if err := rejectDuplicateKeys(raw); err != nil {
+		return nil, err
+	}
 	var m Manifest
 	if err := json.Unmarshal(raw, &m); err != nil {
 		return nil, fmt.Errorf("manifest: parse: %w", err)
