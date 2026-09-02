@@ -417,10 +417,17 @@ func (b *PGBackend) AppendProgress(ctx context.Context, id string, ev ProgressEv
                -- to say earlier ones had been shed.
                progress_dropped = progress_dropped
                    + GREATEST(jsonb_array_length(progress || $1::jsonb) - $4, 0),
+               -- $2 is the RECEIVE time, not ev.At: updated_at is the
+               -- control plane's liveness field and SweepAbandoned keys
+               -- abandonment on it. ev.At comes off the agent's JSON body,
+               -- stamped by a clock on another host; writing it here let an
+               -- agent whose clock ran slow post progress and be reclaimed
+               -- for "not reporting" by the very statement that recorded
+               -- the report. ev.At survives verbatim inside $1.
                updated_at = $2
          WHERE id = $3
            AND state = 'running'
-    `, "["+string(body)+"]", ev.At, id, maxProgressEvents)
+    `, "["+string(body)+"]", time.Now().UTC(), id, maxProgressEvents)
 	if err != nil {
 		return fmt.Errorf("pgbackend: append progress: %w", err)
 	}

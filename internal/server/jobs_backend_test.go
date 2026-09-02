@@ -414,6 +414,69 @@ func runBackendContract(t *testing.T, factory func(t *testing.T) server.JobBacke
 	// and each was tested on its own terms so nothing compared them. A
 	// backend that trims silently is a backend that loses the record of
 	// what an agent did to a cluster.
+	// A progress report must never make the reporter look ABSENT.
+	//
+	// ProgressEvent.At arrives in the agent's JSON body (routes.go
+	// decodes it straight off the wire), so it is stamped by a clock on
+	// the database host, not by the control plane. Job.UpdatedAt is what
+	// SweepAbandoned keys abandonment on. While AppendProgress wrote
+	// UpdatedAt = ev.At, an agent whose clock ran slower than the control
+	// plane's by more than the claim deadline was reclaimed BY THE
+	// STATEMENT THAT RECORDED ITS PROGRESS, and failed with "abandoned:
+	// agent stopped reporting" -- a message contradicted by the very row
+	// it was written into. A second agent then claims the same job
+	// (duplicate concurrent backup) and the original's Complete returns
+	// ErrClaimLost, discarding the finished work.
+	//
+	// Clock skew between a database host and a control plane is ordinary,
+	// needs no misbehaviour to arise, and is invisible in tests that pass
+	// a fresh At. Hence the contract: liveness belongs to the receive
+	// clock on every backend.
+	t.Run("StaleEventTimestampDoesNotFakeAbandonment", func(t *testing.T) {
+		b := factory(t)
+		ctx := context.Background()
+
+		j, err := b.Enqueue(ctx, server.EnqueueOptions{Kind: server.JobBackup, Deployment: "db1"})
+		if err != nil {
+			t.Fatalf("enqueue: %v", err)
+		}
+		if _, err := b.Claim(ctx, server.ClaimOptions{AgentID: "a1", Deployments: []string{"db1"}}); err != nil {
+			t.Fatalf("claim: %v", err)
+		}
+		// The agent is alive and reporting; its clock is 2h slow.
+		if err := b.AppendProgress(ctx, j.ID, server.ProgressEvent{
+			At: time.Now().UTC().Add(-2 * time.Hour), Op: "backup.chunk",
+		}); err != nil {
+			t.Fatalf("append progress: %v", err)
+		}
+
+		reaped, err := b.SweepAbandoned(ctx, time.Hour)
+		if err != nil {
+			t.Fatalf("sweep: %v", err)
+		}
+		if reaped != 0 {
+			t.Errorf("sweep reaped %d job(s); the agent had just reported progress and "+
+				"only its clock was behind. A backend that lets a remote timestamp write "+
+				"the liveness field reclaims healthy jobs under ordinary clock skew.", reaped)
+		}
+		got, err := b.Get(ctx, j.ID)
+		if err != nil {
+			t.Fatalf("get: %v", err)
+		}
+		if got.State != server.JobRunning {
+			t.Errorf("state = %s, want running (failure=%q)", got.State, got.Failure)
+		}
+		// The event keeps its own timestamp -- only liveness is reclaimed
+		// by the control plane.
+		if len(got.Progress) != 1 {
+			t.Fatalf("progress = %d events, want 1", len(got.Progress))
+		}
+		if age := time.Since(got.Progress[0].At); age < 90*time.Minute {
+			t.Errorf("stored event At was rewritten (age %s, want ~2h); the agent's "+
+				"observation timestamp is real data and must survive", age)
+		}
+	})
+
 	t.Run("ProgressCap_CountsWhatItDropped", func(t *testing.T) {
 		b := factory(t)
 		ctx := context.Background()

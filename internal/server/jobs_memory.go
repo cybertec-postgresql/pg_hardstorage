@@ -181,7 +181,15 @@ func (b *MemoryBackend) AppendProgress(_ context.Context, id string, ev Progress
 		j.Progress = kept
 		j.ProgressDropped += int64(over)
 	}
-	j.UpdatedAt = ev.At
+	// UpdatedAt is the control plane's LIVENESS field, not the event's
+	// timestamp, so it takes the receive clock — never ev.At, which
+	// arrives in the agent's JSON body and is therefore stamped by the
+	// agent's clock on a different machine. SweepAbandoned keys
+	// abandonment on UpdatedAt; letting a remote clock write it means an
+	// agent running a few minutes slow reports progress and is reclaimed
+	// for "not reporting" in the same breath. ev.At is still kept
+	// verbatim inside the appended event, where it belongs.
+	j.UpdatedAt = time.Now().UTC()
 	return nil
 }
 
