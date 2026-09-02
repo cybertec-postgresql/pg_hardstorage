@@ -469,8 +469,15 @@ func runApprovalList(cmd *cobra.Command, repoURL, opF, statusF, tenantF string) 
 			fmt.Sprintf("approval list: %v", err)).Wrap(err)
 	}
 	body := approvalListBody{}
+	// One clock for the whole listing, and one fetch per request.
+	// store.StatusOf(ctx, r.ID) re-fetched every request that List had
+	// just fetched -- 2N round trips -- and recomputed the status
+	// against a fresh time.Now(), so a row could display a status
+	// contradicting the --status filter it had matched moments before.
+	// approval.StatusOf classifies the request already in hand.
+	now := time.Now().UTC()
 	for _, r := range requests {
-		st, _ := store.StatusOf(cmd.Context(), r.ID)
+		st := approval.StatusOf(r, now)
 		count, _ := approval.VerifyApprovals(r)
 		body.Requests = append(body.Requests, approvalListEntry{
 			ID:            r.ID,

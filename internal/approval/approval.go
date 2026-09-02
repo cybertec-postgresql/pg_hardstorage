@@ -383,7 +383,28 @@ func (s *Store) List(ctx context.Context, f ListFilters) ([]*Request, error) {
 		id := strings.TrimSuffix(strings.TrimPrefix(k, "approvals/"), ".json")
 		r, err := s.Get(ctx, id)
 		if err != nil {
-			continue
+			// A request deleted between the listing and the fetch is
+			// benign: the key was real when we listed it and is gone
+			// now, so there is nothing to report. Anything else -- a
+			// body that will not decode, an auth failure, a storage
+			// error -- means we cannot say what this request's status
+			// is, and dropping it here silently reports FEWER pending
+			// approvals than exist. `status` renders that count as a
+			// flat "Pending approvals: 0", which is a claim that
+			// nothing awaits sign-off.
+			//
+			// Get itself already draws exactly this line one level
+			// down, for approver votes ("A deleted approver key
+			// mid-list is benign; surface only genuine failures");
+			// this walk simply never applied it.
+			//
+			// Partial results are returned alongside the error so a
+			// caller that wants best-effort output can still use what
+			// was readable, the same posture SweepExpired takes.
+			if errors.Is(err, ErrNotFound) {
+				continue
+			}
+			return out, fmt.Errorf("approval: list: request %s: %w", id, err)
 		}
 		if f.Op != "" && r.Op != f.Op {
 			continue

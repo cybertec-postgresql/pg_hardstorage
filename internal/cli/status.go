@@ -92,7 +92,9 @@ func runStatus(cmd *cobra.Command, deployment, repoURL string) error {
 	// than aborting the whole command. Same posture as doctor's
 	// per-repo checks.
 	body.AuditAnchor = computeAnchorStatus(cmd.Context(), sp, repoMeta)
-	body.PendingApprovals = countPendingApprovals(cmd.Context(), sp)
+	var approvalsKnown bool
+	body.PendingApprovals, approvalsKnown = countPendingApprovals(cmd.Context(), sp)
+	body.PendingApprovalsUnknown = !approvalsKnown
 
 	return d.Result(output.NewResult(cmd.CommandPath()).WithBody(body))
 }
@@ -185,17 +187,23 @@ func computeAnchorStatus(ctx context.Context, sp storage.StoragePlugin, repoMeta
 	return a
 }
 
-// countPendingApprovals walks the approvals/ prefix and counts
-// requests in StatusPending. Approved / expired / revoked requests
-// don't count — operators want "what still needs sign-off?" Errors
-// during the walk return 0 + best-effort.
-func countPendingApprovals(ctx context.Context, sp storage.StoragePlugin) int {
+// countPendingApprovals walks the approvals/ prefix and counts the
+// requests still awaiting sign-off. The second return reports whether
+// the count is TRUSTWORTHY.
+//
+// It used to collapse any walk failure into 0, and WriteText renders a
+// bare "Pending approvals: 0" -- so a repository whose approval
+// listing could not be read told the operator, on the primary
+// at-a-glance screen, that nothing awaited sign-off. "I could not
+// look" and "there is nothing there" are not the same answer, and only
+// one of them is safe to act on.
+func countPendingApprovals(ctx context.Context, sp storage.StoragePlugin) (int, bool) {
 	store := approval.NewStore(sp)
 	pending, err := store.List(ctx, approval.ListFilters{Status: approval.StatusPending})
 	if err != nil {
-		return 0
+		return len(pending), false
 	}
-	return len(pending)
+	return len(pending), true
 }
 
 // summarizeDeployment scans every committed backup for one deployment
@@ -300,6 +308,12 @@ type statusBody struct {
 	Deployments      []deploymentStatus `json:"deployments"`
 	AuditAnchor      anchorStatus       `json:"audit_anchor"`
 	PendingApprovals int                `json:"pending_approvals"`
+
+	// PendingApprovalsUnknown marks PendingApprovals as a floor rather
+	// than a count: the approval listing failed partway, so there may
+	// be outstanding requests this run could not see. Additive and
+	// omitempty, so a healthy run's JSON is byte-identical to before.
+	PendingApprovalsUnknown bool `json:"pending_approvals_unknown,omitempty"`
 }
 
 // WriteText renders a per-deployment table plus the repo-level
@@ -365,10 +379,17 @@ func (b statusBody) WriteText(w io.Writer) error {
 	// Repo-level footer. Compact one-liners so a glance answers
 	// the "is anything pending sign-off / out of date?" question.
 	fmt.Fprintf(bw, "\n  Audit anchor: %s\n", b.AuditAnchor.summary())
-	if b.PendingApprovals > 0 {
+	switch {
+	case b.PendingApprovalsUnknown:
+		// Never print a bare 0 for a walk that failed: that is the one
+		// reading an operator must not take away from a listing we
+		// could not complete.
+		fmt.Fprintf(bw, "  Pending approvals: at least %d — THE LISTING COULD NOT BE READ IN FULL "+
+			"(run `pg_hardstorage approval list --status pending`)\n", b.PendingApprovals)
+	case b.PendingApprovals > 0:
 		fmt.Fprintf(bw, "  Pending approvals: %d (run `pg_hardstorage approval list --status pending`)\n",
 			b.PendingApprovals)
-	} else {
+	default:
 		fmt.Fprintln(bw, "  Pending approvals: 0")
 	}
 	_, err := io.WriteString(w, bw.String())
