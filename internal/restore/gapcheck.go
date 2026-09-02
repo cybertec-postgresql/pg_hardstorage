@@ -208,7 +208,27 @@ func preflightWALGap(ctx context.Context, sp storage.StoragePlugin, deployment, 
 		// gate's first boot-proof caught (a pre-stream window from
 		// `init --quick` before the streamer ever started).
 		if stop, perr := pglogrepl.ParseLSN(backupStopLSN); perr == nil && stop > 0 {
-			liveGaps, _ := gapstate.New(sp).List(ctx, deployment)
+			// A List failure degrades this refusal to manifest-only.
+			// Proceeding is the right call — a transient backend error
+			// must not block a legitimate restore — but it must not be
+			// SILENT: this is the path the file's own header calls the
+			// one that suffers most from a hole ("a standby ... replays
+			// up to the missing segment and then waits"), and its
+			// refusal is what "turns the silent-truncation failure into
+			// a typed error". Degrading it without a word puts the
+			// operator back in the failure mode the gate exists to
+			// prevent, believing the gate ran.
+			//
+			// Same posture and same event as the LSN-target path below.
+			liveGaps, lerr := gapstate.New(sp).List(ctx, deployment)
+			if lerr != nil && emit != nil {
+				emit(output.NewEvent(output.SeverityWarning, "restore", "gap_state_unreadable").
+					WithSubject(output.Subject{Deployment: deployment}).
+					WithBody(map[string]any{
+						"error": lerr.Error(),
+						"hint":  "the unbounded-recovery gap pre-flight ran against manifest-embedded gaps only; a live gap record could not be read, so a hole recorded there would not have refused this restore",
+					}))
+			}
 			for _, g := range manifestGaps {
 				if err := refuseUnboundedOverGap(deployment, stop, g.GapStartLSN, g.GapEndLSN, "manifest"); err != nil {
 					return err
@@ -238,7 +258,7 @@ func preflightWALGap(ctx context.Context, sp storage.StoragePlugin, deployment, 
 		// PG's own end-of-WAL semantics handle the gap-tail
 		// scenario correctly even when the agent missed bytes.
 		if recovery.IsTargetSet() {
-			if err := preflightTimeTargetGap(ctx, sp, deployment, backupStopLSN, recovery, manifestGaps); err != nil {
+			if err := preflightTimeTargetGap(ctx, sp, deployment, backupStopLSN, recovery, manifestGaps, emit); err != nil {
 				return err
 			}
 			if emit != nil {
@@ -366,8 +386,20 @@ func checkOneGap(target pglogrepl.LSN, startStr, endStr string, bytes uint64, de
 // effort live-gapstate read: a List failure falls back to
 // manifest-only gaps so a transient backend issue doesn't block
 // a legitimate restore.
-func preflightTimeTargetGap(ctx context.Context, sp storage.StoragePlugin, deployment, backupStopLSN string, recovery *Recovery, manifestGaps []backup.WALGap) error {
-	liveGaps, _ := gapstate.New(sp).List(ctx, deployment) // best-effort
+func preflightTimeTargetGap(ctx context.Context, sp storage.StoragePlugin, deployment, backupStopLSN string, recovery *Recovery, manifestGaps []backup.WALGap, emit func(*output.Event)) error {
+	// Best-effort, but not silent: falling back to manifest-only gaps
+	// is the right call for a transient backend error, and the operator
+	// still has to learn that the refusal decision was made on a
+	// partial picture. Matches the LSN-target path.
+	liveGaps, lerr := gapstate.New(sp).List(ctx, deployment)
+	if lerr != nil && emit != nil {
+		emit(output.NewEvent(output.SeverityWarning, "restore", "gap_state_unreadable").
+			WithSubject(output.Subject{Deployment: deployment}).
+			WithBody(map[string]any{
+				"error": lerr.Error(),
+				"hint":  "the time-target gap pre-flight ran against manifest-embedded gaps only; a live gap record could not be read, so a hole recorded there would not have refused this restore",
+			}))
+	}
 
 	// Count only gaps the SEED'S REPLAY CAN REACH. The seed for a
 	// time/name target was already resolved (stop_time <= target)
@@ -434,9 +466,11 @@ func preflightTimeTargetGap(ctx context.Context, sp storage.StoragePlugin, deplo
 // check) or inspect via `wal gaps <deployment>` to confirm
 // the target is outside known gap windows.
 //
-// Best-effort: a gapstate.List failure here is silent (the
-// operator's gap-check is advisory; doctor would have already
-// surfaced a persistent corruption).
+// Best-effort, and deliberately silent on a gapstate.List failure:
+// this advisory runs immediately after preflightTimeTargetGap, which
+// now emits gap_state_unreadable for the same failure. Emitting again
+// would be a warning about a warning. The REFUSING paths are the ones
+// that must report degradation; this one is already covered.
 func emitTimeTargetGapWarning(ctx context.Context, sp storage.StoragePlugin, deployment, backupStopLSN string, recovery *Recovery, manifestGaps []backup.WALGap, emit func(*output.Event)) {
 	liveGaps, _ := gapstate.New(sp).List(ctx, deployment) // best-effort
 	// Same seed-reachability bound as preflightTimeTargetGap: warning

@@ -13,6 +13,31 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **The PITR gap gate degraded silently when it could not read the live
+  gap state.** `preflightWALGap` has three consumers of `gapstate`: the
+  LSN-target path, the time/name-target refusal, and an advisory
+  warning. All three fall back to manifest-embedded gaps when
+  `gapstate.List` fails — which is the right call, since a transient
+  backend error must not block a legitimate restore. Two of the three
+  did it with a bare `_`.
+
+  The unbounded path was the worst instance: no comment at all, and it
+  is the one this file's own header singles out —
+
+  > a STANDBY has no target by construction … and a standby is the
+  > consumer that suffers most from a hole: it replays up to the
+  > missing segment and then waits.
+
+  Its refusal is what "turns the silent-truncation failure into a typed
+  error". Degrading it without a word puts the operator back in exactly
+  the failure the gate exists to prevent, while believing the gate ran.
+
+  Both refusing paths now emit `gap_state_unreadable` — the same event
+  and posture the LSN-target path already had — and still proceed. The
+  purely advisory path stays silent on purpose: it runs immediately
+  after the time-target refusal, which now reports the same failure, and
+  a warning about a warning is noise.
+
 - **A repository that had silently lost backups reported healthy.**
   Every commit writes the primary manifest and then a redundancy copy at
   `manifests/_replicas/<id>.manifest.json`, for the reason the store's
