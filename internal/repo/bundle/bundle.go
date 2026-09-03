@@ -101,8 +101,16 @@ type ExportOptions struct {
 	BackupID string
 
 	// IncludeWAL pulls every WAL segment listed in each manifest's
-	// WALRequired field, plus every timeline-history file under
-	// `wal/<deployment>/timelines/`.
+	// WALRequired field.
+	//
+	// NOTE: nothing populates Manifest.WALRequired today — the backup
+	// runner sets it to nil — so on a repository written by this build
+	// there is nothing for this option to pull, and Build REFUSES rather
+	// than emit a bundle whose base backups have no WAL to replay. The
+	// timeline-history files this comment used to promise ("plus every
+	// timeline-history file under wal/<deployment>/timelines/") were
+	// never copied either, and BundleManifest.Timelines is never
+	// populated by anything.
 	IncludeWAL bool
 
 	// SourceRepoURL is recorded in the bundle's manifest so
@@ -235,6 +243,37 @@ func Export(ctx context.Context, sp storage.StoragePlugin, w io.Writer, opts Exp
 				})
 			}
 		}
+	}
+
+	// --include-wal must not silently produce a bundle with no WAL.
+	//
+	// The loop above draws its segment list from each manifest's
+	// WALRequired, and nothing populates that field: the backup runner
+	// sets `WALRequired: nil` with the note "empty in v0.1: WAL
+	// streaming lands in Slice 8". WAL streaming has since landed; the
+	// field did not follow. So the loop body never ran, and
+	// bundleManifest.Timelines — declared as "one timeline-history file
+	// the bundle carries" — is never populated by anything either.
+	//
+	// The result was an air-gap export that reported success, carried
+	// the base backups, and contained not one WAL segment. A base backup
+	// cannot reach a consistent state without the WAL between its start
+	// and stop LSN, so every such bundle was unrestorable — discovered
+	// at restore time, from the air-gapped copy, which is the worst
+	// possible moment to find out.
+	//
+	// Refusing is the fail-closed reading of an unmet completeness
+	// claim. If a repository's manifests DO carry wal_required (written
+	// by a build that populates it), the loop collects them and this
+	// never fires.
+	if opts.IncludeWAL && len(bundleManifest.WAL) == 0 {
+		return nil, fmt.Errorf("bundle: --include-wal was requested but no manifest in this " +
+			"selection declares any required WAL (the manifest field wal_required is not " +
+			"populated at backup time), so the bundle would carry base backups with none of " +
+			"the WAL needed to bring them to a consistent state. Refusing to write an " +
+			"unrestorable bundle: export without --include-wal if the base backups alone are " +
+			"what you want, or copy the repository with `repo replicate` to a local " +
+			"destination and archive that instead")
 	}
 
 	// Step 5 — bundle.json at the tar root.  Sort embedded slices

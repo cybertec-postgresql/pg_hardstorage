@@ -137,7 +137,11 @@ func newRepoBundleExportCmd() *cobra.Command {
 	c.Flags().StringVar(&backupID, "backup-id", "", "single backup to export (default: every live backup for the deployment)")
 	c.Flags().StringVar(&outPath, "out", "", "output path for the .tar bundle (required)")
 	_ = c.MarkFlagRequired("out")
-	c.Flags().BoolVar(&includeWAL, "include-wal", false, "also include WAL segments listed in each manifest's wal_required")
+	c.Flags().BoolVar(&includeWAL, "include-wal", false,
+		"also include the WAL segments each manifest lists in wal_required. "+
+			"NOTE: nothing populates wal_required at backup time yet, so on a repository "+
+			"written by this build the export refuses rather than produce base backups "+
+			"with no WAL to replay")
 	return c
 }
 
