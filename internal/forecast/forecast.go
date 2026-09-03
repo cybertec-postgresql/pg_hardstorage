@@ -159,8 +159,16 @@ type DeploymentForecast struct {
 
 	// DedupRatio is the average ratio across observed manifests
 	// where it's computable (1.0 means no dedup; > 1.0 means N
-	// logical bytes for 1 physical byte). Empty (0) when no
-	// manifests in window have decompressed dedup info.
+	// logical bytes for 1 physical byte).
+	//
+	// NOT COMPUTED. Nothing assigns this field, so it is always 0 and,
+	// being omitempty, never appears in the forecast output at all. The
+	// note that used to sit here — "Empty (0) when no manifests in
+	// window have decompressed dedup info" — made the permanent absence
+	// read as a legitimate data condition, which is the harm: a
+	// consumer of this schema waits for a value that cannot arrive.
+	// pg_hardstorage_backup_dedup_ratio (obs/metrics) is the working
+	// dedup signal today.
 	DedupRatio float64 `json:"dedup_ratio,omitempty"`
 
 	// Note carries a human-readable caveat (e.g. "fewer than
