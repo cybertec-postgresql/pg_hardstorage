@@ -98,3 +98,67 @@ func TestHandleJobsList_BackendFailureIsNotAnEmptyQueue(t *testing.T) {
 		t.Errorf("response carries no structured code a client can branch on:\n%s", rec.Body.String())
 	}
 }
+
+// The /metrics half, which is the one that would have gone unnoticed
+// longest: an alert cannot fire on a series that reads "healthy and
+// idle" while the backend is unreachable.
+//
+// I found this gap by simulation — reverting the metrics half alone
+// left every test above passing, because they only cover the HTTP
+// endpoint. The scrape path is the consumer I argued was the more
+// dangerous of the two, so it needs its own assertion.
+func TestMetricsScrape_UnreadableBackendIsNotAnIdleQueue(t *testing.T) {
+	s, err := server.NewWithJobs(server.Config{
+		Listen:           "127.0.0.1:0",
+		HeartbeatTimeout: 30 * time.Second,
+	}, server.NewJobRegistryWithBackend(errListBackend{server.NewMemoryBackend()}))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("/metrics status = %d", rec.Code)
+	}
+	body := rec.Body.String()
+
+	if !strings.Contains(body, "pg_hardstorage_jobs_census_failed 1") {
+		t.Errorf("scrape does not report that the job census failed.\n\n"+
+			"Without this series the exposition below is indistinguishable from a "+
+			"healthy idle control plane, and every alert written against "+
+			"pg_hardstorage_jobs stays quiet exactly when the queue cannot be read.\n\n"+
+			"jobs-related output was:\n%s", grepLines(body, "pg_hardstorage_jobs"))
+	}
+}
+
+// A healthy backend must report the census as good, or the signal is
+// useless.
+func TestMetricsScrape_HealthyBackendReportsCensusOK(t *testing.T) {
+	s, err := server.NewWithJobs(server.Config{
+		Listen:           "127.0.0.1:0",
+		HeartbeatTimeout: 30 * time.Second,
+	}, server.NewJobRegistry())
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	body := rec.Body.String()
+	if !strings.Contains(body, "pg_hardstorage_jobs_census_failed 0") {
+		t.Errorf("a healthy control plane does not report census_failed 0:\n%s",
+			grepLines(body, "pg_hardstorage_jobs"))
+	}
+}
+
+func grepLines(body, substr string) string {
+	var keep []string
+	for _, l := range strings.Split(body, "\n") {
+		if strings.Contains(l, substr) {
+			keep = append(keep, l)
+		}
+	}
+	return strings.Join(keep, "\n")
+}
