@@ -288,11 +288,19 @@ func preflightWALGap(ctx context.Context, sp storage.StoragePlugin, deployment, 
 	// Either source refusing is enough. We don't try to dedupe;
 	// the same gap recorded in both produces ONE refusal, not
 	// two, because the loop short-circuits on the first match.
+	// Records whose LSN fields will not parse. Collected rather than
+	// dropped: see checkOneGap.
+	var malformed []string
 	for _, g := range manifestGaps {
-		if err := checkOneGap(target, g.GapStartLSN, g.GapEndLSN, g.GapBytes,
+		bad, err := checkOneGap(target, g.GapStartLSN, g.GapEndLSN, g.GapBytes,
 			g.DetectedAt.UTC().Format("2006-01-02T15:04:05Z"),
-			g.SlotName, g.Timeline, deployment, "manifest"); err != nil {
+			g.SlotName, g.Timeline, deployment, "manifest")
+		if err != nil {
 			return err
+		}
+		if bad {
+			malformed = append(malformed, fmt.Sprintf("manifest slot=%q start=%q end=%q",
+				g.SlotName, g.GapStartLSN, g.GapEndLSN))
 		}
 	}
 
@@ -331,38 +339,79 @@ func preflightWALGap(ctx context.Context, sp storage.StoragePlugin, deployment, 
 	}
 
 	for _, g := range gaps {
-		if err := checkOneGap(target, g.GapStartLSN, g.GapEndLSN, g.GapBytes,
+		bad, err := checkOneGap(target, g.GapStartLSN, g.GapEndLSN, g.GapBytes,
 			g.DetectedAt.UTC().Format("2006-01-02T15:04:05Z"),
-			g.SlotName, g.Timeline, deployment, "live"); err != nil {
+			g.SlotName, g.Timeline, deployment, "live")
+		if err != nil {
 			return err
 		}
+		if bad {
+			malformed = append(malformed, fmt.Sprintf("live slot=%q start=%q end=%q",
+				g.SlotName, g.GapStartLSN, g.GapEndLSN))
+		}
+	}
+
+	// A record that parsed as JSON but carries unusable LSNs told this
+	// pre-flight nothing, and it must not pass for "no gap here". Same
+	// posture as the unreadable and List-error paths above -- warn, do
+	// not block -- but no longer silent.
+	if len(malformed) > 0 && emit != nil {
+		emit(output.NewEvent(output.SeverityWarning, "restore", "gap_record_malformed").
+			WithSubject(output.Subject{Deployment: deployment}).
+			WithBody(map[string]any{
+				"malformed_records": len(malformed),
+				"records":           malformed,
+				"error": fmt.Sprintf("%d WAL-gap record(s) for %s have gap_start_lsn/gap_end_lsn "+
+					"that will not parse and were excluded from this pre-flight",
+					len(malformed), deployment),
+				"hint": "a gap record with unusable LSNs is indistinguishable from one covering " +
+					"this target; inspect with `pg_hardstorage wal gaps " + deployment +
+					"` before trusting this result. A malformed record on the MANIFEST source is " +
+					"signed, so it indicates a defect at backup time rather than tampering.",
+			}))
 	}
 	return nil
 }
 
 // checkOneGap is the per-record refusal logic, shared between
-// the manifest-embedded gaps and live gapstate gaps. Returns
-// nil when the target falls outside the gap (allow) or the
-// record is malformed (silent skip); returns a structured
-// error when the target falls in [start, end) (refuse).
+// the manifest-embedded gaps and live gapstate gaps.
+//
+// Returns (false, nil) when the target falls outside the gap (allow),
+// (false, err) when it falls in [start, end) (refuse), and (true, nil)
+// when the record's LSN fields will not parse.
+//
+// That last case used to be a silent `return nil // malformed; skip`,
+// and it was the fail-open direction on the one guard that stops a
+// silently truncated recovery. The unreadable-record warning above does
+// NOT cover it: gapstate.Record stores gap_start_lsn / gap_end_lsn as
+// plain strings and validates neither on write nor on read, so a record
+// that is perfectly good JSON with a garbage LSN counts as READABLE,
+// produces no warning, and is then dropped here without a trace. The
+// pre-flight sees "no gap" and lets the restore through.
+//
+// The consequence is spelled out in the comment on the unreadable path:
+// PG cannot tell a hole from the end of the archive, so it ends
+// recovery at the hole, promotes, and reports success arbitrarily far
+// behind. A malformed gap record is exactly as uninformative as an
+// unparseable one, and gets the same treatment -- warn, do not block.
 //
 // `source` is "manifest" or "live"; it's surfaced in the
 // error message so the operator knows which record fired the
 // refusal (e.g., a stale manifest-embedded gap can be
 // distinguished from a fresh live one).
-func checkOneGap(target pglogrepl.LSN, startStr, endStr string, bytes uint64, detectedAt, slotName string, tli uint32, deployment, source string) error {
+func checkOneGap(target pglogrepl.LSN, startStr, endStr string, bytes uint64, detectedAt, slotName string, tli uint32, deployment, source string) (bool, error) {
 	start, sErr := pglogrepl.ParseLSN(startStr)
 	if sErr != nil {
-		return nil // malformed; skip
+		return true, nil
 	}
 	end, eErr := pglogrepl.ParseLSN(endStr)
 	if eErr != nil {
-		return nil
+		return true, nil
 	}
 	if target < start || target >= end {
-		return nil
+		return false, nil
 	}
-	return output.NewError("restore.target_in_wal_gap",
+	return false, output.NewError("restore.target_in_wal_gap",
 		fmt.Sprintf("restore: target_lsn %s falls within a known WAL gap (%s..%s, %d bytes, detected %s on slot %q TLI %d, source=%s) — PITR within this range is impossible from this repo",
 			target.String(), startStr, endStr, bytes, detectedAt, slotName, tli, source)).
 		WithSuggestion(&output.Suggestion{
