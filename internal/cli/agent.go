@@ -904,8 +904,14 @@ func startPatroniFollowers(ctx context.Context, d *output.Dispatcher, deps map[s
 				}))
 			continue
 		}
-		client, err := patroni.NewClient(dep.Patroni.URL,
-			patroniClientOpts(dep.Patroni)...)
+		pOpts, pErr := patroniClientOpts(dep.Patroni)
+		if pErr != nil {
+			_ = d.Event(ctx, output.NewEvent(output.SeverityError, "agent", "patroni.auth_config_failed").
+				WithSubject(output.Subject{Deployment: name}).
+				WithBody(map[string]any{"error": pErr.Error()}))
+			continue
+		}
+		client, err := patroni.NewClient(dep.Patroni.URL, pOpts...)
 		if err != nil {
 			_ = d.Event(ctx, output.NewEvent(output.SeverityError, "agent", "patroni.client_init_failed").
 				WithSubject(output.Subject{Deployment: name}).
@@ -1121,12 +1127,52 @@ func startPatroniFollowers(ctx context.Context, d *output.Dispatcher, deps map[s
 // patroni.NewClient from a deployment's PatroniConfig. Today
 // only basic-auth lands; future fields (TLS pinning, custom
 // HTTP client) drop in here.
-func patroniClientOpts(cfg config.PatroniConfig) []patroni.ClientOption {
-	var opts []patroni.ClientOption
-	if cfg.User != "" || cfg.Password != "" {
-		opts = append(opts, patroni.WithAuth(cfg.User, cfg.Password))
+func patroniClientOpts(cfg config.PatroniConfig) ([]patroni.ClientOption, error) {
+	pw, err := resolvePatroniPassword(cfg)
+	if err != nil {
+		return nil, err
 	}
-	return opts
+	var opts []patroni.ClientOption
+	if cfg.User != "" || pw != "" {
+		opts = append(opts, patroni.WithAuth(cfg.User, pw))
+	}
+	return opts, nil
+}
+
+// resolvePatroniPassword returns the Patroni REST basic-auth password,
+// preferring patroni.password_file over the inline patroni.password.
+//
+// The file was previously accepted and ignored. PatroniConfig has
+// declared PasswordFile since the field landed, config merge carries it
+// (mergePatroni), and `deployment list` names it as one of the "auth
+// secrets (password, password_file)" it deliberately does not render --
+// so every signal an operator has says it is supported. Nothing read it.
+// An operator who kept the password out of the config file, which is the
+// reason the field exists, got cfg.Password == "" and therefore
+// WithAuth(user, "") -- Patroni answers 401 on exactly the mutating
+// endpoints (switchover, restart) the coordinator needs, and the config
+// looks correct.
+//
+// Precedence and semantics mirror resolveLLMAPIKey, the same pattern
+// implemented correctly for llm.api_key_file: the file wins over the
+// inline value, is read at use time so a rotation needs no restart, and
+// is TrimSpace'd so an editor's trailing newline does not become part of
+// the secret.
+//
+// An unreadable password_file is a hard error rather than a fall-back to
+// the inline value or to no auth. The operator asked for authentication
+// and named where the secret lives; quietly proceeding unauthenticated
+// is how a coordinator ends up failing every switchover with a 401 that
+// points nowhere.
+func resolvePatroniPassword(cfg config.PatroniConfig) (string, error) {
+	if cfg.PasswordFile != "" {
+		body, err := os.ReadFile(cfg.PasswordFile)
+		if err != nil {
+			return "", fmt.Errorf("patroni: read password_file %q: %w", cfg.PasswordFile, err)
+		}
+		return strings.TrimSpace(string(body)), nil
+	}
+	return cfg.Password, nil
 }
 
 // parseSlotRole maps a YAML role string to the Coordinator's

@@ -77,7 +77,11 @@ func gameDayPatroniDriver(deployment, overrideURL string) (gameday.PatroniDriver
 	if !ok || !dep.Patroni.IsEnabled() {
 		return nil, nil
 	}
-	c, err := patroni.NewClient(dep.Patroni.URL, patroniClientOpts(dep.Patroni)...)
+	pOpts, pErr := patroniClientOpts(dep.Patroni)
+	if pErr != nil {
+		return nil, pErr
+	}
+	c, err := patroni.NewClient(dep.Patroni.URL, pOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("gameday: build Patroni client for %q: %w", deployment, err)
 	}
