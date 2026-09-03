@@ -59,6 +59,34 @@ HS_TMPDIR ?= $(CURDIR)/test-runs/tmp
 export TMPDIR := $(HS_TMPDIR)
 $(info pg_hardstorage: TMPDIR=$(TMPDIR) (override: HS_TMPDIR=<path> make ...))
 
+# Keep the go command's own scratch out of the package walk.
+#
+# With TMPDIR inside the repo, `go build`/`go test` write their
+# go-build<random>/ trees there, and those trees contain .go files
+# copied from the toolchain (runtime/cgo among them). `./...` does not
+# skip gitignored directories, so it matched them as packages and
+# `go vet ./...` failed with four errors that have nothing to do with
+# this project:
+#
+#     package .../test-runs/tmp/go-build1712427766/b071
+#         .../src/runtime/cgo/cgo.go:36:8: use of internal package
+#         internal/runtime/sys not allowed
+#
+# A vet that exits non-zero for reasons no one can act on is a vet
+# people learn to ignore. GOTMPDIR is specifically where the go command
+# puts those trees, so pointing it at a dot-prefixed sibling fixes it at
+# the source: the go tool ignores directories beginning with "." or "_"
+# when expanding ./..., while TMPDIR stays exactly where it is
+# documented to be for testcontainers and minio bind mounts.
+HS_GOTMPDIR ?= $(CURDIR)/test-runs/.gotmp
+export GOTMPDIR := $(HS_GOTMPDIR)
+# Created at parse time rather than as an order-only prerequisite: the
+# go tool errors when GOTMPDIR names a directory that does not exist,
+# and GOTMPDIR is exported for EVERY make invocation, including targets
+# that build nothing. An order-only prereq on $(HS_TMPDIR) would also
+# not fire on an existing checkout, where that directory already exists.
+$(shell mkdir -p "$(HS_GOTMPDIR)")
+
 # Disable testcontainers-go's Ryuk reaper container by default.
 # Why: testcontainers/ryuk:0.13.0 starts and exits with code 1
 # ~2 s later on Docker 29.x + cgroup-v2 + overlay2 (reproduced on

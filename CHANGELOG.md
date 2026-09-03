@@ -13,6 +13,53 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **`repair scrub --heal` could copy a replica's corruption in and call
+  it a repair.** Heal checked only that the replica's bytes *parse* as a
+  chunk envelope. A parseable envelope is not an intact one — rot inside
+  the compressed payload leaves the header perfectly well-formed — so a
+  replica copy that no longer hashed to the address it was filed under
+  was written over the local copy and counted as `Healed`.
+
+  This was not an undetected corruption path: `repair scrub --heal`
+  follows up with `reverifyChunksPlaintext`, which rebuilds a
+  per-manifest CAS and re-reads each healed chunk, raising
+  `verify.heal_unverified`. That backstop works and stays. What was
+  missing is that the check is possible *before* the overwrite for every
+  unencrypted chunk — `bundle.Import`, the other path that writes chunks
+  into a repository from an outside source, has always taken a codec
+  registry for exactly this purpose.
+
+  `HealOptions` gains `Codecs`. Heal now decompresses an unencrypted
+  chunk and refuses a copy whose content does not match its address,
+  naming the replica so the operator repairs the right side rather than
+  retrying a heal that cannot work; the local copy is left as found.
+  Encrypted chunks still cannot be checked without a DEK, and are now
+  counted in `HealResult.HealedUnverified` rather than folded into a
+  clean-looking `Healed` — that count is exactly the set the post-heal
+  re-verify still has to cover.
+
+- **`verify.heal_incomplete` named no chunks.** It reported three counts
+  and suggested "review the per-chunk failures in the result body" — but
+  it is an error return, so the body carrying `HealResult.Failures` is
+  never rendered. The operator was pointed at output that does not
+  exist. The message now names each failing chunk and why, bounded the
+  same way the sibling `heal_unverified` message has always bounded its
+  hashes.
+
+### Changed
+
+- **`GOTMPDIR` moved out of the package walk.** With `TMPDIR` inside the
+  repo (deliberate — `/tmp`'s inode ceiling breaks long soak campaigns),
+  the go command wrote its `go-build*/` trees to `test-runs/tmp/`, and
+  those contain `.go` files copied from the toolchain. `./...` does not
+  skip gitignored directories, so `go vet ./...` failed with four errors
+  from Go's own `runtime/cgo`, and `go test ./...` failed outright at
+  setup — `pattern ./...: stat .../go-build.../b070: directory not
+  found` — when one of those transient trees vanished mid-walk. A vet
+  that exits non-zero for reasons nobody can act on is a vet people
+  learn to ignore. `GOTMPDIR` now points at a dot-prefixed sibling the
+  go tool skips; `TMPDIR` stays exactly where it is documented to be.
+
 - **Storage middlewares dropped the free-space capability, silently
   switching off the disk-space gate.** The optional-capability pattern
   is a type assertion: `RegionOf` asks whether the plugin implements

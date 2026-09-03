@@ -13,6 +13,216 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **`repair scrub --heal` could copy a replica's corruption in and call
+  it a repair.** Heal checked only that the replica's bytes *parse* as a
+  chunk envelope. A parseable envelope is not an intact one — rot inside
+  the compressed payload leaves the header perfectly well-formed — so a
+  replica copy that no longer hashed to the address it was filed under
+  was written over the local copy and counted as `Healed`.
+
+  This was not an undetected corruption path: `repair scrub --heal`
+  follows up with `reverifyChunksPlaintext`, which rebuilds a
+  per-manifest CAS and re-reads each healed chunk, raising
+  `verify.heal_unverified`. That backstop works and stays. What was
+  missing is that the check is possible *before* the overwrite for every
+  unencrypted chunk — `bundle.Import`, the other path that writes chunks
+  into a repository from an outside source, has always taken a codec
+  registry for exactly this purpose.
+
+  `HealOptions` gains `Codecs`. Heal now decompresses an unencrypted
+  chunk and refuses a copy whose content does not match its address,
+  naming the replica so the operator repairs the right side rather than
+  retrying a heal that cannot work; the local copy is left as found.
+  Encrypted chunks still cannot be checked without a DEK, and are now
+  counted in `HealResult.HealedUnverified` rather than folded into a
+  clean-looking `Healed` — that count is exactly the set the post-heal
+  re-verify still has to cover.
+
+- **`verify.heal_incomplete` named no chunks.** It reported three counts
+  and suggested "review the per-chunk failures in the result body" — but
+  it is an error return, so the body carrying `HealResult.Failures` is
+  never rendered. The operator was pointed at output that does not
+  exist. The message now names each failing chunk and why, bounded the
+  same way the sibling `heal_unverified` message has always bounded its
+  hashes.
+
+### Changed
+
+- **`GOTMPDIR` moved out of the package walk.** With `TMPDIR` inside the
+  repo (deliberate — `/tmp`'s inode ceiling breaks long soak campaigns),
+  the go command wrote its `go-build*/` trees to `test-runs/tmp/`, and
+  those contain `.go` files copied from the toolchain. `./...` does not
+  skip gitignored directories, so `go vet ./...` failed with four errors
+  from Go's own `runtime/cgo`, and `go test ./...` failed outright at
+  setup — `pattern ./...: stat .../go-build.../b070: directory not
+  found` — when one of those transient trees vanished mid-walk. A vet
+  that exits non-zero for reasons nobody can act on is a vet people
+  learn to ignore. `GOTMPDIR` now points at a dot-prefixed sibling the
+  go tool skips; `TMPDIR` stays exactly where it is documented to be.
+
+- **Storage middlewares dropped the free-space capability, silently
+  switching off the disk-space gate.** The optional-capability pattern
+  is a type assertion: `RegionOf` asks whether the plugin implements
+  `RegionAware`, `FreeSpaceOf` asks whether it implements
+  `FreeSpaceAware`. A wrapper that does not implement one does *not*
+  fall through to the inner plugin — it fails the assertion, and the
+  helper returns its "backend does not support this" answer. The
+  wrapper answers on behalf of a backend that would have answered
+  differently.
+
+  Both middlewares (`throttle`, `faultinject`) forwarded `Region` and
+  neither forwarded `FreeSpace`. Only the `fs` plugin implements
+  `FreeSpace`, so wrapping it turned a backend that *has* a disk-space
+  probe into one reporting it unsupported, and `capacity.Preflight`
+  recorded `PreflightUnsupported` with the note "backend does not expose
+  free-space probe" — true of an object store, false here.
+  `repo replicate --bwlimit` wraps its destination in `throttle`, so the
+  shape is live even though no caller runs the pre-flight on a
+  replication destination today.
+
+  Both now delegate through `storage.FreeSpaceOf`, exactly as `Region`
+  delegates through `RegionOf`, with compile-time assertions for every
+  optional interface. A new tree-wide guard derives both sides from
+  source — the optional interfaces are the `…Aware` interfaces declared
+  in package `storage`, the middlewares are the types under
+  `internal/plugin/storage` holding a `StoragePlugin` field — so a new
+  optional interface or a new middleware is covered the day it lands.
+  That the existing code forwarded one of the two members is the
+  argument for the guard: the pattern was understood and a member was
+  still missed.
+
+- **An unreadable approval subtracted itself from "pending approvals".**
+  `approval.Store.List` fetched each listed request and swallowed every
+  failure with a bare `continue` — a body that would not decode, an auth
+  failure, a transient storage error. `status` renders the result as a
+  flat `Pending approvals: 0`, so a repository whose approval listing
+  could not be read told the operator, on the primary at-a-glance
+  screen, that nothing awaited sign-off. No tampering is required to
+  reach it; a network blip mid-listing is enough.
+
+  `Store.Get` already draws the right line one level down for approver
+  votes — "a deleted approver key mid-list is benign; surface only
+  genuine failures" — and the outer walk simply never applied it. It
+  does now: `ErrNotFound` means the request was deleted between the
+  listing and the fetch and is skipped; anything else returns, with the
+  partial results alongside the error so best-effort callers keep what
+  was readable.
+
+  `status` distinguishes the two answers, printing
+  `Pending approvals: at least N — THE LISTING COULD NOT BE READ IN FULL`
+  and setting a new `pending_approvals_unknown` JSON field. The field is
+  additive and `omitempty`, so a healthy run's output is byte-identical
+  to before and the 24-month output-schema window is untouched.
+
+  Also in `approval list`: statuses were computed by re-fetching every
+  request `List` had just fetched (2N round trips) and recomputing
+  against a fresh `time.Now()`, so a row could display a status
+  contradicting the `--status` filter it had matched moments earlier.
+  It now classifies the request already in hand, with one clock for the
+  whole listing.
+
+- **The repository audit's approval rollup counted nothing it claimed to
+  count.** `summarizeApprovals` documented itself as classifying the
+  approval lifecycle — "counts the lifecycle states … Pending /
+  approved / expired / revoked" — and did not. It counted keys and
+  returned `Total` alone; the four state fields were never assigned by
+  any code path. The discarded clock parameter (`_ time.Time`) was the
+  shape of the missing work: two of the four states are time-dependent.
+
+  Because the fields are `omitempty` they did not render as zero — they
+  vanished, so a repository with unresolved privileged operations
+  audited as a bare `{"total":4}`. This report is compliance evidence;
+  "0 pending approvals" asserts that every privileged operation has been
+  resolved by someone.
+
+  Classification now delegates to `approval.StatusOf`, newly exported so
+  the audit uses the same derivation the approval store uses for its own
+  filtering and gating rather than a second copy of the rules. The old
+  comment declined to import the approval package fearing an import
+  cycle; there is none. Two further honesty fixes ride along:
+  `Unreadable` counts bodies that list but will not load (dropping them
+  let a corrupt or tampered request vanish from the record), and
+  `Incomplete`/`Error` mark a walk that failed partway, which previously
+  rendered exactly like a repository with no approvals at all.
+
+- **The soak gate reported every unrevertable fault as recovered.**
+  `FaultStats.RecoveryFails` is rendered by the report
+  (`- Recovery failures: %d`) and was incremented by nothing anywhere in
+  the tree; the `recovery_failed` event was consumed by no aggregation,
+  no report field and no gate check. Every soak printed zero regardless.
+
+  Worse, the `fault_recovered` emit sat outside the error branch, so a
+  fault that could not be undone emitted `recovery_failed` and then
+  `fault_recovered` immediately behind it. `fault_recovered` is one of
+  the three ops the watch TUI paints as healthy, and being last it
+  became the cell's `LastOp` — a cell still sitting in the degraded
+  state the fault created displayed green for the rest of the run, while
+  every later failure in it looked like a product bug rather than a
+  poisoned environment.
+
+  `fault_recovered` is now emitted only when the revert succeeded,
+  `CellReport.RecoveryFails` counts genuine revert failures per cell,
+  and the orchestrator rolls them into `FaultStats.RecoveryFails`.
+  Deadline-aborted recoveries remain excluded — a cancelled call during
+  teardown is not a cleanup failure.
+
+- **A progress report could make the agent that sent it look absent.**
+  `AppendProgress` set `Job.UpdatedAt` from `ProgressEvent.At`. That
+  field arrives in the agent's JSON body — `handleJobProgress` decodes
+  it straight off the wire — so it is stamped by a clock on the database
+  host. `UpdatedAt` is what `SweepAbandoned` keys abandonment on.
+
+  So an agent whose clock ran behind the control plane's by more than
+  the claim deadline was reclaimed *by the statement that recorded its
+  progress*, and the job it was actively working failed with
+  `abandoned: agent stopped reporting` — contradicted by the very row
+  the message was written into. From there the documented cascade runs:
+  a second agent claims the same job, two backups run concurrently
+  against one cluster, and the first agent's `Complete` returns
+  `ErrClaimLost`, discarding the finished work.
+
+  This is the same failure the `started_at` → `updated_at` fix
+  addressed, and that fix is intact; it closed the path where a job was
+  reclaimed for running too **long**. This is the path where a job is
+  reclaimed for running on a host whose clock is a few minutes **slow**.
+  Clock skew between a database host and a control plane is ordinary and
+  needs no misbehaviour to arise.
+
+  `AppendProgress` was the only writer of `UpdatedAt` not using the
+  server clock — `Claim`, `Complete`, `Cancel` and `SweepAbandoned` all
+  use `time.Now()` — and the only one taking wire input. Both backends
+  now stamp liveness with the receive clock; `ev.At` still rides
+  verbatim inside the stored event, where it is the agent's real
+  observation timestamp.
+
+- **A signed manifest could say two different things at once.**
+  `ParseAndVerify` does not compare the file on disk against the signed
+  bytes — it cannot, because the attestation lives inside the file. It
+  unmarshals the document, zeroes the attestation and *re-serialises*,
+  then checks that reconstruction against the signature. Anything the
+  struct does not represent falls out of the comparison.
+
+  A repeated object key is exactly that. `encoding/json` binds the last
+  occurrence, so a manifest carrying `"backup_id"` twice parses to the
+  genuine value, re-serialises to the genuine bytes, and **verifies** —
+  while a first-wins JSON reader, or an operator opening the file, sees
+  the other value. `verify` would call such a backup cryptographically
+  sound. `ParseAttestationless` accepted it too, and that is the path
+  `repair attestation` reads through: re-signing an ambiguous document
+  mints a genuine signature over it.
+
+  Both readers now reject a manifest that repeats any object key, nested
+  objects and objects inside arrays included, folding case because Go
+  matches JSON keys to struct fields case-insensitively. The schema has
+  no map fields, so every key is fixed and a repeat is never legitimate.
+
+  Unknown fields remain accepted **by design**, now pinned by a test:
+  `Schema` has been `pg_hardstorage.manifest.v1` since v1.0.0 and is
+  exact-matched on read, yet fields have been added under it
+  (`pg_backup_manifest`, `wal_gaps`). That tolerance is what lets an
+  older binary read a newer repository's manifests, and it is required
+  by the 24-month compatibility window above.
+
 - **The durable job backend trimmed progress history silently.**
   `Job.ProgressDropped` exists for one stated reason: progress is
   bounded, and the counter "records how many were shed" so "the
