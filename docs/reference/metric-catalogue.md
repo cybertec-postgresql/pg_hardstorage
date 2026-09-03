@@ -125,6 +125,7 @@ deployment names) never become series.
 | `pg_hardstorage_jobs` | gauge | `state` | Jobs known to the control plane by state (`queued`/`running`/`completed`/`failed`/`cancelled`); idle states report 0. |
 | `pg_hardstorage_agents` | gauge | `state` | Registered agents by liveness (`active`/`total`). |
 | `pg_hardstorage_repos_configured` | gauge | (none) | Number of repositories the control plane serves. |
+| `pg_hardstorage_jobs_census_failed` | gauge | (none) | `1` when the last scrape could not read the job backend, so `pg_hardstorage_jobs` is stale. Alert on it: the job gauges are seeded to zero for every state so an idle control plane still emits the full series set, which means a backend outage would otherwise be indistinguishable from an empty queue. |
 | `pg_hardstorage_controlplane_errors_total` | counter | `op` | Agent control-plane loop errors, by `op` (`heartbeat`/`claim`/`progress`/`complete`). |
 
 ## Repo — **Reserved**

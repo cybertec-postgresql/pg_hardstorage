@@ -36,7 +36,12 @@ func runCLIWithControlPlane(t *testing.T, args []string, onJob func(s *server.Se
 		defer close(done)
 		deadline := time.Now().Add(10 * time.Second)
 		for time.Now().Before(deadline) {
-			jobs := s.Jobs().List(server.ListOptions{State: server.JobQueued})
+			jobs, lerr := s.Jobs().List(server.ListOptions{State: server.JobQueued})
+			if lerr != nil {
+				// The in-memory backend cannot fail; if that ever
+				// changes here, stop polling rather than spin.
+				return
+			}
 			if len(jobs) > 0 && onJob != nil {
 				onJob(s, jobs[0].ID)
 				return

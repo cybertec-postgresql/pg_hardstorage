@@ -854,7 +854,14 @@ func (s *Server) handleJobs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	opts.Limit = limit
-	out := s.jobs.List(opts)
+	out, err := s.jobs.List(opts)
+	if err != nil {
+		// 200 + an empty list would tell the caller the queue is empty.
+		// It is not; we could not read it.
+		s.writeError(w, http.StatusInternalServerError, "internal.job_list_failed",
+			"jobs: list: "+err.Error())
+		return
+	}
 	s.writeJSON(w, http.StatusOK, envelope{
 		Result: map[string]any{"jobs": out, "count": len(out)},
 	})

@@ -37,9 +37,14 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	metrics.Default().Handler().ServeHTTP(w, r)
 }
 
-// refreshScrapeGauges samples this server's in-memory state into the
-// scrape-time gauges.  Cheap: the job list is an in-memory walk and the
-// agent registry is a small map.  Called once per scrape.
+// refreshScrapeGauges samples this server's state into the scrape-time
+// gauges.  Called once per scrape.
+//
+// The job census is NOT necessarily an in-memory walk: on the Postgres
+// backend it is a query, and it can fail. When it does, the per-state
+// gauges are left at their previous values and jobs_census_failed goes
+// to 1, because the alternative -- publishing the zero-seeded map below
+// -- makes a backend outage look exactly like a healthy idle queue.
 func (s *Server) refreshScrapeGauges() {
 	// Seed every known state at zero so an idle control plane still
 	// emits the full series set (a dashboard panel for "failed jobs"
@@ -51,10 +56,20 @@ func (s *Server) refreshScrapeGauges() {
 		string(JobFailed):    0,
 		string(JobCancelled): 0,
 	}
-	for _, j := range s.jobs.List(ListOptions{}) {
-		counts[string(j.State)]++
+	jobs, err := s.jobs.List(ListOptions{})
+	if err != nil {
+		// Do not publish `counts`: it is seeded to zero for every state
+		// so an idle control plane still emits the full series set, and
+		// that same all-zero census would here assert "nothing queued,
+		// nothing running" about a backend we could not read.
+		metrics.SetJobsCensusFailed(true)
+	} else {
+		for _, j := range jobs {
+			counts[string(j.State)]++
+		}
+		metrics.SetJobsByState(counts)
+		metrics.SetJobsCensusFailed(false)
 	}
-	metrics.SetJobsByState(counts)
 
 	total := len(s.agents.List(true))
 	active := len(s.agents.List(false))

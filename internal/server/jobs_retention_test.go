@@ -61,7 +61,7 @@ func TestMemoryBackend_PruneTerminal(t *testing.T) {
 	}
 
 	// The queued job survives; the completed ones are gone.
-	all := r.List(server.ListOptions{})
+	all := mustList(t, r, server.ListOptions{})
 	if len(all) != 1 || all[0].Deployment != "queued" {
 		t.Fatalf("after prune, remaining jobs = %+v, want only the queued one", all)
 	}
@@ -103,7 +103,7 @@ func TestJobRegistry_PruneTerminal_RetentionDisabled(t *testing.T) {
 	if n := r.PruneTerminal(); n != 0 {
 		t.Fatalf("retention disabled but PruneTerminal pruned %d", n)
 	}
-	if len(r.List(server.ListOptions{})) != 1 {
+	if mustListLen(t, r, server.ListOptions{}) != 1 {
 		t.Fatalf("disabled retention must keep the completed job")
 	}
 

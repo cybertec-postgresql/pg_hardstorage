@@ -307,12 +307,14 @@ func (r *JobRegistry) Get(id string) (*Job, error) {
 }
 
 // List returns jobs matching opts.
-func (r *JobRegistry) List(opts ListOptions) []Job {
-	out, err := r.backend.List(context.Background(), opts)
-	if err != nil {
-		return nil
-	}
-	return out
+//
+// The error is returned rather than folded into an empty slice. Every
+// other method here surfaces its backend error, and List used to be the
+// exception: on the durable backend a failed query became "no jobs",
+// which the HTTP endpoint served as 200 with an empty list and the
+// metrics scrape published as an all-zero census.
+func (r *JobRegistry) List(opts ListOptions) ([]Job, error) {
+	return r.backend.List(context.Background(), opts)
 }
 
 // Claim atomically transitions the oldest queued job matching opts

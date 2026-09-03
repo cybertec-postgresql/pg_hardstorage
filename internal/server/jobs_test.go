@@ -124,7 +124,7 @@ func TestJobRegistry_FIFOOrder(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	listed := r.List(server.ListOptions{State: server.JobRunning})
+	listed := mustList(t, r, server.ListOptions{State: server.JobRunning})
 	if len(listed) != 2 {
 		t.Errorf("want 2 running; got %d", len(listed))
 	}

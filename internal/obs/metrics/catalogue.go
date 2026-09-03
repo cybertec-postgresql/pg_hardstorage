@@ -205,6 +205,12 @@ var (
 	reposConfigured = defaultReg.RegisterGauge(
 		namespace+"repos_configured",
 		"Number of repositories the control plane is configured to serve.")
+
+	jobsCensusFailed = defaultReg.RegisterGauge(
+		namespace+"jobs_census_failed",
+		"1 when the last scrape could not read the job backend, so the "+
+			"per-state job gauges are stale. Alert on this: without it a "+
+			"backend outage is indistinguishable from an idle queue.")
 )
 
 // SetJobsByState publishes the control plane's per-state job counts.
@@ -212,6 +218,24 @@ func SetJobsByState(counts map[string]int) {
 	for state, n := range counts {
 		jobsGauge.With(state).Set(float64(n))
 	}
+}
+
+// SetJobsCensusFailed records whether the last scrape could read the job
+// backend.
+//
+// It exists because the per-state job gauges are seeded to zero for
+// every known state, deliberately, so an idle control plane still emits
+// the full series set. That is right for idle and wrong for broken: a
+// backend outage published the same all-zero census as a healthy quiet
+// one, so an alert on "queued jobs climbing" or "nothing running"
+// stayed silent exactly when the control plane could not see its own
+// queue.
+func SetJobsCensusFailed(failed bool) {
+	v := 0.0
+	if failed {
+		v = 1
+	}
+	jobsCensusFailed.With().Set(v)
 }
 
 // SetAgents publishes the active/total agent counts.

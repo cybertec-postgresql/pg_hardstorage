@@ -118,7 +118,7 @@ func TestClaim_ConcurrencyCap_HardUnderConcurrency(t *testing.T) {
 	}
 	// Confirm exactly `cap` jobs are running.
 	running := 0
-	for _, j := range r.List(server.ListOptions{}) {
+	for _, j := range mustList(t, r, server.ListOptions{}) {
 		if j.State == server.JobRunning {
 			running++
 		}
