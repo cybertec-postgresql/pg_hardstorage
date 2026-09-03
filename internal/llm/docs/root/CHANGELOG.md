@@ -13,6 +13,38 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **`wal stream` could archive a deployment at the wrong
+  `wal_segment_size`, renaming its WAL.** `probeSegmentSize` contains
+  both halves of this side by side: it refuses a probed value that is
+  not a valid segment size, saying *"Refusing to stream rather than
+  mis-name segments"*, and immediately above it falls back to the 16 MiB
+  default when the probe query returns nothing. On a cluster built with
+  `initdb --wal-segsize 64MB`, that fallback produces exactly the
+  mis-named segments the other branch refuses to produce — segment size
+  determines segment *names* as well as their length, so mixing two
+  sizes in one lineage yields names that collide or skip and PITR across
+  the boundary breaks.
+
+  Nothing downstream noticed. `SegmentSize` is recorded on every segment
+  manifest and read back by `wal list`, and a segment name is checked
+  against its *own* manifest's size, but nothing compared a new stream's
+  size against what the deployment had already archived.
+
+  `guardSegmentSize` now sits beside `guardSystemIdentifier` and
+  prevents the same class of damage. It has no `--allow` override, and
+  that asymmetry is deliberate: unlike a system identifier,
+  `wal_segment_size` cannot legitimately change, being fixed by `initdb`
+  for the life of a cluster — so a mismatch can only mean the size in
+  use is wrong. A genuine re-initdb changes the system identifier too,
+  so the guard above catches that first and offers the right remedy. It
+  fails open when nothing is archived yet.
+
+  The fallback itself is unchanged (it is right for a *connect* failure,
+  where streaming would fail anyway), but its stated justification is
+  corrected: the probe uses `pg_size_bytes`, available since PG 9.6, so
+  "old PG" cannot be the reason — the reachable case is a transient
+  query failure against a connected cluster.
+
 - **A `--timeline` the pre-flight could not interpret switched the
   pre-flight off.** `preflightTimelineHistory` returned `nil` on a
   non-numeric timeline, with the comment "recovery.Validate owns the
