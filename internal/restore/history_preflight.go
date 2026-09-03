@@ -68,7 +68,27 @@ func preflightTimelineHistory(ctx context.Context, sp storage.StoragePlugin, dep
 	default:
 		t, perr := strconv.ParseUint(recovery.Timeline, 10, 32)
 		if perr != nil {
-			return nil // recovery.Validate owns the complaint
+			// Refuse rather than skip.
+			//
+			// This used to `return nil // recovery.Validate owns the
+			// complaint`. The complaint is real -- validateRecovery
+			// rejects a non-numeric Timeline -- but it only runs inside
+			// WriteRecoveryFiles, which is step 6 of the restore, AFTER
+			// the data directory has been fully materialised. So a
+			// malformed --timeline silently switched off the
+			// timeline-reachability check and the restore failed at the
+			// very end, having already extracted the whole backup.
+			//
+			// This pre-flight exists to "refuse while the operator can
+			// still re-archive it"; skipping itself on an input it cannot
+			// interpret is the one behaviour that cannot serve that. Only
+			// the Timeline field is judged here -- validating the whole
+			// Recovery at this point would put a "RestoreCommand is
+			// required" complaint ahead of the WAL-gap refusal, which is
+			// the message the operator most needs to see first.
+			return output.NewError("usage.bad_timeline",
+				fmt.Sprintf("restore: timeline %q is not \"latest\" or a positive integer",
+					recovery.Timeline)).Wrap(output.ErrUsage)
 		}
 		if uint32(t) > seedTLI {
 			// A pinned target timeline needs its own history file —

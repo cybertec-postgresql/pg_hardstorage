@@ -33,6 +33,7 @@ package restore
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -175,5 +176,62 @@ func TestPreflightWALGap_MalformedRecordDoesNotMaskARealRefusal(t *testing.T) {
 	if !strings.Contains(err.Error(), "target_in_wal_gap") &&
 		!strings.Contains(err.Error(), "WAL gap") {
 		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+// A --timeline the pre-flight cannot interpret must be refused, not
+// silently skipped.
+//
+// preflightTimelineHistory used to `return nil // recovery.Validate
+// owns the complaint` on a non-numeric Timeline. validateRecovery does
+// own it — but it runs inside WriteRecoveryFiles, step 6 of the
+// restore, AFTER the data directory has been fully materialised. So the
+// timeline-reachability check quietly switched itself off and the
+// restore failed at the very end, having already extracted the whole
+// backup. This pre-flight's stated reason for existing is to "refuse
+// while the operator can still re-archive it".
+func TestPreflightTimelineHistory_MalformedTimelineRefuses(t *testing.T) {
+	sp := newGapTestSP(t)
+	emit, _ := collectEvents()
+
+	rec := &Recovery{Enable: true, RestoreCommand: "x", Timeline: "not-a-number"}
+	err := preflightTimelineHistory(context.Background(), sp, "db1", 1, rec, emit)
+	if err == nil {
+		t.Fatal("a --timeline that cannot be parsed was accepted, and the " +
+			"timeline-reachability pre-flight silently did not run")
+	}
+	var oerr *output.Error
+	if !errors.As(err, &oerr) || oerr.Code != "usage.bad_timeline" {
+		t.Errorf("expected usage.bad_timeline; got %v", err)
+	}
+}
+
+// A well-formed timeline must never raise usage.bad_timeline. It may
+// still be refused for REACHABILITY (a pinned timeline whose .history
+// file is absent) — that is this pre-flight working, and a different
+// code — so the assertion is on the code, not on success.
+func TestPreflightTimelineHistory_WellFormedTimelinesAreNotUsageErrors(t *testing.T) {
+	sp := newGapTestSP(t)
+	emit, _ := collectEvents()
+	for _, tl := range []string{"", "latest", "7", "4294967295"} {
+		rec := &Recovery{Enable: true, RestoreCommand: "x", Timeline: tl}
+		err := preflightTimelineHistory(context.Background(), sp, "db1", 1, rec, emit)
+		var oerr *output.Error
+		if errors.As(err, &oerr) && oerr.Code == "usage.bad_timeline" {
+			t.Errorf("timeline %q reported as malformed: %v", tl, err)
+		}
+	}
+}
+
+// The boundary: Timeline is a uint32 in PG, so a value that overflows
+// it is malformed, not merely unreachable.
+func TestPreflightTimelineHistory_OverflowingTimelineIsAUsageError(t *testing.T) {
+	sp := newGapTestSP(t)
+	emit, _ := collectEvents()
+	rec := &Recovery{Enable: true, RestoreCommand: "x", Timeline: "4294967296"}
+	err := preflightTimelineHistory(context.Background(), sp, "db1", 1, rec, emit)
+	var oerr *output.Error
+	if !errors.As(err, &oerr) || oerr.Code != "usage.bad_timeline" {
+		t.Errorf("a timeline past uint32 should be a usage error; got %v", err)
 	}
 }
