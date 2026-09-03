@@ -13,6 +13,22 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **A `--timeline` the pre-flight could not interpret switched the
+  pre-flight off.** `preflightTimelineHistory` returned `nil` on a
+  non-numeric timeline, with the comment "recovery.Validate owns the
+  complaint". It does — but `validateRecovery` runs inside
+  `WriteRecoveryFiles`, which is *step 6* of the restore, after the data
+  directory has been fully materialised. So a malformed `--timeline`
+  silently disabled the timeline-reachability check, the restore
+  extracted the entire backup, and only then failed. The gate exists to
+  "refuse while the operator can still re-archive it", which is not true
+  after the restore has run.
+
+  The refusal is scoped to the `Timeline` field alone, deliberately:
+  validating the whole `Recovery` struct at that point puts a
+  "RestoreCommand is required" complaint *ahead* of the WAL-gap refusal,
+  and the gap refusal is the message an operator most needs first.
+
 - **A WAL-gap record with unusable LSNs passed for "no gap".** The PITR
   gap pre-flight is the guard that stops a silently truncated recovery,
   and it already refuses to be silent about a gapstate listing error or
