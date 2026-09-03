@@ -41,6 +41,15 @@ func TestParseWORMRetention_RefusesUnrepresentableDurations(t *testing.T) {
 		{"99999999999999999999d", "digit run that overflows the accumulator to a POSITIVE value"},
 		{"9223372036854775807d", "int64 max as a digit run"},
 		{"300000000000y", "overflows on the unit multiply"},
+		// These two isolate the accumulator bound, and they are the
+		// worst shape of all. 18446744073709551621 is 2^64+5, so a
+		// wrapping accumulator lands on 5 — a POSITIVE value small
+		// enough that every downstream check waves it through. Without
+		// the bound, "18446744073709551621m" resolves to 300 seconds:
+		// a twenty-digit retention silently becoming five minutes, with
+		// no error, on a repository configured for compliance.
+		{"18446744073709551621m", "wraps to a small positive value (2^64+5 -> 5 minutes)"},
+		{"18446744073709551623h", "wraps to a small positive value (2^64+7 -> 7 hours)"},
 	}
 	for _, c := range cases {
 		t.Run(c.in, func(t *testing.T) {
