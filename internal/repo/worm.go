@@ -3,6 +3,7 @@ package repo
 
 import (
 	"fmt"
+	"math"
 	"strings"
 	"time"
 )
@@ -51,6 +52,20 @@ type WORMPolicy struct {
 	RetentionSeconds int64 `json:"retention_seconds"`
 }
 
+// MaxRetentionSeconds is the largest retention this type can represent.
+//
+// RetainUntil computes now.Add(RetentionSeconds * time.Second), and
+// time.Duration is int64 NANOSECONDS -- so it saturates at roughly 292
+// years. Past that the multiplication wraps and the deadline lands in
+// the PAST: "293y" produced 1734-12-04 and "1000y" produced 1856-11-25.
+// A backend handed an already-expired ObjectLockRetainUntilDate either
+// rejects the PUT or accepts it as expired, so an operator who asked to
+// keep data effectively forever got NO WORM protection, silently, on
+// exactly the repositories where that matters most.
+//
+// int64 nanoseconds / 1e9 ns-per-second = 9223372036 seconds.
+const MaxRetentionSeconds = int64(math.MaxInt64) / int64(time.Second)
+
 // IsZero reports whether p is unconfigured (Mode empty).
 func (p *WORMPolicy) IsZero() bool {
 	return p == nil || p.Mode == ""
@@ -63,7 +78,18 @@ func (p *WORMPolicy) RetainUntil(now time.Time) time.Time {
 	if p.IsZero() || p.RetentionSeconds <= 0 {
 		return time.Time{}
 	}
-	return now.Add(time.Duration(p.RetentionSeconds) * time.Second).UTC()
+	secs := p.RetentionSeconds
+	if secs > MaxRetentionSeconds {
+		// CLAMP, do not overflow. Validate refuses such a value now, but
+		// RetentionSeconds is persisted in repo metadata and read back on
+		// every PUT, so a repository initialised before this limit was
+		// enforced still carries one. Clamping yields the longest
+		// representable protection; overflowing yields a deadline in the
+		// past, which is no protection at all. Of the two ways to be
+		// wrong, only one keeps the bytes.
+		secs = MaxRetentionSeconds
+	}
+	return now.Add(time.Duration(secs) * time.Second).UTC()
 }
 
 // Validate checks that the policy is internally consistent. Used
@@ -83,6 +109,13 @@ func (p *WORMPolicy) Validate() error {
 	}
 	if p.RetentionSeconds <= 0 {
 		return fmt.Errorf("worm: retention_seconds must be > 0; got %d", p.RetentionSeconds)
+	}
+	if p.RetentionSeconds > MaxRetentionSeconds {
+		return fmt.Errorf("worm: retention_seconds %d exceeds the maximum this can represent, "+
+			"%d (~292 years) — a longer deadline overflows time.Duration and lands in the PAST, "+
+			"which the storage backend treats as already expired and therefore as no lock at all. "+
+			"Use a retention at or below 292y",
+			p.RetentionSeconds, MaxRetentionSeconds)
 	}
 	return nil
 }
@@ -109,7 +142,15 @@ func ParseWORMRetention(s string) (int64, error) {
 	for i := 0; i < len(s); i++ {
 		c := s[i]
 		if c >= '0' && c <= '9' {
-			num = num*10 + int64(c-'0')
+			d := int64(c - '0')
+			// Bound the accumulator. Unbounded, a fat-fingered digit run
+			// wraps silently: "9223372036854775807d" came out as -86400
+			// seconds and "99999999999999999999d" as a positive 6.2e18,
+			// which then passed Validate and overflowed RetainUntil.
+			if num > (math.MaxInt64-d)/10 {
+				return 0, fmt.Errorf("retention %q: value is too large (maximum is 292y)", s)
+			}
+			num = num*10 + d
 			continue
 		}
 		// Non-digit: must be the trailing unit suffix.
@@ -130,15 +171,26 @@ func ParseWORMRetention(s string) (int64, error) {
 		day    = 24 * hour
 		year   = 365 * day
 	)
+	var mult int64
 	switch unit {
 	case 'y', 'Y':
-		return num * year, nil
+		mult = year
 	case 'd', 'D':
-		return num * day, nil
+		mult = day
 	case 'h', 'H':
-		return num * hour, nil
+		mult = hour
 	case 'm', 'M':
-		return num * minute, nil
+		mult = minute
+	}
+	if mult != 0 {
+		// The unit multiply is the second place this overflows: "300000000000y"
+		// wrapped to a large NEGATIVE second count.
+		if num > MaxRetentionSeconds/mult {
+			return 0, fmt.Errorf("retention %q: exceeds the maximum representable retention "+
+				"of %d seconds (~292 years); beyond that the deadline overflows and lands in "+
+				"the past, which is no lock at all", s, MaxRetentionSeconds)
+		}
+		return num * mult, nil
 	}
 	return 0, fmt.Errorf("retention %q: unknown unit %q (use y|d|h|m)", s, string(unit))
 }
