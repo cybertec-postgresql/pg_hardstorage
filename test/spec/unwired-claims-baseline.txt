@@ -1,0 +1,41 @@
+# Packages that SPEC.md marks "Implemented" but that no binary can reach.
+#
+# Each line is a module-relative package path. A package listed here is a
+# KNOWN, ACCEPTED-FOR-NOW discrepancy between what SPEC.md claims and what
+# the shipped binaries can do. New ones fail TestSpec_ImplementedClaims-
+# CiteReachablePackages; this file is the same device as
+# test/coverage/deadcorners-baseline.txt — a ratchet, not an amnesty.
+#
+# Resolving an entry means one of two things, and both end with the line
+# being deleted:
+#
+#   - wire the package into a binary, so the claim becomes true; or
+#   - change the SPEC row's status. SPEC already uses "Planned" where that
+#     is the truth (see the cross-account replication ACL row, and the
+#     "Planned, not yet implemented" note on internal/supervisor).
+#
+# ---------------------------------------------------------------------
+# internal/i18n
+#   SPEC row: "Multi-language CLI / TUI (i18n) | Implemented |
+#              internal/i18n/ — German, French, Japanese."
+#   Reality:  the package is complete (T, Tn, ResolveLocale, AutoActivate)
+#             and tested, and NOTHING imports it. No CLI string is routed
+#             through i18n.T, so the binaries are English-only regardless
+#             of LANG/LC_ALL. docs/release-notes/v1.0.md lists "i18n —
+#             en / de / fr / ja translation" as a shipped v1.0 feature.
+internal/i18n
+#
+# internal/scim
+#   SPEC row: "SCIM 2.0 for user/group provisioning | Implemented |
+#              internal/scim/ — auto-provision and de-provision human
+#              users."
+#   Reality:  scim.go is a full 29 KB SCIM 2.0 surface with tests, and it
+#             has no references anywhere outside its own package — the
+#             control-plane server does not import it, so no IdP can
+#             provision against this build. docs/release-notes/v1.0.md
+#             lists "SCIM 2.0 — IdP-driven user / group provisioning".
+#             The compliance mappings (SOC2 CC6.7, ISO A.5.15, HIPAA
+#             164.312(a)(1), FedRAMP AC-2) cite SCIM-provisioning as part
+#             of the access-control implementation, though each hedges the
+#             evidence column with "(server-side)".
+internal/scim
