@@ -13,6 +13,27 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **`wal stream` assumed the segment size in silence when it could not
+  probe it.** `probeSegmentSize` falls back to the 16 MiB default when
+  the cluster's `wal_segment_size` will not read. That assumption
+  determines segment *names*, so on a cluster built with
+  `initdb --wal-segsize 64MB` it names every archived segment wrongly.
+  The new `guardSegmentSize` catches that once a deployment has archived
+  WAL to compare against — but on a **fresh** deployment there is
+  nothing to compare, so the assumption goes unchallenged until a
+  restore fails.
+
+  The two fallbacks now differ, as they should. A *connect* failure
+  stays quiet: `streamAttempt` is about to report the identical failure
+  with retry and backoff, so the stream never proceeds on the
+  assumption, and warning there would fire on every transient blip. A
+  *query* failure on a connected cluster — where the stream does
+  proceed — now emits `wal.stream/segment_size_probe_failed` naming the
+  assumed size and pointing at `--wal-segment-size`. Same "fail open,
+  but never silently" posture as `guardSourceIsPrimary` beside it;
+  blocking instead would be its own way to lose WAL, since the primary
+  keeps recycling while archiving is stopped.
+
 - **An unreadable job queue reported itself empty.**
   `JobRegistry.List` folded its backend error into its value — the only
   method there that did; `Enqueue`, `Get`, `Claim`, `AppendProgress`,
