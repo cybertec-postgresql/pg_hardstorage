@@ -1390,21 +1390,53 @@ type walStreamOptions struct {
 // command + context without setting up the full CLI binary.
 // probeSegmentSize probes the cluster's wal_segment_size and returns the
 // value the streamer should chop and name segments with. A probe that
-// can't run (old PG, transient connect failure) falls back to the 16 MiB
-// default so a flaky preflight never blocks a valid stream — the connect
-// error, if any, resurfaces in streamAttempt with proper retry/backoff.
+// can't run falls back to the 16 MiB default so a flaky preflight never
+// blocks a valid stream — the connect error, if any, resurfaces in
+// streamAttempt with proper retry/backoff, and a failure to read the
+// setting on a CONNECTED cluster is reported as a warning rather than
+// assumed away in silence.
+//
+// ("old PG" used to be offered as a reason a probe might not run; it is
+// not one. The query uses pg_size_bytes, available since PG 9.6, far
+// below any version this supports.)
 // A probed value that is not a valid WAL segment size (a power of two in
 // [1 MiB, 1 GiB]) is refused: PG cannot produce such a size, so it
 // signals a broken probe or a non-PG endpoint rather than a real
 // cluster, and streaming would mis-name segments.
-func probeSegmentSize(ctx context.Context, dsn string) (int64, error) {
+func probeSegmentSize(ctx context.Context, d *output.Dispatcher, dsn string) (int64, error) {
 	c, err := pg.Connect(ctx, dsn, pg.ModeRegular)
 	if err != nil {
+		// Could not connect at all. No warning: streamAttempt is about to
+		// hit the same failure with proper retry/backoff, so the stream
+		// never quietly proceeds on this assumption.
 		return walsink.DefaultSegmentSize, nil
 	}
 	defer c.Close(ctx)
 	got, err := pg.QueryWALSegmentSize(ctx, c)
 	if err != nil {
+		// Connected, but the setting would not read. Fail OPEN -- blocking
+		// WAL archiving on an inconclusive probe is itself a way to lose
+		// WAL, since the primary keeps recycling -- but never silently,
+		// the same posture guardSourceIsPrimary takes below.
+		//
+		// Silence was wrong here specifically because the assumption can
+		// be wrong AND undetectable: on a cluster built with
+		// `initdb --wal-segsize 64MB` this names every segment as though
+		// it were 16 MiB, and on a FRESH deployment guardSegmentSize has
+		// no archived WAL to compare against, so nothing downstream
+		// notices until a restore fails.
+		if d != nil {
+			_ = d.Event(ctx, output.NewEvent(output.SeverityWarning, "wal.stream", "segment_size_probe_failed").
+				WithBody(map[string]any{
+					"error":         err.Error(),
+					"assumed":       walSegSizeHuman(walsink.DefaultSegmentSize),
+					"assumed_bytes": walsink.DefaultSegmentSize,
+					"message": "could not read wal_segment_size from the cluster; assuming the " +
+						"16 MiB default. If this cluster was built with `initdb --wal-segsize`, " +
+						"every segment archived now is named for the wrong size and the archive " +
+						"will not restore. Pass --wal-segment-size explicitly to be sure.",
+				}))
+		}
 		return walsink.DefaultSegmentSize, nil
 	}
 	if !walsink.ValidSegmentSize(got) {
@@ -1666,7 +1698,7 @@ func runWalStream(cmd *cobra.Command, opts walStreamOptions) error {
 	// default so a flaky preflight never blocks a valid stream; a probed
 	// value that is not a valid WAL segment size (power of two in
 	// [1 MiB, 1 GiB]) is refused — it cannot be a real PG cluster.
-	segSize, err := probeSegmentSize(repoCtx, opts.pgConn)
+	segSize, err := probeSegmentSize(repoCtx, d, opts.pgConn)
 	if err != nil {
 		return err
 	}
