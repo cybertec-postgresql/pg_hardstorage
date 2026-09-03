@@ -1448,23 +1448,94 @@ func guardSystemIdentifier(ctx context.Context, sp storage.StoragePlugin, who, d
 // and stable across timelines, so any one segment manifest is
 // representative; we stop at the first readable one.
 func deploymentRecordedSysID(ctx context.Context, sp storage.StoragePlugin, deployment string) (string, bool, error) {
+	m, found, err := firstSegmentManifestWhere(ctx, sp, deployment,
+		func(m *walsink.SegmentManifest) bool { return m.SystemIdentifier != "" })
+	if err != nil || !found {
+		return "", false, err
+	}
+	return m.SystemIdentifier, true, nil
+}
+
+// guardSegmentSize refuses to stream into a deployment whose already-
+// archived WAL was written with a DIFFERENT wal_segment_size.
+//
+// Segment size shapes both the chop boundary and the segment NAME (PG
+// packs 4 GiB / size segments per log-id), so interleaving two sizes
+// under one lineage produces names that collide or skip and breaks
+// point-in-time recovery — the same failure the system_identifier guard
+// beside this one exists to prevent.
+//
+// Unlike that guard there is no --allow override, because unlike a
+// system identifier this value cannot legitimately change: wal_segment_size
+// is fixed by initdb --wal-segsize and is immutable for the life of a
+// cluster. Same cluster therefore ALWAYS means same size, so a mismatch
+// can only mean the size WE resolved is wrong — a --wal-segment-size flag
+// that does not match the cluster, or probeSegmentSize falling back to the
+// 16 MiB default when its query failed against a cluster that is not 16 MiB.
+// (A genuine re-initdb changes the system identifier, so the guard above
+// catches that case first and offers the right remedy.)
+//
+// Fails OPEN when nothing is archived yet or no manifest is readable:
+// same posture as every other pre-flight here, and there is nothing to
+// contradict.
+func guardSegmentSize(ctx context.Context, sp storage.StoragePlugin, who, deployment string, liveSize int64) error {
+	if !walsink.ValidSegmentSize(liveSize) {
+		return nil // the caller already refuses an invalid size
+	}
+	recorded, found, err := deploymentRecordedSegSize(ctx, sp, deployment)
+	if err != nil || !found || recorded == liveSize {
+		return nil
+	}
+	return output.NewError("preflight.wal_segment_size_changed",
+		fmt.Sprintf("%s: about to stream deployment %q with wal_segment_size=%s (%d bytes), but its "+
+			"already-archived WAL was written with %s (%d bytes). Segment size determines segment "+
+			"NAMES as well as their length, so mixing two sizes in one lineage produces names that "+
+			"collide or skip and breaks point-in-time recovery. wal_segment_size is set by initdb and "+
+			"cannot change on a live cluster, so this means the size in use here is wrong. Refusing.",
+			who, deployment, walSegSizeHuman(liveSize), liveSize,
+			walSegSizeHuman(recorded), recorded)).
+		WithSuggestion(&output.Suggestion{
+			Human: "check the cluster's real value with `SHOW wal_segment_size` and pass it explicitly via --wal-segment-size (in MB). If this is genuinely a different cluster — a re-initdb changes wal_segment_size and the system_identifier together — archive it under a FRESH deployment name so the existing lineage stays intact for PITR.",
+		})
+}
+
+// deploymentRecordedSegSize returns the wal_segment_size the deployment's
+// already-archived WAL was stamped with. found=false when nothing has been
+// archived yet, or when no manifest records a size this build considers
+// valid.
+func deploymentRecordedSegSize(ctx context.Context, sp storage.StoragePlugin, deployment string) (int64, bool, error) {
+	m, found, err := firstSegmentManifestWhere(ctx, sp, deployment,
+		func(m *walsink.SegmentManifest) bool { return walsink.ValidSegmentSize(m.SegmentSize) })
+	if err != nil || !found {
+		return 0, false, err
+	}
+	return m.SegmentSize, true, nil
+}
+
+// firstSegmentManifestWhere returns the first per-segment manifest under
+// wal/<deployment>/ that satisfies accept.
+//
+// Shared by the system-identifier and segment-size guards so the key
+// filtering lives in ONE place. That filtering is load-bearing, not
+// incidental: both guards fail OPEN when found=false, so a skip rule that
+// is too broad silently disables them. The temp check is BASENAME-scoped,
+// never full-key, because a deployment whose NAME contains ".json.tmp."
+// (validateStorageID permits dots) would otherwise have every segment
+// skipped and every guard quietly switched off.
+func firstSegmentManifestWhere(ctx context.Context, sp storage.StoragePlugin, deployment string,
+	accept func(*walsink.SegmentManifest) bool,
+) (*walsink.SegmentManifest, bool, error) {
 	prefix := fmt.Sprintf("wal/%s/", deployment)
 	for info, lerr := range sp.List(ctx, prefix) {
 		if lerr != nil {
-			return "", false, lerr
+			return nil, false, lerr
 		}
 		if cerr := ctx.Err(); cerr != nil {
-			return "", false, cerr
+			return nil, false, cerr
 		}
 		key := info.Key
 		// Per-segment manifests only: skip in-flight tmp files and the
-		// history/ aux tree (history files carry no system_identifier). The
-		// temp check is BASENAME-scoped, never full-key: a deployment whose
-		// NAME contains ".json.tmp." (validateStorageID permits dots) would
-		// otherwise have every segment skipped, deploymentRecordedSysID would
-		// return found=false, and guardSystemIdentifier fails OPEN on that —
-		// silently disabling the foreign-cluster guard so a different
-		// cluster's WAL corrupts the lineage.
+		// history/ aux tree (history files carry no cluster metadata).
 		if !strings.HasSuffix(key, ".json") || segmentKeyBasenameIsTemp(key) {
 			continue
 		}
@@ -1482,12 +1553,12 @@ func deploymentRecordedSysID(ctx context.Context, sp storage.StoragePlugin, depl
 			continue
 		}
 		m, perr := walsink.ParseSegmentManifest(raw)
-		if perr != nil || m.SystemIdentifier == "" {
+		if perr != nil || !accept(m) {
 			continue
 		}
-		return m.SystemIdentifier, true, nil
+		return m, true, nil
 	}
-	return "", false, nil
+	return nil, false, nil
 }
 
 // walSegSizeHuman renders a power-of-two byte count the way PG does (16MB,
@@ -1614,6 +1685,18 @@ func runWalStream(cmd *cobra.Command, opts walStreamOptions) error {
 		if err := guardSystemIdentifier(repoCtx, sp, "wal stream", opts.deployment, liveID.SystemID, opts.allowSysIDChange); err != nil {
 			return err
 		}
+	}
+
+	// Preflight: the size we resolved above must match what this
+	// deployment's WAL was already archived with. probeSegmentSize
+	// deliberately falls back to the 16 MiB default when its query
+	// fails, so that a flaky pre-flight never blocks a valid stream —
+	// but on a cluster built with `initdb --wal-segsize 64MB` that
+	// fallback silently produces exactly the mis-named segments the
+	// invalid-value branch refuses to produce. This is the check that
+	// notices, whatever the wrong size came from.
+	if err := guardSegmentSize(repoCtx, sp, "wal stream", opts.deployment, segSize); err != nil {
+		return err
 	}
 
 	// Encrypt streamed WAL under the deployment's shared DEK when a local KEK
