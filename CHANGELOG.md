@@ -13,6 +13,34 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **An unreadable job queue reported itself empty.**
+  `JobRegistry.List` folded its backend error into its value — the only
+  method there that did; `Enqueue`, `Get`, `Claim`, `AppendProgress`,
+  `Complete` and `Cancel` all return theirs. On `MemoryBackend` `List`
+  cannot fail, so the shape was invisible; on `PGBackend` it is a query,
+  and a failed query became "no jobs".
+
+  `GET /v1/jobs` answered `200` with `{"jobs": [], "count": 0}`, so a
+  polling client could not tell an empty queue from an unreadable one.
+  It now answers `500` with `internal.job_list_failed`.
+
+  The metrics scrape is the one that would have gone unnoticed longest.
+  The per-state census is deliberately seeded to zero for every state so
+  an idle control plane still emits the full series set — right for
+  idle, wrong for broken. With the error swallowed, a backend outage
+  published exactly the same all-zero census as a healthy quiet one, so
+  an alert on "queued jobs climbing" or "nothing has run in an hour"
+  stayed silent precisely when the control plane could not see its own
+  queue. The job gauges are now left at their previous values and a new
+  `pg_hardstorage_jobs_census_failed` gauge goes to `1`; alert on it.
+
+### Changed
+
+- **`JobRegistry.List` now returns `([]Job, error)`.** Callers that
+  previously treated a nil slice as "no jobs" must distinguish the
+  error. This is an internal Go API, not part of the CLI or output-JSON
+  compatibility surface.
+
 - **`wal stream` could archive a deployment at the wrong
   `wal_segment_size`, renaming its WAL.** `probeSegmentSize` contains
   both halves of this side by side: it refuses a probed value that is
