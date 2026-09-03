@@ -124,7 +124,8 @@ func TestMetricsScrape_UnreadableBackendIsNotAnIdleQueue(t *testing.T) {
 	}
 	body := rec.Body.String()
 
-	if !strings.Contains(body, "pg_hardstorage_jobs_census_failed 1") {
+	got, found := sampleValue(t, body, "pg_hardstorage_jobs_census_failed")
+	if !found || got != "1" {
 		t.Errorf("scrape does not report that the job census failed.\n\n"+
 			"Without this series the exposition below is indistinguishable from a "+
 			"healthy idle control plane, and every alert written against "+
@@ -147,10 +148,36 @@ func TestMetricsScrape_HealthyBackendReportsCensusOK(t *testing.T) {
 	rec := httptest.NewRecorder()
 	s.Handler().ServeHTTP(rec, req)
 	body := rec.Body.String()
-	if !strings.Contains(body, "pg_hardstorage_jobs_census_failed 0") {
-		t.Errorf("a healthy control plane does not report census_failed 0:\n%s",
-			grepLines(body, "pg_hardstorage_jobs"))
+	got, found := sampleValue(t, body, "pg_hardstorage_jobs_census_failed")
+	if !found || got != "0" {
+		t.Errorf("a healthy control plane reports census_failed=%q (found=%v), want 0; "+
+			"a signal that never clears is as useless as one that never fires:\n%s",
+			got, found, grepLines(body, "pg_hardstorage_jobs"))
 	}
+}
+
+// sampleValue returns the value of an unlabelled metric SAMPLE line,
+// ignoring "# HELP" / "# TYPE" metadata.
+//
+// Substring matching on the whole exposition is not safe here: this
+// gauge's help text begins "1 when the last scrape could not read...",
+// so `strings.Contains(body, "pg_hardstorage_jobs_census_failed 1")`
+// matches the HELP line and is true no matter what the sample says. The
+// first version of these tests did exactly that and passed against a
+// deliberately broken implementation.
+func sampleValue(t *testing.T, body, metric string) (string, bool) {
+	t.Helper()
+	for _, l := range strings.Split(body, "\n") {
+		l = strings.TrimSpace(l)
+		if strings.HasPrefix(l, "#") {
+			continue
+		}
+		name, val, ok := strings.Cut(l, " ")
+		if ok && name == metric {
+			return val, true
+		}
+	}
+	return "", false
 }
 
 func grepLines(body, substr string) string {
