@@ -13,6 +13,31 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **`repo bundle export --include-wal` silently produced a bundle with
+  no WAL.** The export draws its segment list from each manifest's
+  `wal_required`, and nothing populates that field — the backup runner
+  sets it to `nil` with the note *"empty in v0.1: WAL streaming lands in
+  Slice 8"*. WAL streaming has since landed; the field did not follow.
+  So the loop body never executed, and `BundleManifest.Timelines` —
+  promised by the same option's doc as "plus every timeline-history
+  file" — is never populated by anything either. The flag was inert in
+  both halves.
+
+  A base backup cannot reach a consistent state without the WAL between
+  its start and stop LSN, so every bundle exported with `--include-wal`
+  was unrestorable. This is an *air-gap* export: the failure surfaces at
+  restore time, from the air-gapped copy.
+
+  Export now refuses when the flag is set and no manifest yields any
+  WAL, naming the cause and the alternatives. This is a refusal, not an
+  implementation of `wal_required`: choosing which segments a backup
+  requires is a design decision, and guessing it would produce a bundle
+  that *looks* complete — strictly worse than one that refuses.
+
+  The gap survived because the package's own `sampleManifest` sets
+  `wal_required` to a segment list, so every bundle test exercised a
+  manifest shape no backup this build writes.
+
 - **A compliance report could print a negative WORM retention.** Both
   display paths repeated the unbounded `time.Duration(secs) *
   time.Second` multiply, so a repository still carrying the
