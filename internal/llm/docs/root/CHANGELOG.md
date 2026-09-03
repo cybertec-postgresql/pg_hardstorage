@@ -13,6 +13,16 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **A compliance report could print a negative WORM retention.** Both
+  display paths repeated the unbounded `time.Duration(secs) *
+  time.Second` multiply, so a repository still carrying the
+  `31536000000` seconds that `1000y` used to resolve to rendered as
+  `WORM: compliance (-1488191h9m7.419103232s)` on `compliance report`,
+  and the same wrapped figure on `repo audit`. Both now go through
+  `durationFromSeconds`, which clamps the same way enforcement does —
+  the number reported is the number enforced, which is the only one an
+  auditor can act on.
+
 - **A WORM retention past ~292 years silently produced no lock at all.**
   `RetainUntil` computes `now.Add(RetentionSeconds * time.Second)`, and
   `time.Duration` is int64 *nanoseconds*, so it saturates around 292
