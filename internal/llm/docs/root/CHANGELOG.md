@@ -13,6 +13,33 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **A WAL-gap record with unusable LSNs passed for "no gap".** The PITR
+  gap pre-flight is the guard that stops a silently truncated recovery,
+  and it already refuses to be silent about a gapstate listing error or
+  a record that fails to JSON-decode. `checkOneGap` had a third way to
+  lose a record and that one was silent: `if sErr != nil { return nil //
+  malformed; skip }`.
+
+  The unreadable counter does not cover it, and this is what makes it
+  reachable — `gapstate.Record` stores `gap_start_lsn` / `gap_end_lsn` as
+  plain strings and validates them neither on write nor on read. A
+  record that is perfectly good JSON carrying a garbage LSN is therefore
+  counted *readable*, raises no warning, and is dropped without a trace.
+  The pre-flight concludes there is no gap and lets the PITR proceed
+  into the window the record existed to describe. As the surrounding
+  comment puts it: PG cannot tell a hole from the end of the archive, so
+  it ends recovery at the hole, promotes, and reports success
+  arbitrarily far behind.
+
+  `checkOneGap` now reports malformed records, and the pre-flight emits
+  `gap_record_malformed` naming each one, its source and its unparseable
+  LSNs. The posture is deliberately unchanged — warn, do not block, as
+  with every other degraded read on this path — what changes is that the
+  operator learns the pre-flight ran against a record it could not
+  evaluate. A malformed record on the *manifest* source is signed, so it
+  indicates a defect at backup time rather than tampering, and the hint
+  says so.
+
 - **`repair scrub --heal` could copy a replica's corruption in and call
   it a repair.** Heal checked only that the replica's bytes *parse* as a
   chunk envelope. A parseable envelope is not an intact one — rot inside
