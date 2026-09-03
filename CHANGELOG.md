@@ -13,6 +13,32 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **A WORM retention past ~292 years silently produced no lock at all.**
+  `RetainUntil` computes `now.Add(RetentionSeconds * time.Second)`, and
+  `time.Duration` is int64 *nanoseconds*, so it saturates around 292
+  years. Past that the multiply wraps and the deadline lands in the
+  past — `293y` → 1734-12-04, `1000y` → 1856-11-25. A backend handed an
+  already-expired `ObjectLockRetainUntilDate` either rejects the PUT or
+  accepts it as expired, so an operator who asked to keep data
+  effectively forever (`1000y` is an ordinary way to spell that in an
+  archival or SEC-17a-4(f) policy) got **no WORM protection**, silently.
+
+  Two further wrap points fed the same outcome: `ParseWORMRetention`'s
+  digit accumulator was unbounded, and the unit multiply wrapped. The
+  `> 0` validation caught the results that happened to land negative and
+  nothing else — `99999999999999999999d` overflowed to a *positive*
+  6.2×10¹⁸ and passed. Worse, an input wrapping to a small positive
+  value (`18446744073709551621m`, i.e. 2^64+5) resolved to **300
+  seconds**: a twenty-digit retention becoming five minutes with no
+  error.
+
+  Fixed fail-closed at all three points. `RetainUntil` now *clamps*
+  rather than overflowing, which is not redundant with the validation:
+  `RetentionSeconds` is persisted in repo metadata and read back on
+  every PUT, so a repository initialised before this limit was enforced
+  still carries an oversized value. Clamping gives the longest
+  representable protection; overflowing gives none.
+
 - **`patroni.password_file` was accepted and ignored.** `PatroniConfig`
   has declared the field since it landed, config merge carries it, and
   `deployment list` names it explicitly as one of the "auth secrets
