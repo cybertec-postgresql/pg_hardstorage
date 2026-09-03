@@ -273,8 +273,12 @@ func writeComplianceReportSummary(w io.Writer, r *compliance.Report) error {
 		fmt.Fprintf(bw, "  Filter: deployment %q\n", r.DeploymentFilter)
 	}
 	if r.Repo != nil && r.Repo.WORMMode != "" {
+		// durationFromSeconds rather than an inline multiply: it clamps
+		// to the representable maximum the same way enforcement does, so
+		// this line cannot print a negative retention for a repository
+		// whose stored value predates that limit.
 		fmt.Fprintf(bw, "  WORM:   %s (%s)\n", r.Repo.WORMMode,
-			(time.Duration(r.Repo.WORMRetentionSeconds) * time.Second).String())
+			durationFromSeconds(r.Repo.WORMRetentionSeconds))
 	}
 	fmt.Fprintf(bw, "  Walk:   %d ms\n", r.DurationMS)
 	fmt.Fprintln(bw)

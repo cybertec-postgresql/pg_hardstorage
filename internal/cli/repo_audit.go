@@ -4,6 +4,7 @@ package cli
 import (
 	stdjson "encoding/json"
 	"fmt"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo"
 	"io"
 	"sort"
 	"strings"
@@ -304,6 +305,18 @@ func (b repoAuditBody) WriteText(w io.Writer) error {
 func durationFromSeconds(secs int64) string {
 	if secs <= 0 {
 		return "0s"
+	}
+	// Clamp exactly as repo.WORMPolicy.RetainUntil does, so the number
+	// REPORTED is the number ENFORCED.
+	//
+	// time.Duration is int64 nanoseconds and saturates near 292 years.
+	// Unclamped, a repository still carrying the value "1000y" used to
+	// resolve to (31536000000 seconds, written before that retention was
+	// refused) rendered as "-1488191h9m7.419103232s" — a NEGATIVE WORM
+	// retention printed on a compliance report. Showing the enforced
+	// figure is both truthful and the only one an auditor can act on.
+	if secs > repo.MaxRetentionSeconds {
+		secs = repo.MaxRetentionSeconds
 	}
 	d := time.Duration(secs) * time.Second
 	switch {
