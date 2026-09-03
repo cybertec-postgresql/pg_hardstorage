@@ -284,11 +284,22 @@ func loadDeploymentManifests(ctx context.Context, store *backup.ManifestStore, d
 	var out []*backup.Manifest
 	for m, err := range store.List(ctx, dep, verifier) {
 		if err != nil {
-			// If a single manifest fails verification, skip it but
-			// don't abort — operators want the rest of retention to
-			// proceed. We surface the failure via the return error
-			// after collecting; will plumb each per-manifest
-			// failure through the dispatcher as a warning event.
+			// ABORT the whole rotation for this deployment. Do not skip
+			// the manifest and continue.
+			//
+			// This set is the entire input to the retention decision, and
+			// retention DELETES. A manifest missing from it is invisible
+			// to promoteChainParents, so a parent it depends on can be
+			// selected for deletion and the incremental that needed it
+			// becomes unrestorable — a partial view is how a retention
+			// pass destroys a chain it was never shown.
+			//
+			// (This comment used to say "skip it but don't abort ...
+			// operators want the rest of retention to proceed", which is
+			// the opposite of what the code does and describes the unsafe
+			// behaviour as the intended one. The code was right;
+			// TestRotate_RefusesWhenAManifestWillNotVerify now holds it
+			// to that.)
 			return nil, err
 		}
 		out = append(out, m)
