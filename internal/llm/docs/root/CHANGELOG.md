@@ -13,6 +13,26 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **`patroni.password_file` was accepted and ignored.** `PatroniConfig`
+  has declared the field since it landed, config merge carries it, and
+  `deployment list` names it explicitly as one of the "auth secrets
+  (password, password_file)" it deliberately does not render — every
+  signal an operator has says it is supported. Nothing read it:
+  `patroniClientOpts` consulted `cfg.Password` alone.
+
+  So an operator who kept the password out of the config file — the only
+  reason the field exists — got `WithAuth(user, "")`. Patroni answers
+  `401` on exactly the mutating endpoints the leader-follow coordinator
+  needs (switchover, restart), while the config looks correct.
+
+  The file now wins over the inline value, is read at use time so a
+  rotation needs no restart, and is trimmed so an editor's trailing
+  newline does not become part of the secret — the same semantics
+  `llm.api_key_file` already had. An unreadable `password_file` is a hard
+  error rather than a fall-back to no auth: the agent reports
+  `patroni.auth_config_failed` and skips that deployment's follower
+  rather than starting one that cannot act.
+
 - **`wal stream` assumed the segment size in silence when it could not
   probe it.** `probeSegmentSize` falls back to the 16 MiB default when
   the cluster's `wal_segment_size` will not read. That assumption
