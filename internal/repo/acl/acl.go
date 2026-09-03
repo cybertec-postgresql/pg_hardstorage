@@ -1,9 +1,27 @@
 // Package acl implements the cross-account / cross-org replication
-// ACL boundary.  Closes the SPEC commitment "cross-account /
-// cross-org repo replication.  M&A, partner-data scenarios.  Async
-// copy with explicit ACL boundary."
+// ACL boundary.
 //
-// Design:
+// STATUS: NOT WIRED. The mechanism below is implemented and tested,
+// and nothing calls it. No production code imports this package, there
+// is no `acl` CLI command, and `repo replicate` performs its byte-copy
+// without loading or verifying either policy. SPEC.md lists
+// "Cross-account / cross-org repo replication" as **Planned**, which is
+// the accurate status; this doc previously claimed to CLOSE that
+// commitment and described the enforcement in the present tense, which
+// would lead a reader to believe replication is gated today. It is not.
+// TestACL_IsNotWiredIntoAnyProductionPath fails the moment that changes,
+// so this notice cannot quietly go stale.
+//
+// Before wiring it, note that both policies are signed documents that
+// are parsed with encoding/json and then RE-CANONICALISED from the
+// struct for verification (canonicalSourceBytes / canonicalAcceptBytes).
+// That is the same shape as the backup manifest, where it allowed a
+// document carrying a duplicate JSON key to verify while a first-wins
+// reader saw a different policy — see backup.rejectDuplicateKeys and
+// its tests. An ACL grant decides where data may be copied, so it needs
+// the equivalent guard before it gates anything.
+//
+// Design (of the mechanism, once wired):
 //
 //   - The SOURCE repo declares an `acl/source.json` policy: "I
 //     permit replication of my data to these destinations, signed
@@ -13,9 +31,10 @@
 //     "I accept incoming replication from these sources, signed
 //     by these keys, at or above this classification level, for
 //     these tenants."
-//   - Before any byte-copy, both policies are loaded and verified.
-//     The intersection has to be non-empty: source permits dst,
-//     dst accepts source, classification + tenant scopes overlap.
+//   - Before any byte-copy, both policies would be loaded and
+//     verified. The intersection has to be non-empty: source permits
+//     dst, dst accepts source, classification + tenant scopes overlap.
+//     (No caller does this yet — see STATUS above.)
 //   - Each policy is admin-signed (ed25519) so a malicious actor
 //     can't drop a bogus policy file into the repo and bypass
 //     the boundary.
