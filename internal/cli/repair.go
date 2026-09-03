@@ -1113,11 +1113,19 @@ func runRepairScrub(cmd *cobra.Command, repoURL string, limit int, heal bool, re
 	// jobs alarm — but with a different code so the operator can
 	// distinguish "scrub found findings" from "heal had to give up".
 	if healRes.Failed > 0 || healRes.NotAtReplica > 0 {
+		// Name the chunks and why each one could not be healed. This is
+		// an ERROR return, so the result body -- which is where
+		// HealResult.Failures lives -- is never rendered: the old
+		// suggestion told the operator to "review the per-chunk
+		// failures in the result body" and then did not print one, so
+		// they got three counts and no way to act. heal_unverified
+		// below has always named its hashes; this path simply did not.
 		return output.NewError("verify.heal_incomplete",
-			fmt.Sprintf("repair scrub --heal: %d healed, %d not at replica, %d failed (out of %d mismatches)",
-				healRes.Healed, healRes.NotAtReplica, healRes.Failed, len(res.Mismatches))).
+			fmt.Sprintf("repair scrub --heal: %d healed, %d not at replica, %d failed (out of %d mismatches)%s",
+				healRes.Healed, healRes.NotAtReplica, healRes.Failed, len(res.Mismatches),
+				healFailuresForMsg(healRes.Failures))).
 			WithSuggestion(&output.Suggestion{
-				Human: "review the per-chunk failures in the result body; chunks not at the replica may need to be re-backed-up at the source",
+				Human: "each chunk above names why it could not be healed; a copy that does not match its content address means the REPLICA is corrupt for that chunk (repair or re-replicate it, or heal from a different replica), while chunks not at the replica may need to be re-backed-up at the source",
 			})
 	}
 
@@ -1279,6 +1287,25 @@ type scrubResultAgg struct {
 
 // hashListForMsg renders a hash slice for an error message, capping the
 // count so a large mismatch set doesn't produce an unreadable line.
+// healFailuresForMsg renders the per-chunk heal failures inline,
+// bounded the same way hashListForMsg bounds hashes. Returns "" when
+// there are none, so it can be appended unconditionally.
+func healFailuresForMsg(fs []repo.HealFailure) string {
+	if len(fs) == 0 {
+		return ""
+	}
+	const cap = 8
+	parts := make([]string, 0, cap+1)
+	for i, f := range fs {
+		if i == cap {
+			parts = append(parts, fmt.Sprintf("… (+%d more)", len(fs)-cap))
+			break
+		}
+		parts = append(parts, fmt.Sprintf("%s: %s", f.Hash, f.Err))
+	}
+	return "; " + strings.Join(parts, "; ")
+}
+
 func hashListForMsg(hs []repo.Hash) string {
 	const cap = 8
 	parts := make([]string, 0, cap+1)

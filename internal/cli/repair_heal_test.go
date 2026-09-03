@@ -3,6 +3,7 @@ package cli_test
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	stdjson "encoding/json"
 	"io"
 	"net/url"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/output"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/encryption"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage/fs"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo"
@@ -247,29 +249,34 @@ func TestRepairScrub_HealHappyPath(t *testing.T) {
 	}
 }
 
-// TestRepairScrub_HealCorruptReplica_Unverified pins the silent-heal
-// bug: repo.Heal runs at the storage layer without keys, so it confirms
-// only that the replica BYTES were copied — not that they decrypt to
-// the expected plaintext hash. If the replica's own copy of the chunk
-// is ALSO corrupt, the old code installed it and reported healed=1,
-// exit OK — a silent claim of success while the chunk is still broken.
-// runRepairScrub must re-verify the plaintext after heal and surface
-// verify.heal_unverified instead.
-func TestRepairScrub_HealCorruptReplica_Unverified(t *testing.T) {
+// TestRepairScrub_HealMisaddressedReplica_Incomplete covers PAYLOAD rot
+// in an UNENCRYPTED replica copy: the envelope header is intact, one
+// payload byte is flipped, so the copy no longer hashes to the address
+// it is filed under.
+//
+// This used to reach the CLI as verify.heal_unverified — heal installed
+// the bad copy and the post-heal plaintext re-verify caught it. Heal
+// now holds a codec registry, decodes the unencrypted envelope and
+// REFUSES the copy before overwriting anything, so the run ends as
+// verify.heal_incomplete: "heal had to give up", with the cause named
+// so the operator repairs the replica instead of retrying.
+//
+// That is the better outcome — the local copy is left as found and the
+// failure points at the right side — but it means this fixture no
+// longer exercises the reverifyChunksPlaintext backstop. That backstop
+// still matters for ENCRYPTED chunks, which heal cannot check at any
+// setting, and is covered by
+// TestRepairScrub_HealCorruptEncryptedReplica_Unverified below.
+func TestRepairScrub_HealMisaddressedReplica_Incomplete(t *testing.T) {
 	hw := newHealWorld(t)
 	body := []byte("the-real-bytes")
 	h, envelope := hw.commitChunkedManifest(t, "db1", "20260430T1300Z.000", body)
 
 	// Plant a corrupt-but-VALID envelope at the replica: same header,
-	// one payload byte flipped. This is what real replica bit-rot
-	// inside the ciphertext looks like, and it is the case this test
-	// exists for — heal cannot see it (no DEK), installs it, and the
-	// CLI's plaintext reverify catches it as heal_unverified. Rot that
-	// breaks the envelope HEADER is a different case now: heal itself
-	// refuses it before overwriting anything (heal_incomplete;
-	// TestRepairScrub_HealUnparseableReplica_Incomplete below). The
-	// previous fixture prefixed garbage onto the envelope, which was
-	// header rot — testing the old conflation of the two.
+	// one payload byte flipped. Header rot is a separate case, refused
+	// on the envelope parse (TestRepairScrub_HealUnparseableReplica_
+	// Incomplete); this one parses perfectly and is caught only by
+	// comparing the decoded content against the chunk address.
 	badReplica := append([]byte(nil), envelope...)
 	badReplica[len(badReplica)-1] ^= 0xFF
 	plantAtReplica(t, hw, repo.ChunkKey(h), badReplica)
@@ -287,11 +294,21 @@ func TestRepairScrub_HealCorruptReplica_Unverified(t *testing.T) {
 		t.Fatalf("corrupt-replica heal must exit ExitVerifyFailed (9); got %d\nstdout=%s\nstderr=%s",
 			exit, stdout, stderr)
 	}
-	if !strings.Contains(stderr, `"code": "verify.heal_unverified"`) {
-		t.Errorf("expected verify.heal_unverified code:\n%s", stderr)
+	if !strings.Contains(stderr, `"code": "verify.heal_incomplete"`) {
+		t.Errorf("expected verify.heal_incomplete — heal can decode this unencrypted "+
+			"envelope and must refuse a copy that does not match its content address, "+
+			"rather than install it and let the post-heal re-verify find it:\n%s", stderr)
 	}
+	// The error must name the chunk AND why it could not be healed —
+	// this is an error return, so the result body carrying
+	// HealResult.Failures is never rendered and the message is all the
+	// operator gets.
 	if !strings.Contains(stderr, h.String()) {
-		t.Errorf("expected the still-bad chunk hash %s in the error result:\n%s", h, stderr)
+		t.Errorf("expected the unhealable chunk hash %s in the error result:\n%s", h, stderr)
+	}
+	if !strings.Contains(stderr, "content address") {
+		t.Errorf("the error does not say WHY the chunk could not be healed, so the "+
+			"operator cannot tell a corrupt replica from a missing one:\n%s", stderr)
 	}
 }
 
@@ -453,4 +470,76 @@ func TestRepairScrub_HealUnparseableReplica_Incomplete(t *testing.T) {
 	if !bytes.Equal(got, primaryRot) {
 		t.Errorf("primary chunk modified by a refused heal: %q", got)
 	}
+}
+
+// TestRepairScrub_HealCorruptEncryptedReplica_Unverified keeps the
+// post-heal plaintext re-verify covered.
+//
+// Heal now refuses an UNENCRYPTED replica copy whose content does not
+// match its address, so the fixture that used to exercise
+// reverifyChunksPlaintext no longer reaches it. An ENCRYPTED chunk
+// still does: the chunk key is a hash over PLAINTEXT and the stored
+// object is a ciphertext envelope, so heal — which holds no DEK —
+// genuinely cannot tell a rotted replica copy from a good one. It
+// installs the bytes and reports Healed; only the CLI's re-verify,
+// which rebuilds a per-manifest CAS with the keys, can see the damage.
+//
+// That is why reverifyChunksPlaintext must stay, and why HealResult
+// counts these in HealedUnverified.
+func TestRepairScrub_HealCorruptEncryptedReplica_Unverified(t *testing.T) {
+	hw := newHealWorld(t)
+
+	var kek [encryption.KeyLen]byte
+	if _, err := rand.Read(kek[:]); err != nil {
+		t.Fatal(err)
+	}
+	installLocalKEK(t, kek)
+
+	body := []byte("the-real-encrypted-bytes")
+	commitEncryptedBackup(t, hw.readWorld, "db1", "heal", 7, kek, "local:default", body)
+	h := repo.HashOf(body)
+
+	// Read the real (encrypted) envelope the CAS wrote, then plant a
+	// payload-rotted copy at the replica. The header stays valid and
+	// the ciphertext is opaque to heal.
+	good := readChunkRaw(t, hw.sp, h)
+	bad := append([]byte(nil), good...)
+	bad[len(bad)-1] ^= 0xFF
+	plantAtReplica(t, hw, repo.ChunkKey(h), bad)
+
+	corruptPrimaryChunk(t, hw, h, []byte("totally-bogus-garbage-bytes"))
+
+	stdout, stderr, exit := runCmd(t,
+		"repair", "scrub",
+		"--repo", hw.repoURL,
+		"--heal", "--replica", hw.replicaURL,
+		"--output", "json",
+	)
+	if exit != int(output.ExitVerifyFailed) {
+		t.Fatalf("corrupt encrypted replica must exit ExitVerifyFailed (9); got %d\nstdout=%s\nstderr=%s",
+			exit, stdout, stderr)
+	}
+	if !strings.Contains(stderr, `"code": "verify.heal_unverified"`) {
+		t.Errorf("expected verify.heal_unverified — heal cannot check an encrypted "+
+			"chunk's content address, so it installs the replica's bytes and only the "+
+			"post-heal plaintext re-verify can catch them:\n%s", stderr)
+	}
+	if !strings.Contains(stderr, h.String()) {
+		t.Errorf("expected the still-bad chunk hash %s in the error result:\n%s", h, stderr)
+	}
+}
+
+// readChunkRaw returns the on-disk envelope bytes for a chunk.
+func readChunkRaw(t *testing.T, sp storage.StoragePlugin, h repo.Hash) []byte {
+	t.Helper()
+	rc, err := sp.Get(context.Background(), repo.ChunkKey(h))
+	if err != nil {
+		t.Fatalf("get chunk %s: %v", h, err)
+	}
+	defer rc.Close()
+	var b bytes.Buffer
+	if _, err := b.ReadFrom(rc); err != nil {
+		t.Fatalf("read chunk %s: %v", h, err)
+	}
+	return b.Bytes()
 }
