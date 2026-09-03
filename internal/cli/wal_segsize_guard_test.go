@@ -24,6 +24,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"os"
 	"strings"
 	"testing"
 
@@ -159,5 +160,43 @@ func TestFirstSegmentManifestWhere_PredicateSelectsIndependently(t *testing.T) {
 	size, found, err := deploymentRecordedSegSize(ctx, sp, "db1")
 	if err != nil || !found || size != segGuard64 {
 		t.Errorf("segsize lookup = (%d,%v,%v), want %d", size, found, err, int64(segGuard64))
+	}
+}
+
+// A guard that is never called is worth nothing, and both WAL-stream
+// pre-flights are exactly that shape: pure functions whose unit tests
+// pass just as happily when the call site is deleted. I verified that
+// by deleting the guardSegmentSize call — every test above still
+// passed.
+//
+// There is no unit-testable seam here (the surrounding path needs a
+// live PostgreSQL connection), so this asserts the wiring at the source
+// level, the same way the storage-middleware and fsync guards do. It
+// covers the system-identifier guard too, which had the same exposure.
+func TestWalStream_CallsItsPreflightGuards(t *testing.T) {
+	src, err := os.ReadFile("wal.go")
+	if err != nil {
+		t.Fatalf("read wal.go: %v", err)
+	}
+	body := string(src)
+	start := strings.Index(body, "func runWalStream(")
+	if start < 0 {
+		t.Fatal("runWalStream not found; this guard needs updating, not deleting")
+	}
+	// Bound the search to the stream entry point's own body.
+	end := strings.Index(body[start:], "\n}\n")
+	if end < 0 {
+		t.Fatal("could not delimit runWalStream")
+	}
+	fn := body[start : start+end]
+
+	for _, guard := range []string{"guardSystemIdentifier(", "guardSegmentSize("} {
+		if !strings.Contains(fn, guard) {
+			t.Errorf("runWalStream does not call %s\n\n"+
+				"The guard's own tests call it directly, so they keep passing when the "+
+				"call site goes away. Streaming then proceeds with no pre-flight at all: "+
+				"a foreign cluster's WAL, or a wrong wal_segment_size, enters the lineage "+
+				"unchallenged.", guard)
+		}
 	}
 }
