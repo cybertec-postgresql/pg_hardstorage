@@ -9,7 +9,7 @@ on-disk and on-the-wire schema (backup manifests, configuration, output JSON,
 and the on-disk chunk envelope): an agent built against a given schema version
 keeps reading that version for at least 24 months after a successor lands.
 
-## [Unreleased]
+## [1.4.0] — 2026-09-08
 
 ### Fixed
 
@@ -482,8 +482,6 @@ Barman 3.20.0 and WAL-G, plus a 32-cell / 2 h chaos soak.
   exist. The message now names each failing chunk and why, bounded the
   same way the sibling `heal_unverified` message has always bounded its
   hashes.
-
-### Changed
 
 - **`GOTMPDIR` moved out of the package walk.** With `TMPDIR` inside the
   repo (deliberate — `/tmp`'s inode ceiling breaks long soak campaigns),

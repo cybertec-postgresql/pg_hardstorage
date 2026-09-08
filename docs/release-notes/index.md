@@ -13,6 +13,20 @@ operator deciding whether to upgrade.
 
 ## Releases
 
+- **[v1.4](v1.4.md)** — the compat-layer release.  Driving the
+  pgBackRest / Barman / WAL-G shims against the real tools found that
+  every restore performed through a shim produced an unbootable
+  cluster, that `barman-cloud-wal-restore` could let a CNPG replica
+  promote with unreplayed WAL still in the repository, and that all
+  three config translators emitted YAML the loader rejects — so the
+  documented migration path could not work at all.  Also: `doctor` now
+  actually connects to PostgreSQL and scopes to the deployment you
+  name, source corruption reports `source_corruption.*` instead of
+  `internal`, and the soak's WAL streamer is supervised — it had been
+  dying with the first killed container on most cells, which the
+  reports had been reading as lag.  Several exit codes change; see the
+  upgrade notes.  Nothing on disk or on the wire changes — no
+  migration.
 - **[v1.3](v1.3.md)** — the unrun-tests release.  A scenario corpus
   where 162 of 174 files were wired into no target, and what running
   them found: an air-gap bundle feature that never worked for any
