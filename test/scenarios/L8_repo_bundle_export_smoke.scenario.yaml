@@ -14,8 +14,9 @@
 #      empty .tar.
 #   2. `repo bundle export --backup-id <specific>`
 #      narrows to one manifest; output is smaller.
-#   3. `--include-wal` augments the bundle with WAL
-#      segments listed in each manifest's wal_required.
+#   3. `--include-wal` REFUSES while no manifest carries a
+#      wal_required list, rather than shipping a bundle
+#      with no WAL in it (which cannot be restored).
 #
 # Import-side verification (round-trip into a fresh
 # repo + restore from the imported bundle) is left to
@@ -30,9 +31,10 @@ name: L8-repo-bundle-export-smoke
 tier: L8
 description: |
   3 backups → repo bundle export (all backups) →
-  export --backup-id (specific backup) →
-  export --include-wal.  All three produce a non-empty
-  .tar.
+  export --backup-id (specific backup) → export
+  --include-wal.  The first two produce a non-empty .tar;
+  the third refuses, because a WAL-less "self-contained"
+  bundle is unrestorable.
 
 topology:
   provider: local-docker
@@ -86,9 +88,20 @@ steps:
         - "$ARTEFACT_DIR/bundle-one.tar"
       timeout: 60s
 
-  # Export with --include-wal so the bundle is
-  # self-contained for PITR up to the latest backup's
-  # end-LSN.
+  # --include-wal must REFUSE, not produce a WAL-less bundle.
+  #
+  # The option draws its segment list from each manifest's
+  # `wal_required`, and nothing in the backup runner populates that
+  # field, so the loop body never executed: every bundle exported
+  # with --include-wal was a bundle with no WAL, and a base backup
+  # cannot reach a consistent state without the WAL between its start
+  # and stop LSN. Since this is an air-gap export, that only surfaced
+  # at restore time, from the air-gapped copy.
+  #
+  # Export now refuses rather than shipping something that looks
+  # complete. This step pins the refusal: when `wal_required` is
+  # eventually populated, this expectation flips back to 0 together
+  # with the implementation.
   - cli_run:
       args:
         - "repo"
@@ -101,6 +114,8 @@ steps:
         - "--include-wal"
         - "--out"
         - "$ARTEFACT_DIR/bundle-with-wal.tar"
+      expect_exit: 1
+      expect_stderr_contains: "--include-wal was requested"
       timeout: 60s
 
 cleanup:
