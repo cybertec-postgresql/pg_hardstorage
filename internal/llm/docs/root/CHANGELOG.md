@@ -36,6 +36,44 @@ byte-identical to v1.4.0.
   Both branches of the ternary now carry the full argument list, so
   neither can be falsy.
 
+## [1.4.2] — 2026-09-08
+
+Container images only. No code changes: the binary, packages and
+repository format remain byte-identical to v1.4.0, which stays the
+release of record for what changed.
+
+### Fixed
+
+- **The container-publishing gate could never open.** The release
+  workflow chose goreleaser's arguments with
+
+      release --clean ${{ cond && '' || '--skip=docker' }}
+
+  and an empty string is FALSY in GitHub Actions expressions, so
+  `cond && ''` is `''` even when `cond` is true and the `||` always
+  fell through to `--skip=docker`. Setting `PUBLISH_CONTAINERS` could
+  not have helped.
+
+  Nothing surfaced it: the QEMU and Buildx steps test the same
+  variable in an `if:`, and those work, so a run showed both green
+  while goreleaser was still being told to skip docker. Both branches
+  of the ternary now carry the full argument list.
+
+- **GHCR images resume after eleven releases.** The container package
+  was still owned by `pg_hardstorage-private`, the repository this
+  project developed in before the public repo was created on
+  2026-06-18. Images stopped at 0.9.0 on 2026-05-02, and every release
+  from v1.0.0 on was silently image-less, because the public repo's
+  Actions token has no write access to another repository's package —
+  the `denied: permission_denied: write_package` that aborts an entire
+  goreleaser run.
+
+  The stale package (21 versions, 0.2.0–0.9.0) was deleted so this
+  repository recreates and owns it. `latest` had been pointing at a
+  May build; it now tracks the current release. The Helm chart
+  (`charts/pg-hardstorage-sidecar/values.yaml`) and the SLSA
+  verification docs reference this image, so both are live again.
+
 ## [1.4.1] — 2026-09-08
 
 Container images only. No code changes: the binary, packages and
