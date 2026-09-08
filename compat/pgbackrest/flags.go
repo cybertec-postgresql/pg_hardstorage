@@ -359,7 +359,7 @@ func mapToNativeArgs(verb string, a pgbackrestArgs) (native []string, warnings [
 	// out, rather than letting the native CLI report a bare
 	// "--pg-connection, --repo are required" three layers down.
 	var missing []string
-	if verbAcceptsPGConnection(verb) && conn == "" {
+	if verbRequiresPGConnection(verb) && conn == "" {
 		missing = append(missing, "--pg1-host (or pg_connection)")
 	}
 	if repoURL == "" && verbNeedsRepo(verb) {
@@ -423,6 +423,21 @@ func verbAcceptsPGConnection(verb string) bool {
 	default:
 		return false
 	}
+}
+
+// verbRequiresPGConnection reports whether the native verb REFUSES to
+// run without --pg-connection, which is a narrower question than
+// whether it accepts one.
+//
+// Only `backup` refuses: it has to talk to the live server. `wal push`
+// accepts the flag but does not need it — it derives the
+// system_identifier from the segment header (issue #8), which is why
+// the barman shim deliberately archives without one. Gating on
+// "accepts" made `pgbackrest archive-push` demand a connection it
+// never used, breaking archive_command for any stanza whose config
+// carries only repo settings.
+func verbRequiresPGConnection(verb string) bool {
+	return verb == "backup"
 }
 
 // verbNeedsRepo reports whether the native verb cannot run without a
