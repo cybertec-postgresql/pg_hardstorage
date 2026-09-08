@@ -635,6 +635,15 @@ func mergeLoadStats(cr *report.CellReport, src *report.LoadStats) {
 	if src.WALStreamRan {
 		dst.WALStreamRan = true
 	}
+	if src.WALStreamRestarts != 0 {
+		dst.WALStreamRestarts = src.WALStreamRestarts
+	}
+	if src.WALStreamUpAtStop {
+		dst.WALStreamUpAtStop = true
+	}
+	if src.WALStreamDownFor != "" {
+		dst.WALStreamDownFor = src.WALStreamDownFor
+	}
 }
 
 // hashName produces a stable per-cell uint64 used to mix into
