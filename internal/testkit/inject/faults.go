@@ -271,9 +271,10 @@ func (signalFault) Apply(ctx context.Context, args Args, ts TargetSet) (Recovery
 		// zero recovery attempts after.
 		//
 		// Verify, with a bounded wait, that the target actually
-		// answers. A target that does not come back is a fault-apply
-		// FAILURE — which is a true statement about the run, and the
-		// orchestrator already knows how to record one.
+		// answers — retrying the start, not just probing. A target
+		// that never comes back is a fault-apply FAILURE, which is a
+		// true statement about the run and something the orchestrator
+		// already knows how to record.
 		if err := waitTargetAlive(ctx, t, signalRecoveryTimeout); err != nil {
 			return nil, fmt.Errorf("signal: %s: %w", t.Name(), err)
 		}
@@ -290,16 +291,28 @@ const signalRecoveryTimeout = 60 * time.Second
 // waitTargetAliveInterval is the poll gap for waitTargetAlive.
 const waitTargetAliveInterval = 2 * time.Second
 
-// waitTargetAlive polls a target until it can execute a trivial
-// command, i.e. the container is running again and its namespace
-// accepts an exec.
+// waitTargetStartTimeout caps each retried Start inside
+// waitTargetAlive, matching the runner's own 2s cap.
+const waitTargetStartTimeout = 2 * time.Second
+
+// waitTargetAlive brings a target back up and waits until it answers,
+// RE-ISSUING Start on every attempt rather than probing a single
+// fire-and-forget one.
+//
+// Retrying the start is what makes this reliable, and it is not a
+// guess: the scenario runner's own heal_window loop
+// (runner.waitPGReady) has always called Start on each pass while it
+// waits for PostgreSQL, precisely because one start can lose a race —
+// the container can still be mid-teardown when the first one lands,
+// and Docker will not queue it. A probe-only wait inherits that race
+// and turns it into a spurious fault-apply failure under load.
 //
 // This deliberately checks the TARGET, not PostgreSQL: a cell whose
 // container is up but whose PG is still in crash recovery is exactly
-// the state the soak wants to observe, and the fault primitives that
-// care about the PG process have their own probes. What must not
-// happen is the run continuing against a container that is simply
-// gone.
+// the state the soak wants to observe, and the callers that care
+// about the PG process have their own probes (the soak's next
+// iteration, the scenario runner's heal_window). What must not happen
+// is the run continuing against a container that is simply gone.
 func waitTargetAlive(ctx context.Context, t Target, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	var lastErr error
@@ -313,7 +326,7 @@ func waitTargetAlive(ctx context.Context, t Target, timeout time.Duration) error
 			return fmt.Errorf("post-signal liveness wait cancelled: %w", ctx.Err())
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("target did not come back within %s after post-signal start (last probe: %v)",
+			return fmt.Errorf("target did not come back within %s despite repeated starts (last probe: %v)",
 				timeout, lastErr)
 		}
 		select {
@@ -321,6 +334,13 @@ func waitTargetAlive(ctx context.Context, t Target, timeout time.Duration) error
 			return fmt.Errorf("post-signal liveness wait cancelled: %w", ctx.Err())
 		case <-time.After(waitTargetAliveInterval):
 		}
+		// Re-issue the start each pass. Idempotent on a running
+		// target; the one that matters is the pass where the previous
+		// start lost to a teardown still in flight. Bounded so a
+		// wedged docker daemon cannot hijack the loop.
+		sctx, scancel := context.WithTimeout(ctx, waitTargetStartTimeout)
+		_ = t.Start(sctx)
+		scancel()
 	}
 }
 
