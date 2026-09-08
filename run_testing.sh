@@ -581,6 +581,12 @@ Consequences, so nobody re-derives them at 3am:
     of kilobytes — because du cannot descend either. That number is
     NOT the repository size, and an empty-looking repo-data is not an
     empty repository.
+  * `go test ./...` in the repo root FAILS while this directory
+    exists, with "permission denied" on one of the subdirectories.
+    Go's package walk descends the whole module tree and does not
+    honour .gitignore, so a kept soak report blocks the test suite.
+    Use `go test ./cmd/... ./internal/... ./compat/...`, or take
+    ownership of the tree (below), or delete the report dir.
 
 To read the repository, go in through a container (they are preserved
 when the run used --keep-on-failure):
