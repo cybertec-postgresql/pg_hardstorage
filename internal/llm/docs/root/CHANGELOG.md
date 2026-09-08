@@ -9,6 +9,30 @@ on-disk and on-the-wire schema (backup manifests, configuration, output JSON,
 and the on-disk chunk envelope): an agent built against a given schema version
 keeps reading that version for at least 24 months after a successor lands.
 
+## [1.4.1] — 2026-09-08
+
+Container images only. No code changes: the binary, packages and
+repository format are byte-identical to v1.4.0.
+
+### Added
+
+- **Container images are published to GHCR again.** Image publishing
+  had been gated behind the `PUBLISH_CONTAINERS` repository variable
+  since the org's Actions runners lacked package-write on ghcr.io: a
+  failed push aborts the *whole* goreleaser run, so `--skip=docker`
+  kept the binaries, `.deb`/`.rpm`, Homebrew cask and GitHub Release
+  shipping while images did not. The last images published were
+  0.9.0, in May 2026, which left `latest` pointing at a build eleven
+  releases old.
+
+  The variable is now set, so `ghcr.io/cybertec-postgresql/pg_hardstorage`
+  carries `1.4.1` and a `latest` that means it. The Helm chart
+  (`charts/pg-hardstorage-sidecar/values.yaml`) and the shim how-tos
+  reference this image, so they point at something current again.
+
+  v1.4.0 remains the release of record for what actually changed; this
+  tag exists so the images match it.
+
 ## [1.4.0] — 2026-09-08
 
 ### Security
