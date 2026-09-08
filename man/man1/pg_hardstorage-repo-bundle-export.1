@@ -31,7 +31,7 @@ Export deployment state into an air-gap-transportable tar
 
 .PP
 \fB--include-wal\fP[=false]
-	also include WAL segments listed in each manifest's wal_required
+	also include the WAL segments each manifest lists in wal_required. NOTE: nothing populates wal_required at backup time yet, so on a repository written by this build the export refuses rather than produce base backups with no WAL to replay
 
 .PP
 \fB--out\fP=""
