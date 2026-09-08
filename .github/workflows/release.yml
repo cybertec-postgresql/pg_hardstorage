@@ -131,14 +131,27 @@ jobs:
         with:
           version: latest
           # Container images publish to GHCR only when the repo/org
-          # variable PUBLISH_CONTAINERS == 'true'. Until the org enables
-          # Actions package-write on ghcr.io (otherwise the push fails
-          # `denied: permission_denied: write_package` and aborts the
-          # whole release), --skip=docker is passed so the binaries /
-          # .deb / .rpm / Homebrew / GitHub Release still ship. Flip the
-          # variable to 'true' once GHCR is enabled, then re-tag to
-          # publish images. (--skip=docker covers docker_manifests too.)
-          args: release --clean ${{ vars.PUBLISH_CONTAINERS == 'true' && '' || '--skip=docker' }}
+          # variable PUBLISH_CONTAINERS == 'true'. Without it the push
+          # can fail `denied: permission_denied: write_package`, and
+          # that aborts the WHOLE goreleaser run — so --skip=docker is
+          # passed instead, and the binaries / .deb / .rpm / Homebrew /
+          # GitHub Release still ship. (--skip=docker covers
+          # docker_manifests too.)
+          #
+          # Both branches of the ternary MUST be non-empty. The obvious
+          # spelling —
+          #
+          #   release --clean ${{ cond && '' || '--skip=docker' }}
+          #
+          # is silently broken: '' is FALSY in GitHub Actions
+          # expressions, so `cond && ''` yields '' even when cond is
+          # true, and the `||` then always falls through to
+          # '--skip=docker'. The gate could never open no matter what
+          # the variable said, and nothing failed to show it — v1.4.1
+          # ran with QEMU and Buildx set up (their `if:` on the same
+          # variable evaluated true) and still passed --skip=docker.
+          # Keep the whole argument list in each branch.
+          args: ${{ vars.PUBLISH_CONTAINERS == 'true' && 'release --clean' || 'release --clean --skip=docker' }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # Separate fine-grained PAT (contents:write on the homebrew-tap

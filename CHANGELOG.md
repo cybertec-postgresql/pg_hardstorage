@@ -9,6 +9,33 @@ on-disk and on-the-wire schema (backup manifests, configuration, output JSON,
 and the on-disk chunk envelope): an agent built against a given schema version
 keeps reading that version for at least 24 months after a successor lands.
 
+## [1.4.2] — 2026-09-08
+
+Container images only, again — v1.4.1 did not actually publish any.
+No code changes: the binary, packages and repository format remain
+byte-identical to v1.4.0.
+
+### Fixed
+
+- **The container-publishing gate could never open.** The release
+  workflow chose goreleaser's arguments with
+
+      release --clean ${{ cond && '' || '--skip=docker' }}
+
+  and an empty string is FALSY in GitHub Actions expressions. So
+  `cond && ''` evaluates to `''` even when `cond` is true, the `||`
+  falls through, and `--skip=docker` was passed unconditionally —
+  whatever `PUBLISH_CONTAINERS` was set to.
+
+  Nothing failed to reveal it. v1.4.1 set the variable, and the QEMU
+  and Buildx steps — whose `if:` tests the same variable — ran and
+  succeeded, so the run looked like it was publishing images. It was
+  not: the goreleaser log still read `args: release --clean
+  --skip=docker`, and `latest` stayed on 0.9.0 from May 2026.
+
+  Both branches of the ternary now carry the full argument list, so
+  neither can be falsy.
+
 ## [1.4.1] — 2026-09-08
 
 Container images only. No code changes: the binary, packages and
