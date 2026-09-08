@@ -80,15 +80,39 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 	// `check <server>` rides on this, which is how a dead server could
 	// be reported healthy. Narrow the config to the named deployment
 	// before any probe runs.
+	var unknownDeployment, unknownDeploymentHint string
 	if len(args) == 1 {
-		var scopeErr error
-		cfg, scopeErr = scopeConfigToDeployment(cfg, args[0])
-		if scopeErr != nil {
-			return scopeErr
-		}
+		// Render the hint from the PRE-scope config: after scoping it
+		// holds no deployments by construction, so asking it which
+		// names exist would always answer "none" — and the typo case,
+		// which is the whole reason for the hint, would never get the
+		// list it needs.
+		unknownDeploymentHint = configuredDeploymentsHint(cfg)
+		cfg, unknownDeployment = scopeConfigToDeployment(cfg, args[0])
 	}
 
 	report := buildDoctorReport(p, cfg, cfgErr)
+
+	// A name that matches nothing is worth saying loudly — it is
+	// usually a typo — but it must NOT stop the report. Everything
+	// doctor knows about paths, config load state and the keystore is
+	// still true and still useful, and the case where the name matches
+	// nothing *because nothing is configured yet* is precisely the
+	// fresh install where an operator reaches for doctor first.
+	// Refusing there would have made the command useless exactly when
+	// it is needed.
+	if unknownDeployment != "" {
+		report.Issues = append(report.Issues, doctorIssue{
+			Severity: output.SeverityWarning,
+			Code:     "doctor.unknown_deployment",
+			Message: fmt.Sprintf("doctor: no deployment %q in the loaded config — reporting environment health only",
+				unknownDeployment),
+			Suggestion: &output.Suggestion{
+				Human:   unknownDeploymentHint,
+				Command: "pg_hardstorage deployment list",
+			},
+		})
+	}
 
 	// Defence-in-depth posture check: the top-level CLI gate (see
 	// refuse_root.go) blocks euid 0 before any command body runs,
@@ -1518,33 +1542,51 @@ func appendLeaseWedgeChecks(ctx context.Context, cfg *config.LoadResult, issues 
 // `doctor <server>`, inherited it: a server whose PostgreSQL was down
 // could be reported healthy because some other deployment was fine.
 //
-// An unknown name is a usage error, not an empty report: silently
-// reporting on nothing would be the same class of lie.
-func scopeConfigToDeployment(cfg *config.LoadResult, name string) (*config.LoadResult, error) {
+// A name that matches nothing returns the config narrowed to NO
+// deployments, plus that name as the second result so the caller can
+// report it. It is deliberately not an error: doctor's whole job is
+// to make an unhealthy or unconfigured environment legible, and the
+// commonest reason a name matches nothing is that nothing is
+// configured yet — a fresh install, or a deployment driven entirely
+// by --repo / --pg-connection flags. Refusing to report there would
+// break the command exactly where it is most wanted.
+func scopeConfigToDeployment(cfg *config.LoadResult, name string) (*config.LoadResult, string) {
 	if cfg == nil {
-		return cfg, nil
-	}
-	dep, ok := cfg.Config.Deployments[name]
-	if !ok {
-		known := make([]string, 0, len(cfg.Config.Deployments))
-		for n := range cfg.Config.Deployments {
-			known = append(known, n)
-		}
-		sort.Strings(known)
-		detail := "no deployments are configured"
-		if len(known) > 0 {
-			detail = "known deployments: " + strings.Join(known, ", ")
-		}
-		return nil, output.NewError("notfound.deployment",
-			fmt.Sprintf("doctor: no deployment %q in the loaded config (%s)", name, detail)).
-			Wrap(output.ErrUsage)
+		return cfg, ""
 	}
 	// Copy so the narrowed view never mutates the caller's config.
 	scoped := *cfg
 	scopedCfg := cfg.Config
+	dep, ok := cfg.Config.Deployments[name]
+	if !ok {
+		scopedCfg.Deployments = map[string]config.DeploymentConfig{}
+		scoped.Config = scopedCfg
+		return &scoped, name
+	}
 	scopedCfg.Deployments = map[string]config.DeploymentConfig{name: dep}
 	scoped.Config = scopedCfg
-	return &scoped, nil
+	return &scoped, ""
+}
+
+// configuredDeploymentsHint renders the remediation for a deployment
+// name that matched nothing in the CONFIG: the names that do exist, or
+// a pointer at setup when there are none.
+//
+// Distinct from knownDeploymentsHint in deployment_filter.go, which
+// answers the same question for the names present in a REPOSITORY.
+func configuredDeploymentsHint(cfg *config.LoadResult) string {
+	if cfg == nil {
+		return "no configuration was loaded; run `pg_hardstorage init` to set one up"
+	}
+	known := make([]string, 0, len(cfg.Config.Deployments))
+	for n := range cfg.Config.Deployments {
+		known = append(known, n)
+	}
+	if len(known) == 0 {
+		return "no deployments are configured; run `pg_hardstorage init`, or pass --repo / --pg-connection explicitly"
+	}
+	sort.Strings(known)
+	return "check the spelling — configured deployments are: " + strings.Join(known, ", ")
 }
 
 // pgLivenessReport is the answer to the question every `barman check

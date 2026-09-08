@@ -117,9 +117,11 @@ Barman 3.20.0 and WAL-G, plus a 32-cell / 2 h chaos soak.
   always been advertised; every probe walked the whole fleet, so the
   answer to "is db1 healthy?" was a fleet verdict — and
   `barman check <server>`, which dispatches straight to it, inherited
-  that. `doctor` now scopes to the named deployment, and an unknown
-  name is a `notfound.deployment` usage error rather than a report
-  about nothing.
+  that. `doctor` now scopes to the named deployment. A name that
+  matches nothing still reports — an unconfigured host is exactly
+  where doctor earns its keep — but says so with a
+  `doctor.unknown_deployment` warning naming the deployments that do
+  exist.
 
 - **`doctor` never connected to PostgreSQL.** It inspected paths,
   repositories, keys and manifests — everything except the database.
