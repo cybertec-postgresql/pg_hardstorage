@@ -13,6 +13,10 @@ import (
 
 func TestCheckpointStorm_DispatchesSuViaPsqlLoop(t *testing.T) {
 	ts, _, pg, _ := fixtureSet(t)
+	// The script echoes how many CHECKPOINTs actually ran, and Apply
+	// refuses a storm that ran none — see
+	// TestCheckpointStorm_ZeroCheckpointsIsAFailure.
+	pg.ExecDefault = []byte("5\n")
 	_, err := inject.DefaultRegistry.Apply(context.Background(),
 		"checkpoint_storm(target=pg, count=5)", ts)
 	if err != nil {
@@ -43,6 +47,28 @@ func TestCheckpointStorm_DispatchesSuViaPsqlLoop(t *testing.T) {
 	}
 }
 
+// TestCheckpointStorm_ZeroCheckpointsIsAFailure pins the fault's
+// honesty.
+//
+// The loop swallowed every psql failure with `|| true` and exited 0
+// regardless, so a storm could apply as a COMPLETE no-op — wrong OS
+// user, no psql in the image, PG down — while the report recorded it
+// as applied. Any correlation later drawn between "checkpoint_storm
+// fired" and an observed behaviour was then unfounded in both
+// directions. The script now counts successes and Apply refuses zero.
+func TestCheckpointStorm_ZeroCheckpointsIsAFailure(t *testing.T) {
+	ts, _, pg, _ := fixtureSet(t)
+	pg.ExecDefault = []byte("0\n")
+	_, err := inject.DefaultRegistry.Apply(context.Background(),
+		"checkpoint_storm(target=pg, count=5)", ts)
+	if err == nil {
+		t.Fatal("a storm where no CHECKPOINT succeeded must not report success")
+	}
+	if !strings.Contains(err.Error(), "no-op") {
+		t.Errorf("error should say the fault applied as a no-op; got %v", err)
+	}
+}
+
 func TestCheckpointStorm_BadCountRejected(t *testing.T) {
 	ts, _, _, _ := fixtureSet(t)
 	_, err := inject.DefaultRegistry.Apply(context.Background(),
@@ -54,6 +80,7 @@ func TestCheckpointStorm_BadCountRejected(t *testing.T) {
 
 func TestCheckpointStorm_SleepMsInjected(t *testing.T) {
 	ts, _, pg, _ := fixtureSet(t)
+	pg.ExecDefault = []byte("3\n")
 	_, err := inject.DefaultRegistry.Apply(context.Background(),
 		"checkpoint_storm(target=pg, count=3, sleep_ms=250)", ts)
 	if err != nil {

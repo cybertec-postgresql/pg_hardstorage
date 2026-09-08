@@ -36,8 +36,8 @@ infrastructure that surrounds it. Dockerfiles here are referenced from
 
 ## Read next
 
-- `../deploy/docker/README.md` — the canonical runtime image (not in this
-  tree)
+- `../deploy/README.md` — the canonical runtime image, built from
+  `../deploy/docker/Dockerfile` (not in this tree)
 - `../packaging/README.md` — the package recipes the `pkg-build/` images
   consume
 - `../test/scenarios/README.md` — the L1–L8 tiers that schedule the

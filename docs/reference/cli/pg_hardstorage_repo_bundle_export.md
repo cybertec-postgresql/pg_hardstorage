@@ -24,7 +24,7 @@ pg_hardstorage repo bundle export [flags]
       --backup-id string    single backup to export (default: every live backup for the deployment)
       --deployment string   deployment to export (required)
   -h, --help                help for export
-      --include-wal         also include WAL segments listed in each manifest's wal_required
+      --include-wal         also include the WAL segments each manifest lists in wal_required. NOTE: nothing populates wal_required at backup time yet, so on a repository written by this build the export refuses rather than produce base backups with no WAL to replay
       --out string          output path for the .tar bundle (required)
       --repo string         source repository URL (required)
 ```

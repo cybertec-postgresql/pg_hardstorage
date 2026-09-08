@@ -23,29 +23,38 @@ import (
 //	archive_command = 'barman-wal-archive db1 %p'
 func NewWALArchiveRoot(stdout, stderr io.Writer) *cobra.Command {
 	c := &cobra.Command{
-		Use:   "barman-wal-archive <barman-host> <server-name> <wal-path>",
+		Use:   "barman-wal-archive [<barman-host>] <server-name> <wal-path>",
 		Short: "Archive one PostgreSQL WAL segment (Barman compat)",
 		Long: `barman-wal-archive is invoked by PostgreSQL's archive_command
 during normal operation.  In the pg_hardstorage shim, it dispatches
 the segment into the native repository via 'pg_hardstorage wal push'.
 
-Real barman-wal-archive takes three positionals — BARMAN_HOST,
-SERVER_NAME, and WAL_PATH:
+BOTH real-world argv shapes are accepted:
 
-	archive_command = 'barman-wal-archive backup.internal db1 %p'
+	archive_command = 'barman-wal-archive db1 %p'                     # 2 args
+	archive_command = 'barman-wal-archive backup.internal db1 %p'     # 3 args
 
-BARMAN_HOST is the SSH target the upstream tool ships the segment to;
-the shim archives straight into the configured repository over libpq,
-so BARMAN_HOST is accepted for argv compatibility and ignored. The
-SERVER_NAME positional is the deployment and WAL_PATH is the segment.
+The 2-argument form (SERVER_NAME, WAL_PATH) is the classic shape that
+sits in most existing postgresql.conf files. The 3-argument form adds
+BARMAN_HOST first: that is the SSH target the upstream tool ships the
+segment to, and since the shim archives straight into the configured
+repository over libpq, it is accepted for argv compatibility and
+ignored.
 
 Re-archives of an already-committed segment are no-ops; PG's retry
 loop is safe.`,
-		Args: cobra.ExactArgs(3),
+		// 2 or 3 positionals. Requiring exactly 3 broke the single most
+		// common drop-in point there is: an existing archive_command
+		// written in the 2-arg form failed immediately with
+		// "accepts 3 arg(s), received 2" — and PostgreSQL retries a
+		// failing archive_command forever, so WAL piled up.
+		Args: cobra.RangeArgs(2, 3),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			// args[0] = BARMAN_HOST (SSH target — ignored by the shim),
-			// args[1] = SERVER_NAME (deployment), args[2] = WAL_PATH.
-			server, segPath := args[1], args[2]
+			// 3-arg: BARMAN_HOST (SSH target — ignored by the shim),
+			// SERVER_NAME, WAL_PATH. 2-arg: SERVER_NAME, WAL_PATH.
+			// The trailing two positionals are the same in both, so
+			// read from the end rather than branching on length.
+			server, segPath := args[len(args)-2], args[len(args)-1]
 			// wal push derives system_identifier from the segment
 			// header (issue #8) so --pg-connection is unnecessary.
 			// Skip it from config so a deployment without a

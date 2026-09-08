@@ -1,8 +1,9 @@
 # api
 
 External-facing API contracts in their canonical, hand-maintained form. Today:
-the OpenAPI 3.1 spec for the REST control plane. Future: Kubernetes CRDs (v0.5
-roadmap, not yet built).
+the OpenAPI 3.1 spec for the REST control plane. Future: the generic Kubernetes
+CRDs (`pghardstorage.org/v1` — `HSDeployment`, `HSBackup`, `HSRestore`,
+`HSSchedule`), still planned and not yet built.
 
 ## What lives here
 
@@ -29,8 +30,9 @@ treated as a release-blocking bug; see `../docs/SPEC_DRIFT.md`.
 
 ## Don't put X here
 
-- Kubernetes CRDs — slated for the v0.5 roadmap; they will land here as YAML
-  manifests once the controller story is decided.
+- Kubernetes CRDs — still on the roadmap; they will land here as YAML
+  manifests once the controller story is decided. See
+  `../docs/how-to/kubernetes/cnpg-i-provider.md`.
 - Generated SDKs — consumers can generate from `openapi.yaml`; we don't ship
   them.
 - Internal RPC shapes — those belong in `../proto/` or stay package-private

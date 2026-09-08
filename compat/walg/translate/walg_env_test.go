@@ -79,11 +79,19 @@ func TestTranslate_HappyPath(t *testing.T) {
 		// Deployments are emitted as a mapping keyed by name (config.Load
 		// decodes `deployments:` as map[string]DeploymentConfig with
 		// KnownFields(true)), not a `- name:` sequence item.
-		"  db1.example.com:",
+		// The deployment name is derived from PGHOST, and a dotted
+		// FQDN is NOT a legal deployment name
+		// (internal/config: [a-zA-Z][a-zA-Z0-9_-]{1,63}). Emitting
+		// "db1.example.com" verbatim produced a file the loader
+		// rejected, with nothing in the output saying why — so the
+		// name is sanitized and the rewrite is warned about.
+		"  db1_example_com:",
 		"pg_connection: \"postgres://pgbackup@db1.example.com:5432/postgres\"",
 		"repo: \"s3://acme-pg-backups/wal-g\"",
-		// libsodium triggers the encryption stub.
-		"encryption:",
+		// libsodium triggers the KEK stub. kek_ref is a FLAT field on
+		// the deployment: there is no `encryption:` block in
+		// config.DeploymentConfig, and emitting one made the file
+		// unloadable.
 		"kek_ref: \"local:default\"",
 		// lz4 emits a comment.
 		"WALG_COMPRESSION_METHOD=lz4 ignored",
@@ -98,6 +106,9 @@ func TestTranslate_HappyPath(t *testing.T) {
 	wantWarn := []string{
 		"AWS credentials",
 		"WAL-G envelope (libsodium/GPG/PGP) is not honoured",
+		// The sanitized name must be explained, with the override
+		// that lets the operator pick their own.
+		"PG_HARDSTORAGE_DEPLOYMENT",
 		"WALG_COMPRESSION_METHOD=lz4 ignored",
 	}
 	for _, w := range wantWarn {

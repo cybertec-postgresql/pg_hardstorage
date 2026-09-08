@@ -35,11 +35,12 @@ func TestSampleBarmanConfRoundTrip(t *testing.T) {
 		// conninfo -> pg_connection (the native field name); the paired
 		// streaming_conninfo collapses onto the same key (see below).
 		`pg_connection: "host=db1.example.com user=barman dbname=postgres"`,
-		"slot:",
-		"name: barman_db1",
-		"parallelism: 4",
-		"compression:",
-		"algorithm: zstd",
+		// slot / parallelism / compression / backup are NOT
+		// config.DeploymentConfig fields. Emitting them made every
+		// translated barman.conf fail to load (the loader decodes with
+		// KnownFields(true)), so each is now a drop-with-note: the
+		// value survives as a comment naming the native equivalent,
+		// and the file loads. See compat/translate_loads_test.go.
 		"retention:",
 		// RECOVERY WINDOW OF 7 DAYS -> time.ParseDuration-compatible 168h
 		// (the agent rejects "7 days"); REDUNDANCY 4 -> keep_fulls (the
@@ -48,8 +49,19 @@ func TestSampleBarmanConfRoundTrip(t *testing.T) {
 		"keep_fulls: 4",
 		`repo: "file:///var/lib/barman/db1"`,
 		`repo: "file:///mnt/nfs/barman/db2-reporting"`,
-		"backup:",
-		"fast: false",
+	}
+
+	// The dropped keys must still be TRACEABLE: the operator has to be
+	// able to see what their barman.conf asked for and where it went.
+	for _, note := range []string{
+		"slot_name = barman_db1",
+		"parallel_jobs = 4",
+		"compression = ",
+		"immediate_checkpoint = ",
+	} {
+		if !strings.Contains(got.YAML, note) {
+			t.Errorf("dropped setting %q left no trace in the YAML\n--- yaml ---\n%s", note, got.YAML)
+		}
 	}
 	for _, want := range mustContain {
 		if !strings.Contains(got.YAML, want) {

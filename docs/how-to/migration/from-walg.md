@@ -47,10 +47,28 @@ tags:
 | `backup-fetch`          | `pg_hardstorage restore`           |
 | `wal-push`              | `agent` mode WAL streaming via slot |
 | `wal-fetch`             | `wal fetch` for one-off retrieval  |
-| Delta backup            | Incremental backup                 |
+| Delta backup            | Incremental backup — **PG 17+ with `summarize_wal = on` only**, see below |
 | `WALG_DELTA_MAX_STEPS`  | Implicit: incrementals roll back to nearest full automatically |
-| `WALG_LIBSODIUM_KEY`    | KMS envelope (`encryption.kek_ref` per manifest) |
-| `WALG_COMPRESSION_METHOD` | `compression:` config            |
+| `WALG_LIBSODIUM_KEY`    | KMS envelope: set `kek_ref:` on the deployment (recorded per manifest as `encryption.kek_ref`) |
+| `WALG_COMPRESSION_METHOD` | none — native compresses chunks with zstd; not configurable per deployment |
+
+!!! warning "`backup-push` deltas need PostgreSQL 17+ with `summarize_wal = on`"
+
+    WAL-G's delta is tool-level: wal-g diffs pages itself and asks the
+    server for nothing, so `wal-g backup-push` works on every
+    PostgreSQL version.  `pg_hardstorage` uses **PostgreSQL's own**
+    incremental protocol, which needs **PG 17+** *and*
+    `summarize_wal = on` (off by default; a SIGHUP reload is enough).
+
+    The shim probes the server before each `backup-push` and takes a
+    **full** backup, with a warning on stderr, when either
+    prerequisite is missing — so the canonical `wal-g backup-push
+    $PGDATA` keeps working on PG 15 / 16 and on an unconfigured PG 17.
+    Pass `--full` to skip the probe and always take a full.
+
+    A full is not the cost it sounds like: every backup is
+    content-addressed and deduplicated against the repository, so a
+    full stores roughly what a delta would.
 
 ## What you need
 
@@ -76,7 +94,7 @@ and dispatches to native pg_hardstorage commands.
 #    .env file (or your /etc/default/wal-g) and emits YAML.
 pg_hardstorage compat translate --from walg \
     /etc/default/wal-g \
-    --output /etc/pg_hardstorage/pg_hardstorage.yaml
+    --out-file /etc/pg_hardstorage/pg_hardstorage.yaml
 
 # 3. Review the YAML — every unmapped WALG_ setting surfaces
 #    as a comment + on stderr.

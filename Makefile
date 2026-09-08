@@ -738,8 +738,9 @@ sync-llm-docs:
 # ./docs/ and builds with MkDocs Material.  See
 # docs/DOC_PLAN.md for the design + IA + tooling decisions.
 #
-# The site builds without a public domain — set site_url
-# in mkdocs.yml when one lands.
+# site_url in mkdocs.yml points at the published site,
+# https://docs.pghardstorage.org (docs/CNAME pins the Pages
+# custom domain); the project home is www.pghardstorage.org.
 
 # docs-deps installs the Python toolchain into a project-
 # local venv.  Idempotent.  CI installs the same set via

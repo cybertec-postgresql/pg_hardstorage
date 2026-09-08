@@ -26,8 +26,8 @@ The matching builder containers live in `../dockerfiles/pkg-build/`.
   per convention)
 - `../dockerfiles/pkg-build/` — the container images that exercise these
   recipes in CI
-- `../dockerfiles/testbed/README.md` — distro-matrix testbeds that install the
-  produced packages
+- `../dockerfiles/README.md` — the `testbed/` distro-matrix images that
+  install the produced packages
 
 ## Don't put X here
 

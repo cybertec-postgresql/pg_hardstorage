@@ -326,11 +326,14 @@ nav:
   - Documentation plan: DOC_PLAN.md
   - SPEC drift (eng follow-ups): SPEC_DRIFT.md
 
-# Top-level extras: footer, social, copyright.  Designed to
-# light up cleanly when a domain lands; today they're modest
-# repo-pointer links.
+# Top-level extras: footer, social, copyright.  The domain has
+# landed: these point at the project home (www.pghardstorage.org),
+# the repo, and the maintainer.
 extra:
   social:
+    - icon: fontawesome/solid/house
+      link: https://www.pghardstorage.org/
+      name: pg_hardstorage project home
     - icon: fontawesome/brands/github
       link: https://github.com/cybertec-postgresql/pg_hardstorage
       name: pg_hardstorage on GitHub

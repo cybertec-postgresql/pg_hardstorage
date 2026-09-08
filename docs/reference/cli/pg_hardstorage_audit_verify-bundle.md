@@ -16,7 +16,16 @@ Verify a signed audit evidence bundle
 
 ### Synopsis
 
-Asserts the bundle's ed25519 signature is valid + the chain segment is contiguous. Returns the bundle manifest on success.
+Asserts the bundle's ed25519 signature is valid, that its recorded
+signer fingerprint matches the key that validated it, that every event
+in events.ndjson re-hashes to its recorded value, and — when the
+bundled segment is sequence-contiguous — that each event's prev_hash
+links to the one before it.
+
+A bundle exported with filters holds a NON-contiguous slice of the
+chain, so linkage cannot be asserted from the bundle alone; the result
+reports that explicitly rather than implying a contiguity it did not
+check. Returns the bundle manifest on success.
 
 ```
 pg_hardstorage audit verify-bundle <path> [flags]

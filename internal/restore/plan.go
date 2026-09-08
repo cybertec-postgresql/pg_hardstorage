@@ -134,8 +134,7 @@ func Preview(ctx context.Context, opts PlanOptions) (*Plan, error) {
 	store := backup.NewManifestStore(sp)
 	m, err := store.Read(ctx, opts.Deployment, opts.BackupID, opts.Verifier)
 	if err != nil {
-		return nil, fmt.Errorf("plan: read manifest %s/%s: %w",
-			opts.Deployment, opts.BackupID, err)
+		return nil, mapManifestReadErr("plan", opts.Deployment, opts.BackupID, err)
 	}
 
 	p := &Plan{

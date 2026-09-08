@@ -2,7 +2,8 @@
 
 > PostgreSQL backup, done right.
 
-[![CI](https://github.com/cybertec-postgresql/pg_hardstorage/actions/workflows/ci.yml/badge.svg)](https://github.com/cybertec-postgresql/pg_hardstorage/actions/workflows/ci.yml)
+[![Website](https://img.shields.io/badge/website-pghardstorage.org-0a7ea4)](https://www.pghardstorage.org/)
+[![Docs](https://img.shields.io/badge/docs-docs.pghardstorage.org-0a7ea4)](https://docs.pghardstorage.org)
 [![Release](https://img.shields.io/github/v/release/cybertec-postgresql/pg_hardstorage?display_name=tag&sort=semver)](https://github.com/cybertec-postgresql/pg_hardstorage/releases)
 [![Go Reference](https://pkg.go.dev/badge/github.com/cybertec-postgresql/pg_hardstorage.svg)](https://pkg.go.dev/github.com/cybertec-postgresql/pg_hardstorage)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
@@ -22,6 +23,9 @@ Everything happens over the **PostgreSQL replication protocol on an
 ordinary libpq connection** — the agent never needs OS access to the
 database host, and the same binary scales from a laptop to a
 100 TB production fleet.
+
+Project home: **<https://www.pghardstorage.org/>** · documentation:
+**<https://docs.pghardstorage.org>**.
 
 Maintained by **[CYBERTEC PostgreSQL International GmbH](https://www.cybertec-postgresql.com)**.
 
@@ -374,7 +378,9 @@ schema is `pg_hardstorage.v1` with a 24-month back-compat commitment.
 
 ## Documentation
 
-The doc site is [Diátaxis](https://diataxis.fr/)-organised — every
+The rendered documentation site is **<https://docs.pghardstorage.org>**
+— the same pages the `docs/` tree below holds, with search and
+cross-linking. It is [Diátaxis](https://diataxis.fr/)-organised — every
 page is one of *tutorial / how-to / reference / explanation*.
 
 | Quadrant | What lives there |
@@ -388,6 +394,9 @@ Plus the [operations handbook](docs/operations/index.md), the
 [compliance docs](docs/compliance/index.md), the
 [3am-operator runbooks](docs/reference/runbooks/index.md), the
 [FAQ](docs/faq.md) and the [glossary](docs/glossary.md).
+
+Project news, releases and background live on the project site,
+<https://www.pghardstorage.org/>.
 
 ---
 

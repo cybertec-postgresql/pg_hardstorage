@@ -111,8 +111,10 @@ func Translate(env *EnvFile) (*Result, error) {
 	b.WriteString("deployments:\n")
 
 	name := env.KV["PG_HARDSTORAGE_DEPLOYMENT"]
+	derived := false
 	if name == "" {
 		name = env.KV["PGHOST"]
+		derived = name != ""
 	}
 	if name == "" {
 		name = "default"
@@ -120,6 +122,21 @@ func Translate(env *EnvFile) (*Result, error) {
 	// Strip any port artefact from PGHOST.
 	if i := strings.IndexAny(name, ":/"); i >= 0 {
 		name = name[:i]
+	}
+	// A deployment name must match [a-zA-Z][a-zA-Z0-9_-]{1,63}
+	// (internal/config.validDeploymentNameRegexp). Production WAL-G
+	// hosts are dotted FQDNs — "db.prod.internal" would be emitted
+	// verbatim and then rejected by the loader, with nothing in the
+	// output explaining why. Sanitize, and tell the operator both that
+	// we did and how to choose the name themselves.
+	if sanitized := sanitizeDeploymentName(name); sanitized != name {
+		out.Warnings = append(out.Warnings,
+			fmt.Sprintf("deployment name %q is not a legal deployment name (must match [a-zA-Z][a-zA-Z0-9_-]{1,63}); using %q — set PG_HARDSTORAGE_DEPLOYMENT to choose your own",
+				name, sanitized))
+		name = sanitized
+	} else if derived {
+		out.Warnings = append(out.Warnings,
+			fmt.Sprintf("deployment name %q was derived from PGHOST; set PG_HARDSTORAGE_DEPLOYMENT to choose your own", name))
 	}
 	// config.Load decodes `deployments:` as map[string]DeploymentConfig
 	// (KnownFields(true)), so the deployment must be a MAPPING keyed by
@@ -198,12 +215,11 @@ func Translate(env *EnvFile) (*Result, error) {
 	}
 	if encrypted {
 		fmt.Fprintln(&b, "    # WAL-G encryption (libsodium / GPG / PGP) is not byte-compatible with native AES-256-GCM.")
-		fmt.Fprintln(&b, "    # Configure encryption.kek_ref before activating; existing WAL-G backups stay readable by `wal-g`.")
-		fmt.Fprintln(&b, "    encryption:")
-		fmt.Fprintln(&b, "      kek_ref: \"local:default\"")
-		fmt.Fprintln(&b, "      passphrase_env: PG_HARDSTORAGE_KEK_PASSPHRASE")
+		fmt.Fprintln(&b, "    # kek_ref is a FLAT field on the deployment (there is no `encryption:` block);")
+		fmt.Fprintln(&b, "    # provision the key before activating. Existing WAL-G backups stay readable by `wal-g`.")
+		fmt.Fprintln(&b, "    kek_ref: \"local:default\"")
 		out.Warnings = append(out.Warnings,
-			"["+name+"] WAL-G envelope (libsodium/GPG/PGP) is not honoured; configure encryption.kek_ref")
+			"["+name+"] WAL-G envelope (libsodium/GPG/PGP) is not honoured; configure kek_ref")
 	}
 
 	// Compression
@@ -245,4 +261,33 @@ func sortedKeys(m map[string]string) []string {
 	}
 	sort.Strings(keys)
 	return keys
+}
+
+// sanitizeDeploymentName coerces a derived name into the shape
+// internal/config accepts: [a-zA-Z][a-zA-Z0-9_-]{1,63}.  Dots and any
+// other illegal byte become "_", a leading non-letter is prefixed, and
+// the result is truncated to 64 bytes.  Returns the input unchanged
+// when it is already legal, so callers can detect that they had to
+// rewrite it.
+func sanitizeDeploymentName(name string) string {
+	var b strings.Builder
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '_', r == '-':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('_')
+		}
+	}
+	out := b.String()
+	if out == "" {
+		return "default"
+	}
+	if c := out[0]; !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z') {
+		out = "d" + out
+	}
+	if len(out) > 63 {
+		out = out[:63]
+	}
+	return out
 }

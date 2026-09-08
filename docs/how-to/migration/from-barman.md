@@ -63,7 +63,7 @@ tags:
 # 2. Translate your existing barman.conf in one shot.
 pg_hardstorage compat translate --from barman \
     /etc/barman.conf \
-    --output /etc/pg_hardstorage/pg_hardstorage.yaml
+    --out-file /etc/pg_hardstorage/pg_hardstorage.yaml
 
 # 3. Review the YAML — every unmapped Barman setting
 #    surfaces as a comment + on stderr.  Multi-server

@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -101,15 +102,25 @@ type DockerCellRuntime struct {
 	sustainedDone      chan struct{}
 	walPreCount        int64 // pg_stat_wal.wal_bytes at writer start; 0 = not sampled
 
-	// WAL-stream sidecar state.  Same shape as the sustained
-	// writer — backgrounded `docker exec pg_hardstorage wal
-	// stream` whose lifecycle is bracketed by
-	// StartWALStream / StopWALStream.
-	walStreamCmd    *exec.Cmd
-	walStreamStdout *bytes.Buffer
-	walStreamStderr *bytes.Buffer
-	walStreamCancel context.CancelFunc
-	walStreamDone   chan struct{}
+	// WAL-stream sidecar state.  Unlike the sustained writer,
+	// this one is SUPERVISED: `docker exec` dies with the
+	// container, and the soak kills containers on purpose, so a
+	// one-shot exec would silently be gone for the rest of the
+	// cell.  walStreamSupervisor owns the restart loop; the
+	// mutex guards the fields it writes from the reader in
+	// StopWALStream.
+	walStreamMu       sync.Mutex
+	walStreamStdout   *bytes.Buffer
+	walStreamStderr   *bytes.Buffer
+	walStreamCancel   context.CancelFunc
+	walStreamDone     chan struct{}
+	walStreamRunning  bool
+	walStreamRestarts int
+	// walStreamLastExit records when the sidecar most recently
+	// stopped running, so StopWALStream can tell "died and was
+	// restarted" from "still up at teardown".
+	walStreamLastExit time.Time
+	walStreamUp       bool
 }
 
 // NewDockerCellRuntime builds a DockerCellRuntime from a fleet
@@ -813,38 +824,100 @@ func (d *DockerCellRuntime) StopSustainedLoad(ctx context.Context) (*report.Load
 // the whole point of the soak is to exercise the production
 // archiving path.
 func (d *DockerCellRuntime) StartWALStream(ctx context.Context) error {
-	if d.walStreamCmd != nil {
+	d.walStreamMu.Lock()
+	if d.walStreamRunning {
+		d.walStreamMu.Unlock()
 		return errors.New("StartWALStream: already running")
 	}
-	bgCtx, cancel := context.WithCancel(context.Background())
-	// `-u pgbackup` so the agent runs as the dedicated non-root
-	// system user — the CLI gate at internal/cli/refuse_root.go
-	// rejects euid 0 outright.  Matches production posture; the
-	// testbed Dockerfile creates pgbackup at build time.
-	full := []string{"exec", "-u", "pgbackup", d.Container,
-		d.AgentBinary, "wal", "stream", d.Deployment,
-		"--pg-connection", d.containerDSN(),
-		"--repo", d.RepoURL,
-	}
-	cmd := exec.CommandContext(bgCtx, d.dockerBin(), full...)
+	d.walStreamRunning = true
 	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	if err := cmd.Start(); err != nil {
-		cancel()
-		return fmt.Errorf("wal stream: start: %w", err)
-	}
-
-	d.walStreamCmd = cmd
 	d.walStreamStdout = &stdout
 	d.walStreamStderr = &stderr
+	bgCtx, cancel := context.WithCancel(context.Background())
 	d.walStreamCancel = cancel
 	d.walStreamDone = make(chan struct{})
-	go func() {
-		_ = cmd.Wait()
-		close(d.walStreamDone)
-	}()
+	d.walStreamRestarts = 0
+	d.walStreamUp = false
+	done := d.walStreamDone
+	d.walStreamMu.Unlock()
+
+	go d.superviseWALStream(bgCtx, done, &stdout, &stderr)
 	return nil
+}
+
+// walStreamRestartDelay is how long the supervisor waits before
+// re-attaching after the sidecar exits.  Long enough that a container
+// coming back from `docker start` has its entrypoint running, short
+// enough that the gap does not dominate a 2h cell.
+const walStreamRestartDelay = 2 * time.Second
+
+// superviseWALStream keeps a `wal stream` sidecar attached to the cell
+// for as long as the supervisor context lives.
+//
+// The sidecar is a `docker exec` into the lead container, so it dies
+// whenever the container does — and killing containers is exactly what
+// the soak's `signal` fault primitive does (`docker kill -s N` followed
+// by `docker start`). With a one-shot exec, the FIRST signal fault in a
+// cell ended continuous WAL archiving for the rest of that cell's run:
+// 30 of 32 cells in the 2h soak took at least one signal fault, so the
+// feature the soak exists to exercise was unmeasured almost everywhere.
+// The tell was in the report all along — cells whose first signal fired
+// early carried 1.3-2.3 GB of wal_repo_lag_bytes against 33-67 MB for
+// cells that took no signal, and 7 of 32 deployments had no WAL
+// segments in the repo at all. That was read as "the streamer fell
+// behind"; the streamer was not there.
+//
+// Restarts are counted rather than merely retried: a cell whose sidecar
+// had to be re-attached ten times is telling you something about the
+// fault schedule, and StopWALStream reports it.
+func (d *DockerCellRuntime) superviseWALStream(ctx context.Context, done chan struct{}, stdout, stderr *bytes.Buffer) {
+	defer close(done)
+	first := true
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		if !first {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(walStreamRestartDelay):
+			}
+			d.walStreamMu.Lock()
+			d.walStreamRestarts++
+			d.walStreamMu.Unlock()
+		}
+		first = false
+
+		// `-u pgbackup` so the agent runs as the dedicated non-root
+		// system user — the CLI gate at internal/cli/refuse_root.go
+		// rejects euid 0 outright.  Matches production posture; the
+		// testbed Dockerfile creates pgbackup at build time.
+		full := []string{"exec", "-u", "pgbackup", d.Container,
+			d.AgentBinary, "wal", "stream", d.Deployment,
+			"--pg-connection", d.containerDSN(),
+			"--repo", d.RepoURL,
+		}
+		cmd := exec.CommandContext(ctx, d.dockerBin(), full...)
+		cmd.Stdout = stdout
+		cmd.Stderr = stderr
+		if err := cmd.Start(); err != nil {
+			// The container is probably down mid-fault. Loop and
+			// retry; the delay above bounds the spin.
+			continue
+		}
+
+		d.walStreamMu.Lock()
+		d.walStreamUp = true
+		d.walStreamMu.Unlock()
+
+		_ = cmd.Wait()
+
+		d.walStreamMu.Lock()
+		d.walStreamUp = false
+		d.walStreamLastExit = time.Now()
+		d.walStreamMu.Unlock()
+	}
 }
 
 // StopWALStream terminates the streamer and computes the lag
@@ -854,7 +927,10 @@ func (d *DockerCellRuntime) StartWALStream(ctx context.Context) error {
 // unbounded value here is the signal that the streamer fell
 // behind the source under load.
 func (d *DockerCellRuntime) StopWALStream(ctx context.Context) (*report.LoadStats, error) {
-	if d.walStreamCmd == nil {
+	d.walStreamMu.Lock()
+	running := d.walStreamRunning
+	d.walStreamMu.Unlock()
+	if !running {
 		return nil, nil
 	}
 	// Compute lag BEFORE killing the streamer — once it's
@@ -874,17 +950,35 @@ func (d *DockerCellRuntime) StopWALStream(ctx context.Context) (*report.LoadStat
 		stats.WALSegmentsCommitted = segs
 	}
 
+	// Read the supervisor's view BEFORE cancelling it, so
+	// "was the sidecar up at teardown?" is the answer for the run
+	// rather than for the moment after we killed it.
+	//
+	// The distinction the old code could not make: a sidecar that
+	// exited early and stayed dead looked identical, in the report, to
+	// one that was healthy right up to teardown — both simply had a
+	// lag number. Now a cell that spent the run reconnecting says so.
+	d.walStreamMu.Lock()
+	stats.WALStreamRestarts = d.walStreamRestarts
+	stats.WALStreamUpAtStop = d.walStreamUp
+	if !d.walStreamUp && !d.walStreamLastExit.IsZero() {
+		stats.WALStreamDownFor = time.Since(d.walStreamLastExit).Round(time.Second).String()
+	}
+	d.walStreamMu.Unlock()
+
 	d.walStreamCancel()
 	select {
 	case <-d.walStreamDone:
 	case <-time.After(5 * time.Second):
 	}
 
-	d.walStreamCmd = nil
+	d.walStreamMu.Lock()
+	d.walStreamRunning = false
 	d.walStreamStdout = nil
 	d.walStreamStderr = nil
 	d.walStreamCancel = nil
 	d.walStreamDone = nil
+	d.walStreamMu.Unlock()
 	return stats, nil
 }
 

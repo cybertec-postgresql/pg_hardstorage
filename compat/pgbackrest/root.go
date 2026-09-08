@@ -17,11 +17,14 @@
 package pgbackrest
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
 
 	"github.com/spf13/cobra"
+
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/version"
 )
 
 // NewRoot returns the cobra command tree exposed by
@@ -59,6 +62,29 @@ playbook.`,
 	// reads what it needs via mapToNativeArgs.
 	registerCommonFlags(root.PersistentFlags())
 
+	// pgBackRest answers `--version` with rc=0 and a version line, and
+	// monitoring / upgrade-verification scripts probe exactly that.
+	// The shim used to answer "unknown flag: --version" (rc=1), which
+	// reads as a broken binary.
+	var showVersion bool
+	root.PersistentFlags().BoolVar(&showVersion, "version", false,
+		"print the pg_hardstorage version behind this shim and exit")
+
+	// Every verb inherits the refused-flag gate: a flag we register so
+	// the command line parses, but whose effect we must not silently
+	// drop, refuses by name with the native remediation.
+	root.PersistentPreRunE = func(cmd *cobra.Command, _ []string) error {
+		if showVersion {
+			// Shape mirrors pgBackRest's own one-line answer, with the
+			// shim named so triage can tell what it is actually talking
+			// to.
+			fmt.Fprintf(stdoutWriter, "pg-hardstorage-pgbackrest %s (pgBackRest-compatible shim for pg_hardstorage %s)\n",
+				version.Version, version.Version)
+			return errVersionPrinted
+		}
+		return checkRefusedFlags(cmd.Flags())
+	}
+
 	// Suppress cobra's default `help` and `completion`
 	// children — pgBackRest doesn't have them and we don't
 	// want shim users to see surface area that isn't real.
@@ -86,6 +112,9 @@ playbook.`,
 		}
 		return refuseUnknown(args[0])
 	}
+	// A bare `pgbackrest --version` has no verb, so PersistentPreRunE
+	// runs against the root itself and returns errVersionPrinted
+	// before RunE would print help.
 	root.Args = cobra.ArbitraryArgs
 
 	return root
@@ -100,11 +129,20 @@ playbook.`,
 func Execute() int {
 	root := NewRoot()
 	if err := root.Execute(); err != nil {
+		// --version already wrote its line to stdout; the sentinel only
+		// exists to stop cobra continuing into a verb.
+		if errors.Is(err, errVersionPrinted) {
+			return 0
+		}
 		fmt.Fprintln(os.Stderr, err)
 		return ExitCode(err)
 	}
 	return 0
 }
+
+// errVersionPrinted unwinds cobra after `--version` has printed. It is
+// never shown to the operator.
+var errVersionPrinted = errors.New("version printed")
 
 // notImplementedExitCode is what every refusal returns —
 // kept consistent with the Barman shim so wrapper scripts
@@ -141,12 +179,30 @@ func ExitCode(err error) int {
 //	pg-hardstorage-pgbackrest: <command>: not implemented
 //	in v1.1; native equivalent: <suggestion>
 func refuseUnknown(command string) error {
+	suggestion := "pg_hardstorage --help"
+	if s, ok := unknownVerbHints[command]; ok {
+		suggestion = s
+	}
 	return &shimError{
 		exitCode: notImplementedExitCode,
 		message: fmt.Sprintf(
-			"pg-hardstorage-pgbackrest: %s: not implemented in v1.1; native equivalent: pg_hardstorage --help",
-			command),
+			"pg-hardstorage-pgbackrest: %s: not implemented in v1.1; native equivalent: %s",
+			command, suggestion),
 	}
+}
+
+// unknownVerbHints names the native equivalent for pgBackRest verbs
+// the shim does not translate but whose mapping is already known —
+// `pg_hardstorage --help` is a true answer, but not a useful one when
+// the migration guide already says exactly where the verb went.
+var unknownVerbHints = map[string]string{
+	"expire":         "pg_hardstorage rotate <deployment> --policy <gfs|simple|count> --apply",
+	"stanza-delete":  "pg_hardstorage repo gc, or remove the deployment from pg_hardstorage.yaml",
+	"stanza-upgrade": "no equivalent needed; the repository format is self-describing across PG majors",
+	"start":          "no equivalent; pg_hardstorage has no per-stanza stop/start latch",
+	"stop":           "no equivalent; pg_hardstorage has no per-stanza stop/start latch",
+	"repo-ls":        "pg_hardstorage list <deployment>",
+	"repo-get":       "pg_hardstorage manifest show <deployment> <backup-id>",
 }
 
 // refuseFlag is the same idea for an unsupported flag inside
@@ -162,3 +218,7 @@ func refuseFlag(flag, suggestion string) error {
 
 // stderrWriter resolves to os.Stderr unless overridden in tests.
 var stderrWriter io.Writer = os.Stderr
+
+// stdoutWriter resolves to os.Stdout unless overridden in tests.
+// `--version` writes here: monitoring scripts capture stdout.
+var stdoutWriter io.Writer = os.Stdout

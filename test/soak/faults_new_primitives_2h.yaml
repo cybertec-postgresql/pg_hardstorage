@@ -33,6 +33,36 @@
 #     is the success signal.  A verify_ok immediately following a
 #     manifest/wal corruption hit on the same backup would mean
 #     the product MISSED the corruption (test FAIL).
+#   - backup_refused_source_corruption is likewise EXPECTED, and is
+#     NOT a backup_failed.  See the PG-version note below.
+#
+# PG-version note for torn_page (why "0 backup_failed" needs the
+# clause above):
+#
+#   PostgreSQL 18 verifies page checksums during BASE_BACKUP; 15-17
+#   do not.  So the SAME injected torn page detects at different
+#   points in the pipeline depending on the major:
+#
+#     PG 15-17  torn page is copied into the backup; the damage
+#               surfaces later at restore / verify — the case the
+#               criteria above were written for.
+#     PG 18     PG refuses the backup outright with SQLSTATE XX001
+#               ("checksum verification failure during base backup").
+#
+#   The PG18 refusal is the product and the server behaving
+#   correctly — the corruption was caught EARLIER, which is better,
+#   not worse.  Counting it as backup_failed made this criterion
+#   unsatisfiable by construction for any fleet containing PG 18 and
+#   torn_page: the cell aborted on the first hit and burned the rest
+#   of its window.  The orchestrator now emits
+#   backup_refused_source_corruption for it and keeps the cell
+#   running (see isSourceCorruptionFailure in
+#   internal/testkit/validate/orchestrator.go).
+#
+#   A PG 18 cell that takes torn_page hits and reports ZERO
+#   backup_refused_source_corruption is the suspicious case: either
+#   the fault never landed, or churn rewrote the page before the
+#   next backup read it.
 
 schema: pg_hardstorage.testkit.fault.v1
 version: 1

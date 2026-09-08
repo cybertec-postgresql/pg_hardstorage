@@ -151,6 +151,14 @@ func writeDeployment(b *strings.Builder, s *Section, global map[string]string, r
 	// its name — not a `- name:` sequence item.
 	fmt.Fprintf(b, "  %s:\n", s.Name)
 
+	// A stanza whose connection details we cannot map renders as a
+	// deployment with zero fields. YAML decodes that as a null
+	// DeploymentConfig, the loader accepts it, and `lint` used to call
+	// the file valid — the operator only found out at the first
+	// backup, as a bare "usage.missing_flag". Track what we emit so
+	// the gap is stated in the file itself and in the stderr summary.
+	var haveConn, haveRepo bool
+
 	// PG connection
 	host := resolve("pg1-host")
 	port := resolve("pg1-port")
@@ -169,14 +177,21 @@ func writeDeployment(b *strings.Builder, s *Section, global map[string]string, r
 		}
 		conn += "/" + db
 		fmt.Fprintf(b, "    pg_connection: %q\n", conn)
+		haveConn = true
 	}
 
 	// Repo URL
 	repoType := strings.ToLower(resolve("repo1-type"))
 	switch repoType {
-	case "", "posix":
+	// "file" is pgBackRest's own documented spelling for a local
+	// repository; "posix" is the value its option validator reports.
+	// Both mean the same thing and both map to a file:// repo URL —
+	// treating "file" as unsupported claimed the product could not do
+	// something it does end-to-end.
+	case "", "posix", "file":
 		if path := resolve("repo1-path"); path != "" {
 			fmt.Fprintf(b, "    repo: %q\n", "file://"+path)
+			haveRepo = true
 		}
 	case "s3":
 		bucket := resolve("repo1-s3-bucket")
@@ -187,6 +202,7 @@ func writeDeployment(b *strings.Builder, s *Section, global map[string]string, r
 				url += "/" + prefix
 			}
 			fmt.Fprintf(b, "    repo: %q\n", url)
+			haveRepo = true
 			r.Warnings = append(r.Warnings,
 				"["+s.Name+"] AWS credentials must be supplied via the standard SDK chain (env, IRSA, profile)")
 		}
@@ -200,11 +216,13 @@ func writeDeployment(b *strings.Builder, s *Section, global map[string]string, r
 		if pass := resolve("repo1-cipher-pass"); pass != "" {
 			fmt.Fprintln(b,
 				"    # repo1-cipher-type=aes-256-cbc -> native AES-256-GCM with KEK derivation; algorithm differs.")
-			fmt.Fprintln(b, "    encryption:")
-			fmt.Fprintln(b, "      kek_ref: \"local:default\"")
-			fmt.Fprintln(b, "      passphrase_env: PG_HARDSTORAGE_KEK_PASSPHRASE")
+			fmt.Fprintln(b,
+				"    # The cipher passphrase does NOT carry across: load the key into the")
+			fmt.Fprintln(b,
+				"    # keyring (pg_hardstorage kms ...) or point kek_ref at a KMS provider.")
+			fmt.Fprintln(b, "    kek_ref: \"local:default\"")
 			r.Warnings = append(r.Warnings,
-				"["+s.Name+"] aes-256-cbc maps to AES-256-GCM; set PG_HARDSTORAGE_KEK_PASSPHRASE before first run")
+				"["+s.Name+"] aes-256-cbc maps to AES-256-GCM; kek_ref is set to local:default — provision that key before the first run")
 		}
 	}
 
@@ -223,9 +241,12 @@ func writeDeployment(b *strings.Builder, s *Section, global map[string]string, r
 
 	// Retention
 	if rf := resolve("retention-full"); rf != "" {
+		// keep_fulls, not keep_full_count: config.RetentionConfig
+		// decodes with KnownFields(true), so an invented key makes the
+		// whole translated file unloadable. See TestTranslateOutputLoads.
 		fmt.Fprintln(b, "    retention:")
 		fmt.Fprintln(b, "      policy: count")
-		fmt.Fprintf(b, "      keep_full_count: %s\n", rf)
+		fmt.Fprintf(b, "      keep_fulls: %s\n", rf)
 	}
 
 	// Per-section unknowns
@@ -237,10 +258,40 @@ func writeDeployment(b *strings.Builder, s *Section, global map[string]string, r
 			"repo1-cipher-type", "repo1-cipher-pass",
 			"compress-type", "retention-full":
 			// handled above
+		case "pg1-path":
+			// A local single-node stanza. pg_hardstorage reaches
+			// PostgreSQL over the replication protocol, never through
+			// the data directory, so the path itself has no
+			// equivalent — but it does tell us this stanza has no
+			// host/port/user to build a connection from.
+			r.Unmapped = append(r.Unmapped,
+				fmt.Sprintf("[%s] pg1-path = %s (no equivalent: native connects over the replication protocol, not the data directory)",
+					s.Name, s.KV[k]))
 		default:
 			r.Unmapped = append(r.Unmapped,
 				fmt.Sprintf("[%s] %s = %s", s.Name, k, s.KV[k]))
 		}
+	}
+
+	// Say it in the file, not only on stderr: stdout is the only
+	// output mode most operators pipe, and a comment survives the pipe.
+	switch {
+	case !haveConn && !haveRepo:
+		fmt.Fprintf(b, "    # UNTRANSLATED: no pg_connection and no repo could be derived for %q.\n", s.Name)
+		fmt.Fprintln(b, "    # This deployment is INOPERABLE until you fill both in.")
+		r.Warnings = append(r.Warnings,
+			fmt.Sprintf("[%s] UNTRANSLATED: neither pg_connection nor repo could be derived; the deployment is inoperable until both are filled in",
+				s.Name))
+	case !haveConn:
+		fmt.Fprintf(b, "    # UNTRANSLATED: no pg_connection could be derived for %q (needs pg1-host).\n", s.Name)
+		r.Warnings = append(r.Warnings,
+			fmt.Sprintf("[%s] UNTRANSLATED: no pg_connection could be derived (pgbackrest.conf has no pg1-host); fill it in before use",
+				s.Name))
+	case !haveRepo:
+		fmt.Fprintf(b, "    # UNTRANSLATED: no repo could be derived for %q (needs repo1-path).\n", s.Name)
+		r.Warnings = append(r.Warnings,
+			fmt.Sprintf("[%s] UNTRANSLATED: no repo could be derived (pgbackrest.conf has no repo1-path); fill it in before use",
+				s.Name))
 	}
 }
 

@@ -229,3 +229,60 @@ func TestBuildStandbyWithIdentity_ArmsTheCheck(t *testing.T) {
 		t.Error("empty identity must emit exactly BuildStandby's command")
 	}
 }
+
+// TestBuildRejectsCompatShimPaths pins the compat-shim arm of the
+// companion-binary rule.
+//
+// The compat shims dispatch the native CLI in-process, so a restore
+// run as `pgbackrest restore` or `barman recover` executes
+// WriteAutoRecovery inside the SHIM process and os.Executable()
+// returns the shim's path. That path was written verbatim into the
+// restored cluster's postgresql.auto.conf, and at recovery time PG ran
+// `<shim> wal fetch …`. The multicall binary dispatches on argv[0],
+// did not recognise itself under that name, and exited 2 — neither 0
+// (delivered) nor 6 (absent), so the embedded tail aborted the shell
+// and PG died with "child process was terminated by signal 6".
+//
+// Every cluster restored through a shim was unbootable. The restore
+// itself reported success.
+func TestBuildRejectsCompatShimPaths(t *testing.T) {
+	shims := []string{
+		"pg-hardstorage-compat",
+		"pg-hardstorage-pgbackrest",
+		"pg-hardstorage-barman",
+		"pg-hardstorage-barman-wal-archive",
+		"pg-hardstorage-walg",
+		"pg-hardstorage-barman-cloud-wal-restore",
+		// the upstream names operators symlink them to
+		"pgbackrest",
+		"barman",
+		"wal-g",
+		"barman-cloud-wal-restore",
+	}
+	for _, shim := range shims {
+		t.Run(shim, func(t *testing.T) {
+			got := Build("/usr/local/bin/"+shim, "db1", "file:///srv/repo")
+			if strings.Contains(got, shim) {
+				t.Errorf("restore_command embeds the shim %q — the restored cluster cannot boot:\n%s", shim, got)
+			}
+			if !strings.Contains(got, "/usr/local/bin/pg_hardstorage") {
+				t.Errorf("restore_command must name the native agent beside the shim; got:\n%s", got)
+			}
+		})
+	}
+}
+
+// TestNormalizeAgentBinLeavesTheAgentAlone guards the other
+// direction: the rule must not rewrite the real agent, or any
+// unrelated path an operator deliberately pointed at.
+func TestNormalizeAgentBinLeavesTheAgentAlone(t *testing.T) {
+	for _, keep := range []string{
+		"/usr/bin/pg_hardstorage",
+		"/opt/custom/my-pg-hardstorage",
+		"/usr/local/bin/pg_hardstorage_testkit",
+	} {
+		if got := normalizeAgentBin(keep); got != keep {
+			t.Errorf("normalizeAgentBin(%q) = %q, want it unchanged", keep, got)
+		}
+	}
+}

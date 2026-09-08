@@ -52,8 +52,13 @@ func TestTranslate_RoundTrip(t *testing.T) {
 		`pg_connection: "postgres://pgbackup@db1.example.com:5432/postgres"`,
 		`repo: "file:///var/lib/pgbackrest"`,
 		`repo: "s3://acme-pg-backups/db2-prefix"`,
-		"keep_full_count: 4",
-		"keep_full_count: 2",
+		// keep_fulls, NOT keep_full_count: config.RetentionConfig has
+		// no keep_full_count field and the loader runs with
+		// KnownFields(true), so the old spelling made every translated
+		// file unloadable. See compat/translate_loads_test.go, which
+		// now pushes this output through the real loader.
+		"keep_fulls: 4",
+		"keep_fulls: 2",
 		"AES-256-GCM",
 		"compress-type=lz4 ignored",
 	}

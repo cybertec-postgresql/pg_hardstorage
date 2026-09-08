@@ -57,7 +57,7 @@ var deploymentLookup = func(server string) (deploymentSettings, error) {
 	dep, ok := loaded.Config.Deployments[server]
 	if !ok {
 		return deploymentSettings{}, fmt.Errorf(
-			"server %q not in pg_hardstorage.yaml deployments (config dir: %s) — translate barman.conf with `pg_hardstorage compat translate-barman` or add the deployment manually",
+			"server %q not in pg_hardstorage.yaml deployments (config dir: %s) — translate barman.conf with `pg_hardstorage compat translate --from barman <barman.conf>` or add the deployment manually",
 			server, p.Config.Value)
 	}
 	out := deploymentSettings{Repo: dep.Repo, PGConnection: dep.PGConnection}

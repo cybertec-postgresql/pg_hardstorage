@@ -41,24 +41,94 @@ func newLintCmdImpl() *cobra.Command {
 					}).Wrap(output.ErrUsage)
 			}
 			deployments := 0
+			var incomplete []incompleteDeployment
 			if loaded != nil {
 				deployments = len(loaded.Config.Deployments)
+				incomplete = findIncompleteDeployments(loaded.Config.Deployments)
+			}
+
+			// A deployment block that parses but carries neither
+			// pg_connection nor repo is syntactically fine and
+			// operationally dead: every command against it fails with a
+			// bare "usage.missing_flag", far from the config that caused
+			// it. `compat translate` can emit exactly this shape from a
+			// pgBackRest stanza whose connection details it cannot map,
+			// and lint used to call the result valid. Say it here, where
+			// the operator is looking.
+			for _, inc := range incomplete {
+				_ = d.Event(cmd.Context(), output.NewEvent(output.SeverityWarning, "config", "deployment_incomplete").
+					WithBody(map[string]any{
+						"deployment": inc.Name,
+						"missing":    inc.Missing,
+						"detail": fmt.Sprintf("deployment %q is missing %s; commands against it will fail with usage.missing_flag unless the value is passed on the command line",
+							inc.Name, strings.Join(inc.Missing, " and ")),
+					}))
+			}
+
+			status := "valid"
+			if len(incomplete) > 0 {
+				status = "incomplete"
 			}
 			return d.Result(output.NewResult(cmd.CommandPath()).WithBody(lintBody{
-				Status:      "valid",
+				Status:      status,
 				Deployments: deployments,
+				Incomplete:  incomplete,
 			}))
 		},
 	}
 }
 
+// incompleteDeployment names a deployment that loaded cleanly but
+// cannot be operated without extra flags.
+type incompleteDeployment struct {
+	Name    string   `json:"deployment"`
+	Missing []string `json:"missing"`
+}
+
+// findIncompleteDeployments returns, in deterministic order, the
+// deployments missing pg_connection and/or repo.  Both are needed by
+// every data-plane command; neither has a default the loader can
+// supply.
+func findIncompleteDeployments(deployments map[string]config.DeploymentConfig) []incompleteDeployment {
+	var out []incompleteDeployment
+	for name, dc := range deployments {
+		var missing []string
+		if strings.TrimSpace(dc.PGConnection) == "" {
+			missing = append(missing, "pg_connection")
+		}
+		if strings.TrimSpace(dc.Repo) == "" {
+			missing = append(missing, "repo")
+		}
+		if len(missing) > 0 {
+			out = append(out, incompleteDeployment{Name: name, Missing: missing})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
+}
+
 type lintBody struct {
-	Status      string `json:"status"`
-	Deployments int    `json:"deployments"`
+	Status      string                 `json:"status"`
+	Deployments int                    `json:"deployments"`
+	Incomplete  []incompleteDeployment `json:"incomplete_deployments,omitempty"`
 }
 
 func (b lintBody) WriteText(w io.Writer) error {
-	_, err := fmt.Fprintf(w, "✓ config valid — %d deployment(s)\n", b.Deployments)
+	if len(b.Incomplete) == 0 {
+		_, err := fmt.Fprintf(w, "✓ config valid — %d deployment(s)\n", b.Deployments)
+		return err
+	}
+	if _, err := fmt.Fprintf(w, "⚠ config parses — %d deployment(s), %d incomplete\n",
+		b.Deployments, len(b.Incomplete)); err != nil {
+		return err
+	}
+	for _, inc := range b.Incomplete {
+		if _, err := fmt.Fprintf(w, "    %s: missing %s\n",
+			inc.Name, strings.Join(inc.Missing, ", ")); err != nil {
+			return err
+		}
+	}
+	_, err := fmt.Fprintln(w, "  (these deployments need the value in config or on every command line)")
 	return err
 }
 

@@ -716,6 +716,15 @@ func Take(ctx context.Context, opts TakeOptions) (*Result, error) {
 		bbSpan.SetStatus(codes.Error, err.Error())
 		bbSpan.End()
 		span.SetStatus(codes.Error, err.Error())
+		// A torn page or a damaged index is the source database
+		// telling us its data is not intact. Without this, PostgreSQL's
+		// XX001 arrived at the operator as code "internal" — the
+		// bucket for "we have no idea what this is" — so the most
+		// urgent signal the tool can produce looked exactly like a bug
+		// in the tool. See sourceerror.go.
+		if typed := classifySourceError(err, opts.Deployment); typed != err {
+			return nil, typed
+		}
 		return nil, fmt.Errorf("backup: BASE_BACKUP: %w", err)
 	}
 	bbSpan.SetAttributes(

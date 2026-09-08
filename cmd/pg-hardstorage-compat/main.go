@@ -42,7 +42,22 @@ import (
 	"github.com/cybertec-postgresql/pg_hardstorage/compat/barmancloud"
 	"github.com/cybertec-postgresql/pg_hardstorage/compat/pgbackrest"
 	"github.com/cybertec-postgresql/pg_hardstorage/compat/walg"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/cli"
 )
+
+// isNativeVerb reports whether arg names a top-level verb of the
+// native pg_hardstorage CLI. Used only by the unknown-name fallback
+// above, so it is scoped to the verbs a restored cluster or an
+// operator's recovery tooling can plausibly invoke on this binary
+// rather than to the whole command tree.
+func isNativeVerb(arg string) bool {
+	switch arg {
+	case "wal", "restore", "verify", "list", "show", "status", "doctor", "version":
+		return true
+	default:
+		return false
+	}
+}
 
 func main() {
 	switch filepath.Base(os.Args[0]) {
@@ -104,6 +119,30 @@ func main() {
 		os.Exit(barmancloud.ExecuteWalRestore(os.Args[1:]))
 
 	default:
+		// Belt-and-braces for the restore_command hazard.
+		//
+		// A restore driven through a shim writes the running
+		// executable's path into the restored cluster's
+		// postgresql.auto.conf, and PG then runs `<that path> wal
+		// fetch …` during recovery. walfetchcmd.normalizeAgentBin now
+		// rewrites known shim names to the native agent so that path
+		// is correct — but a cluster restored by an OLDER build, or a
+		// shim installed under a name we do not know, still carries a
+		// restore_command pointing here. Refusing it makes the cluster
+		// unbootable; PG reads the exit as neither delivered (0) nor
+		// absent (6), and the embedded tail aborts recovery.
+		//
+		// So when we are invoked under an unknown name with a NATIVE
+		// verb as the first argument, fall through to the native CLI
+		// instead of refusing. The native surface is statically linked
+		// into this binary already; there is nothing to gain by
+		// pretending it is not there.
+		if len(os.Args) > 1 && isNativeVerb(os.Args[1]) {
+			root := cli.NewRoot()
+			root.SetArgs(os.Args[1:])
+			os.Exit(cli.Run(root))
+		}
+
 		// Invoked under an unrecognised name.  Print the
 		// install hint and exit non-zero — better than
 		// silently picking a default and confusing the

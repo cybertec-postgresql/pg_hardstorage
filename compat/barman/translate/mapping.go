@@ -131,26 +131,29 @@ var mappingByKey = map[string]mappingRow{
 	// Compression.  Native picks zstd by default; surface the choice
 	// only if Barman explicitly asks for something else.
 	"compression": {render: func(v string) (string, bool, string) {
+		// There is no `compression` key in config.DeploymentConfig, and
+		// the loader runs with KnownFields(true) — emitting one made
+		// every translated barman.conf fail to load. Native chunk
+		// compression is zstd and is not per-deployment configurable,
+		// so this is a drop-with-note, not a mapping.
 		v = strings.ToLower(strings.TrimSpace(v))
 		switch v {
-		case "", "none":
-			return "compression:\n  algorithm: none", false, ""
-		case "gzip":
-			return "compression:\n  algorithm: gzip", false, ""
-		case "bzip2":
-			return "", true, "bzip2 compression not supported in v1.1 (use gzip or zstd)"
-		case "pigz", "pbzip2":
-			return "", true, "parallel-coder compression names not exposed in v1.1; native zstd is parallel by default"
-		case "zstd":
-			return "compression:\n  algorithm: zstd", false, ""
+		case "", "none", "zstd":
+			return "", true, "native compresses chunks with zstd; not per-deployment configurable"
+		case "gzip", "bzip2", "pigz", "pbzip2":
+			return "", true, fmt.Sprintf("%s not exposed per deployment; native compresses chunks with zstd", v)
 		default:
-			return "", true, fmt.Sprintf("unknown compression %q", v)
+			return "", true, fmt.Sprintf("unknown compression %q; native compresses chunks with zstd", v)
 		}
 	}},
 
 	// Slot.
 	"slot_name": {render: func(v string) (string, bool, string) {
-		return fmt.Sprintf("slot:\n  name: %s", yamlString(v)), false, ""
+		// No `slot` key in config.DeploymentConfig. The replication
+		// slot name is a `wal stream` flag (--slot), not deployment
+		// config, so carry the value in the note rather than inventing
+		// a field the loader rejects.
+		return "", true, fmt.Sprintf("no deployment-level slot field; pass --slot %s to `pg_hardstorage wal stream`", v)
 	}},
 	"streaming_archiver": {render: func(_ string) (string, bool, string) {
 		return "", true, "native is streaming-first by default; explicit flag not required"
@@ -158,10 +161,8 @@ var mappingByKey = map[string]mappingRow{
 	"create_slot": {render: func(v string) (string, bool, string) {
 		v = strings.ToLower(strings.TrimSpace(v))
 		switch v {
-		case "auto":
-			return "slot:\n  create: auto", false, ""
-		case "manual":
-			return "slot:\n  create: manual", false, ""
+		case "auto", "manual":
+			return "", true, "no deployment-level slot field; `wal stream` creates the slot with RESERVE_WAL on first connect"
 		default:
 			return "", true, fmt.Sprintf("unknown create_slot %q", v)
 		}
@@ -180,7 +181,8 @@ var mappingByKey = map[string]mappingRow{
 
 	// Parallelism.
 	"parallel_jobs": {render: func(v string) (string, bool, string) {
-		return fmt.Sprintf("parallelism: %s", v), false, ""
+		// No `parallelism` key in config.DeploymentConfig.
+		return "", true, fmt.Sprintf("no deployment-level parallelism field (parallel_jobs = %s); native sizes its own worker pool", v)
 	}},
 
 	// Checks.
@@ -190,12 +192,14 @@ var mappingByKey = map[string]mappingRow{
 		return fmt.Sprintf("# check_timeout: %s  (native doctor uses a global timeout)", v), false, ""
 	}},
 	"immediate_checkpoint": {render: func(v string) (string, bool, string) {
+		// No `backup` key in config.DeploymentConfig. The fast-checkpoint
+		// choice is a per-invocation flag on `backup`, not config.
 		v = strings.ToLower(strings.TrimSpace(v))
 		switch v {
 		case "true", "on", "1":
-			return "backup:\n  fast: true", false, ""
+			return "", true, "no deployment-level backup block; pass --fast to `pg_hardstorage backup` for an immediate checkpoint"
 		case "false", "off", "0", "":
-			return "backup:\n  fast: false", false, ""
+			return "", true, "no deployment-level backup block; native defaults to a spread checkpoint"
 		default:
 			return "", true, fmt.Sprintf("unknown immediate_checkpoint %q", v)
 		}

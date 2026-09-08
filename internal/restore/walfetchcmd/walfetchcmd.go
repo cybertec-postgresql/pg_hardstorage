@@ -200,8 +200,49 @@ func resolveRestoreBin(agentBin string) string {
 // so the restored cluster sits forever waiting for WAL that never arrives
 // (issue #105).  pg_hardstorage_simple is the interactive kind-interface
 // companion; only the full `pg_hardstorage` agent implements `wal fetch`.
+//
+// The compat shims are the same hazard, and worse. They dispatch the
+// native CLI IN-PROCESS (compat/*/dispatch.go → internal/cli.Run), so
+// a restore driven by `pgbackrest restore` or `barman recover` runs
+// WriteAutoRecovery inside the shim process and os.Executable()
+// returns the SHIM's path. That literal path went into the restored
+// cluster's postgresql.auto.conf. At recovery time PG then ran
+//
+//	<shim-path> wal fetch 000000010000000000000002 …
+//
+// and the multicall binary, which dispatches on argv[0], answered
+// `invoked as "…/pg-hardstorage-compat" which is not a known shim
+// name` and exited 2 — neither 0 nor 6, so the embedded tail ABRTed
+// the shell and PG died with "child process was terminated by signal
+// 6". Every cluster restored through a shim was unbootable until an
+// operator hand-edited postgresql.auto.conf.
+//
+// Both the prefixed build names and the upstream names operators
+// symlink them to are listed: os.Executable() resolves symlinks, so
+// which one appears depends on how the shim was installed.
 var knownCompanionBinaries = map[string]bool{
 	"pg_hardstorage_simple": true,
+
+	// compat multicall binary + its per-tool build names
+	"pg-hardstorage-compat":                   true,
+	"pg-hardstorage-pgbackrest":               true,
+	"pg-hardstorage-barman":                   true,
+	"pg-hardstorage-barman-wal-archive":       true,
+	"pg-hardstorage-walg":                     true,
+	"pg-hardstorage-barman-cloud-backup":      true,
+	"pg-hardstorage-barman-cloud-restore":     true,
+	"pg-hardstorage-barman-cloud-wal-archive": true,
+	"pg-hardstorage-barman-cloud-wal-restore": true,
+
+	// the upstream names those get symlinked to on PATH
+	"pgbackrest":               true,
+	"barman":                   true,
+	"barman-wal-archive":       true,
+	"wal-g":                    true,
+	"barman-cloud-backup":      true,
+	"barman-cloud-restore":     true,
+	"barman-cloud-wal-archive": true,
+	"barman-cloud-wal-restore": true,
 }
 
 // normalizeAgentBin rewrites a companion-binary path to the full

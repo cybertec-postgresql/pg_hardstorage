@@ -553,6 +553,45 @@ if ! touch "$HOST_REPO_DIR/.writable-check" 2>/dev/null; then
     ls -ld "$HOST_REPO_DIR" >&2 || true
     exit 1
 fi
+
+# Ownership contract for post-run forensics.
+#
+# The agent runs inside the container as `pgbackup`, so every
+# subdirectory it creates under repo-data (chunks/, wal/, manifests/,
+# audit/, deployments/, leases/) is owned by that container uid and is
+# NOT readable by the host user afterwards. Only the top-level files
+# are. The trap for whoever reads this later: `du -sh repo-data`
+# reports a plausible-looking small number (40K on the 2h soak) because
+# du cannot descend either, so the repository looks EMPTY rather than
+# unreadable.
+#
+# Drop a note next to the data so the next person to open this report
+# dir knows before they draw a conclusion from it.
+cat > "$REPORT_DIR/repo-data/HOST-READING-THIS-DIR.txt" <<'REPO_NOTE'
+This directory is bind-mounted into the testbed containers at
+/var/lib/pg_hardstorage/repo, and the agent inside them runs as the
+`pgbackup` user. Every subdirectory here (chunks/, wal/, manifests/,
+audit/, deployments/, leases/) is therefore owned by that CONTAINER
+uid and is unreadable from the host account that ran the soak.
+
+Consequences, so nobody re-derives them at 3am:
+
+  * `ls repo-data/chunks` fails with Permission denied.
+  * `du -sh repo-data` reports only the top-level files — a few tens
+    of kilobytes — because du cannot descend either. That number is
+    NOT the repository size, and an empty-looking repo-data is not an
+    empty repository.
+
+To read the repository, go in through a container (they are preserved
+when the run used --keep-on-failure):
+
+    docker compose -f <report-dir>/docker-compose.yaml         exec <cell> ls -la /var/lib/pg_hardstorage/repo
+
+or take ownership of the tree first, if you no longer need the
+containers:
+
+    sudo chown -R "$(id -u):$(id -g)" <report-dir>/repo-data
+REPO_NOTE
 rm -f "$HOST_REPO_DIR/.writable-check"
 
 # Compose project name = lowercased basename, with anything

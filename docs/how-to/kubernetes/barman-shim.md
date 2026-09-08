@@ -100,7 +100,7 @@ pod (or on the host) once:
 ```bash
 pg_hardstorage compat translate --from barman \
     /etc/barman.conf \
-    --output /etc/pg_hardstorage/pg_hardstorage.yaml
+    --out-file /etc/pg_hardstorage/pg_hardstorage.yaml
 ```
 
 Multi-server `barman.conf` files (one `[server]` section

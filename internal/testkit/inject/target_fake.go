@@ -18,8 +18,18 @@ type FakeTarget struct {
 
 	// ExecResponses can be set to control return values.
 	// Lookup is keyed on the joined argv ("dd if=/dev/zero ...").
-	// Anything not in the map returns ("", nil).
+	// Anything not in the map returns ExecDefault.
 	ExecResponses map[string][]byte
+
+	// ExecDefault is returned by Exec for any argv that
+	// ExecResponses does not cover. Nil keeps the historical
+	// empty-output behaviour.
+	//
+	// Needed for faults whose script REPORTS something the fault then
+	// parses — checkpoint_storm echoes how many CHECKPOINT statements
+	// actually succeeded — where keying on the exact generated script
+	// would make the test assert the script's text twice.
+	ExecDefault []byte
 
 	// SignalErr is returned from every Signal call when set.
 	SignalErr error
@@ -68,7 +78,7 @@ func (f *FakeTarget) Exec(_ context.Context, argv ...string) ([]byte, error) {
 			return r, nil
 		}
 	}
-	return nil, nil
+	return f.ExecDefault, nil
 }
 
 // Signal records the signal and returns SignalErr.

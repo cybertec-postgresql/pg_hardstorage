@@ -2,10 +2,14 @@
 package barmancloud
 
 import (
+	"errors"
 	"fmt"
 	"os"
+	"strconv"
 
 	"github.com/spf13/cobra"
+
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/output"
 )
 
 // ExecuteWalRestore is the entry point for
@@ -26,6 +30,41 @@ import (
 //
 // Native dispatch: `pg_hardstorage wal fetch <deployment>
 // <wal-name> <output-abs-path> --repo <url>`.
+//
+// # Exit-code discipline
+//
+// This binary IS the restore_command, so it owns the contract
+// internal/restore/walfetchcmd/tail.go spells out for the shell
+// wrapper the native restore writes. PostgreSQL's restore_command
+// contract (xlogarchive.c, RestoreArchivedFile) reads EVERY plain
+// nonzero exit as "that segment is not available", and during
+// unbounded recovery "not available" means END OF ARCHIVE: stop
+// replaying, promote, report success. Only death BY SIGNAL aborts
+// recovery.
+//
+// The shim used to collapse every native failure to exit 1. An S3
+// outage, an expired credential, a keyring refused for its file mode,
+// a chunk swept by gc — each one reached PostgreSQL as a clean
+// end-of-archive, and the replica promoted with unreplayed WAL still
+// in the repository. That is the exact silent-data-loss mode tail.go
+// exists to prevent, reintroduced in the one path where this shim is
+// the restore_command.
+//
+// So this entry point speaks the same three-way language:
+//
+//	native 0            → exit 0   (segment delivered)
+//	native 6 (notfound) → exit 1   (the genuine "no such segment")
+//	anything else       → exit 126 (recovery ABORTS loudly)
+//
+// 126 is not arbitrary. tail.go's shell wrapper aborts by killing
+// itself with SIGABRT, which a Go binary cannot do cleanly (the
+// runtime intercepts SIGABRT, prints a traceback and exits 2 — and 2
+// is just another "not available"). PostgreSQL gives us a second
+// door: RestoreArchivedFile classifies the result with
+// wait_result_is_any_signal(rc, true), which returns true for a real
+// signal AND for any exit status greater than 125. So exit 126 lands
+// on the same FATAL branch a signal would, without dumping a Go
+// traceback into the server log.
 func ExecuteWalRestore(argv []string) int {
 	var f commonFlags
 	var stdout, stderr = os.Stdout, os.Stderr
@@ -46,10 +85,37 @@ func ExecuteWalRestore(argv []string) int {
 	c.SetArgs(argv)
 	if err := c.Execute(); err != nil {
 		fmt.Fprintln(stderr, err)
-		return 1
+		// A usage / argv / config failure never happened against the
+		// repository at all, so it cannot be "no such segment".
+		// Treat it the same as any other non-notfound fault: abort
+		// recovery rather than let PG read it as end-of-archive.
+		var fe *fetchError
+		if errors.As(err, &fe) && fe.exitCode == int(output.ExitNotFound) {
+			return 1
+		}
+		fmt.Fprintln(stderr,
+			"pg-hardstorage-barmancloud: wal-restore: exiting "+
+				strconv.Itoa(exitAbortRecovery)+" to ABORT recovery — this is a fetch FAILURE, "+
+				"not an end of archive; PostgreSQL must not promote here")
+		return exitAbortRecovery
 	}
 	return 0
 }
+
+// exitAbortRecovery is the status that makes PostgreSQL treat a failed
+// restore_command as fatal rather than as the end of the archive.
+// Anything greater than 125 satisfies wait_result_is_any_signal(rc,
+// true) in PostgreSQL's RestoreArchivedFile.
+const exitAbortRecovery = 126
+
+// fetchError carries the native CLI's exit code so ExecuteWalRestore
+// can tell "segment genuinely absent" (6) from every other fault.
+type fetchError struct {
+	exitCode int
+	message  string
+}
+
+func (e *fetchError) Error() string { return e.message }
 
 func runWalRestore(cmd *cobra.Command, f commonFlags, s3Path, stanza, walName, outRel string) error {
 	env := readEnv()
@@ -82,7 +148,11 @@ func runWalRestore(cmd *cobra.Command, f commonFlags, s3Path, stanza, walName, o
 	res := dispatchNative(args)
 	forwardCaptured(res)
 	if res.ExitCode != 0 {
-		return fmt.Errorf("pg-hardstorage-barmancloud: wal-restore: native CLI exited %d", res.ExitCode)
+		return &fetchError{
+			exitCode: res.ExitCode,
+			message: fmt.Sprintf("pg-hardstorage-barmancloud: wal-restore: native CLI exited %d",
+				res.ExitCode),
+		}
 	}
 	return nil
 }

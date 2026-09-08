@@ -97,7 +97,7 @@ set; what gets translated:
 | `PGHOST` / `PGPORT` / `PGUSER` / `PGDATABASE` | `--pg-connection postgres://…` |
 | `WALG_COMPRESSION_METHOD`| warning if not zstd; native uses zstd by default |
 | `WALG_DELTA_MAX_STEPS`   | implicit (incrementals roll back automatically) |
-| `WALG_LIBSODIUM_KEY` / `WALG_GPG_KEY_ID` / `WALG_PGP_KEY[_PATH]` | **refused** with a pointer to `encryption.kek_ref` (the algorithms are not byte-compatible) |
+| `WALG_LIBSODIUM_KEY` / `WALG_GPG_KEY_ID` / `WALG_PGP_KEY[_PATH]` | **refused** with a pointer to the deployment's `kek_ref:` (the algorithms are not byte-compatible) |
 
 `PG_HARDSTORAGE_DEPLOYMENT` (a pg_hardstorage-specific
 opt-in) sets the deployment name explicitly; otherwise the
@@ -161,8 +161,11 @@ existing alerting works unchanged.
 - **Encryption envelope re-keying.**  WAL-G's libsodium /
   GPG / PGP envelopes are not byte-compatible with native
   AES-256-GCM.  The shim refuses if those env vars are set;
-  configure `encryption.kek_ref` in pg_hardstorage.yaml
-  before activating.
+  set `kek_ref:` on the deployment in pg_hardstorage.yaml
+  before activating.  It is a FLAT field on the deployment —
+  there is no `encryption:` block in the config schema, and
+  the loader rejects one.  (`encryption.kek_ref` IS a real
+  path, but inside a backup *manifest*, not the config.)
 
 ## Why a shim, not a fork
 

@@ -2,6 +2,7 @@
 package walg
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"strings"
@@ -57,11 +58,22 @@ func runBackupPush(stderr io.Writer, full, permanent bool, args []string) error 
 	out = append(out, native[1:]...)
 
 	if !full {
-		// Match WAL-G's default: incremental relative to the
-		// nearest full when one exists.  Native CLI handles the
-		// "no prior full" case automatically by promoting to a
-		// full.
-		out = append(out, "--incremental-from", "latest")
+		// Match WAL-G's default — incremental relative to the nearest
+		// full — but only when the SERVER can actually serve one.
+		//
+		// The previous comment here claimed the native CLI "handles
+		// the no prior full case automatically by promoting to a
+		// full". It does, for the repository side. It cannot help
+		// with the SERVER side: --incremental-from drives the PG17
+		// incremental protocol, and PG15/16 reject it outright while
+		// PG17 rejects it unless summarize_wal is on (off by
+		// default). Both refusals arrive before the repository is
+		// consulted, so even the very first push into a fresh repo
+		// failed. wal-g's own delta has no such prerequisite, which
+		// is why its users never had to think about this.
+		if resolveIncremental(context.Background(), stderr, pgConnectionFrom(out)) {
+			out = append(out, "--incremental-from", "latest")
+		}
 	}
 
 	if len(args) == 1 && args[0] != "" {

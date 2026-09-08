@@ -244,13 +244,91 @@ func TestCheckVerbNoInjectedFlags(t *testing.T) {
 	}
 }
 
+// TestCheckVerbNagios pins the argv shape AND the exit contract.
+//
+// The old --nagios path templated over `.ok` / `.summary`, which the
+// doctor result does not have, and never passed anything that could
+// make the process exit non-zero. It therefore printed
+// "BARMAN CRITICAL - <no value>" with rc=0 in every state: a healthy
+// server paged, and a server whose PostgreSQL was down monitored
+// green. Nagios reads the exit code, so rc is the part that matters.
 func TestCheckVerbNagios(t *testing.T) {
-	got, _, _, err := runShim(t, "check", "db1", "--nagios")
-	if err != nil {
-		t.Fatalf("check --nagios: %v", err)
-	}
+	// A dispatcher that yields no report at all: doctor could not run.
+	// That is UNKNOWN (3) — never a silent OK.
+	got, stdout, _, err := runShim(t, "check", "db1", "--nagios")
 	if len(got) < 3 || got[0] != "doctor" || got[2] != "--output" {
 		t.Errorf("argv: %v", got)
+	}
+	if ExitCode(err) != 3 {
+		t.Errorf("no report must be Nagios UNKNOWN(3); got rc=%d (err=%v)", ExitCode(err), err)
+	}
+	if !strings.Contains(stdout, "BARMAN UNKNOWN") {
+		t.Errorf("stdout should carry a BARMAN UNKNOWN line; got %q", stdout)
+	}
+	if strings.Contains(stdout, "<no value>") {
+		t.Errorf("the Nagios line must never render a template placeholder; got %q", stdout)
+	}
+}
+
+// TestCheckVerbNagiosVerdicts drives the three states a Nagios plugin
+// branches on, from real doctor-shaped JSON.
+func TestCheckVerbNagiosVerdicts(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		report string
+		wantRC int
+		want   string
+	}{
+		{
+			name:   "healthy",
+			report: `{"result":{"healthy":true,"issues":[]}}`,
+			wantRC: 0,
+			want:   "BARMAN OK",
+		},
+		{
+			// A notice is informational — doctor's own
+			// --exit-on-issues threshold is warning+, and paging on a
+			// notice is what made every healthy server alert.
+			name:   "healthy with notice only",
+			report: `{"result":{"healthy":true,"issues":[{"severity":"notice","code":"recovery.drill_never_run","message":"never drilled"}]}}`,
+			wantRC: 0,
+			want:   "BARMAN OK",
+		},
+		{
+			name:   "unhealthy",
+			report: `{"result":{"healthy":false,"issues":[{"severity":"error","code":"pg.unreachable","message":"cannot connect to PostgreSQL"}]}}`,
+			wantRC: 2,
+			want:   "BARMAN CRITICAL",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			restore := swapDispatcher(func(stdout, _ io.Writer, _ []string) error {
+				_, _ = io.WriteString(stdout, tc.report)
+				return nil
+			})
+			defer restore()
+			restoreDep := swapDeploymentLookup(func(string) (deploymentSettings, error) {
+				return deploymentSettings{Repo: "file:///tmp/test-repo"}, nil
+			})
+			defer restoreDep()
+
+			var sout, serr bytes.Buffer
+			root := NewRoot(&sout, &serr)
+			root.SetArgs([]string{"check", "db1", "--nagios"})
+			root.SetOut(&sout)
+			root.SetErr(&serr)
+			_, err := root.ExecuteC()
+
+			if rc := ExitCode(err); rc != tc.wantRC {
+				t.Errorf("rc: got %d want %d (stdout=%q)", rc, tc.wantRC, sout.String())
+			}
+			if !strings.Contains(sout.String(), tc.want) {
+				t.Errorf("stdout: got %q want it to contain %q", sout.String(), tc.want)
+			}
+			if strings.Contains(sout.String(), "<no value>") {
+				t.Errorf("template placeholder leaked into the Nagios line: %q", sout.String())
+			}
+		})
 	}
 }
 

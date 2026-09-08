@@ -60,7 +60,7 @@ func newRealDoctorCmd() *cobra.Command {
 	return c
 }
 
-func runDoctor(cmd *cobra.Command, _ []string) error {
+func runDoctor(cmd *cobra.Command, args []string) error {
 	d := DispatcherFrom(cmd)
 
 	p, err := paths.Resolve(paths.DefaultOptions())
@@ -72,6 +72,21 @@ func runDoctor(cmd *cobra.Command, _ []string) error {
 	// We deliberately do NOT bubble cfgErr up — a bad config IS a finding,
 	// not an early-return. doctor's job is to report; the report includes
 	// the parse error instead of suppressing it.
+
+	// `doctor [<deployment>]` advertised a deployment positional and
+	// then ignored it: every probe walked the whole fleet, so
+	// `doctor db1` answered about db2 as well and a caller asking
+	// about ONE server got a fleet verdict. The barman shim's
+	// `check <server>` rides on this, which is how a dead server could
+	// be reported healthy. Narrow the config to the named deployment
+	// before any probe runs.
+	if len(args) == 1 {
+		var scopeErr error
+		cfg, scopeErr = scopeConfigToDeployment(cfg, args[0])
+		if scopeErr != nil {
+			return scopeErr
+		}
+	}
 
 	report := buildDoctorReport(p, cfg, cfgErr)
 
@@ -101,6 +116,7 @@ func runDoctor(cmd *cobra.Command, _ []string) error {
 		report.WALGaps, report.Issues = appendWALGapChecks(cmd.Context(), cfg, report.Issues)
 		report.ExpiredHolds, report.Issues = appendExpiredHoldChecks(cmd.Context(), cfg, report.Issues)
 		report.PGVersions, report.Issues = appendPGVersionChecks(cmd.Context(), cfg, report.Issues)
+		report.PGLiveness, report.Issues = appendPGLivenessChecks(cmd.Context(), cfg, report.Issues)
 		report.ManifestSig, report.Issues = appendManifestSignatureChecks(cmd.Context(), cfg, report.Issues)
 		// GetDuration works with the day-aware Value too: its Type() is
 		// "duration" and String() renders stdlib format.
@@ -910,6 +926,7 @@ type doctorReport struct {
 	WALGaps      []walGapReport      `json:"wal_gaps,omitempty"`
 	ExpiredHolds []expiredHoldReport `json:"expired_holds,omitempty"`
 	PGVersions   []pgVersionReport   `json:"pg_versions,omitempty"`
+	PGLiveness   []pgLivenessReport  `json:"pg_liveness,omitempty"`
 	ManifestSig  []manifestSigReport `json:"manifest_signatures,omitempty"`
 	Drills       []drillStatusReport `json:"drills,omitempty"`
 	Issues       []doctorIssue       `json:"issues,omitempty"`
@@ -1489,4 +1506,117 @@ func appendLeaseWedgeChecks(ctx context.Context, cfg *config.LoadResult, issues 
 		})
 	}
 	return issues
+}
+
+// scopeConfigToDeployment narrows a loaded config to a single
+// deployment so every doctor probe answers about THAT server.
+//
+// `doctor [<deployment>]` has always advertised the positional; until
+// now runDoctor discarded it and every probe walked the whole fleet.
+// That made the answer to "is db1 healthy?" a fleet verdict — and the
+// Barman shim's `check <server>`, which dispatches straight to
+// `doctor <server>`, inherited it: a server whose PostgreSQL was down
+// could be reported healthy because some other deployment was fine.
+//
+// An unknown name is a usage error, not an empty report: silently
+// reporting on nothing would be the same class of lie.
+func scopeConfigToDeployment(cfg *config.LoadResult, name string) (*config.LoadResult, error) {
+	if cfg == nil {
+		return cfg, nil
+	}
+	dep, ok := cfg.Config.Deployments[name]
+	if !ok {
+		known := make([]string, 0, len(cfg.Config.Deployments))
+		for n := range cfg.Config.Deployments {
+			known = append(known, n)
+		}
+		sort.Strings(known)
+		detail := "no deployments are configured"
+		if len(known) > 0 {
+			detail = "known deployments: " + strings.Join(known, ", ")
+		}
+		return nil, output.NewError("notfound.deployment",
+			fmt.Sprintf("doctor: no deployment %q in the loaded config (%s)", name, detail)).
+			Wrap(output.ErrUsage)
+	}
+	// Copy so the narrowed view never mutates the caller's config.
+	scoped := *cfg
+	scopedCfg := cfg.Config
+	scopedCfg.Deployments = map[string]config.DeploymentConfig{name: dep}
+	scoped.Config = scopedCfg
+	return &scoped, nil
+}
+
+// pgLivenessReport is the answer to the question every `barman check
+// <server>` and every monitoring probe is really asking: can we reach
+// this deployment's PostgreSQL right now?
+//
+// Before this existed, doctor inspected paths, repositories, keys and
+// manifests — everything except the database. A deployment whose PG
+// was unreachable reported healthy, because nothing in the report had
+// ever opened a connection. Manifest-derived checks
+// (appendPGVersionChecks) read the LAST backup's recorded version;
+// they say nothing about the server's state now.
+type pgLivenessReport struct {
+	Deployment string `json:"deployment"`
+	Reachable  bool   `json:"reachable"`
+	// ServerVersion is PostgreSQL's own server_version_num, present
+	// only when the connection succeeded.
+	ServerVersion string `json:"server_version,omitempty"`
+	// Error is the connection failure, verbatim, when Reachable is
+	// false.
+	Error string `json:"error,omitempty"`
+}
+
+// pgLivenessTimeout bounds each probe. doctor is run from cron and
+// Nagios wrappers with their own deadlines; a black-holed host must
+// not hang the whole report.
+const pgLivenessTimeout = 10 * time.Second
+
+// appendPGLivenessChecks opens a short-lived regular connection to
+// every configured deployment's PostgreSQL and records whether it
+// answered. Deployments with no pg_connection are skipped silently —
+// a repo-only deployment (restore target, air-gapped copy) is a
+// legitimate shape and has no server to probe.
+func appendPGLivenessChecks(ctx context.Context, cfg *config.LoadResult, issues []doctorIssue) ([]pgLivenessReport, []doctorIssue) {
+	type dep struct{ name, dsn string }
+	var pairs []dep
+	for name, d := range cfg.Config.Deployments {
+		if strings.TrimSpace(d.PGConnection) == "" {
+			continue
+		}
+		pairs = append(pairs, dep{name: name, dsn: d.PGConnection})
+	}
+	sort.Slice(pairs, func(i, j int) bool { return pairs[i].name < pairs[j].name })
+
+	out := make([]pgLivenessReport, 0, len(pairs))
+	for _, pr := range pairs {
+		rep := pgLivenessReport{Deployment: pr.name}
+
+		probeCtx, cancel := context.WithTimeout(ctx, pgLivenessTimeout)
+		conn, err := pg.Connect(probeCtx, pr.dsn, pg.ModeRegular)
+		if err != nil {
+			cancel()
+			rep.Error = err.Error()
+			out = append(out, rep)
+			issues = append(issues, doctorIssue{
+				Severity: output.SeverityError,
+				Code:     "pg.unreachable",
+				Message: fmt.Sprintf("doctor: deployment %q: cannot connect to PostgreSQL: %v",
+					pr.name, err),
+				Suggestion: &output.Suggestion{
+					Human: "check that PostgreSQL is running and that pg_connection in pg_hardstorage.yaml " +
+						"(host, port, user, pg_hba.conf) still matches; a deployment whose server is " +
+						"unreachable cannot take a backup or stream WAL",
+				},
+			})
+			continue
+		}
+		rep.Reachable = true
+		rep.ServerVersion = conn.PgConn().ParameterStatus("server_version")
+		_ = conn.PgConn().Close(probeCtx)
+		cancel()
+		out = append(out, rep)
+	}
+	return out, issues
 }

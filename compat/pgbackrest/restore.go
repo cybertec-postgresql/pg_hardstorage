@@ -37,7 +37,52 @@ func newRestoreCmd() *cobra.Command {
 		"action when target reached: promote | shutdown | pause")
 	c.Flags().StringVar(&globalArgs.targetType, "type", "",
 		"target form override: time | lsn | name | immediate")
+
+	// pgBackRest's own explicit forms. Real pgbackrest spells a
+	// recovery target as --target-time / --target-lsn / --target-name;
+	// --target + --type is the older shape. Only the older shape
+	// parsed, so a cron written against the documented flags died with
+	// "unknown flag: --target-lsn".
+	c.Flags().StringVar(&globalArgs.targetTime, "target-time", "",
+		"recovery target time (pgBackRest form of --target --type=time)")
+	c.Flags().StringVar(&globalArgs.targetLSN, "target-lsn", "",
+		"recovery target LSN (pgBackRest form of --target --type=lsn)")
+	c.Flags().StringVar(&globalArgs.targetName, "target-name", "",
+		"recovery target restore-point name (pgBackRest form of --target --type=name)")
 	return c
+}
+
+// resolveTarget folds pgBackRest's two target spellings into the one
+// (form, value) pair runRestore emits. The explicit --target-* flags
+// win over --target/--type, and setting more than one is a usage
+// error rather than a silent pick.
+func resolveTarget(a pgbackrestArgs) (form, value string, err error) {
+	explicit := 0
+	if a.targetTime != "" {
+		form, value, explicit = "time", a.targetTime, explicit+1
+	}
+	if a.targetLSN != "" {
+		form, value, explicit = "lsn", a.targetLSN, explicit+1
+	}
+	if a.targetName != "" {
+		form, value, explicit = "name", a.targetName, explicit+1
+	}
+	if explicit > 1 {
+		return "", "", fmt.Errorf(
+			"pg-hardstorage-pgbackrest: restore: --target-time, --target-lsn and --target-name are mutually exclusive")
+	}
+	if explicit == 1 {
+		if a.target != "" {
+			return "", "", fmt.Errorf(
+				"pg-hardstorage-pgbackrest: restore: pass either --target/--type or one of --target-time/--target-lsn/--target-name, not both")
+		}
+		return form, value, nil
+	}
+	if a.target == "" {
+		return "", "", nil
+	}
+	form, value = classifyTarget(a.target, a.targetType)
+	return form, value, nil
 }
 
 func runRestore(a pgbackrestArgs) error {
@@ -62,20 +107,21 @@ func runRestore(a pgbackrestArgs) error {
 	out = append(out, native[1:]...)
 	out = append(out, "--target", target)
 
-	if a.target != "" {
-		form, value := classifyTarget(a.target, a.targetType)
-		switch form {
-		case "lsn":
-			out = append(out, "--to-lsn", value)
-		case "name":
-			out = append(out, "--to-name", value)
-		case "time":
-			out = append(out, "--to", value)
-		case "immediate":
-			// Native maps "immediate" to no PITR target — recovery
-			// stops at the end of the base backup, which is the
-			// default already.
-		}
+	form, value, err := resolveTarget(a)
+	if err != nil {
+		return err
+	}
+	switch form {
+	case "lsn":
+		out = append(out, "--to-lsn", value)
+	case "name":
+		out = append(out, "--to-name", value)
+	case "time":
+		out = append(out, "--to", value)
+	case "immediate", "":
+		// Native maps "immediate" to no PITR target — recovery
+		// stops at the end of the base backup, which is the
+		// default already.
 	}
 	if a.targetAction != "" {
 		out = append(out, "--to-action", strings.ToLower(a.targetAction))

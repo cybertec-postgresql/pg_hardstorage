@@ -123,12 +123,37 @@ func (checkpointStormFault) Apply(ctx context.Context, args Args, ts TargetSet) 
 	if sleepMs > 0 {
 		sleepCmd = fmt.Sprintf(" sleep %d.%03d;", sleepMs/1000, sleepMs%1000)
 	}
+	// COUNT the checkpoints that actually ran, and report zero as a
+	// failure.
+	//
+	// The loop used to swallow every psql failure with `|| true` and
+	// exit 0 regardless, so a storm could apply as a complete no-op —
+	// wrong OS user, psql missing from the image, PG down — while the
+	// report recorded it as applied. Any correlation drawn between
+	// "checkpoint_storm fired" and an observed behaviour was then
+	// unfounded, in either direction. The `|| true` is kept inside the
+	// loop on purpose (one refused CHECKPOINT mid-storm should not end
+	// the storm), but the tally makes silence impossible.
 	script := fmt.Sprintf(
-		`i=0; while [ "$i" -lt %d ]; do psql -c CHECKPOINT >/dev/null 2>&1 || true;%s i=$((i+1)); done`,
+		`ok=0; i=0; while [ "$i" -lt %d ]; do `+
+			`if psql -c CHECKPOINT >/dev/null 2>&1; then ok=$((ok+1)); fi;%s i=$((i+1)); done; echo "$ok"`,
 		count, sleepCmd)
 	for _, t := range tgs {
-		if _, err := t.Exec(ctx, "su", "-s", "/bin/sh", "-c", script, user); err != nil {
+		out, err := t.Exec(ctx, "su", "-s", "/bin/sh", "-c", script, user)
+		if err != nil {
 			return nil, fmt.Errorf("checkpoint_storm on %s: %w", t.Name(), err)
+		}
+		ran, convErr := strconv.Atoi(strings.TrimSpace(string(out)))
+		if convErr != nil {
+			return nil, fmt.Errorf("checkpoint_storm on %s: could not read the checkpoint tally from %q",
+				t.Name(), truncate(out, 200))
+		}
+		if ran == 0 {
+			return nil, fmt.Errorf(
+				"checkpoint_storm on %s: 0 of %d CHECKPOINT statements succeeded — "+
+					"the fault applied as a no-op (check that OS user %q can run psql "+
+					"as a PG superuser inside the container)",
+				t.Name(), count, user)
 		}
 	}
 	return NoRecovery, nil
@@ -558,12 +583,26 @@ if [ -z "$oldest_pid" ]; then
     echo "fd_exhaustion: no process with comm=$target_comm" >&2
     exit 2
 fi
+# Capture the CURRENT limits before lowering them, so recovery can put
+# back exactly what the image set rather than a guessed ceiling.
+# prlimit's --noheadings --raw output for one resource is
+# "<soft> <hard>"; "unlimited" is possible and is passed back verbatim.
+orig=$(prlimit --nofile --pid=$oldest_pid --noheadings --raw --output=SOFT,HARD 2>/dev/null | head -n1)
 prlimit --nofile=%[2]d:%[2]d --pid=$oldest_pid
-echo "$oldest_pid"
+echo "$oldest_pid $orig"
 `, commName, limit)
 	type clamped struct {
 		name string
 		pid  string
+		// soft/hard are the target's limits as they were BEFORE the
+		// fault. Recovery restores these instead of a hardcoded
+		// 65536:65536, which left every cell that took an
+		// fd_exhaustion fault running with a different nofile ceiling
+		// than its image had configured — state drift that outlives
+		// the fault and quietly changes what every later fault in
+		// that cell is measuring.
+		soft string
+		hard string
 	}
 	var done []clamped
 	for _, t := range tgs {
@@ -583,27 +622,53 @@ echo "$oldest_pid"
 					"fd_exhaustion on %s: %w (add cap_add: [\"SYS_RESOURCE\"] to the cell)",
 					t.Name(), ErrCapSysResource)
 			}
+			// The container is up but the process we clamp is gone —
+			// PG was taken down by an earlier fault and has not come
+			// back yet. That is the SAME condition as a down
+			// container, and the orchestrator has a skip path for it;
+			// without the sentinel it was recorded as an apply
+			// failure, inflating the run's failure count with faults
+			// that simply landed in another fault's down-window.
+			if strings.Contains(string(out), "no process with comm=") {
+				return nil, fmt.Errorf("fd_exhaustion on %s: %s: %w",
+					t.Name(), commName, ErrTargetNotRunning)
+			}
 			return nil, fmt.Errorf("fd_exhaustion on %s: %w (output: %s)",
 				t.Name(), err, strings.TrimSpace(string(out)))
 		}
-		pid := strings.TrimSpace(string(out))
-		// The last line is the PID; if the shell printed
-		// chatter before it, take the final non-empty line.
-		if i := strings.LastIndex(pid, "\n"); i >= 0 {
-			pid = strings.TrimSpace(pid[i+1:])
+		line := strings.TrimSpace(string(out))
+		// The last line is "<pid> [<soft> <hard>]"; if the shell
+		// printed chatter before it, take the final non-empty line.
+		if i := strings.LastIndex(line, "\n"); i >= 0 {
+			line = strings.TrimSpace(line[i+1:])
 		}
-		if pid == "" {
+		fields := strings.Fields(line)
+		if len(fields) == 0 || fields[0] == "" {
 			return nil, fmt.Errorf("fd_exhaustion on %s: prlimit succeeded but no PID echoed", t.Name())
 		}
-		done = append(done, clamped{name: t.Name(), pid: pid})
+		c := clamped{name: t.Name(), pid: fields[0]}
+		if len(fields) >= 3 {
+			c.soft, c.hard = fields[1], fields[2]
+		}
+		done = append(done, c)
 	}
 	return func(ctx context.Context) error {
 		var firstErr error
 		for _, c := range done {
-			// We don't know the original hard limit; 65536 is
-			// the universal sane ceiling and is what every
-			// distro ships as the systemd default.
-			restoreScript := fmt.Sprintf(`prlimit --nofile=65536:65536 --pid=%s`, c.pid)
+			// Put back exactly what we measured. 65536:65536 is a
+			// plausible ceiling, not the target's ceiling: restoring
+			// it left the cell in a state its image never configured,
+			// and every fault applied after that one was measured
+			// against the wrong baseline.
+			soft, hard := c.soft, c.hard
+			if soft == "" || hard == "" {
+				// The pre-fault read failed (old prlimit, unusual
+				// image). Fall back to the previous behaviour rather
+				// than leaving the target clamped — but it IS a
+				// fallback, not the intent.
+				soft, hard = "65536", "65536"
+			}
+			restoreScript := fmt.Sprintf(`prlimit --nofile=%s:%s --pid=%s`, soft, hard, c.pid)
 			tgs2, err := ts.Pick(c.name)
 			if err != nil {
 				if firstErr == nil {

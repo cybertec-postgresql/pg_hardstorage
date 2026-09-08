@@ -259,8 +259,69 @@ func (signalFault) Apply(ctx context.Context, args Args, ts TargetSet) (Recovery
 		if err := t.Start(ctx); err != nil {
 			return nil, fmt.Errorf("signal: %s: post-signal start: %w", t.Name(), err)
 		}
+		// `docker start` returning 0 is not the same as the target
+		// being back. It can succeed and the container can exit again
+		// immediately — a bad entrypoint, a corrupted data directory,
+		// a port still held. Nothing checked, and nothing else in the
+		// orchestrator watches a cell that is down with no fault in
+		// flight, so a cell could sit dead for the rest of its window
+		// and still PASS: the 2h soak had a cell whose container was
+		// killed at 13:49:39 and never came back for the remaining
+		// 44 minutes, with `fault_recovered` logged one minute in and
+		// zero recovery attempts after.
+		//
+		// Verify, with a bounded wait, that the target actually
+		// answers. A target that does not come back is a fault-apply
+		// FAILURE — which is a true statement about the run, and the
+		// orchestrator already knows how to record one.
+		if err := waitTargetAlive(ctx, t, signalRecoveryTimeout); err != nil {
+			return nil, fmt.Errorf("signal: %s: %w", t.Name(), err)
+		}
 	}
 	return NoRecovery, nil
+}
+
+// signalRecoveryTimeout bounds the post-start liveness wait. Long
+// enough for a PostgreSQL container to run its entrypoint and open
+// the socket on a loaded host; short enough that a genuinely dead
+// cell is reported inside one fault window.
+const signalRecoveryTimeout = 60 * time.Second
+
+// waitTargetAliveInterval is the poll gap for waitTargetAlive.
+const waitTargetAliveInterval = 2 * time.Second
+
+// waitTargetAlive polls a target until it can execute a trivial
+// command, i.e. the container is running again and its namespace
+// accepts an exec.
+//
+// This deliberately checks the TARGET, not PostgreSQL: a cell whose
+// container is up but whose PG is still in crash recovery is exactly
+// the state the soak wants to observe, and the fault primitives that
+// care about the PG process have their own probes. What must not
+// happen is the run continuing against a container that is simply
+// gone.
+func waitTargetAlive(ctx context.Context, t Target, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	var lastErr error
+	for {
+		if _, err := t.Exec(ctx, "true"); err == nil {
+			return nil
+		} else {
+			lastErr = err
+		}
+		if ctx.Err() != nil {
+			return fmt.Errorf("post-signal liveness wait cancelled: %w", ctx.Err())
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("target did not come back within %s after post-signal start (last probe: %v)",
+				timeout, lastErr)
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("post-signal liveness wait cancelled: %w", ctx.Err())
+		case <-time.After(waitTargetAliveInterval):
+		}
+	}
 }
 
 // --- cgroup_squeeze ---------------------------------------------------
@@ -1159,6 +1220,17 @@ func (dockerPauseFault) Apply(ctx context.Context, args Args, ts TargetSet) (Rec
 			// don't leave half-frozen state on the way out.
 			for _, p := range done {
 				_ = exec.Command(p.dockerBin, "unpause", p.container).Run()
+			}
+			// Same posture as Exec / Signal / SetMemoryLimit: a
+			// container that an earlier fault took down is a
+			// pre-existing cell crash, not a docker_pause failure.
+			// This path reached the orchestrator as a raw
+			// fault_apply_failed, so a run's apply-failure count
+			// included every fault that merely landed in another
+			// fault's down-window — and the down-window skip signal
+			// the orchestrator does know how to record was lost.
+			if strings.Contains(string(out), "is not running") {
+				return nil, fmt.Errorf("docker_pause: %s: %w", dt.Container, ErrTargetNotRunning)
 			}
 			return nil, fmt.Errorf("docker_pause: %s: %w (output: %s)",
 				dt.Container, err, strings.TrimSpace(string(out)))

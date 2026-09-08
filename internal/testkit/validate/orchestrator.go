@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math/rand"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -462,6 +463,31 @@ func runCellLoop(
 				cr.BackupsTaken--
 				emit(Event{Cell: cr.Name, Op: "backup_skipped_cell_down",
 					Iteration: iter})
+			case isSourceCorruptionFailure(err):
+				// PostgreSQL refused the backup because the SOURCE
+				// data is damaged — a page that failed its checksum,
+				// a broken index. The soak injects exactly that
+				// (torn_page), and detection is the success signal,
+				// not a failure.
+				//
+				// It only started arriving here on PostgreSQL 18,
+				// which verifies page checksums during BASE_BACKUP;
+				// PG 15-17 copy the torn page and the damage surfaces
+				// later, at restore or verify, where the catalogue
+				// already expects it. So a criterion of "0
+				// backup_failed" was unsatisfiable for any fleet
+				// containing PG 18 + torn_page: every such cell
+				// aborted on the first hit and burned the rest of its
+				// window. All five failing cells in the 2h soak were
+				// exactly this, and the one PG18 cell that passed had
+				// only been lucky — churn happened to rewrite the
+				// corrupted page before the next backup read it.
+				//
+				// Record it as a detection so the cell keeps running
+				// and the rest of its window still measures something.
+				cr.CorruptionDetected++
+				emit(Event{Cell: cr.Name, Op: "backup_refused_source_corruption",
+					Iteration: iter, Err: err.Error()})
 			case err != nil:
 				cr.BackupsFailed++
 				emit(Event{Cell: cr.Name, Op: "backup_failed",
@@ -621,4 +647,39 @@ func hashName(s string) int64 {
 		h *= 1099511628211
 	}
 	return int64(h)
+}
+
+// sourceCorruptionCodes are the structured error codes the backup
+// runner emits when PostgreSQL itself refuses to hand over the data
+// because that data is damaged (see
+// internal/backup/runner/sourceerror.go).
+//
+// The soak injects source corruption on purpose (torn_page), so this
+// is a DETECTION, not a product failure — the same posture the fault
+// catalogue already takes for corruption that surfaces at restore or
+// verify time.
+var sourceCorruptionCodes = []string{
+	"source_corruption.data_checksum",
+	"source_corruption.index",
+}
+
+// isSourceCorruptionFailure reports whether a backup error is
+// PostgreSQL refusing to read damaged source data.
+//
+// The cell runtime shells out to the agent binary and returns the
+// captured output, so the typed error does not survive as a Go error
+// value — match on the code string the JSON envelope carries. The
+// legacy XX001/XX002 SQLSTATE text is matched too, so a run driven
+// against an older agent binary classifies the same way.
+func isSourceCorruptionFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	for _, code := range sourceCorruptionCodes {
+		if strings.Contains(msg, code) {
+			return true
+		}
+	}
+	return strings.Contains(msg, "XX001") || strings.Contains(msg, "XX002")
 }

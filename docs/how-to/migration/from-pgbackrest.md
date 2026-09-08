@@ -42,14 +42,34 @@ tags:
 | Stanza                   | Deployment (`db1`, `db2`, ...)      |
 | Repo (`repo1-path`)      | Repository URL (`s3://…`, `file://…`) |
 | Full backup              | Full backup (`db1.full.<ts>`)       |
-| Differential / incremental | Incremental backup (incremental of nearest full) |
+| Differential / incremental | Incremental backup (incremental of nearest full) — **PG 17+ only**, see below |
 | `archive-push` /
   `archive-get`            | WAL streaming via `pg_hardstorage agent` |
 | `restore`                | `pg_hardstorage restore`            |
 | `info`                   | `pg_hardstorage list` + `show`      |
 | `expire`                 | `pg_hardstorage rotate`             |
-| Cipher (`repo1-cipher-pass`) | KMS envelope (`encryption.kek_ref` per manifest) |
+| Cipher (`repo1-cipher-pass`) | KMS envelope: set `kek_ref:` on the deployment (recorded per manifest as `encryption.kek_ref`) |
 | Repo verify (`pgbackrest verify`) | `pg_hardstorage verify` (fast or `--full`) |
+
+!!! warning "Incrementals need PostgreSQL 17+"
+
+    pgBackRest implements differential / incremental backups with its
+    own page-level scheme, so `--type=incr` works on every PostgreSQL
+    version it supports.  `pg_hardstorage` uses **PostgreSQL's own**
+    incremental-backup protocol, which exists only in **PG 17+** and
+    additionally needs `summarize_wal = on` (off by default, a SIGHUP
+    reload is enough).
+
+    On PG 15 / 16 an incremental refuses cleanly with
+    `backup.incremental_unsupported`.  Migrating a PG 15 / 16 cron
+    that relies on `--type=incr` therefore loses the incremental
+    capability: run full backups instead, or upgrade the source.
+
+    Running fulls is far less costly here than it sounds.  Every
+    backup is content-addressed and deduplicated against what the
+    repository already holds, so a "full" stores roughly what an
+    incremental would — the chain requirement is what disappears, not
+    the space saving.
 
 The conceptual model is similar — the bytes-on-disk shape
 is not.
@@ -76,7 +96,7 @@ and dispatches to native pg_hardstorage commands.
 # 2. Translate your existing pgbackrest.conf in one shot.
 pg_hardstorage compat translate --from pgbackrest \
     /etc/pgbackrest/pgbackrest.conf \
-    --output /etc/pg_hardstorage/pg_hardstorage.yaml
+    --out-file /etc/pg_hardstorage/pg_hardstorage.yaml
 
 # 3. Review the YAML — every unmapped pgBackRest setting
 #    surfaces as a comment + on stderr.

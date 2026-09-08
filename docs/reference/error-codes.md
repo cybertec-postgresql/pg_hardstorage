@@ -246,6 +246,7 @@ field is where the recovery hint lives.
 | `connect.*`, `deployment.*` | Connection probing |
 | `standby.*`, `timetravel.*`, `timetable.*` | Standby / timetravel features |
 | `gameday.*` | Disaster drills |
+| `source_corruption.*` | **The database being backed up is damaged** — not pg_hardstorage, and not the repository. Raised when PostgreSQL itself refuses to hand over the data: `source_corruption.data_checksum` (SQLSTATE XX001, a data page failed its checksum during `BASE_BACKUP`) and `source_corruption.index` (XX002). Exit 1. Do NOT retry the backup: treat it as a data-loss incident on the primary, and keep the backups already in the repository (verify one). PostgreSQL 18 verifies page checksums during `BASE_BACKUP`; 15–17 do not, so an older major may have been copying a damaged page silently. |
 | `notimpl.*` | Scaffolded command that is not implemented yet (`notimpl.<command>`, e.g. `notimpl.compact`). Always exit 1; the suggestion points at the design spec. |
 | `internal` | Catch-all for unstructured errors funnelled through `output.ToError` |
 

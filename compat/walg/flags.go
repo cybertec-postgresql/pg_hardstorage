@@ -158,11 +158,11 @@ func mapEnvToNativeArgs(verb string, e walgEnv) (native []string, warnings []str
 	// algorithms.
 	if e.libsodiumKey != "" {
 		return nil, nil, fmt.Errorf(
-			"pg-hardstorage-walg: WALG_LIBSODIUM_KEY is not honoured (libsodium box is not byte-compatible with native AES-256-GCM); configure encryption.kek_ref in pg_hardstorage.yaml")
+			"pg-hardstorage-walg: WALG_LIBSODIUM_KEY is not honoured (libsodium box is not byte-compatible with native AES-256-GCM); set `kek_ref:` on the deployment in pg_hardstorage.yaml")
 	}
 	if e.gpgKeyID != "" || e.pgpKey != "" || e.pgpKeyPath != "" {
 		return nil, nil, fmt.Errorf(
-			"pg-hardstorage-walg: WAL-G GPG/PGP envelope is not honoured; configure encryption.kek_ref (KMS-wrapped DEK) in pg_hardstorage.yaml")
+			"pg-hardstorage-walg: WAL-G GPG/PGP envelope is not honoured; set `kek_ref:` (KMS-wrapped DEK) on the deployment in pg_hardstorage.yaml")
 	}
 
 	// Soft warnings.

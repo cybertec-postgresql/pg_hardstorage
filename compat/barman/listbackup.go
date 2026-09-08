@@ -21,6 +21,13 @@ import (
 // IDs) by translating to `--output template` with a tiny template
 // that emits one ID per line.  That keeps the most common
 // "list-backup | head -1" cron-monitoring pattern working.
+//
+// The template must name the field the JSON envelope actually
+// carries: backupSummary marshals its id as `backup_id`, not `id`.
+// The original `{{.id}}` rendered the empty string for every row, so
+// `--minimal` printed one blank line per backup — indistinguishable
+// from "no backups" to the very scripts this flag exists for, which
+// then extracted garbage.
 func newListBackupCmd(stdout, stderr io.Writer) *cobra.Command {
 	var minimal bool
 	c := &cobra.Command{
@@ -33,7 +40,7 @@ func newListBackupCmd(stdout, stderr io.Writer) *cobra.Command {
 			if minimal {
 				native = append(native,
 					"--output", "template",
-					"--template", `{{range .backups}}{{.id}}
+					"--template", `{{range .backups}}{{.backup_id}}
 {{end}}`,
 				)
 			}

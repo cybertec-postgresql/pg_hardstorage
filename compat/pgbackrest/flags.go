@@ -4,6 +4,7 @@ package pgbackrest
 import (
 	"fmt"
 	"net/url"
+	"sort"
 	"strings"
 
 	"github.com/spf13/pflag"
@@ -47,6 +48,13 @@ type pgbackrestArgs struct {
 	target       string // time | LSN | name (recovery target)
 	targetAction string // pause | promote | shutdown
 	targetType   string // explicit form override (time|lsn|name|immediate)
+
+	// pgBackRest's explicit per-form target flags. These are what the
+	// tool's own documentation and most crons use; --target + --type
+	// is the older spelling. resolveTarget folds the two together.
+	targetTime string
+	targetLSN  string
+	targetName string
 }
 
 // registerCommonFlags wires pgBackRest's persistent flags onto
@@ -104,14 +112,152 @@ func registerCommonFlags(fs *pflag.FlagSet) {
 	}
 
 	// start-fast / stop-auto / backup-standby are BOOLEAN pgBackRest
-	// knobs: operators write a bare `--start-fast` (no value). If they
-	// were registered as string flags (like the ignored knobs above),
-	// cobra would fail parsing with "flag needs an argument". Register
-	// them as bool flags so a bare flag parses; the values are ignored.
+	// knobs: operators write a bare `--start-fast` (no value), and
+	// pgBackRest's own documentation spells the explicit form
+	// `--start-fast=y` / `=n`. pflag's native bool only accepts Go's
+	// strconv.ParseBool vocabulary, so the documented y/n form failed
+	// with a raw "strconv.ParseBool: parsing \"y\"" and no
+	// remediation. pgbRestBool accepts both vocabularies.
 	for _, ignoredBool := range silentlyIgnoredBoolFlags {
-		fs.Bool(ignoredBool, false, "")
+		v := new(pgbRestBool)
+		fs.Var(v, ignoredBool, "")
+		// NoOptDefVal is what lets a BARE `--start-fast` parse; without
+		// it pflag demands a value for a Var flag.
+		fs.Lookup(ignoredBool).NoOptDefVal = "y"
 		_ = fs.MarkHidden(ignoredBool)
 	}
+
+	// Flags pgBackRest accepts that the shim has nothing to do with,
+	// but which appear in real cron lines. Accepting them keeps the
+	// command line parsing; a bare "unknown flag" from cobra carries
+	// no remediation and breaks the migration outright.
+	for _, ignored := range silentlyIgnoredValueFlags {
+		fs.String(ignored, "", "")
+		_ = fs.MarkHidden(ignored)
+	}
+	for _, ignoredBool := range silentlyIgnoredExtraBoolFlags {
+		v := new(pgbRestBool)
+		fs.Var(v, ignoredBool, "")
+		fs.Lookup(ignoredBool).NoOptDefVal = "y"
+		_ = fs.MarkHidden(ignoredBool)
+	}
+
+	// Flags pgBackRest accepts and the shim must NOT silently swallow,
+	// because ignoring them would change what the operator asked for.
+	// Registered so they parse, then refused by name with a pointer at
+	// the native equivalent (checkRefusedFlags).
+	for name := range refusedFlags {
+		if refusedFlagIsBool[name] {
+			v := new(pgbRestBool)
+			fs.Var(v, name, "")
+			fs.Lookup(name).NoOptDefVal = "y"
+		} else {
+			fs.String(name, "", "")
+		}
+		_ = fs.MarkHidden(name)
+	}
+}
+
+// pgbRestBool is a pflag.Value that understands BOTH pgBackRest's
+// y/n spelling and Go's true/false, so `--start-fast`,
+// `--start-fast=y` and `--start-fast=true` all parse.
+type pgbRestBool bool
+
+func (b *pgbRestBool) String() string {
+	if b != nil && bool(*b) {
+		return "y"
+	}
+	return "n"
+}
+
+func (b *pgbRestBool) Set(v string) error {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "y", "yes", "true", "1", "on", "":
+		*b = true
+		return nil
+	case "n", "no", "false", "0", "off":
+		*b = false
+		return nil
+	default:
+		return fmt.Errorf("invalid boolean %q (pgBackRest spells these y/n)", v)
+	}
+}
+
+// Type is what pflag prints in usage; "y|n" matches pgBackRest.
+func (b *pgbRestBool) Type() string { return "y|n" }
+
+// silentlyIgnoredValueFlags take a value and have no native
+// equivalent. --subject is the classic mail-subject cron option;
+// --cwd / --log-file are logging/placement concerns the native
+// structured output replaces.
+var silentlyIgnoredValueFlags = []string{
+	"subject",
+	"cwd",
+	"log-file",
+	// Inline S3 credentials. pg_hardstorage takes credentials from the
+	// standard SDK chain, so these are not honoured — but they have to
+	// PARSE for buildRepoURL's "not honoured" warning to be reachable
+	// at all. Previously the flag died at parse time and the warning
+	// was dead code.
+	"repo1-s3-key",
+	"repo1-s3-key-secret",
+}
+
+// silentlyIgnoredExtraBoolFlags are booleans pgBackRest accepts whose
+// effect the native path already provides or does not need.
+var silentlyIgnoredExtraBoolFlags = []string{
+	// `verify --online` — native verify reads the repository and does
+	// not care whether PG is up.
+	"online",
+	// `restore --delta` restores only changed files into an existing
+	// data directory. Native restore always writes a complete data
+	// directory, which is a superset of the delta result: correct, just
+	// not incremental. Accepting it keeps the cron working.
+	"delta",
+}
+
+// refusedFlags maps a pgBackRest flag the shim will not silently
+// ignore to the native remediation. Ignoring any of these would
+// change the outcome the operator asked for, so they refuse loudly
+// (exit 2) instead of parsing into a no-op.
+var refusedFlags = map[string]string{
+	"force": "native restore refuses a non-empty --target on purpose; " +
+		"clear the directory yourself, or restore to a fresh path",
+	"dry-run": "use `pg_hardstorage restore ... --preview` for a restore dry-run, " +
+		"or `pg_hardstorage rotate ...` without --apply for a retention dry-run",
+	"pg1-path": "pg_hardstorage reaches PostgreSQL over the replication protocol, " +
+		"not the data directory: set --pg1-host/--pg1-port/--pg1-user instead",
+	"repo2-type": "multi-repository stanzas are not translated; run one deployment " +
+		"per repository, or replicate with `pg_hardstorage repo replicate`",
+	"repo2-path": "multi-repository stanzas are not translated; run one deployment " +
+		"per repository, or replicate with `pg_hardstorage repo replicate`",
+	"config": "the shim reads pg_hardstorage.yaml, not pgbackrest.conf: convert it " +
+		"once with `pg_hardstorage compat translate --from pgbackrest <config-path>`",
+}
+
+// refusedFlagIsBool marks which refused flags are pgBackRest booleans,
+// so a bare `--force` parses (and is then refused) rather than
+// swallowing the next argv element as its value.
+var refusedFlagIsBool = map[string]bool{
+	"force":   true,
+	"dry-run": true,
+}
+
+// checkRefusedFlags returns a refusal for the first registered-but-
+// refused flag the operator actually set. Verbs call it after parse
+// and before dispatching anything.
+func checkRefusedFlags(fs *pflag.FlagSet) error {
+	var found []string
+	fs.Visit(func(f *pflag.Flag) {
+		if _, ok := refusedFlags[f.Name]; ok {
+			found = append(found, f.Name)
+		}
+	})
+	sort.Strings(found)
+	if len(found) == 0 {
+		return nil
+	}
+	return refuseFlag("--"+found[0], refusedFlags[found[0]])
 }
 
 // silentlyIgnoredFlags is the list of pgBackRest knobs that
@@ -181,16 +327,46 @@ func mapToNativeArgs(verb string, a pgbackrestArgs) (native []string, warnings [
 	// (archive-get) do NOT define --pg-connection — passing it makes
 	// cobra reject the argv as unknown. `backup` and `wal push`
 	// (archive-push) do accept it.
-	if verbAcceptsPGConnection(verb) {
-		if conn := buildPGConnection(a); conn != "" {
-			native = append(native, "--pg-connection", conn)
-		}
+	// Explicit flags win; the stanza's pg_hardstorage.yaml deployment
+	// fills only what the command line left out. A real pgBackRest
+	// cron carries just --stanza (everything else lives in
+	// pgbackrest.conf), so without this fallback the canonical
+	// invocation failed with usage.missing_flag.
+	fromConfig := stanzaLookup(a.stanza)
+
+	conn := buildPGConnection(a)
+	if conn == "" {
+		conn = fromConfig.PGConnection
 	}
-	if repoURL, w, e := buildRepoURL(a); e != nil {
+	if verbAcceptsPGConnection(verb) && conn != "" {
+		native = append(native, "--pg-connection", conn)
+	}
+
+	repoURL, w, e := buildRepoURL(a)
+	if e != nil {
 		return nil, nil, e
-	} else if repoURL != "" {
-		native = append(native, "--repo", repoURL)
+	}
+	if repoURL == "" {
+		repoURL = fromConfig.Repo
+	} else {
 		warnings = append(warnings, w...)
+	}
+	if repoURL != "" {
+		native = append(native, "--repo", repoURL)
+	}
+
+	// Say what is still missing HERE, naming the stanza and the way
+	// out, rather than letting the native CLI report a bare
+	// "--pg-connection, --repo are required" three layers down.
+	var missing []string
+	if verbAcceptsPGConnection(verb) && conn == "" {
+		missing = append(missing, "--pg1-host (or pg_connection)")
+	}
+	if repoURL == "" && verbNeedsRepo(verb) {
+		missing = append(missing, "--repo1-path (or repo)")
+	}
+	if len(missing) > 0 {
+		return nil, nil, missingStanzaHint(a.stanza, missing)
 	}
 
 	// Cipher: pgBackRest's CBC vs our GCM is a real
@@ -217,6 +393,21 @@ func mapToNativeArgs(verb string, a pgbackrestArgs) (native []string, warnings [
 			"warn: --archive-async ignored; native streaming is already async via the replication slot")
 	}
 
+	// --retention-full parsed into retentionFull and was then dropped
+	// on the floor: no native arg, no warning. An operator's
+	// `backup --retention-full=7` appeared to "run unchanged" while
+	// retention silently reverted to the native default. Retention is
+	// applied by `rotate`, not by `backup`, so the shim cannot forward
+	// it — but it must never pretend it did.
+	if a.retentionFull > 0 {
+		warnings = append(warnings,
+			fmt.Sprintf("warn: --retention-full=%d is NOT applied by this command; "+
+				"pg_hardstorage applies retention in `rotate` — set `retention: {policy: count, keep_fulls: %d}` "+
+				"for this deployment in pg_hardstorage.yaml, or run "+
+				"`pg_hardstorage rotate %s --policy count --keep-fulls %d --apply`",
+				a.retentionFull, a.retentionFull, a.stanza, a.retentionFull))
+	}
+
 	return native, warnings, nil
 }
 
@@ -231,6 +422,19 @@ func verbAcceptsPGConnection(verb string) bool {
 		return true
 	default:
 		return false
+	}
+}
+
+// verbNeedsRepo reports whether the native verb cannot run without a
+// repository. Every verb the shim dispatches reads or writes the
+// repo; `check` is the one that can still say something useful
+// without it, so it is not gated.
+func verbNeedsRepo(verb string) bool {
+	switch verb {
+	case "doctor":
+		return false
+	default:
+		return true
 	}
 }
 
@@ -269,7 +473,12 @@ func buildPGConnection(a pgbackrestArgs) string {
 // for S3.
 func buildRepoURL(a pgbackrestArgs) (string, []string, error) {
 	switch strings.ToLower(a.repo1Type) {
-	case "posix", "":
+	// "file" is pgBackRest's own documented spelling for a local
+	// repository and the value most real pgbackrest.conf files carry;
+	// "posix" is what its option validator echoes back. Both mean the
+	// same thing. Rejecting "file" made the single most common repo
+	// shape unusable through the shim.
+	case "posix", "file", "":
 		// Empty type with --repo1-path set: treat as posix.
 		if a.repo1Path == "" {
 			return "", nil, nil
@@ -323,7 +532,7 @@ func buildRepoURL(a pgbackrestArgs) (string, []string, error) {
 
 	default:
 		return "", nil, fmt.Errorf(
-			"pg-hardstorage-pgbackrest: unsupported --repo1-type %q (supported: posix, s3)",
+			"pg-hardstorage-pgbackrest: unsupported --repo1-type %q (supported: posix, file, s3)",
 			a.repo1Type)
 	}
 }

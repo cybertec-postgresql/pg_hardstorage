@@ -13,6 +13,238 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+#### Compatibility shims and config translators
+
+Findings from a compat-layer test pass against real pgBackRest 2.59.1,
+Barman 3.20.0 and WAL-G, plus a 32-cell / 2 h chaos soak.
+
+- **Every restore driven through a compat shim produced an unbootable
+  cluster.** The shims dispatch the native CLI in-process, so
+  `WriteAutoRecovery` ran inside the *shim* process and
+  `os.Executable()` returned the shim's own path — which went verbatim
+  into the restored cluster's `postgresql.auto.conf`. At recovery time
+  PostgreSQL then ran `<shim> wal fetch …`; the multicall binary
+  dispatches on `argv[0]`, did not recognise itself under that name,
+  and exited 2. That is neither 0 (delivered) nor 6 (absent), so the
+  embedded tail aborted the shell and PG died with *"child process was
+  terminated by signal 6"*.
+
+  The restore itself reported success. The failure surfaced only at
+  first boot, and only to whoever tried to start the cluster.
+
+  The companion-binary rewrite that already existed for
+  `pg_hardstorage_simple` now covers every shim name, under both the
+  built names and the upstream names operators symlink them to. As
+  belt-and-braces for clusters restored by an older build, the
+  multicall binary now serves native verbs under any name instead of
+  refusing.
+
+- **`barman-cloud-wal-restore` turned any fetch failure into a silent
+  promotion.** It collapsed every native exit to 1. PostgreSQL reads
+  every plain non-zero exit from a `restore_command` as *end of
+  archive* — so an S3 outage, an expired credential, a keyring refused
+  for its file mode, or a chunk swept by `gc` all reached a CNPG
+  replica as "no more WAL", and the replica promoted with unreplayed
+  WAL still sitting in the repository.
+
+  This is the exact data-loss mode `walfetchcmd/tail.go` was written to
+  prevent, reintroduced in the one path where this shim *is* the
+  `restore_command`. It now forwards native 6 as exit 1 and returns
+  126 for anything else: PostgreSQL's `wait_result_is_any_signal`
+  treats a status above 125 as signal-ish and makes recovery fatal.
+
+- **All three config translators emitted YAML the loader rejects.** The
+  documented migration path is translate → drop in → use, and it could
+  not work: `internal/config` decodes with `KnownFields(true)`, and the
+  pgBackRest translator emitted `keep_full_count` plus an
+  `encryption:` block, the Barman translator emitted `slot:`,
+  `parallelism:`, `compression:` and `backup:`, and the WAL-G
+  translator emitted `encryption.{kek_ref,passphrase_env}` — none of
+  which exist in `DeploymentConfig`.
+
+  Each now renders the real schema (`keep_fulls`, a flat `kek_ref`) or
+  carries the setting as a comment naming the native equivalent. A new
+  round-trip test pushes all three translators' output through the
+  production loader, so this class of drift is a build failure rather
+  than something an operator finds mid-migration.
+
+- **`compat translate --output <path>` could not run at all.** The
+  documented command in all three migration guides died with `unknown
+  output format "/etc/pg_hardstorage/pg_hardstorage.yaml"`: the local
+  `--output` (a file path) shadowed the root's persistent `-o/--output`
+  (an output *format*), which `installDispatcher` reads via
+  `cmd.Flags().GetString("output")`. The flag is now `--out-file`, and
+  the guides are updated.
+
+- **A pgBackRest stanza the translator could not map became a silently
+  inoperable deployment.** A `pg1-path` stanza (no host/port/user —
+  the common single-node shape) rendered a deployment block with zero
+  fields, which YAML decodes as null, the loader accepts, and `lint`
+  called `valid`. Every command against it then failed with a bare
+  `usage.missing_flag`, far from the config that caused it.
+
+  The translator now writes an `UNTRANSLATED` marker into the file
+  itself (stdout is the mode operators pipe; stderr is not), and `lint`
+  reports deployments missing `pg_connection` or `repo` instead of
+  calling the file valid.
+
+- **`pgbackrest --stanza=db1 backup` — the canonical cron line —
+  failed.** Real pgBackRest keeps connection and repository in
+  `pgbackrest.conf`, so a real cron carries only the stanza. The shim
+  could build `--pg-connection` / `--repo` from flags alone, so it
+  answered `usage.missing_flag`, contradicting the migration guide's
+  promise that an existing cron runs unchanged. The stanza now falls
+  back to the matching `pg_hardstorage.yaml` deployment, with explicit
+  flags still winning.
+
+- **`--retention-full` was parsed and then silently dropped.** No
+  native argument, no warning: an operator's
+  `backup --retention-full=7` appeared to run unchanged while retention
+  reverted to the native default. Silent policy drift is the worst
+  failure mode a backup tool has. Retention is applied by `rotate`, not
+  `backup`, so the shim cannot forward it — but it now says so, and
+  names both ways to set it.
+
+- **`barman check --nagios` was broken in both directions.** The
+  template read `.ok` and `.summary`, which the `doctor` result does
+  not have, so it rendered `BARMAN CRITICAL - <no value>` for a
+  *healthy* server; and `doctor` was invoked without
+  `--exit-on-issues`, so the process exited 0 in every state — a server
+  whose PostgreSQL was down monitored green. The line is now rendered
+  from the real fields and carries Nagios' own exit codes.
+
+- **`doctor <deployment>` ignored the deployment.** The positional has
+  always been advertised; every probe walked the whole fleet, so the
+  answer to "is db1 healthy?" was a fleet verdict — and
+  `barman check <server>`, which dispatches straight to it, inherited
+  that. `doctor` now scopes to the named deployment, and an unknown
+  name is a `notfound.deployment` usage error rather than a report
+  about nothing.
+
+- **`doctor` never connected to PostgreSQL.** It inspected paths,
+  repositories, keys and manifests — everything except the database.
+  A deployment whose server was unreachable reported healthy, because
+  nothing in the report had ever opened a connection (the
+  manifest-derived version check reads the *last backup's* recorded
+  version). A bounded per-deployment liveness probe now reports
+  `pg.unreachable`.
+
+- **`barman-wal-archive` demanded three positionals.** The classic
+  `archive_command = 'barman-wal-archive db1 %p'` — the single most
+  common drop-in point there is — failed immediately with `accepts
+  3 arg(s), received 2`, and PostgreSQL retries a failing
+  `archive_command` forever, so WAL piled up. Both shapes are accepted.
+
+- **`barman list-backup --minimal` printed one blank line per backup.**
+  The template named `{{.id}}`; the field marshals as `backup_id`. To
+  the `list-backup -m | head -1` scripts the flag exists for, that is
+  indistinguishable from "no backups" — and they extracted garbage.
+
+- **`wal-g backup-push` failed out of the box on PG 15/16 and on
+  unconfigured PG 17.** The shim always passed `--incremental-from
+  latest`, mapping wal-g's tool-level delta default onto PostgreSQL's
+  incremental protocol — which needs PG 17+ *and* `summarize_wal = on`
+  (off by default). Both refusals arrive before the repository is
+  consulted, so even the first push into a fresh repo failed. The shim
+  now probes the server and takes a full backup, with a warning, when
+  either prerequisite is missing.
+
+- **Widely-used pgBackRest flags died as `unknown flag` with no
+  remediation**, against a documented promise that anything unsupported
+  refuses with a pointer at the native equivalent. `--version`,
+  `--delta`, `--force`, `--dry-run`, `--subject`, `verify --online`,
+  `--pg1-path`, `--repo2-*`, `--config`, the inline S3 credential flags,
+  and pgBackRest's own `--target-time` / `--target-lsn` /
+  `--target-name` are now either accepted, mapped, or refused by name.
+  `--repo1-type=file` — pgBackRest's own spelling for a local repo, and
+  the most common one — was rejected outright; it is an alias for
+  `posix`. pgBackRest's canonical `=y` / `=n` boolean spelling now
+  parses instead of failing with a raw `strconv.ParseBool` error.
+
+- **Barman's global flags and several real verbs had no entry.**
+  `-f json`, `-c`, `--color`, `--log-level`, `-q`, `-d`, `-v` all
+  failed, and the short boolean forms blamed the *server name*
+  (`unknown command "db2"`). `status` — a first-class Barman verb and a
+  monitoring staple — was missing entirely, along with a dozen others.
+  Plural aliases (`list-backups`, `show-backups`) now resolve.
+
+- **The barman shim's own remediation pointed at a command that does
+  not exist** (`pg_hardstorage compat translate-barman`), in exactly
+  the failure mode where the operator needs it.
+
+- **Source corruption was reported as `code: "internal"`.** A torn page
+  caught by PostgreSQL 18's base-backup checksum verification surfaced
+  with the code reserved for "we do not know what this is", so the most
+  urgent signal the tool can emit — *your production data is damaged* —
+  was indistinguishable from a bug in the tool, and automation keyed on
+  error codes routed it accordingly. XX001 / XX002 now map to
+  `source_corruption.*` with operator guidance. Likewise, restoring a
+  backup id that does not exist now reports `notfound.backup` rather
+  than `internal`.
+
+- **The WAL-G shim, its translator, and the docs all taught a config
+  path the loader rejects** — `encryption.kek_ref`, where the schema
+  has a flat `kek_ref`. (`encryption.kek_ref` *is* real, but inside a
+  backup manifest, not the config.) The migration guides also mapped
+  `WALG_COMPRESSION_METHOD` to a `compression:` config field that does
+  not exist, and promised pgBackRest-style incrementals without the
+  PG 17+ caveat that makes them unavailable on a PG 15/16 fleet.
+
+#### Soak harness
+
+- **The WAL-stream sidecar was never restarted after a container
+  fault**, so the soak's stated purpose went unmeasured on most cells.
+  It is a `docker exec`, which dies with the container — and the
+  `signal` fault primitive kills containers on purpose. The first
+  signal fault in a cell ended continuous WAL archiving for the rest of
+  that cell's run; 30 of 32 cells took at least one. The tell was in
+  the report all along: cells whose first signal fired early carried
+  1.3–2.3 GB of `wal_repo_lag_bytes` against 33–67 MB for cells that
+  took none, and 7 of 32 deployments had no WAL in the repo at all.
+  That was read as "the streamer fell behind". The streamer was not
+  there. It is now supervised, and the report distinguishes "was
+  interrupted" from "fell behind".
+
+- **A cell could be dead for 44 minutes and still PASS.** The `signal`
+  fault ran `docker start` and never checked it worked; nothing else
+  watches a cell that is down with no fault in flight. One cell in the
+  2 h soak was killed at 13:49:39, logged `fault_recovered` a minute
+  later, and never ran again. Post-signal liveness is now verified with
+  a bounded wait.
+
+- **PG 18 × `torn_page` failed the catalogue's own pass criterion by
+  construction.** PostgreSQL 18 verifies page checksums during
+  `BASE_BACKUP`, so an injected torn page is refused at *backup* time
+  rather than surfacing later at restore — an earlier and better
+  detection, counted as `backup_failed`. Every such cell aborted on the
+  first hit and burned the rest of its window; all five cell failures
+  in the 2 h soak were this. It is now recorded as a detection.
+
+- **`checkpoint_storm` could apply as a complete no-op** — wrong OS
+  user, no `psql` in the image, PG down — while the report recorded it
+  as applied, voiding any correlation drawn from it in either
+  direction. The script now counts successful checkpoints and refuses
+  zero.
+
+- **Faults landing in another fault's down-window were counted as apply
+  failures.** `docker_pause` and `fd_exhaustion` did not emit the
+  `ErrTargetNotRunning` sentinel the orchestrator already knows how to
+  skip on.
+
+- **`fd_exhaustion` recovery restored a guessed `RLIMIT_NOFILE`**
+  (65536:65536) instead of the target's own, leaving every cell that
+  took the fault with a ceiling its image never configured — drift that
+  outlived the fault and changed what later faults measured. The
+  pre-fault limits are now captured and restored.
+
+- **A soak report's `repo-data/` looks empty and is not.** Every
+  subdirectory is owned by the in-container uid, so the host user
+  cannot read it — and `du -sh` reports a few tens of kilobytes because
+  it cannot descend either. The ownership contract, and both ways to
+  read the tree, are now documented next to the data.
+
+#### Other
+
 - **`repo bundle export --include-wal` silently produced a bundle with
   no WAL.** The export draws its segment list from each manifest's
   `wal_required`, and nothing populates that field — the backup runner

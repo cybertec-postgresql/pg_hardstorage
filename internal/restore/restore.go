@@ -287,8 +287,7 @@ func Restore(ctx context.Context, opts Options) (res *Result, err error) {
 	// 2. Read + verify the manifest.
 	m, err := store.Read(ctx, opts.Deployment, opts.BackupID, opts.Verifier)
 	if err != nil {
-		return nil, fmt.Errorf("restore: read manifest %s/%s: %w",
-			opts.Deployment, opts.BackupID, err)
+		return nil, mapManifestReadErr("restore", opts.Deployment, opts.BackupID, err)
 	}
 
 	// 2pre. WAL-gap pre-flight. Refuse if the operator's PITR
@@ -1614,6 +1613,32 @@ func mapRepoErr(url string, err error) error {
 			fmt.Sprintf("restore: no pg_hardstorage repository at %s", url)).Wrap(err)
 	}
 	return fmt.Errorf("restore: open repo: %w", err)
+}
+
+// mapManifestReadErr types a failed manifest read.
+//
+// A backup id that is not in the repository is a well-known,
+// operator-caused condition — a typo, a rotated-away backup, a wrong
+// deployment name — and every caller that lists backups can act on
+// it. It used to surface as code "internal", the bucket for
+// unclassified failures, so `restore db1 does-not-exist` was reported
+// with the same code as a genuine tool bug, and shells that branch on
+// the exit code got ExitError instead of ExitNotFound.
+//
+// Only a definitive storage-layer "no such object" is typed: a read
+// that failed for any other reason (permission, I/O, a signature
+// mismatch) genuinely is something else, and must keep its own error.
+func mapManifestReadErr(verb, deployment, backupID string, err error) error {
+	if errors.Is(err, storage.ErrNotFound) {
+		return output.NewError("notfound.backup",
+			fmt.Sprintf("%s: no backup %q for deployment %q in this repository",
+				verb, backupID, deployment)).
+			WithSuggestion(&output.Suggestion{
+				Human:   "list what the repository actually holds, then re-run with an id from that list",
+				Command: fmt.Sprintf("pg_hardstorage list %s", deployment),
+			}).Wrap(err)
+	}
+	return fmt.Errorf("%s: read manifest %s/%s: %w", verb, deployment, backupID, err)
 }
 
 // restoreIncrementalChain implements PG 17+ incremental-chain

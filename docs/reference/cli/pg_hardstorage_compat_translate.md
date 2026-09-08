@@ -24,16 +24,16 @@ is emitted as a YAML comment with a stderr summary so the
 operator can review.
 
 ```
-pg_hardstorage compat translate --from <tool> <config-path> [flags]
+pg_hardstorage compat translate --from <tool> <config-path> [--out-file <path>] [flags]
 ```
 
 ### Options
 
 ```
-      --force           overwrite an existing output file
-      --from string     source tool: pgbackrest|barman|walg (required)
-  -h, --help            help for translate
-      --output string   output file path (default: stdout)
+      --force             overwrite an existing output file
+      --from string       source tool: pgbackrest|barman|walg (required)
+  -h, --help              help for translate
+      --out-file string   write the rendered YAML to this path (default: stdout)
 ```
 
 ### Options inherited from parent commands
@@ -47,6 +47,7 @@ pg_hardstorage compat translate --from <tool> <config-path> [flags]
       --on-error-llm                                                                      on a structured-error failure, drop into the matching LLM helper skill (auto_on_error trigger). Also enabled by PG_HARDSTORAGE_ON_ERROR_LLM=1.
       --otel-endpoint string                                                              OpenTelemetry OTLP/HTTP endpoint (e.g. http://otel-collector:4318); empty disables tracing
       --otel-stdout                                                                       also export OpenTelemetry traces to stderr (useful for dev)
+  -o, --output string                                                                     output format: text|json|ndjson|yaml|template|csv|markdown|html|tap|junit|pdf (default: text on TTY, json off-TTY)
       --profile-port go tool pprof http://127.0.0.1:6060/debug/pprof/profile?seconds=30   if non-zero, expose net/http/pprof on 127.0.0.1:<port> for live profiling of long-running commands (e.g. go tool pprof http://127.0.0.1:6060/debug/pprof/profile?seconds=30). Off when zero.
   -q, --quiet                                                                             suppress non-essential output
       --template string                                                                   Go text/template applied when --output template (or implied if --template is set without --output)

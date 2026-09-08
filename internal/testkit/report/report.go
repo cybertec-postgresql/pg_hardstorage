@@ -58,6 +58,20 @@ type CellReport struct {
 	RestoresFailed    int    `json:"restores_failed"`
 	FaultsApplied     int    `json:"faults_applied"`
 
+	// CorruptionDetected counts backups PostgreSQL REFUSED because the
+	// source data was damaged (a torn page failing its checksum, a
+	// broken index). The soak injects that damage on purpose, so a
+	// refusal is the product working — the same posture the fault
+	// catalogue already takes for corruption that surfaces at restore
+	// or verify time.
+	//
+	// It is counted separately from BackupsFailed because it started
+	// arriving only on PostgreSQL 18, which verifies page checksums
+	// during BASE_BACKUP. Counted as a failure, it made the
+	// catalogue's own "0 backup_failed" criterion unsatisfiable for
+	// any fleet containing PG 18 and torn_page.
+	CorruptionDetected int `json:"corruption_detected,omitempty"`
+
 	// RecoveryFails counts faults that were applied but could NOT be
 	// reverted, leaving the cell in the degraded state the fault
 	// created for every iteration that follows. Deadline-aborted
@@ -146,6 +160,27 @@ type LoadStats struct {
 	// WALStreamRan is the same flag for the wal-stream
 	// sidecar.
 	WALStreamRan bool `json:"wal_stream_ran,omitempty"`
+
+	// WALStreamRestarts counts how many times the supervisor had to
+	// re-attach the `wal stream` sidecar during the cell.
+	//
+	// The sidecar is a `docker exec`, so it dies with the container —
+	// and the soak kills containers on purpose. Before it was
+	// supervised, the first `signal` fault ended WAL archiving for the
+	// rest of the cell, and the report showed that only as a large
+	// wal_repo_lag_bytes, indistinguishable from "the streamer fell
+	// behind". A non-zero count here says the streamer was interrupted;
+	// a zero count with a large lag means it really was behind.
+	WALStreamRestarts int `json:"wal_stream_restarts,omitempty"`
+
+	// WALStreamUpAtStop records whether the sidecar was attached when
+	// the cell finished. False with a large lag means the measurement
+	// ends in a hole, not in a backlog.
+	WALStreamUpAtStop bool `json:"wal_stream_up_at_stop,omitempty"`
+
+	// WALStreamDownFor is how long the sidecar had been detached when
+	// the cell finished, when it was not up. Empty when it was up.
+	WALStreamDownFor string `json:"wal_stream_down_for,omitempty"`
 }
 
 // FaultStats are aggregated injection counts.

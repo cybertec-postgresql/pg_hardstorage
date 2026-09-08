@@ -21,8 +21,19 @@ import (
 // pg_hardstorage.yaml, and surfaces a stderr summary of the
 // settings that didn't make it across.
 //
-// The file is written to --output (default: stdout).  We
+// The file is written to --out-file (default: stdout).  We
 // never overwrite a non-empty target without --force.
+//
+// The flag is --out-file and NOT --output: the root command owns a
+// persistent -o/--output that selects the output FORMAT, and
+// installDispatcher resolves it with cmd.Flags().GetString("output"),
+// which reaches a same-named local flag first.  A local --output here
+// therefore fed a file path into the format resolver, and the exact
+// command the migration guides document —
+//
+//	compat translate --from pgbackrest pgbackrest.conf --output /etc/...
+//
+// died with `unknown output format "/etc/..."` before doing any work.
 func newCompatTranslateCmd() *cobra.Command {
 	var (
 		from   string
@@ -30,7 +41,7 @@ func newCompatTranslateCmd() *cobra.Command {
 		force  bool
 	)
 	c := &cobra.Command{
-		Use:   "translate --from <tool> <config-path>",
+		Use:   "translate --from <tool> <config-path> [--out-file <path>]",
 		Short: "Convert a legacy config to pg_hardstorage.yaml",
 		Long: `translate reads a legacy backup-tool config file (today:
 pgBackRest's pgbackrest.conf, Barman's barman.conf, or a
@@ -46,8 +57,8 @@ operator can review.`,
 	}
 	c.Flags().StringVar(&from, "from", "",
 		"source tool: pgbackrest|barman|walg (required)")
-	c.Flags().StringVar(&output, "output", "",
-		"output file path (default: stdout)")
+	c.Flags().StringVar(&output, "out-file", "",
+		"write the rendered YAML to this path (default: stdout)")
 	c.Flags().BoolVar(&force, "force", false,
 		"overwrite an existing output file")
 	_ = c.MarkFlagRequired("from")
