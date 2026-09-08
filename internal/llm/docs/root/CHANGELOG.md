@@ -11,6 +11,16 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ## [1.4.0] — 2026-09-08
 
+### Security
+
+- **Bumped `golang.org/x/crypto` to v0.56.0** (from v0.53.0), which
+  fixes two reachable denial-of-service issues in `x/crypto/ssh`:
+  GO-2026-6355 (deadlocked established channel) and GO-2026-6354
+  (deadlocked undecided channel). `govulncheck -mode=binary` reported
+  both as reachable in the shipped binary through `ssh.Dial` /
+  `ssh.NewClientConn` — the call path the `sftp://` and `scp://`
+  storage backends use. The shipped binary now scans clean.
+
 ### Fixed
 
 #### Compatibility shims and config translators
