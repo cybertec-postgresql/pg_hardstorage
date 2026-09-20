@@ -34,6 +34,16 @@ These were NOT run on this branch, because each rebuilds
 - [ ] `./run_testing.sh 34 2h` (caps to 21 cells on arm64 — the full
       arm64 matrix)
 
+## Known, accepted, not blocking
+
+- **#64** — `cgroup_squeeze` records a kernel limit refusal as
+  `fault_apply_failed`. Seen once in 152 applications during the 10 h
+  soak. The cell was unharmed (157 further events, 16/16 backups) and
+  nothing in the product is at fault: the kernel declined a 32 MiB cap
+  it could not reclaim to. Testkit-only triage noise; deliberately not
+  fixed on this branch, because changing the injector mid-gate would
+  put untested code on it.
+
 ## Release mechanics
 
 Version comes from `git describe` via ldflags; there is no version
