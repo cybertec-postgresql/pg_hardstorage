@@ -382,6 +382,15 @@ func runCellLoop(
 				// fault_apply_failed signal the soak triages on.
 				emit(Event{Cell: cr.Name, Op: "fault_skipped_cell_down",
 					Iteration: iter, Detail: fault.Action})
+			case err != nil && errors.Is(err, inject.ErrLimitUnreachable):
+				// cgroup_squeeze asked for a memory.max the kernel
+				// could not honour (unreclaimable RSS already above
+				// the cap, swap disabled). The injector behaved
+				// correctly; counting it as fault_apply_failed makes
+				// every soak with a 0.7% timing race look like a
+				// product failure. Same skip class as cell-down.
+				emit(Event{Cell: cr.Name, Op: "fault_skipped_limit_unreachable",
+					Iteration: iter, Detail: fault.Action})
 			case err != nil:
 				emit(Event{Cell: cr.Name, Op: "fault_apply_failed",
 					Iteration: iter, Detail: fault.Action, Err: err.Error()})

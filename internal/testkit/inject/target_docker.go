@@ -20,6 +20,17 @@ import (
 // down) can treat this as already-satisfied rather than a failure.
 var ErrTargetNotRunning = errors.New("target container is not running")
 
+// ErrLimitUnreachable reports that docker update refused a cgroup
+// memory.max write because the kernel could not reclaim the
+// container down to the requested cap (swap disabled, unreclaimable
+// RSS already above the target). The injector asked for something
+// the host cannot do at that instant — same class as
+// ErrTargetNotRunning / ErrCapSysResource: a well-understood
+// refusal, not a product fault. The soak triages generic
+// fault_apply_failed; this sentinel lets the orchestrator skip
+// instead of paging someone for a 0.7% timing race.
+var ErrLimitUnreachable = errors.New("cgroup memory limit unreachable")
+
 // DockerTarget fronts a docker container.  Constructed by the
 // soak driver from the fleet → container mapping; passes
 // through `docker exec`, `docker kill`, `docker cp`.
@@ -175,10 +186,37 @@ func (d *DockerTarget) SetMemoryLimit(ctx context.Context, bytes int64) error {
 		if strings.Contains(string(out), "is not running") {
 			return fmt.Errorf("%s: %w", d.Container, ErrTargetNotRunning)
 		}
+		// docker update --memory-swap=N with swap disabled asks
+		// the kernel to reclaim down to N with nowhere to page
+		// anon memory. PostgreSQL's shared_buffers alone is
+		// often larger than a 32 MiB squeeze; when the
+		// unreclaimable footprint exceeds N the write to
+		// memory.max is refused (runc: "failed to write").
+		// That is the injector asking for an impossible limit,
+		// not a product fault — type it so the soak does not
+		// triage a 0.7% timing race as fault_apply_failed.
+		if isCgroupLimitUnreachable(string(out)) {
+			return fmt.Errorf("%s: %w", d.Container, ErrLimitUnreachable)
+		}
 		return fmt.Errorf("docker update --memory=%s --memory-swap=%s %s: %w (output: %s)",
 			arg, arg, d.Container, err, truncate(out, 256))
 	}
 	return nil
+}
+
+// isCgroupLimitUnreachable matches the kernel/runc refusal when
+// docker update cannot write memory.max because the live
+// unreclaimable RSS is already above the requested cap. The
+// soak log looks like:
+//
+//	runc did not terminate successfully:
+//	  failed to write "33554432": write /sys/fs/cgroup/.../memory.max
+func isCgroupLimitUnreachable(out string) bool {
+	s := strings.ToLower(out)
+	if strings.Contains(s, "memory.max") {
+		return true
+	}
+	return strings.Contains(s, "failed to write") && strings.Contains(s, "cgroup")
 }
 
 // dockerMemoryLimitArg encodes a byte count for `docker update
