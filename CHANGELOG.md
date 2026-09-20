@@ -38,11 +38,56 @@ keeps reading that version for at least 24 months after a successor lands.
 - **Three runbooks referenced `pg_hardstorage-agent`**, a unit no
   package has ever shipped. Now `pg_hardstorage`.
 
+- **A slow model was treated as a hung connection.** The
+  OpenAI-compatible provider set `http.Client.Timeout` to 5 minutes,
+  described as "a backstop for hung connections". It is not one:
+  `Client.Timeout` bounds the whole exchange including the body, and
+  an SSE client cannot distinguish a dead connection from a healthy
+  stream still delivering tokens. Measured, one ordinary question
+  streams for 265 s on a deepseek-v4 endpoint and 532 s on a qwen3.8
+  one — both well-behaved, both killed at 300 s and reported as a
+  context deadline, which reads as a network fault rather than as our
+  own client hanging up. Every reasoning model was affected.
+
+  Connect, TLS and response-header timeouts are now bounded
+  individually, and the stream is watched for a two-minute gap
+  *between bytes* — the condition the old timeout was reaching for. A
+  stalled stream now says so.
+
+- **The command validator's retry narrated itself into the answer.**
+  When a reply named a bad flag, the session asked the model to
+  revise, and nothing told it to keep that internal. Answers came
+  back opening "Now I have the correct flags. Here's the revised
+  answer." The operator never saw the first attempt, so the answer
+  began by referring to a conversation that, from their side, never
+  happened.
+
 - **Nothing connected the unit files to the CLI verbs they invoke.**
   New tests assert that every unit in `deploy/systemd/` is referenced
   by every packaging recipe, that each `ExecStart` names a verb the CLI
   implements, and that some unit actually runs `wal stream` — the
   check that would have caught #56 when the docs were written.
+
+### Changed
+
+- **The LLM helper's system prompt shrank from 150 KB to 64 KB.**
+  `hotCommandPaths` baked the full `--help` of 38 commands into every
+  prompt. Its comment estimated "~200-400 tokens" per entry; measured
+  against the live binary it is ~1,000 — 38,309 tokens in total, so
+  the list had been kept "tight" against a budget understating the
+  cost threefold. Asking "is there an RPM?" shipped the full flag
+  inventory of `restore`, `forecast` and `compliance report`.
+
+  The cost is latency, not money: that much prefill on a reasoning
+  endpoint is minutes of silence before the first token, which is
+  indistinguishable from a hung client. The block is now budgeted
+  (`PG_HARDSTORAGE_LLM_HOT_HELP_BYTES`, default 16 KB, `0` disables),
+  and the overflow is named so the model calls `read_command_help` —
+  a tool already registered and already advertised in that prompt —
+  rather than guessing.
+
+  Measured against a deepseek-v4 endpoint: "How do I take my first
+  backup?" went from 764 s and failing to 316 s and answering.
 
 ### Security
 

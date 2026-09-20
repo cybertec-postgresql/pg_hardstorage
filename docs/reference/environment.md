@@ -53,6 +53,7 @@ the same order.
 | `PG_HARDSTORAGE_LLM_API_KEY` / `PG_HARDSTORAGE_LLM_KEY` | Credential for the provider. |
 | `PG_HARDSTORAGE_LLM_TEMPERATURE` | Sampling temperature, as a float. Overrides the provider default. |
 | `PG_HARDSTORAGE_LLM_DEBUG_PROMPT` | Any non-empty value prints the assembled system prompt to stderr. For debugging what the assistant was actually told. |
+| `PG_HARDSTORAGE_LLM_HOT_HELP_BYTES` | Byte budget for the "detailed help for hot commands" block baked into the system prompt (default `16384`; `0` disables it). That block exists to stop the model inventing flags, and it is not free: the full `--help` of every hot command is ~150 KB, about 38,000 tokens of prefill on *every* question, which on a reasoning endpoint is minutes of silence before the first token. Anything that does not fit the budget is still reachable — the model is told to call the `read_command_help` tool instead of guessing. Raise it if you have a large context window and a fast endpoint; set `0` to rely on the tool entirely. |
 | `PG_HARDSTORAGE_ON_ERROR_LLM` | Offers an assistant explanation when a command fails. |
 | `PG_HARDSTORAGE_RUNBOOK_DIR` | Directory the assistant searches for runbooks, ahead of `/usr/share/pg_hardstorage/runbooks` and `docs/runbooks`. |
 | `PG_HARDSTORAGE_SKILL_DIR` | Directory of assistant skill definitions. |
