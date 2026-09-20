@@ -436,6 +436,58 @@ func TestRun_FaultOnDownCell_RecordsSkipNotFailure(t *testing.T) {
 	}
 }
 
+// TestRun_FaultLimitUnreachable_RecordsSkipNotFailure locks the
+// cgroup_squeeze soak triage: a kernel refusal to write memory.max
+// (inject.ErrLimitUnreachable) is a well-understood injector
+// refusal, not a product fault, and must not count as
+// fault_apply_failed.
+func TestRun_FaultLimitUnreachable_RecordsSkipNotFailure(t *testing.T) {
+	validate.ResetForTesting()
+	emit, events, mu := collectEvents(t)
+	cell := &validate.FakeCellRuntime{
+		NameStr:  "squeezed",
+		FaultErr: fmt.Errorf("cgroup_squeeze: pg_random: %w", inject.ErrLimitUnreachable),
+	}
+	_, err := validate.Run(context.Background(), validate.RunOptions{
+		Seed:     1,
+		Duration: 150 * time.Millisecond,
+		Loop: validate.LoopOptions{
+			IterationInterval: 5 * time.Millisecond,
+			BackupEvery:       99,
+			FaultProbability:  1.0,
+			HealWindow:        time.Microsecond,
+		},
+		Faults:  defaultFaults(),
+		Cells:   []validate.CellRuntime{cell},
+		OnEvent: emit,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	var sawSkip, sawFailed, sawDown bool
+	for _, ev := range *events {
+		switch ev.Op {
+		case "fault_skipped_limit_unreachable":
+			sawSkip = true
+		case "fault_apply_failed":
+			sawFailed = true
+		case "fault_skipped_cell_down":
+			sawDown = true
+		}
+	}
+	if !sawSkip {
+		t.Errorf("expected fault_skipped_limit_unreachable for ErrLimitUnreachable")
+	}
+	if sawFailed {
+		t.Errorf("ErrLimitUnreachable must NOT be recorded as fault_apply_failed")
+	}
+	if sawDown {
+		t.Errorf("ErrLimitUnreachable must NOT be recorded as fault_skipped_cell_down")
+	}
+}
+
 // TestRun_FaultGenericError_RecordsFailure is the control: a non-sentinel
 // fault error is still reported as fault_apply_failed.
 func TestRun_FaultGenericError_RecordsFailure(t *testing.T) {
