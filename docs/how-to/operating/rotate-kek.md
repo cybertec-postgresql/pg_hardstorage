@@ -136,7 +136,7 @@ restarting; see
 Restart the agent so the next backup picks up the new KEK:
 
 ```bash
-systemctl restart pg_hardstorage-agent
+systemctl restart pg_hardstorage
 ```
 
 ### 4. Verify

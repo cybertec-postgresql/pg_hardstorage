@@ -232,6 +232,10 @@ nfpms:
         dst: /usr/lib/systemd/system/pg_hardstorage.service
       - src: deploy/systemd/pg_hardstorage@.service
         dst: /usr/lib/systemd/system/pg_hardstorage@.service
+      # The WAL streamer is a SEPARATE unit: the two units above run
+      # `pg_hardstorage agent`, which never opens a WAL stream (#56).
+      - src: deploy/systemd/pg_hardstorage-wal-stream@.service
+        dst: /usr/lib/systemd/system/pg_hardstorage-wal-stream@.service
       - src: deploy/systemd/pg-hardstorage.sysusers.conf
         dst: /usr/lib/sysusers.d/pg-hardstorage.conf
       - src: deploy/systemd/pg-hardstorage.tmpfiles.conf
