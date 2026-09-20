@@ -201,7 +201,7 @@ isn't running for that deployment. Check:
 
 ```bash
 pg_hardstorage doctor db1
-systemctl status pg_hardstorage-agent
+systemctl status pg_hardstorage
 ```
 
 **Two deployments thrash each other's I/O** — stagger the

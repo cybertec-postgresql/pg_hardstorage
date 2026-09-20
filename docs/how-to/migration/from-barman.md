@@ -136,7 +136,10 @@ maintains its own replication slot, so they coexist
 without conflict.
 
 ```bash
-sudo systemctl enable --now pg_hardstorage@db1.service
+# The WAL streamer. NOT pg_hardstorage@db1.service — that unit runs
+# `pg_hardstorage agent` (scheduled backups + retention) and never
+# opens a stream or holds a slot.
+sudo systemctl enable --now pg_hardstorage-wal-stream@db1.service
 ```
 
 If your Barman setup uses `archive_command` rather than

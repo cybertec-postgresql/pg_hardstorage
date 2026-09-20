@@ -9,6 +9,53 @@ on-disk and on-the-wire schema (backup manifests, configuration, output JSON,
 and the on-disk chunk envelope): an agent built against a given schema version
 keeps reading that version for at least 24 months after a successor lands.
 
+## [Unreleased]
+
+### Added
+
+- **A systemd unit for the WAL streamer** (#56, reported by @marsqd).
+  `deploy/systemd/pg_hardstorage-wal-stream@.service` runs
+  `pg_hardstorage wal stream %i` — templated on the deployment, since
+  that is a positional argument — and is packaged by all four recipes
+  (goreleaser/nfpm, debian, Arch, RPM).
+
+### Fixed
+
+- **The documentation pointed at the agent units to supervise the WAL
+  streamer, and the agent does not stream.** `pg_hardstorage.service`
+  and `pg_hardstorage@.service` both run `pg_hardstorage agent`, which
+  executes the scheduled backup and retention engine and never opens a
+  WAL stream. An operator who followed the getting-started tutorial got
+  periodic base backups and **no continuous archiving**, with nothing
+  to indicate the always-on data plane was absent.
+
+  Corrected in the getting-started tutorial (which now carries an
+  explicit "this is not the agent unit" warning), the R1 runbook —
+  whose `systemctl stop pg_hardstorage` would have left the slot held
+  and PostgreSQL still blocked — and all three migration guides, each
+  of which promised a replication slot and then enabled the agent.
+
+- **Three runbooks referenced `pg_hardstorage-agent`**, a unit no
+  package has ever shipped. Now `pg_hardstorage`.
+
+- **Nothing connected the unit files to the CLI verbs they invoke.**
+  New tests assert that every unit in `deploy/systemd/` is referenced
+  by every packaging recipe, that each `ExecStart` names a verb the CLI
+  implements, and that some unit actually runs `wal stream` — the
+  check that would have caught #56 when the docs were written.
+
+### Security
+
+- **`google.golang.org/grpc` v1.83.1 → v1.83.2** (#57), clearing
+  GO-2026-6443 (server panic via missing authority or Host headers),
+  which `govulncheck` reported as REACHABLE through
+  `transport.http2Server.HandleStreams`. v1.83.1 had arrived four days
+  earlier in #55 as a fix for an *unreachable* advisory; it introduced
+  a reachable one. The shipped binary scans clean again.
+
+- OpenTelemetry bumps to 1.45.0 (#58, #59, #60): `otel/sdk`,
+  `otlptrace`, `otlptrace/otlptracehttp`.
+
 ## [1.4.2] — 2026-09-08
 
 Container images only, again — v1.4.1 did not actually publish any.
