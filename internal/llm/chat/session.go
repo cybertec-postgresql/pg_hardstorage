@@ -450,6 +450,28 @@ func (s *Session) buildSystemPrompt(ctx context.Context) (string, error) {
 	//    this is the human-readable summary for prompt-engineering).
 	if s.Skill != nil && len(s.Skill.Context.AvailableTools) > 0 {
 		b.WriteString("## Available tools\n\n")
+		// State the boundary BEFORE listing them. Several tool
+		// descriptions read "Run `pg_hardstorage doctor` and return
+		// ...", which describes what the tool does for us but leaves
+		// the tool NAME looking like part of the CLI surface — and the
+		// names sit in the same prompt as the real command catalog.
+		//
+		// Models duly conflated the two. Answers came back telling the
+		// operator to run
+		//
+		//	pg_hardstorage read_command_help deployment add
+		//
+		// in a copy-pasteable shell block. That command does not
+		// exist and cannot be made to exist: read_command_help is
+		// ours, not theirs. The operator following it gets "unknown
+		// command" while trying to do the thing the answer was
+		// supposedly explaining.
+		//
+		// Budgeting the hot-command help block made this likelier, not
+		// less: the model is now told more often to reach for
+		// read_command_help, so the name appears more often in its
+		// context. Naming the boundary is what keeps that safe.
+		b.WriteString(systemPromptToolPreamble())
 		for _, name := range s.Skill.Context.AvailableTools {
 			t, err := s.Tools.Get(name)
 			if err != nil {
@@ -1717,3 +1739,16 @@ point at the safe alternative.
 
 This is an AI assistant.  Every suggested command must be
 verified by the operator before running.`
+
+// systemPromptToolPreamble is the sentence that keeps the assistant's
+// tools and the operator's CLI apart. Its own function so the test
+// can assert the claim survives a reword.
+func systemPromptToolPreamble() string {
+	return "These are YOUR tools. You call them; the operator cannot.\n" +
+		"They are NOT `pg_hardstorage` subcommands and MUST NEVER appear\n" +
+		"in a command you show the operator. `pg_hardstorage read_command_help`,\n" +
+		"`pg_hardstorage read_doctor` and the like are not real commands — if\n" +
+		"you catch yourself writing one, you wanted a tool CALL, and the\n" +
+		"operator-facing equivalent is the plain command (`pg_hardstorage\n" +
+		"doctor`, `pg_hardstorage --help`) or nothing at all.\n\n"
+}
