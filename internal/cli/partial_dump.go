@@ -290,6 +290,13 @@ func runPartialDump(cmd *cobra.Command, f partialDumpFlags) error {
 	defer dumpClose()
 	counter := &countingWriter{w: dumpDest}
 	if err := sb.Dump(cmd.Context(), counter, tlist, f.dataOnly); err != nil {
+		// "matched no tables" is a not-found, not a failure. Modern
+		// pg_dump reports it by exiting 1, which lands here, so this
+		// branch — not the empty-dump guard below — is what fires on
+		// any current PostgreSQL. Both raise the same refusal.
+		if errors.Is(err, sandbox.ErrNoMatchingTables) {
+			return noTablesMatchedError(f, tlist)
+		}
 		return output.NewError("partial.dump_pg_dump_failed",
 			fmt.Sprintf("partial dump: pg_dump: %v (sandbox PG log: %s)",
 				err, sb.LogFile())).Wrap(err)
@@ -308,19 +315,7 @@ func runPartialDump(cmd *cobra.Command, f partialDumpFlags) error {
 	// empty SQL file on disk.  Fail loudly and remove the empty file so
 	// the operator isn't left with a silent, misleading artefact.
 	if sqlBytes == 0 {
-		dbName := f.database
-		if dbName == "" {
-			dbName = "postgres"
-		}
-		if f.output != "" && f.output != "-" {
-			_ = os.Remove(f.output)
-		}
-		return output.NewError("partial.dump_no_tables",
-			fmt.Sprintf("partial dump: pg_dump produced no output — table(s) %s not found in database %q",
-				strings.Join(tlist, ", "), dbName)).
-			WithSuggestion(&output.Suggestion{
-				Human: "the requested table lives in a different database; pass --database <name> (partial dump connects to a single database, default \"postgres\")",
-			})
+		return noTablesMatchedError(f, tlist)
 	}
 
 	body := partialDumpBody{
@@ -431,4 +426,33 @@ func (b partialDumpBody) WriteText(w io.Writer) error {
 	fmt.Fprintln(bw, "  ✓ sandbox PG cleaned up; staging dir removed")
 	_, err := io.WriteString(w, strings.TrimRight(bw.String(), "\n"))
 	return err
+}
+
+// noTablesMatchedError is the single refusal for "pg_dump matched
+// nothing", raised from the two places that can discover it.
+//
+// pg_dump's behaviour here is version-dependent: current builds treat
+// an unmatched --table as a hard error and exit 1, while older ones
+// exit 0 and simply emit nothing. The first lands in the Dump error
+// path, the second in the empty-dump guard. An operator hitting the
+// same mistake must not get two different codes, two different exit
+// statuses and two different pieces of advice depending on which
+// pg_dump the host happens to carry.
+//
+// The empty file is removed on the way out: leaving a zero-byte .sql
+// behind after a refusal invites someone to restore from it.
+func noTablesMatchedError(f partialDumpFlags, tlist []string) error {
+	dbName := f.database
+	if dbName == "" {
+		dbName = "postgres"
+	}
+	if f.output != "" && f.output != "-" {
+		_ = os.Remove(f.output)
+	}
+	return output.NewError("partial.dump_no_tables",
+		fmt.Sprintf("partial dump: pg_dump produced no output — table(s) %s not found in database %q",
+			strings.Join(tlist, ", "), dbName)).
+		WithSuggestion(&output.Suggestion{
+			Human: "the requested table lives in a different database; pass --database <name> (partial dump connects to a single database, default \"postgres\")",
+		})
 }

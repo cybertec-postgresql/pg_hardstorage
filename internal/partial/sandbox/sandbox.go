@@ -352,6 +352,16 @@ func (s *Sandbox) LogFile() string { return s.logFile }
 //
 // The caller is responsible for the bytes' destination — we don't
 // open files, we just stream pg_dump's stdout into w.
+// ErrNoMatchingTables reports that pg_dump ran, connected, and found
+// nothing matching the requested --table patterns.
+//
+// It is a distinct sentinel because the two outcomes need different
+// exit codes and different advice: a dump that failed is a fault to
+// investigate, while a dump that matched nothing is almost always the
+// operator naming a table that lives in another database (issue #97)
+// and is answered by `--database`.
+var ErrNoMatchingTables = errors.New("sandbox: pg_dump found no matching tables")
+
 func (s *Sandbox) Dump(ctx context.Context, w io.Writer, tables []string, dataOnly bool) error {
 	if s.closed {
 		return errors.New("sandbox: Dump after Stop")
@@ -374,12 +384,37 @@ func (s *Sandbox) Dump(ctx context.Context, w io.Writer, tables []string, dataOn
 		cmd.Stderr = &errBuf
 	}
 	if err := cmd.Run(); err != nil {
-		if msg := strings.TrimSpace(errBuf.String()); msg != "" {
+		msg := strings.TrimSpace(errBuf.String())
+		// pg_dump treats "--table matched nothing" as a hard error and
+		// exits 1. That is a *not found*, not a dump failure, and the
+		// caller has to be able to tell them apart to route the exit
+		// code — so say which one it is here rather than making the
+		// caller re-parse the same stderr.
+		if isNoMatchingTables(msg) {
+			if msg != "" {
+				return fmt.Errorf("%w: %s", ErrNoMatchingTables, tailString(msg, 2048))
+			}
+			return ErrNoMatchingTables
+		}
+		if msg != "" {
 			return fmt.Errorf("%w: %s", err, tailString(msg, 2048))
 		}
 		return err
 	}
 	return nil
+}
+
+// isNoMatchingTables recognises pg_dump's refusal to dump a --table
+// pattern that matched nothing:
+//
+//	pg_dump: error: no matching tables were found
+//
+// Matched on the diagnostic rather than on the exit status, because
+// pg_dump exits 1 for every failure it has — a dead connection, a
+// permission denial and an empty pattern are indistinguishable by
+// code alone.
+func isNoMatchingTables(stderr string) bool {
+	return strings.Contains(strings.ToLower(stderr), "no matching tables were found")
 }
 
 // buildPGDumpArgs assembles the pg_dump argv for a sandbox dump.  The

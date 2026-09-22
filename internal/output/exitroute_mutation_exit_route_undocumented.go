@@ -43,6 +43,7 @@ var exitLeafRoutes = map[string]ExitCode{
 	"storage.no_space":           ExitUnreachable, // <-- undocumented leaf route
 	"restore.target_unreachable": ExitConflict,
 	"restore.target_in_wal_gap":  ExitConflict,
+	"partial.dump_no_tables":     ExitNotFound,
 }
 
 func codePrefixToExit(code string) ExitCode {

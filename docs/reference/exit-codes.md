@@ -26,7 +26,7 @@ change without a major-version bump.
 | **3** | `ExitAuth` | Authentication or authorization failure. Code namespace `auth.*`. | No — re-authenticate. |
 | **4** | `ExitPreflight` | A pre-flight check refused the operation. **No mutation occurred.** Code namespace `preflight.*`. | Yes — once the underlying condition is fixed (free disk, PG version, target dir empty, etc.). |
 | **5** | `ExitAborted` | Operation aborted by the user or by a context cancellation. Code namespace `aborted.*`. | Yes. |
-| **6** | `ExitNotFound` | Named resource (backup, deployment, repo, sink, slot, …) does not exist. Code namespace `notfound.*`. | No — list and pick a real ID. |
+| **6** | `ExitNotFound` | Named resource (backup, deployment, repo, sink, slot, …) does not exist. Code namespace `notfound.*`. Also the leaf code `partial.dump_no_tables`: a `partial dump` whose `--tables` matched nothing in the connected database. | No — list and pick a real ID. |
 | **7** | `ExitConflict` | Conflict: lease held, ID collision, in-progress operation, repo read-only, chain has live descendants. Code namespace `conflict.*`. | Yes — once the holder releases or you pick a new name. |
 | **8** | `ExitUnreachable` | Storage backend or KMS provider is unreachable. Specifically the leaf codes `storage.unreachable` and `kms.unreachable`; other `storage.*` / `kms.*` codes stay in `ExitError`. | Yes — transient by nature. |
 | **9** | `ExitVerifyFailed` | Verification failed (`verify.*` namespace) **or** an anomaly was detected (`anomaly.*` namespace). Same exit code so a single cron contract — "non-zero if anything is unusual" — covers both. | Investigate before retry. |
@@ -55,6 +55,7 @@ segment to an exit code:
 | `kms.unreachable` (leaf) | `8` |
 | `restore.target_unreachable` (leaf) | `7` |
 | `restore.target_in_wal_gap` (leaf) | `7` |
+| `partial.dump_no_tables` (leaf) | `6` |
 | any other code | `1` |
 
 Unmatched namespaces fall through to `ExitError` (1) by

@@ -21,6 +21,30 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **`partial dump` reported a table that does not exist as a tool
+  failure, and its guard against that case was unreachable.** The
+  command carried an empty-dump guard (issue #97) that turned "pg_dump
+  matched nothing" into a structured refusal. It was written against
+  pg_dump builds that exit 0 and emit nothing; every current build
+  treats an unmatched `--table` as a hard error and exits 1, so the
+  generic `partial.dump_pg_dump_failed` branch returned first and the
+  guard could not run on any supported PostgreSQL.
+
+  The operator therefore got `code: "partial.dump_pg_dump_failed"` and
+  exit 1 — the bucket for *the dump broke* — for what is almost always
+  a table living in a different database, the exact mistake `--database`
+  exists to fix. Both discovery paths now raise the same refusal, with
+  the same advice.
+
+  Separately, that refusal routed to exit **1** even when it did fire:
+  `partial.*` has no namespace route and no leaf route existed, so a
+  not-found was indistinguishable from a crash by exit code alone.
+
+  The gate that should have caught this
+  (`L3_partial_dump_database_flag`) skips unless the host carries
+  PostgreSQL **server** binaries, and no CI host did, so it had never
+  run.
+
 - **The documentation promised that retention runs after every backup,
   and it does not** (#66, reported by @marsqd). Two pages — the
   operator guide's retention section and the "Set retention" how-to —

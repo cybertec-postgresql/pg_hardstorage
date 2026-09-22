@@ -56,6 +56,7 @@ var exitLeafRoutes = map[string]ExitCode{
 	"kms.unreachable":            ExitUnreachable,
 	"restore.target_unreachable": ExitConflict,
 	"restore.target_in_wal_gap":  ExitConflict,
+	"partial.dump_no_tables":     ExitNotFound,
 }
 
 // codePrefixToExit maps an error code to an exit code.
