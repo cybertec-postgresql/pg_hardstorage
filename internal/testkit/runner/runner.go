@@ -886,8 +886,6 @@ func splitLSN(s string) (hi, lo uint64, ok bool) {
 // instead of letting topology.Up's docker call fail with the
 // generic "pull access denied".
 func dockerImageExistsLocally(ctx context.Context, image string) bool {
-	cmd := exec.CommandContext(ctx, "docker", "image", "inspect", image)
-	cmd.Stdout = nil
-	cmd.Stderr = nil
-	return cmd.Run() == nil
+	_, err := dockerInfo(ctx, "image", "inspect", image)
+	return err == nil
 }

@@ -352,8 +352,7 @@ func findDockerLeaderContainer(ctx context.Context, dsn string) (string, error) 
 	if port == "" {
 		return "", errors.New("DSN has no explicit port")
 	}
-	cmd := exec.CommandContext(ctx, "docker", "ps", "--format", "{{.Names}}\t{{.Ports}}")
-	stdout, err := cmd.Output()
+	stdout, err := dockerInfo(ctx, "ps", "--format", "{{.Names}}\t{{.Ports}}")
 	if err != nil {
 		return "", fmt.Errorf("docker ps: %w", err)
 	}
@@ -574,11 +573,10 @@ func runAssertRestoredMatch(ctx context.Context, st scenario.Step, idx int, stat
 		// Capture docker logs for forensics — the sandbox name
 		// may already be gone if `docker run` itself bombed,
 		// but `docker logs` is best-effort.
-		logsOut, _ := exec.Command("docker", "logs", "--tail", "200",
-			sandboxName).CombinedOutput()
+		logsOut, _ := dockerDiag("logs", "--tail", "200", sandboxName)
 		_ = os.WriteFile(logFile, logsOut, 0o644)
 		// Best-effort cleanup of a half-spawned container.
-		_ = exec.Command("docker", "rm", "-fv", sandboxName).Run()
+		_, _ = dockerDiag("rm", "-fv", sandboxName)
 		return StepResult{Index: idx, Kind: st.Kind, Pass: false,
 			Message: fmt.Sprintf("assert_restored_match: sandbox start: %v (logs: %s)",
 				startErr, logFile)}
@@ -658,8 +656,7 @@ func runAssertRestoredMatch(ctx context.Context, st scenario.Step, idx int, stat
 		// Drop the sandbox's stderr into logFile so the operator
 		// can see why postmaster never came up (auth?  bad
 		// pg_hba?  WAL replay errors?).
-		logsOut, _ := exec.Command("docker", "logs", "--tail", "200",
-			sandboxName).CombinedOutput()
+		logsOut, _ := dockerDiag("logs", "--tail", "200", sandboxName)
 		_ = os.WriteFile(logFile, logsOut, 0o644)
 		return StepResult{Index: idx, Kind: st.Kind, Pass: false,
 			Message: fmt.Sprintf("assert_restored_match: sandbox did not accept connections within %s (log: %s)", sandboxReadyTimeout, logFile)}
