@@ -188,6 +188,10 @@ install -m 0755 bin/pg-hardstorage-walg %{buildroot}%{_bindir}/pg-hardstorage-wa
 install -d %{buildroot}%{_unitdir}
 install -m 0644 deploy/systemd/pg_hardstorage.service %{buildroot}%{_unitdir}/pg_hardstorage.service
 install -m 0644 deploy/systemd/pg_hardstorage@.service %{buildroot}%{_unitdir}/pg_hardstorage@.service
+%{_unitdir}/pg_hardstorage-wal-stream@.service
+# The WAL streamer is a SEPARATE unit — the two above run
+# `pg_hardstorage agent`, which never opens a WAL stream (#56).
+install -m 0644 deploy/systemd/pg_hardstorage-wal-stream@.service %{buildroot}%{_unitdir}/pg_hardstorage-wal-stream@.service
 
 install -d %{buildroot}%{_sysusersdir}
 install -m 0644 deploy/systemd/pg-hardstorage.sysusers.conf %{buildroot}%{_sysusersdir}/pg-hardstorage.conf

@@ -10,8 +10,11 @@ import (
 	"fmt"
 	"io"
 	"iter"
+	"net"
 	"net/http"
+	"os"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/airgap"
@@ -122,15 +125,194 @@ func (p *OpenAIProvider) Open(_ context.Context, cfg ProviderConfig) error {
 		return errors.New("openai: APIKey is required for the canonical OpenAI endpoint (set OPENAI_API_KEY or configure llm.api_key_file in pg_hardstorage.yaml). For local Ollama / vLLM you can leave it empty or set any placeholder.")
 	}
 	p.cfg = cfg
+	// NO http.Client.Timeout.
+	//
+	// Client.Timeout is a deadline on the WHOLE exchange, body
+	// included, and it cannot tell a hung connection from a healthy
+	// one that is still streaming. This is a Server-Sent Events
+	// client: a reasoning model answering one ordinary question can
+	// stream steadily for several minutes (measured: 267s for "What
+	// does pg_hardstorage wal stream do?" against a deepseek-v4
+	// reasoning endpoint at max_tokens=4096). The old 5-minute
+	// Timeout killed exactly that case mid-stream, and reported it as
+	//
+	//	openai: read stream: context deadline exceeded
+	//	  (Client.Timeout or context cancellation while reading body)
+	//
+	// which reads like a network fault rather than "your own client
+	// hung up on a working model".
+	//
+	// The three things that SHOULD be bounded are bounded here
+	// instead, and each of them is a real stall:
+	//
+	//   - establishing the connection      (DialContext)
+	//   - the server starting to respond   (ResponseHeaderTimeout)
+	//   - the stream going quiet mid-flight (stallReader, below)
+	//
+	// Overall cancellation remains the caller's ctx, which is the
+	// right place for it — the operator's Ctrl-C, or a command-level
+	// deadline.
 	p.client = &http.Client{
-		// Generous overall timeout — a long completion + tool use
-		// can take a couple of minutes.  ctx cancellation is the
-		// authoritative early-exit; this is just a backstop for
-		// hung connections.
-		Timeout: 5 * time.Minute,
+		Transport: &http.Transport{
+			DialContext: (&net.Dialer{
+				Timeout:   openaiDialTimeout,
+				KeepAlive: 30 * time.Second,
+			}).DialContext,
+			TLSHandshakeTimeout:   openaiDialTimeout,
+			ResponseHeaderTimeout: durationFromEnv("PG_HARDSTORAGE_LLM_HEADER_TIMEOUT", openaiResponseHeaderTimeout),
+			ExpectContinueTimeout: 1 * time.Second,
+			Proxy:                 http.ProxyFromEnvironment,
+		},
 	}
 	return nil
 }
+
+// Timeouts for the streaming client. These bound the phases where
+// silence genuinely means something is wrong, and leave the
+// generation itself unbounded (the caller's ctx owns that).
+const (
+	// openaiDialTimeout bounds TCP connect and the TLS handshake.
+	openaiDialTimeout = 30 * time.Second
+
+	// openaiResponseHeaderTimeout bounds how long the server may take
+	// to send response headers. A busy inference server queues
+	// requests before it starts generating, so this is minutes, not
+	// seconds — but it is not unbounded, because a server that never
+	// answers at all is a fault.
+	//
+	// Override with PG_HARDSTORAGE_LLM_HEADER_TIMEOUT.
+	openaiResponseHeaderTimeout = 10 * time.Minute
+
+	// openaiFirstByteTimeout bounds the wait for the FIRST byte of the
+	// stream, which is a different thing from a gap mid-stream and
+	// needs its own, much larger budget.
+	//
+	// Measured against a self-hosted vLLM with 8 concurrent requests:
+	//
+	//	req  headers   1st byte   max gap    total
+	//	 5     0.1s        1.0s      0.9s     272s
+	//	 0     0.1s      273.1s    273.0s     464s
+	//	 3     0.1s      873.7s    873.6s    1142s
+	//
+	// Headers come back in 0.1s for every request — the server accepts
+	// immediately and then QUEUES. A request can sit silent for 14+
+	// minutes waiting its turn, and that wait grows with concurrency.
+	// But notice the third column: max gap equals first byte in every
+	// row. Once a request starts generating, tokens arrive
+	// continuously and the gaps are sub-second.
+	//
+	// So the long silence is entirely the queue, and it is legitimate.
+	// A single stall budget cannot tell it from a dead socket — which
+	// is why one set to 15 minutes still lost 6 of 8 concurrent
+	// questions. Splitting the two lets the queue wait be generous
+	// while a mid-stream stall stays tight enough to be useful.
+	//
+	// Override with PG_HARDSTORAGE_LLM_FIRST_BYTE_TIMEOUT.
+	openaiFirstByteTimeout = 45 * time.Minute
+
+	// openaiStreamStallTimeout is the gap between BYTES once the
+	// stream has STARTED. Past the first byte the server is generating
+	// for us specifically, so silence here really does mean the far
+	// end died without closing the connection.
+	//
+	// This was 2 minutes, calibrated against an IDLE endpoint where
+	// the largest observed mid-stream gap was 0.7s. That calibration
+	// was wrong for the deployment this feature exists to serve.
+	// Point the helper at an on-prem GPU that is batching several
+	// requests — the normal case for a self-hosted vLLM, and the
+	// whole reason the endpoint is configurable — and the server
+	// legitimately goes quiet for minutes at a time while it works
+	// through the batch. A 194-question run against one such endpoint
+	// lost 192 of 194 answers to this timeout.
+	//
+	// Reasoning models make it starker still: an extended-thinking
+	// variant buffers its ENTIRE reasoning phase before emitting a
+	// first token — measured at 363-444s of silence on a trivial
+	// question, with a correct answer at the end of it.
+	//
+	// So the budget is generous. A genuinely dead connection now
+	// costs one wasted quarter-hour; the alternative cost — throwing
+	// away a working answer the server was still producing — is worse
+	// and, unlike a hung socket, it is silent.
+	//
+	// Override with PG_HARDSTORAGE_LLM_STALL_TIMEOUT.
+	openaiStreamStallTimeout = 5 * time.Minute
+)
+
+// durationFromEnv reads a duration override, falling back to def when
+// unset or unparseable. Shared by the two stream timeouts so an
+// operator on a slow or heavily-batched endpoint can raise them
+// without rebuilding.
+func durationFromEnv(key string, def time.Duration) time.Duration {
+	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			return d
+		}
+	}
+	return def
+}
+
+// stallReader aborts a stream that goes silent, without penalising
+// one that is merely slow.
+//
+// It resets a timer before every Read. While bytes keep arriving the
+// timer keeps being pushed out and the stream runs as long as it
+// needs; if a Read blocks for longer than the idle budget, the timer
+// fires and cancels the request context, which unblocks the read with
+// a context error.
+type stallReader struct {
+	rd    io.Reader
+	timer *time.Timer
+	// first is the budget until the first byte arrives — the queue
+	// wait. idle is the budget between bytes afterwards.
+	first   time.Duration
+	idle    time.Duration
+	started *atomic.Bool
+	fired   *atomic.Bool
+	cancel  context.CancelFunc
+}
+
+// newStallReader wraps rd, cancelling via cancel when a single Read
+// exceeds idle.
+func newStallReader(rd io.Reader, first, idle time.Duration, cancel context.CancelFunc) *stallReader {
+	fired := &atomic.Bool{}
+	s := &stallReader{rd: rd, first: first, idle: idle,
+		started: &atomic.Bool{}, fired: fired, cancel: cancel}
+	s.timer = time.AfterFunc(first, func() {
+		fired.Store(true)
+		cancel()
+	})
+	return s
+}
+
+// Read implements io.Reader.
+func (s *stallReader) Read(p []byte) (int, error) {
+	budget := s.first
+	if s.started.Load() {
+		budget = s.idle
+	}
+	s.timer.Reset(budget)
+	n, err := s.rd.Read(p)
+	if n > 0 {
+		s.started.Store(true)
+	}
+	return n, err
+}
+
+// Budget reports which budget was in force, for the error message.
+func (s *stallReader) Budget() time.Duration {
+	if s.started.Load() {
+		return s.idle
+	}
+	return s.first
+}
+
+// Stop releases the timer. Safe to call more than once.
+func (s *stallReader) Stop() { s.timer.Stop() }
+
+// Stalled reports whether the watchdog fired, so the caller can say
+// "the stream went silent" instead of surfacing a bare context error.
+func (s *stallReader) Stalled() bool { return s.fired.Load() }
 
 // Chat implements Provider.  Streams Server-Sent Events from the
 // /v1/chat/completions endpoint, translating each event into a
@@ -172,7 +354,31 @@ func (p *OpenAIProvider) Chat(ctx context.Context, msgs []Message, tools []ToolD
 			return
 		}
 
-		streamOpenAISSE(ctx, resp.Body, yield)
+		// Watch the stream for silence rather than for elapsed time.
+		streamCtx, cancelStream := context.WithCancel(ctx)
+		defer cancelStream()
+		sr := newStallReader(resp.Body,
+			durationFromEnv("PG_HARDSTORAGE_LLM_FIRST_BYTE_TIMEOUT", openaiFirstByteTimeout),
+			durationFromEnv("PG_HARDSTORAGE_LLM_STALL_TIMEOUT", openaiStreamStallTimeout),
+			cancelStream)
+		defer sr.Stop()
+
+		streamOpenAISSE(streamCtx, sr, func(c Chunk, err error) bool {
+			// Name the real cause: a cancelled read that the
+			// watchdog triggered is a dead stream, not the
+			// operator's cancellation and not a slow model.
+			if err != nil && sr.Stalled() {
+				which := "PG_HARDSTORAGE_LLM_STALL_TIMEOUT"
+				what := "the stream stopped mid-answer"
+				if !sr.started.Load() {
+					which = "PG_HARDSTORAGE_LLM_FIRST_BYTE_TIMEOUT"
+					what = "the server accepted the request but never began answering (it may be queued behind other work)"
+				}
+				err = fmt.Errorf("openai: no data for %s — %s; raise %s if your endpoint is busy: %w",
+					sr.Budget(), what, which, err)
+			}
+			return yield(c, err)
+		})
 	}
 }
 

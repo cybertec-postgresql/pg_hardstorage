@@ -1524,7 +1524,22 @@ func runRestore(ctx context.Context, st scenario.Step, idx int, state *runState,
 	// skip as a separate event so an operator looking at the
 	// run can see the gap.
 	if vbBin, err := exec.LookPath("pg_verifybackup"); err == nil {
-		vbCmd := exec.CommandContext(ctx, vbBin, target)
+		// -n, for the same reason internal/restore/verify.go passes
+		// it: a restored data directory legitimately has no WAL yet.
+		// pg_hardstorage restores the base backup; the WAL needed to
+		// reach consistency arrives later via the restore_command. So
+		// asking pg_verifybackup to parse pg_wal fails a perfectly
+		// good restore —
+		//
+		//	pg_waldump: could not find a valid record after 0/2000028
+		//	pg_verifybackup: WAL parsing failed for timeline 1
+		//
+		// which is what L4_pg_upgrade_cross_major hit. The product
+		// documented this and got it right; this check did not, and
+		// nothing noticed because LookPath fails on any host without
+		// postgresql-client — so the whole block silently never ran.
+		// Installing the client is what made it visible.
+		vbCmd := exec.CommandContext(ctx, vbBin, "-n", target)
 		var vbOut bytes.Buffer
 		vbCmd.Stdout = &vbOut
 		vbCmd.Stderr = &vbOut

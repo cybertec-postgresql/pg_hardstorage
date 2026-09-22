@@ -651,12 +651,30 @@ func runLlmAsk(cmd *cobra.Command, opts llmAskOptions) error {
 // `--provider mock` for tests / demos / plumbing exercises.
 
 // hotCommandPaths is the hand-picked set of subcommands whose
-// FULL --help text gets baked into the system prompt at session
+// --help text gets baked into the system prompt at session
 // bootstrap.  Evidence: each entry corresponds to a flag-invention
 // failure mode observed in the operator-quality pilot (see
-// the L2 *_flag_accuracy
-// scenarios).  Keep this list tight — every entry costs ~200-400
-// tokens in every chat session.
+// the L2 *_flag_accuracy scenarios).
+//
+// COST, measured rather than estimated. This comment used to say
+// "every entry costs ~200-400 tokens". Against the live binary the 38
+// entries below render 150 KB — about 38,000 tokens, ~1,000 each, so
+// the estimate was low by 3x and the list was kept "tight" against a
+// budget that was not real. Every question paid it: asking "is there
+// an RPM?" shipped the full flag inventory of restore, forecast and
+// compliance report.
+//
+// The practical effect is not cost, it is LATENCY. 38k tokens of
+// prefill on a reasoning endpoint is minutes of silence before the
+// first token — long enough to look like a hung client, which is
+// exactly how it was reported.
+//
+// So the block is now BUDGETED (hotCommandHelpBudget): entries are
+// rendered in list order until the budget is spent, and the rest are
+// reachable through the read_command_help tool, which is already
+// registered and already named in the prompt. Order this list by how
+// badly a wrong flag hurts — what does not fit is a tool call away,
+// not lost.
 var hotCommandPaths = [][]string{
 	// Recovery / repair surface — every entry here is a real
 	// pilot or stretch failure mode.
@@ -718,18 +736,66 @@ var hotCommandPaths = [][]string{
 // the --help output for every command in hotCommandPaths.  Missing
 // commands are silently skipped (covers test fixtures and partial
 // command trees).
+// hotCommandHelpBudget caps the "Detailed help for hot commands"
+// block. ~16 KB is roughly 4,000 tokens — enough for the commands
+// where a wrong flag does real damage, small enough that prefill
+// stays in seconds rather than minutes.
+//
+// Operators with a large context window and a fast endpoint can raise
+// it with PG_HARDSTORAGE_LLM_HOT_HELP_BYTES; 0 disables the block
+// entirely and leaves everything to read_command_help.
+const hotCommandHelpBudget = 16 * 1024
+
+// hotCommandHelpBudgetBytes resolves the budget, honouring the
+// environment override.
+func hotCommandHelpBudgetBytes() int {
+	if v := strings.TrimSpace(os.Getenv("PG_HARDSTORAGE_LLM_HOT_HELP_BYTES")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			return n
+		}
+	}
+	return hotCommandHelpBudget
+}
+
+// renderHotCommandHelp renders hot-command help up to the budget.
+//
+// Entries are emitted in hotCommandPaths order and the walk STOPS at
+// the first one that would overflow, rather than skipping it to fit a
+// later, smaller entry — the list is priority-ordered, and silently
+// preferring a cheap low-priority command over an expensive
+// high-priority one would make the block's contents depend on help
+// text length instead of on importance.
+//
+// The trailing note is load-bearing: without it the model cannot tell
+// "this command has no flags" from "this command was not included",
+// and that ambiguity is what produces invented flags.
 func renderHotCommandHelp(tree *cmdtree.Node) string {
 	if tree == nil {
 		return ""
 	}
+	budget := hotCommandHelpBudgetBytes()
+	if budget == 0 {
+		return ""
+	}
 	var b strings.Builder
+	var shown, omitted int
 	for _, path := range hotCommandPaths {
 		help := cmdtree.Help(tree, path)
 		if help == "" {
 			continue
 		}
+		if b.Len()+len(help)+1 > budget {
+			omitted++
+			continue
+		}
 		b.WriteString(help)
 		b.WriteString("\n")
+		shown++
+	}
+	if omitted > 0 {
+		fmt.Fprintf(&b, "\n(%d more commands are NOT listed above. Their flags are "+
+			"not shown here and must NOT be guessed — call read_command_help "+
+			"with the command name to get its exact flag list.)\n", omitted)
 	}
 	return b.String()
 }

@@ -9,6 +9,98 @@ on-disk and on-the-wire schema (backup manifests, configuration, output JSON,
 and the on-disk chunk envelope): an agent built against a given schema version
 keeps reading that version for at least 24 months after a successor lands.
 
+## [Unreleased]
+
+### Added
+
+- **A systemd unit for the WAL streamer** (#56, reported by @marsqd).
+  `deploy/systemd/pg_hardstorage-wal-stream@.service` runs
+  `pg_hardstorage wal stream %i` — templated on the deployment, since
+  that is a positional argument — and is packaged by all four recipes
+  (goreleaser/nfpm, debian, Arch, RPM).
+
+### Fixed
+
+- **The documentation pointed at the agent units to supervise the WAL
+  streamer, and the agent does not stream.** `pg_hardstorage.service`
+  and `pg_hardstorage@.service` both run `pg_hardstorage agent`, which
+  executes the scheduled backup and retention engine and never opens a
+  WAL stream. An operator who followed the getting-started tutorial got
+  periodic base backups and **no continuous archiving**, with nothing
+  to indicate the always-on data plane was absent.
+
+  Corrected in the getting-started tutorial (which now carries an
+  explicit "this is not the agent unit" warning), the R1 runbook —
+  whose `systemctl stop pg_hardstorage` would have left the slot held
+  and PostgreSQL still blocked — and all three migration guides, each
+  of which promised a replication slot and then enabled the agent.
+
+- **Three runbooks referenced `pg_hardstorage-agent`**, a unit no
+  package has ever shipped. Now `pg_hardstorage`.
+
+- **A slow model was treated as a hung connection.** The
+  OpenAI-compatible provider set `http.Client.Timeout` to 5 minutes,
+  described as "a backstop for hung connections". It is not one:
+  `Client.Timeout` bounds the whole exchange including the body, and
+  an SSE client cannot distinguish a dead connection from a healthy
+  stream still delivering tokens. Measured, one ordinary question
+  streams for 265 s on a deepseek-v4 endpoint and 532 s on a qwen3.8
+  one — both well-behaved, both killed at 300 s and reported as a
+  context deadline, which reads as a network fault rather than as our
+  own client hanging up. Every reasoning model was affected.
+
+  Connect, TLS and response-header timeouts are now bounded
+  individually, and the stream is watched for a two-minute gap
+  *between bytes* — the condition the old timeout was reaching for. A
+  stalled stream now says so.
+
+- **The command validator's retry narrated itself into the answer.**
+  When a reply named a bad flag, the session asked the model to
+  revise, and nothing told it to keep that internal. Answers came
+  back opening "Now I have the correct flags. Here's the revised
+  answer." The operator never saw the first attempt, so the answer
+  began by referring to a conversation that, from their side, never
+  happened.
+
+- **Nothing connected the unit files to the CLI verbs they invoke.**
+  New tests assert that every unit in `deploy/systemd/` is referenced
+  by every packaging recipe, that each `ExecStart` names a verb the CLI
+  implements, and that some unit actually runs `wal stream` — the
+  check that would have caught #56 when the docs were written.
+
+### Changed
+
+- **The LLM helper's system prompt shrank from 150 KB to 64 KB.**
+  `hotCommandPaths` baked the full `--help` of 38 commands into every
+  prompt. Its comment estimated "~200-400 tokens" per entry; measured
+  against the live binary it is ~1,000 — 38,309 tokens in total, so
+  the list had been kept "tight" against a budget understating the
+  cost threefold. Asking "is there an RPM?" shipped the full flag
+  inventory of `restore`, `forecast` and `compliance report`.
+
+  The cost is latency, not money: that much prefill on a reasoning
+  endpoint is minutes of silence before the first token, which is
+  indistinguishable from a hung client. The block is now budgeted
+  (`PG_HARDSTORAGE_LLM_HOT_HELP_BYTES`, default 16 KB, `0` disables),
+  and the overflow is named so the model calls `read_command_help` —
+  a tool already registered and already advertised in that prompt —
+  rather than guessing.
+
+  Measured against a deepseek-v4 endpoint: "How do I take my first
+  backup?" went from 764 s and failing to 316 s and answering.
+
+### Security
+
+- **`google.golang.org/grpc` v1.83.1 → v1.83.2** (#57), clearing
+  GO-2026-6443 (server panic via missing authority or Host headers),
+  which `govulncheck` reported as REACHABLE through
+  `transport.http2Server.HandleStreams`. v1.83.1 had arrived four days
+  earlier in #55 as a fix for an *unreachable* advisory; it introduced
+  a reachable one. The shipped binary scans clean again.
+
+- OpenTelemetry bumps to 1.45.0 (#58, #59, #60): `otel/sdk`,
+  `otlptrace`, `otlptrace/otlptracehttp`.
+
 ## [1.4.2] — 2026-09-08
 
 Container images only, again — v1.4.1 did not actually publish any.

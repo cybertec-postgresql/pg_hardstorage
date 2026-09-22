@@ -31,9 +31,13 @@ need to keep PG protected and switch to a replica region.
 1. **Stop the streamer** so PG isn't blocked indefinitely.
 
    ```sh
-   systemctl stop pg_hardstorage
+   systemctl stop pg_hardstorage-wal-stream@db1
    # or send SIGTERM to the wal stream process
    ```
+
+   Not `systemctl stop pg_hardstorage` — that unit runs the agent
+   (scheduled backups and retention), not the streamer, so stopping
+   it leaves the slot held and PG still blocked.
 
 2. **Repoint the deployment** at the replica region. Edit
    `pg_hardstorage.yaml`:
