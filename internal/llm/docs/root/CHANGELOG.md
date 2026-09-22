@@ -21,6 +21,27 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **The documentation promised that retention runs after every backup,
+  and it does not** (#66, reported by @marsqd). Two pages — the
+  operator guide's retention section and the "Set retention" how-to —
+  stated that `rotate` runs automatically on every backup commit.
+  Nothing in the backup path has ever applied retention:
+  `internal/backup/retention` is imported by exactly two non-test
+  callers, the manual `rotate` command and the agent's *scheduled*
+  rotate task.
+
+  An operator who configured `retention` and a `backup` schedule, and
+  took the documentation at its word, therefore accumulated every
+  backup ever taken while believing a policy was in force — and would
+  find out when the repository filled. The reporter's deployment had
+  78 fulls under a `keep_for: 7d` policy.
+
+  Both pages now say plainly that `backup` does not trigger `rotate`,
+  that the two are independent jobs, and what to schedule (or chain in
+  cron) to get retention actually applied. The behaviour is unchanged:
+  this is a documentation fix, not a new implicit delete inside
+  `backup`.
+
 - **The documentation pointed at the agent units to supervise the WAL
   streamer, and the agent does not stream.** `pg_hardstorage.service`
   and `pg_hardstorage@.service` both run `pg_hardstorage agent`, which

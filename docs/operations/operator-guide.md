@@ -150,8 +150,14 @@ deployments:
       keep_yearly: 5
 ```
 
-`rotate` runs after every backup commit and as a scheduled job. Manual
-invocation is dry-run by default:
+`rotate` is a job in its own right: the agent runs it on the schedule
+the deployment declares, and nothing else triggers it. In particular
+**`backup` does not run it** — a deployment that schedules `backup` but
+not `rotate` keeps every backup it ever takes, whatever `retention`
+says. Retention is a policy the `rotate` job applies, not a property
+the repository enforces on write.
+
+Manual invocation is dry-run by default:
 
 ```sh
 pg_hardstorage rotate db1                # dry-run, prints decisions
