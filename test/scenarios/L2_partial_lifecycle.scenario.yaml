@@ -29,6 +29,21 @@
 # Wall-clock budget: ~15s.
 
 schema: pg_hardstorage.scenario.v1
+
+# `partial dump` restores into a sandbox and drives it with pg_ctl, so
+# it needs PostgreSQL SERVER binaries on the host — not just the client
+# package. Declared for the same reason
+# L3_partial_dump_database_flag declares it: without them the command
+# refuses at preflight with `preflight.pg_tools_missing`, which is a
+# statement about the host and not about pg_hardstorage.
+#
+# This scenario asserted that refusal by accident. Its negative dump
+# step expected exit 4 and passed for years on hosts with no server
+# binaries, so the not-found path it describes was never once
+# exercised. Skip honestly instead of passing on an environmental
+# coincidence.
+requires:
+  host_tools: [pg_ctl]
 name: L2-partial-lifecycle
 tier: L2
 description: |
@@ -65,7 +80,10 @@ steps:
       timeout: 60s
 
   # 2. Negative dump: --tables references a user table
-  # that doesn't exist in this fresh-PG testbed.
+  # that doesn't exist in this fresh-PG testbed, so the
+  # command must refuse with exit 6 (ExitNotFound, code
+  # partial.dump_no_tables) rather than writing an empty
+  # .sql and claiming success.
   - cli_run:
       args:
         - "partial"
@@ -77,7 +95,7 @@ steps:
         - "public.no_such_user_table"
         - "--sql-file"
         - "$ARTEFACT_DIR/partial-dump.sql"
-      expect_exit: 4
+      expect_exit: 6
       timeout: 60s
 
   # 3. Negative restore: same.
