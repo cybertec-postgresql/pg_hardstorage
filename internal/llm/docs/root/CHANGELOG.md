@@ -21,6 +21,31 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **A restore reported `postverify_failed` — "your backup did not
+  survive" — when the truth was that the host lacked an extension the
+  source cluster preloaded.** Backups taken from a Patroni/Spilo
+  cluster carry `shared_preload_libraries = bg_mon,...` in their
+  `postgresql.conf`. Restored onto stock PostgreSQL, the boot smoke
+  test dies with
+
+  ```
+  FATAL:  could not access file "bg_mon": No such file or directory
+  ```
+
+  before the postmaster has looked at a single data page. The restored
+  data is sound; only the smoke test could not run. Telling an
+  operator mid-disaster-recovery that their backup is bad, when it is
+  not, is the most expensive wrong answer this tool can give.
+
+  A postmaster that will not start because *this host* is missing a
+  library is now the same category as a host with no `pg_ctl` at all —
+  undetermined, not failed. `Mode=auto` soft-skips with a reason
+  naming the library and three ways to proceed; `Mode=required` still
+  fails, because the operator asked for proof. Every other start
+  failure — invalid checkpoint record, incompatible data files, bad
+  permissions — stays a hard failure, pinned by tests, since catching
+  those is why postverify exists.
+
 - **`partial dump` connected to its sandbox as the host's login name,
   and honoured the backup's own `pg_hba.conf`.** Both are wrong for
   what the sandbox is: a throwaway cluster restored from the

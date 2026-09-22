@@ -52,6 +52,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -433,6 +434,40 @@ func Verify(ctx context.Context, opts Options) (*Result, error) {
 		// a few KB per failing restore; harmless on the success
 		// path.
 		logTail := readTail(logFile, 16384)
+
+		// A postmaster that refuses to start because THIS HOST lacks a
+		// library the SOURCE cluster preloads is telling us about the
+		// host, not about the backup — the same category as having no
+		// pg_ctl at all, and it gets the same treatment.
+		//
+		// The case that surfaced it: backups taken from a Patroni /
+		// Spilo cluster carry `shared_preload_libraries = bg_mon,...`
+		// in postgresql.conf. Restore them onto a machine running
+		// stock PostgreSQL and the boot smoke test dies with
+		//
+		//	FATAL: could not access file "bg_mon": No such file or directory
+		//
+		// while the restored data is entirely sound. Reporting that as
+		// restore.postverify_failed tells an operator mid-DR that
+		// their backup did not survive, which is both false and the
+		// most expensive wrong answer this tool can give.
+		if lib, ok := missingPreloadLibrary(logTail); ok {
+			reason := fmt.Sprintf("the restored cluster preloads %q, which is not installed on this host — "+
+				"the source cluster (a Patroni/Spilo or otherwise extended PostgreSQL) had it and this one "+
+				"does not. The DATA restored fine; only the boot smoke test could not run. Install the "+
+				"extension here, restore onto an image matching the source, or start it yourself with "+
+				"`pg_ctl -D %s -o \"-c shared_preload_libraries=''\" start` to confirm the cluster boots.",
+				lib, opts.DataDir)
+			switch opts.Mode {
+			case ModeRequired:
+				return res, fmt.Errorf("postverify: %s", reason)
+			default:
+				res.Skipped = true
+				res.SkipReason = reason
+				return res, nil
+			}
+		}
+
 		return res, fmt.Errorf("postverify: pg_ctl start: %w (output: %s; log tail: %s)",
 			err, truncate(out, 4096), truncate([]byte(logTail), 8192))
 	}
@@ -1046,4 +1081,37 @@ func touchAsRoot(path string) error {
 		return err
 	}
 	return f.Close()
+}
+
+// preloadLibraryPatterns are PostgreSQL's two ways of saying "a
+// library named in shared_preload_libraries (or similar) is not on
+// this machine".
+//
+//	FATAL:  could not access file "bg_mon": No such file or directory
+//	FATAL:  could not load library "/usr/lib/.../pg_stat_statements.so": ...
+//
+// Both are emitted before the postmaster reaches a state where it
+// could have looked at any data, which is what makes them safe to
+// read as "the host is missing something" rather than "the backup is
+// damaged".
+var preloadLibraryPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`could not access file "([^"]+)": No such file or directory`),
+	regexp.MustCompile(`could not load library "([^"]+)"`),
+}
+
+// missingPreloadLibrary returns the library the postmaster could not
+// find, and whether the log names one at all.
+//
+// Deliberately narrow. Every other pg_ctl start failure — an invalid
+// checkpoint record, incompatible data files, bad permissions — stays
+// a hard failure, because those DO say something about the restored
+// data and softening them would hide exactly what postverify exists
+// to catch.
+func missingPreloadLibrary(logTail string) (string, bool) {
+	for _, re := range preloadLibraryPatterns {
+		if m := re.FindStringSubmatch(logTail); m != nil {
+			return m[1], true
+		}
+	}
+	return "", false
 }
