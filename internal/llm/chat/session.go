@@ -1244,29 +1244,6 @@ const flagCheatsheetAddendum = "## Flag inventory cheatsheet\n\n" +
 	"These subcommand flag sets are commonly misremembered.  When\n" +
 	"recommending one of these commands, use ONLY the flags shown\n" +
 	"here.  For anything else, call `read_command_help`.\n\n" +
-	"### The `--repo` trap\n\n" +
-	"`--repo` is on roughly HALF the command surface, so guessing it\n" +
-	"is a coin flip — and the catalog above shows verbs without flags,\n" +
-	"which gives you nothing to guess from. Across a 194-question\n" +
-	"evaluation this was the single most invented flag: it was bolted\n" +
-	"onto commands that do not accept it 42-69 times per model, and\n" +
-	"every one of those command lines fails immediately with\n" +
-	"`error: unknown flag: --repo`.\n\n" +
-	"These common commands take NO `--repo`. They find the repository\n" +
-	"through the deployment in pg_hardstorage.yaml, or do not touch a\n" +
-	"repository at all:\n\n" +
-	"- `doctor` — `--drill-max-age`, `--exit-on-issues`\n" +
-	"- `deployment list` — no flags of its own\n" +
-	"- `kms inspect` — no flags of its own\n" +
-	"- `wal preflight` — `--pg-connection`, `--role`\n" +
-	"- `schedule` — `--task`\n" +
-	"- `audit` — no flags of its own\n" +
-	"- `lint` — no flags of its own\n" +
-	"- `patroni` — no flags of its own\n" +
-	"\n" +
-	"If you are about to write `--repo` on a command that is not in\n" +
-	"the positive list above, call `read_command_help` first. Naming\n" +
-	"a deployment is almost always what you meant instead.\n\n" +
 	"- `repair scrub` — `--repo` (required), `--heal`, `--replica`\n" +
 	"  (required when `--heal`), `--limit`.  No `--recover`, no\n" +
 	"  `--verbose`, no `--show-affected-backups`, no `--list-flagged`.\n" +
