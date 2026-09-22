@@ -31,6 +31,25 @@ import (
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/testkit/scenario"
 )
 
+// cliRunStderrExcerpt bounds how much of a failing command's stderr
+// reaches the scenario result.
+//
+// It was 256 bytes, which predates the CLI emitting structured JSON
+// errors. Those open with a schema line, the command name and a
+// timestamp — roughly 200 bytes of preamble before "error" — so a
+// 256-byte excerpt reliably showed everything except the message,
+// rendering every failure as
+//
+//	"code": "partial.dump_pg_dump_failed",
+//	"message": "partial dump: pg_dump: exit status 1: pg_dump: error:...
+//
+// and cutting off at the one substring that says what went wrong.
+// Diagnosing a scenario failure meant reproducing it by hand.
+//
+// 2 KiB matches the budget the sandbox already uses when it captures
+// pg_dump's stderr, so the excerpt can now carry what that captured.
+const cliRunStderrExcerpt = 2048
+
 // splitPGConn parses a libpq URI ("postgres://user[:pass]@host[:port]/db?...")
 // into its host, port, user, and database components.  Empty input
 // returns four empty strings — caller's substitutePlaceholders surfaces
@@ -201,14 +220,14 @@ func runCLIRun(ctx context.Context, st scenario.Step, idx int, state *runState, 
 		} else {
 			return StepResult{Index: idx, Kind: st.Kind, Pass: false,
 				Message: fmt.Sprintf("cli_run: %v (stderr: %s)", runErr,
-					truncate(stderrBuf.Bytes(), 256))}
+					truncate(stderrBuf.Bytes(), cliRunStderrExcerpt))}
 		}
 	}
 
 	if gotExit != expectExit {
 		return StepResult{Index: idx, Kind: st.Kind, Pass: false,
 			Message: fmt.Sprintf("cli_run: exit %d, want %d (stderr: %s)",
-				gotExit, expectExit, truncate(stderrBuf.Bytes(), 256))}
+				gotExit, expectExit, truncate(stderrBuf.Bytes(), cliRunStderrExcerpt))}
 	}
 
 	// expect_*_contains accept the same $PLACEHOLDER syntax
@@ -236,7 +255,7 @@ func runCLIRun(ctx context.Context, st scenario.Step, idx int, state *runState, 
 		if !strings.Contains(stderrBuf.String(), want) {
 			return StepResult{Index: idx, Kind: st.Kind, Pass: false,
 				Message: fmt.Sprintf("cli_run: stderr missing %q (stderr: %s)",
-					want, truncate(stderrBuf.Bytes(), 256))}
+					want, truncate(stderrBuf.Bytes(), cliRunStderrExcerpt))}
 		}
 	}
 

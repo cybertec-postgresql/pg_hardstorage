@@ -58,6 +58,7 @@ func newPartialDumpCmd() *cobra.Command {
 		tables           string
 		outFile          string
 		database         string
+		pgUser           string
 		dataOnly         bool
 		stagingDir       string
 		skipVersionCheck bool
@@ -99,6 +100,7 @@ who want a PGDATA tree run restore.`,
 				tables:           tables,
 				output:           outFile,
 				database:         database,
+				pgUser:           pgUser,
 				dataOnly:         dataOnly,
 				stagingDir:       stagingDir,
 				skipVersionCheck: skipVersionCheck,
@@ -114,6 +116,8 @@ who want a PGDATA tree run restore.`,
 		"comma-separated qualified tables (required, e.g. public.users,public.events)")
 	c.Flags().StringVar(&database, "database", "postgres",
 		"database containing the requested tables; pg_dump connects to exactly one database, so a table in another database needs its name here (issue #97)")
+	c.Flags().StringVar(&pgUser, "pg-user", sandbox.DefaultSandboxUser,
+		"PostgreSQL role to read the sandbox as. The sandbox is your own cluster restored from the backup, so this must be a role that exists IN THE BACKUP — not a host login. Only needed when the cluster was initdb'd with -U <name>")
 	c.Flags().StringVar(&outFile, "sql-file", "",
 		"write the dumped SQL here; empty streams to stdout (named --sql-file to avoid shadowing the global --output flag)")
 	c.Flags().BoolVar(&dataOnly, "data-only", false,
@@ -134,6 +138,7 @@ type partialDumpFlags struct {
 	tables           string
 	output           string
 	database         string
+	pgUser           string
 	dataOnly         bool
 	stagingDir       string
 	skipVersionCheck bool
@@ -245,6 +250,7 @@ func runPartialDump(cmd *cobra.Command, f partialDumpFlags) error {
 		PGCtlPath:        pgCtl,
 		PGDumpPath:       pgDump,
 		Database:         f.database,
+		User:             f.pgUser,
 		SkipVersionCheck: f.skipVersionCheck,
 	})
 	if err != nil {
@@ -296,6 +302,17 @@ func runPartialDump(cmd *cobra.Command, f partialDumpFlags) error {
 		// any current PostgreSQL. Both raise the same refusal.
 		if errors.Is(err, sandbox.ErrNoMatchingTables) {
 			return noTablesMatchedError(f, tlist)
+		}
+		// The cluster came up; we just asked to be someone it has
+		// never heard of. That is a flag away, and saying so beats
+		// making the operator read a FATAL out of a PG log.
+		if errors.Is(err, sandbox.ErrRoleMissing) {
+			return output.NewError("preflight.pg_role_missing",
+				fmt.Sprintf("partial dump: role %q does not exist in the restored cluster: %v", f.pgUser, err)).
+				WithSuggestion(&output.Suggestion{
+					Human: fmt.Sprintf("pass --pg-user <role> naming a role that exists in the backed-up cluster (default %q). The sandbox is your own cluster restored from the backup, so its roles are the ones the source cluster had — a host login name is not one of them unless it also existed there.",
+						sandbox.DefaultSandboxUser),
+				}).Wrap(err)
 		}
 		return output.NewError("partial.dump_pg_dump_failed",
 			fmt.Sprintf("partial dump: pg_dump: %v (sandbox PG log: %s)",

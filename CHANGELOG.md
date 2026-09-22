@@ -21,6 +21,32 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **`partial dump` connected to its sandbox as the host's login name,
+  and honoured the backup's own `pg_hba.conf`.** Both are wrong for
+  what the sandbox is: a throwaway cluster restored from the
+  operator's backup, whose roles and auth policy belong to *their*
+  source cluster.
+
+  The connection role came from `$USER`, so the command worked only
+  where the operator's login happened to match a role inside their own
+  backup — and otherwise failed with PostgreSQL's
+  `FATAL: role "<login>" does not exist`, which reads like a
+  pg_hardstorage bug. Running as `root`, as a service account, or from
+  CI failed by construction.
+
+  The auth policy was the restored cluster's, so a `pg_hba.conf`
+  demanding scram, md5, LDAP, GSSAPI or a client certificate — an
+  ordinary production posture — made `partial dump` unusable, since
+  pg_hardstorage holds no credential for the operator's own database.
+
+  The sandbox now supplies its own trust-only `pg_hba.conf` (via
+  `hba_file`, so the operator's file is never modified) and connects
+  as `postgres` by default, with `--pg-user` for clusters `initdb`'d
+  under another name. Trust is confined to a cluster with no TCP
+  listener whose socket lives in a 0700 directory the process creates
+  and deletes. A role that is not present is now
+  `preflight.pg_role_missing` naming `--pg-user`, not a dump failure.
+
 - **`partial dump` reported a table that does not exist as a tool
   failure, and its guard against that case was unreachable.** The
   command carried an empty-dump guard (issue #97) that turned "pg_dump

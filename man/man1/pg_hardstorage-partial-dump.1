@@ -64,6 +64,10 @@ who want a PGDATA tree run restore.
 	cloud KMS provider config for a cloud-KMS-encrypted backup (e.g. region=eu-central-1,endpoint=...); empty uses ambient credentials
 
 .PP
+\fB--pg-user\fP="postgres"
+	PostgreSQL role to read the sandbox as. The sandbox is your own cluster restored from the backup, so this must be a role that exists IN THE BACKUP — not a host login. Only needed when the cluster was initdb'd with -U 
+
+.PP
 \fB--repo\fP=""
 	repository URL (required)
 
