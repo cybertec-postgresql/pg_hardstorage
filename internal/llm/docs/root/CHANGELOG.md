@@ -21,6 +21,16 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **A split-brain was never reported with its documented code.** The
+  error-code reference tells automation to route on `splitbrain.*` — the
+  signal that two clusters are archiving into one lineage. `wal push`
+  wrapped every such refusal as `wal.push_failed` and `wal stream`
+  stopped with `wal.stream_permanent`; `splitbrain.content_mismatch`
+  appeared only inside the message text, so no rule keyed on the code
+  could match the most dangerous condition the archive detects. Both
+  now emit the documented `splitbrain.<leaf>` code (exit 1, unchanged),
+  and `wal push` points at runbook R7.
+
 - **The RPM could not be built.** The #56 change placed the new WAL-stream
   unit's `%files` path inside `%install`, which rpmbuild runs as a shell
   script, and never listed the installed unit in `%files`. A packaging

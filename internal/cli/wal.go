@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -372,6 +373,19 @@ func mapWalPushError(path string, err error) error {
 			fmt.Sprintf("wal push: %v", err)).
 			WithSuggestion(&output.Suggestion{
 				Human: "this archive_command input is neither a canonical 16 MiB WAL segment nor a recognised companion file (.backup / .history / .partial) — check the %f PG passed",
+			}).Wrap(err)
+	}
+	// Split-brain must surface as its documented code. walsink reports it
+	// as a message prefix ("splitbrain.content_mismatch: ...") and this
+	// function used to wrap everything as wal.push_failed, so the code an
+	// operator's automation was told to route on — docs/reference/
+	// error-codes.md, `splitbrain.*` — never appeared. That is the
+	// signal for two clusters archiving into one lineage; it has to be
+	// matchable without parsing prose.
+	if code := splitBrainCode(err); code != "" {
+		return output.NewError(code, fmt.Sprintf("wal push: %v", err)).
+			WithSuggestion(&output.Suggestion{
+				Human: "another writer has already archived this WAL with different content — two clusters are archiving into one lineage, or the archive was altered. Stop archiving from this node and follow runbook R7 (docs/reference/runbooks/R7-patroni-split-brain.md) before retrying",
 			}).Wrap(err)
 	}
 	return output.NewError("wal.push_failed",
@@ -2482,6 +2496,12 @@ func decideStreamStop(streamErr error, noProgress int) (code, msg string, stop b
 		e := startBeforeRestartError(streamErr)
 		return "wal.start_before_slot_restart_lsn", e.Error(), true
 	}
+	// Split-brain keeps its documented code on the streaming path too;
+	// it was reported as wal.stream_permanent, invisible to automation
+	// routing on `splitbrain.*`.
+	if code := splitBrainCode(streamErr); code != "" {
+		return code, fmt.Sprintf("wal stream stopped: %v", streamErr), true
+	}
 	if isPermanentStreamError(streamErr) {
 		return "wal.stream_permanent",
 			fmt.Sprintf("wal stream stopped: %v", streamErr), true
@@ -3288,4 +3308,17 @@ func captureStreamTimelineHistory(ctx context.Context, d *output.Dispatcher, sp 
 			WithSubject(output.Subject{Deployment: opts.deployment, Timeline: tli}).
 			WithBody(map[string]any{"timelines": captured}))
 	}
+}
+
+// splitBrainRe extracts a `splitbrain.<leaf>` code from an error chain's
+// text, where walsink records it.
+var splitBrainRe = regexp.MustCompile(`splitbrain\.[a-z_]+`)
+
+// splitBrainCode returns the documented splitbrain.* code carried by err,
+// or "" when err is not a split-brain refusal.
+func splitBrainCode(err error) string {
+	if err == nil {
+		return ""
+	}
+	return splitBrainRe.FindString(err.Error())
 }
