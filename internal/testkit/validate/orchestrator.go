@@ -308,7 +308,26 @@ func runCellLoop(
 		})
 		return
 	}
-	emit(Event{Cell: cr.Name, Op: "sustained_load_started"})
+	// Only claim the writer started if one actually did.
+	//
+	// StartSustainedLoad is a documented no-op when the profile
+	// leaves SustainedClients at 0 — which the default profile
+	// (oltp_smoke) does — and it signals that by returning nil,
+	// indistinguishable here from a writer that really launched.
+	// Emitting "started" either way put 21 sustained_load_started
+	// events in an 8 h run that had no sustained writer at all,
+	// while the report's own Writer column correctly read "—".
+	//
+	// An event stream that overstates what ran is the specific
+	// failure this soak already shipped once: in v1.4 the
+	// WAL-stream sidecar was dead for most of a run and the
+	// report looked healthy. Say "skipped" when it is skipped.
+	if cell.SustainedWriterActive() {
+		emit(Event{Cell: cr.Name, Op: "sustained_load_started"})
+	} else {
+		emit(Event{Cell: cr.Name, Op: "sustained_load_skipped",
+			Detail: "profile sets no sustained_clients"})
+	}
 	if err := cell.StartWALStream(ctx); err != nil {
 		cr.Pass = false
 		cr.FirstFailureMsg = "wal stream failed to start: " + err.Error()

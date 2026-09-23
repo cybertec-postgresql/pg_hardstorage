@@ -61,6 +61,13 @@ type FakeCellRuntime struct {
 	// invocation counts.
 	SustainedStarted bool
 	SustainedErr     error
+
+	// SustainedNoop models the real runtime's documented no-op: a
+	// profile with SustainedClients == 0 makes StartSustainedLoad
+	// return nil without launching anything. Indistinguishable from
+	// success by the return value alone, which is the whole reason
+	// SustainedWriterActive exists.
+	SustainedNoop    bool
 	SustainedStats   *report.LoadStats // returned from StopSustainedLoad
 	WALStreamStarted bool
 	WALStreamErr     error
@@ -217,8 +224,20 @@ func (f *FakeCellRuntime) StartSustainedLoad(_ context.Context) error {
 	if f.SustainedErr != nil {
 		return f.SustainedErr
 	}
+	if f.SustainedNoop {
+		return nil // no writer, no error — exactly the real no-op
+	}
 	f.SustainedStarted = true
 	return nil
+}
+
+// SustainedWriterActive mirrors the docker runtime: true only once a
+// writer really started, so orchestrator tests can distinguish a
+// launched writer from a skipped one.
+func (f *FakeCellRuntime) SustainedWriterActive() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.SustainedStarted
 }
 
 // StopSustainedLoad returns nil when no writer is running,

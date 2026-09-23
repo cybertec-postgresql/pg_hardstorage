@@ -768,6 +768,13 @@ func (d *DockerCellRuntime) StartSustainedLoad(ctx context.Context) error {
 // StartSustainedLoad and parses its final report into
 // LoadStats.  Returns nil/nil when no writer was running so
 // the orchestrator can call Stop unconditionally.
+// SustainedWriterActive reports whether a writer is actually
+// running. The zero-SustainedClients path leaves sustainedCmd nil,
+// which is the same state as "never asked for one" — and that is
+// precisely the distinction the orchestrator needs before it
+// announces a writer to the event stream.
+func (d *DockerCellRuntime) SustainedWriterActive() bool { return d.sustainedCmd != nil }
+
 func (d *DockerCellRuntime) StopSustainedLoad(ctx context.Context) (*report.LoadStats, error) {
 	if d.sustainedCmd == nil {
 		return nil, nil

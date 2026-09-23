@@ -89,6 +89,13 @@ type CellRuntime interface {
 	// during backup" semantics.
 	StartSustainedLoad(ctx context.Context) error
 
+	// SustainedWriterActive reports whether StartSustainedLoad
+	// actually launched a writer, as opposed to no-opping because
+	// the profile sets no SustainedClients. Both return nil, so
+	// the orchestrator cannot otherwise tell them apart — and it
+	// must, because it announces one of them to the event stream.
+	SustainedWriterActive() bool
+
 	// StopSustainedLoad stops the writer started by
 	// StartSustainedLoad, captures its final TPS / latency
 	// report, and returns it via LoadStats.  Idempotent: a
