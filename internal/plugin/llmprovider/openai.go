@@ -324,7 +324,17 @@ func (p *OpenAIProvider) Chat(ctx context.Context, msgs []Message, tools []ToolD
 			yield(Chunk{}, err)
 			return
 		}
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.chatCompletionsURL(), bytes.NewReader(body))
+		// The stall watchdog below cancels streamCtx, and the request
+		// MUST be bound to it: net/http interrupts a blocked
+		// resp.Body.Read only when the REQUEST's context is cancelled.
+		// This used to build the request on the parent ctx and derive
+		// streamCtx later, so the watchdog cancelled a context the read
+		// never observed — it "fired" and the read stayed blocked. With
+		// http.Client.Timeout removed, a black-holed connection (no
+		// RST, no FIN) would then hang the command indefinitely.
+		streamCtx, cancelStream := context.WithCancel(ctx)
+		defer cancelStream()
+		req, err := http.NewRequestWithContext(streamCtx, http.MethodPost, p.chatCompletionsURL(), bytes.NewReader(body))
 		if err != nil {
 			yield(Chunk{}, fmt.Errorf("openai: build request: %w", err))
 			return
@@ -355,8 +365,6 @@ func (p *OpenAIProvider) Chat(ctx context.Context, msgs []Message, tools []ToolD
 		}
 
 		// Watch the stream for silence rather than for elapsed time.
-		streamCtx, cancelStream := context.WithCancel(ctx)
-		defer cancelStream()
 		sr := newStallReader(resp.Body,
 			durationFromEnv("PG_HARDSTORAGE_LLM_FIRST_BYTE_TIMEOUT", openaiFirstByteTimeout),
 			durationFromEnv("PG_HARDSTORAGE_LLM_STALL_TIMEOUT", openaiStreamStallTimeout),
