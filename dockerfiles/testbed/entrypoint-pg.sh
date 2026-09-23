@@ -212,10 +212,27 @@ chmod 0644 /var/log/postgresql.log /var/log/pg_hardstorage.log
 # quirk, etc.) — exactly the rhel/fedora regression we just
 # debugged where the symptom was three layers removed from
 # the cause.
+#
+# Wait long enough for CRASH RECOVERY, not just a clean start. pg_ctl's
+# default -t is 60 s. After a fault kills PG on a busy cell (10 GB
+# seeded, 16 writers in the enterprise_heavy soak), redo takes longer
+# than that; pg_ctl then reports "server did not start in time" while
+# the postmaster is still recovering, this script used to exit 1, and
+# Docker's unless-stopped policy restarted the container — killing any
+# in-flight `docker exec` backup (exit 137) and restarting recovery from
+# scratch. Four soak backups died that way and three cells stopped.
 set +e
-sudo -u "$PGUSER" "$PG_CTL" -D "$PGDATA" -l /var/log/postgresql.log start
+sudo -u "$PGUSER" "$PG_CTL" -D "$PGDATA" -l /var/log/postgresql.log \
+    -t "${PG_START_TIMEOUT:-1800}" start
 pg_ctl_rc=$?
 set -e
+# Even past the timeout, a postmaster that is alive is recovering, not
+# failed. Leave it running and keep the container up; exiting here is
+# what turned a slow recovery into a restart loop.
+if [[ "$pg_ctl_rc" -ne 0 ]] && sudo -u "$PGUSER" "$PG_CTL" -D "$PGDATA" status >/dev/null 2>&1; then
+    echo "entrypoint-pg.sh: pg_ctl start timed out but the postmaster is running (still recovering) — keeping the container up" >&2
+    pg_ctl_rc=0
+fi
 if [[ "$pg_ctl_rc" -ne 0 ]]; then
     echo "entrypoint-pg.sh: pg_ctl start exited $pg_ctl_rc — dumping postgresql.log" >&2
     echo "------------------------ /var/log/postgresql.log ------------------------" >&2
