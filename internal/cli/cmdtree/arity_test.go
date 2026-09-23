@@ -448,11 +448,13 @@ func TestValidate_UnterminatedQuoteAfterPipe(t *testing.T) {
 			t.Errorf("%q valid pre-pipe should pass (tail discarded), got: %v", c, err)
 		}
 	}
-	// The pre-pipe part's OWN problem (missing --repo) is still reported —
-	// and as that, not a generic "parse" error.
-	err := cmdtree.Validate(tree, `pg_hardstorage status --output json | jq -r '`, "pg_hardstorage")
-	if ve, ok := err.(*cmdtree.ValidationError); !ok || ve.Kind != "missing_required" {
-		t.Errorf("status (missing --repo) before the pipe should be missing_required, got: %v", err)
+	// The pre-pipe part's OWN problem is still reported — and as that,
+	// not a generic "parse" error. (Bare `status` without --repo is no
+	// longer such a problem: the CLI fills --repo from the sole
+	// configured repo, so this uses an invented flag instead.)
+	err := cmdtree.Validate(tree, `pg_hardstorage status --bogus-flag | jq -r '`, "pg_hardstorage")
+	if ve, ok := err.(*cmdtree.ValidationError); !ok || ve.Kind != "unknown_flag" {
+		t.Errorf("an unknown flag before the pipe should be unknown_flag, got: %v", err)
 	}
 }
 

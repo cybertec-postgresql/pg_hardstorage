@@ -73,16 +73,21 @@ the exact command to run.
 
 ## 2. Restore
 
-### Interactive
+### Choosing a backup
+
+`restore` always takes the deployment **and** the backup to restore —
+there is no prompt that picks one for you. List the candidates first,
+then name one (or `latest`):
 
 ```sh
-pg_hardstorage restore db1
+pg_hardstorage list db1
+pg_hardstorage restore db1 <backup-id> --target /var/lib/postgresql/restored
 ```
 
-With no positional argument the command lists backups, prompts for
-selection, runs pre-flight checks, and asks for confirmation. The
-answer is `y` to proceed, anything else aborts with exit 5
-(operator-aborted).
+There is no confirmation prompt: the command runs its pre-flight checks
+(see *Refusals* below) and then restores. Use `--preview` to see the plan
+without touching disk. For a guided, menu-driven restore, use
+`pg_hardstorage_simple`.
 
 ### Latest, with one confirmation
 
@@ -117,8 +122,9 @@ pg_hardstorage restore db1 latest \
 
 Prints what would happen — source backup, WAL replay range, RTO
 estimate, target tablespace mapping, verification gate — and exits
-without touching disk. Pair with `--force` to run the same
-operation non-interactively after operator review.
+without touching disk. Re-run the same command without `--preview` to
+perform it. (`--force` is unrelated: it only permits restoring into a
+non-empty target directory.)
 
 ### Refusals (pre-flight, exit 4)
 
@@ -256,7 +262,7 @@ that ran and failed, so a cron gate keyed on 9 catches both.
 The full SHA round-trip across every chunk in the repo:
 
 ```sh
-pg_hardstorage repair scrub <repo-url>
+pg_hardstorage repair scrub --repo <repo-url>
 ```
 
 Mismatches surface as `verify.scrub_mismatch` (exit 9). Schedule this

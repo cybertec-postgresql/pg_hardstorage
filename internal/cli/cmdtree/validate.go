@@ -248,6 +248,14 @@ func Validate(root *Node, command, binaryName string) error {
 			if posCount > 0 && DeploymentBackfilledFlags[f.Name] && firstPositionalIsDeployment(cur.Use) {
 				continue
 			}
+			// With NO positional at all (all-deployments mode: bare
+			// `status`, `rotate`, `kms verify`), the hook fills --repo
+			// from the one repo every configured deployment shares.
+			// The docs teach bare `pg_hardstorage status`; flagging it
+			// made the LLM helper "correct" a working command.
+			if posCount == 0 && ZeroArgBackfilledFlags[f.Name] {
+				continue
+			}
 			return &ValidationError{
 				Kind: "missing_required",
 				Message: fmt.Sprintf("required flag --%s not supplied on %q",
@@ -613,4 +621,11 @@ func firstPositionalIsDeployment(use string) bool {
 	}
 	first := strings.Trim(fields[1], "[]<>")
 	return first == "deployment"
+}
+
+// ZeroArgBackfilledFlags are filled by the pre-run hook when a command is
+// given no positional at all and every configured deployment points at
+// the same repository. Only --repo: there is no single DSN to infer.
+var ZeroArgBackfilledFlags = map[string]bool{
+	"repo": true,
 }

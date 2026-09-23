@@ -158,7 +158,7 @@ pg_hardstorage llm history show <session-id>
 Or export a signed evidence bundle suitable for an auditor:
 
 ```bash
-pg_hardstorage llm export-session <session-id> --out bundle.tar.gz
+pg_hardstorage llm export-session <session-id> --repo <repo-url> --out bundle.tar.gz
 ```
 
 ## Testing your changes

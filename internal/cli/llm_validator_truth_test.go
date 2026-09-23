@@ -125,3 +125,33 @@ func TestValidator_BackfillOnlyForDeploymentPositionals(t *testing.T) {
 		}
 	}
 }
+
+// Zero-argument mode: with no positional, the hook fills --repo from the
+// one repo every deployment shares — and never --pg-connection. The
+// validator's ZeroArgBackfilledFlags must say exactly that.
+func TestZeroArgBackfillMatchesThePreRunHook(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("PG_HARDSTORAGE_ROOT", root)
+	if err := os.MkdirAll(filepath.Join(root, "etc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfg := "deployments:\n" +
+		"  db1:\n    pg_connection: 'host=h dbname=postgres'\n    repo: file:///shared\n" +
+		"  db2:\n    pg_connection: 'host=k dbname=postgres'\n    repo: file:///shared\n"
+	if err := os.WriteFile(filepath.Join(root, "etc", "pg_hardstorage.yaml"), []byte(cfg), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cmd := &cobra.Command{Use: "probe"}
+	cmd.Flags().String("repo", "", "")
+	cmd.Flags().String("pg-connection", "", "")
+	if err := resolveDeploymentDefaultsPreRun(cmd, nil); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"repo", "pg-connection"} {
+		filled := cmd.Flags().Lookup(name).Changed
+		if filled != cmdtree.ZeroArgBackfilledFlags[name] {
+			t.Errorf("--%s: hook filled=%v but validator exempts=%v in zero-arg mode",
+				name, filled, cmdtree.ZeroArgBackfilledFlags[name])
+		}
+	}
+}

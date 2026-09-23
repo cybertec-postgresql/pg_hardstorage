@@ -100,10 +100,14 @@ func TestValidate_UsageDeclaredRequiredFlag(t *testing.T) {
 	rot.Flags().String("repo", "", "repository URL (file://, s3://, ...) — must already exist (required)")
 	rot.Flags().Bool("apply", false, "actually soft-delete (default: dry-run)")
 	root.AddCommand(rot)
+	appr := &cobra.Command{Use: "approve <request-id>", Run: func(_ *cobra.Command, _ []string) {}}
+	appr.Flags().String("repo", "", "repository URL (required)")
+	root.AddCommand(appr)
 	tree := cmdtree.Walk(root)
 
-	// No deployment named → nothing to back-fill --repo from.
-	err := cmdtree.Validate(tree, "pg_hardstorage rotate --apply", "pg_hardstorage")
+	// A positional that is NOT a deployment → nothing back-fills --repo,
+	// so the usage-declared "(required)" must be enforced.
+	err := cmdtree.Validate(tree, "pg_hardstorage approve req-123", "pg_hardstorage")
 	ve, ok := err.(*cmdtree.ValidationError)
 	if !ok || ve.Kind != "missing_required" || !strings.Contains(ve.Message, "repo") {
 		t.Fatalf("usage-declared required flag not enforced; got: %v", err)

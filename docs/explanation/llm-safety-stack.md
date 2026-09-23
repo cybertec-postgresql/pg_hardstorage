@@ -245,8 +245,8 @@ cryptographic evidence that none of it was rewritten afterwards.
 Any session can be exported as a signed bundle:
 
 ```console
-$ pg_hardstorage llm export-session <session-id>
-Wrote signed evidence bundle to ./session-20260428T1423-db1-restore.evidence.tar.gz
+$ pg_hardstorage llm export-session <session-id> --repo <repo-url>
+Wrote signed evidence bundle to ./llm-session-<session-id>.tar.gz
   - transcript.ndjson         (every prompt, tool call, response, in order)
   - tool_results/             (raw JSON of each tool call's return)
   - executed_commands.ndjson  (every command actually run, exit code, duration)
