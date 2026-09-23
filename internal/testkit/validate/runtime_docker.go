@@ -1351,8 +1351,18 @@ func (d *DockerCellRuntime) dockerExecAs(ctx context.Context, user string, argv 
 // start accepting connections again after a fault, and
 // pgRecoveryMaxBackoff caps the gap between attempts. Vars so tests
 // can shrink them.
+//
+// The budget must be no shorter than the testbed's own allowance for PG
+// to start (entrypoint-pg.sh: PG_START_TIMEOUT, default 1800 s). It was
+// 3 minutes, and an enterprise_heavy cell whose crash recovery took
+// 4 min 17 s had its backup abandoned seven seconds before PostgreSQL
+// began accepting connections — while PG was explicitly answering
+// 57P03 "not yet accepting connections", i.e. recovering, not gone.
+// That scored a correct refusal as backup_failed and stopped the cell
+// for the rest of the run. A PG that never returns still fails, just
+// not before the container itself would have given up on it.
 var (
-	pgRecoveryBudget     = 3 * time.Minute
+	pgRecoveryBudget     = 30 * time.Minute
 	pgRecoveryMaxBackoff = 10 * time.Second
 )
 

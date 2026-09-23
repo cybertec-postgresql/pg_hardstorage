@@ -4,6 +4,8 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -79,5 +81,25 @@ exit 0
 	}
 	if el := time.Since(start); el > 10*time.Second {
 		t.Fatalf("took %s against a 1.5 s budget — the wait is not bounded", el)
+	}
+}
+
+// The soak must never abandon a PostgreSQL that the testbed is still
+// legitimately starting: its wait has to be at least the entrypoint's
+// PG_START_TIMEOUT default. A 3-minute wait gave up on a recovery that
+// finished at 4 min 17 s.
+func TestPGRecoveryBudgetCoversTheTestbedStartTimeout(t *testing.T) {
+	raw, err := os.ReadFile("../../../dockerfiles/testbed/entrypoint-pg.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := regexp.MustCompile(`PG_START_TIMEOUT:-(\d+)`).FindSubmatch(raw)
+	if m == nil {
+		t.Fatal("entrypoint no longer declares a PG_START_TIMEOUT default; update this test")
+	}
+	secs, _ := strconv.Atoi(string(m[1]))
+	if pgRecoveryBudget < time.Duration(secs)*time.Second {
+		t.Errorf("pgRecoveryBudget %s is shorter than the testbed's PG start timeout %ds — "+
+			"the soak would give up on a PG that is still recovering", pgRecoveryBudget, secs)
 	}
 }
