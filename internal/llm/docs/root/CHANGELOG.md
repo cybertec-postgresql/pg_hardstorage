@@ -55,8 +55,9 @@ keeps reading that version for at least 24 months after a successor lands.
   load. PostgreSQL raises it without an errcode (XX000), so it landed in
   the "we don't know what this is" bucket. Now `backup.wal_recycled`,
   saying it is a sizing condition, not damage, that retry is safe, and
-  how to prevent it (keep `wal stream`'s slot, or raise
-  `wal_keep_size`).
+  how to prevent it (raise `wal_keep_size`; a running `wal stream`
+  does not help, since its slot holds only WAL the streamer has not yet
+  consumed).
 
 - **Manual `rotate` ignored the deployment's `retention:` block and
   applied the built-in GFS defaults** (#66 follow-up, reported by

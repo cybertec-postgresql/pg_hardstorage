@@ -97,9 +97,10 @@ func classifySourceError(err error, deployment string) error {
 				Human: "The write rate outran the WAL the server kept around, and nothing was holding " +
 					"it back. This is a sizing condition on the source, not a pg_hardstorage fault and " +
 					"not data damage — the backup is incomplete, so do not use it, but retrying is safe. " +
-					"To prevent it: keep `pg_hardstorage wal stream` running for the deployment (its " +
-					"replication slot retains WAL until it is archived), or raise wal_keep_size on the " +
-					"server to cover a full backup's duration at peak write rate.",
+					"To prevent it, raise wal_keep_size on the server to cover the WAL written during a " +
+					"full backup at peak write rate. A running `wal stream` does NOT prevent this: its " +
+					"slot only holds WAL the streamer has not yet consumed, while BASE_BACKUP needs WAL " +
+					"from its own start point, which the streamer may already have passed.",
 			}).Wrap(err)
 	}
 	return err
