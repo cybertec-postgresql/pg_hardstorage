@@ -779,12 +779,19 @@ func renderHotCommandHelp(tree *cmdtree.Node) string {
 	}
 	var b strings.Builder
 	var shown, omitted int
+	full := false
 	for _, path := range hotCommandPaths {
 		help := cmdtree.Help(tree, path)
 		if help == "" {
 			continue
 		}
-		if b.Len()+len(help)+1 > budget {
+		// Once one entry overflows, everything after it is omitted —
+		// even entries small enough to fit. This loop used `continue`
+		// here, contradicting the comment above, so a large
+		// high-priority command could be dropped while a smaller
+		// low-priority one behind it was rendered.
+		if full || b.Len()+len(help)+1 > budget {
+			full = true
 			omitted++
 			continue
 		}
