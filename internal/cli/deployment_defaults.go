@@ -205,6 +205,10 @@ func resolveDeploymentDefaultsPreRun(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 	fl := cmd.Flags()
+	// The flags filled here must stay in lockstep with
+	// cmdtree.DeploymentBackfilledFlags, which tells the LLM command
+	// validator not to demand them when a deployment is named.
+	// TestBackfilledFlagsMatchThePreRunHook enforces it.
 	repoF := fl.Lookup("repo")
 	pgF := fl.Lookup("pg-connection")
 	repoNeed := repoF != nil && !repoF.Changed

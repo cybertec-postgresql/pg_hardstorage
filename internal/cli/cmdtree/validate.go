@@ -199,7 +199,8 @@ func Validate(root *Node, command, binaryName string) error {
 			posCount += len(tokens) - i - 1
 			break
 		}
-		if cur.FlagByName(raw) == nil {
+		canon := cur.FlagByName(raw)
+		if canon == nil {
 			return &ValidationError{
 				Kind: "unknown_flag",
 				Message: fmt.Sprintf("unknown flag %q on %q",
@@ -208,7 +209,7 @@ func Validate(root *Node, command, binaryName string) error {
 				PathBeforeError: append([]string(nil), resolved...),
 			}
 		}
-		seenFlags[raw] = true
+		seenFlags[canon.Name] = true
 		// Skip the flag's value when it's a non-bool
 		// space-separated form: `--connection xyz`.
 		// (We use the resolved Flag.Type to decide;
@@ -230,6 +231,17 @@ func Validate(root *Node, command, binaryName string) error {
 	// validator-retry loop ask for a correction.
 	for _, f := range cur.Flags {
 		if f.Required && !seenFlags[f.Name] {
+			// --repo / --pg-connection are back-filled from the named
+			// deployment in pg_hardstorage.yaml before cobra checks
+			// required flags (issue #12; resolveDeploymentDefaultsPreRun).
+			// `backup db1` is therefore a complete command for any
+			// configured deployment — the form the docs teach. The
+			// validator cannot see the operator's config, and demanding
+			// the flag anyway made the retry prompt push the model to
+			// spell out a DSN it did not need, or to guess at one.
+			if posCount > 0 && DeploymentBackfilledFlags[f.Name] {
+				continue
+			}
 			return &ValidationError{
 				Kind: "missing_required",
 				Message: fmt.Sprintf("required flag --%s not supplied on %q",
@@ -573,4 +585,14 @@ func min3(a, b, c int) int {
 		m = c
 	}
 	return m
+}
+
+// DeploymentBackfilledFlags are the flags the CLI fills from the
+// deployment named as a command's first positional argument, before
+// cobra's required-flag check runs. The CLI's pre-run hook iterates
+// this same set, so the validator and the runtime cannot disagree
+// about which flags a configured deployment supplies.
+var DeploymentBackfilledFlags = map[string]bool{
+	"repo":          true,
+	"pg-connection": true,
 }

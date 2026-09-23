@@ -21,6 +21,22 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **The LLM helper's command validator rejected valid commands, then
+  talked the model into invalid ones.** Every suggested command is
+  checked against the live CLI and, on a warning, the model is asked to
+  fix it. The validator knew only declared flag names, so it rejected
+  `deployment add --pg-connection` (an accepted spelling of
+  `--connection`); and it demanded `--repo` / `--pg-connection` on
+  `backup db1`, which the CLI fills from the named deployment's config
+  (#12). The retry prompt then told the model a correct command was
+  wrong, and it "fixed" `--pg-connection` into `--conn` or `--pg-conn` —
+  flags that really do not exist. A 64-question eval traced a large
+  share of invented flags to this loop. Operators also saw warnings on
+  the documented form. The validator now applies each command's own
+  flag normalization and treats config-back-filled flags as supplied
+  when a deployment is named; a test pins that exemption to exactly the
+  flags the runtime hook fills.
+
 - **A PostgreSQL connection failure was coded `storage.unreachable`.**
   Exit 8 is correct (transient; retry), but the code is what alert
   routing keys on, and it named the wrong system: "the database is in
