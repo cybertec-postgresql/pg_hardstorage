@@ -20,6 +20,26 @@ import (
 // down) can treat this as already-satisfied rather than a failure.
 var ErrTargetNotRunning = errors.New("target container is not running")
 
+// dockerErrExcerpt bounds how much daemon output survives into a
+// fault-injection error.
+//
+// It was 256 bytes. An 8 h soak recorded exactly one
+// fault_apply_failed — a cgroup_squeeze the daemon refused — and the
+// excerpt ended mid-path:
+//
+//	runc did not terminate successfully: exit status 1:
+//	openat2 /sys/fs/cgroup/system.slice/docker-d515520d7ed70...
+//
+// The errno that says WHY (and the "memory.max" that says which knob)
+// sits past the cut, so the one event worth triaging in a whole soak
+// could not be triaged. Docker prefixes its refusals with a long
+// "Cannot update container <64-hex-id>" preamble, which alone eats a
+// third of the old budget.
+//
+// 2 KiB matches the scenario runner's cli_run excerpt, raised for the
+// same reason.
+const dockerErrExcerpt = 2048
+
 // DockerTarget fronts a docker container.  Constructed by the
 // soak driver from the fleet → container mapping; passes
 // through `docker exec`, `docker kill`, `docker cp`.
@@ -96,7 +116,7 @@ func (d *DockerTarget) Signal(ctx context.Context, sig int) error {
 			return fmt.Errorf("%s: %w", d.Container, ErrTargetNotRunning)
 		}
 		return fmt.Errorf("docker kill -s %d %s: %w (output: %s)",
-			sig, d.Container, err, truncate(out, 256))
+			sig, d.Container, err, truncate(out, dockerErrExcerpt))
 	}
 	return nil
 }
@@ -114,7 +134,7 @@ func (d *DockerTarget) Start(ctx context.Context) error {
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("docker start %s: %w (output: %s)",
-			d.Container, err, truncate(out, 256))
+			d.Container, err, truncate(out, dockerErrExcerpt))
 	}
 	return nil
 }
@@ -176,7 +196,7 @@ func (d *DockerTarget) SetMemoryLimit(ctx context.Context, bytes int64) error {
 			return fmt.Errorf("%s: %w", d.Container, ErrTargetNotRunning)
 		}
 		return fmt.Errorf("docker update --memory=%s --memory-swap=%s %s: %w (output: %s)",
-			arg, arg, d.Container, err, truncate(out, 256))
+			arg, arg, d.Container, err, truncate(out, dockerErrExcerpt))
 	}
 	return nil
 }

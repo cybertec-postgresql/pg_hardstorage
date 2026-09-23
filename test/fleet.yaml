@@ -1,0 +1,150 @@
+schema: pg_hardstorage.testkit.fleet.v1
+version: 1
+fleet:
+    - name: debian-13-pg15-arm
+      os: debian:13
+      pg: "15"
+      arch: arm64
+      count: 1
+      filesystem: ext4
+      storage_gb: 55
+    - name: rockylinux-9-pg17-arm
+      os: rockylinux:9
+      pg: "17"
+      arch: arm64
+      count: 1
+      filesystem: ext4
+      storage_gb: 25
+    - name: ubuntu-2204-pg18-arm
+      os: ubuntu:22.04
+      pg: "18"
+      arch: arm64
+      count: 1
+      filesystem: ext4
+      storage_gb: 65
+    - name: rockylinux-9-pg16-arm
+      os: rockylinux:9
+      pg: "16"
+      arch: arm64
+      count: 1
+      filesystem: zfs
+      storage_gb: 105
+    - name: ubuntu-2204-pg17-arm
+      os: ubuntu:22.04
+      pg: "17"
+      arch: arm64
+      count: 1
+      filesystem: ext4
+      storage_gb: 25
+    - name: rockylinux-9-pg15-arm
+      os: rockylinux:9
+      pg: "15"
+      arch: arm64
+      count: 1
+      filesystem: zfs
+      storage_gb: 10
+    - name: debian-12-pg18-arm
+      os: debian:12
+      pg: "18"
+      arch: arm64
+      count: 1
+      filesystem: ext4
+      storage_gb: 95
+    - name: fedora-40-pg16-arm
+      os: fedora:40
+      pg: "16"
+      arch: arm64
+      count: 1
+      filesystem: btrfs
+      storage_gb: 50
+    - name: debian-12-pg17-arm
+      os: debian:12
+      pg: "17"
+      arch: arm64
+      count: 1
+      filesystem: xfs
+      storage_gb: 25
+    - name: rockylinux-9-pg18-arm
+      os: rockylinux:9
+      pg: "18"
+      arch: arm64
+      count: 1
+      filesystem: ext4
+      storage_gb: 70
+    - name: debian-12-pg16-arm
+      os: debian:12
+      pg: "16"
+      arch: arm64
+      count: 1
+      filesystem: btrfs
+      storage_gb: 60
+    - name: fedora-40-pg17-arm
+      os: fedora:40
+      pg: "17"
+      arch: arm64
+      count: 1
+      filesystem: zfs
+      storage_gb: 80
+    - name: debian-12-pg15-arm
+      os: debian:12
+      pg: "15"
+      arch: arm64
+      count: 1
+      filesystem: xfs
+      storage_gb: 30
+    - name: ubuntu-2204-pg16-arm
+      os: ubuntu:22.04
+      pg: "16"
+      arch: arm64
+      count: 1
+      filesystem: btrfs
+      storage_gb: 100
+    - name: ubuntu-2404-pg18-arm
+      os: ubuntu:24.04
+      pg: "18"
+      arch: arm64
+      count: 1
+      filesystem: xfs
+      storage_gb: 70
+    - name: ubuntu-2404-pg15-arm
+      os: ubuntu:24.04
+      pg: "15"
+      arch: arm64
+      count: 1
+      filesystem: xfs
+      storage_gb: 35
+    - name: debian-13-pg17-arm
+      os: debian:13
+      pg: "17"
+      arch: arm64
+      count: 1
+      filesystem: ext4
+      storage_gb: 85
+    - name: ubuntu-2204-pg15-arm
+      os: ubuntu:22.04
+      pg: "15"
+      arch: arm64
+      count: 1
+      filesystem: btrfs
+      storage_gb: 25
+    - name: debian-13-pg16-arm
+      os: debian:13
+      pg: "16"
+      arch: arm64
+      count: 1
+      filesystem: zfs
+      storage_gb: 40
+    - name: ubuntu-2404-pg16-arm
+      os: ubuntu:24.04
+      pg: "16"
+      arch: arm64
+      count: 1
+      filesystem: ext4
+      storage_gb: 90
+    - name: ubuntu-2404-pg17-arm
+      os: ubuntu:24.04
+      pg: "17"
+      arch: arm64
+      count: 1
+      filesystem: ext4
+      storage_gb: 50
