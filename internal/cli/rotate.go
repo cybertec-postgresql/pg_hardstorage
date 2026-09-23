@@ -15,6 +15,7 @@ import (
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup/keystore"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup/retention"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/config"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/output"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/paths"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo"
@@ -38,6 +39,16 @@ func newRotateCmd() *cobra.Command {
 		Short: "Apply retention policy to a deployment (or all)",
 		Long: `Classify each backup as kept or to-be-soft-deleted per the chosen
 retention policy, then optionally apply the decision.
+
+Where the policy comes from, per deployment:
+
+  1. any --policy / --keep-* flag  → the flags define the whole policy
+  2. otherwise                     → the deployment's retention: block in
+                                     pg_hardstorage.yaml (the same policy
+                                     the agent's scheduled rotate applies)
+  3. otherwise                     → the built-in GFS defaults below
+
+The plan prints which source it used for each deployment.
 
 Three policies ship today:
 
@@ -105,9 +116,21 @@ type rotateOpts struct {
 func runRotate(cmd *cobra.Command, opts rotateOpts) error {
 	d := DispatcherFrom(cmd)
 
-	policy, err := buildPolicy(opts)
-	if err != nil {
-		return err
+	// Retention comes from flags, else the deployment's config, else the
+	// built-in default — resolved per deployment below (see
+	// rotate_policy_source.go). Validate explicit flags up front so a bad
+	// --policy fails before anything is opened.
+	flagsSet := retentionFlagsChanged(cmd)
+	if flagsSet {
+		if _, err := buildPolicy(opts); err != nil {
+			return err
+		}
+	}
+	var configured map[string]config.DeploymentConfig
+	if pp, perr := paths.Resolve(paths.DefaultOptions()); perr == nil {
+		if loaded, lerr := config.Load(pp); lerr == nil && loaded != nil {
+			configured = loaded.Config.Deployments
+		}
 	}
 
 	// Resolve verifier the same way restore does — every manifest we
@@ -146,6 +169,10 @@ func runRotate(cmd *cobra.Command, opts rotateOpts) error {
 			return output.NewError("rotate.list_failed",
 				fmt.Sprintf("rotate: list %s: %v", dep, err)).Wrap(err)
 		}
+		policy, source, err := resolveRotatePolicy(dep, flagsSet, opts, configured)
+		if err != nil {
+			return err
+		}
 		decision := policy.Apply(now, manifests)
 
 		// Filter out held backups BEFORE counting "Deleted" so the
@@ -162,6 +189,8 @@ func runRotate(cmd *cobra.Command, opts rotateOpts) error {
 		report := rotationPerDeployment{
 			Deployment:      dep,
 			Policy:          decision.PolicyName,
+			PolicySource:    source,
+			PolicyDetail:    fmt.Sprintf("%+v", policy),
 			Kept:            len(decision.Keep) + len(heldIDs) + len(anchorIDs),
 			Deleted:         len(filteredDelete),
 			Held:            len(heldIDs),
@@ -214,9 +243,24 @@ func runRotate(cmd *cobra.Command, opts rotateOpts) error {
 		overall = append(overall, report)
 	}
 
+	policyName := ""
+	for i, r := range overall {
+		if i == 0 {
+			policyName = r.Policy
+		} else if r.Policy != policyName {
+			policyName = "per-deployment"
+			break
+		}
+	}
+	if policyName == "" {
+		// No deployments: report what flags/defaults would have used.
+		if p, perr := buildPolicy(opts); perr == nil {
+			policyName = p.Name()
+		}
+	}
 	body := rotateResultBody{
 		DryRun:      !opts.apply,
-		PolicyName:  policy.Name(),
+		PolicyName:  policyName,
 		Deployments: overall,
 		EvaluatedAt: now,
 	}
@@ -355,12 +399,20 @@ type rotateResultBody struct {
 }
 
 type rotationPerDeployment struct {
-	Deployment string   `json:"deployment"`
-	Policy     string   `json:"policy"`
-	Kept       int      `json:"kept"`
-	Deleted    int      `json:"deleted"`
-	Held       int      `json:"held,omitempty"`
-	HeldIDs    []string `json:"held_ids,omitempty"`
+	Deployment string `json:"deployment"`
+	Policy     string `json:"policy"`
+	// PolicySource says where Policy came from: "flags",
+	// "pg_hardstorage.yaml", or "built-in default". Before it existed,
+	// a plan could follow the built-in GFS default while the deployment
+	// declared something else, and nothing on screen said so.
+	PolicySource string `json:"policy_source"`
+	// PolicyDetail is the resolved policy's parameters, e.g.
+	// "{KeepFulls:2}", so the numbers the plan followed are visible.
+	PolicyDetail string   `json:"policy_detail,omitempty"`
+	Kept         int      `json:"kept"`
+	Deleted      int      `json:"deleted"`
+	Held         int      `json:"held,omitempty"`
+	HeldIDs      []string `json:"held_ids,omitempty"`
 	// HeldChainAnchor lists backups kept ONLY because a held
 	// descendant depends on them — deleting them would either break
 	// the held chain or (pre-fix) wedge the whole batch.
@@ -392,6 +444,7 @@ func (b rotateResultBody) WriteText(w io.Writer) error {
 	fmt.Fprintf(bw, "  Policy: %s\n", b.PolicyName)
 	for _, dep := range b.Deployments {
 		fmt.Fprintf(bw, "\n  %s\n", dep.Deployment)
+		fmt.Fprintf(bw, "    policy:  %s %s (from %s)\n", dep.Policy, dep.PolicyDetail, dep.PolicySource)
 		fmt.Fprintf(bw, "    keep:    %d\n", dep.Kept)
 		fmt.Fprintf(bw, "    delete:  %d\n", dep.Deleted)
 		if dep.Held > 0 {

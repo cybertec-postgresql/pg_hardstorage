@@ -21,6 +21,30 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **Manual `rotate` ignored the deployment's `retention:` block and
+  applied the built-in GFS defaults** (#66 follow-up, reported by
+  @marsqd). A deployment declaring `policy: count, keep_fulls: 2` got a
+  plan headed `Policy: gfs` that kept 7 of 8 backups. The agent's
+  scheduled rotate always read the block; the manual command never did,
+  though it back-filled `--repo` from the same deployment since #12 and
+  so looked config-aware. One deployment, two retention policies,
+  depending on who ran it.
+
+  This mattered more after the #66 doc fix, which tells operators
+  without the agent to cron `backup && rotate --apply` — a command that
+  would have applied GFS, not the declared policy, and for a deployment
+  configured to keep *more* than GFS, soft-deleted backups its own
+  policy protects.
+
+  Policy now resolves per deployment: any `--policy`/`--keep-*` flag
+  defines the whole policy; otherwise the deployment's block, through
+  the same builder the scheduled task uses; otherwise the GFS defaults.
+  Each plan line says which (`from flags` / `from pg_hardstorage.yaml` /
+  `from built-in default`), and a retention block that does not parse
+  refuses rather than falling back. **Behaviour change:** a bare
+  `rotate <deployment>` on a deployment with a `retention:` block now
+  follows that block — dry-run first.
+
 - **A restore reported `postverify_failed` — "your backup did not
   survive" — when the truth was that the host lacked an extension the
   source cluster preloaded.** Backups taken from a Patroni/Spilo

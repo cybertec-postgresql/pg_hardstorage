@@ -198,6 +198,12 @@ the backup, as a separate command:
 pg_hardstorage backup db1 && pg_hardstorage rotate db1 --apply
 ```
 
+`rotate db1` applies the `retention:` block declared for `db1` in
+`pg_hardstorage.yaml` — the same policy the agent's scheduled rotate
+uses — and prints `(from pg_hardstorage.yaml)` beside it. Passing any
+`--policy` or `--keep-*` flag replaces that policy for the one run.
+Always dry-run first (omit `--apply`) and check the `policy:` line.
+
 ## Troubleshooting
 
 **`rotate.no_repo`** — `--repo` not set and the deployment
