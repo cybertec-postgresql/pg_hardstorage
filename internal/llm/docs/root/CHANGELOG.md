@@ -21,6 +21,16 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **Usage errors ignored `-o json`.** An unknown flag or a wrong number
+  of arguments — the commonest failures there are — printed a plain text
+  line even when JSON output was requested, contradicting the promise
+  that every error is structured. Parsing fails before the output
+  dispatcher is installed, and a code comment claimed JSON consumers
+  were covered anyway. The fallback now honours `-o`/`--output` (even
+  when it appears after the bad flag) and `PG_HARDSTORAGE_OUTPUT`,
+  emitting the normal envelope with its `usage.*` code. Text output is
+  unchanged.
+
 - **A split-brain was never reported with its documented code.** The
   error-code reference tells automation to route on `splitbrain.*` — the
   signal that two clusters are archiving into one lineage. `wal push`

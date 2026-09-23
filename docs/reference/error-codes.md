@@ -58,7 +58,8 @@ Common leaf shapes:
 | Leaf | Meaning |
 | --- | --- |
 | `usage.bad_flag`, `usage.bad_flags` | Flag value parse failed |
-| `usage.bad_arg`, `usage.bad_set` | Positional argument shape mismatch |
+| `usage.flag` | Unknown flag (`unknown flag: --x`) — the commonest usage error |
+| `usage.bad_args`, `usage.bad_arg`, `usage.bad_set` | Wrong number or shape of positional arguments |
 | `usage.missing_*` | Required input absent (`missing_repo_url`, `missing_deployment`, `missing_signer`, `missing_target_dir`, …) |
 | `usage.bad_lsn`, `usage.bad_target_lsn`, `usage.unaligned_lsn` | LSN parse / alignment refused |
 | `usage.bad_time`, `usage.bad_until`, `usage.bad_schedule` | Time / cron parse refused |
