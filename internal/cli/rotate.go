@@ -128,7 +128,22 @@ func runRotate(cmd *cobra.Command, opts rotateOpts) error {
 	}
 	var configured map[string]config.DeploymentConfig
 	if pp, perr := paths.Resolve(paths.DefaultOptions()); perr == nil {
-		if loaded, lerr := config.Load(pp); lerr == nil && loaded != nil {
+		loaded, lerr := config.Load(pp)
+		switch {
+		case lerr != nil && !flagsSet:
+			// A config that EXISTS but will not load must stop the run.
+			// Load reports a missing file as ReadOK=false, not an error,
+			// so reaching here means pg_hardstorage.yaml is present and
+			// broken. Treating that as "no config" would plan with the
+			// built-in GFS defaults — the exact #66 bug, reached through
+			// a bad edit instead of a missing lookup. With explicit
+			// retention flags the config is not consulted, so proceed.
+			return output.NewError("config.load_failed",
+				fmt.Sprintf("rotate: cannot read the deployments' retention policies: %v", lerr)).
+				WithSuggestion(&output.Suggestion{
+					Human: "fix pg_hardstorage.yaml (`pg_hardstorage lint` shows the error), or pass --policy / --keep-* to rotate with an explicit policy for this run",
+				}).Wrap(lerr)
+		case lerr == nil && loaded != nil:
 			configured = loaded.Config.Deployments
 		}
 	}

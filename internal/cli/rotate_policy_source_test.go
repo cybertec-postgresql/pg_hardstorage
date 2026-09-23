@@ -1,7 +1,11 @@
 package cli
 
 import (
+	"bytes"
+	"os"
+	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -116,4 +120,46 @@ func TestRotatePolicy_ManualMatchesScheduled(t *testing.T) {
 				"one deployment, two retention policies", r, manual, scheduled)
 		}
 	}
+}
+
+// Found by ultrareview: runRotate discarded config.Load errors, so a
+// pg_hardstorage.yaml that exists but will not parse made every
+// deployment look unconfigured, and rotate planned with the built-in
+// GFS defaults — the #66 bug again, reached through a bad edit. It must
+// refuse unless explicit retention flags make the config irrelevant.
+func TestRotate_BrokenConfigRefusesInsteadOfDefaulting(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("PG_HARDSTORAGE_ROOT", root)
+	if err := os.MkdirAll(filepath.Join(root, "etc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	broken := "deployments:\n  local:\n    retention:\n      policy: count\n      keep_fulls: [unclosed\n"
+	if err := os.WriteFile(filepath.Join(root, "etc", "pg_hardstorage.yaml"), []byte(broken), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, stderr, exit := rotateCLI(t, "rotate", "local", "--repo", "file://"+filepath.Join(root, "repo"))
+	if exit == 0 || !strings.Contains(stderr, "config.load_failed") {
+		t.Fatalf("broken config must refuse with config.load_failed, got exit %d:\n%s", exit, stderr)
+	}
+
+	// With an explicit policy the config is not consulted, so the run is
+	// NOT refused for that reason (it may fail later on the empty repo).
+	_, stderr, _ = rotateCLI(t, "rotate", "local", "--repo", "file://"+filepath.Join(root, "repo"),
+		"--policy", "count", "--keep-fulls", "2")
+	if strings.Contains(stderr, "config.load_failed") {
+		t.Errorf("explicit retention flags must bypass the config; got:\n%s", stderr)
+	}
+}
+
+// rotateCLI runs the real root command in-package.
+func rotateCLI(t *testing.T, args ...string) (string, string, int) {
+	t.Helper()
+	root := NewRoot()
+	var out, errb bytes.Buffer
+	root.SetOut(&out)
+	root.SetErr(&errb)
+	root.SetArgs(args)
+	exit := Run(root)
+	return out.String(), errb.String(), exit
 }
