@@ -526,18 +526,28 @@ func (d *DockerCellRuntime) TakeBackup(ctx context.Context) (string, error) {
 	// fails with `storage.unreachable: cannot connect to
 	// PostgreSQL: ... connection refused`, which is a transient
 	// signal — not a real "backup broken" outcome.  The user
-	// wants 100% reliability, so we retry with exponential
-	// backoff (1 s, 2 s, 4 s) before giving up.  Three retries
-	// covers the worst-observed "PG restarted but isn't ready"
-	// window from soak testing (~5 s after a SIGKILL on a busy
-	// cell) with comfortable margin.  Pure transient handler:
-	// any error that isn't "PG unreachable" propagates on the
-	// first try.
+	// wants 100% reliability, so we keep retrying while PG is
+	// recovering. Pure transient handler: any error that isn't
+	// "PG unreachable" propagates on the first try.
+	//
+	// This was three attempts with 1 s / 2 s backoff — about three
+	// seconds of patience, calibrated against "~5 s after a SIGKILL
+	// on a busy cell" under the light oltp_smoke profile. The first
+	// enterprise_heavy soak (10 GB seeded, 16 pgbench writers per
+	// cell) had PG still in crash recovery 29 s after the fault, and
+	// every such backup was scored backup_failed: the soak blamed the
+	// product for declining to back up a database that was not yet
+	// accepting connections. A larger fixed count would just be the
+	// next wrong guess, so this waits on readiness under a deadline —
+	// quick on a quiet cell, patient on a busy one — which is the
+	// same move the scenario runner already made (see ensureUp in
+	// runner/steps.go).
 	var (
 		stdout, stderr []byte
 		err            error
 	)
-	for attempt, backoff := 0, time.Second; attempt < 3; attempt++ {
+	deadline := time.Now().Add(pgRecoveryBudget)
+	for backoff := time.Second; ; {
 		stdout, stderr, err = d.dockerExecCapture(ctx,
 			d.AgentBinary, "backup", d.Deployment,
 			"--pg-connection", d.containerDSN(),
@@ -548,7 +558,7 @@ func (d *DockerCellRuntime) TakeBackup(ctx context.Context) (string, error) {
 		if err == nil {
 			break
 		}
-		if !isPGUnreachable(stdout, stderr) {
+		if !isPGUnreachable(stdout, stderr) || time.Now().After(deadline) {
 			break
 		}
 		// Wait, then re-poll the container; if the cell isn't
@@ -559,7 +569,9 @@ func (d *DockerCellRuntime) TakeBackup(ctx context.Context) (string, error) {
 			return "", ctx.Err()
 		case <-time.After(backoff):
 		}
-		backoff *= 2
+		if backoff *= 2; backoff > pgRecoveryMaxBackoff {
+			backoff = pgRecoveryMaxBackoff
+		}
 		if !d.containerRunning(ctx) {
 			return "", ErrCellNotReady
 		}
@@ -571,8 +583,13 @@ func (d *DockerCellRuntime) TakeBackup(ctx context.Context) (string, error) {
 		combined := make([]byte, 0, len(stdout)+len(stderr))
 		combined = append(combined, stdout...)
 		combined = append(combined, stderr...)
+		// 2 KiB, not 256: the agent's JSON error spends ~200 bytes on
+		// schema/command/timestamp before "message", so every
+		// connection failure in the enterprise_heavy soak was recorded
+		// as "failed to connect to `user=postgres d…" — cut off before
+		// pgx said whether it was refused, timed out or in recovery.
 		return "", fmt.Errorf("backup %s: %w (output: %s)",
-			d.CellName, err, truncate(combined, 256))
+			d.CellName, err, truncate(combined, 2048))
 	}
 	// Parse the backup ID from the agent's stdout-only JSON output.
 	// Schema: `{"result": {"backup_id": "..."}}`.  encoding/json
@@ -1312,6 +1329,15 @@ func (d *DockerCellRuntime) dockerExecAs(ctx context.Context, user string, argv 
 	full := append([]string{"exec", "-u", user, d.Container}, argv...)
 	return exec.CommandContext(ctx, d.dockerBin(), full...).CombinedOutput()
 }
+
+// pgRecoveryBudget bounds how long TakeBackup waits for PostgreSQL to
+// start accepting connections again after a fault, and
+// pgRecoveryMaxBackoff caps the gap between attempts. Vars so tests
+// can shrink them.
+var (
+	pgRecoveryBudget     = 3 * time.Minute
+	pgRecoveryMaxBackoff = 10 * time.Second
+)
 
 func (d *DockerCellRuntime) dockerBin() string {
 	if d.DockerBin != "" {
