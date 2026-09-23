@@ -108,3 +108,20 @@ func TestBackfilledFlagsMatchThePreRunHook(t *testing.T) {
 		t.Fatal("nothing filled — the config fixture did not load: " + strings.Join(filled, ","))
 	}
 }
+
+// Found by ultrareview: the back-fill exemption keyed on "any positional
+// present", but the runtime hook only fills --repo when the first
+// positional names a configured deployment. For commands whose
+// positional is something else, --repo is still required at runtime,
+// so the validator must still demand it.
+func TestValidator_BackfillOnlyForDeploymentPositionals(t *testing.T) {
+	tree := realTree(t)
+	for _, c := range []string{
+		"pg_hardstorage approval approve req-123",
+		"pg_hardstorage audit verify-anchor log-1",
+	} {
+		if err := cmdtree.Validate(tree, c, "pg_hardstorage"); err == nil {
+			t.Errorf("%s\n  its positional is not a deployment, so nothing back-fills --repo; the validator must reject it", c)
+		}
+	}
+}
