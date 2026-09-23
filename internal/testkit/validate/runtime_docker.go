@@ -394,8 +394,19 @@ func (d *DockerCellRuntime) Seed(ctx context.Context, sizeGB int) error {
 		return fmt.Errorf("seed: %w", err)
 	}
 
-	out, err := d.dockerExec(ctx,
-		"sudo", "-u", d.PGUser,
+	// Run pgbench AS the PG superuser via `docker exec -u`, exactly
+	// as StartSustainedLoad does. This used to be `sudo -u <pguser>`
+	// inside dockerExec — but dockerExec always enters the container as
+	// pgbackup, and pgbackup has no sudo rights on any testbed image,
+	// so every seed died on
+	//
+	//	sudo: a terminal is required to read the password
+	//
+	// which made enterprise_heavy (the only shipped profile with
+	// seed_target_gb) fail on all 21 cells before its first iteration.
+	// The profile that exists to test backup under concurrent write
+	// load had never been able to start.
+	out, err := d.dockerExecAs(ctx, d.PGUser,
 		pgBinDir+"/pgbench", "-i", "-s", fmt.Sprintf("%d", scale),
 		"-d", d.PGDatabase)
 	if err != nil {
@@ -1286,6 +1297,16 @@ func (d *DockerCellRuntime) dockerExecCapture(ctx context.Context, argv ...strin
 	cmd.Stderr = &stderr
 	err := cmd.Run()
 	return stdout.Bytes(), stderr.Bytes(), err
+}
+
+// dockerExecAs runs argv in the cell container as user, returning
+// combined output. dockerExecCapture always uses pgbackup; the few
+// callers that must act as the PG superuser (seeding pgbench tables it
+// will own) go through here instead of attempting sudo from pgbackup,
+// which has no sudo rights on the testbed images.
+func (d *DockerCellRuntime) dockerExecAs(ctx context.Context, user string, argv ...string) ([]byte, error) {
+	full := append([]string{"exec", "-u", user, d.Container}, argv...)
+	return exec.CommandContext(ctx, d.dockerBin(), full...).CombinedOutput()
 }
 
 func (d *DockerCellRuntime) dockerBin() string {
