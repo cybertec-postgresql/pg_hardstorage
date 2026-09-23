@@ -233,10 +233,21 @@ func (d *DockerTarget) SetMemoryLimit(ctx context.Context, bytes int64) error {
 //	  failed to write "33554432": write /sys/fs/cgroup/.../memory.max
 func isCgroupLimitUnreachable(out string) bool {
 	s := strings.ToLower(out)
-	if strings.Contains(s, "memory.max") {
-		return true
+	if !strings.Contains(s, "memory.max") &&
+		!(strings.Contains(s, "failed to write") && strings.Contains(s, "cgroup")) {
+		return false
 	}
-	return strings.Contains(s, "failed to write") && strings.Contains(s, "cgroup")
+	// Only an errno that means "the write reached the kernel and the
+	// kernel could not reclaim down to this cap" is the injector asking
+	// for the impossible. EACCES / EPERM / ENOENT say this host cannot
+	// squeeze at all — rootless docker, no cgroup delegation, cgroup v1 —
+	// and matching on the path alone turned those into a silent skip of
+	// EVERY cgroup_squeeze in the run. Since fault_skipped_* is not
+	// counted against the pass criteria, such a soak went green having
+	// never applied the fault. Those must stay loud.
+	return strings.Contains(s, "invalid argument") ||
+		strings.Contains(s, "device or resource busy") ||
+		strings.Contains(s, "cannot allocate memory")
 }
 
 // dockerMemoryLimitArg encodes a byte count for `docker update
