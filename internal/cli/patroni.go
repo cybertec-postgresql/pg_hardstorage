@@ -344,7 +344,10 @@ func buildPatroniClient(url, user, password string) (*patroni.Client, error) {
 func mapPatroniError(verb string, err error) error {
 	switch {
 	case errors.Is(err, patroni.ErrUnreachable):
-		return output.NewError("storage.unreachable",
+		// Patroni's REST endpoint, not the repository — see
+		// pg.unreachable in internal/pg/conn.go for why the code
+		// must name the system that is actually down.
+		return output.NewError("patroni.unreachable",
 			fmt.Sprintf("patroni %s: %v", verb, err)).
 			WithSuggestion(&output.Suggestion{
 				Human: "check the --url is reachable and the Patroni REST endpoint is up (default port 8008)",

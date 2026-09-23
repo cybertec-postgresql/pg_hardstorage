@@ -36,7 +36,7 @@ properties documented here.
 | `conflict.*` | 7 | Wait for the holder, or pick a fresh name. |
 | `verify.*`, `anomaly.*` | 9 | Investigate; do not retry blindly. |
 | `doctor.*` | 10 | Read the doctor body; address the issue. |
-| `storage.unreachable`, `kms.unreachable` (leaf) | 8 | Transient by nature; retry with backoff. |
+| `storage.unreachable`, `kms.unreachable`, `pg.unreachable`, `patroni.unreachable` (leaf) | 8 | Transient by nature; retry with backoff. The code names which dependency is down — route alerts on it. |
 | every other namespace | 1 | Generic; consult the leaf code and the suggestion. |
 
 `*output.Error.Suggestion` carries the human + command +
@@ -247,6 +247,7 @@ field is where the recovery hint lives.
 | `standby.*`, `timetravel.*`, `timetable.*` | Standby / timetravel features |
 | `gameday.*` | Disaster drills |
 | `source_corruption.*` | **The database being backed up is damaged** — not pg_hardstorage, and not the repository. Raised when PostgreSQL itself refuses to hand over the data: `source_corruption.data_checksum` (SQLSTATE XX001, a data page failed its checksum during `BASE_BACKUP`) and `source_corruption.index` (XX002). Exit 1. Do NOT retry the backup: treat it as a data-loss incident on the primary, and keep the backups already in the repository (verify one). PostgreSQL 18 verifies page checksums during `BASE_BACKUP`; 15–17 do not, so an older major may have been copying a damaged page silently. |
+| `backup.wal_recycled` | PostgreSQL recycled WAL the backup still needed before `BASE_BACKUP` could send it ("requested WAL segment … has already been removed"). A sizing condition on a busy source — **not** data damage and not a pg_hardstorage fault. Exit 1. The partial backup is not committed; retrying is safe. Prevent it by keeping `wal stream` running for the deployment (its replication slot retains WAL) or raising `wal_keep_size` to cover a backup at peak write rate. Previously reported as `internal`. |
 | `notimpl.*` | Scaffolded command that is not implemented yet (`notimpl.<command>`, e.g. `notimpl.compact`). Always exit 1; the suggestion points at the design spec. |
 | `internal` | Catch-all for unstructured errors funnelled through `output.ToError` |
 

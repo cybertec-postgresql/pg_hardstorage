@@ -1704,7 +1704,7 @@ func actionWantsPGReadyPoll(action string) bool {
 // previous fixed-sleep heal_window had to be tuned to the slowest
 // observed case, wasting time on quiet hosts and STILL silently
 // expiring before PG was ready on the slowest ones — surfacing
-// as `storage.unreachable` on the next take_backup.
+// as `pg.unreachable` on the next take_backup.
 //
 // ensureUp is the list of docker containers that should be running
 // for PG to come back.  Each tick calls `docker start` on each —

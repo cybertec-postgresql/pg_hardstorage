@@ -39,6 +39,8 @@ var exitNamespaceRoutes = map[string]ExitCode{
 
 var exitLeafRoutes = map[string]ExitCode{
 	"storage.unreachable":        ExitUnreachable,
+	"pg.unreachable":             ExitUnreachable,
+	"patroni.unreachable":        ExitUnreachable,
 	"kms.unreachable":            ExitUnreachable,
 	"storage.no_space":           ExitUnreachable, // <-- undocumented leaf route
 	"restore.target_unreachable": ExitConflict,

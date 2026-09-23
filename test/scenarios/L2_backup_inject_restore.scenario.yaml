@@ -64,7 +64,7 @@ steps:
       # sessions to close.  The runner keeps idle libpq
       # connections in its pool, so smart shutdown hangs
       # for the full heal_window and PG never actually
-      # bounces — surfacing as `storage.unreachable` on the
+      # bounces — surfacing as `pg.unreachable` on the
       # next take_backup with PG still mid-shutdown.
       signal: 2
       # heal_window is now a *max-budget* for `pg_isready`,

@@ -140,6 +140,21 @@ and span in seconds.
 
 ---
 
+## PostgreSQL unreachable
+
+**Symptom.** `backup`, `wal stream` or `doctor` fails with
+`pg.unreachable` (exit 8).
+
+**What it means.** The *database* did not accept a connection: it is
+down, still in crash recovery, restarting after a failover, or the DSN
+points somewhere wrong. Nothing is wrong with the repository. Before
+v1.5 this was reported as `storage.unreachable`, which named the wrong
+system — alerting that routes on codes sent it to whoever owns storage.
+
+**Fix.** Check `pg_isready` against the deployment's `pg_connection`,
+and the server log. After a crash or failover, recovery on a busy
+cluster can take minutes; retry once it accepts connections.
+
 ## Repository unreachable
 
 **Symptom.** Any command that touches the repo fails with

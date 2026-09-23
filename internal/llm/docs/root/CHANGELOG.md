@@ -21,6 +21,27 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **A PostgreSQL connection failure was coded `storage.unreachable`.**
+  Exit 8 is correct (transient; retry), but the code is what alert
+  routing keys on, and it named the wrong system: "the database is in
+  crash recovery" reached whoever owns the storage backend. `doctor`
+  already called the same condition `pg.unreachable`, so one outage had
+  two names. It is now `pg.unreachable` everywhere; a Patroni REST
+  endpoint that is down is likewise `patroni.unreachable` rather than
+  `storage.unreachable`. **Upgrade note:** automation matching the
+  string `storage.unreachable` to detect a down database must match
+  `pg.unreachable`; exit codes are unchanged.
+
+- **"Requested WAL segment has already been removed" during a backup
+  was reported as `internal`.** It is the most predictable failure a
+  backup of a busy database has, with a two-line remedy, and it
+  surfaced the first time the soak ran backups under sustained write
+  load. PostgreSQL raises it without an errcode (XX000), so it landed in
+  the "we don't know what this is" bucket. Now `backup.wal_recycled`,
+  saying it is a sizing condition, not damage, that retry is safe, and
+  how to prevent it (keep `wal stream`'s slot, or raise
+  `wal_keep_size`).
+
 - **Manual `rotate` ignored the deployment's `retention:` block and
   applied the built-in GFS defaults** (#66 follow-up, reported by
   @marsqd). A deployment declaring `policy: count, keep_fulls: 2` got a

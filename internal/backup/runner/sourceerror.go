@@ -27,6 +27,7 @@ package runner
 
 import (
 	"errors"
+	"strings"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/output"
 )
@@ -88,5 +89,41 @@ func classifySourceError(err error, deployment string) error {
 					"primary, then re-run the backup.",
 			}).Wrap(err)
 	}
+	if isWALRecycledDuringBackup(err) {
+		return output.NewError("backup.wal_recycled",
+			"backup: PostgreSQL recycled WAL that the backup of "+deployment+
+				" still needed before BASE_BACKUP could send it: "+err.Error()).
+			WithSuggestion(&output.Suggestion{
+				Human: "The write rate outran the WAL the server kept around, and nothing was holding " +
+					"it back. This is a sizing condition on the source, not a pg_hardstorage fault and " +
+					"not data damage — the backup is incomplete, so do not use it, but retrying is safe. " +
+					"To prevent it: keep `pg_hardstorage wal stream` running for the deployment (its " +
+					"replication slot retains WAL until it is archived), or raise wal_keep_size on the " +
+					"server to cover a full backup's duration at peak write rate.",
+			}).Wrap(err)
+	}
 	return err
+}
+
+// isWALRecycledDuringBackup recognises PostgreSQL's
+//
+//	requested WAL segment 000000010000000200000017 has already been removed
+//
+// raised mid-BASE_BACKUP when the server has recycled a segment the
+// backup still has to include. basebackup.c emits it without an
+// errcode, so it arrives as XX000 — the same SQLSTATE as every other
+// unclassified internal error — and was reported as code "internal":
+// pg_hardstorage's bucket for "we do not know what this is".
+//
+// We do know. It is the most predictable failure a backup of a busy
+// database can have, it has a two-line remedy, and it first appeared
+// the first time this project's soak ran backups under sustained
+// write load (enterprise_heavy, 16 writers per cell). Matched on the
+// message because the SQLSTATE carries no information here.
+func isWALRecycledDuringBackup(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), "has already been removed") &&
+		strings.Contains(err.Error(), "WAL segment")
 }

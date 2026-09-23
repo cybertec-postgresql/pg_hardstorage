@@ -107,7 +107,7 @@ func WithApplicationName(name string) ConnectOption {
 // mode). When the DSN omits connect_timeout, DefaultConnectTimeout is
 // applied so a black-holed network surfaces promptly. Returns a
 // structured *output.Error on failure so the CLI maps to the right
-// exit code (storage.unreachable / auth.denied / ...).
+// exit code (pg.unreachable / auth.denied / ...).
 func Connect(ctx context.Context, dsn string, mode Mode, opts ...ConnectOption) (*Conn, error) {
 	cfg, err := pgconn.ParseConfig(dsn)
 	if err != nil {
@@ -208,7 +208,14 @@ func classifyConnectError(err error) error {
 	// pgx wraps them as a *net.OpError or similar. We can't reliably
 	// distinguish refused-vs-timeout without unwrapping further; treat
 	// them all as "unreachable" so the CLI exits with code 8.
-	return output.NewError("storage.unreachable",
+	//
+	// pg.unreachable, not storage.unreachable. The exit code is the same
+	// (8: transient, retry), but the CODE says which system is down, and
+	// that is what alert routing keys on. This was storage.unreachable,
+	// so "PostgreSQL is in crash recovery" paged whoever owns the S3
+	// bucket — and doctor already reported the same condition as
+	// pg.unreachable, so one outage carried two names.
+	return output.NewError("pg.unreachable",
 		fmt.Sprintf("cannot connect to PostgreSQL: %v", err)).
 		WithSuggestion(&output.Suggestion{
 			Human: "verify host, port, network, and that PostgreSQL is accepting connections",

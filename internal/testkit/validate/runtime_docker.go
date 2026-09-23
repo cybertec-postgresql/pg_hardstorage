@@ -1245,7 +1245,11 @@ func (d *DockerCellRuntime) dockerExec(ctx context.Context, argv ...string) ([]b
 // stable across PG / pgx versions.
 func isPGUnreachable(stdout, stderr []byte) bool {
 	combined := append(append([]byte{}, stdout...), stderr...)
-	if !bytesContains(combined, `"code": "storage.unreachable"`) &&
+	// pg.unreachable is the current code for a PG connect failure;
+	// storage.unreachable is what agents before v1.5 emitted for it.
+	if !bytesContains(combined, `"code": "pg.unreachable"`) &&
+		!bytesContains(combined, `"code":"pg.unreachable"`) &&
+		!bytesContains(combined, `"code": "storage.unreachable"`) &&
 		!bytesContains(combined, `"code":"storage.unreachable"`) {
 		return false
 	}

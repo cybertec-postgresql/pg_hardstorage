@@ -406,7 +406,7 @@ func (cgroupSqueezeFault) Apply(ctx context.Context, args Args, ts TargetSet) (R
 		//     tail -F`) — there is NO supervisor — so a killed
 		//     postmaster stays dead for the rest of the cell's
 		//     life.  Every subsequent `pg_hardstorage backup`
-		//     then fails with `storage.unreachable`, which is
+		//     then fails with `pg.unreachable`, which is
 		//     pg_hardstorage behaving CORRECTLY (you cannot back
 		//     up a down database) but is scored as a spurious
 		//     cell-failure.  Lifting the limit alone is not a

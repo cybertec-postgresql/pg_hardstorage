@@ -28,7 +28,7 @@ change without a major-version bump.
 | **5** | `ExitAborted` | Operation aborted by the user or by a context cancellation. Code namespace `aborted.*`. | Yes. |
 | **6** | `ExitNotFound` | Named resource (backup, deployment, repo, sink, slot, …) does not exist. Code namespace `notfound.*`. Also the leaf code `partial.dump_no_tables`: a `partial dump` whose `--tables` matched nothing in the connected database. | No — list and pick a real ID. |
 | **7** | `ExitConflict` | Conflict: lease held, ID collision, in-progress operation, repo read-only, chain has live descendants. Code namespace `conflict.*`. | Yes — once the holder releases or you pick a new name. |
-| **8** | `ExitUnreachable` | Storage backend or KMS provider is unreachable. Specifically the leaf codes `storage.unreachable` and `kms.unreachable`; other `storage.*` / `kms.*` codes stay in `ExitError`. | Yes — transient by nature. |
+| **8** | `ExitUnreachable` | A dependency is unreachable: the storage backend (`storage.unreachable`), the KMS provider (`kms.unreachable`), PostgreSQL itself (`pg.unreachable`), or Patroni's REST endpoint (`patroni.unreachable`). The code names which one — route alerts on it. Other `storage.*` / `kms.*` codes stay in `ExitError`. | Yes — transient by nature. |
 | **9** | `ExitVerifyFailed` | Verification failed (`verify.*` namespace) **or** an anomaly was detected (`anomaly.*` namespace). Same exit code so a single cron contract — "non-zero if anything is unusual" — covers both. | Investigate before retry. |
 | **10** | `ExitDoctorIssues` | `pg_hardstorage doctor --exit-on-issues` found at least one issue. Code namespace `doctor.*`. | n/a — informational. |
 
@@ -53,6 +53,8 @@ segment to an exit code:
 | `doctor.*` | `10` |
 | `storage.unreachable` (leaf) | `8` |
 | `kms.unreachable` (leaf) | `8` |
+| `pg.unreachable` (leaf) | `8` |
+| `patroni.unreachable` (leaf) | `8` |
 | `restore.target_unreachable` (leaf) | `7` |
 | `restore.target_in_wal_gap` (leaf) | `7` |
 | `partial.dump_no_tables` (leaf) | `6` |
