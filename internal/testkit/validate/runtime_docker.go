@@ -546,6 +546,7 @@ func (d *DockerCellRuntime) TakeBackup(ctx context.Context) (string, error) {
 		stdout, stderr []byte
 		err            error
 	)
+	bootBefore := d.containerStartedAt(ctx)
 	deadline := time.Now().Add(pgRecoveryBudget)
 	for backoff := time.Second; ; {
 		stdout, stderr, err = d.dockerExecCapture(ctx,
@@ -577,6 +578,22 @@ func (d *DockerCellRuntime) TakeBackup(ctx context.Context) (string, error) {
 		}
 	}
 	if err != nil {
+		// The container restarted underneath the backup. `docker exec`
+		// children die with the container (exit 137), so the backup was
+		// killed by the testbed, not by pg_hardstorage — the enterprise_
+		// heavy soak lost four backups this way, each within a second of
+		// Docker's unless-stopped policy restarting a cell whose entrypoint
+		// had exited during cgroup_squeeze recovery. Detected precisely:
+		// the container's StartedAt changed across the call. A real
+		// pg_hardstorage crash never restarts its container, so this
+		// cannot hide one; the event stays visible as
+		// backup_skipped_cell_down.
+		if bootBefore != "" {
+			if bootAfter := d.containerStartedAt(ctx); bootAfter != "" && bootAfter != bootBefore {
+				return "", fmt.Errorf("%w: container %s restarted during the backup (StartedAt %s -> %s): %v",
+					ErrCellNotReady, d.Container, bootBefore, bootAfter, err)
+			}
+		}
 		// Diagnostic display still wants combined output —
 		// stderr is where the operator-relevant context
 		// usually lives on a failure.
@@ -1338,6 +1355,22 @@ var (
 	pgRecoveryBudget     = 3 * time.Minute
 	pgRecoveryMaxBackoff = 10 * time.Second
 )
+
+// containerStartedAt returns the container's State.StartedAt, or ""
+// when it cannot be read. It changes exactly when the container
+// (re)starts, which is what TakeBackup uses to tell "the testbed
+// restarted the cell under the backup" from a failed backup.
+func (d *DockerCellRuntime) containerStartedAt(ctx context.Context) string {
+	if d.Container == "" {
+		return ""
+	}
+	out, err := exec.CommandContext(ctx, d.dockerBin(), "inspect", "--format",
+		"{{.State.StartedAt}}", d.Container).Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
 
 func (d *DockerCellRuntime) dockerBin() string {
 	if d.DockerBin != "" {
