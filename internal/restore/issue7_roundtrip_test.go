@@ -198,6 +198,7 @@ func TestRoundTrip_Issue7_DirsAndFiles_AllSurvive(t *testing.T) {
 		BackupLabel:      string(sink.BackupLabel()),
 	}
 	store := backup.NewManifestStore(sp)
+	plantArchivedWAL(t, sp, m.Deployment, m.Timeline)
 	if err := store.Commit(context.Background(), m, signer, backup.CommitOptions{}); err != nil {
 		t.Fatalf("commit: %v", err)
 	}

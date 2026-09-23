@@ -20,6 +20,7 @@ import (
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/paths"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/restore"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/wal/inventory"
 )
 
 // newRealBackupCmd is the in-development real backup command.
@@ -351,8 +352,52 @@ func runBackup(cmd *cobra.Command, opts runOptions) error {
 		UniqueChunkBytes: res.UniqueChunkBytes,
 		PrimaryKey:       res.PrimaryKey,
 		Encrypted:        encConfig != nil,
+		SelfContained:    opts.includeWAL,
+	}
+	if !opts.includeWAL {
+		if archived, known := walArchivedFor(cmd.Context(), opts.repoURL, res.Deployment, uint32(res.Timeline)); known {
+			body.WALArchived = &archived
+			if !archived {
+				body.RestoreNeeds = fmt.Sprintf("WAL through %s (timeline %d) in the repository", res.StopLSN, res.Timeline)
+				_ = d.Event(cmd.Context(), output.NewEvent(output.SeverityWarning, "backup", "not_yet_restorable").
+					WithSubject(output.Subject{Deployment: res.Deployment, BackupID: res.BackupID}).
+					WithBody(map[string]any{
+						"stop_lsn": res.StopLSN,
+						"timeline": res.Timeline,
+						"message": fmt.Sprintf("no WAL has been archived for %s yet, and this backup does not embed its own (--include-wal was not set): "+
+							"it cannot be restored until WAL through %s is in the repository", res.Deployment, res.StopLSN),
+						"hint": "if `pg_hardstorage wal stream` is running this resolves when that segment completes; " +
+							"otherwise start it (pg_hardstorage-wal-stream@" + res.Deployment + ".service), or re-take the backup with --include-wal",
+					}))
+			}
+		}
 	}
 	return d.Result(output.NewResult(cmd.CommandPath()).WithBody(body))
+}
+
+// walArchivedFor reports whether ANY WAL has been archived for the
+// deployment on the backup's timeline. known=false when the repository
+// could not be asked; the caller then says nothing rather than guess.
+//
+// Why a backup needs to know: without --include-wal, a base backup is
+// only restorable once the WAL covering it is archived. A deployment
+// with no WAL archive at all — the first-backup tutorial's exact setup —
+// produced backups that `restore` could never finish (recovery waits
+// forever for the next segment) while `backup` reported success with no
+// hint of it. Nothing archived is the one condition that can be judged
+// with no false alarms: if even one segment exists, archiving is working
+// and the tail will follow.
+func walArchivedFor(ctx context.Context, repoURL, deployment string, timeline uint32) (archived, known bool) {
+	_, sp, err := repo.Open(ctx, repoURL)
+	if err != nil {
+		return false, false
+	}
+	defer sp.Close()
+	_, found, err := inventory.HighestArchivedLSN(ctx, sp, deployment, timeline)
+	if err != nil {
+		return false, false
+	}
+	return found, true
 }
 
 // loadIncrementalConfig reads the named parent backup's manifest
@@ -518,8 +563,16 @@ func stringMapToAny(in map[string]string) map[string]any {
 // Field order matches what we want users to read top-to-bottom in
 // text mode (id first, then sizes, then storage location).
 type backupResultBody struct {
-	BackupID         string `json:"backup_id"`
-	Deployment       string `json:"deployment"`
+	BackupID   string `json:"backup_id"`
+	Deployment string `json:"deployment"`
+	// SelfContained is true when the backup embeds the WAL it needs
+	// (--include-wal). WALArchived reports whether any WAL was already
+	// archived for the deployment; with SelfContained false and
+	// WALArchived false, the backup is not restorable yet and
+	// RestoreNeeds says what is missing.
+	SelfContained    bool   `json:"self_contained"`
+	WALArchived      *bool  `json:"wal_archived,omitempty"`
+	RestoreNeeds     string `json:"restore_needs,omitempty"`
 	Tenant           string `json:"tenant,omitempty"`
 	PGVersion        int    `json:"pg_version"`
 	SystemIdentifier string `json:"system_identifier"`
@@ -557,6 +610,10 @@ func (b backupResultBody) WriteText(w io.Writer) error {
 	fmt.Fprintf(bw, "  PostgreSQL:       %d\n", b.PGVersion)
 	fmt.Fprintf(bw, "  Cluster ID:       %s\n", b.SystemIdentifier)
 	fmt.Fprintf(bw, "  Stop LSN / TLI:   %s / %d\n", b.StopLSN, b.Timeline)
+	if b.RestoreNeeds != "" {
+		fmt.Fprintf(bw, "  ⚠ Not restorable yet: needs %s — no WAL has been archived for this\n"+
+			"    deployment and the backup does not embed its own. Start `wal stream`, or re-take with --include-wal.\n", b.RestoreNeeds)
+	}
 	fmt.Fprintf(bw, "  Files:            %d in %d tablespace(s)\n", b.FileCount, b.TablespaceCount)
 	fmt.Fprintf(bw, "  Logical bytes:    %s\n", humanBytes(b.LogicalBytes))
 	fmt.Fprintf(bw, "  Unique chunks:    %d (%s after dedup)\n", b.UniqueChunkCount, humanBytes(b.UniqueChunkBytes))

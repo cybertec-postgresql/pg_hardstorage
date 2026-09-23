@@ -73,6 +73,7 @@ func fixtureWithTablespaceMap(t *testing.T, mapBody string) *fixture {
 		TablespaceMap: mapBody,
 	}
 	store := backup.NewManifestStore(sp)
+	plantArchivedWAL(t, sp, m.Deployment, m.Timeline)
 	if err := store.Commit(context.Background(), m, signer, backup.CommitOptions{}); err != nil {
 		t.Fatalf("commit: %v", err)
 	}

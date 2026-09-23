@@ -119,12 +119,21 @@ func TestExportImportRestore_ByteIdentical(t *testing.T) {
 	}
 
 	target := filepath.Join(t.TempDir(), "restored-from-import")
+	// What this test proves is FILE fidelity across export/import — every
+	// byte of the base backup survives. It does not, and cannot, prove the
+	// restored cluster boots: bundles do not carry WAL yet (nothing
+	// populates Manifest.WALRequired, so export --include-wal refuses
+	// rather than write an unrestorable bundle), and this backup does not
+	// embed its own. Restore now refuses such a backup up front
+	// (preflight.backup_wal_missing); SkipGapCheck is the documented
+	// override and states exactly the limit of this test.
 	res, err := restore.Restore(ctx, restore.Options{
 		RepoURL:    dstURL,
 		Deployment: "db1",
 		BackupID:   m.BackupID,
 		TargetDir:  target,
 		Verifier:   verifier,
+		Recovery:   &restore.Recovery{SkipGapCheck: true},
 	})
 	if err != nil {
 		t.Fatalf("restore from imported repo: %v", err)

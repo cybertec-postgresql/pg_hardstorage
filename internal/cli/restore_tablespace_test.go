@@ -46,6 +46,9 @@ func commitVerifiableBackupWithTablespaceMap(t *testing.T, w *readWorld, deploym
 				Chunks: []backup.ChunkRef{{Hash: info.Hash, Offset: 0, Len: int64(len(body))}}},
 		},
 	}
+	// Real deployments archive WAL; restore refuses a backup whose
+	// WAL exists nowhere (preflight.backup_wal_missing).
+	w.plantArchivedWAL(t, deployment, 1)
 	if err := w.store.Commit(context.Background(), m, w.signer, backup.CommitOptions{}); err != nil {
 		t.Fatalf("commit: %v", err)
 	}

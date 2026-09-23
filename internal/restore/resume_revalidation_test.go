@@ -127,6 +127,7 @@ func buildResumeBackup(t *testing.T) (repoURL string, verifier *backup.Verifier,
 		Files:       sink.AllFiles(), Dirs: sink.AllDirs(),
 		BackupLabel: string(sink.BackupLabel()),
 	}
+	plantArchivedWAL(t, sp, m.Deployment, m.Timeline)
 	if err := backup.NewManifestStore(sp).Commit(context.Background(), m, signer, backup.CommitOptions{}); err != nil {
 		t.Fatalf("commit: %v", err)
 	}

@@ -102,6 +102,8 @@ is fixed.
 | `preflight.pg_version_mismatch` | Target PG version does not match the backup's |
 | `preflight.pg_combinebackup_missing`, `preflight.pg_tools_missing` | Required PG client tools not on `$PATH` |
 | `preflight.checkpoint_check_failed` | Source PG refused to issue a checkpoint |
+| `preflight.backup_wal_missing` | Restore refused: the backup embeds no WAL and the repository holds none on its timeline, so it could never become consistent (recovery would wait forever). Take a new backup with `--include-wal` or with `wal stream` running; `--skip-gap-check` overrides |
+| `preflight.pg_role_missing` | `partial dump`: the role it connects to the sandbox as (default `postgres`) does not exist in the backed-up cluster; pass `--pg-user`. The temporary sandbox is removed |
 | `preflight.chain_target_not_empty` | Replicate-by-chain target already has content |
 
 **Recovery:** read the body, fix the condition (free disk,

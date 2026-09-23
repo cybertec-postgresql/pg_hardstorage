@@ -306,6 +306,11 @@ func Restore(ctx context.Context, opts Options) (res *Result, err error) {
 	// deletion). Never refuses — it only warns so a false positive can't
 	// block a legitimate restore.
 	preflightWALContiguity(ctx, sp, opts.Deployment, m, opts.Recovery, emit)
+	// The backup's OWN WAL must exist somewhere, or it can never become
+	// consistent. Refuse before writing anything.
+	if err := preflightBackupWALAvailable(ctx, sp, opts.Deployment, m, opts.Recovery); err != nil {
+		return nil, err
+	}
 	// Timeline-history reachability: PG probes <N>.history ascending
 	// and stops at the FIRST miss, so a lost history file makes a
 	// --to-latest recovery silently end on an older timeline and

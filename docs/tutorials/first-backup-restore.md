@@ -80,8 +80,17 @@ is idempotent on the URL.
 # RUNNABLE
 pg_hardstorage backup db1 \
     --pg-connection "${PG_CONNECTION:-postgres://postgres:postgres@127.0.0.1/postgres}" \
-    --repo file:///tmp/hs-tutorial-repo
+    --repo file:///tmp/hs-tutorial-repo \
+    --include-wal
 ```
+
+`--include-wal` matters here. A base backup only becomes a consistent
+database after replaying the WAL written while it ran. In production
+`wal stream` archives that WAL continuously; this tutorial does not run
+it, so the backup has to carry its own. Without the flag, `backup`
+warns that the result is **not restorable yet**, and `restore` refuses
+it (`preflight.backup_wal_missing`) rather than producing a data
+directory that would wait forever for WAL that exists nowhere.
 
 The pipeline is `BASE_BACKUP` over libpq → tar parser → FastCDC
 chunker → CAS PUTs → signed manifest. On the first run a signing
@@ -166,7 +175,7 @@ fetch, no SHA), pass `--existence-only`. Useful before
 ### 6. Restore to a sandbox directory
 
 ```bash
-# RUNNABLE skip-in-ci="postverify pg_ctl-start needs continuous WAL in the repo; this tutorial deliberately omits `wal stream`, so recovery hangs reading trailing segments. See pitr-tutorial.md."
+# RUNNABLE
 pg_hardstorage restore db1 latest \
     --repo file:///tmp/hs-tutorial-repo \
     --target /tmp/hs-tutorial-restored

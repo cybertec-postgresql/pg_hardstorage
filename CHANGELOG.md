@@ -21,6 +21,30 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **A backup whose WAL existed nowhere was reported as a success, and
+  restoring it hung forever.** Without `--include-wal`, a base backup is
+  restorable only once the WAL written during it is archived. With no
+  archiving running — exactly the first-backup tutorial's setup —
+  `backup` said `✓ Backup committed`, and `restore` produced a data
+  directory whose recovery waited forever for the next segment (the
+  tutorial's own doctest block was skipped with a note saying so).
+  `backup` now flags such a backup: a `not_yet_restorable` warning, a
+  `⚠ Not restorable yet` line, and `self_contained` / `wal_archived` /
+  `restore_needs` in the JSON result. `restore` refuses it up front with
+  **`preflight.backup_wal_missing` (exit 4)** instead of hanging;
+  `--skip-gap-check` overrides. Both fire only when the backup embeds no
+  WAL **and** the repository holds none on its timeline, so a deployment
+  with working archiving never sees them. The tutorial now uses
+  `--include-wal`, and its restore block runs in CI again.
+
+- **`repo replicate` reported "replication clean" for a DR replica that
+  could not restore.** WAL is replicated only with `--include-wal`; by
+  default a replica of a WAL-archiving source holds backups that cannot
+  become consistent there. The run now warns
+  (`replicate.wal_not_replicated`, `wal_not_replicated: true`, and a
+  `⚠ WAL not replicated` line), and restoring from such a replica is
+  refused rather than hanging.
+
 - **Usage errors ignored `-o json`.** An unknown flag or a wrong number
   of arguments — the commonest failures there are — printed a plain text
   line even when JSON output was requested, contradicting the promise

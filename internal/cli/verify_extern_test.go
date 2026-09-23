@@ -58,6 +58,9 @@ func commitVerifiableBackup(t *testing.T, w *readWorld, deployment string, idx i
 			},
 		},
 	}
+	// Real deployments archive WAL; restore refuses a backup whose
+	// WAL exists nowhere (preflight.backup_wal_missing).
+	w.plantArchivedWAL(t, deployment, 1)
 	if err := w.store.Commit(context.Background(), m, w.signer, backup.CommitOptions{}); err != nil {
 		t.Fatalf("commit: %v", err)
 	}
