@@ -103,6 +103,12 @@ type ReplicateResult struct {
 	DestURL    string `json:"dest_url,omitempty"`
 	DryRun     bool   `json:"dry_run"`
 	IncludeWAL bool   `json:"include_wal"`
+	// WALNotReplicated is true when the source holds archived WAL and
+	// this run did not copy it (no --include-wal). Backups that do not
+	// embed their own WAL are then NOT restorable from the replica —
+	// restore refuses them with preflight.backup_wal_missing — which a
+	// report reading "replication clean" used to leave unsaid.
+	WALNotReplicated bool `json:"wal_not_replicated,omitempty"`
 
 	ManifestsConsidered int `json:"manifests_considered"`
 	ManifestsCopied     int `json:"manifests_copied"`

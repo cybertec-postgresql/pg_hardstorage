@@ -2,7 +2,10 @@
 package cli
 
 import (
+	"context"
+
 	"fmt"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
 	"io"
 	"strings"
 	"time"
@@ -209,6 +212,14 @@ func runRepoReplicate(cmd *cobra.Command, from, to string, includeWAL, dryRun bo
 	}
 	res.SourceURL = from
 	res.DestURL = to
+	if !includeWAL && !dryRun && sourceHasArchivedWAL(cmd.Context(), srcSP) {
+		res.WALNotReplicated = true
+		emitProgress(output.NewEvent(output.SeverityWarning, "repo", "replicate.wal_not_replicated").
+			WithBody(map[string]any{
+				"message": "the source archives WAL but this replication did not copy it: backups that do not embed their own WAL cannot be restored from the replica",
+				"hint":    "re-run with --include-wal so the replica can serve restores and PITR on its own",
+			}))
+	}
 
 	// Run metrics + a completion event. result is "incomplete" when any
 	// object failed (the per-key detail is in the result body).
@@ -322,6 +333,10 @@ func (r repoReplicateBody) WriteText(w io.Writer) error {
 	}
 	fmt.Fprintf(bw, "  Bytes copied: %s\n", humanBytes(r.BytesCopied))
 	fmt.Fprintf(bw, "  Duration:     %s\n", time.Duration(r.DurationMS)*time.Millisecond)
+	if r.WALNotReplicated {
+		fmt.Fprintln(bw, "  ⚠ WAL not replicated: the source archives WAL, this run did not copy it (no --include-wal).")
+		fmt.Fprintln(bw, "    Backups without embedded WAL cannot be restored from this replica.")
+	}
 	if r.ManifestsFailed == 0 && r.ChunksFailed == 0 && r.ChunksMissing == 0 &&
 		r.ManifestReplicasFailed == 0 {
 		fmt.Fprintln(bw, "  ✓ replication clean")
@@ -343,4 +358,18 @@ func (r repoReplicateBody) WriteText(w io.Writer) error {
 	}
 	_, err := io.WriteString(w, strings.TrimRight(bw.String(), "\n"))
 	return err
+}
+
+// sourceHasArchivedWAL reports whether any WAL segment manifest exists
+// under wal/ in the source. It stops at the first one found.
+func sourceHasArchivedWAL(ctx context.Context, sp storage.StoragePlugin) bool {
+	for info, err := range sp.List(ctx, "wal/") {
+		if err != nil {
+			return false
+		}
+		if strings.HasSuffix(info.Key, ".json") && !strings.Contains(info.Key, ".tmp") {
+			return true
+		}
+	}
+	return false
 }

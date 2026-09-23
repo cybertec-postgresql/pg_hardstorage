@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/testfixture"
 	"net/url"
 	"testing"
 	"time"
@@ -93,13 +94,18 @@ func (w *rvWorld) commitToBoth(t *testing.T, deployment string, idx int, body []
 			Chunks: []backup.ChunkRef{{Hash: info.Hash, Offset: 0, Len: int64(len(body))}},
 		}},
 	}
+	// Archived WAL lives in the SOURCE; replication must carry it, or a
+	// restore from the replica is refused (preflight.backup_wal_missing).
+	testfixture.PlantArchivedWAL(t, w.srcSP, deployment, m.Timeline)
 	if err := w.srcStore.Commit(context.Background(), m, w.signer, backup.CommitOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	if replicate {
 		// Use repo.Replicate to copy primary → replica.  This
 		// exercises the same code path the operator runs.
-		if _, err := repo.Replicate(context.Background(), w.srcSP, w.dstSP, repo.ReplicateOptions{}); err != nil {
+		// IncludeWAL: a DR replica that cannot restore WAL-dependent
+		// backups is not a DR replica.
+		if _, err := repo.Replicate(context.Background(), w.srcSP, w.dstSP, repo.ReplicateOptions{IncludeWAL: true}); err != nil {
 			t.Fatalf("Replicate: %v", err)
 		}
 	}
