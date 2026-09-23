@@ -73,12 +73,9 @@ config: |
         rotate:
           daily_at: "04:00"
 
-env:
-  - name: PG_HARDSTORAGE_KEYRING_PASSPHRASE
-    valueFrom:
-      secretKeyRef:
-        name: pg-hardstorage-keyring
-        key: passphrase
+# Keys come from the keyring Secret (see "Configuring the KMS /
+# keyring" below), not from an environment variable — pg_hardstorage
+# reads no keyring passphrase variable.
 
 persistence:
   enabled: true

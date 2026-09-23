@@ -120,14 +120,15 @@ Slack message, open a Jira ticket, raise a PagerDuty page.
 Approval comes through the standard binary-side flow; the LLM
 cannot fake it.
 
-n-of-m thresholds are configurable per operation:
+The n-of-m threshold is set on each request, not in configuration:
 
-```yaml
-approvals:
-  kms_shred: { initiator: 1, approvers: 2 }
-  repo_gc_delete: { initiator: 1, approvers: 1 }
-  backup_delete_force: { initiator: 1, approvers: 1 }
+```sh
+pg_hardstorage approval request --threshold 2 ...
 ```
+
+`--threshold` is the number of distinct allowlisted approvals the
+operation needs (default 2). There is no `approvals:` section in
+`pg_hardstorage.yaml`; adding one makes the configuration fail to load.
 
 ### Anomaly refusal (cross-cutting)
 

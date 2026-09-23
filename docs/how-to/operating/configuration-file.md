@@ -119,9 +119,6 @@ Every config field has an equivalent flag.  Precedence is
 # Use the config's defaults but override the repo just for one
 # backup (e.g. take an ad-hoc backup to a secondary store):
 pg_hardstorage backup prod --repo s3://emergency-backups/prod
-
-# Same, via env var:
-PG_HARDSTORAGE_REPO=s3://emergency-backups/prod pg_hardstorage backup prod
 ```
 
 `pg_hardstorage --config <path>` lets you point at a fully

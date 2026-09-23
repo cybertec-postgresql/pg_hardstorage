@@ -21,6 +21,22 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **Four documented `pg_hardstorage.yaml` sections did not exist, and
+  pasting any of them broke the whole configuration.** The monitoring
+  guide's `observability:` block (tracing), the scaling guide's and
+  `server --help`'s `server:` block, the plugin protocol's `plugins:`
+  block (RPC timeout), and the LLM safety page's `approvals:` block
+  (n-of-m thresholds). The config file is decoded strictly, so each made
+  every command fail with "field … not found". Each page now documents
+  the real mechanism: `--otel-endpoint` / `--otel-stdout`,
+  `server --max-concurrent-jobs`, a fixed 30 s plugin RPC timeout, and
+  `approval request --threshold`. Three documented environment variables
+  were also read by nothing: `PG_HARDSTORAGE_REPO` (a backup "sent to the
+  emergency repo" this way went to the configured one),
+  `PG_HARDSTORAGE_OTLP_ENDPOINT` / `_INSECURE`, and
+  `PG_HARDSTORAGE_KEYRING_PASSPHRASE`. Removed. New tests fail the build
+  on either kind of drift.
+
 - **A backup whose WAL existed nowhere was reported as a success, and
   restoring it hung forever.** Without `--include-wal`, a base backup is
   restorable only once the WAL written during it is archived. With no

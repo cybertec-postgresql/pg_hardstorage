@@ -92,3 +92,64 @@ func TestDocumentedConfigExamplesLoad(t *testing.T) {
 	}
 	t.Logf("loaded %d documented config examples", checked)
 }
+
+// TestDocumentedConfigClaimsAreReal closes the gap the test above leaves
+// open. That one only loads blocks whose keys it already recognises, so a
+// block claiming a config section that does not exist was skipped as
+// "not config" — exactly how four did ship:
+//
+//	observability:  (monitoring.md — tracing)
+//	server:         (scaling-large-fleets.md, and `server --help`)
+//	plugins:        (tier2 plugin protocol — RPC timeout)
+//	approvals:      (llm-safety-stack.md — n-of-m thresholds)
+//
+// None exists. Because the file is decoded with KnownFields, an operator
+// who pasted any of them did not get an ignored setting: every command
+// refused to load the configuration.
+//
+// Here a YAML block counts as a claim about pg_hardstorage.yaml when the
+// prose just before it says so, and it is not recognisably another
+// tool's YAML (Kubernetes, Helm values, compose, Patroni, skill files,
+// testkit files). Every top-level key of such a block must exist.
+func TestDocumentedConfigClaimsAreReal(t *testing.T) {
+	cfgKeys := map[string]bool{}
+	ty := reflect.TypeOf(Config{})
+	for i := 0; i < ty.NumField(); i++ {
+		if k := strings.Split(ty.Field(i).Tag.Get("yaml"), ",")[0]; k != "" && k != "-" {
+			cfgKeys[k] = true
+		}
+	}
+	claim := regexp.MustCompile(`(?i)pg_hardstorage\.yaml|config(uration)? file|in (the )?config\b|via config|configurable (per|via)`)
+	foreign := regexp.MustCompile(`(?m)^(apiVersion|kind|services|jobs|on|steps|scrape_configs|groups|route|receivers|image|replicaCount|config|env|persistence|serviceAccount|keyring|permanent_slots|bootstrap|postgresql|schema|trigger|permissions|context|guardrails|locales|fleet|profiles|faults|scenario|topology):`)
+	top := regexp.MustCompile(`(?m)^([A-Za-z0-9_.-]+):`)
+	fence := regexp.MustCompile("(?s)```ya?ml\n(.*?)```")
+
+	err := filepath.WalkDir("../../docs", func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() || !strings.HasSuffix(path, ".md") {
+			return err
+		}
+		raw, rerr := os.ReadFile(path)
+		if rerr != nil {
+			return rerr
+		}
+		src := string(raw)
+		for _, m := range fence.FindAllStringSubmatchIndex(src, -1) {
+			body := src[m[2]:m[3]]
+			pre := src[max(0, m[0]-400):m[0]]
+			if foreign.MatchString(body) || !claim.MatchString(pre) {
+				continue
+			}
+			for _, k := range top.FindAllStringSubmatch(body, -1) {
+				if !cfgKeys[k[1]] {
+					t.Errorf("%s:%d: documented as pg_hardstorage.yaml but %q is not a config section — "+
+						"pasting it makes every command fail to load the configuration",
+						path, strings.Count(src[:m[2]], "\n")+1, k[1])
+				}
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}

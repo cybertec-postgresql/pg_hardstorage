@@ -91,12 +91,8 @@ pg_hardstorage server \
     --max-concurrent-jobs 200
 ```
 
-Or in the server config file:
-
-```yaml
-server:
-  max_concurrent_jobs: 200
-```
+The cap is a `server` flag; `pg_hardstorage.yaml` has no `server:`
+section, and adding one makes the configuration fail to load.
 
 Once the cap is reached, claims are refused and queued work stays
 queued; agents keep polling and pick the work up as running jobs

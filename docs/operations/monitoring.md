@@ -231,23 +231,23 @@ configured the spans are zero-overhead.
 
 ### Wiring an OTLP collector
 
-Set the OTLP endpoint via config or env var:
-
-```yaml
-observability:
-  tracing:
-    otlp_endpoint: http://otel-collector.observability.svc:4318
-    otlp_insecure: true       # plaintext localhost / sidecar
-    sampler: parent_based_always_sample
-```
-
-Or:
+Tracing is enabled per invocation with the global `--otel-endpoint`
+flag (OTLP/HTTP). An `http://` endpoint is sent in plaintext — right for
+a localhost or sidecar collector — and `https://` uses TLS:
 
 ```sh
-PG_HARDSTORAGE_OTLP_ENDPOINT=http://otel-collector:4318 \
-PG_HARDSTORAGE_OTLP_INSECURE=true \
-pg_hardstorage agent
+pg_hardstorage agent --otel-endpoint http://otel-collector:4318
 ```
+
+`--otel-stdout` additionally writes spans to stderr, which is handy while
+developing. For the agent under systemd, add the flag to `ExecStart` in a
+drop-in (`systemctl edit pg_hardstorage`).
+
+There is no `pg_hardstorage.yaml` section and no environment variable for
+tracing. (Earlier versions of this page showed an `observability:` config
+block and OTLP environment variables; neither ever existed, and
+because the config file is parsed strictly, adding that block made every
+command refuse to load the configuration.)
 
 Air-gap mode refuses public collectors automatically — only
 loopback and RFC1918 destinations are allowed.
