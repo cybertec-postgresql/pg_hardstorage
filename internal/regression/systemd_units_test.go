@@ -171,3 +171,47 @@ func TestWALStreamUnitExists(t *testing.T) {
 	t.Error("no systemd unit runs `pg_hardstorage wal stream` — continuous WAL " +
 		"archiving has no supervisor, and the agent units do not provide it (issue #56)")
 }
+
+// TestRPMSpecPackagesEveryUnitInTheRightSection is stricter than the
+// substring check above, which is how a unit once shipped "packaged"
+// while breaking the RPM build: its %files path was pasted into
+// %install. rpmbuild runs %install as a shell script, so the bare path
+// executes as a command and the build aborts — and the file that WAS
+// installed was missing from %files, which rpmbuild also rejects. The
+// filename appeared in the spec twice, so the substring test passed.
+func TestRPMSpecPackagesEveryUnitInTheRightSection(t *testing.T) {
+	root := repoRoot(t)
+	raw, err := os.ReadFile(filepath.Join(root, "packaging/rpm/pg_hardstorage.spec"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec := string(raw)
+	section := func(name string) string {
+		i := strings.Index(spec, "\n"+name+"\n")
+		if i < 0 {
+			t.Fatalf("spec has no %s section", name)
+		}
+		rest := spec[i+len(name)+2:]
+		if j := regexp.MustCompile(`(?m)^%(files|install|build|prep|check|clean|pre|post|preun|postun|pretrans|posttrans|changelog|package|description)\b`).FindStringIndex(rest); j != nil {
+			rest = rest[:j[0]]
+		}
+		return rest
+	}
+	install, files := section("%install"), section("%files")
+
+	for _, line := range strings.Split(install, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "%{_unitdir}/") {
+			t.Errorf("%%install contains a bare %%files-style path — rpmbuild will try to execute it:\n  %s", line)
+		}
+	}
+	units, _ := filepath.Glob(filepath.Join(root, "deploy/systemd/*.service"))
+	for _, u := range units {
+		name := filepath.Base(u)
+		if !strings.Contains(install, "%{_unitdir}/"+name) {
+			t.Errorf("%s is not installed in %%install", name)
+		}
+		if !regexp.MustCompile(`(?m)^%\{_unitdir\}/`+regexp.QuoteMeta(name)+`$`).MatchString(files) {
+			t.Errorf("%s is not listed in %%files — rpmbuild rejects installed-but-unpackaged files", name)
+		}
+	}
+}
