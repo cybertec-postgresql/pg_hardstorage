@@ -797,7 +797,7 @@ func Restore(ctx context.Context, opts Options) (res *Result, err error) {
 				WithBody(map[string]any{
 					"reason": pvRes.SkipReason,
 					"mode":   string(mode),
-					"hint":   "install postgresql-client/server on the runner host or pass --verify-restore=off to silence",
+					"hint":   postverifySkipHint(pvRes.SkipReason),
 				}))
 		} else {
 			body := map[string]any{
@@ -2157,7 +2157,7 @@ func restoreIncrementalChain(ctx context.Context, opts Options, sp storage.Stora
 				WithBody(map[string]any{
 					"reason": pvRes.SkipReason,
 					"mode":   string(mode),
-					"hint":   "install postgresql-client/server on the runner host or pass --verify-restore=off to silence",
+					"hint":   postverifySkipHint(pvRes.SkipReason),
 				}))
 		} else {
 			body := map[string]any{
@@ -2475,4 +2475,16 @@ func totalChunkCountForManifest(m *backup.Manifest) int {
 		n += len(m.Files[i].Chunks)
 	}
 	return n
+}
+
+// postverifySkipHint picks advice that matches WHY the boot check was
+// skipped. It used to say "install postgresql-client/server" for every
+// skip — including the one where PostgreSQL is installed and the host
+// merely lacks an extension the source cluster preloaded, for which
+// that advice sends the operator the wrong way.
+func postverifySkipHint(reason string) string {
+	if strings.Contains(reason, "preloads") {
+		return "the restored data is fine; install the named extension on this host, or pass --verify-restore=off to silence"
+	}
+	return "install postgresql-client/server on the runner host or pass --verify-restore=off to silence"
 }

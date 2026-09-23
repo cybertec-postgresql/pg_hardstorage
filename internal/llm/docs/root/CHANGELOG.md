@@ -21,6 +21,12 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **The RPM could not be built.** The #56 change placed the new WAL-stream
+  unit's `%files` path inside `%install`, which rpmbuild runs as a shell
+  script, and never listed the installed unit in `%files`. A packaging
+  test that only checked the filename appeared somewhere in the spec
+  passed; it now checks both sections.
+
 - **The LLM helper's command validator rejected valid commands, then
   talked the model into invalid ones.** Every suggested command is
   checked against the live CLI and, on a warning, the model is asked to
@@ -34,8 +40,10 @@ keeps reading that version for at least 24 months after a successor lands.
   share of invented flags to this loop. Operators also saw warnings on
   the documented form. The validator now applies each command's own
   flag normalization and treats config-back-filled flags as supplied
-  when a deployment is named; a test pins that exemption to exactly the
-  flags the runtime hook fills.
+  when the command's first argument is a deployment (as the runtime
+  hook requires — `approval approve <request-id>` still needs
+  `--repo`); a test pins that exemption to exactly the flags the hook
+  fills.
 
 - **A PostgreSQL connection failure was coded `storage.unreachable`.**
   Exit 8 is correct (transient; retry), but the code is what alert
@@ -79,7 +87,9 @@ keeps reading that version for at least 24 months after a successor lands.
   the same builder the scheduled task uses; otherwise the GFS defaults.
   Each plan line says which (`from flags` / `from pg_hardstorage.yaml` /
   `from built-in default`), and a retention block that does not parse
-  refuses rather than falling back. **Behaviour change:** a bare
+  refuses rather than falling back — as does a `pg_hardstorage.yaml`
+  that exists but will not load, unless explicit flags are given.
+  **Behaviour change:** a bare
   `rotate <deployment>` on a deployment with a `retention:` block now
   follows that block — dry-run first.
 
@@ -208,9 +218,16 @@ keeps reading that version for at least 24 months after a successor lands.
   own client hanging up. Every reasoning model was affected.
 
   Connect, TLS and response-header timeouts are now bounded
-  individually, and the stream is watched for a two-minute gap
-  *between bytes* — the condition the old timeout was reaching for. A
-  stalled stream now says so.
+  individually, and the stream is watched for silence rather than
+  elapsed time, with two budgets: up to 45 minutes for the first byte
+  (a busy local endpoint can queue a request that long) and 5 minutes
+  between bytes once the answer is flowing
+  (`PG_HARDSTORAGE_LLM_FIRST_BYTE_TIMEOUT`,
+  `PG_HARDSTORAGE_LLM_STALL_TIMEOUT`). A single two-minute budget was
+  tried first and discarded 192 of 194 answers from a queued endpoint.
+  The watchdog is bound to the request itself, so a connection that
+  goes silent without closing is actually interrupted rather than
+  merely noticed. A stalled stream now says which budget ran out.
 
 - **The command validator's retry narrated itself into the answer.**
   When a reply named a bad flag, the session asked the model to
