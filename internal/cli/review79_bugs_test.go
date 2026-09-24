@@ -11,7 +11,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup/keystore"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/output"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/paths"
@@ -191,38 +190,9 @@ func TestCopyFile_CopiesDistinctPath(t *testing.T) {
 	}
 }
 
-// --- Bug 61: isManifestSignatureFailure distinguishes backend errors ---
-
-// TestIsManifestSignatureFailure is the #61 classifier regression: a
-// backend/storage error must NOT be treated as a signature failure
-// (which would report "potential tampering" and present a truncated
-// walk as complete), while genuine verification failures must.
-func TestIsManifestSignatureFailure(t *testing.T) {
-	// Backend errors → not a signature failure.
-	for _, err := range []error{
-		storage.ErrNotFound,
-		storage.ErrChecksumMismatch,
-		storage.ErrUnsupported,
-		storage.ErrUnknownScheme,
-	} {
-		if isManifestSignatureFailure(err) {
-			t.Errorf("%v should be classified as a backend error, not a signature failure", err)
-		}
-	}
-	// Genuine verification failures → signature failure.
-	for _, err := range []error{
-		backup.ErrPublicKeyMismatch,
-		backup.ErrUnsigned,
-		backup.ErrBadSignature,
-	} {
-		if !isManifestSignatureFailure(err) {
-			t.Errorf("%v should be classified as a signature failure", err)
-		}
-	}
-	if isManifestSignatureFailure(nil) {
-		t.Error("nil is not a failure")
-	}
-}
+// --- Bug 61: repo check distinguishes backend errors from signature
+// failures — now by the stage that failed; see
+// TestCheckDeploymentManifests_TransientGetIsNotTampering. ---
 
 // --- Bug 64: doctor recomputes Healthy from the final issue set ---
 
