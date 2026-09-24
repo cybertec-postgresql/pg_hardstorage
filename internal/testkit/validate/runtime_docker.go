@@ -96,8 +96,8 @@ type DockerCellRuntime struct {
 	// kills the process and parses pgbench's final report
 	// from the captured stdout/stderr.
 	sustainedCmd       *exec.Cmd
-	sustainedStdout    *bytes.Buffer
-	sustainedStderr    *bytes.Buffer
+	sustainedStdout    *lockedBuffer
+	sustainedStderr    *lockedBuffer
 	sustainedStartedAt time.Time
 	sustainedCancel    context.CancelFunc
 	sustainedDone      chan struct{}
@@ -115,8 +115,8 @@ type DockerCellRuntime struct {
 	// mutex guards the fields it writes from the reader in
 	// StopWALStream.
 	walStreamMu       sync.Mutex
-	walStreamStdout   *bytes.Buffer
-	walStreamStderr   *bytes.Buffer
+	walStreamStdout   *lockedBuffer
+	walStreamStderr   *lockedBuffer
 	walStreamCancel   context.CancelFunc
 	walStreamDone     chan struct{}
 	walStreamRunning  bool
@@ -922,7 +922,7 @@ func (d *DockerCellRuntime) StartSustainedLoad(ctx context.Context) error {
 	args = append(args, d.PGDatabase)
 
 	bgCtx, cancel := context.WithCancel(context.Background())
-	var stdout, stderr bytes.Buffer
+	var stdout, stderr lockedBuffer
 	// A placeholder Cmd marks the writer as requested-and-running for
 	// SustainedWriterActive; the supervisor owns the real processes.
 	d.sustainedCmd = exec.CommandContext(bgCtx, d.dockerBin())
@@ -944,7 +944,7 @@ func (d *DockerCellRuntime) StartSustainedLoad(ctx context.Context) error {
 // passed without backups having run under sustained writes for most of
 // it. This is the same defect v1.4 found in the WAL-stream sidecar, and
 // the same fix: restart on exit, count the restarts.
-func (d *DockerCellRuntime) superviseSustainedLoad(ctx context.Context, args []string, stdout, stderr *bytes.Buffer) {
+func (d *DockerCellRuntime) superviseSustainedLoad(ctx context.Context, args []string, stdout, stderr *lockedBuffer) {
 	defer close(d.sustainedDone)
 	first := true
 	for {
@@ -964,10 +964,11 @@ func (d *DockerCellRuntime) superviseSustainedLoad(ctx context.Context, args []s
 		first = false
 		full := append([]string{"exec", "-u", d.PGUser, d.Container}, args...)
 		cmd := exec.CommandContext(ctx, d.dockerBin(), full...)
-		d.sustainedMu.Lock()
 		cmd.Stdout = stdout
 		cmd.Stderr = stderr
-		d.sustainedMu.Unlock()
+		// Once ctx kills the docker client, stop waiting for an output
+		// pipe something else still holds open, so the supervisor exits.
+		cmd.WaitDelay = sidecarWaitDelay
 		if err := cmd.Start(); err != nil {
 			continue // container likely down mid-fault; retry after the delay
 		}
@@ -978,6 +979,37 @@ func (d *DockerCellRuntime) superviseSustainedLoad(ctx context.Context, args []s
 // sustainedRestartDelay spaces pgbench restarts while PostgreSQL is
 // recovering, so a long recovery does not become a tight loop.
 var sustainedRestartDelay = 5 * time.Second
+
+// sustainedStopTimeout bounds how long StopSustainedLoad waits for the
+// supervisor to exit before it reports anyway, so a wedged docker
+// cannot block teardown. A var so tests can shrink it.
+var sustainedStopTimeout = 10 * time.Second
+
+// sidecarWaitDelay is exec.Cmd.WaitDelay for the supervised sidecars.
+const sidecarWaitDelay = 2 * time.Second
+
+// lockedBuffer is a bytes.Buffer safe for exec's output-copier goroutine
+// to write while another goroutine reads it. The sidecar buffers need
+// it: StopSustainedLoad reads the progress stream after at most
+// sustainedStopTimeout even when the supervisor has not exited, and at
+// that point exec may still be copying into the buffer — a plain
+// bytes.Buffer there was a data race.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
 
 // SustainedWriterActive reports whether a writer is actually
 // running. The zero-SustainedClients path leaves sustainedCmd nil,
@@ -996,7 +1028,7 @@ func (d *DockerCellRuntime) StopSustainedLoad(ctx context.Context) (*report.Load
 	d.sustainedCancel()
 	select {
 	case <-d.sustainedDone:
-	case <-time.After(10 * time.Second):
+	case <-time.After(sustainedStopTimeout):
 		// docker wedged; do not block teardown
 	}
 
@@ -1082,7 +1114,7 @@ func (d *DockerCellRuntime) StartWALStream(ctx context.Context) error {
 		return errors.New("StartWALStream: already running")
 	}
 	d.walStreamRunning = true
-	var stdout, stderr bytes.Buffer
+	var stdout, stderr lockedBuffer
 	d.walStreamStdout = &stdout
 	d.walStreamStderr = &stderr
 	bgCtx, cancel := context.WithCancel(context.Background())
@@ -1122,7 +1154,7 @@ const walStreamRestartDelay = 2 * time.Second
 // Restarts are counted rather than merely retried: a cell whose sidecar
 // had to be re-attached ten times is telling you something about the
 // fault schedule, and StopWALStream reports it.
-func (d *DockerCellRuntime) superviseWALStream(ctx context.Context, done chan struct{}, stdout, stderr *bytes.Buffer) {
+func (d *DockerCellRuntime) superviseWALStream(ctx context.Context, done chan struct{}, stdout, stderr *lockedBuffer) {
 	defer close(done)
 	first := true
 	for {
@@ -1153,6 +1185,7 @@ func (d *DockerCellRuntime) superviseWALStream(ctx context.Context, done chan st
 		cmd := exec.CommandContext(ctx, d.dockerBin(), full...)
 		cmd.Stdout = stdout
 		cmd.Stderr = stderr
+		cmd.WaitDelay = sidecarWaitDelay
 		if err := cmd.Start(); err != nil {
 			// The container is probably down mid-fault. Loop and
 			// retry; the delay above bounds the spin.
