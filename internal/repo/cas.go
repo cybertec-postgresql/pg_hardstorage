@@ -187,6 +187,10 @@ type CAS struct {
 // later cache hit may vouch for the chunk on its own; see seenWriteTrust.
 type seenEntry struct {
 	writtenAt time.Time
+	// retainedUntil is the WORM deadline this CAS last put on the
+	// object (at write or by extending an adopted one); zero when no
+	// retention is configured or when it is unknown. See ensureRetention.
+	retainedUntil time.Time
 }
 
 // seenWriteTrust bounds how long a cache hit may vouch for a chunk
@@ -714,6 +718,12 @@ func (c *CAS) PutChunk(ctx context.Context, body []byte) (ChunkInfo, error) {
 		if e.writtenAt.IsZero() || c.clock().Sub(e.writtenAt) >= seenWriteTrust {
 			c.markAdopted(hash)
 		}
+		if until, err := c.ensureRetention(ctx, hash, e.retainedUntil); err != nil {
+			return ChunkInfo{}, err
+		} else if !until.Equal(e.retainedUntil) {
+			e.retainedUntil = until
+			c.markSeen(hash, e)
+		}
 		c.dedupInMem.Add(1)
 		info.Deduped = true
 		return info, nil
@@ -732,7 +742,11 @@ func (c *CAS) PutChunk(ctx context.Context, body []byte) (ChunkInfo, error) {
 				if err := c.ensureAdoptable(ctx, hash); err != nil {
 					return ChunkInfo{}, err
 				}
-				c.markSeen(hash, seenEntry{})
+				until, err := c.ensureRetention(ctx, hash, time.Time{})
+				if err != nil {
+					return ChunkInfo{}, err
+				}
+				c.markSeen(hash, seenEntry{retainedUntil: until})
 				c.markAdopted(hash)
 				c.dedupStorage.Add(1)
 				info.Deduped = true
@@ -797,14 +811,18 @@ func (c *CAS) PutChunk(ctx context.Context, body []byte) (ChunkInfo, error) {
 	_, err = c.sp.Put(ctx, key, bytes.NewReader(envelope), putOpts)
 	switch {
 	case err == nil:
-		c.markSeen(hash, seenEntry{writtenAt: c.clock()})
+		c.markSeen(hash, seenEntry{writtenAt: c.clock(), retainedUntil: putOpts.RetainUntil})
 		c.dedupMiss.Add(1)
 		return info, nil
 	case errors.Is(err, storage.ErrAlreadyExists):
 		if aerr := c.ensureAdoptable(ctx, hash); aerr != nil {
 			return ChunkInfo{}, aerr
 		}
-		c.markSeen(hash, seenEntry{})
+		until, rerr := c.ensureRetention(ctx, hash, time.Time{})
+		if rerr != nil {
+			return ChunkInfo{}, rerr
+		}
+		c.markSeen(hash, seenEntry{retainedUntil: until})
 		c.markAdopted(hash)
 		c.dedupStorage.Add(1)
 		info.Deduped = true
@@ -930,6 +948,61 @@ func (c *CAS) GetChunkBytes(ctx context.Context, hash Hash) ([]byte, error) {
 	// seenCount blind to entries a later unmarkSeen would decrement.
 	c.markSeen(hash, seenEntry{})
 	return body, nil
+}
+
+// retentionExtendHeadroom is added to the deadline when ensureRetention
+// has to extend a lock under a MOVING deadline (RetainUntilFunc — the
+// long-lived `wal stream`). Without it every later reference of a hot
+// chunk (a zero page recurring in WAL) would pay one SetRetention per
+// segment as the deadline creeps forward by seconds; with it the chunk
+// is re-locked at most once per headroom. Holding a compliance chunk an
+// hour past its manifest is the safe direction. Bounded writers have a
+// fixed deadline, extend at most once per chunk, and get no headroom.
+const retentionExtendHeadroom = time.Hour
+
+// ensureRetention makes an ADOPTED chunk's WORM lock last at least as
+// long as the manifest about to reference it.
+//
+// A chunk this CAS writes is locked at Put time. A chunk it deduplicates
+// against is not written, so nothing touched its lock — and its lock is
+// whatever the backup that first wrote it asked for, possibly years ago
+// under a shorter policy. A new seven-year backup then references chunks
+// whose lock expires next month, after which they can be deleted while
+// the manifest that needs them is still immutable: a compliance backup
+// that is legally retained and physically unrestorable.
+//
+// have is the deadline this CAS already applied (zero = unknown, e.g. a
+// fresh adoption). Nothing to do when retention is not configured or
+// have already covers the current deadline. ErrUnsupported (a backend
+// without WORM that the operator explicitly accepted via
+// WithRetentionAllowUnenforced) is not an error: there is no lock to
+// extend. Any other failure fails the PutChunk — dedup must not adopt a
+// chunk into a retention promise it could not make. Note that S3 refuses
+// to SHORTEN a lock, so an object already locked beyond our deadline
+// surfaces here as a refusal too; the error says so.
+func (c *CAS) ensureRetention(ctx context.Context, hash Hash, have time.Time) (time.Time, error) {
+	if c.retention.IsZero() {
+		return time.Time{}, nil
+	}
+	need := c.retention.retainUntil()
+	if !have.IsZero() && !have.Before(need) {
+		return have, nil
+	}
+	until := need
+	if c.retention.RetainUntilFunc != nil {
+		until = need.Add(retentionExtendHeadroom)
+	}
+	if err := c.sp.SetRetention(ctx, ChunkKey(hash), until, c.retention.Mode); err != nil {
+		if errors.Is(err, storage.ErrUnsupported) {
+			return have, nil
+		}
+		return time.Time{}, fmt.Errorf("cas: chunk %s is already in the repository but its WORM retention "+
+			"could not be extended to %s (%w); deduplicating against it would reference a chunk whose lock "+
+			"may expire before this manifest's. Check the credentials allow setting object retention "+
+			"(s3:PutObjectRetention); a lock already longer than the new deadline is also refused by S3",
+			hash, until.UTC().Format(time.RFC3339), err)
+	}
+	return until, nil
 }
 
 // ensureAdoptable verifies, once per CAS, that a chunk already present
