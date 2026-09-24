@@ -58,8 +58,8 @@ func startLocalLogicalPG(t *testing.T) string {
 type idleSink struct{}
 
 func (idleSink) OnRecord(context.Context, logicalreceiver.Record) error { return nil }
-func (idleSink) SyncedLSN() pglogrepl.LSN                              { return 0 }
-func (idleSink) Flush(context.Context) error                           { return nil }
+func (idleSink) SyncedLSN() pglogrepl.LSN                               { return 0 }
+func (idleSink) Flush(context.Context) error                            { return nil }
 
 // A quiet publication on a busy database: the walsender decodes and
 // discards every change and sends only keepalives. The slot's
