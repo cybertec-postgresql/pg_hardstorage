@@ -793,7 +793,11 @@ func (c *CAS) GetChunkBytes(ctx context.Context, hash Hash) ([]byte, error) {
 		return nil, fmt.Errorf("cas: chunk %s: %w (stored bytes hash to %s)",
 			hash, storage.ErrChecksumMismatch, got)
 	}
-	c.seen.Store(hash, struct{}{})
+	// Through markSeen, never a bare Store: a restore reads every chunk
+	// of a backup through one CAS, and an uncounted Store grew the cache
+	// one entry per chunk read — O(chunks) memory — while leaving
+	// seenCount blind to entries a later unmarkSeen would decrement.
+	c.markSeen(hash)
 	return body, nil
 }
 
