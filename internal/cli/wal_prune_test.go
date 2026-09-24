@@ -174,6 +174,44 @@ func TestWalPrune_ApplyDeletesSegments(t *testing.T) {
 	}
 }
 
+// TestWalPrune_FailuresExitNonZero: a run that could not process every
+// segment must not exit 0. Cron and `wal prune --apply && repo gc
+// --apply` pipelines read the exit code, not the JSON counters; exit 0
+// with segments_failed > 0 told them retention had been enforced when it
+// had not. The body is still rendered first so monitoring keeps the
+// counters.
+func TestWalPrune_FailuresExitNonZero(t *testing.T) {
+	for _, mode := range []string{"--apply", "--dry-run-default"} {
+		t.Run(mode, func(t *testing.T) {
+			repoURL := initRepoForTest(t)
+			plantBackupAtCLI(t, repoURL, "db1", "db1.full.aaa",
+				"0/05000000", time.Now().Add(-1*time.Hour))
+			plantWALSegmentAtCLI(t, repoURL, "db1", 1,
+				"000000010000000000000001", "0/02000000",
+				time.Now().Add(-3*time.Hour))
+			// An end_lsn that does not parse: this segment fails.
+			plantWALSegmentAtCLI(t, repoURL, "db1", 1,
+				"000000010000000000000002", "not-an-lsn",
+				time.Now().Add(-3*time.Hour))
+
+			args := []string{"wal", "prune", "db1", "--repo", repoURL, "-o", "json"}
+			if mode == "--apply" {
+				args = append(args, "--apply")
+			}
+			stdout, stderr, exit := runCLI(t, args...)
+			if exit == int(output.ExitOK) {
+				t.Fatalf("exit 0 with a failed segment:\n%s", stdout)
+			}
+			if !strings.Contains(stderr, "repo.wal_prune.incomplete") {
+				t.Errorf("expected repo.wal_prune.incomplete:\n%s", stderr)
+			}
+			if !strings.Contains(stdout, `"segments_failed": 1`) {
+				t.Errorf("the result body (counters) must still be rendered:\n%s", stdout)
+			}
+		})
+	}
+}
+
 // TestWalPrune_KeepSinceFloor: --keep-since N keeps young segments
 // even when their LSN is below the frontier.
 func TestWalPrune_KeepSinceFloor(t *testing.T) {

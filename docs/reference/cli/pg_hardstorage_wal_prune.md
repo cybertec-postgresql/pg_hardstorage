@@ -32,6 +32,12 @@ primary rule (the plan's keep_wal_days).
 Chunks are NOT deleted by this command. Run 'pg_hardstorage repo
 gc --apply' afterwards to reclaim the now-orphan chunk bytes.
 
+Exits non-zero (repo.wal_prune.incomplete) when any segment could not
+be processed (segments_failed > 0), in dry-run and --apply alike; the
+result body with the per-segment failures is still written first.
+Gap records (wal/<deployment>/gaps/) and timeline histories are never
+treated as segments.
+
 ```
 pg_hardstorage wal prune <deployment> [flags]
 ```
