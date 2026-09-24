@@ -712,6 +712,17 @@ func Take(ctx context.Context, opts TakeOptions) (*Result, error) {
 			attribute.Bool("incremental", opts.Incremental != nil),
 		))
 	bbRes, err := basebackup.Run(bbCtx, replConn, bbOpts, sink)
+	if bbRes != nil && bbRes.WALSlotErr != "" {
+		// Without the temporary slot the WAL for this backup is not
+		// pinned; on a busy server it can be recycled before BASE_BACKUP
+		// sends it (backup.wal_recycled). Say why up front.
+		emit(output.NewEvent(output.SeverityWarning, "backup", "wal_slot_unavailable").
+			WithSubject(output.Subject{Deployment: opts.Deployment}).
+			WithBody(map[string]any{
+				"error": bbRes.WALSlotErr,
+				"hint":  "free a replication slot (max_replication_slots) or grant REPLICATION; until then --include-wal backups of a busy database may fail with backup.wal_recycled",
+			}))
+	}
 	if err != nil {
 		bbSpan.SetStatus(codes.Error, err.Error())
 		bbSpan.End()

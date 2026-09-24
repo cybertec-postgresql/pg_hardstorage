@@ -21,6 +21,19 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **`backup --include-wal` failed on a busy database.** `BASE_BACKUP`
+  sends the WAL written during the backup at the end, and nothing pinned
+  it meanwhile, so under sustained writes it was recycled first
+  (`backup.wal_recycled`). With the soak's write load finally kept alive,
+  that was 4 of 16 heavy-profile backups; in an A/B at ~5,000 tps with
+  minimal WAL retention the old binary failed 2/2 and the new one
+  succeeded 2/2, restoring to a consistent, promoted cluster with every
+  row. Each `--include-wal` backup now creates a TEMPORARY physical
+  replication slot with RESERVE_WAL on its own connection — as
+  `pg_basebackup -X stream` does — which the server drops when the
+  session ends. If no slot is available the backup proceeds as before
+  and warns (`backup.wal_slot_unavailable`).
+
 - **Four documented `pg_hardstorage.yaml` sections did not exist, and
   pasting any of them broke the whole configuration.** The monitoring
   guide's `observability:` block (tracing), the scaling guide's and

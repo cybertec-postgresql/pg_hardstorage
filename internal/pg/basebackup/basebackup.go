@@ -43,7 +43,9 @@ package basebackup
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"strconv"
@@ -159,6 +161,14 @@ type Result struct {
 	Stats         streaming.Stats
 	StartedAt     time.Time
 	StoppedAt     time.Time
+
+	// WALSlot names the temporary replication slot that pinned WAL for
+	// an IncludeWAL backup ("" when none was used). WALSlotErr is why
+	// one could not be created — the backup then proceeds unpinned,
+	// exactly as it did before slots were used, and may fail with
+	// backup.wal_recycled on a busy server.
+	WALSlot    string
+	WALSlotErr string
 }
 
 // ManifestSinkIndex is the Sink-callback "idx" reserved for the
@@ -186,6 +196,39 @@ func Run(ctx context.Context, c *pg.Conn, opts Options, sink Sink) (*Result, err
 	}
 	if sink == nil {
 		return nil, errors.New("basebackup: nil Sink")
+	}
+
+	// Pin WAL for the backup's whole duration when the backup is to
+	// carry its own WAL.
+	//
+	// BASE_BACKUP's WAL option sends the WAL written during the backup
+	// at the END. Nothing pins it meanwhile, so on a busy server it is
+	// recycled before it can be sent: PostgreSQL answers "requested WAL
+	// segment … has already been removed". Under a sustained ~900 tps
+	// load in the enterprise_heavy soak that was 4 of 16 --include-wal
+	// backups; wal_keep_size would have to cover everything written
+	// during a backup to avoid it.
+	//
+	// pg_basebackup solves the same problem with a temporary replication
+	// slot, and so does this. The slot is created on the backup's own
+	// replication connection with RESERVE_WAL, so its restart point
+	// precedes the backup's start LSN and every segment the backup needs
+	// is retained. TEMPORARY slots are dropped by the server when the
+	// session ends — on success, error or a killed client alike — so
+	// nothing is left behind to pin WAL forever.
+	//
+	// If no slot can be had (max_replication_slots exhausted, missing
+	// privilege) the backup proceeds as it always did; the reason is
+	// reported so an operator can see why a later wal_recycled happened.
+	res := &Result{}
+	if opts.IncludeWAL {
+		name := tempWALSlotName()
+		q := fmt.Sprintf("CREATE_REPLICATION_SLOT %s TEMPORARY PHYSICAL RESERVE_WAL", name)
+		if _, err := c.PgConn().Exec(ctx, q).ReadAll(); err != nil {
+			res.WALSlotErr = err.Error()
+		} else {
+			res.WALSlot = name
+		}
 	}
 
 	timeout := opts.InactivityTimeout
@@ -237,7 +280,7 @@ func Run(ctx context.Context, c *pg.Conn, opts Options, sink Sink) (*Result, err
 		return nil, fmt.Errorf("basebackup: send command: %w", err)
 	}
 
-	res := &Result{StartedAt: time.Now().UTC()}
+	res.StartedAt = time.Now().UTC()
 	if err := drive(ctx, reader, opts, sink, res); err != nil {
 		return res, err
 	}
@@ -769,4 +812,12 @@ func uploadIncrementalManifest(ctx context.Context, reader *streaming.Reader, ma
 				streaming.ErrUnexpectedMessage, msg)
 		}
 	}
+}
+
+// tempWALSlotName returns a unique, valid PostgreSQL identifier for the
+// per-backup temporary slot.
+func tempWALSlotName() string {
+	var b [6]byte
+	_, _ = rand.Read(b[:])
+	return "pg_hardstorage_bb_" + hex.EncodeToString(b[:])
 }
