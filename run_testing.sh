@@ -27,7 +27,8 @@
 #                      testkit-internal 0.2)
 #   --retention-interval D
 #                      pause the fleet for rotate + gc every D (default
-#                      testkit-internal 15m; negative disables)
+#                      testkit-internal 15m; a negative duration
+#                      such as -1s disables)
 #   --max-containers N soak the whole matrix in sequential batches,
 #                      never exceeding N containers at once (one cell
 #                      = 1 PG + 1 toxiproxy container, so a batch
@@ -40,6 +41,9 @@
 #   --dry-run          drive the orchestrator against fake cells
 #                      (no PG, no Docker required)
 #   --keep-on-failure  preserve containers + bundle for forensics
+#   --keep-repo        keep the backup repository (report-dir/repo-data)
+#                      after a PASSING run; by default it is removed,
+#                      since only a failed run needs it for forensics
 #   --skip-mem-check   skip the host-RAM preflight (see issue #46)
 #   --help             this message
 #
@@ -104,6 +108,7 @@ NO_BUILD=0
 NO_UP=0
 DRY_RUN=0
 KEEP_ON_FAILURE=0
+KEEP_REPO=0
 PARALLEL=1
 HOST_PORT_BASE=15432
 PROFILE="oltp_smoke"
@@ -136,6 +141,7 @@ while [[ $# -gt 0 ]]; do
         --no-up) NO_UP=1; shift ;;
         --dry-run) DRY_RUN=1; shift ;;
         --keep-on-failure) KEEP_ON_FAILURE=1; shift ;;
+        --keep-repo) KEEP_REPO=1; shift ;;
         --skip-mem-check) SKIP_MEM_CHECK=1; shift ;;
         --help|-h) usage 0 ;;
         *) echo "unknown option: $1" >&2; usage 2 ;;
@@ -300,6 +306,7 @@ if [[ "$CELLS_PER_BATCH" -gt 0 ]]; then
         [[ "$NO_UP" -eq 1 ]]           && forward+=(--no-up)
         [[ "$DRY_RUN" -eq 1 ]]         && forward+=(--dry-run)
         [[ "$KEEP_ON_FAILURE" -eq 1 ]] && forward+=(--keep-on-failure)
+        [[ "$KEEP_REPO" -eq 1 ]]       && forward+=(--keep-repo)
         [[ -n "$PROFILE" && "$PROFILE" != "oltp_smoke" ]] && forward+=(--profile "$PROFILE")
         [[ -n "$FAULT_RATE" ]]         && forward+=(--fault-rate "$FAULT_RATE")
         [[ -n "$RETENTION_INTERVAL" ]] && forward+=(--retention-interval "$RETENTION_INTERVAL")
@@ -389,6 +396,7 @@ if [[ "$PARALLEL" -gt 1 ]]; then
         [[ "$NO_UP" -eq 1 ]]            && forward+=(--no-up)
         [[ "$DRY_RUN" -eq 1 ]]          && forward+=(--dry-run)
         [[ "$KEEP_ON_FAILURE" -eq 1 ]]  && forward+=(--keep-on-failure)
+        [[ "$KEEP_REPO" -eq 1 ]]        && forward+=(--keep-repo)
         [[ -n "$PROFILE" && "$PROFILE" != "oltp_smoke" ]] && forward+=(--profile "$PROFILE")
         [[ -n "$FAULT_RATE" ]]          && forward+=(--fault-rate "$FAULT_RATE")
         [[ -n "$RETENTION_INTERVAL" ]]  && forward+=(--retention-interval "$RETENTION_INTERVAL")
@@ -742,8 +750,28 @@ cleanup() {
             note "Soak failed; preserving containers (project=$PROJECT) for forensics."
             note "Tear down manually: docker compose -f $COMPOSE_PATH -p $PROJECT down -v"
         else
+            # A passing run's repository is dead weight — tens of GB per
+            # heavy soak, owned by the container uid so the host account
+            # cannot remove it (see HOST-READING-THIS-DIR.txt). Aborted
+            # and passing runs accumulated ~300 GB of it in one day and
+            # starved the next soak of disk. Remove it through one of the
+            # run's own images (as root, no network) unless --keep-repo;
+            # a failed run keeps it for forensics.
+            local img=""
+            if [[ "$rc" -eq 0 && "$KEEP_REPO" -eq 0 ]]; then
+                img=$(docker compose -f "$COMPOSE_PATH" -p "$PROJECT" config --images 2>/dev/null \
+                    | grep -m1 testbed || true)
+            fi
             note "docker compose down -v"
             docker compose -f "$COMPOSE_PATH" -p "$PROJECT" down -v --remove-orphans || true
+            if [[ -n "$img" ]]; then
+                note "soak passed; removing its repository $HOST_REPO_DIR (--keep-repo keeps it)"
+                docker run --rm -u 0 --network none --entrypoint sh \
+                    -v "$HOST_REPO_DIR":/r "$img" -c 'find /r -mindepth 1 -delete' \
+                    || note "could not remove $HOST_REPO_DIR — see HOST-READING-THIS-DIR.txt there"
+            elif [[ "$rc" -eq 0 && "$KEEP_REPO" -eq 0 ]]; then
+                note "soak passed, but no testbed image found to remove $HOST_REPO_DIR as root; left in place"
+            fi
         fi
     fi
     return "$rc"

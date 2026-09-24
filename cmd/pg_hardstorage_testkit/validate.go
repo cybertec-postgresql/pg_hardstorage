@@ -250,7 +250,7 @@ fleet.`,
 	c.Flags().IntVar(&verifyEvery, "verify-every", 25,
 		"restore-verify every N iterations")
 	c.Flags().DurationVar(&retentionEvery, "retention-interval", 0,
-		"pause the fleet for rotate + gc this often (0 = 15m default, negative disables)")
+		"pause the fleet for rotate + gc this often (0 = 15m default, negative such as -1s disables)")
 	c.Flags().DurationVar(&iterInterval, "iter-interval", 10*time.Second,
 		"sleep between iterations")
 	c.Flags().IntVar(&hostPortBase, "host-port-base", 15432,
