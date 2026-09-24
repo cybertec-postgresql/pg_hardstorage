@@ -1954,6 +1954,10 @@ func restoreIncrementalChain(ctx context.Context, opts Options, sp storage.Stora
 			return nil, output.NewError("internal",
 				fmt.Sprintf("restore chain: clean stale link dir %q: %v", linkDir, err)).Wrap(err)
 		}
+		if err := os.RemoveAll(chainTablespaceStagingRoot(linkDir)); err != nil && !errors.Is(err, stdfs.ErrNotExist) {
+			return nil, output.NewError("internal",
+				fmt.Sprintf("restore chain: clean stale tablespace staging for %q: %v", linkDir, err)).Wrap(err)
+		}
 		if err := os.MkdirAll(linkDir, 0o700); err != nil {
 			return nil, output.NewError("internal",
 				fmt.Sprintf("restore chain: mkdir link dir: %v", err)).Wrap(err)
@@ -2065,14 +2069,16 @@ func restoreIncrementalChain(ctx context.Context, opts Options, sp storage.Stora
 		PGCombineBackupPath: combineBin,
 		InputDirs:           inputDirs,
 		OutputDir:           combineOut,
-		// ExtraArgs flows the operator's tablespace remap
-		// through to pg_combinebackup as
-		// --tablespace-mapping=OLD=NEW. Empty when no
-		// remap was requested. pg_combinebackup itself
-		// rewrites the OUTPUT dir's tablespace_map AND
-		// creates symlinks under pg_tblspc/, so we don't
-		// need to pre-rewrite the staging dirs.
-		ExtraArgs: opts.TablespaceRemap.ToCombineArgs(),
+		// Every tablespace of the leaf is staged per link (see
+		// materializeManifestInto), so pg_combinebackup would by
+		// default write the merged tablespace back into the LEAF's
+		// staging dir. Map each one from there to its real
+		// destination — the recorded location, or the operator's
+		// --tablespace-mapping target. pg_combinebackup's olddir is
+		// the tablespace path as it exists in the final input, so
+		// the operator's OLD=NEW (original locations) cannot be
+		// passed through verbatim.
+		ExtraArgs: chainTablespaceCombineArgs(leaf, inputDirs[len(inputDirs)-1], opts.TablespaceRemap),
 		Stderr:    &stderr,
 	}); err != nil {
 		combineSpan.SetStatus(codes.Error, err.Error())
@@ -2347,11 +2353,18 @@ func materializeManifestInto(ctx context.Context, cas *repo.CAS, m *backup.Manif
 	// incremental-lifecycle integration test first ran end-to-
 	// end against a real PG.  Idempotent: MkdirAll on an
 	// existing dir is a no-op.
+	tsRoots := chainTablespaceRoots(m, dir)
 	for _, d := range m.Dirs {
 		if d.Path == "" {
 			continue
 		}
-		full, err := safeJoinTarget(dir, d.Path)
+		// A tablespace's empty dirs belong under its staging root,
+		// like its files (see below).
+		root, err := fileDestRoot(dir, tsRoots, d.TablespaceOID)
+		if err != nil {
+			return totalBytes, totalChunks, err
+		}
+		full, err := safeJoinTarget(root, d.Path)
 		if err != nil {
 			return totalBytes, totalChunks,
 				fmt.Errorf("chain materialise: dir %s: %w", d.Path, err)
@@ -2366,23 +2379,46 @@ func materializeManifestInto(ctx context.Context, cas *repo.CAS, m *backup.Manif
 		}
 	}
 
+	// Non-default tablespaces: pg_combinebackup takes plain-format
+	// inputs, where each tablespace is reached through a
+	// pg_tblspc/<oid> symlink to that backup's own copy of it. Stage
+	// each link's tablespace files in a per-link directory (never the
+	// real destination: every link has its own version of the same
+	// relative paths) and point the link's pg_tblspc/<oid> at it. A
+	// file's Path is relative to its tablespace root, so writing it
+	// under the link root instead — as this used to — misplaced the
+	// data and let same-named files of different tablespaces
+	// overwrite each other, while pg_combinebackup never saw the
+	// tablespace at all.
 	for i := range m.Files {
 		if err := ctx.Err(); err != nil {
 			return totalBytes, totalChunks, err
 		}
-		bw, ck, err := materializeFile(ctx, cas, dir, &m.Files[i])
+		root, err := fileDestRoot(dir, tsRoots, m.Files[i].TablespaceOID)
+		if err != nil {
+			return totalBytes, totalChunks, err
+		}
+		bw, ck, err := materializeFile(ctx, cas, root, &m.Files[i])
 		if err != nil {
 			return totalBytes, totalChunks, err
 		}
 		totalBytes += bw
 		totalChunks += ck
 	}
+	if err := writeTablespaceSymlinks(dir, tsRoots); err != nil {
+		return totalBytes, totalChunks, err
+	}
 	if m.BackupLabel != "" {
 		if err := writeSpecial(dir, "backup_label", []byte(m.BackupLabel)); err != nil {
 			return totalBytes, totalChunks, err
 		}
 	}
-	if m.TablespaceMap != "" {
+	// tablespace_map is deliberately NOT written into a staged link:
+	// plain-format backups carry symlinks instead, and a map naming
+	// the ORIGINAL locations would travel into the merged output and
+	// make PostgreSQL re-point pg_tblspc there at startup, undoing the
+	// symlinks pg_combinebackup wrote to the real destinations.
+	if m.TablespaceMap != "" && len(tsRoots) == 0 {
 		if err := writeSpecial(dir, "tablespace_map", []byte(m.TablespaceMap)); err != nil {
 			return totalBytes, totalChunks, err
 		}
@@ -2404,6 +2440,43 @@ func materializeManifestInto(ctx context.Context, cas *repo.CAS, m *backup.Manif
 		return totalBytes, totalChunks, err
 	}
 	return totalBytes, totalChunks, nil
+}
+
+// chainTablespaceStagingRoot is where a staged chain link keeps its
+// non-default tablespaces: a sibling of the link dir (so a wipe of
+// one cannot reach into the other), one subdirectory per OID.
+func chainTablespaceStagingRoot(linkDir string) string {
+	return linkDir + ".tblspc"
+}
+
+// chainTablespaceRoots maps each non-default tablespace of m (the
+// ones tablespaceDestRoots would restore outside PGDATA) to its
+// per-link staging directory under linkDir.
+func chainTablespaceRoots(m *backup.Manifest, linkDir string) map[uint32]string {
+	out := map[uint32]string{}
+	for oid := range tablespaceDestRoots(m, nil) {
+		out[oid] = filepath.Join(chainTablespaceStagingRoot(linkDir), strconv.FormatUint(uint64(oid), 10))
+	}
+	return out
+}
+
+// chainTablespaceCombineArgs returns pg_combinebackup
+// --tablespace-mapping flags moving each of the leaf's tablespaces
+// from its staging dir in the final input (leafDir) to its real
+// destination (recorded location, after the operator's remap).
+func chainTablespaceCombineArgs(leaf *backup.Manifest, leafDir string, remap TablespaceRemap) []string {
+	staged := chainTablespaceRoots(leaf, leafDir)
+	dests := tablespaceDestRoots(leaf, remap)
+	oids := make([]uint32, 0, len(dests))
+	for oid := range dests {
+		oids = append(oids, oid)
+	}
+	sort.Slice(oids, func(i, j int) bool { return oids[i] < oids[j] })
+	out := make([]string, 0, len(oids))
+	for _, oid := range oids {
+		out = append(out, fmt.Sprintf("--tablespace-mapping=%s=%s", staged[oid], dests[oid]))
+	}
+	return out
 }
 
 // sumFileCount totals the FileEntry count across every chain link.
