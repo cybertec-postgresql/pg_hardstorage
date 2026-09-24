@@ -234,6 +234,12 @@ retention floor, then WAL-G retires.
   KEK never leaves the KMS provider; chunks are encrypted
   at rest with a per-backup DEK that's wrapped under the
   KEK in the manifest.
+- **`wal-fetch` exit codes.** As `restore_command`, the shim
+  exits **1** only when the segment is genuinely absent
+  (PostgreSQL's end-of-archive signal).  Any other failure —
+  S3 5xx, expired credentials, a broken `WALG_*` setting, bad
+  argv — exits **126**, so PostgreSQL aborts recovery instead
+  of promoting with WAL still unreplayed.
 
 ## Troubleshooting
 

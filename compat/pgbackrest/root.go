@@ -128,16 +128,33 @@ playbook.`,
 // convention.  Other failures exit 1.
 func Execute() int {
 	root := NewRoot()
-	if err := root.Execute(); err != nil {
+	cmd, err := root.ExecuteC()
+	if err != nil {
 		// --version already wrote its line to stdout; the sentinel only
 		// exists to stop cobra continuing into a verb.
 		if errors.Is(err, errVersionPrinted) {
 			return 0
 		}
 		fmt.Fprintln(os.Stderr, err)
-		return ExitCode(err)
+		return exitCodeFor(cmd, err)
 	}
 	return 0
+}
+
+// exitCodeFor maps a failed invocation to its process status.
+// archive-get is PostgreSQL's restore_command, where every plain
+// nonzero exit (1 AND the refusal code 2) reads as "end of archive,
+// promote". Anything but the explicit segment-absent answer — a
+// refused flag, wrong argc, an unknown flag — never established that
+// the segment is missing, so it must abort recovery instead.
+func exitCodeFor(cmd *cobra.Command, err error) int {
+	if cmd != nil && cmd.Name() == "archive-get" {
+		if se, ok := err.(*shimError); ok && se.exitCode == exitSegmentAbsent {
+			return exitSegmentAbsent
+		}
+		return exitAbortRecovery
+	}
+	return ExitCode(err)
 }
 
 // errVersionPrinted unwinds cobra after `--version` has printed. It is

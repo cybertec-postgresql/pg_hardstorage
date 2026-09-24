@@ -135,6 +135,13 @@ divergence.
 `--archive-async` and friends silently drop because native
 streaming is already async via the replication slot.
 
+`archive-get` (your `restore_command`) exits **1** only when
+the segment is genuinely absent from the repository — PostgreSQL's
+end-of-archive signal.  Every other failure (storage outage,
+stanza missing from `pg_hardstorage.yaml`, a refused flag, bad
+argv) exits **126**, which makes PostgreSQL abort recovery
+instead of promoting with WAL still unreplayed.
+
 After the shim is wired, the rest of the cutover (steps 1-8
 below) proceeds exactly as documented — the shim simply
 replaces the pgBackRest binary, not the migration model.
