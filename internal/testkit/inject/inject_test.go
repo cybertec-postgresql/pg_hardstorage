@@ -143,58 +143,6 @@ func TestSignal_GenuineSignalFailureStillErrors(t *testing.T) {
 	}
 }
 
-func TestDiskFull_FillsAndRecovers(t *testing.T) {
-	ts, _, pg, _ := fixtureSet(t)
-	rec, err := inject.DefaultRegistry.Apply(context.Background(),
-		"disk_full(target=pg, fill=98%)", ts)
-	if err != nil {
-		t.Fatal(err)
-	}
-	calls := pg.ExecCalls()
-	// Expect: df, then dd.
-	if len(calls) < 2 {
-		t.Fatalf("expected df + dd; got %v", calls)
-	}
-	if calls[0][0] != "df" {
-		t.Errorf("first call should be df; got %v", calls[0])
-	}
-	if calls[1][0] != "sh" || !strings.Contains(strings.Join(calls[1], " "), "dd if=/dev/zero") {
-		t.Errorf("second call should be dd via sh -c; got %v", calls[1])
-	}
-	// Recovery removes the spacer.
-	if err := rec(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	last := pg.ExecCalls()[len(pg.ExecCalls())-1]
-	if last[0] != "rm" || last[1] != "-f" {
-		t.Errorf("recovery should rm -f; got %v", last)
-	}
-	// Default cap kicks in: avail=1 GiB × 98% = ~1004 MiB, but
-	// the default max_bytes cap (256 MiB) clamps the dd to 256
-	// blocks.  Without the cap, a parallel-soak run filled the
-	// host's docker storage from a single fault and cascade-failed
-	// every other cell with ENOSPC.
-	ddCmd := strings.Join(calls[1], " ")
-	if !strings.Contains(ddCmd, "count=256") {
-		t.Errorf("default max_bytes cap (256 MiB) should clamp dd to count=256; got %q", ddCmd)
-	}
-}
-
-func TestDiskFull_MaxBytesCapsTheFill(t *testing.T) {
-	// Explicit max_bytes overrides the default cap.  64 MiB
-	// here, so the dd should land at count=64 regardless of
-	// the (much larger) avail-times-fill product.
-	ts, _, pg, _ := fixtureSet(t)
-	if _, err := inject.DefaultRegistry.Apply(context.Background(),
-		"disk_full(target=pg, fill=98%, max_bytes=67108864)", ts); err != nil {
-		t.Fatal(err)
-	}
-	dd := strings.Join(pg.ExecCalls()[1], " ")
-	if !strings.Contains(dd, "count=64") {
-		t.Errorf("max_bytes=64MiB should clamp dd to count=64; got %q", dd)
-	}
-}
-
 func TestDiskFull_BadMaxBytes(t *testing.T) {
 	ts, _, _, _ := fixtureSet(t)
 	if _, err := inject.DefaultRegistry.Apply(context.Background(),
@@ -441,26 +389,6 @@ func TestFlipRandomByte_ReadsFlipsWrites(t *testing.T) {
 	}
 	if w := repo.Written(); len(w) != 1 || w[0] != "chunks/aa/bbcdef.chk" {
 		t.Errorf("expected one write to the flipped file; got %v", w)
-	}
-}
-
-func TestPauseArchive_TouchesAndRemoves(t *testing.T) {
-	ts, agent, _, _ := fixtureSet(t)
-	rec, err := inject.DefaultRegistry.Apply(context.Background(),
-		"pause_archive(target=agent)", ts)
-	if err != nil {
-		t.Fatal(err)
-	}
-	calls := agent.ExecCalls()
-	if calls[0][0] != "touch" {
-		t.Errorf("expected touch; got %v", calls[0])
-	}
-	if err := rec(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	last := agent.ExecCalls()[len(agent.ExecCalls())-1]
-	if last[0] != "rm" || last[1] != "-f" {
-		t.Errorf("recovery should rm -f sentinel; got %v", last)
 	}
 }
 

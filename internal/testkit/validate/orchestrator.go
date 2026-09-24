@@ -495,6 +495,14 @@ func runCellLoop(
 					// product failure. Same skip class as cell-down.
 					emit(Event{Cell: cr.Name, Op: "fault_skipped_limit_unreachable",
 						Iteration: iter, Detail: fault.Action})
+				case err != nil && errors.Is(err, inject.ErrNotApplicable):
+					// The fault cannot produce its effect here (disk_full
+					// whose capped spill cannot fill a large filesystem,
+					// pause_archive with no archiver running). Not applied
+					// and not a failure — but never counted as a fault the
+					// product survived, which is what these used to be.
+					emit(Event{Cell: cr.Name, Op: "fault_skipped_not_applicable",
+						Iteration: iter, Detail: fault.Action, Err: err.Error()})
 				case err != nil:
 					cr.FaultApplyFails++
 					emit(Event{Cell: cr.Name, Op: "fault_apply_failed",
