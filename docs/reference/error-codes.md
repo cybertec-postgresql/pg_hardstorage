@@ -60,7 +60,7 @@ Common leaf shapes:
 | `usage.bad_flag`, `usage.bad_flags` | Flag value parse failed |
 | `usage.flag` | Unknown flag (`unknown flag: --x`) — the commonest usage error |
 | `usage.bad_args`, `usage.bad_arg`, `usage.bad_set` | Wrong number or shape of positional arguments |
-| `usage.missing_*` | Required input absent (`missing_repo_url`, `missing_deployment`, `missing_signer`, `missing_target_dir`, …) |
+| `usage.missing_*` | Required input absent (`missing_repo_url`, `missing_deployment`, `missing_signer`, `missing_target_dir`, `missing_trusted_key`, …) |
 | `usage.bad_lsn`, `usage.bad_target_lsn`, `usage.unaligned_lsn` | LSN parse / alignment refused |
 | `usage.bad_time`, `usage.bad_until`, `usage.bad_schedule` | Time / cron parse refused |
 | `usage.bad_token`, `usage.bad_key_file`, `usage.bad_approver_key` | Cryptographic input did not parse |
@@ -176,6 +176,8 @@ treat any `verify.*` exit as an alert.
 | `verify.envelope_break` | Envelope-encryption tag did not validate |
 | `verify.replica_inconsistent`, `verify.replica_identity_mismatch` | Cross-region replica disagrees with primary |
 | `verify.audit_anchor_mismatch`, `verify.audit_chain_broken` | Audit hash chain is broken |
+| `verify.bundle_invalid` | `audit verify-bundle`: signature, layout or chain check failed |
+| `verify.bundle_untrusted_signer` | `audit verify-bundle`: the bundle is internally consistent but signed by a key outside the trust set (this host's keyring key, or `--trusted-key` / `--trusted-fingerprint`) |
 | `verify.residency_violation` | Data-residency policy refused the action |
 | `verify.wal_gap_detected` | A Patroni-failover WAL gap covers the requested PITR window |
 | `verify.heal_incomplete`, `verify.integrity_issues`, `verify.insider_findings` | Resilience checks surfaced findings |

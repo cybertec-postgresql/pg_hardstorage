@@ -610,7 +610,56 @@ const (
 //
 // Returns the decoded BundleManifest on success; error on
 // signature failure or chain-break.
+//
+// VerifyBundle alone proves only "signed by whoever ships in this
+// tarball": the key it checks against travels INSIDE the bundle, so a
+// forger who rewrites the events and re-signs under a fresh key passes.
+// Callers answering "is this evidence genuine?" must use
+// VerifyBundleWithOptions with a trust set.
 func VerifyBundle(r io.Reader) (*BundleManifest, error) {
+	return VerifyBundleWithOptions(r, VerifyBundleOptions{})
+}
+
+// VerifyBundleOptions pins which signers a bundle may come from.
+type VerifyBundleOptions struct {
+	// TrustedKeys and TrustedFingerprints together form the trust set:
+	// the key that validated the signature must equal a TrustedKey or
+	// match a TrustedFingerprint (the full lowercase hex SHA-256 of the
+	// raw key, or its 16-hex prefix as printed in the manifest). Both
+	// empty = no trust check (the VerifyBundle behaviour).
+	TrustedKeys         []ed25519.PublicKey
+	TrustedFingerprints []string
+}
+
+// ErrBundleSignerUntrusted is returned (wrapped) when a bundle's
+// signature and chain verify but its signer is not in the trust set.
+// The manifest is returned alongside so the caller can report what was
+// found; it must not be treated as verified evidence.
+var ErrBundleSignerUntrusted = errors.New("audit: bundle signature is valid but the signing key is not trusted")
+
+// trusts reports whether pub is in the trust set.
+func (o VerifyBundleOptions) trusts(pub ed25519.PublicKey) bool {
+	for _, k := range o.TrustedKeys {
+		if bytes.Equal(k, pub) {
+			return true
+		}
+	}
+	sum := sha256.Sum256(pub)
+	full := hex.EncodeToString(sum[:])
+	for _, fp := range o.TrustedFingerprints {
+		fp = strings.ToLower(strings.TrimSpace(fp))
+		if fp != "" && (fp == full || fp == full[:16]) {
+			return true
+		}
+	}
+	return false
+}
+
+// VerifyBundleWithOptions is VerifyBundle plus signer trust: after the
+// signature and chain checks pass, the signing key must be in the
+// trust set (when one is given), else the manifest is returned with a
+// wrapped ErrBundleSignerUntrusted.
+func VerifyBundleWithOptions(r io.Reader, opts VerifyBundleOptions) (*BundleManifest, error) {
 	gz, err := gzip.NewReader(r)
 	if err != nil {
 		return nil, fmt.Errorf("audit: open gzip: %w", err)
@@ -751,6 +800,13 @@ func VerifyBundle(r io.Reader) (*BundleManifest, error) {
 		return nil, ierr
 	}
 	manifest.Integrity = &integ
+
+	// Signer trust, last: everything above only shows the bundle is
+	// internally consistent under the key it carries.
+	if (len(opts.TrustedKeys) > 0 || len(opts.TrustedFingerprints) > 0) && !opts.trusts(pub) {
+		sum := sha256.Sum256(pub)
+		return &manifest, fmt.Errorf("%w (signer fingerprint %s)", ErrBundleSignerUntrusted, hex.EncodeToString(sum[:]))
+	}
 	return &manifest, nil
 }
 
