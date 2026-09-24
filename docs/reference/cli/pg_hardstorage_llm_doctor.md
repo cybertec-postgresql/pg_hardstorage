@@ -22,11 +22,12 @@ doctor verifies the LLM helper's plumbing end-to-end:
   - cheatsheet drift guard passes against the live cobra tree
   - validator catches a planted invalid command
   - hot-command paths all resolve in the catalog
-  - a known-good probe round-trips to the provider
+  - a known-good probe round-trips to the provider (the child probe
+    inherits --provider / --endpoint / --model)
 
-Each check returns pass/fail with a one-line summary.  Exits
-non-zero when any check fails.  Read-only and cheap; safe to
-run in CI.
+Each check returns pass/fail with a one-line summary.  Exits 1
+(runtime failure, not 2 = misuse) when any check fails.
+Read-only and cheap; safe to run in CI.
 
 ```
 pg_hardstorage llm doctor [flags]

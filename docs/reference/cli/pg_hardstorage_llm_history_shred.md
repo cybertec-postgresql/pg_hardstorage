@@ -21,9 +21,10 @@ pg_hardstorage llm history shred [flags]
 ### Options
 
 ```
-  -h, --help               help for shred
-      --principal string   operator principal (default: $USER)
-      --yes                acknowledge that the deletion is irreversible (no backup of these transcripts is taken anywhere — they live only on the operator's host)
+  -h, --help                      help for shred
+      --history-key-file string   path to the 32-byte hex key file the transcripts were recorded with (as passed to llm chat --history-key-file); default: derive from the local KEK
+      --principal string          operator principal (default: $USER)
+      --yes                       acknowledge that the deletion is irreversible (no backup of these transcripts is taken anywhere — they live only on the operator's host)
 ```
 
 ### Options inherited from parent commands

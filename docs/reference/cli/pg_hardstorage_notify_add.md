@@ -26,7 +26,11 @@ Common configurations:
   notify add syslog   --set protocol=tcp --set address=siem.example.com:6514
 
 --set values are passed verbatim into the sink's config map; the
-plugin's builder validates them.
+plugin's builder validates them.  Commas are part of the value (no
+splitting).  Repeating a key builds a list, e.g. for email recipients:
+
+  notify add email --set smtp_host=smtp.example.com --set from=pgh@example.com \
+                   --set to=ops@example.com --set to=dba@example.com
 
 Re-adding a sink with the same name replaces the existing entry —
 unless --no-replace is set, in which case a duplicate name is
@@ -42,7 +46,7 @@ pg_hardstorage notify add <plugin> [--name <id>] [--set key=value ...] [flags]
   -h, --help                  help for add
       --min-severity string   convenience for --set min_severity=<level>
       --name string           operator-chosen sink name (default: plugin name)
-      --set strings           key=value pairs to merge into the sink's config (repeatable)
+      --set stringArray       key=value pair to merge into the sink's config (repeatable; repeat a key to build a list, e.g. --set to=a@x --set to=b@x)
       --yes                   replace an existing sink with the same name without confirmation
 ```
 
