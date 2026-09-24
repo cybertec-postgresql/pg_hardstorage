@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -136,6 +138,46 @@ func TestStreamRead_HonoursContext(t *testing.T) {
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("Read still blocked 10s after its context was cancelled")
+	}
+}
+
+// TestReapStaging_RemovesLeakedTemps pins M32 for scp: a Put that died
+// between upload and commit left "<key>.hstmp-*" behind, hidden from
+// List and never removed.
+func TestReapStaging_RemovesLeakedTemps(t *testing.T) {
+	srv := startExecServer(t)
+	p := openExecPlugin(t, srv.addr, srv.hostPub)
+	ctx := context.Background()
+	if _, err := p.Put(ctx, "chunks/aa/real", strings.NewReader("keep"), storage.PutOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-48 * time.Hour)
+	stale := filepath.Join(p.root, "chunks/aa/bb.hstmp-0123456789abcdef")
+	fresh := filepath.Join(p.root, "chunks/aa/cc.hstmp-fedcba9876543210")
+	for _, f := range []string{stale, fresh} {
+		if err := os.WriteFile(f, []byte("leaked"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Chtimes(stale, old, old); err != nil {
+		t.Fatal(err)
+	}
+
+	st, err := storage.ReapStagingOf(ctx, p, storage.DefaultStagingReapAge)
+	if err != nil {
+		t.Fatalf("ReapStagingOf: %v", err)
+	}
+	if st.Removed != 1 || st.Bytes != int64(len("leaked")) {
+		t.Errorf("stats = %+v, want 1 removed / 6 bytes", st)
+	}
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Error("stale staging temp survived")
+	}
+	if _, err := os.Stat(fresh); err != nil {
+		t.Errorf("fresh staging temp (a live writer's) was reaped: %v", err)
+	}
+	if _, err := p.Stat(ctx, "chunks/aa/real"); err != nil {
+		t.Errorf("real object reaped: %v", err)
 	}
 }
 

@@ -169,6 +169,76 @@ func isFSStagingName(name string) bool {
 		strings.Contains(name, ".excl-")
 }
 
+// isReapableStagingName is the subset of isFSStagingName the staging
+// reaper may delete: names this backend's own writers produce. The
+// bare ".tmp" suffix is left alone — it is not ours to judge.
+func isReapableStagingName(name string) bool {
+	return strings.Contains(name, ".hstmp-") ||
+		strings.Contains(name, ".deferred-") ||
+		strings.Contains(name, ".excl-")
+}
+
+// ReapStaging implements storage.StagingReapAware: it removes staging
+// temps (see isReapableStagingName) last modified more than olderThan
+// ago — the leftovers of a writer that died between staging and
+// publishing. List hides these names, so nothing else ever finds them.
+// Deferred chunks this process has staged but not yet published are
+// spared whatever their age; Barrier still needs them.
+func (p *Plugin) ReapStaging(ctx context.Context, olderThan time.Duration) (storage.ReapStats, error) {
+	var st storage.ReapStats
+	if p.root == "" {
+		return st, errors.New("fs: plugin not opened")
+	}
+	p.mu.Lock()
+	pending := make(map[string]bool, len(p.deferred))
+	for _, dw := range p.deferred {
+		pending[dw.staging] = true
+	}
+	p.mu.Unlock()
+	cutoff := time.Now().Add(-olderThan)
+	dirs := map[string]bool{}
+	err := filepath.WalkDir(p.root, func(path string, d stdfs.DirEntry, err error) error {
+		if cerr := ctx.Err(); cerr != nil {
+			return cerr
+		}
+		if err != nil {
+			if errors.Is(err, stdfs.ErrNotExist) {
+				return nil
+			}
+			return err
+		}
+		if d.IsDir() || !isReapableStagingName(d.Name()) || pending[path] {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			if errors.Is(err, stdfs.ErrNotExist) {
+				return nil
+			}
+			return err
+		}
+		if !info.ModTime().Before(cutoff) {
+			return nil
+		}
+		if err := os.Remove(path); err != nil {
+			if errors.Is(err, stdfs.ErrNotExist) {
+				return nil
+			}
+			return fmt.Errorf("fs: reap staging %q: %w", path, err)
+		}
+		st.Removed++
+		st.Bytes += info.Size()
+		dirs[filepath.Dir(path)] = true
+		return nil
+	})
+	for dir := range dirs {
+		if serr := syncDir(dir); serr != nil && err == nil {
+			err = serr
+		}
+	}
+	return st, err
+}
+
 // randHex returns 16 hex chars of crypto-random for staging-temp
 // names — collision-free in practice, and O_EXCL guards the rest.
 func randHex() string {

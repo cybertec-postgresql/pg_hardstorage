@@ -556,6 +556,43 @@ func (p *Plugin) RenameIfNotExists(ctx context.Context, src, dst string) error {
 	return nil
 }
 
+// ReapStaging implements storage.StagingReapAware: it removes
+// "<key>.hstmp-<rand>" temps under the repo root last modified more
+// than olderThan ago — left by a Put whose process or connection died
+// between the upload and the commit. List hides these names, so
+// nothing else ever finds them.
+func (p *Plugin) ReapStaging(ctx context.Context, olderThan time.Duration) (storage.ReapStats, error) {
+	var st storage.ReapStats
+	if err := p.assertOpen(); err != nil {
+		return st, err
+	}
+	out, err := p.runShell(ctx, reapStagingCommand(p.root, olderThan))
+	// Count what was removed even when find failed part way.
+	for _, line := range strings.Split(out, "\n") {
+		n, perr := strconv.ParseInt(strings.TrimSpace(line), 10, 64)
+		if perr != nil {
+			continue
+		}
+		st.Removed++
+		st.Bytes += n
+	}
+	if err != nil {
+		return st, fmt.Errorf("scp: reap staging: %w", err)
+	}
+	return st, nil
+}
+
+// reapStagingCommand prints the size of, then deletes, every staging
+// temp under root older than olderThan (rounded up to whole minutes:
+// -mmin +N is "more than N minutes").
+func reapStagingCommand(root string, olderThan time.Duration) string {
+	mins := int64((olderThan + time.Minute - 1) / time.Minute)
+	q := shellQuote(root)
+	return "if [ ! -e " + q + " ]; then exit 0; fi; " +
+		"find " + q + " -type f -name '*.hstmp-*' -mmin +" + strconv.FormatInt(mins, 10) +
+		` -printf '%s\n' -delete`
+}
+
 // SetRetention is unsupported on plain SSH-exec — there's no
 // regulatory-grade WORM concept to surface.
 func (p *Plugin) SetRetention(ctx context.Context, key string, until time.Time, mode storage.WORMMode) error {

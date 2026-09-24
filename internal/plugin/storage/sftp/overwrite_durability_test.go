@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	gosftp "github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
@@ -109,6 +110,40 @@ func TestPut_OverwriteIsAtomicReplace(t *testing.T) {
 	}
 	if got := readAll(t, p, "locks/lease"); got != "v2" {
 		t.Errorf("content = %q, want v2", got)
+	}
+}
+
+// TestReapStaging_RemovesLeakedTemps pins M32 for sftp: a Put that
+// died between upload and commit left "<key>.hstmp-*" behind, hidden
+// from List and never removed. (The in-memory server stamps files with
+// the current time, so the cut-off here is zero.)
+func TestReapStaging_RemovesLeakedTemps(t *testing.T) {
+	p, _ := pipePlugin(t)
+	ctx := context.Background()
+	if _, err := p.Put(ctx, "chunks/aa/real", strings.NewReader("keep"), storage.PutOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	f, err := p.client.Create("/repo/chunks/aa/bb.hstmp-0123456789abcdef")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = f.Write([]byte("leaked"))
+	_ = f.Close()
+	time.Sleep(10 * time.Millisecond)
+
+	var _ storage.StagingReapAware = p
+	st, err := p.ReapStaging(ctx, 0)
+	if err != nil {
+		t.Fatalf("ReapStaging: %v", err)
+	}
+	if st.Removed != 1 || st.Bytes != int64(len("leaked")) {
+		t.Errorf("stats = %+v, want 1 removed / 6 bytes", st)
+	}
+	if _, err := p.client.Stat("/repo/chunks/aa/bb.hstmp-0123456789abcdef"); err == nil {
+		t.Error("leaked staging temp survived")
+	}
+	if _, err := p.Stat(ctx, "chunks/aa/real"); err != nil {
+		t.Errorf("real object reaped: %v", err)
 	}
 }
 

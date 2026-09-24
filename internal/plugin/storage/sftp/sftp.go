@@ -745,6 +745,42 @@ func isStagingName(name string) bool {
 	return strings.Contains(name, ".hstmp-")
 }
 
+// ReapStaging implements storage.StagingReapAware: it removes
+// "<key>.hstmp-<rand>" temps under the repo root last modified more
+// than olderThan ago — left by a Put whose process or connection died
+// between the upload and the commit. List hides these names, so
+// nothing else ever finds them.
+func (p *Plugin) ReapStaging(ctx context.Context, olderThan time.Duration) (storage.ReapStats, error) {
+	var st storage.ReapStats
+	cli, err := p.conn()
+	if err != nil {
+		return st, err
+	}
+	cutoff := time.Now().Add(-olderThan)
+	w := cli.Walk(p.root)
+	for w.Step() {
+		if err := ctx.Err(); err != nil {
+			return st, err
+		}
+		if werr := w.Err(); werr != nil {
+			if isNotExist(werr) {
+				continue
+			}
+			return st, fmt.Errorf("sftp: reap staging walk: %w", werr)
+		}
+		fi := w.Stat()
+		if fi.IsDir() || !isStagingName(fi.Name()) || !fi.ModTime().Before(cutoff) {
+			continue
+		}
+		if rerr := cli.Remove(w.Path()); rerr != nil && !isNotExist(rerr) {
+			return st, fmt.Errorf("sftp: reap staging %s: %w", w.Path(), rerr)
+		}
+		st.Removed++
+		st.Bytes += fi.Size()
+	}
+	return st, nil
+}
+
 // Sanity import used to reference the net package symbol via
 // ssh.Dial; kept for clarity that the dependency is intentional.
 var _ = net.Dial

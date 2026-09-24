@@ -354,13 +354,23 @@ func (t *Throttle) FreeSpace(ctx context.Context) (storage.FreeSpaceInfo, error)
 	return storage.FreeSpaceOf(ctx, t.inner)
 }
 
+// ReapStaging forwards the staging reaper so `repo gc` sees through
+// the wrapper; the reap is metadata-only and not throttled.
+func (t *Throttle) ReapStaging(ctx context.Context, olderThan time.Duration) (storage.ReapStats, error) {
+	if r, ok := t.inner.(storage.StagingReapAware); ok {
+		return r.ReapStaging(ctx, olderThan)
+	}
+	return storage.ReapStats{Unsupported: true}, nil
+}
+
 // Compile-time assertions that we satisfy StoragePlugin and forward
 // every optional capability interface. A middleware that drops one
 // turns a backend that HAS the capability into one that reports it
 // unsupported, which reads as "this backend cannot" rather than "we
 // hid it".
 var (
-	_ storage.StoragePlugin  = (*Throttle)(nil)
-	_ storage.RegionAware    = (*Throttle)(nil)
-	_ storage.FreeSpaceAware = (*Throttle)(nil)
+	_ storage.StoragePlugin    = (*Throttle)(nil)
+	_ storage.RegionAware      = (*Throttle)(nil)
+	_ storage.FreeSpaceAware   = (*Throttle)(nil)
+	_ storage.StagingReapAware = (*Throttle)(nil)
 )
