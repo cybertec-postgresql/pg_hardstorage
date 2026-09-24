@@ -310,6 +310,17 @@ type walManifestShape struct {
 func harvestManifest(ctx context.Context, sp storage.StoragePlugin, key string, refs *RefSet, kind harvestKind) error {
 	rc, err := sp.Get(ctx, key)
 	if err != nil {
+		// Deleted between our List and this Get — `wal prune`,
+		// retention or `backup delete` running beside gc. A manifest
+		// that no longer exists references nothing, so its absence is
+		// the correct contribution to the live set. Aborting instead
+		// failed every gc that overlapped a prune, which on a busy
+		// shared repository meant gc never completed. Only ErrNotFound
+		// is skipped: any other read failure still aborts, because an
+		// unread manifest that DOES exist would under-count references.
+		if errors.Is(err, storage.ErrNotFound) {
+			return nil
+		}
 		return err
 	}
 	defer rc.Close()
