@@ -401,6 +401,16 @@ func runCellLoop(
 
 	var lastBackupID string
 
+	// Repo-corruption faults (manifest_targeted_corruption,
+	// truncated/missing_wal_segment) damage this cell's own backups —
+	// DockerCellRuntime scopes them to its deployment. A restore of a
+	// backup that existed when such a fault landed may then rightly be
+	// refused: that is the product DETECTING the damage, the success
+	// signal. lastBackupAt / corruptedAt tell those restores from a
+	// genuine failure: only a backup completed BEFORE the latest
+	// corruption can carry it.
+	var lastBackupAt, corruptedAt time.Time
+
 	// Proof of life. A cell a fault killed for good skips every later
 	// backup and verify as *_skipped_cell_down, and skips are rightly not
 	// failures — so without a floor such a cell PASSED having measured
@@ -514,6 +524,9 @@ func runCellLoop(
 					// floor below, not here.
 				default:
 					cr.FaultsApplied++
+					if inject.DefaultRegistry.CorruptsRepo(fault.Action) {
+						corruptedAt = time.Now()
+					}
 					select {
 					case <-ctx.Done():
 					case <-time.After(opts.Loop.HealWindow):
@@ -651,6 +664,7 @@ func runCellLoop(
 					backupsAlive++
 					lastAlive = time.Now()
 					lastBackupID = id
+					lastBackupAt = time.Now()
 					emit(Event{Cell: cr.Name, Op: "backup_completed",
 						Iteration: iter, Detail: id})
 				}
@@ -693,6 +707,13 @@ func runCellLoop(
 					cr.RestoresAttempted--
 					emit(Event{Cell: cr.Name, Op: "verify_skipped_cell_down",
 						Iteration: iter})
+				case err != nil && !corruptedAt.IsZero() && lastBackupAt.Before(corruptedAt):
+					// The backup predates a corruption fault this cell
+					// injected into its own repository files; refusing
+					// to restore it is detection, not failure.
+					cr.CorruptionDetected++
+					emit(Event{Cell: cr.Name, Op: "verify_refused_injected_corruption",
+						Iteration: iter, Detail: lastBackupID, Err: err.Error()})
 				case err != nil:
 					cr.RestoresFailed++
 					emit(Event{Cell: cr.Name, Op: "verify_failed",

@@ -113,6 +113,45 @@ func (r *Registry) Apply(ctx context.Context, action string, targets TargetSet) 
 	return f.Apply(ctx, pa.Args, targets)
 }
 
+// ApplyForDeployment is Apply for a caller that injects on behalf of
+// one deployment (a soak cell). Faults that damage repository files
+// (CorruptsRepo) are confined to that deployment's files unless the
+// action names its own prefix or deployment: in a repository shared by
+// the fleet, an unscoped pick corrupted another cell's backups.
+func (r *Registry) ApplyForDeployment(ctx context.Context, action string, targets TargetSet, deployment string) (Recovery, error) {
+	pa, err := ParseAction(action)
+	if err != nil {
+		return nil, err
+	}
+	f, err := r.Lookup(pa.Prefix)
+	if err != nil {
+		return nil, err
+	}
+	if _, ok := f.(repoCorrupter); ok && deployment != "" && pa.Args["deployment"] == "" && pa.Args["prefix"] == "" {
+		if pa.Args == nil {
+			pa.Args = Args{}
+		}
+		pa.Args["deployment"] = deployment
+	}
+	return f.Apply(ctx, pa.Args, targets)
+}
+
+// CorruptsRepo reports whether action is a fault that damages a
+// deployment's repository files. A restore of that deployment's earlier
+// backups failing afterwards is the product DETECTING the damage.
+func (r *Registry) CorruptsRepo(action string) bool {
+	pa, err := ParseAction(action)
+	if err != nil {
+		return false
+	}
+	f, err := r.Lookup(pa.Prefix)
+	if err != nil {
+		return false
+	}
+	_, ok := f.(repoCorrupter)
+	return ok
+}
+
 // DefaultRegistry holds every in-tree fault registered via
 // init().  Production callers use this directly; tests
 // construct their own.

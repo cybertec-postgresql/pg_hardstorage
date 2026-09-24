@@ -47,6 +47,14 @@ killed for good from passing on skips alone. `fault_apply_failed` is counted
 (`fault_apply_fails`) but is not a failure by itself: some catalogues expect an
 injector to refuse (`inode_exhaustion`).
 
+Detection is not failure either: `backup_refused_source_corruption` (PostgreSQL
+refusing a torn page) and `verify_refused_injected_corruption` (a restore
+refusing a backup that predates a repo-corruption fault this cell injected)
+count as `corruption_detected`. Repo-corruption faults (`manifest_targeted_corruption`,
+`truncated_wal_segment`, `missing_wal_segment`) are confined to the injecting
+cell's deployment (`inject.Registry.ApplyForDeployment`), so they cannot damage
+— and blame — another cell sharing the repository.
+
 Fault reverts run with their own bounded context, so a fault in flight at the
 run deadline is still reverted before teardown.
 

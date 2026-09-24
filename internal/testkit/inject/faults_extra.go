@@ -14,6 +14,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 )
@@ -725,9 +726,9 @@ func (manifestCorruptionFault) Apply(ctx context.Context, args Args, ts TargetSe
 	if target == "" {
 		target = "repo"
 	}
-	prefix := args["prefix"]
-	if prefix == "" {
-		prefix = "/var/lib/pg_hardstorage/repo/manifests"
+	prefix, err := repoScopedPrefix(args, "/var/lib/pg_hardstorage/repo/manifests")
+	if err != nil {
+		return nil, fmt.Errorf("manifest_targeted_corruption: %w", err)
 	}
 	count := 1
 	if raw := args["count"]; raw != "" {
@@ -741,6 +742,7 @@ func (manifestCorruptionFault) Apply(ctx context.Context, args Args, ts TargetSe
 	if err != nil {
 		return nil, err
 	}
+	hit := 0
 	for _, t := range tgs {
 		// Match the same `find … | shuf -n 1` shape
 		// flip_random_byte uses so the selection happens in the
@@ -755,11 +757,10 @@ func (manifestCorruptionFault) Apply(ctx context.Context, args Args, ts TargetSe
 		if path == "" {
 			// No manifest in the repo yet — typically the
 			// early-soak window before the first backup
-			// commits its manifest.  Cleanly skip: there is
-			// no target to corrupt, so the fault is
-			// vacuously satisfied.
+			// commits its manifest.  Nothing to corrupt here.
 			continue
 		}
+		hit++
 		// In-container byte flip via `dd seek=N conv=notrunc`,
 		// NOT CopyOut+CopyIn.  The previous tar-stream shape
 		// (read whole file out via `docker cp -`, flip a byte
@@ -793,6 +794,12 @@ done
 			return nil, fmt.Errorf("manifest_targeted_corruption: flip on %s: %w (output: %s)",
 				t.Name(), err, strings.TrimSpace(string(cmdOut)))
 		}
+	}
+	if hit == 0 {
+		// Nothing was corrupted, so nothing may be claimed: an
+		// "applied" corruption fault that changed no byte reads, in
+		// the report, as damage the product survived.
+		return nil, fmt.Errorf("manifest_targeted_corruption: no manifest.json under %s: %w", prefix, ErrNotApplicable)
 	}
 	return NoRecovery, nil
 }
@@ -1004,9 +1011,9 @@ func (truncatedWALSegmentFault) Apply(ctx context.Context, args Args, ts TargetS
 	if target == "" {
 		target = "repo"
 	}
-	prefix := args["prefix"]
-	if prefix == "" {
-		prefix = "/var/lib/pg_hardstorage/repo/wal"
+	prefix, err := repoScopedPrefix(args, "/var/lib/pg_hardstorage/repo/wal")
+	if err != nil {
+		return nil, fmt.Errorf("truncated_wal_segment: %w", err)
 	}
 	bytes := 512
 	if raw := args["bytes"]; raw != "" {
@@ -1020,6 +1027,7 @@ func (truncatedWALSegmentFault) Apply(ctx context.Context, args Args, ts TargetS
 	if err != nil {
 		return nil, err
 	}
+	hit := 0
 	for _, t := range tgs {
 		out, err := t.Exec(ctx, "sh", "-c",
 			fmt.Sprintf(`find %s -type f 2>/dev/null | shuf -n 1`, prefix))
@@ -1030,14 +1038,16 @@ func (truncatedWALSegmentFault) Apply(ctx context.Context, args Args, ts TargetS
 		if path == "" {
 			// No archived WAL yet — typically the early-soak
 			// window before the streamer commits its first
-			// segment.  Cleanly skip rather than erroring;
-			// the operator who actually wired a wrong prefix
-			// sees a per-application zero-effect outcome.
+			// segment.  Nothing to truncate here.
 			continue
 		}
 		if _, err := t.Exec(ctx, "truncate", "-s", fmt.Sprintf("-%d", bytes), path); err != nil {
 			return nil, fmt.Errorf("truncated_wal_segment: truncate %s on %s: %w", path, t.Name(), err)
 		}
+		hit++
+	}
+	if hit == 0 {
+		return nil, fmt.Errorf("truncated_wal_segment: no file under %s: %w", prefix, ErrNotApplicable)
 	}
 	return NoRecovery, nil
 }
@@ -1072,14 +1082,15 @@ func (missingWALSegmentFault) Apply(ctx context.Context, args Args, ts TargetSet
 	if target == "" {
 		target = "repo"
 	}
-	prefix := args["prefix"]
-	if prefix == "" {
-		prefix = "/var/lib/pg_hardstorage/repo/wal"
+	prefix, err := repoScopedPrefix(args, "/var/lib/pg_hardstorage/repo/wal")
+	if err != nil {
+		return nil, fmt.Errorf("missing_wal_segment: %w", err)
 	}
 	tgs, err := ts.Pick(target)
 	if err != nil {
 		return nil, err
 	}
+	hit := 0
 	for _, t := range tgs {
 		out, err := t.Exec(ctx, "sh", "-c",
 			fmt.Sprintf(`find %s -type f 2>/dev/null | shuf -n 1`, prefix))
@@ -1089,12 +1100,16 @@ func (missingWALSegmentFault) Apply(ctx context.Context, args Args, ts TargetSet
 		path := strings.TrimSpace(string(out))
 		if path == "" {
 			// No archived WAL yet — same early-soak window
-			// shape as truncated_wal_segment.  Skip cleanly.
+			// shape as truncated_wal_segment.
 			continue
 		}
 		if _, err := t.Exec(ctx, "rm", "-f", path); err != nil {
 			return nil, fmt.Errorf("missing_wal_segment: rm %s on %s: %w", path, t.Name(), err)
 		}
+		hit++
+	}
+	if hit == 0 {
+		return nil, fmt.Errorf("missing_wal_segment: no file under %s: %w", prefix, ErrNotApplicable)
 	}
 	return NoRecovery, nil
 }
@@ -1283,4 +1298,40 @@ done
 		}
 	}
 	return NoRecovery, nil
+}
+
+// repoCorrupter marks the faults that damage a deployment's files in a
+// repository: they are scoped to one deployment (ApplyForDeployment
+// passes it) and their damage is detected, not survived — see
+// CorruptsRepo.
+type repoCorrupter interface{ corruptsRepo() }
+
+func (manifestCorruptionFault) corruptsRepo()  {}
+func (truncatedWALSegmentFault) corruptsRepo() {}
+func (missingWALSegmentFault) corruptsRepo()   {}
+
+// deploymentNameRE bounds what a deployment name may contain before it
+// is spliced into the faults' `find` shell commands.
+var deploymentNameRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
+
+// repoScopedPrefix resolves a repo-corruption fault's search prefix. An
+// explicit prefix wins; otherwise base, narrowed to base/<deployment>
+// when a deployment is given.
+//
+// Without the narrowing the faults picked a random file across the
+// WHOLE repository — which the soak's cells share — so the damage (and
+// the restore failure it causes) landed on whichever cell owned that
+// file, blaming an innocent cell for the injecting cell's fault.
+func repoScopedPrefix(args Args, base string) (string, error) {
+	if p := args["prefix"]; p != "" {
+		return p, nil
+	}
+	dep := args["deployment"]
+	if dep == "" {
+		return base, nil
+	}
+	if !deploymentNameRE.MatchString(dep) {
+		return "", fmt.Errorf("deployment %q is not a plain name", dep)
+	}
+	return base + "/" + dep, nil
 }

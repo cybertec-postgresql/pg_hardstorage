@@ -860,7 +860,9 @@ func (d *DockerCellRuntime) ApplyFault(ctx context.Context, action string) (inje
 	if d.Targets == nil {
 		return nil, errors.New("ApplyFault: target set not initialised (Setup not called?)")
 	}
-	return inject.DefaultRegistry.Apply(ctx, action, d.Targets)
+	// On behalf of this deployment: repo-corruption faults touch only its
+	// files, not a random file of the repository the fleet shares.
+	return inject.DefaultRegistry.ApplyForDeployment(ctx, action, d.Targets, d.Deployment)
 }
 
 // Teardown closes the pgx connection and brings down the

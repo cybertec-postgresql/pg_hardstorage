@@ -70,6 +70,10 @@ type CellReport struct {
 	// during BASE_BACKUP. Counted as a failure, it made the
 	// catalogue's own "0 backup_failed" criterion unsatisfiable for
 	// any fleet containing PG 18 and torn_page.
+	//
+	// It also counts restores refused because a repo-corruption fault
+	// this cell injected (into its own deployment's files) damaged the
+	// backup being verified — detection, likewise, not failure.
 	CorruptionDetected int `json:"corruption_detected,omitempty"`
 
 	// RecoveryFails counts faults that were applied but could NOT be
