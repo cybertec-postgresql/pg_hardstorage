@@ -232,11 +232,24 @@ type SearchOptions struct {
 	// 50k lines of text.
 	Limit int
 
-	// Verifier, when set, is used to verify each manifest's signature
-	// before yielding it. nil means accept whatever's on disk —
-	// suitable for a quick query, but real audits should always pass
-	// a Verifier.
+	// Verifier checks each manifest's signature before it is matched.
+	// Every committed manifest is signed and ParseAndVerify refuses a
+	// signed manifest without a verifier, so a nil Verifier makes EVERY
+	// manifest unreadable (counted in Result.Unreadable) -- it does not
+	// mean "accept whatever's on disk". Callers pass the operator's
+	// keyring verifier, the same one `list` uses.
 	Verifier *backup.Verifier
+}
+
+// Result is what Search returns: the matching hits plus a count of the
+// manifests the walk could not read or verify.
+type Result struct {
+	Hits []Hit
+	// Unreadable counts manifests that failed to read, parse or
+	// verify. They cannot be matched against the query, so a non-zero
+	// value means the hit list may be incomplete -- "0 hits" with
+	// Unreadable > 0 is NOT "nothing matches".
+	Unreadable int
 }
 
 // Search walks every deployment's manifests and returns those matching
@@ -244,23 +257,25 @@ type SearchOptions struct {
 // backup_id ASC) so two runs against the same repo produce identical
 // output regardless of the storage backend's listing order.
 //
-// Unreadable / un-verifiable manifests are silently skipped — fleet
-// search is a discovery tool, not a forensic one. Use `repair manifest`
-// to chase a specific bad manifest.
-func Search(ctx context.Context, sp storage.StoragePlugin, q And, opts SearchOptions) ([]Hit, error) {
+// Unreadable / un-verifiable manifests do not abort the walk -- fleet
+// search is a discovery tool, not a forensic one -- but each is
+// counted in Result.Unreadable so the caller can say the answer is
+// partial. Use `repair manifest` to chase a specific bad manifest.
+func Search(ctx context.Context, sp storage.StoragePlugin, q And, opts SearchOptions) (Result, error) {
 	ms := backup.NewManifestStore(sp)
 	deployments, err := ms.Deployments(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("search: list deployments: %w", err)
+		return Result{}, fmt.Errorf("search: list deployments: %w", err)
 	}
-	var hits []Hit
+	var res Result
 	for _, dep := range deployments {
 		if err := ctx.Err(); err != nil {
-			return nil, err
+			return Result{}, err
 		}
 		for m, lerr := range ms.List(ctx, dep, opts.Verifier) {
 			if lerr != nil {
-				// Skip unreadable manifests — see doc comment.
+				// Keep walking, but record it -- see doc comment.
+				res.Unreadable++
 				continue
 			}
 			if m == nil {
@@ -269,13 +284,15 @@ func Search(ctx context.Context, sp storage.StoragePlugin, q And, opts SearchOpt
 			if !q.Match(m) {
 				continue
 			}
-			hits = append(hits, manifestToHit(m))
-			if opts.Limit > 0 && len(hits) >= opts.Limit {
-				return sortHits(hits), nil
+			res.Hits = append(res.Hits, manifestToHit(m))
+			if opts.Limit > 0 && len(res.Hits) >= opts.Limit {
+				res.Hits = sortHits(res.Hits)
+				return res, nil
 			}
 		}
 	}
-	return sortHits(hits), nil
+	res.Hits = sortHits(res.Hits)
+	return res, nil
 }
 
 func manifestToHit(m *backup.Manifest) Hit {
