@@ -204,7 +204,7 @@ func TestForecast_LinearGrowth_Detected(t *testing.T) {
 	now := time.Now().UTC()
 	for i := 0; i < 7; i++ {
 		stoppedAt := now.Add(-time.Duration(7-i) * 24 * time.Hour)
-		commitForecastBackup(t, w, "db1", stoppedAt, 1<<30)
+		commitForecastBackup(t, w, "db1", stoppedAt, int64(i+1)<<30) // database grows 1 GiB/day
 	}
 
 	stdout, _, exit := runCLI(t, "forecast",

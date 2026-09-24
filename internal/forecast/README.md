@@ -6,9 +6,12 @@ and what will it cost?".
 
 ## What lives here
 
-Linear regression on observable points (manifest `StoppedAt` + logical bytes,
-WAL volume) produces a slope (bytes/day, manifests/day) and R-squared for
-confidence reporting. Sparse-data deployments get "low confidence" + a note, not
+Linear regression of each full/snapshot backup's logical size against its
+`StoppedAt` — the database's size over time — produces a slope (bytes/day) and
+R-squared for confidence reporting; manifests/day counts every backup.
+Incrementals are excluded from the size fit (their size is a delta), and the
+projection is the size of one full backup, not the retention- and
+dedup-dependent repository footprint. Sparse-data deployments get "low confidence" + a note, not
 a noisy line through two points. Cost projection is opt-in via
 `--price-per-gb-month` — we never try to look up cloud pricing automatically.
 Read-only by construction; safe against a WORM-locked repo.

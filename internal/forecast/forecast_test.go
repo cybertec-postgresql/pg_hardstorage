@@ -136,11 +136,11 @@ func TestGenerate_Validation(t *testing.T) {
 func TestGenerate_LinearGrowth_Detected(t *testing.T) {
 	w := setupWorld(t)
 	now := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
-	// 10 backups over 30 days, +1 GiB each. Cumulative grows
-	// linearly → R² = 1.0.
+	// 10 backups over 30 days, each 1 GiB larger than the last: the
+	// database grows linearly → R² = 1.0.
 	for i := 0; i < 10; i++ {
 		stoppedAt := now.Add(-time.Duration(30-i*3) * 24 * time.Hour)
-		w.commitBackup(t, "db1", stoppedAt, int64(1<<30)) // 1 GiB
+		w.commitBackup(t, "db1", stoppedAt, int64(i+1)<<30)
 	}
 	rep, err := forecast.Generate(context.Background(), w.sp, w.meta, w.repoURL, forecast.Options{
 		Verifier: w.verifier,
@@ -341,22 +341,23 @@ func TestGenerate_DeploymentFilter(t *testing.T) {
 	}
 }
 
-// TestGenerate_AnomalyDetected: a tail with a 5× rate over the
-// baseline-without-tail surfaces a sudden_uptick.
+// TestGenerate_AnomalyDetected: a tail whose size growth rate is
+// >4× the baseline-without-tail rate surfaces a sudden_uptick.
 func TestGenerate_AnomalyDetected(t *testing.T) {
 	w := setupWorld(t)
 	now := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
-	// Baseline: 1 GiB per backup, 4 backups spread over 30 days
-	// before the tail window (so AnomalyTailWindow = 7d ago,
-	// baseline range = -30d to -7d).
+	// Baseline: the database grows 1 GiB every 5 days (10 → 13 GiB
+	// at -23, -18, -13, -8 days), i.e. 0.2 GiB/day, before the tail
+	// window (AnomalyTailWindow = 7d ago).
 	for i := 0; i < 4; i++ {
-		stoppedAt := now.Add(-time.Duration(8+i*5) * 24 * time.Hour) // -8, -13, -18, -23
-		w.commitBackup(t, "db1", stoppedAt, 1<<30)
+		stoppedAt := now.Add(-time.Duration(23-i*5) * 24 * time.Hour)
+		w.commitBackup(t, "db1", stoppedAt, int64(10+i)<<30)
 	}
-	// Tail: 5 GiB per backup, 3 backups in the last 7 days.
+	// Tail: 15, 17, 19 GiB at -5, -3, -1 days — 6 GiB in the 7 days
+	// since the last baseline backup, ≈0.86 GiB/day ≈ 4.3× baseline.
 	for i := 0; i < 3; i++ {
-		stoppedAt := now.Add(-time.Duration(i*2+1) * 24 * time.Hour) // -1, -3, -5
-		w.commitBackup(t, "db1", stoppedAt, 5<<30)
+		stoppedAt := now.Add(-time.Duration(5-i*2) * 24 * time.Hour)
+		w.commitBackup(t, "db1", stoppedAt, int64(15+2*i)<<30)
 	}
 
 	rep, err := forecast.Generate(context.Background(), w.sp, w.meta, w.repoURL, forecast.Options{
