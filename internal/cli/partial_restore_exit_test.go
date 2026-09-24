@@ -63,16 +63,18 @@ func TestPartialRestoreIncomplete_NotInBackupExitsNonZero(t *testing.T) {
 	}
 }
 
-// NotFound keeps its exit-0 behaviour on purpose:
-// TestPartialRestore_NotFoundTable_PropagatesNotFound pins it, and a
-// multi-table run that names one typo should still extract the rest.
-// Asserted here so the scoping is a decision on the record rather than
-// an oversight — if it is ever unified, this test is the one to delete
-// deliberately.
-func TestPartialRestoreIncomplete_NotFoundAloneKeepsExitZero(t *testing.T) {
+// NotFound exits non-zero too (H4). It used to keep exit 0, and a
+// --relfilenode-map whose entries the loader did not understand made
+// EVERY table NotFound: nothing extracted, exit 0. The rest of a
+// multi-table run is still extracted; only the exit code changes.
+func TestPartialRestoreIncomplete_NotFoundExitsNonZero(t *testing.T) {
 	res := &partial.RestoreResult{NotFound: []string{"public.typo"}}
-	if err := partialRestoreIncomplete(res); err != nil {
-		t.Errorf("a catalog miss alone must keep exit 0 (an existing, tested contract): %v", err)
+	err := partialRestoreIncomplete(res)
+	if err == nil {
+		t.Fatal("a table that was not found (nothing extracted for it) exited 0")
+	}
+	if !strings.Contains(err.Error(), "public.typo") {
+		t.Errorf("error does not name the table: %v", err)
 	}
 }
 
