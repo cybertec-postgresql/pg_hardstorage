@@ -68,6 +68,13 @@ func TestTakeBackupKilledWithoutRestartStillFails(t *testing.T) {
 // exec fails the way Docker fails to enter a dead container.
 func fakeDockerStops(t *testing.T, afterward string) string {
 	t.Helper()
+	return fakeDockerExecFails(t, afterward,
+		"OCI runtime exec failed: exec failed: unable to start container process: error executing setns process: exit status 1")
+}
+
+// fakeDockerExecFails is fakeDockerStops with a chosen exec error.
+func fakeDockerExecFails(t *testing.T, afterward, execErr string) string {
+	t.Helper()
 	dir := t.TempDir()
 	n := filepath.Join(dir, "n")
 	script := `#!/bin/sh
@@ -77,7 +84,7 @@ case "$*" in
     c=$(cat ` + n + ` 2>/dev/null || echo 0); c=$((c+1)); echo $c > ` + n + `
     if [ $c -le 1 ]; then echo true; exit 0; fi
     ` + afterward + ` ;;
-  *" backup "*) echo "OCI runtime exec failed: exec failed: unable to start container process: error executing setns process: exit status 1" >&2; exit 128 ;;
+  *" backup "*) echo "` + execErr + `" >&2; exit 128 ;;
 esac
 exit 0
 `
@@ -102,10 +109,34 @@ func TestTakeBackupContainerStoppedIsCellNotReady(t *testing.T) {
 // If Docker cannot say whether the container is running, the failure
 // stays a failure — not knowing is not evidence against the testbed.
 func TestTakeBackupUnknownContainerStateStillFails(t *testing.T) {
-	d := &DockerCellRuntime{CellName: "c", Container: "cell-c", DockerBin: fakeDockerStops(t, "exit 1"),
+	d := &DockerCellRuntime{CellName: "c", Container: "cell-c", DockerBin: fakeDockerExecFails(t, "exit 1", `{"error":{"code":"internal","message":"boom"}}`),
 		AgentBinary: "/usr/bin/pg_hardstorage", Deployment: "db1", RepoURL: "file:///r"}
 	_, err := d.TakeBackup(context.Background())
 	if err == nil || errors.Is(err, ErrCellNotReady) {
 		t.Fatalf("container state unknown; the backup failure must stay a failure, got: %v", err)
+	}
+}
+
+// The release soak's second backup_failed: Docker still said "running"
+// for ~30 s after a SIGKILLed container's init had died. The exec error
+// is the evidence — runc could not join namespaces that no longer exist.
+func TestTakeBackupDeadButReportedRunningIsCellNotReady(t *testing.T) {
+	d := &DockerCellRuntime{CellName: "c", Container: "cell-c", DockerBin: fakeDockerStops(t, "echo true; exit 0"),
+		AgentBinary: "/usr/bin/pg_hardstorage", Deployment: "db1", RepoURL: "file:///r"}
+	_, err := d.TakeBackup(context.Background())
+	if !errors.Is(err, ErrCellNotReady) {
+		t.Fatalf("exec could not join the container's namespaces; must be ErrCellNotReady, got: %v", err)
+	}
+}
+
+// Other OCI exec failures are the harness's own bugs and must surface.
+func TestTakeBackupOtherOCIExecFailureStillFails(t *testing.T) {
+	d := &DockerCellRuntime{CellName: "c", Container: "cell-c",
+		DockerBin: fakeDockerExecFails(t, "echo true; exit 0",
+			`OCI runtime exec failed: exec failed: unable to start container process: exec: \"/usr/bin/pg_hardstorage\": stat /usr/bin/pg_hardstorage: no such file or directory`),
+		AgentBinary: "/usr/bin/pg_hardstorage", Deployment: "db1", RepoURL: "file:///r"}
+	_, err := d.TakeBackup(context.Background())
+	if err == nil || errors.Is(err, ErrCellNotReady) {
+		t.Fatalf("a missing binary is a real failure, got: %v", err)
 	}
 }

@@ -480,6 +480,14 @@ func (d *DockerCellRuntime) containerRunning(ctx context.Context) bool {
 	return strings.TrimSpace(string(out)) == "true"
 }
 
+// isContainerGoneExecError reports whether a docker exec failed because
+// the container's namespaces were gone — runc's "error executing setns
+// process" — rather than for anything the exec'd program did.
+func isContainerGoneExecError(stdout, stderr []byte) bool {
+	const marker = "error executing setns process"
+	return bytes.Contains(stderr, []byte(marker)) || bytes.Contains(stdout, []byte(marker))
+}
+
 // containerPositivelyStopped reports whether Docker says the container
 // is not running. Unlike containerRunning, an inspect error is "don't
 // know" (false), not "stopped" — it decides whether a failure is blamed
@@ -621,6 +629,17 @@ func (d *DockerCellRuntime) TakeBackup(ctx context.Context) (string, error) {
 		// to say so; an inspect that fails proves nothing.
 		if d.containerPositivelyStopped(ctx) {
 			return "", fmt.Errorf("%w: container %s stopped during the backup: %v",
+				ErrCellNotReady, d.Container, err)
+		}
+		// Docker can lag the truth: on the loaded soak host a SIGKILLed
+		// container stayed "running" for ~30 s after its init died (docker
+		// kill: "did not receive an exit event"), so the check above saw
+		// nothing. The exec error is the evidence then — runc could not
+		// join the container's namespaces because they no longer exist, so
+		// pg_hardstorage never ran. Only that message: other OCI exec
+		// failures (a wrong binary path) are real harness failures.
+		if isContainerGoneExecError(stdout, stderr) {
+			return "", fmt.Errorf("%w: container %s had died under the backup (exec could not join its namespaces): %v",
 				ErrCellNotReady, d.Container, err)
 		}
 		// Diagnostic display still wants combined output —
