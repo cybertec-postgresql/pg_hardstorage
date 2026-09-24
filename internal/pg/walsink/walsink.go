@@ -1014,6 +1014,10 @@ func verifyAdoptedSegmentRefs(ctx context.Context, sp storage.StoragePlugin, cas
 		}
 		if _, err := sp.Stat(ctx, repo.ChunkKey(ref.Hash)); err != nil {
 			if errors.Is(err, storage.ErrNotFound) {
+				// Drop every memory of the chunk: without this the retry's
+				// PutChunk hits the in-memory seen cache, "dedups" against
+				// the deleted chunk again and fails the same way forever.
+				cas.ForgetChunk(ref.Hash)
 				return fmt.Errorf("walsink: segment %s references chunk %s which was "+
 					"deduplicated against and has since been deleted (a concurrent "+
 					"`repo gc --apply` swept it as an orphan); refusing to commit a segment "+
@@ -1026,6 +1030,26 @@ func verifyAdoptedSegmentRefs(ctx context.Context, sp storage.StoragePlugin, cas
 }
 
 func (s *Sink) commitManifest(ctx context.Context, m *SegmentManifest) error {
+	// gc exclusion (repo/gcfence.go). The re-Stat below is only a timing
+	// guard: a `repo gc --apply` could delete an adopted chunk after the
+	// Stat and before the commit is visible. The fence pins the segment's
+	// adopted chunks against a running gc and waits out its in-flight
+	// delete batch BEFORE the Stat; Confirm then checks no gc run swept
+	// one mid-commit. WAL writers hold no backup lease, so without the
+	// fence a streamer was the one writer gc's exclusion never covered.
+	var adopted []repo.Hash
+	if s.cas != nil {
+		for _, ref := range m.Chunks {
+			if s.cas.WasAdopted(ref.Hash) {
+				adopted = append(adopted, ref.Hash)
+			}
+		}
+	}
+	fence, err := repo.BeginCommitFence(ctx, s.sp, adopted,
+		repo.FenceOptions{Owner: "wal " + m.Deployment + "/" + m.SegmentName})
+	if err != nil {
+		return fmt.Errorf("walsink: gc fence: %w", err)
+	}
 	if err := verifyAdoptedSegmentRefs(ctx, s.sp, s.cas, m); err != nil {
 		return err
 	}
@@ -1064,6 +1088,21 @@ func (s *Sink) commitManifest(ctx context.Context, m *SegmentManifest) error {
 	}
 	if commitErr != nil {
 		return commitErr
+	}
+	if err := fence.Confirm(ctx); err != nil {
+		// Committed over a chunk a gc run deleted mid-commit (only possible
+		// when the commit overran the fence's writer budget). The manifest
+		// must not stay: an idempotent re-commit of the same refs would
+		// accept it as archived. Remove it and forget the chunks, so the
+		// failed attempt leaves SyncedLSN where it was, PostgreSQL resends
+		// the segment, and the retry rewrites it whole.
+		s.cas.ForgetChunk(adopted...)
+		cctx, cancel := storage.CleanupContext(ctx)
+		defer cancel()
+		if derr := s.sp.Delete(cctx, key); derr != nil && !errors.Is(derr, storage.ErrNotFound) {
+			return fmt.Errorf("walsink: segment %s: %w; removing the unrestorable manifest also failed (%v) — delete %s by hand before the stream resumes", m.SegmentName, err, derr, key)
+		}
+		return fmt.Errorf("walsink: segment %s: %w", m.SegmentName, err)
 	}
 	// Releasing this segment's adopted refs is flushBatch's job, not
 	// ours: only it knows which later segments of the same batch —

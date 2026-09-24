@@ -263,9 +263,51 @@ func (s *Sink) flushLocked(ctx context.Context) error {
 		Chunks:     refs,
 		CreatedAt:  time.Now().UTC(),
 	}
+	// gc exclusion (repo/gcfence.go): a logical stream holds no backup
+	// lease, so a `repo gc --apply` could sweep a chunk this batch merely
+	// deduplicated against — then the segment would commit over a missing
+	// chunk. The fence pins the adopted chunks against a live gc run;
+	// VerifyAdopted re-checks them (dropping missing ones from the CAS so
+	// the retry, which re-chunks the still-buffered batch, rewrites them);
+	// Confirm checks no gc swept one mid-commit.
+	var adopted []repo.Hash
+	for _, r := range refs {
+		if s.cas.WasAdopted(r.Hash) {
+			adopted = append(adopted, r.Hash)
+		}
+	}
+	fence, err := repo.BeginCommitFence(ctx, s.sp, adopted,
+		repo.FenceOptions{Owner: "logical " + s.opts.Deployment + "/" + s.opts.StreamName})
+	if err != nil {
+		return fmt.Errorf("chunked: gc fence: %w", err)
+	}
+	missing, _, err := s.cas.VerifyAdopted(ctx, adopted)
+	if err != nil {
+		return fmt.Errorf("chunked: verify adopted chunks: %w", err)
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("chunked: %w before the segment could commit: %d chunk(s); the retry rewrites them",
+			repo.ErrAdoptedChunkSwept, len(missing))
+	}
 	if err := s.commitManifest(ctx, m); err != nil {
 		return err
 	}
+	if err := fence.Confirm(ctx); err != nil {
+		// Swept mid-commit: THIS attempt's manifest references a deleted
+		// chunk. Remove it, or the retry would accept it as an idempotent
+		// re-commit of the same refs.
+		s.cas.ForgetChunk(adopted...)
+		cctx, cancel := storage.CleanupContext(ctx)
+		defer cancel()
+		if derr := s.sp.Delete(cctx, SegmentPath(m.Deployment, m.StreamName, s.startLSN)); derr != nil && !errors.Is(derr, storage.ErrNotFound) {
+			return fmt.Errorf("chunked: %w; removing the unrestorable segment manifest also failed: %v", err, derr)
+		}
+		return fmt.Errorf("chunked: %w", err)
+	}
+	// Committed: every ref is now held by a manifest, so the adoption set
+	// no longer needs them. Without this a weeks-long stream's CAS keeps
+	// every deduplicated hash it ever saw.
+	s.cas.ForgetAdopted(adopted...)
 
 	// Confirm only a commit this batch made durable. A batch that
 	// ends mid-transaction leaves syncedLSN at the previous commit, so
