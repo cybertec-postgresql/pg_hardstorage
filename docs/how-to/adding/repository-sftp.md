@@ -158,6 +158,20 @@ because chunks are content-addressed, a duplicate write is
 harmless. Manifest commits go through `RenameIfNotExists` which
 shares the same posture and is the actual race winner.
 
+On OpenSSH servers the commit uses the protocol extensions:
+
+- `hardlink@openssh.com` for `IfNotExists` (atomic
+  create-exclusive; the backend reports `ConditionalPut` only
+  when the server offers it);
+- `posix-rename@openssh.com` for an overwrite, which replaces the
+  destination atomically. A server without it gets
+  remove-then-rename, during which the key is briefly absent (a
+  concurrent writer can slip in and be overwritten, and a
+  dropped connection in that gap loses the object);
+- `fsync@openssh.com` to flush each staged file before it is
+  published. SFTP cannot fsync the directory entry, so the
+  backend does not claim inline durability.
+
 ## Troubleshooting
 
 **`extras.known_hosts is required`** — the plugin refuses to
