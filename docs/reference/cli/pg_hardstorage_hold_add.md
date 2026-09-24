@@ -33,6 +33,12 @@ moment. Useful for time-bounded debugging windows
   - absolute time:      "2027-01-01T00:00:00Z" (RFC3339) or
                         "2027-01-01" (date only, midnight UTC)
 
+Re-adding a hold may extend it (same holder, later or no expiry) but
+never silently weakens an ACTIVE one: an earlier expiry, a finite
+expiry on an indefinite hold, or a different --holder is refused with
+conflict.hold_exists (exit 7). --force replaces it anyway and records
+the replaced hold in a hold.replace audit event.
+
 ```
 pg_hardstorage hold add <deployment> <backup-id> [flags]
 ```
@@ -40,6 +46,7 @@ pg_hardstorage hold add <deployment> <backup-id> [flags]
 ### Options
 
 ```
+      --force           replace an existing active hold even if the new one is weaker (shorter/finite expiry, different holder); audited as hold.replace
   -h, --help            help for add
       --holder string   who placed the hold (free-form; appears in the marker for audit)
       --reason string   why the hold was placed (free-form; appears in the marker for audit)

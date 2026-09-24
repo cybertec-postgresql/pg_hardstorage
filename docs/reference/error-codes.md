@@ -146,7 +146,8 @@ actually there.
 | `conflict.repo_exists`, `conflict.deployment_exists`, `conflict.sink_exists`, `conflict.standby_exists`, `conflict.timetravel_exists`, `conflict.roster_exists` | Resource with that name is already configured |
 | `conflict.repo_read_only` | Repo is in read-only mode (legal hold, scheduled retire) |
 | `conflict.manifest_held`, `conflict.chain_has_held_links` | Backup or one of its parents is on legal hold |
-| `conflict.chain_has_live_descendants` | Refused to delete; descendants would orphan |
+| `conflict.chain_has_live_descendants` | Refused to delete; descendants would orphan (also raised by `rotate --apply` when an incremental lands mid-rotation) |
+| `conflict.hold_exists` | `hold add` would weaken an active hold (earlier or finite expiry on an indefinite hold, different holder); `--force` replaces it and audits `hold.replace` |
 | `conflict.checkpoint_mismatch`, `conflict.chunks_missing`, `conflict.no_live_manifests` | Repo state would be inconsistent |
 | `conflict.approval_pending`, `conflict.already_signed`, `conflict.already_revoked` | Approval-flow state machine refused |
 | `conflict.too_many_connections` | PG refused another replication / regular connection |

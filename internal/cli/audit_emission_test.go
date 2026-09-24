@@ -41,10 +41,13 @@ func TestHoldAdd_EmitsAudit(t *testing.T) {
 }
 
 // TestHoldRemove_EmitsAudit: releasing a hold writes an audit record (the
-// command's help already promised it was "auditable"); the record carries
-// the holder of the hold that was released.
+// command's help already promised it was "auditable"). The record's actor
+// is the operator who RELEASED the hold — it used to be the original
+// holder, so every release looked self-inflicted — and the released
+// hold's holder stays in the body.
 func TestHoldRemove_EmitsAudit(t *testing.T) {
 	w := newReadWorld(t)
+	t.Setenv("USER", "releaser@ops")
 	id := commitVerifiableBackup(t, w, "db1", 0, []byte("body"))
 	if err := w.store.PutHold(context.Background(), "db1", id, "compliance@acme", "GDPR-7"); err != nil {
 		t.Fatal(err)
@@ -60,10 +63,13 @@ func TestHoldRemove_EmitsAudit(t *testing.T) {
 	if exit != int(output.ExitOK) {
 		t.Fatalf("audit search exit=%d", exit)
 	}
-	for _, want := range []string{`"count": 1`, `"action": "hold.remove"`, id, "compliance@acme"} {
+	for _, want := range []string{`"count": 1`, `"action": "hold.remove"`, id, `"actor": "releaser@ops"`} {
 		if !strings.Contains(out, want) {
 			t.Errorf("hold.remove audit missing %q:\n%s", want, out)
 		}
+	}
+	if strings.Contains(out, `"actor": "compliance@acme"`) {
+		t.Errorf("hold.remove attributed the release to the original holder:\n%s", out)
 	}
 }
 

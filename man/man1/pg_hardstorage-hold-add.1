@@ -32,8 +32,19 @@ moment. Useful for time-bounded debugging windows
   - absolute time:      "2027-01-01T00:00:00Z" (RFC3339) or
                         "2027-01-01" (date only, midnight UTC)
 
+.PP
+Re-adding a hold may extend it (same holder, later or no expiry) but
+never silently weakens an ACTIVE one: an earlier expiry, a finite
+expiry on an indefinite hold, or a different --holder is refused with
+conflict.hold_exists (exit 7). --force replaces it anyway and records
+the replaced hold in a hold.replace audit event.
+
 
 .SH OPTIONS
+.PP
+\fB--force\fP[=false]
+	replace an existing active hold even if the new one is weaker (shorter/finite expiry, different holder); audited as hold.replace
+
 .PP
 \fB-h\fP, \fB--help\fP[=false]
 	help for add
