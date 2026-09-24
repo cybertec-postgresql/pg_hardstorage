@@ -708,8 +708,18 @@ func fetchAuxBody(ctx context.Context, sp storage.StoragePlugin, key string, kin
 	}
 	if kind == walsink.AuxiliaryHistory {
 		if tli, ok := historyRequestTLI(segmentName); ok {
-			if b, terr := timeline.New(sp).Get(ctx, deployment, tli); terr == nil {
+			b, terr := timeline.New(sp).Get(ctx, deployment, tli)
+			if terr == nil {
 				return b, nil // found in the follower's timeline store
+			}
+			// Only a genuine miss in BOTH places is NotFound. Any other
+			// timeline-store failure must surface: reporting it as "no such
+			// file" lets PG, under recovery_target_timeline='latest',
+			// silently stay on the pre-failover timeline. The caller maps a
+			// non-NotFound error to wal.fetch.read_failed, which aborts
+			// recovery so the operator can retry once storage is healthy.
+			if !errors.Is(terr, storage.ErrNotFound) {
+				return nil, fmt.Errorf("timeline store: %w", terr)
 			}
 		}
 	}

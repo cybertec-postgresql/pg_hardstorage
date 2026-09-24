@@ -175,3 +175,49 @@ func TestFetchAuxBody_NonHistoryDoesNotConsultTheTimelineStore(t *testing.T) {
 			"with a timeline-history body", err)
 	}
 }
+
+// historyFailPlugin fails every read of one key with a non-NotFound
+// error — a flaky backend, a permission fault, a transient network drop.
+type historyFailPlugin struct {
+	historyMemPlugin
+	failKey string
+	failErr error
+}
+
+func (p *historyFailPlugin) Get(ctx context.Context, key string) (io.ReadCloser, error) {
+	if key == p.failKey {
+		p.gets = append(p.gets, key)
+		return nil, p.failErr
+	}
+	return p.historyMemPlugin.Get(ctx, key)
+}
+
+// TestFetchAuxBody_TimelineStoreReadErrorIsNotAMiss: when the aux path
+// misses and the follower's timeline store then fails with anything
+// OTHER than NotFound, the error must surface as-is. Collapsing it into
+// the aux path's NotFound makes `wal fetch` exit "no such file", and
+// with recovery_target_timeline='latest' PG then silently stays on the
+// pre-failover timeline — the exact failure the fallback exists to
+// prevent, reintroduced by a transient read error. runWalFetchAuxiliary
+// maps any non-NotFound error to wal.fetch.read_failed, which aborts
+// recovery instead.
+func TestFetchAuxBody_TimelineStoreReadErrorIsNotAMiss(t *testing.T) {
+	const deployment = "db1"
+	boom := errors.New("backend: connection reset")
+	sp := &historyFailPlugin{
+		historyMemPlugin: historyMemPlugin{objects: map[string][]byte{}},
+		failKey:          timeline.Path(deployment, 2),
+		failErr:          boom,
+	}
+	auxKey := walsink.AuxiliaryFilePath(deployment, "00000002.history", walsink.AuxiliaryHistory)
+
+	_, err := fetchAuxBody(context.Background(), sp, auxKey,
+		walsink.AuxiliaryHistory, deployment, "00000002.history")
+	if errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("err = %v is typed NotFound; a timeline-store READ FAILURE must not be "+
+			"reported to restore_command as a missing file", err)
+	}
+	if !errors.Is(err, boom) {
+		t.Fatalf("err = %v, want the timeline-store read error %v", err, boom)
+	}
+}
