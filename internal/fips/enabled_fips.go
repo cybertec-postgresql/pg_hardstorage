@@ -2,11 +2,17 @@
 
 package fips
 
-// enabled is true for the FIPS variant.  Compiled only when
-// the binary is built with `-tags=fips` (see Makefile's
-// build-fips target).  In production this build also sets
-// `GOEXPERIMENT=boringcrypto` + `CGO_ENABLED=1` so every
-// crypto call routes through BoringSSL; the build tag is the
-// runtime-visible signal that those compile-time settings
-// were applied.
-const enabled = true
+import "crypto/fips140"
+
+// enabled reports FIPS mode for the `-tags=fips` variant — but only
+// when a validated module is actually doing the crypto.
+//
+// The build tag alone used to be the answer. `make build-fips` also
+// sets GOEXPERIMENT=boringcrypto + CGO_ENABLED=1, but nothing checked
+// that it had: a plain `go build -tags fips` produced a binary that
+// claimed FIPS in doctor, passed --fips-strict and stamped `fips:true`
+// on every backup, while all crypto ran through the ordinary Go
+// implementation. Now the claim requires BoringCrypto to be linked in
+// and active, or the Go FIPS 140-3 module to be enabled
+// (GODEBUG=fips140=on).
+func enabled() bool { return fips140.Enabled() || boringEnabled() }
