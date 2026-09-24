@@ -238,7 +238,7 @@ field is where the recovery hint lives.
 | `partial.*` | Partial / table-level restore |
 | `combine.*` | `pg_combinebackup` orchestration |
 | `paths.*`, `init.*`, `config.*` | Bootstrap (`config.invalid`, `config.load_failed`, `config.kek_ref_unknown_scheme`) |
-| `compliance.*`, `integrity.*`, `insider.*` | Compliance / integrity scanning |
+| `compliance.*`, `integrity.*`, `insider.*` | Compliance / integrity scanning. `integrity.run_incomplete` (exit 1): `integrity run` could not complete — deployments could not be listed, or chunk presence checks failed for a reason other than not-found (throttling, permissions). The run is still signed and stored with `status: error`, so the gap is on record; it is never reported as a clean pass. Real findings stay `verify.integrity_issues` (exit 9). |
 | `llm.*` | LLM provider, skill loading, MCP server |
 | `history.*` | Restore-history slice |
 | `hold.*`, `rotate.*`, `jit.*` | Legal hold, KMS rotation, JIT credentials |

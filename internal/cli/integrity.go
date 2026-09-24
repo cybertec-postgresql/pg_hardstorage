@@ -202,6 +202,21 @@ func runIntegrityRun(cmd *cobra.Command, f integrityRunFlags) error {
 	if rerr := d.Result(output.NewResult(cmd.CommandPath()).WithBody(body)); rerr != nil {
 		return rerr
 	}
+	// An ERRORED run is persisted (and signed) like any other — its
+	// status field says "error" inside the signed body, `integrity list
+	// --status error` finds it, and an auditor sees that the scheduled
+	// check ran and could not complete rather than a silent gap — but it
+	// must not exit 0. It used to: a run that could not list the
+	// deployments, or whose every presence check was throttled, reported
+	// success to the cron job whose only question is "did the check pass".
+	if run.Status == integrity.StatusError {
+		return output.NewError("integrity.run_incomplete",
+			fmt.Sprintf("integrity run: the run did not complete (status=error; %d chunk(s) could not be checked, %d manifest failure(s)); it was recorded with status error, not as a clean pass",
+				run.Chunks.PresenceUnchecked, len(run.Manifests.Failures))).
+			WithSuggestion(&output.Suggestion{
+				Human: "see the run body's failures for the storage error; re-run once the backend is healthy",
+			})
+	}
 	if run.Status == integrity.StatusFoundIssues {
 		return output.NewError("verify.integrity_issues",
 			fmt.Sprintf("integrity run: %d signature failure(s), %d missing chunk(s), %d mismatched chunk(s)",
