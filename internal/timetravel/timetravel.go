@@ -232,6 +232,11 @@ func (m *Manager) Create(ctx context.Context, opts CreateOptions) (*Session, err
 		// timetravel default.
 		Action:   "pause",
 		Timeline: "latest",
+		// Inclusive must be set explicitly: the Go zero value is
+		// false, which would render an EXCLUSIVE stop (the opposite
+		// of PG's default and of `restore --to`), and make an LSN
+		// equal to the backup's stop LSN unreachable.
+		Inclusive: true,
 	}
 	if !atTime.IsZero() {
 		rec.TargetTime = atTime

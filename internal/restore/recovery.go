@@ -61,8 +61,10 @@ type Recovery struct {
 	TargetName string
 
 	// Inclusive: when true, recovery stops just after the target.
-	// PG's default is true; we propagate that as the field's default
-	// so the user sees the actual rendered GUC.
+	// PG's default is true, but this field's Go zero value is FALSE
+	// and it is always rendered explicitly — every caller that builds
+	// a Recovery must set it (the CLI and agent default it to true);
+	// leaving it unset silently asks for an exclusive stop.
 	Inclusive bool
 
 	// Action: what PG does when the target is reached.
