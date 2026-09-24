@@ -21,14 +21,14 @@ pg_hardstorage approval request [flags]
 ### Options
 
 ```
-      --approver-key stringArray   path to an approver's ed25519 public-key PEM (repeatable; need at least --threshold)
+      --approver-key stringArray   path to an approver's ed25519 public-key PEM (repeatable; need at least --threshold; each must be on the trusted roster PG_HARDSTORAGE_APPROVAL_ROSTER)
   -h, --help                       help for request
       --op string                  namespaced op being approved (e.g. backup.delete, kms.shred) (required)
       --reason string              free-form reason for the destructive op
       --repo string                repository URL (required)
-      --target string              target identifier (e.g. a backup ID)
+      --target string              target the destructive op will act on, exactly as that command names it (backup ID, repo URL, keyring dir) (required)
       --tenant string              tenant scope
-      --threshold int              number of distinct approvals required (≥ 1) (default 2)
+      --threshold int              number of distinct approvals required (≥ 1, and ≥ the operator minimum PG_HARDSTORAGE_APPROVAL_MIN_THRESHOLD, default 2) (default 2)
       --ttl duration               how long this request stays approvable (default 24h0m0s)
 ```
 
