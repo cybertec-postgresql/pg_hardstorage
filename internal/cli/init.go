@@ -16,7 +16,6 @@ import (
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup/keystore"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup/runner"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/config"
-	"github.com/cybertec-postgresql/pg_hardstorage/internal/fsutil"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/output"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/paths"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/pg"
@@ -125,6 +124,20 @@ func runInit(cmd *cobra.Command, opts initOpts) error {
 		if opts.repoURL == "" {
 			opts.repoURL = quickDefaultRepoURL()
 		}
+	}
+
+	// Prompts are text for a human. Under a structured renderer (-o json,
+	// or the json default when stdout is not a terminal) they would be
+	// the first bytes of a stream a script parses, before the one Result
+	// document it expects — so refuse up front, per the SPEC, and point
+	// at the non-interactive form.
+	if !opts.yes && d.Renderer().Name() != "text" {
+		return output.NewError("init.interactive_needs_text",
+			fmt.Sprintf("init: the interactive wizard cannot run with --output %s", d.Renderer().Name())).
+			WithSuggestion(&output.Suggestion{
+				Human:   "run non-interactively with --yes and the answers as flags, or interactively with -o text",
+				Command: "pg_hardstorage init --yes --pg-connection '<dsn>' --repo '<url>'",
+			}).Wrap(output.ErrUsage)
 	}
 
 	prompter := newPrompter(cmd.InOrStdin(), cmd.OutOrStderr(), opts.yes)
@@ -266,9 +279,18 @@ func runInit(cmd *cobra.Command, opts initOpts) error {
 
 	// 8. Final result document. Operator-readable; structured for
 	//    JSON consumers.
-	body := initResultBody{
-		Deployment:     deployment,
-		PGConnection:   pgConn,
+	body := newInitResultBody(p, opts, deployment, pgConn, repoURL, pgVersion, identity, firstBackup, wantEncrypt, kekGenerated)
+	return d.Result(output.NewResult(cmd.CommandPath()).WithBody(body))
+}
+
+// newInitResultBody assembles the wizard's exit document.
+func newInitResultBody(p *paths.Paths, opts initOpts, deployment, pgConn, repoURL string, pgVersion int,
+	identity pg.SystemIdentity, firstBackup *runner.Result, wantEncrypt, kekGenerated bool) initResultBody {
+	return initResultBody{
+		Deployment: deployment,
+		// Redacted: this document is what scripts capture and log
+		// (`init -o json | tee`); the config file holds the real DSN.
+		PGConnection:   redactDSN(pgConn),
 		RepoURL:        repoURL,
 		PGVersion:      pgVersion,
 		SystemID:       identity.SystemID,
@@ -281,7 +303,6 @@ func runInit(cmd *cobra.Command, opts initOpts) error {
 		Encryption:     wantEncrypt,
 		KEKGenerated:   kekGenerated,
 	}
-	return d.Result(output.NewResult(cmd.CommandPath()).WithBody(body))
 }
 
 // probeForInit opens a replication-mode connection to validate the
@@ -316,21 +337,20 @@ func probeForInit(ctx context.Context, dsn string) (pg.SystemIdentity, int, erro
 // pg_hardstorage.yaml (or creates it). Existing deployments and
 // sinks are preserved; the new deployment with this name is upserted.
 //
-// We deliberately re-emit the FULL config so the file is always
+// We deliberately re-emit the file's FULL content so it is always
 // canonical and human-readable, rather than appending fragments.
 func writeInitConfig(p *paths.Paths, deployment, pgConn, repoURL, schedBackup, schedRotate string) error {
-	loaded, err := config.Load(p)
+	// Same layered edit as `deployment add` (configio.go): only the
+	// target file's own content plus this deployment is written, never
+	// the merge with conf.d drop-ins and the PG_HARDSTORAGE_CONFIG env
+	// YAML. The target honours -c, so `init -c staging.yaml` writes
+	// staging.yaml — the file it read — not the default path.
+	view, err := config.LoadForEdit(p)
 	if err != nil {
 		return output.NewError("init.config_parse_failed",
 			fmt.Sprintf("init: parse existing config: %v", err)).Wrap(err)
 	}
-	cfg := config.Config{}
-	if loaded != nil {
-		cfg = loaded.Config
-	}
-	if cfg.Schema == "" {
-		cfg.Schema = config.Schema
-	}
+	cfg := view.Merged
 	if cfg.Deployments == nil {
 		cfg.Deployments = map[string]config.DeploymentConfig{}
 	}
@@ -344,29 +364,20 @@ func writeInitConfig(p *paths.Paths, deployment, pgConn, repoURL, schedBackup, s
 	dep.Schedule.Rotate = parseSchedExpr(schedRotate)
 	cfg.Deployments[deployment] = dep
 
-	body, err := config.Marshal(&cfg)
+	own, err := view.Apply(&cfg)
 	if err != nil {
-		return output.NewError("init.config_marshal_failed", err.Error()).Wrap(err)
+		return configEditError(err)
 	}
-	configPath := initConfigPath(p)
-	if err := os.MkdirAll(filepath.Dir(configPath), 0o755); err != nil {
-		return output.NewError("init.config_dir_failed",
-			fmt.Sprintf("init: mkdir %s: %v", filepath.Dir(configPath), err)).Wrap(err)
-	}
-	// fsutil.WriteFileAtomic: the config file is the entire output
-	// of the wizard — losing it after the agent prints "✓ done"
-	// would silently strand the operator with a half-set-up
-	// deployment.
-	if err := fsutil.WriteFileAtomic(configPath, body, 0o600); err != nil {
-		return output.NewError("init.config_write_failed",
-			fmt.Sprintf("init: write %s: %v", configPath, err)).Wrap(err)
-	}
-	return nil
+	// writeConfigFile writes atomically: the config file is the entire
+	// output of the wizard — losing it after the agent prints "✓ done"
+	// would silently strand the operator with a half-set-up deployment.
+	return writeConfigFile(view.Path, own)
 }
 
-// initConfigPath is the canonical config-file location for `init`.
+// initConfigPath is the config file `init` writes: the -c file when one
+// was given, else the well-known location.
 func initConfigPath(p *paths.Paths) string {
-	return filepath.Join(p.Config.Value, "pg_hardstorage.yaml")
+	return configFilePath(p)
 }
 
 // parseSchedExpr maps wizard-friendly shorthand to a config.ScheduleSpec.
@@ -616,7 +627,11 @@ func resolveQuickPGConn() string {
 		if port == "" {
 			port = "5432"
 		}
-		return fmt.Sprintf("postgres://%s:%s/?sslmode=disable", host, port)
+		// Keyword form, not a URI: PGHOST is very often a socket
+		// DIRECTORY (/var/run/postgresql), and pasted into a URI's
+		// authority it became postgres:///var/run/postgresql:5432/ —
+		// the default host with a database named after the path.
+		return fmt.Sprintf("host=%s port=%s sslmode=disable", quoteConnValue(host), quoteConnValue(port))
 	}
 	sockDir := "/var/run/postgresql"
 	if os.Getenv("PGHOST") == "" {
@@ -625,4 +640,13 @@ func resolveQuickPGConn() string {
 		}
 	}
 	return "postgres:///?sslmode=disable&host=/var/run/postgresql"
+}
+
+// quoteConnValue quotes a libpq keyword/value value when it needs it
+// (empty, whitespace, quote or backslash), escaping per libpq.
+func quoteConnValue(v string) string {
+	if v != "" && !strings.ContainsAny(v, " \t\n\r'\\") {
+		return v
+	}
+	return "'" + strings.NewReplacer(`\`, `\\`, `'`, `\'`).Replace(v) + "'"
 }

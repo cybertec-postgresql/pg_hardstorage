@@ -2,6 +2,7 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"sort"
@@ -30,6 +31,15 @@ func newLintCmdImpl() *cobra.Command {
 				return output.NewError("internal", err.Error()).Wrap(err)
 			}
 			loaded, err := config.Load(p)
+			var missing *config.MissingConfigFileError
+			if errors.As(err, &missing) {
+				// -c named a file that is not there: nothing was
+				// linted, so "valid, 0 deployments" would be a lie.
+				return output.NewError("config.load_failed", err.Error()).
+					WithSuggestion(&output.Suggestion{
+						Human: "check the path given to -c/--config (or PG_HARDSTORAGE_CONFIG_FILE)",
+					}).Wrap(output.ErrUsage)
+			}
 			if err != nil {
 				// A parse/validation failure is the whole point of lint:
 				// report it as invalid with the reason, and exit non-zero

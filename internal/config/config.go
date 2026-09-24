@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -601,7 +602,8 @@ type LoadResult struct {
 
 // Load reads pg_hardstorage.yaml plus every conf.d/*.yaml under the
 // resolved Config path, merges them in lexicographic order, and returns
-// the result. Missing files are not errors; parse errors are.
+// the result. A missing file at the DEFAULT location is not an error (a
+// fresh install has none); parse errors are.
 //
 // Inline-YAML env-var fallback (issue #87): when the env var
 // PG_HARDSTORAGE_CONFIG is set, its value is parsed as YAML and
@@ -610,11 +612,67 @@ type LoadResult struct {
 // docker-compose evaluation stack relies on (operators expect to
 // configure single-binary containers by setting one env var
 // instead of bind-mounting a file).  Empty / unset is a no-op.
+//
+// An explicit -c/--config file (via PG_HARDSTORAGE_CONFIG_FILE) that
+// does not exist IS an error (*MissingConfigFileError): the operator
+// named a file, and silently running on an empty config — lint saying
+// "valid, 0 deployments", the agent scheduling nothing — hides the typo.
 func Load(p *paths.Paths) (*LoadResult, error) {
+	ls, err := readLayers(p)
+	if err != nil {
+		return nil, err
+	}
+	if ls.explicit && !ls.layers[ls.own].sf.ReadOK {
+		return nil, &MissingConfigFileError{Path: ls.layers[ls.own].sf.Path}
+	}
+	res := &LoadResult{}
+	for _, l := range ls.layers {
+		res.SourceFiles = append(res.SourceFiles, l.sf)
+		if l.sf.ReadOK {
+			res.Config = mergeConfig(res.Config, l.cfg)
+		}
+	}
+	if err := validate(res.Config); err != nil {
+		return nil, err
+	}
+	return res, nil
+}
+
+// MissingConfigFileError reports that the config file named explicitly
+// (-c/--config, PG_HARDSTORAGE_CONFIG_FILE) does not exist. It matches
+// errors.Is(err, fs.ErrNotExist).
+type MissingConfigFileError struct{ Path string }
+
+func (e *MissingConfigFileError) Error() string {
+	return fmt.Sprintf("config: config file %s (named by -c/--config or PG_HARDSTORAGE_CONFIG_FILE) does not exist", e.Path)
+}
+
+// Unwrap makes errors.Is(err, fs.ErrNotExist) true.
+func (e *MissingConfigFileError) Unwrap() error { return fs.ErrNotExist }
+
+// layer is one config source as read, before merging.
+type layer struct {
+	cfg Config
+	sf  SourceFile
+}
+
+// layerSet is every config source in merge order (lowest precedence
+// first). own indexes the layer write-back targets — the main file or
+// the -c file; explicit reports that it came from -c.
+type layerSet struct {
+	layers   []layer
+	own      int
+	explicit bool
+}
+
+// readLayers reads the env-var YAML, the main (or -c) file and, without
+// -c, every conf.d drop-in, in merge order. Parse errors are fatal;
+// absent files come back with ReadOK=false.
+func readLayers(p *paths.Paths) (*layerSet, error) {
 	if p == nil {
 		return nil, errors.New("config: nil paths")
 	}
-	res := &LoadResult{}
+	ls := &layerSet{}
 
 	if envBody := os.Getenv("PG_HARDSTORAGE_CONFIG"); strings.TrimSpace(envBody) != "" {
 		envCfg, envSF, err := loadBytes([]byte(envBody),
@@ -622,30 +680,21 @@ func Load(p *paths.Paths) (*LoadResult, error) {
 		if err != nil {
 			return nil, err
 		}
-		res.SourceFiles = append(res.SourceFiles, envSF)
-		if envSF.ReadOK {
-			res.Config = mergeConfig(res.Config, envCfg)
-		}
+		ls.layers = append(ls.layers, layer{envCfg, envSF})
 	}
 
 	// An explicit -c/--config file (via PG_HARDSTORAGE_CONFIG_FILE) is
 	// authoritative: read exactly that file and skip the well-known
 	// path + drop-in dir, so `-c staging.yaml` operates on staging.yaml
-	// and nothing else. Previously the flag was silently ignored and
-	// the tool always read <Config>/pg_hardstorage.yaml.
+	// and nothing else.
 	if override := strings.TrimSpace(p.ConfigFileOverride); override != "" {
 		cfg, sf, err := loadFile(override, "config_flag")
 		if err != nil {
 			return nil, err
 		}
-		res.SourceFiles = append(res.SourceFiles, sf)
-		if sf.ReadOK {
-			res.Config = mergeConfig(res.Config, cfg)
-		}
-		if err := validate(res.Config); err != nil {
-			return nil, err
-		}
-		return res, nil
+		ls.own, ls.explicit = len(ls.layers), true
+		ls.layers = append(ls.layers, layer{cfg, sf})
+		return ls, nil
 	}
 
 	mainPath := filepath.Join(p.Config.Value, "pg_hardstorage.yaml")
@@ -653,10 +702,8 @@ func Load(p *paths.Paths) (*LoadResult, error) {
 	if err != nil {
 		return nil, err
 	}
-	res.SourceFiles = append(res.SourceFiles, mainSF)
-	if mainSF.ReadOK {
-		res.Config = mergeConfig(res.Config, mainCfg)
-	}
+	ls.own = len(ls.layers)
+	ls.layers = append(ls.layers, layer{mainCfg, mainSF})
 
 	dropInDir := p.ConfigDropIn.Value
 	entries, err := os.ReadDir(dropInDir)
@@ -681,19 +728,12 @@ func Load(p *paths.Paths) (*LoadResult, error) {
 			if err != nil {
 				return nil, err
 			}
-			res.SourceFiles = append(res.SourceFiles, sf)
-			if sf.ReadOK {
-				res.Config = mergeConfig(res.Config, cfg)
-			}
+			ls.layers = append(ls.layers, layer{cfg, sf})
 		}
 	} else if !os.IsNotExist(err) {
 		return nil, fmt.Errorf("config: read drop-in dir %s: %w", dropInDir, err)
 	}
-
-	if err := validate(res.Config); err != nil {
-		return nil, err
-	}
-	return res, nil
+	return ls, nil
 }
 
 // loadBytes parses one YAML blob (from a file or from

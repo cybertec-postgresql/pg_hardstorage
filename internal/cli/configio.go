@@ -2,6 +2,7 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -43,12 +44,20 @@ func configFilePath(p *paths.Paths) string {
 	return filepath.Join(p.Config.Value, "pg_hardstorage.yaml")
 }
 
-// loadEditableConfig reads the merged config exactly once and returns
-// (paths, current config, write-back closure). The closure serialises
-// the config back to disk, preserving the schema header. Drop-in
-// files (`conf.d/*.yaml`) are READ but never written — write-back
-// always targets the main file. Operators who want their changes
-// in a drop-in must edit the YAML by hand.
+// loadEditableConfig reads the config exactly once and returns
+// (paths, merged config, write-back closure). The returned config is the
+// merged view every reader sees (env YAML + main file + conf.d
+// drop-ins), so list/show commands keep working unchanged.
+//
+// The closure does NOT serialise that merged view. It diffs the edited
+// config against what was loaded and applies only the changes to the
+// target file's own content (the -c file, else the main file) — see
+// config.EditView. Persisting the merge copied every drop-in deployment
+// and the PG_HARDSTORAGE_CONFIG env YAML, credentials included, into the
+// main file on the first edit. Editing or removing something a drop-in
+// or the env YAML defines is refused (config.defined_elsewhere, exit 2)
+// with the file to edit instead; removing a drop-in deployment used to
+// report "removed" while the drop-in kept defining it.
 //
 // This shape is what the notify / schedule / deployment commands
 // share: they each load, mutate the in-memory Config, and call the
@@ -59,39 +68,57 @@ func loadEditableConfig() (*paths.Paths, *config.Config, func(*config.Config) er
 	if err != nil {
 		return nil, nil, nil, output.NewError("internal", err.Error()).Wrap(err)
 	}
-	loaded, err := config.Load(p)
+	view, err := config.LoadForEdit(p)
 	if err != nil {
 		return nil, nil, nil, output.NewError("config.load_failed",
 			fmt.Sprintf("config: load: %v", err)).Wrap(err)
 	}
-	cfg := config.Config{}
-	if loaded != nil {
-		cfg = loaded.Config
-	}
+	cfg := view.Merged
 	if cfg.Schema == "" {
 		cfg.Schema = config.Schema
 	}
 
 	write := func(updated *config.Config) error {
-		body, err := config.Marshal(updated)
+		own, err := view.Apply(updated)
 		if err != nil {
-			return output.NewError("config.marshal_failed", err.Error()).Wrap(err)
+			return configEditError(err)
 		}
-		path := configFilePath(p)
-		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-			return output.NewError("config.mkdir_failed",
-				fmt.Sprintf("config: mkdir %s: %v", filepath.Dir(path), err)).Wrap(err)
-		}
-		// fsutil.WriteFileAtomic: another process (or a parallel
-		// `pg_hardstorage` invocation) could be reading the config
-		// concurrently — atomic rewrite avoids tearing the YAML.
-		if err := fsutil.WriteFileAtomic(path, body, 0o600); err != nil {
-			return output.NewError("config.write_failed",
-				fmt.Sprintf("config: write %s: %v", path, err)).Wrap(err)
-		}
-		return nil
+		return writeConfigFile(view.Path, own)
 	}
 	return p, &cfg, write, nil
+}
+
+// configEditError maps a refused layered edit onto the structured error
+// operators see; anything else is an internal failure.
+func configEditError(err error) error {
+	var elsewhere *config.DefinedElsewhereError
+	if errors.As(err, &elsewhere) {
+		return output.NewError("config.defined_elsewhere", err.Error()).
+			WithSuggestion(&output.Suggestion{
+				Human: fmt.Sprintf("edit %s directly, or pass -c <file> to work on a single file", strings.Join(elsewhere.Sources, " / ")),
+			}).Wrap(output.ErrUsage)
+	}
+	return output.NewError("config.marshal_failed", err.Error()).Wrap(err)
+}
+
+// writeConfigFile serialises cfg to path atomically.
+func writeConfigFile(path string, cfg *config.Config) error {
+	body, err := config.Marshal(cfg)
+	if err != nil {
+		return output.NewError("config.marshal_failed", err.Error()).Wrap(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return output.NewError("config.mkdir_failed",
+			fmt.Sprintf("config: mkdir %s: %v", filepath.Dir(path), err)).Wrap(err)
+	}
+	// fsutil.WriteFileAtomic: another process (or a parallel
+	// `pg_hardstorage` invocation) could be reading the config
+	// concurrently — atomic rewrite avoids tearing the YAML.
+	if err := fsutil.WriteFileAtomic(path, body, 0o600); err != nil {
+		return output.NewError("config.write_failed",
+			fmt.Sprintf("config: write %s: %v", path, err)).Wrap(err)
+	}
+	return nil
 }
 
 // mustHaveDeployment returns the deployment matching name from cfg,
