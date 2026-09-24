@@ -362,7 +362,7 @@ func expandPgReplacement(repl, match string, groups []string) string {
 
 // hashUUID reproduces the production SQL for hash_to_uuid:
 //
-//	md5(decode('<salt>','hex') || <value>::text)::uuid::text
+//	md5(decode('<salt>','hex') || convert_to(<value>::text,'UTF8'))::uuid::text
 //
 // PG's md5() digests (salt-bytes || value-bytes) and returns 32 lower-
 // case hex chars; ::uuid::text then re-emits them dash-grouped
@@ -377,7 +377,8 @@ func hashUUID(salt []byte, value string) string {
 }
 
 // md5Hex returns the 32-char lowercase hex MD5 of (salt || value) —
-// the byte input PG's md5(decode(salt,'hex') || value::text) hashes.
+// the byte input PG's md5(decode(salt,'hex') || convert_to(value,'UTF8'))
+// hashes (bytea || bytea; see strategyToSQLExpr).
 func md5Hex(salt []byte, value string) string {
 	h := md5.New()
 	h.Write(salt)
@@ -436,12 +437,18 @@ func strategyToSQLExpr(s Strategy, col, saltHex string) string {
 	switch {
 	case s == "nullify":
 		return "NULL"
+	// The hash input must be BYTEA || BYTEA. bytea || text resolves to
+	// PostgreSQL's anynonarray || text, i.e. TEXT concatenation of the
+	// salt's '\x<hex>' output form, so the SQL hashed different bytes
+	// than RedactValue's preview (salt bytes || UTF-8 value) and no
+	// preview ever matched an applied value. convert_to(..., 'UTF8')
+	// pins the value's bytes independent of the server encoding.
 	case s == "hash_to_uuid":
-		return fmt.Sprintf("md5(decode('%s', 'hex') || %s::text)::uuid::text", saltHex, q)
+		return fmt.Sprintf("md5(decode('%s', 'hex') || convert_to(%s::text, 'UTF8'))::uuid::text", saltHex, q)
 	case s == "hash_keep_domain":
 		// keep the @domain suffix; hash the localpart
 		return fmt.Sprintf(
-			"left(md5(decode('%s','hex')||split_part(%s,'@',1)), 8)||'@'||split_part(%s,'@',2)",
+			"left(md5(decode('%s','hex')||convert_to(split_part(%s,'@',1),'UTF8')), 8)||'@'||split_part(%s,'@',2)",
 			saltHex, q, q)
 	case s == "replace_with_xxx":
 		return fmt.Sprintf("repeat('x', length(%s))", q)
