@@ -98,7 +98,21 @@ func Parse(s string) (time.Duration, error) {
 		if unit == 'w' {
 			per *= 7
 		}
-		total += time.Duration(n * per)
+		// Range-check in float BEFORE converting: time.Duration(f) of an
+		// out-of-range f is implementation-defined (amd64 wraps to
+		// math.MinInt64, arm64 saturates), and a wrapped value is a
+		// NEGATIVE duration — which gc and wal prune read as "safety
+		// floor disabled". A floor asked to be enormous must not come
+		// out switched off, so overflow is an error, exactly as
+		// time.ParseDuration treats its own.
+		f := n * per
+		if f >= maxDurationFloat {
+			return 0, fmt.Errorf("invalid duration %q: overflows the maximum duration (~106751d)", s)
+		}
+		var ok bool
+		if total, ok = addDuration(total, time.Duration(f)); !ok {
+			return 0, fmt.Errorf("invalid duration %q: overflows the maximum duration (~106751d)", s)
+		}
 		rest = rest[i+1:]
 		matched = true
 	}
@@ -110,10 +124,29 @@ func Parse(s string) (time.Duration, error) {
 			}
 			return 0, err
 		}
-		total += d
+		var ok bool
+		if total, ok = addDuration(total, d); !ok {
+			return 0, fmt.Errorf("invalid duration %q: overflows the maximum duration (~106751d)", s)
+		}
 	}
 	if neg {
 		total = -total
 	}
 	return total, nil
+}
+
+// maxDurationFloat is 2^63 as a float64 — the first value NOT
+// representable as a time.Duration. float64(math.MaxInt64) rounds up to
+// exactly this, so the comparison must be >=.
+const maxDurationFloat = float64(1 << 63)
+
+// addDuration adds two non-negative durations, reporting false instead
+// of wrapping when the sum leaves the int64 range. Each group is range-
+// checked on its own, but "100000d100000d" overflows only in the sum.
+func addDuration(a, b time.Duration) (time.Duration, bool) {
+	sum := a + b
+	if sum < a {
+		return 0, false
+	}
+	return sum, true
 }

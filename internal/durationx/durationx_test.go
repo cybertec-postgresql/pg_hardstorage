@@ -100,3 +100,33 @@ func TestParse_AgreesWithStdlibWhereStdlibAccepts(t *testing.T) {
 		}
 	}
 }
+
+// A day/week count past the int64-nanosecond range must be REJECTED,
+// never wrapped. time.Duration(float) of an out-of-range value is
+// implementation-defined (amd64 yields math.MinInt64), so "106752d"
+// used to parse as roughly -292 years: a negative safety floor that
+// callers read as "disabled" — `--min-chunk-age 200000d` turned gc's
+// chunk-age floor OFF instead of making it effectively infinite.
+// time.ParseDuration refuses its own overflow ("invalid duration");
+// the widened language must too.
+func TestParse_OverflowIsAnError(t *testing.T) {
+	for _, in := range []string{
+		"106752d",         // just past MaxInt64 ns (~106751.99d)
+		"15251w",          // weeks overflow
+		"200000d",         // far past
+		"100000d100000d",  // each group fits, the SUM overflows
+		"106751d1000000h", // days fit, the stdlib remainder tips it over
+		"-106752d",        // negative overflow
+		"1e30d",           // float exponent spelled in the number
+	} {
+		got, err := durationx.Parse(in)
+		if err == nil {
+			t.Errorf("Parse(%q) = %v, want an overflow error", in, got)
+		}
+	}
+	// The largest representable day count still parses, positive.
+	got, err := durationx.Parse("106751d")
+	if err != nil || got <= 0 {
+		t.Errorf("Parse(106751d) = %v, %v; want a positive duration", got, err)
+	}
+}
