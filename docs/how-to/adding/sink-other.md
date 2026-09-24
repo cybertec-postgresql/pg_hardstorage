@@ -38,22 +38,30 @@ for the full flag list.
 
 ## CEF (`cef`)
 
-ArcSight Common Event Format over TCP / TLS. For SIEMs that
-prefer CEF over RFC 5424's JSON message body.
+ArcSight Common Event Format, one event per line, appended to a
+local file. For SIEMs that prefer CEF over RFC 5424's JSON
+message body; ship the file with the forwarder you already run
+(rsyslog, filebeat, the ArcSight / Splunk connector). The sink
+has no network transport, so the air-gap policy does not apply.
 
 ```yaml
 sinks:
   - name: prod-cef
     plugin: cef
     config:
-      protocol: tls
-      address: siem.example.com:514
+      destination: file:///var/log/pg_hardstorage/audit.cef
       vendor: pg_hardstorage
       product: pg_hardstorage
       version: "1"
 ```
 
 CEF severity is rendered as 0-10 from the RFC 5424 ladder.
+
+The file is safe to rotate with logrotate in either mode.
+`copytruncate` needs nothing special. With the default
+move-and-create, the sink notices before its next write that the
+path names a different file (or none) and re-opens it, so new
+events land in the fresh file rather than the rotated one.
 
 ## Datadog (`datadog-events`)
 
