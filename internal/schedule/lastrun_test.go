@@ -120,3 +120,30 @@ func TestOpenFileLastRunStore_Corrupt(t *testing.T) {
 		t.Error("corrupt store should be empty")
 	}
 }
+
+// A crash between writing the temp file and renaming it leaves a stale
+// .tmp behind. The next write must still persist: last-run state that
+// stops saving after one crash makes every restart re-run (or skip) tasks.
+func TestFileLastRunStore_SurvivesStaleTmpFromACrash(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "lastrun.json")
+	if err := os.WriteFile(path+".tmp", []byte("{torn"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var flushErr error
+	s, err := schedule.OpenFileLastRunStore(path, func(e error) { flushErr = e })
+	if err != nil {
+		t.Fatal(err)
+	}
+	at := time.Date(2026, 9, 24, 12, 0, 0, 0, time.UTC)
+	s.RecordRun("backup", at)
+	if flushErr != nil {
+		t.Fatalf("write after a crash-leftover .tmp failed: %v", flushErr)
+	}
+	re, err := schedule.OpenFileLastRunStore(path, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := re.LastRun("backup"); !ok || !got.Equal(at) {
+		t.Fatalf("persisted last run = %v, %v; want %v", got, ok, at)
+	}
+}

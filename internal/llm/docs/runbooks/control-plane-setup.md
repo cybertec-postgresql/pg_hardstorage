@@ -234,6 +234,13 @@ sudo -u pgbackup pg_hardstorage agent \
     --agent-id db1.example.com
 ```
 
+The agent advertises the deployments named in its local
+`pg_hardstorage.yaml` and claims only jobs for those deployments.
+An agent with no `deployments:` block refuses to start
+(`config.no_deployments`), and the control plane treats a claim that
+names no deployments as matching nothing — an empty list never means
+"any deployment".
+
 Within 10 seconds the agent's first heartbeat should land. Verify
 on the control-plane host:
 
@@ -294,6 +301,26 @@ running     — an agent claimed it; progress events appended
 completed   — agent finished successfully
 failed      — agent reported failure (see .failure for the message)
 ```
+
+### Dispatching from the CLI
+
+`pg_hardstorage backup <deployment> --control-plane <url>` and
+`pg_hardstorage restore <deployment> <backup> --target <dir>
+--control-plane <url>` enqueue the job and poll it to completion.
+Flags travel to the agent as job arguments; a flag the agent cannot
+honour is refused with `usage.unsupported_flag` (exit 2) rather than
+silently dropped:
+
+| Command | Forwarded | Refused |
+| --- | --- | --- |
+| `restore` | `--to`, `--to-lsn`, `--to-name`, `--to-latest`, `--to-action`, `--to-timeline`, `--to-exclusive`, `--force`, `--force-foreign`, `--skip-gap-check`, `--tablespace-mapping`, `--verify` (only when set explicitly) | `--preview` (there is no remote preview — it would run a real restore), `--require-threshold-attestation`, `--verify-restore`, `--kms-config`, `--chain-staging-root`, `--reset-chain-staging` |
+| `backup` | `--fast`, `--label`, `--stall-timeout`, `--incremental-from`, `--include-wal` | `--pg-connection`, `--tenant`, `--encrypt`/`--no-encrypt`, `--kek`, `--kms-config`, `--tde`/`--tde-engine`/`--tde-key-ref`, `--allow-concurrent`, `--ignore-capacity`, `--capacity-safety-factor`, `--verbose` |
+
+Ctrl-C while the CLI is polling cancels the job on the control plane
+and exits `5` (`aborted.context_cancelled`); the agent running it
+notices the cancellation and stops. Agents older than this release
+ignore job arguments they do not know — upgrade agents before relying
+on `--to-latest`, `--skip-gap-check` or `--force-foreign` dispatch.
 
 Job timeout: a job stuck in `running` past `claimDeadline` (default
 6h) is automatically transitioned to `failed` with

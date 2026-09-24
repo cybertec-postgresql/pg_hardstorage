@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/fsutil"
 	"os"
 	"path/filepath"
 	"sync"
@@ -97,22 +98,17 @@ func (s *FileLastRunStore) flushLocked() error {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("schedule: create last-run state dir: %w", err)
 	}
-	tmp, err := os.CreateTemp(dir, ".lastrun-*.json")
-	if err != nil {
-		return fmt.Errorf("schedule: write last-run state: %w", err)
+	// WriteFileAtomic fsyncs the file, renames it into place and fsyncs the
+	// directory: a power loss must not lose the record of a task that ran,
+	// or the restart that follows re-runs it (or skips a due one).
+	// WriteFileAtomic refuses a leftover .tmp (O_EXCL). This store is its
+	// file's only writer (s.mu is held), so a leftover can only be a torn
+	// write from a crash; clearing it keeps one crash from disabling
+	// last-run persistence for good.
+	if err := os.Remove(s.path + ".tmp"); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("schedule: clear stale last-run tmp: %w", err)
 	}
-	tmpName := tmp.Name()
-	if _, err := tmp.Write(body); err != nil {
-		_ = tmp.Close()
-		_ = os.Remove(tmpName)
-		return fmt.Errorf("schedule: write last-run state: %w", err)
-	}
-	if err := tmp.Close(); err != nil {
-		_ = os.Remove(tmpName)
-		return fmt.Errorf("schedule: write last-run state: %w", err)
-	}
-	if err := os.Rename(tmpName, s.path); err != nil {
-		_ = os.Remove(tmpName)
+	if err := fsutil.WriteFileAtomic(s.path, body, 0o600); err != nil {
 		return fmt.Errorf("schedule: write last-run state: %w", err)
 	}
 	return nil
