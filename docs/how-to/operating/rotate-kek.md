@@ -250,7 +250,8 @@ backup and rotate? Compare against `pg_hardstorage kms inspect`.
 repo contains manifests wrapped under a KEK ref you didn't
 expect: another tenant, or an earlier rotation that didn't
 finish. `pg_hardstorage kms verify --repo <url>` counts every
-manifest whose ref the local resolver doesn't recognise as
+manifest whose ref neither the local keyring nor a registered KMS
+provider recognises as
 `kek_unknown`; `--kek-ref` narrows a run to a single ref.
 
 **Replica copy out of sync** — `repo check` flags it; re-run
