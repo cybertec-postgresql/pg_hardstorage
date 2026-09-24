@@ -1231,9 +1231,11 @@ func newLlmSkillLintCmd() *cobra.Command {
 
 func loadSkillSet() (*skills.Set, error) {
 	dirs := skills.DefaultDirs(os.Getenv("HOME"))
-	// Prepend an in-development fallback so a `make build` without
-	// install still finds the in-tree skills.
-	dirs = append([]string{"share/skills"}, dirs...)
+	// No CWD-relative search path (there used to be a ./share/skills
+	// fallback): skill YAML controls the system prompt and the tool
+	// allowlist, so running from an attacker-writable directory must
+	// not silently override the builtins.  In-tree development points
+	// PG_HARDSTORAGE_SKILL_DIR=share/skills at the templates explicitly.
 	if extra := os.Getenv("PG_HARDSTORAGE_SKILL_DIR"); extra != "" {
 		dirs = append(dirs, extra)
 	}
@@ -1339,7 +1341,7 @@ type skillListEntry struct {
 // WriteText renders the available skills as a tabular summary to w.
 func (b skillListBody) WriteText(w io.Writer) error {
 	if len(b.Skills) == 0 {
-		_, err := io.WriteString(w, "no skills loaded — install share/skills/ or drop a YAML in /etc/pg_hardstorage/skills/")
+		_, err := io.WriteString(w, "no skills loaded — drop a YAML in /etc/pg_hardstorage/skills/ or point $PG_HARDSTORAGE_SKILL_DIR at a skill directory")
 		return err
 	}
 	bw := &strings.Builder{}
