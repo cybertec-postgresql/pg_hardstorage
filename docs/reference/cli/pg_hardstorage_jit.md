@@ -23,9 +23,13 @@ operator's ed25519 signing key.  Use case: an operator under
 supervised access needs to perform a destructive operation
 (kms shred, repo gc --apply, etc.) without holding a permanent
 elevated token.  An admin issues a short-TTL token scoped to
-the specific operation; the operator passes the token to the
-destructive command; the audit chain records both issuance and
-consumption.
+the specific operation; the audit chain records issuance and
+revocation.
+
+Enforcement status: destructive commands do NOT yet accept or check
+a JIT token -- they are gated by --require-approval. Use
+"jit verify" to check a token (e.g. in a wrapper script) before
+running the command; a token alone does not authorise anything.
 
 Operationally:
 
@@ -35,8 +39,10 @@ Operationally:
         --reason "GDPR Art. 17 erasure request #4421" \
         --repo s3://acme
 
-    # operator consumes (future commit will wire --jit-token
-    # into kms shred + other destructive commands)
+    # operator (or a wrapper) checks the token, then runs the
+    # approval-gated command; kms shred does not take the token
+    pg_hardstorage jit verify --repo s3://acme \
+        --token <token> --operation kms.shred --tenant <tenant>
     pg_hardstorage kms shred --repo s3://acme \
         --confirm-keyring <keyring-dir> --require-approval <id> --yes
 
