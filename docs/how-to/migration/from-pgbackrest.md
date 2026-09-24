@@ -158,6 +158,15 @@ PostgreSQL read an offset-less time in the server's
 `TimeZone`, pg_hardstorage would read it as UTC, so the shim
 refuses it rather than stop at the wrong instant.
 
+`--repo1-cipher-type=aes-256-cbc` makes the shim's `backup`
+pass native `--encrypt`: the backup is encrypted under the
+deployment's KEK (keyring `kek.bin` from
+`pg_hardstorage init --encrypt`, or `kek_ref:` in
+`pg_hardstorage.yaml`) and **fails** if no KEK is configured,
+instead of silently running unencrypted.  The passphrase in
+`--repo1-cipher-pass` is never used.  `archive-push` encrypts
+WAL whenever that KEK exists — configure it before cutover.
+
 After the shim is wired, the rest of the cutover (steps 1-8
 below) proceeds exactly as documented — the shim simply
 replaces the pgBackRest binary, not the migration model.

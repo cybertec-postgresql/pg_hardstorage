@@ -88,13 +88,14 @@ func registerCommonFlags(fs *pflag.FlagSet) {
 	fs.StringVar(&defaultArgs.repo1S3KeyType, "repo1-s3-key-type", "",
 		"S3 key type (auto | shared) — credentials still come from env")
 
-	// Cipher: pgBackRest defaults to none.  We map cipher-pass
-	// to the native KEK-derivation path with a warning that
-	// AES-256-GCM is the modern equivalent (vs CBC).
+	// Cipher: pgBackRest defaults to none.  A cipher type makes
+	// `backup` demand native encryption (--encrypt, keyed by the
+	// deployment's KEK); the passphrase itself has no native use
+	// and is never forwarded — see mapToNativeArgs.
 	fs.StringVar(&defaultArgs.repo1CipherType, "repo1-cipher-type", "",
-		"repository cipher: none | aes-256-cbc")
+		"repository cipher: none | aes-256-cbc (backup then requires a native KEK)")
 	fs.StringVar(&defaultArgs.repo1CipherPass, "repo1-cipher-pass", "",
-		"repository cipher passphrase (KEK-derivation source)")
+		"repository cipher passphrase (not used: native encryption is keyed by the deployment's KEK)")
 
 	fs.StringVar(&defaultArgs.compressType, "compress-type", "",
 		"compression: zstd | lz4 | gzip | none")
@@ -369,13 +370,26 @@ func mapToNativeArgs(verb string, a pgbackrestArgs) (native []string, warnings [
 		return nil, nil, missingStanzaHint(a.stanza, missing)
 	}
 
-	// Cipher: pgBackRest's CBC vs our GCM is a real
-	// algorithm difference.  We forward as a passphrase
-	// (the native KEK-derivation path treats the value
-	// as a passphrase) but surface a warning.
-	if strings.EqualFold(a.repo1CipherType, "aes-256-cbc") && a.repo1CipherPass != "" {
-		warnings = append(warnings,
-			"warn: pgBackRest aes-256-cbc maps to native AES-256-GCM; algorithm differs but passphrase is honoured")
+	// Cipher: the operator asked for an encrypted repository. Native
+	// encryption is keyed by the deployment's KEK (keyring kek.bin or a
+	// kek_ref), never by a passphrase, so the passphrase cannot be
+	// forwarded. The shim used to forward nothing at all while printing
+	// "passphrase is honoured" — and the backup ran in plaintext. For
+	// `backup` it now passes --encrypt, which makes native refuse
+	// (backup.encrypt_no_kek) instead of silently writing plaintext
+	// when no KEK is configured. `wal push` has no such switch: it
+	// encrypts whenever the deployment has a KEK, so the warning says
+	// exactly that.
+	if cipherRequested(a) {
+		if verb == "backup" {
+			native = append(native, "--encrypt")
+		}
+		if verb == "backup" || verb == "wal push" {
+			warnings = append(warnings,
+				"warn: --repo1-cipher-pass is NOT used; native encrypts with AES-256-GCM under the deployment's KEK "+
+					"(keyring kek.bin from `pg_hardstorage init --encrypt`, or `kek_ref:` in pg_hardstorage.yaml)"+
+					encryptConsequence(verb))
+		}
 	}
 
 	// Compression: native default is zstd.  Anything else
@@ -409,6 +423,23 @@ func mapToNativeArgs(verb string, a pgbackrestArgs) (native []string, warnings [
 	}
 
 	return native, warnings, nil
+}
+
+// cipherRequested reports whether the pgBackRest flags ask for an
+// encrypted repository. pgBackRest ignores a passphrase without a
+// cipher type, and "none" is its explicit plaintext spelling.
+func cipherRequested(a pgbackrestArgs) bool {
+	t := strings.ToLower(a.repo1CipherType)
+	return t != "" && t != "none"
+}
+
+// encryptConsequence finishes the cipher warning with what the verb
+// actually does when no KEK is configured.
+func encryptConsequence(verb string) string {
+	if verb == "backup" {
+		return "; --encrypt is forwarded, so the backup FAILS rather than run unencrypted if no KEK is configured"
+	}
+	return "; without a KEK this segment is archived UNENCRYPTED"
 }
 
 // verbAcceptsPGConnection reports whether the native verb registers a
