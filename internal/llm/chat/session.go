@@ -139,6 +139,14 @@ type Session struct {
 	// turn.  Read internally; tests substitute their own.
 	PreviewLedger *safety.PreviewState
 
+	// Anomaly, when non-nil, is execute_command's anomaly
+	// detector.  Ask merges each OPERATOR prompt's topic tokens
+	// into it before the turn runs, so a high-risk verb the
+	// operator asked for is on-topic.  Model replies and tool
+	// output are deliberately not merged: the detector exists to
+	// catch those steering towards a destructive verb.
+	Anomaly *safety.AnomalyDetector
+
 	// HistoryWriter, when non-nil, receives the same events
 	// the AuditEmitter does — but encrypted at rest under the
 	// store's per-principal DEK.  The CLI opens a Writer per
@@ -266,6 +274,12 @@ func (s *Session) emit(action string, body map[string]any) {
 		})
 	}
 }
+
+// Emit fires an event on the session's observers exactly as the
+// session's own events are.  The CLI uses it for events that
+// originate in tools (execute_command gate and anomaly verdicts)
+// so they land on the same audit trail and transcript.
+func (s *Session) Emit(action string, body map[string]any) { s.emit(action, body) }
 
 // mapActionToHistory maps the chat package's emit-action
 // names onto the history.Entry {Role, Op} pair.  The
@@ -621,6 +635,10 @@ func (s *Session) Ask(ctx context.Context, question string) (*Reply, error) {
 	// protection invariant.
 	if s.PreviewLedger != nil {
 		s.PreviewLedger.Reset()
+	}
+	if s.Anomaly != nil {
+		s.Anomaly.RecentTopicTokens = safety.MergeTopicTokens(
+			s.Anomaly.RecentTopicTokens, safety.ExtractTopicTokens(question))
 	}
 	// Apply privacy redaction to the user prompt BEFORE it
 	// goes into History (so the provider sees the redacted

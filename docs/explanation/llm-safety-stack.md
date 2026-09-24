@@ -169,6 +169,13 @@ destructions are another; jumping between clusters without an
 intervening user statement is treated as evidence of a prompt
 injection or a hallucinated escalation.
 
+Concretely, a command carrying a high-risk verb (`delete`,
+`rotate`, `gc`, `force`, `purge`, `shred`, `wipe`) runs only when
+*you* raised that verb earlier in the session ("please run gc",
+"we need a key rotation"). Only your own prompts count: the model's
+replies and tool output cannot put a verb on-topic, since they are
+exactly what the detector is checking. `/clear` resets the topic set.
+
 This is the "the LLM was malicious / compromised" failure mode.
 It's the gate that catches *the model itself* going wrong, not
 just the model being misused.
