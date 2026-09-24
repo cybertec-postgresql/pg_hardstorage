@@ -52,6 +52,7 @@ import (
 	"fmt"
 	"io"
 	"iter"
+	"net/http"
 	"net/url"
 	"path"
 	"strings"
@@ -60,6 +61,7 @@ import (
 
 	gcs "cloud.google.com/go/storage"
 	gax "github.com/googleapis/gax-go/v2"
+	"google.golang.org/api/googleapi"
 	"google.golang.org/api/iterator"
 	gcsoption "google.golang.org/api/option"
 
@@ -490,19 +492,20 @@ func retentionModeFor(m storage.WORMMode) string {
 	return ""
 }
 
-// isPreconditionFailed detects the "DoesNotExist precondition
-// failed" GCS surfaces when an If-NoOverwrite Put hits an
-// existing object.  GCS's error type is rich; we match on
-// the documented googleapi.Error code.
+// isPreconditionFailed reports whether err is GCS's answer to a failed
+// DoesNotExist precondition: HTTP 412 on the typed googleapi.Error the
+// JSON transport returns.
+//
+// Classification is by TYPE only, never by error text. The old check
+// matched "412" / "Precondition" / "conditionNotMet" anywhere in
+// err.Error(), and a transport error quotes the request URL — which
+// carries the object name. A chunk hash containing "412" (about 1.5% of
+// them) or a dated key like 20260412 turned a dropped upload into
+// ErrAlreadyExists, CAS counted it as a dedup hit, and the backup
+// committed a manifest pointing at a chunk that was never stored.
 func isPreconditionFailed(err error) bool {
-	if err == nil {
-		return false
-	}
-	msg := err.Error()
-	// GCS errors include the HTTP status; conditional-PUT
-	// failure is 412 Precondition Failed.
-	return strings.Contains(msg, "412") || strings.Contains(msg, "Precondition") ||
-		strings.Contains(msg, "conditionNotMet")
+	var gerr *googleapi.Error
+	return errors.As(err, &gerr) && gerr.Code == http.StatusPreconditionFailed
 }
 
 func (p *Plugin) assertOpen() error {
