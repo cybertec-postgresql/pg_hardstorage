@@ -14,6 +14,7 @@ import (
 
 	"github.com/jackc/pglogrepl"
 
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/logical/commitlsn"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/logical/sinks/webhook"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/pg/logicalreceiver"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
@@ -110,7 +111,7 @@ func TestSink_HappyPath_BatchSize(t *testing.T) {
 	if rec.calls.Load() != 0 {
 		t.Errorf("after 1 record: posted, want buffered")
 	}
-	if err := s.OnRecord(ctx, mkRecord(0x1001, []byte("b"))); err != nil {
+	if err := s.OnRecord(ctx, mkRecord(0x1001, commitlsn.Message(0x1040))); err != nil {
 		t.Fatal(err)
 	}
 	if rec.calls.Load() != 1 {
@@ -270,7 +271,7 @@ func TestSink_RetriesTransient(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.OnRecord(context.Background(), mkRecord(0x1000, []byte("a"))); err != nil {
+	if err := s.OnRecord(context.Background(), mkRecord(0x1000, commitlsn.Message(0x1040))); err != nil {
 		t.Fatalf("OnRecord: %v", err)
 	}
 	if rec.calls.Load() != 2 {
@@ -386,7 +387,7 @@ func TestSink_BudgetExhausted_DeadLetter(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = s.OnRecord(context.Background(), mkRecord(0x1000, []byte("a")))
+	err = s.OnRecord(context.Background(), mkRecord(0x1000, commitlsn.Message(0x1040)))
 	if err != nil {
 		t.Errorf("dead-letter should swallow exhaustion: %v", err)
 	}

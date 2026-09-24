@@ -26,6 +26,11 @@ The receive layer (replication-slot wire protocol, WAL message parsing) lives at
 - `sinks/webhook/` — POST per-event to an HTTP endpoint (with retries +
   backoff)
 
+Every sink confirms (`SyncedLSN`) only the end LSN of the last pgoutput commit
+message it has durably stored — `commitlsn/` extracts it. Never confirm
+`WALStart+len(Data)`: it is synthetic and can overshoot commits not yet
+received, which PostgreSQL then skips after a restart.
+
 ## Key files
 
 - `orchestrator.go` — `Manager`, registry state file, add/list/remove
