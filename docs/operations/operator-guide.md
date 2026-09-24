@@ -599,10 +599,10 @@ sinks:
     config:
       smtp_host: smtp.example.com
       smtp_port: 587
-      tls_mode: starttls          # starttls | implicit | none
-      auth_mode: plain            # plain | login | none
+      tls: starttls               # starttls | implicit | none
+      auth: plain                 # plain | login | none
       username: pg-hardstorage
-      password_secret: kms-secret://ops/smtp-password
+      password: "<smtp-password>"   # literal; keep pg_hardstorage.yaml mode 0600
       from: backups@example.com
       to: ["dba@example.com"]
       cc: ["ops@example.com"]
