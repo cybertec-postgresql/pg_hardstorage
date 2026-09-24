@@ -78,8 +78,8 @@ func TestDeploymentRemove_DropInDeploymentIsRefused(t *testing.T) {
 	_, mainPath, dropInPath := layeredConfig(t)
 	before, _ := os.ReadFile(mainPath)
 	_, errb, exit := runCmd(t, "deployment", "remove", "dropdb", "--yes", "-o", "json")
-	if exit != 2 {
-		t.Errorf("remove of a drop-in deployment: exit %d, want 2\n%s", exit, errb)
+	if exit != 1 {
+		t.Errorf("remove of a drop-in deployment: exit %d, want 1\n%s", exit, errb)
 	}
 	if !strings.Contains(errb, "config.defined_elsewhere") || !strings.Contains(errb, dropInPath) {
 		t.Errorf("error should be config.defined_elsewhere naming %s; got\n%s", dropInPath, errb)
@@ -90,8 +90,8 @@ func TestDeploymentRemove_DropInDeploymentIsRefused(t *testing.T) {
 	}
 	// The env-var layer has no file to edit; it is refused the same way.
 	_, errb, exit = runCmd(t, "deployment", "remove", "envdb", "--yes", "-o", "json")
-	if exit != 2 || !strings.Contains(errb, "PG_HARDSTORAGE_CONFIG") {
-		t.Errorf("remove of an env-var deployment: exit %d, want 2 naming PG_HARDSTORAGE_CONFIG\n%s", exit, errb)
+	if exit != 1 || !strings.Contains(errb, "PG_HARDSTORAGE_CONFIG") {
+		t.Errorf("remove of an env-var deployment: exit %d, want 1 naming PG_HARDSTORAGE_CONFIG\n%s", exit, errb)
 	}
 	// A main-file deployment still removes normally.
 	if _, errb, exit := runCmd(t, "deployment", "remove", "maindb", "--yes", "-o", "json"); exit != 0 {
@@ -126,8 +126,8 @@ func TestConfigFlag_MissingExplicitFileIsAnError(t *testing.T) {
 	t.Setenv("PG_HARDSTORAGE_CONFIG_FILE", "")
 	missing := filepath.Join(t.TempDir(), "typo.yaml")
 	out, errb, exit := runCmd(t, "lint", "-c", missing, "-o", "json")
-	if exit != 2 {
-		t.Errorf("lint -c <missing>: exit %d, want 2\nstdout: %s\nstderr: %s", exit, out, errb)
+	if exit != 1 {
+		t.Errorf("lint -c <missing>: exit %d, want 1\nstdout: %s\nstderr: %s", exit, out, errb)
 	}
 	if !strings.Contains(errb, "config.load_failed") || !strings.Contains(errb, missing) {
 		t.Errorf("want config.load_failed naming %s; got\n%s", missing, errb)

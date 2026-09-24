@@ -132,7 +132,7 @@ func runInit(cmd *cobra.Command, opts initOpts) error {
 	// document it expects — so refuse up front, per the SPEC, and point
 	// at the non-interactive form.
 	if !opts.yes && d.Renderer().Name() != "text" {
-		return output.NewError("init.interactive_needs_text",
+		return output.NewError("usage.interactive_needs_text",
 			fmt.Sprintf("init: the interactive wizard cannot run with --output %s", d.Renderer().Name())).
 			WithSuggestion(&output.Suggestion{
 				Human:   "run non-interactively with --yes and the answers as flags, or interactively with -o text",

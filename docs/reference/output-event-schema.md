@@ -36,6 +36,30 @@ Source: [`internal/output/event.go`](https://github.com/cybertec-postgresql/pg_h
 NDJSON renderer emits one Event per line; the text
 renderer emits one Event per paragraph.
 
+### Stdout contract
+
+Under `--output json` — also the default whenever stdout is
+not a terminal — **stdout carries at most one JSON document:
+the command's `Result`** (exactly one on success; none on
+failure, when the error `Result` goes to stderr).  Streaming
+Events (start-up warnings such as `config.sink.build_failed`
+or `plugin.tier2.discovered`, progress, `backup --verbose`
+per-file lines) go to **stderr, one compact JSON object per
+line**, so `cmd -o json | jq` always sees one document and
+stderr stays machine-readable.
+
+`--output ndjson` is the streaming format: Events and the
+final `Result` are all on stdout, one per line.  `--output
+text` prints events on stdout as paragraphs.  `llm
+--mcp-server` sends events to stderr under every format,
+because its stdout is the JSON-RPC stream.
+
+Commands that cannot honour a single document refuse
+instead of mixing formats: interactive `init` under a
+structured format (`usage.interactive_needs_text`) and `logs
+--follow` with anything but `text` / `ndjson`
+(`usage.follow_needs_stream`).
+
 ## `Severity`
 
 RFC 5424.  Lower numeric value = more severe.

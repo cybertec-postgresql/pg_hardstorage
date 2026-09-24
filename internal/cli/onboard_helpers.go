@@ -38,7 +38,7 @@ func newLintCmdImpl() *cobra.Command {
 				return output.NewError("config.load_failed", err.Error()).
 					WithSuggestion(&output.Suggestion{
 						Human: "check the path given to -c/--config (or PG_HARDSTORAGE_CONFIG_FILE)",
-					}).Wrap(output.ErrUsage)
+					})
 			}
 			if err != nil {
 				// A parse/validation failure is the whole point of lint:

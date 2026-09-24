@@ -55,7 +55,7 @@ func configFilePath(p *paths.Paths) string {
 // config.EditView. Persisting the merge copied every drop-in deployment
 // and the PG_HARDSTORAGE_CONFIG env YAML, credentials included, into the
 // main file on the first edit. Editing or removing something a drop-in
-// or the env YAML defines is refused (config.defined_elsewhere, exit 2)
+// or the env YAML defines is refused (config.defined_elsewhere)
 // with the file to edit instead; removing a drop-in deployment used to
 // report "removed" while the drop-in kept defining it.
 //
@@ -96,7 +96,7 @@ func configEditError(err error) error {
 		return output.NewError("config.defined_elsewhere", err.Error()).
 			WithSuggestion(&output.Suggestion{
 				Human: fmt.Sprintf("edit %s directly, or pass -c <file> to work on a single file", strings.Join(elsewhere.Sources, " / ")),
-			}).Wrap(output.ErrUsage)
+			}).Wrap(err)
 	}
 	return output.NewError("config.marshal_failed", err.Error()).Wrap(err)
 }
