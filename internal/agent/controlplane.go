@@ -36,6 +36,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/airgap"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/obs/metrics"
 )
 
@@ -142,6 +143,13 @@ func (c *ControlPlaneClient) Run(ctx context.Context) error {
 	}
 	if c.AgentID == "" {
 		return errors.New("controlplane: AgentID is required")
+	}
+	// The control plane is an outbound endpoint like any sink or
+	// storage backend: in strict air-gap mode it must resolve inside
+	// the perimeter (or be allowlisted). Checked once, before the first
+	// heartbeat, so a refused URL never sees a single request.
+	if err := airgap.Default().EndpointAllowed(c.BaseURL); err != nil {
+		return fmt.Errorf("controlplane: %w", err)
 	}
 	if c.HTTPClient == nil {
 		c.HTTPClient = &http.Client{Timeout: 30 * time.Second}
