@@ -590,6 +590,38 @@ func runCellLoop(
 			}
 		}
 
+		// 4b. Retention every R iterations, after verify so the
+		// backup just verified is never the one being pruned. A later
+		// verify_ok is the proof that gc reclaimed nothing still live —
+		// with the WAL streamer committing chunks concurrently.
+		if ra, ok := cell.(RetentionApplier); ok && opts.Loop.RetentionEvery > 0 &&
+			iter%opts.Loop.RetentionEvery == 0 {
+			err := ra.ApplyRetention(ctx)
+			switch {
+			case err != nil && ctx.Err() != nil:
+				emit(Event{Cell: cr.Name, Op: "retention_aborted_at_deadline",
+					Iteration: iter, Err: err.Error()})
+				cr.LastIteration = iter - 1
+				return
+			case errors.Is(err, ErrCellNotReady):
+				emit(Event{Cell: cr.Name, Op: "retention_skipped_cell_down",
+					Iteration: iter})
+			case err != nil:
+				emit(Event{Cell: cr.Name, Op: "retention_failed",
+					Iteration: iter, Err: err.Error()})
+				if reportFailure(report.Failure{
+					At: time.Now().UTC(), Cell: cr.Name, Iteration: iter,
+					Kind: "retention", Message: err.Error(),
+				}) {
+					cr.Pass = false
+					cr.FirstFailureMsg = "retention failed: " + err.Error()
+					return
+				}
+			default:
+				emit(Event{Cell: cr.Name, Op: "retention_ok", Iteration: iter})
+			}
+		}
+
 		// 5. Optional sleep between iterations.
 		if opts.Loop.IterationInterval > 0 {
 			select {

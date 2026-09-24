@@ -512,6 +512,47 @@ func isContainerGoneExecError(stdout, stderr []byte) bool {
 	return false
 }
 
+// retentionKeepFulls is how many fulls ApplyRetention keeps: enough
+// that the backup the loop verifies next is never among the pruned.
+const retentionKeepFulls = 3
+
+// retentionMinChunkAge guards chunks a concurrent writer (the WAL
+// streamer, a backup) has stored but not yet referenced from a
+// committed manifest. It is the product's own in-flight defence, and
+// the soak running gc beside a live streamer is what exercises it.
+const retentionMinChunkAge = 10 * time.Minute
+
+// ApplyRetention rotates the cell's repository to a count policy and
+// garbage-collects what that released — what a deployment's scheduled
+// rotate + gc does.
+func (d *DockerCellRuntime) ApplyRetention(ctx context.Context) error {
+	if !d.containerRunning(ctx) {
+		return ErrCellNotReady
+	}
+	steps := [][]string{
+		{d.AgentBinary, "rotate", d.Deployment, "--repo", d.RepoURL,
+			"--policy", "count", "--keep-fulls", strconv.Itoa(retentionKeepFulls),
+			"--apply", "-o", "json"},
+		{d.AgentBinary, "repo", "gc", "--repo", d.RepoURL, "--apply",
+			"--tombstone-grace", "0",
+			"--min-chunk-age", retentionMinChunkAge.String(), "-o", "json"},
+	}
+	for _, argv := range steps {
+		stdout, stderr, err := d.dockerExecCapture(ctx, argv...)
+		if err == nil {
+			continue
+		}
+		if isContainerGoneExecError(stdout, stderr) || d.containerPositivelyStopped(ctx) {
+			return fmt.Errorf("%w: container %s went down during %s: %v",
+				ErrCellNotReady, d.Container, argv[1], err)
+		}
+		combined := append(append([]byte{}, stdout...), stderr...)
+		return fmt.Errorf("retention %s (%s): %w (output: %s)",
+			d.CellName, strings.Join(argv[1:3], " "), err, truncate(combined, 2048))
+	}
+	return nil
+}
+
 // containerPositivelyStopped reports whether Docker says the container
 // is not running. Unlike containerRunning, an inspect error is "don't
 // know" (false), not "stopped" — it decides whether a failure is blamed

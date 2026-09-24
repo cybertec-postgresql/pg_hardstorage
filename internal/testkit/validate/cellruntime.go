@@ -137,6 +137,22 @@ type LoopOptions struct {
 	// HealWindow is how long the orchestrator waits between
 	// fault apply and recovery.  Default 30s.
 	HealWindow time.Duration
+
+	// RetentionEvery N iterations, run retention (rotate + gc) on
+	// cells whose runtime implements RetentionApplier. Default 20;
+	// negative disables. Without it the repository only grows: under
+	// enterprise_heavy's sustained writer every backup stores the
+	// pages churned since the last one, ~100 GB/h across 8 cells,
+	// which no host sustains for an 8h soak.
+	RetentionEvery int
+}
+
+// RetentionApplier is implemented by runtimes that can apply retention
+// to their repository the way a deployment does: rotate to a count
+// policy, then garbage-collect what that released. Optional, so the
+// fakes that implement CellRuntime need not.
+type RetentionApplier interface {
+	ApplyRetention(ctx context.Context) error
 }
 
 // defaults fills LoopOptions with sane production defaults
@@ -153,5 +169,8 @@ func (o *LoopOptions) defaults() {
 	}
 	if o.VerifyEvery == 0 {
 		o.VerifyEvery = 25
+	}
+	if o.RetentionEvery == 0 {
+		o.RetentionEvery = 20
 	}
 }
