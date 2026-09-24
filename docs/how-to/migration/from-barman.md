@@ -66,7 +66,8 @@ pg_hardstorage compat translate --from barman \
     --out-file /etc/pg_hardstorage/pg_hardstorage.yaml
 
 # 3. Review the YAML — every unmapped Barman setting
-#    surfaces as a comment + on stderr.  Multi-server
+#    surfaces as a comment + on stderr (secret values
+#    redacted on stderr).  Multi-server
 #    barman.conf with [server] sections produces multiple
 #    deployment entries.
 $EDITOR /etc/pg_hardstorage/pg_hardstorage.yaml

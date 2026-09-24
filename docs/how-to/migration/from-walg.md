@@ -97,7 +97,8 @@ pg_hardstorage compat translate --from walg \
     --out-file /etc/pg_hardstorage/pg_hardstorage.yaml
 
 # 3. Review the YAML — every unmapped WALG_ setting surfaces
-#    as a comment + on stderr.
+#    as a comment + on stderr (secret values such as
+#    AWS_SECRET_ACCESS_KEY are redacted on stderr).
 $EDITOR /etc/pg_hardstorage/pg_hardstorage.yaml
 
 # 4. Initialise the new repo (different from the existing

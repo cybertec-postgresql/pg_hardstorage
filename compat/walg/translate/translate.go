@@ -22,6 +22,8 @@ import (
 	"net/url"
 	"sort"
 	"strings"
+
+	"github.com/cybertec-postgresql/pg_hardstorage/compat/internal/redact"
 )
 
 // EnvFile is the parsed env-file representation.  Keys appear in
@@ -238,7 +240,7 @@ func Translate(env *EnvFile) (*Result, error) {
 			// handled above
 		default:
 			out.Unmapped = append(out.Unmapped,
-				fmt.Sprintf("%s = %s", k, env.KV[k]))
+				fmt.Sprintf("%s = %s", k, redact.Value(k, env.KV[k])))
 		}
 	}
 

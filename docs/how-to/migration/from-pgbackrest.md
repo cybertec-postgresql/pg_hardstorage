@@ -99,7 +99,8 @@ pg_hardstorage compat translate --from pgbackrest \
     --out-file /etc/pg_hardstorage/pg_hardstorage.yaml
 
 # 3. Review the YAML — every unmapped pgBackRest setting
-#    surfaces as a comment + on stderr.
+#    surfaces as a comment + on stderr (secret values
+#    redacted on stderr).
 $EDITOR /etc/pg_hardstorage/pg_hardstorage.yaml
 
 # 4. Initialise the new repo (different from the existing

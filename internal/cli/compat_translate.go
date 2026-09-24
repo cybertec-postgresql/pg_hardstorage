@@ -13,6 +13,7 @@ import (
 	barmantranslate "github.com/cybertec-postgresql/pg_hardstorage/compat/barman/translate"
 	// WAL-G path lives in compat/walg/translate/
 	walgtranslate "github.com/cybertec-postgresql/pg_hardstorage/compat/walg/translate"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/output"
 )
 
 // newCompatTranslateCmd implements `pg_hardstorage compat translate`.
@@ -65,18 +66,20 @@ operator can review.`,
 	return c
 }
 
-func runCompatTranslate(from, input, output string, force bool) error {
+func runCompatTranslate(from, input, outFile string, force bool) error {
 	switch from {
 	case "pgbackrest":
-		return translatePgbackrest(input, output, force)
+		return translatePgbackrest(input, outFile, force)
 	case "barman":
-		return translateBarman(input, output, force)
+		return translateBarman(input, outFile, force)
 	case "walg", "wal-g":
-		return translateWalg(input, output, force)
+		return translateWalg(input, outFile, force)
 	default:
-		return fmt.Errorf(
+		// A wrong --from is operator input, not a runtime failure:
+		// wrap ErrUsage so it exits 2 like every other bad flag.
+		return output.NewError("usage.bad_flag", fmt.Sprintf(
 			"compat translate: --from %q not supported (supported: pgbackrest, barman, walg)",
-			from)
+			from)).Wrap(output.ErrUsage)
 	}
 }
 
@@ -173,9 +176,9 @@ func translateBarman(input, output string, force bool) error {
 		fmt.Fprintln(os.Stderr, "compat translate: unmapped Barman settings (review manually):")
 		for _, u := range res.Unmapped {
 			if u.Section == "" {
-				fmt.Fprintf(os.Stderr, "  - [barman] %s = %s  (%s)\n", u.Key, u.Value, u.Reason)
+				fmt.Fprintf(os.Stderr, "  - [barman] %s = %s  (%s)\n", u.Key, u.RedactedValue(), u.Reason)
 			} else {
-				fmt.Fprintf(os.Stderr, "  - [%s] %s = %s  (%s)\n", u.Section, u.Key, u.Value, u.Reason)
+				fmt.Fprintf(os.Stderr, "  - [%s] %s = %s  (%s)\n", u.Section, u.Key, u.RedactedValue(), u.Reason)
 			}
 		}
 	}
