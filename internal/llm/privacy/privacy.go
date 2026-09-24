@@ -152,10 +152,35 @@ func Redact(m Mode, s string) string {
 // Emails / IPs / connection strings remain.  Used in `open`
 // mode for dev/staging.
 func redactCredentialsOnly(s string) string {
+	// kms-secret:// first so a `secret: kms-secret://...` value keeps
+	// its scheme visible to reviewers.
+	s = kmsSecretRe.ReplaceAllString(s, "kms-secret://<REDACTED>")
+	s = keyedSecretRe.ReplaceAllStringFunc(s, redactKeyedSecret)
 	for _, re := range credentialPatterns {
 		s = re.re.ReplaceAllString(s, re.replacement)
 	}
 	return s
+}
+
+// redactKeyedSecret rewrites one keyedSecretRe match, keeping the key,
+// its quoting and the separator exactly as they were and swapping only
+// the value.  A quoted value stays quoted, so redacted JSON is still
+// JSON and the fields around it survive.
+func redactKeyedSecret(m string) string {
+	sub := keyedSecretRe.FindStringSubmatch(m)
+	if sub == nil {
+		return m
+	}
+	key, quote, sep, val := sub[1], sub[2], sub[3], sub[4]
+	switch {
+	case strings.HasPrefix(val, `"`):
+		val = `"<REDACTED>"`
+	case strings.HasPrefix(val, `'`):
+		val = `'<REDACTED>'`
+	default:
+		val = "<REDACTED>"
+	}
+	return key + quote + sep + val
 }
 
 // redactStandard: credentials + PII.
@@ -229,30 +254,48 @@ type pattern struct {
 	replacement string
 }
 
+// Most of what the redactor sees is tool output, i.e. JSON — often
+// compact, with no whitespace between fields.  Every value class below
+// therefore stops at quotes, ',', '}', ']' and ';' as well as
+// whitespace: a class that only stopped at whitespace swallowed the
+// rest of a compact document (destroying every field after the
+// secret and leaving invalid JSON).
+
+// kmsSecretRe: kms-secret:// references (the scheme stays visible).
+var kmsSecretRe = regexp.MustCompile(`\bkms-secret://[^\s"'<,;}\]]+`)
+
+// keyedSecretRe matches `<key><sep><value>` where key names a
+// credential, in text (`password=x`, `password: x`), query-string
+// (`?password=x&...`) and JSON (`"password":"x"`) shapes.  Groups:
+// 1 key, 2 closing quote of a JSON/YAML-quoted key, 3 separator,
+// 4 value.  The key may carry a prefix (`db_password`, `x-api-key`).
+// A bare `secret` key is deliberately NOT matched — too ambiguous
+// (it would eat `kms-secret://...`); the specific *_secret shapes are
+// listed instead.  The value is a double-quoted JSON string (escapes
+// honoured), a single-quoted string, an auth scheme plus token
+// (`Bearer abc`), or a bare run that stops at '<' so an
+// already-redacted placeholder is not re-consumed.
+var keyedSecretRe = regexp.MustCompile(`(?i)\b([A-Za-z0-9_-]*(?:api[_-]?key|password|passwd|api[_-]?token|access[_-]?token|auth[_-]?token|client[_-]?secret|aws[_-]?secret[_-]?access[_-]?key|authorization))` +
+	`(["']?)` +
+	`(\s*[=:]\s*)` +
+	`("(?:[^"\\]|\\.)*"|'[^']*'|(?:bearer|basic|token)\s+[^<\s"',;&}\]]+|[^<\s"',;&}\]]+)`)
+
 var credentialPatterns = []pattern{
-	// kms-secret:// URLs MUST fire before the generic api_key
-	// pattern so a `secret: kms-secret://...` line keeps the
-	// scheme visible to reviewers.
-	{regexp.MustCompile(`\bkms-secret://\S+`), "kms-secret://<REDACTED>"},
-	// Bearer tokens (Authorization: Bearer ABC...).
-	{regexp.MustCompile(`(?i)\b(authorization|bearer)\s*[:= ]+\s*\S+`), "$1=<REDACTED>"},
+	// Bare bearer tokens outside a keyed field (`-H Bearer abc`).
+	{regexp.MustCompile(`(?i)\b(bearer)(?:\s*[:=]\s*|\s+)[^<\s"',;&}\]]+`), "$1 <REDACTED>"},
 	// AWS-style access key IDs.
 	{regexp.MustCompile(`\bAKIA[0-9A-Z]{16}\b`), "<AWS_KEY>"},
-	// AWS-style secret keys (40 base64-ish chars after a known prefix
-	// or aws_secret_access_key= shape).
-	{regexp.MustCompile(`(?i)\b(aws[_-]?secret[_-]?access[_-]?key)\s*[:= ]+\s*[A-Za-z0-9+/=]{20,}`), "$1=<REDACTED>"},
-	// Generic api_key / password / token in url-encoded form.
-	// We deliberately do NOT match a bare `secret` word — too
-	// ambiguous when surrounded by other tokens (e.g.
-	// `kms-secret://...` would be eaten).  `aws_secret_access_key`
-	// has its own dedicated pattern above; other "secret"
-	// usages are caught case-by-case.  Stops the value match at
-	// `<` so an already-redacted placeholder isn't re-consumed.
-	{regexp.MustCompile(`(?i)\b(api[_-]?key|password|api[_-]?token|access[_-]?token|client[_-]?secret)\s*[=:]\s*[^<\s]+`), "$1=<REDACTED>"},
-	// PostgreSQL connection strings with passwords.
-	{regexp.MustCompile(`(?i)(postgres(?:ql)?://[^:\s]+:)[^@\s]+(@)`), "${1}<REDACTED>${2}"},
+	// AWS secret keys in the space-separated shape
+	// (`aws_secret_access_key ABC...`); the = / : / JSON shapes are
+	// covered by keyedSecretRe.
+	{regexp.MustCompile(`(?i)\b(aws[_-]?secret[_-]?access[_-]?key)\s+[A-Za-z0-9+/=]{20,}`), "$1 <REDACTED>"},
+	// PostgreSQL connection strings with passwords.  The password
+	// runs to the LAST '@' of the authority (a password may itself
+	// contain '@'); the authority ends at '/', '?', '#', a quote or
+	// whitespace, so the match never crosses into the next field.
+	{regexp.MustCompile(`(?i)(postgres(?:ql)?://[^:/\s"'@]+:)[^\s/?#"']*@`), "${1}<REDACTED>@"},
 	// Sentry-style DSNs.
-	{regexp.MustCompile(`\bhttps?://[A-Za-z0-9]+:[^@\s]+@\S+`), "<REDACTED_DSN>"},
+	{regexp.MustCompile(`\bhttps?://[A-Za-z0-9]+:[^\s/?#"']*@[^\s"',;}\]]+`), "<REDACTED_DSN>"},
 }
 
 var piiPatterns = []pattern{
@@ -267,7 +310,7 @@ var piiPatterns = []pattern{
 	{regexp.MustCompile(`\barn:aws:[a-z0-9\-]+:[a-z0-9\-]*:\d{12}:\S+`), "<AWS_ARN>"},
 	// AWS S3 URIs that include access creds (bucket aside; the
 	// generic match for s3://x/y stays intact).
-	{regexp.MustCompile(`\bs3://[A-Za-z0-9]+:[^@\s]+@\S+`), "<S3_WITH_CREDS>"},
+	{regexp.MustCompile(`\bs3://[A-Za-z0-9]+:[^\s/?#"']*@[^\s"',;}\]]+`), "<S3_WITH_CREDS>"},
 }
 
 var (
