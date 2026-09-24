@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/testkit/inject"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/testkit/report"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/testkit/validate"
 )
@@ -30,8 +31,20 @@ func (r *retentionCell) TakeBackup(ctx context.Context) (string, error) {
 	return r.FakeCellRuntime.TakeBackup(ctx)
 }
 
+// ApplyFault takes a moment and counts as in flight, like a backup:
+// a window must never overlap one (a fault killed a window's rotate).
+func (r *retentionCell) ApplyFault(ctx context.Context, action string) (inject.Recovery, error) {
+	r.inflight.Add(1)
+	defer r.inflight.Add(-1)
+	time.Sleep(2 * time.Millisecond)
+	return r.FakeCellRuntime.ApplyFault(ctx, action)
+}
+
 func (r *retentionCell) Rotate(context.Context) error {
 	r.rotates.Add(1)
+	if r.inflight.Load() != 0 {
+		r.violation.Add(1)
+	}
 	return nil
 }
 
@@ -66,7 +79,7 @@ func runRetention(t *testing.T, cells []*retentionCell, interval time.Duration) 
 	rep, err := validate.Run(context.Background(), validate.RunOptions{
 		Seed:     3,
 		Duration: 300 * time.Millisecond,
-		Loop: validate.LoopOptions{BackupEvery: 1, VerifyEvery: 2,
+		Loop: validate.LoopOptions{BackupEvery: 1, VerifyEvery: 2, FaultProbability: 0.5,
 			RetentionInterval: interval, RetentionQuiesceTimeout: time.Second},
 		Faults:  defaultFaults(),
 		Cells:   rts,
@@ -113,10 +126,10 @@ func TestRun_RetentionWindowRotatesEveryCellAndGCsOnceWhileQuiet(t *testing.T) {
 		t.Errorf("gc ran %d times in %d windows; want once per window", gcs, windows)
 	}
 	if v := violation.Load(); v != 0 {
-		t.Fatalf("gc ran %d time(s) with a backup in flight", v)
+		t.Fatalf("rotate/gc ran %d time(s) with a backup or fault in flight", v)
 	}
-	if countOp(evs, "backup_completed") == 0 {
-		t.Fatal("no backups ran — the windows starved the fleet")
+	if countOp(evs, "backup_completed") == 0 || countOp(evs, "fault_apply") == 0 {
+		t.Fatal("no backups or no faults ran — the windows starved the fleet, or the test proves nothing about faults")
 	}
 }
 

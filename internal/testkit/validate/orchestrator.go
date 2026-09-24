@@ -401,98 +401,101 @@ func runCellLoop(
 			// surface it.
 		}
 
-		// 2. Maybe inject a fault.
-		if rng.Float64() < opts.Loop.FaultProbability && opts.Faults != nil &&
-			len(opts.Faults.Faults) > 0 {
-			fault := pickWeighted(opts.Faults.Faults, rng)
-			emit(Event{Cell: cr.Name, Op: "fault_apply",
-				Iteration: iter, Detail: fault.Action})
-			recovery, err := cell.ApplyFault(ctx, fault.Action)
-			switch {
-			case err != nil && errors.Is(err, inject.ErrTargetNotRunning):
-				// A fault that fires on a cell a PRIOR fault already
-				// downed (kill/OOM/SIGTERM) can't be applied — you
-				// can't fill the disk of a stopped container or pause
-				// a dead PG's archiver. That's a benign race, not a
-				// fault-injection failure (signal/cgroup_squeeze
-				// already swallow it internally; disk_full /
-				// pause_archive surface the typed sentinel). Record it
-				// as a skip, mirroring backup_skipped_cell_down /
-				// verify_skipped_cell_down, so it doesn't pollute the
-				// fault_apply_failed signal the soak triages on.
-				emit(Event{Cell: cr.Name, Op: "fault_skipped_cell_down",
-					Iteration: iter, Detail: fault.Action})
-			case err != nil && errors.Is(err, inject.ErrLimitUnreachable):
-				// cgroup_squeeze asked for a memory.max the kernel
-				// could not honour (unreclaimable RSS already above
-				// the cap, swap disabled). The injector behaved
-				// correctly; counting it as fault_apply_failed makes
-				// every soak with a 0.7% timing race look like a
-				// product failure. Same skip class as cell-down.
-				emit(Event{Cell: cr.Name, Op: "fault_skipped_limit_unreachable",
-					Iteration: iter, Detail: fault.Action})
-			case err != nil:
-				emit(Event{Cell: cr.Name, Op: "fault_apply_failed",
-					Iteration: iter, Detail: fault.Action, Err: err.Error()})
-				// Continue — the heal window doesn't
-				// fire and the cell may still recover
-				// on its own.
-			default:
-				cr.FaultsApplied++
-				select {
-				case <-ctx.Done():
-				case <-time.After(opts.Loop.HealWindow):
-				}
-				recovered := true
-				if recovery != nil {
-					if rerr := recovery(ctx); rerr != nil {
-						recovered = false
-						if ctx.Err() != nil {
-							// Run-wide deadline elapsed: the
-							// recovery's docker calls were
-							// cancelled by orchestrator shutdown,
-							// not by a genuine fault-cleanup
-							// failure.  Mirrors the
-							// backup_aborted_at_deadline path —
-							// without this distinction every
-							// soak whose 4-min timer happens to
-							// land inside a heal window reports
-							// alarming "recovery_failed" lines
-							// for what is just teardown.
-							emit(Event{Cell: cr.Name,
-								Op:        "recovery_aborted_at_deadline",
-								Iteration: iter, Err: rerr.Error()})
-						} else {
-							cr.RecoveryFails++
-							emit(Event{Cell: cr.Name,
-								Op:        "recovery_failed",
-								Iteration: iter, Err: rerr.Error()})
-						}
-					}
-				}
-				// Only claim recovery when the revert actually
-				// succeeded. This emit used to be unconditional, so a
-				// fault that could NOT be undone emitted
-				// recovery_failed and then fault_recovered right
-				// behind it -- and fault_recovered is one of the three
-				// ops the watch TUI paints as healthy (tui.go), so it
-				// being LAST made a poisoned cell read green for the
-				// rest of the run.
-				if recovered {
-					emit(Event{Cell: cr.Name, Op: "fault_recovered",
-						Iteration: iter, Detail: fault.Action})
-				}
-			}
-		}
-
-		// Backup and verify run inside the retention gate: a retention
-		// window holds them and waits for in-flight ones to drain, so gc
-		// sees a repository with no backup in flight.
+		// Faults, backups and verifies run inside the retention gate: a
+		// retention window holds them and waits for in-flight ones to
+		// drain, so gc sees a repository with no backup in flight — and
+		// no injected fault lands on the window's own rotate or gc (the
+		// first gated soak lost a rotate to signal(target=agent_random),
+		// which picked the rotate as its random pg_hardstorage process).
 		stop := func() bool {
 			if !gate.enter(ctx) {
 				return false // run ended while a window was open
 			}
 			defer gate.leave()
+			// 2. Maybe inject a fault.
+			if rng.Float64() < opts.Loop.FaultProbability && opts.Faults != nil &&
+				len(opts.Faults.Faults) > 0 {
+				fault := pickWeighted(opts.Faults.Faults, rng)
+				emit(Event{Cell: cr.Name, Op: "fault_apply",
+					Iteration: iter, Detail: fault.Action})
+				recovery, err := cell.ApplyFault(ctx, fault.Action)
+				switch {
+				case err != nil && errors.Is(err, inject.ErrTargetNotRunning):
+					// A fault that fires on a cell a PRIOR fault already
+					// downed (kill/OOM/SIGTERM) can't be applied — you
+					// can't fill the disk of a stopped container or pause
+					// a dead PG's archiver. That's a benign race, not a
+					// fault-injection failure (signal/cgroup_squeeze
+					// already swallow it internally; disk_full /
+					// pause_archive surface the typed sentinel). Record it
+					// as a skip, mirroring backup_skipped_cell_down /
+					// verify_skipped_cell_down, so it doesn't pollute the
+					// fault_apply_failed signal the soak triages on.
+					emit(Event{Cell: cr.Name, Op: "fault_skipped_cell_down",
+						Iteration: iter, Detail: fault.Action})
+				case err != nil && errors.Is(err, inject.ErrLimitUnreachable):
+					// cgroup_squeeze asked for a memory.max the kernel
+					// could not honour (unreclaimable RSS already above
+					// the cap, swap disabled). The injector behaved
+					// correctly; counting it as fault_apply_failed makes
+					// every soak with a 0.7% timing race look like a
+					// product failure. Same skip class as cell-down.
+					emit(Event{Cell: cr.Name, Op: "fault_skipped_limit_unreachable",
+						Iteration: iter, Detail: fault.Action})
+				case err != nil:
+					emit(Event{Cell: cr.Name, Op: "fault_apply_failed",
+						Iteration: iter, Detail: fault.Action, Err: err.Error()})
+					// Continue — the heal window doesn't
+					// fire and the cell may still recover
+					// on its own.
+				default:
+					cr.FaultsApplied++
+					select {
+					case <-ctx.Done():
+					case <-time.After(opts.Loop.HealWindow):
+					}
+					recovered := true
+					if recovery != nil {
+						if rerr := recovery(ctx); rerr != nil {
+							recovered = false
+							if ctx.Err() != nil {
+								// Run-wide deadline elapsed: the
+								// recovery's docker calls were
+								// cancelled by orchestrator shutdown,
+								// not by a genuine fault-cleanup
+								// failure.  Mirrors the
+								// backup_aborted_at_deadline path —
+								// without this distinction every
+								// soak whose 4-min timer happens to
+								// land inside a heal window reports
+								// alarming "recovery_failed" lines
+								// for what is just teardown.
+								emit(Event{Cell: cr.Name,
+									Op:        "recovery_aborted_at_deadline",
+									Iteration: iter, Err: rerr.Error()})
+							} else {
+								cr.RecoveryFails++
+								emit(Event{Cell: cr.Name,
+									Op:        "recovery_failed",
+									Iteration: iter, Err: rerr.Error()})
+							}
+						}
+					}
+					// Only claim recovery when the revert actually
+					// succeeded. This emit used to be unconditional, so a
+					// fault that could NOT be undone emitted
+					// recovery_failed and then fault_recovered right
+					// behind it -- and fault_recovered is one of the three
+					// ops the watch TUI paints as healthy (tui.go), so it
+					// being LAST made a poisoned cell read green for the
+					// rest of the run.
+					if recovered {
+						emit(Event{Cell: cr.Name, Op: "fault_recovered",
+							Iteration: iter, Detail: fault.Action})
+					}
+				}
+			}
+
 			// 3. Backup every N iterations.
 			if iter%opts.Loop.BackupEvery == 0 {
 				emit(Event{Cell: cr.Name, Op: "backup_started", Iteration: iter})
