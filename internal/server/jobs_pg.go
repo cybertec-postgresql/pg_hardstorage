@@ -596,8 +596,12 @@ func (b *PGBackend) SweepAbandoned(ctx context.Context, deadline time.Duration) 
         UPDATE phs.jobs
            SET state = 'failed',
                failure = $1,
-               completed_at = now() AT TIME ZONE 'UTC',
-               updated_at   = now() AT TIME ZONE 'UTC'
+               -- now(), not now() AT TIME ZONE 'UTC': the latter is a
+               -- zone-less wall clock that is re-read in the SESSION
+               -- TimeZone when stored into timestamptz, skewing the
+               -- stamps by the server's UTC offset.
+               completed_at = now(),
+               updated_at   = now()
          WHERE state = 'running'
            AND started_at IS NOT NULL
            AND updated_at < $2
