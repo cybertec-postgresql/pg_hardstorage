@@ -185,6 +185,12 @@ const ManifestSinkIndex = -1
 // must not be used afterwards. Run closes the reader (and the
 // underlying TCP) before returning, regardless of outcome.
 func Run(ctx context.Context, c *pg.Conn, opts Options, sink Sink) (*Result, error) {
+	var aw archiveWait
+	res, err := run(ctx, c, opts, sink, &aw)
+	return res, aw.explain(err)
+}
+
+func run(ctx context.Context, c *pg.Conn, opts Options, sink Sink, aw *archiveWait) (*Result, error) {
 	if c == nil {
 		return nil, errors.New("basebackup: nil connection")
 	}
@@ -235,8 +241,12 @@ func Run(ctx context.Context, c *pg.Conn, opts Options, sink Sink) (*Result, err
 	if timeout == 0 {
 		timeout = defaultInactivityTimeout
 	}
+	var reader *streaming.Reader
 	reader, err := streaming.New(ctx, c.PgConn(), streaming.Options{
 		InactivityTimeout: timeout,
+		// pg_backup_stop waiting on WAL archiving is PG alive and
+		// talking, just slowly: see archiveWait.
+		OnNotice: func(n *pgproto3.NoticeResponse) { aw.observe(n, reader, timeout) },
 	})
 	if err != nil {
 		return nil, fmt.Errorf("basebackup: streaming.New: %w", err)

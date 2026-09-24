@@ -194,6 +194,11 @@ type Reader struct {
 	cancelWatcher context.CancelFunc
 	watcherDone   chan struct{}
 
+	// inactivity is the live InactivityTimeout (ns). Starts at
+	// opts.InactivityTimeout; SetInactivityTimeout may change it from
+	// an OnNotice callback (the only other goroutine-free hook).
+	inactivity atomic.Int64
+
 	// stats
 	bytesReceived atomic.Uint64
 	msgsReceived  atomic.Uint64
@@ -254,6 +259,7 @@ func newFromConn(ctx context.Context, conn net.Conn, frontend *pgproto3.Frontend
 		opts:        opts,
 		watcherDone: make(chan struct{}),
 	}
+	r.inactivity.Store(int64(opts.InactivityTimeout))
 	wctx, cancel := context.WithCancel(ctx)
 	r.cancelWatcher = cancel
 	go func() {
@@ -300,8 +306,8 @@ func (r *Reader) Receive(ctx context.Context) (pgproto3.BackendMessage, error) {
 		// wal_sender_timeout = 0 (PG never sends keepalives, so a
 		// read deadline becomes a false-positive on idle databases —
 		// see issue #12).
-		if r.opts.InactivityTimeout > 0 {
-			deadline := time.Now().Add(r.opts.InactivityTimeout)
+		if inact := time.Duration(r.inactivity.Load()); inact > 0 {
+			deadline := time.Now().Add(inact)
 			if err := r.netConn.SetReadDeadline(deadline); err != nil {
 				return nil, fmt.Errorf("streaming: SetReadDeadline: %w", err)
 			}
@@ -364,6 +370,18 @@ func (r *Reader) Receive(ctx context.Context) (pgproto3.BackendMessage, error) {
 	}
 }
 
+// SetInactivityTimeout changes the inactivity window for subsequent
+// reads (negative disables it, zero is ignored). Callers use it when
+// the server announces a legitimately long silence — BASE_BACKUP's
+// pg_backup_stop waiting on WAL archiving warns at doubling intervals
+// (60 s, 120 s, 240 s, ...) that soon exceed any fixed window.
+func (r *Reader) SetInactivityTimeout(d time.Duration) {
+	if d == 0 {
+		return
+	}
+	r.inactivity.Store(int64(d))
+}
+
 // classifyReadError maps a pgproto3.Receive error onto our typed errors.
 // It needs to consider:
 //   - was ctx cancelled by the caller?
@@ -387,7 +405,7 @@ func (r *Reader) classifyReadError(ctx context.Context, err error) error {
 		if cerr := ctx.Err(); cerr != nil {
 			return cerr
 		}
-		return fmt.Errorf("%w (after %s)", ErrInactivityTimeout, r.opts.InactivityTimeout)
+		return fmt.Errorf("%w (after %s)", ErrInactivityTimeout, time.Duration(r.inactivity.Load()))
 	}
 	return fmt.Errorf("streaming: receive: %w", err)
 }

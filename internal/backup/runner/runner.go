@@ -729,6 +729,12 @@ func take(ctx context.Context, opts TakeOptions, abortCtx *context.Context) (*Re
 		if typed := classifySourceError(err, opts.Deployment); typed != err {
 			return nil, typed
 		}
+		if errors.Is(err, basebackup.ErrArchiveLag) {
+			return nil, output.NewError("backup.archive_lag", fmt.Sprintf("backup: BASE_BACKUP: %v", err)).
+				WithSuggestion(&output.Suggestion{
+					Human: "the data was streamed but pg_backup_stop could not confirm WAL archiving; fix archive_command (see pg_stat_archiver) and retry",
+				}).Wrap(err)
+		}
 		return nil, fmt.Errorf("backup: BASE_BACKUP: %w", err)
 	}
 	bbSpan.SetAttributes(

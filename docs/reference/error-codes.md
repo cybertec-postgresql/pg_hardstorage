@@ -223,6 +223,7 @@ field is where the recovery hint lives.
 | `repair.*` | Manifest / attestation / chunk repair |
 | `manifest.*` | Manifest parse / validation at restore-plan time (`manifest.invalid`) |
 | `kms.*` | KMS rotate / shred / verify (`kms.rotate_failed`, `kms.shred_failed`, `kms.verify_failed`); `kms.unreachable` is the only leaf that maps to exit 8 |
+| `backup.archive_lag` | BASE_BACKUP streamed, but `pg_backup_stop` kept waiting for WAL archiving until the stream went silent (PostgreSQL's "still waiting for all required WAL segments to be archived" warnings widen the inactivity window, so this fires only on a real stall). Exit 1. Fix `archive_command` (see `pg_stat_archiver`) and retry. |
 | `backup.io_starved` | `backup --stall-timeout`: no progress (no stream frame and no event) within the timeout — the backup was aborted. Exit 1. Check host disk/network saturation or raise the timeout. |
 | `kms.rotate_incomplete` | `kms rotate --apply` finished but some manifest, replica copy or WAL segment manifest still holds the old KEK (`failed`, `replica_failures` or `wal_failed` > 0). Exit 1. Do NOT retire the old KEK; re-run until it exits 0. |
 | `kms.rotate_plan_failed` | `kms rotate` dry-run whose plan already contains failures (`failed` or `wal_failed` > 0) — `--apply` could not complete. Exit 1. |
