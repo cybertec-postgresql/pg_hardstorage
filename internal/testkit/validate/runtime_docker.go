@@ -445,25 +445,6 @@ func (d *DockerCellRuntime) locateContainerPGBin(ctx context.Context, binName st
 // test (see runCellLoop).
 var ErrCellNotReady = errors.New("cell not ready: lead container not running")
 
-// cellDownDockerErr reports whether a docker-exec error is the
-// daemon saying the target container is not in a usable state —
-// stopped or removed by a fault.  These phrases originate only
-// from dockerd describing container state, so matching them
-// cannot mask a genuine pg_hardstorage / pg_verifybackup error.
-// Used alongside containerRunning to catch the race where a fault
-// stops the cell *during* an exec (the exec fails, but the
-// container may already be back up by the time we re-inspect).
-func cellDownDockerErr(err error) bool {
-	if err == nil {
-		return false
-	}
-	s := err.Error()
-	return strings.Contains(s, "is not running") ||
-		strings.Contains(s, "is restarting, wait until the container is running") ||
-		strings.Contains(s, "No such container") ||
-		strings.Contains(s, "no such container")
-}
-
 // containerRunning returns true iff `docker inspect` reports
 // State.Running == true for the lead container.  Any inspect
 // failure (missing container, daemon error) returns false so the
@@ -579,6 +560,56 @@ func (d *DockerCellRuntime) containerPositivelyStopped(ctx context.Context) bool
 	return err == nil && strings.TrimSpace(string(out)) == "false"
 }
 
+// cellWentDown classifies a failed agent exec. It returns an error
+// wrapping ErrCellNotReady when there is positive evidence that the
+// container — not pg_hardstorage — ended the exec, and nil when the
+// failure must be scored against the product. bootBefore is the
+// container's StartedAt sampled immediately before THIS exec ("" when
+// unreadable). TakeBackup and VerifyRestore share it so a dying cell is
+// scored the same way whichever operation it interrupted.
+func (d *DockerCellRuntime) cellWentDown(ctx context.Context, op, bootBefore string, stdout, stderr []byte, err error) error {
+	// The container restarted underneath the backup. `docker exec`
+	// children die with the container (exit 137), so the backup was
+	// killed by the testbed, not by pg_hardstorage — the enterprise_
+	// heavy soak lost four backups this way, each within a second of
+	// Docker's unless-stopped policy restarting a cell whose entrypoint
+	// had exited during cgroup_squeeze recovery. Detected precisely:
+	// the container's StartedAt changed across the call. A real
+	// pg_hardstorage crash never restarts its container, so this
+	// cannot hide one; the event stays visible as
+	// backup_skipped_cell_down / verify_skipped_cell_down.
+	if bootBefore != "" {
+		if bootAfter := d.containerStartedAt(ctx); bootAfter != "" && bootAfter != bootBefore {
+			return fmt.Errorf("%w: container %s restarted during the %s (StartedAt %s -> %s): %v",
+				ErrCellNotReady, d.Container, op, bootBefore, bootAfter, err)
+		}
+	}
+	// Or it stopped and has not come back yet: the release soak's first
+	// backup_failed was `docker exec` refusing to enter a container a
+	// SIGKILL fault had just killed (exit 128, "error executing setns
+	// process") — pg_hardstorage never started. Same argument: a
+	// pg_hardstorage failure cannot stop its container. Requires Docker
+	// to say so; an inspect that fails proves nothing.
+	if d.containerPositivelyStopped(ctx) {
+		return fmt.Errorf("%w: container %s stopped during the %s: %v",
+			ErrCellNotReady, d.Container, op, err)
+	}
+	// Docker can lag the truth: on the loaded soak host a SIGKILLed
+	// container stayed "running" for ~30 s after its init died (docker
+	// kill: "did not receive an exit event"), so the check above saw
+	// nothing. The exec error is the evidence then — runc could not
+	// join the container's namespaces because they no longer exist, so
+	// pg_hardstorage never ran. The third attempt then met dockerd
+	// refusing the exec outright ("is restarting"), with Running still
+	// true. Only these messages: other OCI exec failures (a wrong binary
+	// path) are real harness failures.
+	if isContainerGoneExecError(stdout, stderr) {
+		return fmt.Errorf("%w: container %s had died under the %s (exec could not join its namespaces): %v",
+			ErrCellNotReady, d.Container, op, err)
+	}
+	return nil
+}
+
 // TakeBackup invokes `pg_hardstorage backup` inside the
 // container.
 func (d *DockerCellRuntime) TakeBackup(ctx context.Context) (string, error) {
@@ -649,10 +680,17 @@ func (d *DockerCellRuntime) TakeBackup(ctx context.Context) (string, error) {
 	var (
 		stdout, stderr []byte
 		err            error
+		bootBefore     string
 	)
-	bootBefore := d.containerStartedAt(ctx)
 	deadline := time.Now().Add(pgRecoveryBudget)
 	for backoff := time.Second; ; {
+		// StartedAt is sampled per attempt, not once before the loop:
+		// the loop can wait up to pgRecoveryBudget, and a container
+		// restart during that wait (the very recovery it is waiting
+		// out) was otherwise charged to whichever later attempt failed
+		// — turning a genuine pg_hardstorage failure on a healthy,
+		// already-restarted container into backup_skipped_cell_down.
+		bootBefore = d.containerStartedAt(ctx)
 		stdout, stderr, err = d.dockerExecCapture(ctx,
 			d.AgentBinary, "backup", d.Deployment,
 			"--pg-connection", d.containerDSN(),
@@ -682,44 +720,8 @@ func (d *DockerCellRuntime) TakeBackup(ctx context.Context) (string, error) {
 		}
 	}
 	if err != nil {
-		// The container restarted underneath the backup. `docker exec`
-		// children die with the container (exit 137), so the backup was
-		// killed by the testbed, not by pg_hardstorage — the enterprise_
-		// heavy soak lost four backups this way, each within a second of
-		// Docker's unless-stopped policy restarting a cell whose entrypoint
-		// had exited during cgroup_squeeze recovery. Detected precisely:
-		// the container's StartedAt changed across the call. A real
-		// pg_hardstorage crash never restarts its container, so this
-		// cannot hide one; the event stays visible as
-		// backup_skipped_cell_down.
-		if bootBefore != "" {
-			if bootAfter := d.containerStartedAt(ctx); bootAfter != "" && bootAfter != bootBefore {
-				return "", fmt.Errorf("%w: container %s restarted during the backup (StartedAt %s -> %s): %v",
-					ErrCellNotReady, d.Container, bootBefore, bootAfter, err)
-			}
-		}
-		// Or it stopped and has not come back yet: the release soak's first
-		// backup_failed was `docker exec` refusing to enter a container a
-		// SIGKILL fault had just killed (exit 128, "error executing setns
-		// process") — pg_hardstorage never started. Same argument: a
-		// pg_hardstorage failure cannot stop its container. Requires Docker
-		// to say so; an inspect that fails proves nothing.
-		if d.containerPositivelyStopped(ctx) {
-			return "", fmt.Errorf("%w: container %s stopped during the backup: %v",
-				ErrCellNotReady, d.Container, err)
-		}
-		// Docker can lag the truth: on the loaded soak host a SIGKILLed
-		// container stayed "running" for ~30 s after its init died (docker
-		// kill: "did not receive an exit event"), so the check above saw
-		// nothing. The exec error is the evidence then — runc could not
-		// join the container's namespaces because they no longer exist, so
-		// pg_hardstorage never ran. The third attempt then met dockerd
-		// refusing the exec outright ("is restarting"), with Running still
-		// true. Only these messages: other OCI exec failures (a wrong binary
-		// path) are real harness failures.
-		if isContainerGoneExecError(stdout, stderr) {
-			return "", fmt.Errorf("%w: container %s had died under the backup (exec could not join its namespaces): %v",
-				ErrCellNotReady, d.Container, err)
+		if downErr := d.cellWentDown(ctx, "backup", bootBefore, stdout, stderr, err); downErr != nil {
+			return "", downErr
 		}
 		// Diagnostic display still wants combined output —
 		// stderr is where the operator-relevant context
@@ -805,20 +807,25 @@ func (d *DockerCellRuntime) VerifyRestore(ctx context.Context, backupID string) 
 	//
 	// Omitting --to / --to-lsn / --to-name leaves PITR disarmed (the
 	// CLI defaults to "no recovery target" when no --to* is set).
-	out, err := d.dockerExec(ctx,
+	bootBefore := d.containerStartedAt(ctx)
+	stdout, stderr, err := d.dockerExecCapture(ctx,
 		d.AgentBinary, "restore", d.Deployment, backupID,
 		"--repo", d.RepoURL,
 		"--target", target,
 		"--verify", "skip",
 		"--verify-restore", "required")
 	if err != nil {
-		// A fault may have stopped the cell between the gate above
-		// and this exec — re-check (and inspect the error text for
-		// the kill-during-exec race) and soft-skip rather than
-		// reporting a verify failure for a down cell.
-		if !d.containerRunning(ctx) || cellDownDockerErr(err) {
-			return ErrCellNotReady
+		// A fault may have stopped or restarted the cell between the
+		// gate above and this exec. Classified exactly as TakeBackup
+		// does: only positive evidence that the container ended the
+		// exec is a skip. The old check matched dockerd's phrases
+		// against the Go error — which is only "exit status N"; the
+		// daemon's words are in the output — and read an inspect that
+		// FAILED as "stopped", which hid real restore failures.
+		if downErr := d.cellWentDown(ctx, "restore-verify", bootBefore, stdout, stderr, err); downErr != nil {
+			return downErr
 		}
+		out := append(append([]byte{}, stdout...), stderr...)
 		// 4 KiB cap: pg_hardstorage's restore-failure JSON nests the
 		// postverify pg_ctl output + postgresql.log tail; 256 B
 		// truncated the actual reason mid-line.
