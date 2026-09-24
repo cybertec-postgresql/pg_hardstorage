@@ -16,11 +16,15 @@
 //     auto-selected when the deployment has
 //     data_classification: confidential or higher.
 //
-// The redactor runs over message Content + ToolResult bodies
-// before they leave the host.  System prompts are NOT redacted
-// (they're authored by us; the skill template is the only
-// content there).  Tool args are redacted because the model
-// might pass operator input verbatim into a tool call.
+// The redactor runs over everything that carries operator or
+// cluster data before it leaves the host: user prompts, tool
+// results, and the DATA parts of the system prompt — the
+// skill's preload tool output (read_doctor, list_deployments,
+// ...) and the operator's AdditionalContext.  Only the parts of
+// the system prompt we author ourselves (skill template,
+// runbook index, command catalog, rules) are sent verbatim.
+// The same redaction applies to tool results served over the
+// MCP server.
 //
 // What's NOT in this commit:
 //

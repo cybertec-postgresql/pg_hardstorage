@@ -422,10 +422,15 @@ func (s *Session) buildSystemPrompt(ctx context.Context) (string, error) {
 	}
 	b.WriteString("\n\n")
 
-	// 2. AdditionalContext (operator-supplied free text).
+	// 2. AdditionalContext (operator-supplied free text).  It is
+	//    operator DATA, not our authored prompt — it goes through the
+	//    privacy redactor like a user prompt would.  The system prompt
+	//    reaches the provider like any other message; only the parts we
+	//    wrote ourselves (skill template, runbook index, catalog, rules)
+	//    are sent verbatim.
 	if s.AdditionalContext != "" {
 		b.WriteString("## Operator context\n\n")
-		b.WriteString(s.AdditionalContext)
+		b.WriteString(privacy.Redact(s.Privacy, s.AdditionalContext))
 		b.WriteString("\n\n")
 	}
 
@@ -564,9 +569,14 @@ func (s *Session) runPreload(ctx context.Context, b *strings.Builder) {
 		if args == nil {
 			args = map[string]any{}
 		}
+		// Preload output is live cluster data (connection strings,
+		// hosts, deployment names, and — in an error — the child's
+		// stderr).  It is redacted under the session's privacy mode
+		// exactly as a mid-turn tool result is; embedding it in the
+		// system prompt does not make it ours.
 		res, err := t.Run(ctx, args)
 		if err != nil {
-			fmt.Fprintf(b, "### preload: %s — error\n\n```\n%s\n```\n\n", p.Name, err)
+			fmt.Fprintf(b, "### preload: %s — error\n\n```\n%s\n```\n\n", p.Name, privacy.Redact(s.Privacy, err.Error()))
 			continue
 		}
 		body, jerr := stdjson.MarshalIndent(map[string]any{
@@ -576,7 +586,7 @@ func (s *Session) runPreload(ctx context.Context, b *strings.Builder) {
 		if jerr != nil {
 			body = []byte(fmt.Sprintf("(could not encode result: %v)", jerr))
 		}
-		bodyStr, truncated := truncateForPrompt(string(body), maxBytes)
+		bodyStr, truncated := truncateForPrompt(privacy.Redact(s.Privacy, string(body)), maxBytes)
 		fmt.Fprintf(b, "### preload: %s\n\n```json\n%s\n```\n", p.Name, bodyStr)
 		if truncated {
 			fmt.Fprintf(b, "_(preload output truncated to %d bytes to stay within the context budget — call `%s` directly for the full, current result.)_\n", maxBytes, p.Name)
