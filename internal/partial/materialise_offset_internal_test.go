@@ -57,7 +57,7 @@ func TestMaterialiseOneFile_RejectsReorderedChunks(t *testing.T) {
 		},
 	}
 	target := t.TempDir()
-	if _, err := materialiseOneFile(context.Background(), cas, target, scrambled); err == nil {
+	if _, err := materialiseOneFile(context.Background(), cas, target, scrambled.Path, scrambled); err == nil {
 		t.Fatal("reordered chunks ACCEPTED — partial extraction would hand back a byte-scrambled " +
 			"table file that passes the total-size check")
 	} else if !strings.Contains(err.Error(), "out of order") {
@@ -72,7 +72,7 @@ func TestMaterialiseOneFile_RejectsReorderedChunks(t *testing.T) {
 			{Hash: b.Hash, Offset: 4, Len: 4},
 		},
 	}
-	n, err := materialiseOneFile(context.Background(), cas, target, ordered)
+	n, err := materialiseOneFile(context.Background(), cas, target, ordered.Path, ordered)
 	if err != nil || n != 8 {
 		t.Fatalf("correctly-ordered chunks failed: n=%d err=%v", n, err)
 	}

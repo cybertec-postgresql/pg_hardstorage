@@ -192,10 +192,10 @@ type Result struct {
 	Skipped       bool
 	SkipReason    string
 
-	// ProbeDSNKind records which connection mode the probe used:
-	// "socket" (peer auth via the Unix socket pg_ctl placed in
-	// DataDir, preferred — no password) or "tcp" (127.0.0.1
-	// fallback used when the socket attempt failed).  Issue #85.
+	// ProbeDSNKind records which connection mode the probe used.
+	// Always "socket": the boot test listens only on a unix socket
+	// in its private work dir, authenticated by its own trust-only
+	// hba_file (see bootHBA). Issue #85.
 	ProbeDSNKind string
 }
 
@@ -308,7 +308,23 @@ func Verify(ctx context.Context, opts Options) (*Result, error) {
 
 	pgCtl := filepath.Join(binDir, "pg_ctl")
 	psql := filepath.Join(binDir, "psql")
-	logFile := filepath.Join(opts.DataDir, "postverify-postgres.log")
+
+	// Everything the boot test itself needs — server log, unix
+	// socket, a private pg_hba.conf — lives in a private 0700 work
+	// dir OUTSIDE the restored PGDATA. The data dir is what we hand
+	// the operator; an extra postverify-postgres.log in it (the old
+	// location) is also a file pg_verifybackup reports as "present
+	// on disk but not in the manifest".
+	workDir, err := makeWorkDir()
+	if err != nil {
+		return res, fmt.Errorf("postverify: %w", err)
+	}
+	defer os.RemoveAll(workDir)
+	logFile := filepath.Join(workDir, "postgres.log")
+	hbaFile := filepath.Join(workDir, "pg_hba.conf")
+	if err := os.WriteFile(hbaFile, []byte(bootHBA), 0o600); err != nil {
+		return res, fmt.Errorf("postverify: write private pg_hba.conf: %w", err)
+	}
 
 	// Hard pre-flight: PG refuses to start when launched as root
 	// ("pg_ctl: cannot be run as root").  The top-level CLI gate
@@ -357,6 +373,19 @@ func Verify(ctx context.Context, opts Options) (*Result, error) {
 	// stageForRecovery only wires the missing restore_command and skips
 	// the recovery_target='immediate' line — two targets would FATAL
 	// with "multiple recovery targets specified" (issue #56).
+	//
+	// The staging is scaffolding for THIS boot only. Snapshot the
+	// files it (and the postmaster) touch and put them back once the
+	// server is stopped: left in place, postverify's settings became
+	// part of the restored cluster's config, survived promotion, and
+	// were captured by every later backup of it. The deferred revert
+	// is registered BEFORE the stop guard below, so (LIFO) it runs
+	// after the postmaster is down.
+	snap, err := snapshotDataDir(opts.DataDir)
+	if err != nil {
+		return res, fmt.Errorf("postverify: snapshot data dir: %w", err)
+	}
+	defer snap.revert()
 	if err := stageForRecovery(opts.DataDir, opts.RepoURL, opts.Deployment, opts.AgentBinary, opts.SeedSysID, opts.RecoveryArmed); err != nil {
 		return res, fmt.Errorf("postverify: stage for recovery: %w", err)
 	}
@@ -367,8 +396,8 @@ func Verify(ctx context.Context, opts Options) (*Result, error) {
 	// can't accidentally expose the verifier's PG to the
 	// network.
 	//
-	// unix_socket_directories is pinned to the data dir so the
-	// verifier's postmaster never tries to write to the
+	// unix_socket_directories is pinned to the private work dir so
+	// the verifier's postmaster never tries to write to the
 	// distro default (/var/run/postgresql on Debian/Ubuntu's
 	// pgdg build), which is owned by the postgres system user
 	// and unwritable for the postverify caller in unprivileged
@@ -400,8 +429,18 @@ func Verify(ctx context.Context, opts Options) (*Result, error) {
 	// captures from the source, so it always satisfies the
 	// recovery floor. shared_buffers stays pinned: it has no
 	// recovery floor and is the real memory knob.
-	pgOpts := fmt.Sprintf("-p %d -c listen_addresses=127.0.0.1 -c unix_socket_directories=%s -c logging_collector=off -c shared_buffers=128MB",
-		port, opts.DataDir)
+	//
+	// Authentication: hba_file points at bootHBA in the private work
+	// dir, and TCP is off (listen_addresses=''). The restored
+	// pg_hba.conf is the SOURCE cluster's production policy — peer
+	// for a role named like an OS user we are not, scram/LDAP/cert we
+	// hold no credentials for — so honouring it failed the boot test
+	// for correct restores. Trust is safe here for structural reasons
+	// (see bootHBA), and the operator's pg_hba.conf is never touched.
+	// pg_ctl passes -o through /bin/sh, hence the single quotes;
+	// makeWorkDir guarantees the path contains none.
+	pgOpts := fmt.Sprintf("-p %d -c listen_addresses='' -c unix_socket_directories='%s' -c hba_file='%s' -c logging_collector=off -c shared_buffers=128MB",
+		port, workDir, hbaFile)
 	startArgs := []string{
 		"-D", opts.DataDir,
 		"-l", logFile,
@@ -476,36 +515,14 @@ func Verify(ctx context.Context, opts Options) (*Result, error) {
 	// (the stop guard was registered before the start attempt above
 	// so it also cleans up a postmaster leaked by a failed start.)
 
-	// Connection-string preference (issue #85): the local Unix
-	// socket has two advantages over TCP for the postverify
-	// probe:
-	//
-	//   - Peer authentication is the stock pg_hba.conf default
-	//     for `local` connections.  PG looks at the OS uid that
-	//     opened the socket and authenticates it directly — no
-	//     password needed.  TCP from 127.0.0.1 falls into the
-	//     `host` `pg_hba.conf` block whose default is `scram-
-	//     sha-256` / `password`, so the operator gets prompted.
-	//
-	//   - pg_ctl's `-c unix_socket_directories=<DataDir>` (set
-	//     above) places the socket at a path we own, so there's
-	//     no ambiguity about which postmaster we're talking to.
-	//
-	// We try the socket first, fall back to TCP if it errors —
-	// matches the reporter's expectation in #85.  Whichever DSN
-	// we use, psql gets `-w` (`--no-password`) so a failed auth
-	// errors out immediately instead of prompting the operator
-	// for input that would never arrive in an automated restore.
+	// Connect over the private unix socket only. Authentication is
+	// the boot test's own trust-only hba_file (bootHBA), so neither
+	// the source's peer mapping nor a scram password matters; TCP is
+	// not listening at all. psql still gets -w (--no-password) so a
+	// misconfiguration errors out instead of prompting (issue #85).
 	socketDSN := fmt.Sprintf("postgres:///postgres?host=%s&port=%d&user=%s&sslmode=disable",
-		url.QueryEscape(opts.DataDir), port, url.QueryEscape(opts.PGUser))
-	tcpDSN := fmt.Sprintf("postgres://%s@127.0.0.1:%d/postgres?sslmode=disable", opts.PGUser, port)
-
-	// pickProbeDSN tries the socket DSN against probeSelect1;
-	// the first probe that succeeds picks the DSN every later
-	// step in this function uses.  If both fail, both error
-	// messages are surfaced so the operator can act on whichever
-	// one applies.
-	dsn, dsnKind, err := pickProbeDSN(ctx, psql, socketDSN, tcpDSN)
+		url.QueryEscape(workDir), port, url.QueryEscape(opts.PGUser))
+	dsn, dsnKind, err := pickProbeDSN(ctx, psql, socketDSN, "")
 	if err != nil {
 		return res, fmt.Errorf("postverify: SELECT 1: %w", err)
 	}
@@ -544,6 +561,100 @@ func Verify(ctx context.Context, opts Options) (*Result, error) {
 	}
 
 	return res, nil
+}
+
+// bootHBA is the pg_hba.conf the boot test runs with (via hba_file),
+// in place of the restored cluster's own.
+//
+// Trust is safe here specifically, and the reasons are structural:
+// the postmaster listens on no TCP socket (empty listen_addresses),
+// its unix socket lives in a 0700 directory owned by this process,
+// and it runs only for the duration of the probe. Nothing outside
+// this process can reach it. Same reasoning as the partial-restore
+// sandbox (internal/partial/sandbox).
+const bootHBA = `# pg_hardstorage postverify boot test — generated, not the operator's policy.
+local   all   all   trust
+`
+
+// maxSocketDirLen keeps <dir>/.s.PGSQL.<port> under the ~107-byte
+// sun_path limit for unix sockets.
+const maxSocketDirLen = 80
+
+// makeWorkDir creates the boot test's private 0700 directory for the
+// server log, the unix socket and bootHBA. It falls back to /tmp when
+// TMPDIR would give a socket path too long for sun_path, or one with a
+// single quote (pg_ctl hands -o to /bin/sh inside single quotes).
+func makeWorkDir() (string, error) {
+	for _, parent := range []string{"", "/tmp"} {
+		dir, err := os.MkdirTemp(parent, "pghs-pv-")
+		if err != nil {
+			continue
+		}
+		if len(dir) > maxSocketDirLen || strings.ContainsRune(dir, '\'') {
+			_ = os.RemoveAll(dir)
+			continue
+		}
+		if err := os.Chmod(dir, 0o700); err != nil {
+			_ = os.RemoveAll(dir)
+			return "", fmt.Errorf("chmod boot-test work dir: %w", err)
+		}
+		return dir, nil
+	}
+	return "", errors.New("cannot create a boot-test work dir with a usable unix-socket path (TMPDIR too long and /tmp unusable)")
+}
+
+// dataDirSnapshot records the files the boot test's staging and the
+// postmaster itself add to the restored PGDATA, so revert can put the
+// directory back the way the restore left it.
+type dataDirSnapshot struct {
+	dir         string
+	autoConf    []byte
+	hadAutoConf bool
+	// existed records which of the transient files were already
+	// present; revert removes only the ones this boot test created.
+	existed map[string]bool
+}
+
+// bootTransientFiles are created by stageForRecovery (signal files)
+// or by the postmaster (postmaster.opts) and are not part of what the
+// restore produced.
+var bootTransientFiles = []string{"recovery.signal", "standby.signal", "postmaster.opts"}
+
+func snapshotDataDir(dir string) (*dataDirSnapshot, error) {
+	s := &dataDirSnapshot{dir: dir, existed: map[string]bool{}}
+	body, err := os.ReadFile(filepath.Join(dir, "postgresql.auto.conf"))
+	switch {
+	case err == nil:
+		s.autoConf, s.hadAutoConf = body, true
+	case !errors.Is(err, os.ErrNotExist):
+		return nil, err
+	}
+	for _, name := range bootTransientFiles {
+		if _, err := os.Lstat(filepath.Join(dir, name)); err == nil {
+			s.existed[name] = true
+		}
+	}
+	return s, nil
+}
+
+// revert restores postgresql.auto.conf byte-for-byte and removes the
+// transient files the boot test created. A signal file the RESTORE
+// wrote and PostgreSQL consumed at promotion stays consumed: the
+// cluster has genuinely left recovery, and re-arming it would replay
+// recovery on an already-promoted timeline. Best-effort: this runs on
+// every exit path, including failures whose own error matters more.
+func (s *dataDirSnapshot) revert() {
+	autoConf := filepath.Join(s.dir, "postgresql.auto.conf")
+	if s.hadAutoConf {
+		_ = os.WriteFile(autoConf, s.autoConf, 0o600)
+	} else {
+		_ = os.Remove(autoConf)
+	}
+	for _, name := range bootTransientFiles {
+		if !s.existed[name] {
+			_ = os.Remove(filepath.Join(s.dir, name))
+		}
+	}
 }
 
 // runStart runs `pg_ctl … -w start` and returns its combined
@@ -774,6 +885,11 @@ func pickProbeDSN(ctx context.Context, psql, socketDSN, tcpDSN string) (string, 
 	sockErr := probeSelect1(ctx, psql, socketDSN)
 	if sockErr == nil {
 		return socketDSN, "socket", nil
+	}
+	// Verify passes no TCP DSN: the boot test listens on its private
+	// socket only (see bootHBA).
+	if tcpDSN == "" {
+		return "", "", fmt.Errorf("socket probe failed: %w", sockErr)
 	}
 	tcpErr := probeSelect1(ctx, psql, tcpDSN)
 	if tcpErr == nil {

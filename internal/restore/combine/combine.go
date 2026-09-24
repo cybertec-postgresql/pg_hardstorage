@@ -152,13 +152,20 @@ func Build(ctx context.Context, sp storage.StoragePlugin, deployment, leafID str
 	return chain, nil
 }
 
-// pgMajor extracts the PostgreSQL major version from a server_version_num
-// (e.g. 170002 → 17). Returns 0 when v is unknown/unset.
+// pgMajor normalises a manifest's PGVersion to a PostgreSQL major.
+// Manifests written by the backup runner store the bare major (17);
+// older fixtures and some callers carry a server_version_num (170002).
+// Both must compare equal, so only values in server_version_num range
+// are divided. Returns 0 when v is unknown/unset.
 func pgMajor(v int) int {
-	if v <= 0 {
+	switch {
+	case v <= 0:
 		return 0
+	case v >= 10000:
+		return v / 10000
+	default:
+		return v
 	}
-	return v / 10000
 }
 
 // DiscoverPGCombineBackup probes PATH for pg_combinebackup. Used by

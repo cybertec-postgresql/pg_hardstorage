@@ -273,6 +273,11 @@ func preflightWALGap(ctx context.Context, sp storage.StoragePlugin, deployment, 
 			fmt.Sprintf("restore: parse target_lsn %q: %v", recovery.TargetLSN, err)).
 			Wrap(output.ErrUsage)
 	}
+	// Replay starts at the backup's stop, so a gap between the stop
+	// and the target is crossed even when the target itself lies past
+	// it (see checkOneGap). An unknown stop disables only that check.
+	stop, serr := pglogrepl.ParseLSN(backupStopLSN)
+	stopKnown := serr == nil && backupStopLSN != ""
 
 	// Two sources for gap records, both consulted:
 	//
@@ -292,7 +297,7 @@ func preflightWALGap(ctx context.Context, sp storage.StoragePlugin, deployment, 
 	// dropped: see checkOneGap.
 	var malformed []string
 	for _, g := range manifestGaps {
-		bad, err := checkOneGap(target, g.GapStartLSN, g.GapEndLSN, g.GapBytes,
+		bad, err := checkOneGap(target, stop, stopKnown, g.GapStartLSN, g.GapEndLSN, g.GapBytes,
 			g.DetectedAt.UTC().Format("2006-01-02T15:04:05Z"),
 			g.SlotName, g.Timeline, deployment, "manifest")
 		if err != nil {
@@ -339,7 +344,7 @@ func preflightWALGap(ctx context.Context, sp storage.StoragePlugin, deployment, 
 	}
 
 	for _, g := range gaps {
-		bad, err := checkOneGap(target, g.GapStartLSN, g.GapEndLSN, g.GapBytes,
+		bad, err := checkOneGap(target, stop, stopKnown, g.GapStartLSN, g.GapEndLSN, g.GapBytes,
 			g.DetectedAt.UTC().Format("2006-01-02T15:04:05Z"),
 			g.SlotName, g.Timeline, deployment, "live")
 		if err != nil {
@@ -399,7 +404,7 @@ func preflightWALGap(ctx context.Context, sp storage.StoragePlugin, deployment, 
 // error message so the operator knows which record fired the
 // refusal (e.g., a stale manifest-embedded gap can be
 // distinguished from a fresh live one).
-func checkOneGap(target pglogrepl.LSN, startStr, endStr string, bytes uint64, detectedAt, slotName string, tli uint32, deployment, source string) (bool, error) {
+func checkOneGap(target, stop pglogrepl.LSN, stopKnown bool, startStr, endStr string, bytes uint64, detectedAt, slotName string, tli uint32, deployment, source string) (bool, error) {
 	start, sErr := pglogrepl.ParseLSN(startStr)
 	if sErr != nil {
 		return true, nil
@@ -408,14 +413,25 @@ func checkOneGap(target pglogrepl.LSN, startStr, endStr string, bytes uint64, de
 	if eErr != nil {
 		return true, nil
 	}
-	if target < start || target >= end {
+	inGap := target >= start && target < end
+	// A target at or past gap_end is only reachable if replay does not
+	// have to cross the hole, i.e. the backup stopped at or after
+	// gap_end. From an earlier backup PG halts at gap_start, cannot
+	// tell the hole from the end of the archive, and promotes short of
+	// the target.
+	crossed := !inGap && stopKnown && stop < end && target >= end
+	if !inGap && !crossed {
 		return false, nil
 	}
+	where := "falls within"
+	if crossed {
+		where = fmt.Sprintf("lies beyond, and replay from this backup (stop_lsn %s) must cross,", stop.String())
+	}
 	return false, output.NewError("restore.target_in_wal_gap",
-		fmt.Sprintf("restore: target_lsn %s falls within a known WAL gap (%s..%s, %d bytes, detected %s on slot %q TLI %d, source=%s) — PITR within this range is impossible from this repo",
-			target.String(), startStr, endStr, bytes, detectedAt, slotName, tli, source)).
+		fmt.Sprintf("restore: target_lsn %s %s a known WAL gap (%s..%s, %d bytes, detected %s on slot %q TLI %d, source=%s) — this target is unreachable from this backup",
+			target.String(), where, startStr, endStr, bytes, detectedAt, slotName, tli, source)).
 		WithSuggestion(&output.Suggestion{
-			Human:   "the agent recorded a Patroni-failover gap that covers the operator's target LSN. Use `pg_hardstorage wal gaps <deployment>` to inspect the full record history. Pick a target LSN OUTSIDE the gap: either BELOW gap_start (keeps everything before the gap; gap_start itself is refused because a WAL record can span the segment boundary into the missing range) or AT/ABOVE gap_end (resumes after the gap). The underlying slot issue is investigated via `pg_hardstorage repair slot <deployment>`.",
+			Human:   "the agent recorded a WAL gap that replay to this target would need to cross. Use `pg_hardstorage wal gaps <deployment>` to inspect the full record history. Either pick a target LSN BELOW gap_start (keeps everything before the gap; gap_start itself is refused because a WAL record can span the segment boundary into the missing range), or, to recover to or past gap_end, restore a backup whose stop_lsn is at or after gap_end (see `pg_hardstorage list <deployment>`): no backup taken before the gap can replay across it. The underlying slot issue is investigated via `pg_hardstorage repair slot <deployment>`.",
 			Command: "pg_hardstorage wal gaps " + deployment,
 			DocURL:  "https://docs.pghardstorage.org/runbooks/wal-gap-detected",
 		})

@@ -77,9 +77,9 @@ func newPartialDumpCmd() *cobra.Command {
 The SQL is written to --sql-file (or stdout if --sql-file is empty).
 Operator-friendly redirection: pipe stdout into a file or psql
 directly. (--sql-file avoids shadowing the global -o/--output JSON
-output flag; the SQL stream is logically separate from the
-structured Result envelope which still rides on stderr/stdout per
--o.)
+output flag.) When the SQL goes to stdout, stdout carries nothing
+else: progress events and the Result summary (in the -o format) are
+written to stderr. With --sql-file they go to stdout as usual.
 
 --data-only emits only INSERT/COPY statements (no DDL).
 
@@ -147,6 +147,14 @@ type partialDumpFlags struct {
 
 func runPartialDump(cmd *cobra.Command, f partialDumpFlags) error {
 	d := DispatcherFrom(cmd)
+	// With the SQL on stdout (the default; the help suggests piping it
+	// into psql) stdout IS the SQL stream: restore progress events and
+	// the Result summary rendered there were interleaved with the SQL
+	// and fed to psql. Route them to stderr instead, in the operator's
+	// chosen format.
+	if sqlToStdout(f.output) {
+		d = output.NewDispatcher(d.Renderer(), cmd.ErrOrStderr(), cmd.ErrOrStderr())
+	}
 	tlist := splitCommaTrim(f.tables)
 	if len(tlist) == 0 {
 		return output.NewError("usage.missing_flag",
@@ -285,7 +293,7 @@ func runPartialDump(cmd *cobra.Command, f partialDumpFlags) error {
 	// 3. pg_dump.
 	startedDump := time.Now()
 	var sqlBytes int64
-	dumpDest, dumpClose, err := openDumpOutput(f.output)
+	dumpDest, dumpClose, err := openDumpOutput(f.output, cmd.OutOrStdout())
 	if err != nil {
 		return err
 	}
@@ -349,6 +357,9 @@ func runPartialDump(cmd *cobra.Command, f partialDumpFlags) error {
 	return d.Result(output.NewResult(cmd.CommandPath()).WithBody(body))
 }
 
+// sqlToStdout reports whether --sql-file sends the SQL to stdout.
+func sqlToStdout(path string) bool { return path == "" || path == "-" }
+
 // openDumpOutput returns the writer for the SQL stream + closes it
 // when the run ends. Empty path returns os.Stdout (which we don't
 // close). Path = "-" is also stdout (cron-friendly redirection).
@@ -357,10 +368,10 @@ func runPartialDump(cmd *cobra.Command, f partialDumpFlags) error {
 // closer is idempotent — call it from both the happy path (to
 // surface a sync error) and a deferred best-effort path.  For
 // stdout it's a no-op closer.
-func openDumpOutput(path string) (io.Writer, func() error, error) {
+func openDumpOutput(path string, stdout io.Writer) (io.Writer, func() error, error) {
 	noop := func() error { return nil }
-	if path == "" || path == "-" {
-		return os.Stdout, noop, nil
+	if sqlToStdout(path) {
+		return stdout, noop, nil
 	}
 	// MkdirAll on the parent so operators don't have to pre-create
 	// dirs. Then create-or-truncate the file.

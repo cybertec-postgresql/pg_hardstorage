@@ -310,13 +310,20 @@ func Start(ctx context.Context, opts Options) (*Sandbox, error) {
 		cmd.Stderr = opts.Stderr
 	}
 	if err := cmd.Run(); err != nil {
-		sb.cleanup()
 		// Best-effort: capture the log so the operator sees what
-		// went wrong.
+		// went wrong. Read it BEFORE cleanup: the log lives in the
+		// socket dir that cleanup removes.
 		var logTail string
 		if body, rerr := os.ReadFile(logFile); rerr == nil {
 			logTail = tailString(string(body), 4096)
 		}
+		// `pg_ctl -w start` failing (e.g. "server did not start in
+		// time") does not mean no postmaster is running: the one it
+		// forked may still be replaying WAL, holding the operator's
+		// data dir and our socket dir. Stop it before tearing down,
+		// or it outlives the command on the restored data.
+		sb.stopPostmaster()
+		sb.cleanup()
 		return nil, fmt.Errorf("sandbox: pg_ctl start: %w (log tail: %s)", err, logTail)
 	}
 
@@ -324,6 +331,7 @@ func Start(ctx context.Context, opts Options) (*Sandbox, error) {
 	// socket file exists.
 	socketPath := filepath.Join(sockDir, ".s.PGSQL.5432")
 	if _, err := os.Stat(socketPath); err != nil {
+		sb.stopPostmaster()
 		sb.cleanup()
 		return nil, fmt.Errorf("sandbox: PG started but socket %s not found: %w", socketPath, err)
 	}
@@ -570,6 +578,26 @@ func (s *Sandbox) Stop(ctx context.Context) error {
 
 	s.cleanup()
 	return stopErr
+}
+
+// stopPostmaster is the Start failure path's best-effort
+// `pg_ctl -m fast stop`. It runs on a fresh context bounded by
+// ShutdownTimeout because the caller's ctx may be the very thing that
+// was cancelled; a stop against an absent postmaster is a harmless
+// no-op whose error is intentionally discarded.
+func (s *Sandbox) stopPostmaster() {
+	timeout := s.opts.ShutdownTimeout
+	if timeout == 0 {
+		timeout = DefaultShutdownTimeout
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	_ = exec.CommandContext(ctx, s.pgCtl, "stop",
+		"-D", s.opts.DataDir,
+		"-m", "fast",
+		"-w",
+		"-t", fmt.Sprintf("%d", int(timeout/time.Second)),
+	).Run()
 }
 
 // cleanup is called from both the Stop happy path and the Start

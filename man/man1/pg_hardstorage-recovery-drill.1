@@ -105,7 +105,7 @@ For Docker-free runs, pass --skip-verify; the report's RTO actual
 
 .PP
 \fB--tablespace-mapping\fP=[]
-	redirect a tablespace: --tablespace-mapping== (repeatable). Required when the backup has non-default tablespaces: without it they would be restored to their original absolute paths, overwriting live data on the source host
+	redirect a tablespace: --tablespace-mapping== (repeatable). Required when the backup has non-default tablespaces: without it they would be restored to their original absolute paths, overwriting live data on the source host. The mapped dirs are drill scratch: mounted into the verify sandbox at the same path and removed (or, if they pre-existed, emptied) at teardown unless --keep
 
 .PP
 \fB--temp-base\fP=""

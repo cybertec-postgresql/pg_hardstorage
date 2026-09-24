@@ -287,7 +287,8 @@ func TestPartialRestore_TextRender(t *testing.T) {
 
 // TestPartialRestore_NotFoundTable_PropagatesNotFound: a table
 // missing from the relfilenode map shows up under not_found in
-// the result body. The run still succeeds (exit 0).
+// the result body. The present table is still extracted, but the run
+// exits non-zero: a requested table produced nothing (H4).
 func TestPartialRestore_NotFoundTable_PropagatesNotFound(t *testing.T) {
 	w := newReadWorld(t)
 	w.commitWithFilesCLI(t, "db1", "db1.full.nf", []cliFileSpec{
@@ -307,8 +308,8 @@ func TestPartialRestore_NotFoundTable_PropagatesNotFound(t *testing.T) {
 		"--target", target,
 		"--relfilenode-map", mapPath,
 		"-o", "json")
-	if exit != int(output.ExitOK) {
-		t.Fatalf("exit=%d\n%s", exit, stdout)
+	if exit != int(output.ExitError) {
+		t.Fatalf("exit=%d, want %d (partial.restore_incomplete)\n%s", exit, output.ExitError, stdout)
 	}
 	if !strings.Contains(stdout, `"public.does_not_exist"`) {
 		t.Errorf("expected not_found mention:\n%s", stdout)

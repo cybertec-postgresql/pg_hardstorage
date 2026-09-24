@@ -33,8 +33,8 @@ import (
 // ordinary gap checks judge the details. A repository that cannot be
 // listed is not a reason to refuse. --skip-gap-check bypasses it, as it
 // bypasses the other WAL pre-flights.
-func preflightBackupWALAvailable(ctx context.Context, sp storage.StoragePlugin, deployment string, m *backup.Manifest, recovery *Recovery) error {
-	if m == nil || (recovery != nil && recovery.SkipGapCheck) {
+func preflightBackupWALAvailable(ctx context.Context, sp storage.StoragePlugin, deployment string, m *backup.Manifest, recovery *Recovery, skipGapCheck bool) error {
+	if m == nil || skipGapCheck || (recovery != nil && recovery.SkipGapCheck) {
 		return nil
 	}
 	if embedsWAL(m) {

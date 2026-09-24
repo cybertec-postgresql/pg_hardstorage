@@ -25,6 +25,7 @@ package recovery
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"sort"
@@ -32,6 +33,7 @@ import (
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup/keystore"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/kms"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/encryption"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo"
@@ -208,6 +210,13 @@ type Options struct {
 	// nil the encryption-health check is skipped.
 	KEKResolver func(ref string) ([encryption.KeyLen]byte, error)
 
+	// DEKUnwrapper unwraps a cloud-KMS-wrapped DEK server-side — the
+	// same path restore uses (restore.Options.UnwrapDEK). A cloud KEK
+	// never leaves the KMS, so KEKResolver (raw local key bytes)
+	// cannot answer for it; without this every cloud-KMS deployment
+	// read as kek_unreachable. The CLI wires keystore.UnwrapDEK.
+	DEKUnwrapper func(ctx context.Context, kekRef string, wrapped []byte) ([]byte, error)
+
 	// Now overrides time.Now() for deterministic test output.
 	Now time.Time
 
@@ -326,7 +335,7 @@ func Readiness(ctx context.Context, sp storage.StoragePlugin, deployment string,
 		r.Verification = readVerificationFreshness(ctx, sp, latest, now, opts)
 	}
 	if !opts.SkipEncryption {
-		r.Encryption = checkEncryptionHealth(latest, opts)
+		r.Encryption = checkEncryptionHealth(ctx, latest, opts)
 	}
 	if !opts.SkipWAL {
 		r.WAL = scanWALCoverage(ctx, sp, deployment, latest)
@@ -427,7 +436,7 @@ func readVerificationFreshness(ctx context.Context, sp storage.StoragePlugin, la
 // (when KEKResolver provided) confirms the wrapped DEK unwraps.
 // Plaintext manifests report Encrypted=false with a Note; that's
 // fine, not a failure.
-func checkEncryptionHealth(latest *backup.Manifest, opts Options) *EncryptionHealth {
+func checkEncryptionHealth(ctx context.Context, latest *backup.Manifest, opts Options) *EncryptionHealth {
 	out := &EncryptionHealth{}
 	if latest.Encryption == nil {
 		out.Note = "manifest is unencrypted"
@@ -437,6 +446,25 @@ func checkEncryptionHealth(latest *backup.Manifest, opts Options) *EncryptionHea
 	}
 	out.Encrypted = true
 	out.KEKRef = latest.Encryption.KEKRef
+	// A cloud KMS ref (any scheme but local, exactly restore's test in
+	// encryption_glue.go) is proven the way restore uses it: by
+	// unwrapping the manifest's DEK server-side. The local keyring
+	// resolver does not know these schemes and reported every such
+	// deployment kek_unreachable.
+	if scheme := kms.SchemeOf(out.KEKRef); scheme != "" && scheme != "local" && opts.DEKUnwrapper != nil {
+		wrapped, err := base64.StdEncoding.DecodeString(latest.Encryption.WrappedDEK)
+		if err != nil {
+			out.Note = fmt.Sprintf("wrapped_dek is not valid base64: %v", err)
+			return out
+		}
+		if _, err := opts.DEKUnwrapper(ctx, out.KEKRef, wrapped); err != nil {
+			out.Note = fmt.Sprintf("KEK %q not reachable: cloud KMS unwrap failed: %v", out.KEKRef, err)
+			return out
+		}
+		out.KEKReachable = true
+		out.UnwrapOK = true
+		return out
+	}
 	if opts.KEKResolver == nil {
 		out.Note = "KEKResolver not supplied; skipping reachability check"
 		return out

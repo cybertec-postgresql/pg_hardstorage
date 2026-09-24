@@ -109,6 +109,24 @@ type Options struct {
 	// silent data-loss risk flip to "required" in CI.
 	VerifyMode string
 
+	// PGVerifyBackup, when non-empty, runs the external
+	// pg_verifybackup gate (Verify) against TargetDir. It runs
+	// inside Restore, BEFORE the VerifyMode boot test, because the
+	// boot test runs recovery in TargetDir itself: pg_control is
+	// rewritten and backup_label consumed, after which
+	// pg_verifybackup can only report mismatches. The outcome lands
+	// in Result.Verify. When the gate refuses (VerifyRequire),
+	// Restore returns that error together with a Result carrying
+	// Verify, and the boot test does not run.
+	PGVerifyBackup VerifyMode
+
+	// SkipGapCheck is the operator's --skip-gap-check for the WAL
+	// pre-flights that apply to EVERY restore (today: the
+	// backup-WAL-missing refusal). Recovery.SkipGapCheck cannot carry
+	// it on a plain restore, which has no Recovery at all; either
+	// flag bypasses.
+	SkipGapCheck bool
+
 	// KEKForRef resolves a manifest's EncryptionInfo.KEKRef to the
 	// matching 32-byte KEK. Required when restoring an encrypted
 	// backup; ignored for unencrypted backups.
@@ -210,6 +228,26 @@ type Result struct {
 	StartedAt         time.Time     `json:"started_at"`
 	StoppedAt         time.Time     `json:"stopped_at"`
 	Duration          time.Duration `json:"-"`
+
+	// Verify is the pg_verifybackup outcome when
+	// Options.PGVerifyBackup was set; nil otherwise. Not part of
+	// the frozen Result JSON: callers render it in their own body.
+	Verify *VerifyResult `json:"-"`
+}
+
+// runPGVerifyGate runs the Options.PGVerifyBackup gate (see there
+// for why it must precede the boot test). On refusal it returns a
+// Result holding just the identity + Verify outcome, so the caller
+// can still report what was checked.
+func runPGVerifyGate(ctx context.Context, mode VerifyMode, m *backup.Manifest, targetDir string) (*VerifyResult, *Result, error) {
+	if mode == "" {
+		return nil, nil, nil
+	}
+	v, err := Verify(ctx, targetDir, mode)
+	if err != nil {
+		return v, &Result{BackupID: m.BackupID, Deployment: m.Deployment, TargetDir: targetDir, Verify: v}, err
+	}
+	return v, nil, nil
 }
 
 // MarshalJSON emits duration_ms as whole milliseconds (see Result doc).
@@ -308,7 +346,7 @@ func Restore(ctx context.Context, opts Options) (res *Result, err error) {
 	preflightWALContiguity(ctx, sp, opts.Deployment, m, opts.Recovery, emit)
 	// The backup's OWN WAL must exist somewhere, or it can never become
 	// consistent. Refuse before writing anything.
-	if err := preflightBackupWALAvailable(ctx, sp, opts.Deployment, m, opts.Recovery); err != nil {
+	if err := preflightBackupWALAvailable(ctx, sp, opts.Deployment, m, opts.Recovery, opts.SkipGapCheck); err != nil {
 		return nil, err
 	}
 	// Timeline-history reachability: PG probes <N>.history ascending
@@ -379,9 +417,17 @@ func Restore(ctx context.Context, opts Options) (res *Result, err error) {
 	if err := preflightTarget(opts.TargetDir, opts.AllowOverwrite, m.SystemIdentifier, opts.AllowForeignCluster); err != nil {
 		return nil, err
 	}
-	if err := preflightTablespaceTargets(
-		tablespaceDestinations(m, opts.TablespaceRemap), opts.AllowOverwrite); err != nil {
-		return nil, err
+	// A target holding a checkpoint for THIS backup is a resume: its
+	// tablespace dirs legitimately hold what the interrupted attempt
+	// already wrote (and checkpointed). Refusing them made such a
+	// restore impossible to resume; clearing them under --force would
+	// delete files the checkpoint says are done. A checkpoint for a
+	// different backup is refused loudly further down (3a).
+	if !resumesBackup(opts.TargetDir, m.BackupID) {
+		if err := preflightTablespaceTargets(
+			tablespaceDestinations(m, opts.TablespaceRemap), opts.AllowOverwrite); err != nil {
+			return nil, err
+		}
 	}
 	if err := os.MkdirAll(opts.TargetDir, 0o700); err != nil {
 		return nil, output.NewError("internal",
@@ -766,6 +812,13 @@ func Restore(ctx context.Context, opts Options) (res *Result, err error) {
 			}))
 	}
 
+	// L2b — external pg_verifybackup, strictly BEFORE the L3 boot
+	// test below (see Options.PGVerifyBackup).
+	pgVerify, refused, pgvErr := runPGVerifyGate(ctx, opts.PGVerifyBackup, m, opts.TargetDir)
+	if pgvErr != nil {
+		return refused, pgvErr
+	}
+
 	// L3 — post-restore cluster-start smoke test.  Catches
 	// the issue-#7-class bug class (empty PGDATA dirs missing,
 	// permissions broken, tablespace symlinks dangling) that
@@ -834,6 +887,7 @@ func Restore(ctx context.Context, opts Options) (res *Result, err error) {
 		StartedAt:         startedAt,
 		StoppedAt:         stoppedAt,
 		Duration:          stoppedAt.Sub(startedAt),
+		Verify:            pgVerify,
 	}
 	emit(output.NewEvent(output.SeverityInfo, "restore", "completed").
 		WithSubject(output.Subject{Deployment: m.Deployment, BackupID: m.BackupID}).
@@ -897,6 +951,11 @@ func validateOptions(o *Options) error {
 		return output.NewError("usage.missing_target_dir",
 			"restore: TargetDir is required").Wrap(output.ErrUsage)
 	}
+	// Canonical form for every path derived from it: with a trailing
+	// slash, the chain path's sibling "<target>.pgcombine-staging"
+	// became "<target>/.pgcombine-staging" — inside the target — and
+	// the final rename into place failed with EINVAL.
+	o.TargetDir = filepath.Clean(o.TargetDir)
 	if o.Verifier == nil {
 		return output.NewError("usage.missing_verifier",
 			"restore: Verifier is required (we don't restore from unverified manifests)").
@@ -1228,6 +1287,14 @@ func hasFile(entries []os.DirEntry, name string) bool {
 // match logic will refuse loudly if the contents disagree with the
 // requested backup. False positives here just defer the loud
 // refusal to the restore loop, which is fine.
+// resumesBackup reports whether target carries a restore checkpoint
+// for backupID, i.e. this run resumes an interrupted restore of the
+// same backup. An unreadable checkpoint is not a resume.
+func resumesBackup(target, backupID string) bool {
+	cp, err := LoadCheckpoint(target)
+	return err == nil && cp != nil && cp.BackupID == backupID
+}
+
 func targetIsResumeEligible(target string, entries []os.DirEntry) (bool, error) {
 	for _, e := range entries {
 		if e.Name() == CheckpointFilename {
@@ -1407,6 +1474,14 @@ func writeTablespaceSymlinks(target string, tsDests map[uint32]string) error {
 //
 // Sorted and de-duplicated so the preflight's error ordering does not
 // depend on map iteration.
+// TablespaceDestinations returns the directories a restore of m with
+// remap writes non-default tablespace data into (sorted, deduplicated).
+// Callers that stage a restore elsewhere (the recovery drill) use it to
+// expose and clean up exactly those directories.
+func TablespaceDestinations(m *backup.Manifest, remap TablespaceRemap) []string {
+	return tablespaceDestinations(m, remap)
+}
+
 func tablespaceDestinations(m *backup.Manifest, remap TablespaceRemap) []string {
 	seen := map[string]struct{}{}
 	for _, dir := range tablespaceDestRoots(m, remap) {
@@ -1879,6 +1954,10 @@ func restoreIncrementalChain(ctx context.Context, opts Options, sp storage.Stora
 			return nil, output.NewError("internal",
 				fmt.Sprintf("restore chain: clean stale link dir %q: %v", linkDir, err)).Wrap(err)
 		}
+		if err := os.RemoveAll(chainTablespaceStagingRoot(linkDir)); err != nil && !errors.Is(err, stdfs.ErrNotExist) {
+			return nil, output.NewError("internal",
+				fmt.Sprintf("restore chain: clean stale tablespace staging for %q: %v", linkDir, err)).Wrap(err)
+		}
 		if err := os.MkdirAll(linkDir, 0o700); err != nil {
 			return nil, output.NewError("internal",
 				fmt.Sprintf("restore chain: mkdir link dir: %v", err)).Wrap(err)
@@ -1990,14 +2069,16 @@ func restoreIncrementalChain(ctx context.Context, opts Options, sp storage.Stora
 		PGCombineBackupPath: combineBin,
 		InputDirs:           inputDirs,
 		OutputDir:           combineOut,
-		// ExtraArgs flows the operator's tablespace remap
-		// through to pg_combinebackup as
-		// --tablespace-mapping=OLD=NEW. Empty when no
-		// remap was requested. pg_combinebackup itself
-		// rewrites the OUTPUT dir's tablespace_map AND
-		// creates symlinks under pg_tblspc/, so we don't
-		// need to pre-rewrite the staging dirs.
-		ExtraArgs: opts.TablespaceRemap.ToCombineArgs(),
+		// Every tablespace of the leaf is staged per link (see
+		// materializeManifestInto), so pg_combinebackup would by
+		// default write the merged tablespace back into the LEAF's
+		// staging dir. Map each one from there to its real
+		// destination — the recorded location, or the operator's
+		// --tablespace-mapping target. pg_combinebackup's olddir is
+		// the tablespace path as it exists in the final input, so
+		// the operator's OLD=NEW (original locations) cannot be
+		// passed through verbatim.
+		ExtraArgs: chainTablespaceCombineArgs(leaf, inputDirs[len(inputDirs)-1], opts.TablespaceRemap),
 		Stderr:    &stderr,
 	}); err != nil {
 		combineSpan.SetStatus(codes.Error, err.Error())
@@ -2128,6 +2209,13 @@ func restoreIncrementalChain(ctx context.Context, opts Options, sp storage.Stora
 			}))
 	}
 
+	// L2b — external pg_verifybackup before the boot test, as on the
+	// full-restore path (see Options.PGVerifyBackup).
+	pgVerify, refused, pgvErr := runPGVerifyGate(chainCtx, opts.PGVerifyBackup, leaf, opts.TargetDir)
+	if pgvErr != nil {
+		return refused, pgvErr
+	}
+
 	// L3 — post-restore cluster-start smoke test, honouring
 	// Options.VerifyMode exactly like the full-restore path (see
 	// Restore ~L671).  The chain path previously ran no L3 and never
@@ -2194,6 +2282,7 @@ func restoreIncrementalChain(ctx context.Context, opts Options, sp storage.Stora
 		StartedAt:         startedAt,
 		StoppedAt:         stoppedAt,
 		Duration:          stoppedAt.Sub(startedAt),
+		Verify:            pgVerify,
 	}
 	emit(output.NewEvent(output.SeverityInfo, "restore", "completed").
 		WithSubject(output.Subject{Deployment: leaf.Deployment, BackupID: leaf.BackupID}).
@@ -2264,11 +2353,18 @@ func materializeManifestInto(ctx context.Context, cas *repo.CAS, m *backup.Manif
 	// incremental-lifecycle integration test first ran end-to-
 	// end against a real PG.  Idempotent: MkdirAll on an
 	// existing dir is a no-op.
+	tsRoots := chainTablespaceRoots(m, dir)
 	for _, d := range m.Dirs {
 		if d.Path == "" {
 			continue
 		}
-		full, err := safeJoinTarget(dir, d.Path)
+		// A tablespace's empty dirs belong under its staging root,
+		// like its files (see below).
+		root, err := fileDestRoot(dir, tsRoots, d.TablespaceOID)
+		if err != nil {
+			return totalBytes, totalChunks, err
+		}
+		full, err := safeJoinTarget(root, d.Path)
 		if err != nil {
 			return totalBytes, totalChunks,
 				fmt.Errorf("chain materialise: dir %s: %w", d.Path, err)
@@ -2283,23 +2379,46 @@ func materializeManifestInto(ctx context.Context, cas *repo.CAS, m *backup.Manif
 		}
 	}
 
+	// Non-default tablespaces: pg_combinebackup takes plain-format
+	// inputs, where each tablespace is reached through a
+	// pg_tblspc/<oid> symlink to that backup's own copy of it. Stage
+	// each link's tablespace files in a per-link directory (never the
+	// real destination: every link has its own version of the same
+	// relative paths) and point the link's pg_tblspc/<oid> at it. A
+	// file's Path is relative to its tablespace root, so writing it
+	// under the link root instead — as this used to — misplaced the
+	// data and let same-named files of different tablespaces
+	// overwrite each other, while pg_combinebackup never saw the
+	// tablespace at all.
 	for i := range m.Files {
 		if err := ctx.Err(); err != nil {
 			return totalBytes, totalChunks, err
 		}
-		bw, ck, err := materializeFile(ctx, cas, dir, &m.Files[i])
+		root, err := fileDestRoot(dir, tsRoots, m.Files[i].TablespaceOID)
+		if err != nil {
+			return totalBytes, totalChunks, err
+		}
+		bw, ck, err := materializeFile(ctx, cas, root, &m.Files[i])
 		if err != nil {
 			return totalBytes, totalChunks, err
 		}
 		totalBytes += bw
 		totalChunks += ck
 	}
+	if err := writeTablespaceSymlinks(dir, tsRoots); err != nil {
+		return totalBytes, totalChunks, err
+	}
 	if m.BackupLabel != "" {
 		if err := writeSpecial(dir, "backup_label", []byte(m.BackupLabel)); err != nil {
 			return totalBytes, totalChunks, err
 		}
 	}
-	if m.TablespaceMap != "" {
+	// tablespace_map is deliberately NOT written into a staged link:
+	// plain-format backups carry symlinks instead, and a map naming
+	// the ORIGINAL locations would travel into the merged output and
+	// make PostgreSQL re-point pg_tblspc there at startup, undoing the
+	// symlinks pg_combinebackup wrote to the real destinations.
+	if m.TablespaceMap != "" && len(tsRoots) == 0 {
 		if err := writeSpecial(dir, "tablespace_map", []byte(m.TablespaceMap)); err != nil {
 			return totalBytes, totalChunks, err
 		}
@@ -2321,6 +2440,43 @@ func materializeManifestInto(ctx context.Context, cas *repo.CAS, m *backup.Manif
 		return totalBytes, totalChunks, err
 	}
 	return totalBytes, totalChunks, nil
+}
+
+// chainTablespaceStagingRoot is where a staged chain link keeps its
+// non-default tablespaces: a sibling of the link dir (so a wipe of
+// one cannot reach into the other), one subdirectory per OID.
+func chainTablespaceStagingRoot(linkDir string) string {
+	return linkDir + ".tblspc"
+}
+
+// chainTablespaceRoots maps each non-default tablespace of m (the
+// ones tablespaceDestRoots would restore outside PGDATA) to its
+// per-link staging directory under linkDir.
+func chainTablespaceRoots(m *backup.Manifest, linkDir string) map[uint32]string {
+	out := map[uint32]string{}
+	for oid := range tablespaceDestRoots(m, nil) {
+		out[oid] = filepath.Join(chainTablespaceStagingRoot(linkDir), strconv.FormatUint(uint64(oid), 10))
+	}
+	return out
+}
+
+// chainTablespaceCombineArgs returns pg_combinebackup
+// --tablespace-mapping flags moving each of the leaf's tablespaces
+// from its staging dir in the final input (leafDir) to its real
+// destination (recorded location, after the operator's remap).
+func chainTablespaceCombineArgs(leaf *backup.Manifest, leafDir string, remap TablespaceRemap) []string {
+	staged := chainTablespaceRoots(leaf, leafDir)
+	dests := tablespaceDestRoots(leaf, remap)
+	oids := make([]uint32, 0, len(dests))
+	for oid := range dests {
+		oids = append(oids, oid)
+	}
+	sort.Slice(oids, func(i, j int) bool { return oids[i] < oids[j] })
+	out := make([]string, 0, len(oids))
+	for _, oid := range oids {
+		out = append(out, fmt.Sprintf("--tablespace-mapping=%s=%s", staged[oid], dests[oid]))
+	}
+	return out
 }
 
 // sumFileCount totals the FileEntry count across every chain link.

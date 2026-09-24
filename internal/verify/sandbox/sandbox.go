@@ -185,6 +185,14 @@ type Options struct {
 	// silently behind green dashboards.
 	ManifestCaptured bool
 
+	// ExtraBinds are host directories the backend must make visible
+	// at the SAME absolute path inside the sandbox, read-only. A
+	// restored data dir reaches its non-default tablespaces through
+	// absolute pg_tblspc/<oid> symlinks; mounting only DataDir leaves
+	// them dangling and pg_verifybackup fails on every tablespace file.
+	// Honoured by the Docker backend.
+	ExtraBinds []string
+
 	// PGMajor is the major version of the source PG ("15",
 	// "16", "17").  The Docker image / Firecracker rootfs
 	// must match so the pg_verifybackup binary's protocol

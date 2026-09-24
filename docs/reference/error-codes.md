@@ -248,6 +248,8 @@ field is where the recovery hint lives.
 | `demo.*` | `pg_hardstorage demo` sandbox bring-up (`demo.docker_unavailable`, `demo.pg_not_ready`, `demo.port_failed`, `demo.start_failed`, `demo.step_failed`) |
 | `redact.*` | Logical redaction passes |
 | `partial.*` | Partial / table-level restore |
+| `partial.incremental_unsupported` | `partial restore` of an incremental backup: its relations' main forks are stored as `INCREMENTAL.<relfilenode>` and only exist combined with the chain. Extract from a full backup, or use `partial dump` (which restores the whole chain). Exit 1 |
+| `partial.restore_incomplete` | `partial restore` extracted nothing for at least one requested table: not found (catalog or `--relfilenode-map`), or absent from this backup (no main fork). The result body is printed first and lists both; exit 1 |
 | `combine.*` | `pg_combinebackup` orchestration |
 | `paths.*`, `init.*`, `config.*` | Bootstrap (`config.invalid`, `config.load_failed` — also an explicit `-c` file that does not exist; `config.kek_ref_unknown_scheme`; `config.defined_elsewhere` — an edit targets a deployment/sink defined in a `conf.d` drop-in or `PG_HARDSTORAGE_CONFIG`; `config.approval_roster_missing` — no trusted approver roster configured; `config.approval_policy_invalid` — unreadable roster or malformed `PG_HARDSTORAGE_APPROVAL_MIN_THRESHOLD`) |
 | `compliance.*`, `integrity.*`, `insider.*` | Compliance / integrity scanning |

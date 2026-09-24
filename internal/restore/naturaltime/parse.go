@@ -145,7 +145,12 @@ func parse(s string, now time.Time) (time.Time, error) {
 	for _, layout := range []string{
 		time.RFC3339Nano,
 		time.RFC3339,
+		// RFC3339 without seconds (documented above). Go's RFC3339
+		// layout insists on :SS, so the minute-precision shapes
+		// operators actually type must be listed on their own.
+		"2006-01-02T15:04Z07:00",
 		"2006-01-02T15:04:05",
+		"2006-01-02T15:04",
 		"2006-01-02 15:04:05.999999-07:00",
 		"2006-01-02 15:04:05-07:00",
 		"2006-01-02 15:04:05 -07:00",

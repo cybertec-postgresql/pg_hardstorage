@@ -115,7 +115,9 @@ WAL inventory. PITR inside the gap window is then explicitly refused.
 
 **Symptom.** A `wal_gap_detected` notice in `wal stream` logs, or a
 restore returns `restore.target_in_wal_gap` (exit 7) when the requested
-LSN falls inside a known gap.
+LSN falls inside a known gap, or lies beyond one that replay from the
+chosen backup would have to cross (the backup stopped before the gap
+ended).
 
 **What it means.** Some range of WAL LSNs is missing from the repo.
 The gap auditor records the start and end of every gap it knows
@@ -125,7 +127,9 @@ PG would have nothing to replay.
 **What to do.**
 
 - For a recent gap caused by `wal repair`: the gap is real WAL loss.
-  Pick a restore target outside the gap. The gap bounds are reported
+  Pick a restore target below the gap, or restore a backup whose
+  stop LSN is at or after the gap end to reach a target past it (no
+  backup taken before the gap can replay across it). The gap bounds are reported
   in the manifest of any backup taken after the gap, and in
   `pg_hardstorage wal list <deployment>`.
 - For a gap caused by Patroni failover without `permanent_slots`:

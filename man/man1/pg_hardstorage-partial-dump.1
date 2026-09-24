@@ -24,9 +24,9 @@ Run a full pipeline:
 The SQL is written to --sql-file (or stdout if --sql-file is empty).
 Operator-friendly redirection: pipe stdout into a file or psql
 directly. (--sql-file avoids shadowing the global -o/--output JSON
-output flag; the SQL stream is logically separate from the
-structured Result envelope which still rides on stderr/stdout per
--o.)
+output flag.) When the SQL goes to stdout, stdout carries nothing
+else: progress events and the Result summary (in the -o format) are
+written to stderr. With --sql-file they go to stdout as usual.
 
 .PP
 --data-only emits only INSERT/COPY statements (no DDL).
