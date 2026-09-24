@@ -98,6 +98,15 @@ same identity tuple — `(deployment, op)` — reuse the open ticket
 and append a comment. The "exactly one ticket per recurring
 failure" posture from the spec.
 
+The sink finds the open ticket with a JQL `summary ~` search,
+which is a fuzzy text match, and then accepts only a hit whose
+summary is *exactly* the one it would create — a ticket for
+`deployment=db1-replica` is never reused for `deployment=db1`.
+Concurrent identical events from one process are serialised,
+so a burst yields one ticket plus comments. Two separate
+processes (or an event that arrives before JIRA has indexed a
+just-created ticket) can still produce a duplicate.
+
 **`always_new`**. Each event opens a fresh ticket. Useful when
 events have independent significance (audit emission, GDPR
 DSAR notices) and you want a one-to-one paper trail.

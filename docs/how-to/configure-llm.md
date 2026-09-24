@@ -190,6 +190,10 @@ Common errors:
 - `429 Too Many Requests` — rate limit / billing.
 - `model not found` — the chosen model isn't on your account; try `gpt-4o-mini`.
 - `connection refused` (Ollama) — `ollama serve` not running, or wrong port.
+- `openai: stream error (...)` — the backend accepted the request
+  and then failed partway through the streamed reply (overload,
+  context length, a crashed model). The message is the server's
+  own; retry, or shorten the conversation.
 
 ## Reasoning-model output
 
