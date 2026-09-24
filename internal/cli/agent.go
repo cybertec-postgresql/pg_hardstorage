@@ -127,6 +127,18 @@ func runAgentControlPlane(cmd *cobra.Command, baseURL, tokenFile, agentID, metri
 		}
 		sort.Strings(deployments)
 	}
+	// The deployment list is what the control plane matches claims
+	// against. An agent that manages nothing can run nothing, so
+	// refuse to start rather than poll forever (older control planes
+	// read an empty list as "any deployment" and handed this agent
+	// every job, which it then failed).
+	if len(deployments) == 0 {
+		return output.NewError("config.no_deployments",
+			"agent --control-plane: no deployments configured (add a `deployments:` block to pg_hardstorage.yaml naming the deployments this agent may run jobs for)").
+			WithSuggestion(&output.Suggestion{
+				Human: "see `pg_hardstorage init` for the Day-0 walkthrough",
+			})
+	}
 
 	if agentID == "" {
 		host, _ := os.Hostname()

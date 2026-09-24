@@ -234,6 +234,13 @@ sudo -u pgbackup pg_hardstorage agent \
     --agent-id db1.example.com
 ```
 
+The agent advertises the deployments named in its local
+`pg_hardstorage.yaml` and claims only jobs for those deployments.
+An agent with no `deployments:` block refuses to start
+(`config.no_deployments`), and the control plane treats a claim that
+names no deployments as matching nothing — an empty list never means
+"any deployment".
+
 Within 10 seconds the agent's first heartbeat should land. Verify
 on the control-plane host:
 

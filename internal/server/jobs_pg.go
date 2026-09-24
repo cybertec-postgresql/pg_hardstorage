@@ -274,10 +274,13 @@ func (b *PGBackend) Claim(ctx context.Context, opts ClaimOptions) (*Job, error) 
 	if opts.AgentID == "" {
 		return nil, errors.New("jobs: AgentID is required for claim")
 	}
-	deployments := opts.Deployments
-	if deployments == nil {
-		deployments = []string{}
+	// Empty deployment set = manages nothing = claims nothing (see
+	// ClaimOptions.Deployments). Short-circuit before the round-trip;
+	// the SQL below also has no "empty = any" arm any more.
+	if len(opts.Deployments) == 0 {
+		return nil, ErrNoJobs
 	}
+	deployments := opts.Deployments
 	kinds := make([]string, len(opts.Kinds))
 	for i, k := range opts.Kinds {
 		kinds[i] = string(k)
@@ -341,7 +344,7 @@ func (b *PGBackend) claimRow(ctx context.Context, q pgQuerier, opts ClaimOptions
          WHERE id = (
              SELECT id FROM phs.jobs
               WHERE state = 'queued'
-                AND ($3::text[] = '{}'::text[] OR deployment = ANY($3))
+                AND deployment = ANY($3)
                 AND ($4::text[] = '{}'::text[] OR kind = ANY($4))
                 AND ($5 <= 0 OR (
                     SELECT count(*) FROM phs.jobs WHERE state = 'running'

@@ -40,6 +40,27 @@ func runBackendContract(t *testing.T, factory func(t *testing.T) server.JobBacke
 		}
 	})
 
+	// An agent that declares NO deployments manages nothing, so it
+	// must claim nothing. Treating the empty set as "match all" let a
+	// misconfigured agent (control-plane mode, empty config) drain
+	// every deployment's queue and fail each job on its own host.
+	t.Run("Claim_EmptyDeploymentsMatchesNothing", func(t *testing.T) {
+		b := factory(t)
+		ctx := context.Background()
+		if _, err := b.Enqueue(ctx, server.EnqueueOptions{Kind: server.JobBackup, Deployment: "db1"}); err != nil {
+			t.Fatal(err)
+		}
+		for _, deps := range [][]string{nil, {}} {
+			if j, err := b.Claim(ctx, server.ClaimOptions{AgentID: "agent-empty", Deployments: deps}); !errors.Is(err, server.ErrNoJobs) {
+				t.Fatalf("Claim with deployments=%v: got job=%v err=%v, want ErrNoJobs", deps, j, err)
+			}
+		}
+		// The job is still claimable by an agent that does manage db1.
+		if _, err := b.Claim(ctx, server.ClaimOptions{AgentID: "agent-1", Deployments: []string{"db1"}}); err != nil {
+			t.Fatalf("Claim by db1 agent after refused empty claim: %v", err)
+		}
+	})
+
 	t.Run("FullLifecycle", func(t *testing.T) {
 		b := factory(t)
 		ctx := context.Background()

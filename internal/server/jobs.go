@@ -121,9 +121,17 @@ type ListOptions struct {
 
 // ClaimOptions tunes Claim.
 type ClaimOptions struct {
-	AgentID     string
+	AgentID string
+	// Deployments is the set of deployment names the claiming agent
+	// manages. It is an allowlist: an EMPTY set matches NOTHING (the
+	// claim returns ErrNoJobs). An agent that declares no deployments
+	// has nothing it can back up or restore, so "empty = any" would
+	// only let a misconfigured agent drain -- and fail -- every
+	// deployment's queue.
 	Deployments []string
-	Kinds       []JobKind
+	// Kinds filters by job kind. Empty matches every kind: agents that
+	// predate kind advertisement send none and still run backups.
+	Kinds []JobKind
 
 	// MaxConcurrent caps how many jobs may be in JobRunning state at
 	// once. A claim is refused with ErrNoJobs once the running count
