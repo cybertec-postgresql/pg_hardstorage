@@ -21,8 +21,10 @@ tags:
 
 - An understanding of which outbound endpoints your
   deployment actually uses (LLM provider, OTLP collector,
-  Slack/Jira/PagerDuty sinks, control plane, storage
-  backends if HTTP-based).
+  Slack/Jira/PagerDuty sinks, the `email` sink's SMTP relay,
+  the `syslog` sink's collector, control plane, storage
+  backends if HTTP-based). The `cef` sink writes only local
+  files and is not gated.
 - The list of in-perimeter FQDNs that resolve outside
   RFC1918 (split-horizon DNS, private VPC endpoints with
   routable hostnames).
