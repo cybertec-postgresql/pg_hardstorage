@@ -65,8 +65,9 @@ func newKMSRotateCmd() *cobra.Command {
 	c := &cobra.Command{
 		Use:   "rotate",
 		Short: "Re-wrap every encrypted backup's DEK with a new KEK",
-		Long: `Walk every committed (non-tombstoned) backup manifest in the
-repo. For each manifest wrapped with --old-kek-ref:
+		Long: `Walk every committed backup manifest in the repo — soft-deleted
+(tombstoned) ones included, since undelete can still resurrect them —
+and every WAL segment manifest. For each one wrapped with --old-kek-ref:
 
   1. Decrypt the wrapped DEK using the bytes at --old-kek-file.
   2. Re-wrap the DEK using the bytes at --new-kek-file.
@@ -76,6 +77,13 @@ repo. For each manifest wrapped with --old-kek-ref:
      unchanged).
   5. Atomically rewrite the manifest at its repo key (and the
      replica copy if present).
+
+WAL segment manifests (wal/<deployment>/<timeline>/<segment>.json)
+carry their own wrapped DEK, which wal fetch unwraps during PITR, so
+they are rewrapped the same way (they are unsigned; steps 4 and the
+replica do not apply). A segment the backend refuses to overwrite
+(WORM lock) is reported as a failure: the old KEK is then still
+needed for it.
 
 Chunks are NOT re-encrypted. Per-chunk keys are derived via HKDF
 from the (unchanged) BDEK; rewrapping the DEK leaves every chunk's
@@ -93,8 +101,11 @@ rotated (their KEKRef == --new-kek-ref) are counted as
 'already_rotated' and skipped.
 
 Default mode is dry-run; pass --apply to actually rewrite. With
---apply, one kms.rotate audit event is emitted per rotated
-manifest.`,
+--apply, one kms.rotate audit event is emitted per run.
+
+Exits non-zero whenever anything still depends on the old KEK — a
+failed manifest, replica or WAL segment — in dry-run too, so a plan
+that cannot complete never reads as clean.`,
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return runKMSRotate(cmd, kmsRotateFlags{
@@ -201,7 +212,7 @@ func runKMSRotate(cmd *cobra.Command, f kmsRotateFlags) error {
 	// here don't change the verdict — the JSON result already
 	// carries the per-key detail, and the audit chain's job is
 	// the longitudinal "when did we rotate" record.
-	if f.apply && res.Rotated > 0 {
+	if f.apply && (res.Rotated > 0 || res.WALRotated > 0) {
 		emitKMSRotateAudits(cmd.Context(), sp, repoMeta, f, res)
 	}
 
@@ -220,12 +231,23 @@ func runKMSRotate(cmd *cobra.Command, f kmsRotateFlags) error {
 	// retired" verdict, inviting exactly that data loss. Re-running is now
 	// idempotent (it heals stale replicas), so the operator re-runs until
 	// this exits clean BEFORE retiring the old KEK.
-	if f.apply && (res.Failed > 0 || res.ReplicaFailures > 0) {
+	if f.apply && !res.Complete() {
 		return output.NewError("kms.rotate_incomplete",
-			fmt.Sprintf("kms rotate: rotation INCOMPLETE — failed=%d replica_failures=%d; the old KEK MUST be kept (some manifest copies still hold it). Re-run until this exits clean.",
-				res.Failed, res.ReplicaFailures)).
+			fmt.Sprintf("kms rotate: rotation INCOMPLETE — failed=%d replica_failures=%d wal_failed=%d; the old KEK MUST be kept (some manifest copies or WAL segments still hold it). Re-run until this exits clean.",
+				res.Failed, res.ReplicaFailures, res.WALFailed)).
 			WithSuggestion(&output.Suggestion{
-				Human: "re-run `kms rotate --apply` with the same args — it is idempotent and now re-syncs replica copies that a prior run left on the old KEK. Only after a clean (exit 0) run, with replica_failures=0, is it safe to retire the old KEK.",
+				Human: "re-run `kms rotate --apply` with the same args — it is idempotent and now re-syncs replica copies and WAL segments that a prior run left on the old KEK. Only after a clean (exit 0) run, with failed=replica_failures=wal_failed=0, is it safe to retire the old KEK. A WAL segment the backend refuses to overwrite (WORM lock) needs the old KEK until it ages out of retention.",
+			})
+	}
+	// A dry-run whose plan already contains failures used to exit 0,
+	// so a scripted "preview, then apply if clean" pipeline went ahead
+	// with a rotation that could never finish.
+	if !f.apply && !res.Complete() {
+		return output.NewError("kms.rotate_plan_failed",
+			fmt.Sprintf("kms rotate: dry-run plan has failures — failed=%d wal_failed=%d; --apply would leave the rotation incomplete",
+				res.Failed, res.WALFailed)).
+			WithSuggestion(&output.Suggestion{
+				Human: "inspect `failures` in the JSON body: a wrong --old-kek-file, an unreadable/unverifiable manifest, or a corrupt WAL segment manifest. Fix those before --apply.",
 			})
 	}
 	return nil
@@ -269,6 +291,11 @@ func emitKMSRotateAudits(ctx context.Context, sp storage.StoragePlugin, repoMeta
 			"skipped_different_kek": res.SkippedDifferentKEK,
 			"failed":                res.Failed,
 			"replica_failures":      res.ReplicaFailures,
+			"tombstoned_rotated":    res.TombstonedRotated,
+			"wal_considered":        res.WALConsidered,
+			"wal_rotated":           res.WALRotated,
+			"wal_already_rotated":   res.WALAlreadyRotated,
+			"wal_failed":            res.WALFailed,
 			"duration_ms":           res.DurationMS,
 		},
 	})
@@ -308,25 +335,37 @@ func (b kmsRotateBody) WriteText(w io.Writer) error {
 	if b.Failed > 0 {
 		fmt.Fprintf(bw, "  ✗ Failed:              %d\n", b.Failed)
 	}
+	if b.TombstonedRotated > 0 {
+		fmt.Fprintf(bw, "  (of which soft-deleted: %d)\n", b.TombstonedRotated)
+	}
 	if b.ReplicaFailures > 0 {
 		fmt.Fprintf(bw, "  ⚠ Replica failures:   %d (primary OK; replica copy needs `repair manifest`)\n", b.ReplicaFailures)
 	}
+	fmt.Fprintf(bw, "  WAL segments:         %d considered, %s %d, %d already rotated\n",
+		b.WALConsidered, verb, b.WALRotated, b.WALAlreadyRotated)
+	if b.WALFailed > 0 {
+		fmt.Fprintf(bw, "  ✗ WAL segments failed: %d\n", b.WALFailed)
+	}
 	fmt.Fprintf(bw, "  Duration:             %d ms\n", b.DurationMS)
-	if b.Failed == 0 && b.ReplicaFailures == 0 {
+	if b.Complete() {
 		if b.DryRun {
 			fmt.Fprintln(bw, "  ✓ rotation plan is clean — re-run with --apply to commit")
-		} else if b.Rotated > 0 {
+		} else if b.Rotated > 0 || b.WALRotated > 0 {
 			fmt.Fprintln(bw, "  ✓ rotation clean — old KEK can be retired after the operator's grace window")
 		}
-	} else if b.Failed == 0 && b.ReplicaFailures > 0 {
+	} else if b.Failed == 0 && b.WALFailed == 0 && b.ReplicaFailures > 0 {
 		// Primaries rotated, but some REPLICAS still hold the old KEK —
 		// retiring it now would strand them. Do NOT green-light retirement.
 		fmt.Fprintln(bw, "  ✗ DO NOT retire the old KEK — replica copies still hold it.")
 		fmt.Fprintln(bw, "    Re-run `kms rotate --apply` (it now re-syncs replicas) until replica_failures = 0.")
 	} else {
-		fmt.Fprintln(bw, "  ✗ rotation had failures — see JSON body for per-manifest detail")
+		fmt.Fprintln(bw, "  ✗ rotation had failures — DO NOT retire the old KEK; see JSON body for per-object detail")
 		for _, f := range b.Failures {
-			fmt.Fprintf(bw, "    %s/%s — %s\n", f.Deployment, f.BackupID, f.Err)
+			id := f.BackupID
+			if f.Key != "" {
+				id = f.Key
+			}
+			fmt.Fprintf(bw, "    %s/%s — %s\n", f.Deployment, id, f.Err)
 		}
 	}
 	_, err := io.WriteString(w, strings.TrimRight(bw.String(), "\n"))

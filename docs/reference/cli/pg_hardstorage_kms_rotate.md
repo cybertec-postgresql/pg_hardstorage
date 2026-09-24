@@ -16,8 +16,9 @@ Re-wrap every encrypted backup's DEK with a new KEK
 
 ### Synopsis
 
-Walk every committed (non-tombstoned) backup manifest in the
-repo. For each manifest wrapped with --old-kek-ref:
+Walk every committed backup manifest in the repo — soft-deleted
+(tombstoned) ones included, since undelete can still resurrect them —
+and every WAL segment manifest. For each one wrapped with --old-kek-ref:
 
   1. Decrypt the wrapped DEK using the bytes at --old-kek-file.
   2. Re-wrap the DEK using the bytes at --new-kek-file.
@@ -27,6 +28,13 @@ repo. For each manifest wrapped with --old-kek-ref:
      unchanged).
   5. Atomically rewrite the manifest at its repo key (and the
      replica copy if present).
+
+WAL segment manifests (wal/<deployment>/<timeline>/<segment>.json)
+carry their own wrapped DEK, which wal fetch unwraps during PITR, so
+they are rewrapped the same way (they are unsigned; steps 4 and the
+replica do not apply). A segment the backend refuses to overwrite
+(WORM lock) is reported as a failure: the old KEK is then still
+needed for it.
 
 Chunks are NOT re-encrypted. Per-chunk keys are derived via HKDF
 from the (unchanged) BDEK; rewrapping the DEK leaves every chunk's
@@ -44,8 +52,11 @@ rotated (their KEKRef == --new-kek-ref) are counted as
 'already_rotated' and skipped.
 
 Default mode is dry-run; pass --apply to actually rewrite. With
---apply, one kms.rotate audit event is emitted per rotated
-manifest.
+--apply, one kms.rotate audit event is emitted per run.
+
+Exits non-zero whenever anything still depends on the old KEK — a
+failed manifest, replica or WAL segment — in dry-run too, so a plan
+that cannot complete never reads as clean.
 
 ```
 pg_hardstorage kms rotate [flags]

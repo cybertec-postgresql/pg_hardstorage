@@ -11,7 +11,8 @@ tags:
 # Rotate the KEK
 
 > KEK rotation re-wraps every committed manifest's DEK under
-> a new KEK. **Chunks are not re-encrypted** — per-chunk keys
+> a new KEK — backup manifests (soft-deleted ones included) and
+> every WAL segment manifest. **Chunks are not re-encrypted** — per-chunk keys
 > are derived via HKDF from the (unchanged) BDEK, so rotation
 > is O(manifest count), not O(chunk count).
 
@@ -50,6 +51,7 @@ kms rotate — local://main → local://main-2026-q2
   Considered:           1247
   would rotate:          1184
   Skipped different KEK: 63 (other tenants)
+  WAL segments:         8121 considered, would rotate 8121, 0 already rotated
   Duration:             47200 ms
   ✓ rotation plan is clean — re-run with --apply to commit
 ```
@@ -57,6 +59,11 @@ kms rotate — local://main → local://main-2026-q2
 `Skipped different KEK` (`skipped_different_kek` in the JSON
 body) is the multi-tenant safety: manifests wrapped under a
 different KEK ref are skipped, not failed.
+
+A dry-run whose plan already contains failures (a wrong
+`--old-kek-file`, an unverifiable manifest, a corrupt WAL segment
+manifest) exits 1 with `kms.rotate_plan_failed`, so a scripted
+"preview, then apply" stops before `--apply`.
 
 ### 2. Apply
 
@@ -75,6 +82,7 @@ kms rotate — local://main → local://main-2026-q2
   Considered:           1247
   rotated:               1184
   Skipped different KEK: 63 (other tenants)
+  WAL segments:         8121 considered, rotated 8121, 0 already rotated
   Duration:             47200 ms
   ✓ rotation clean — old KEK can be retired after the operator's grace window
 ```
@@ -85,6 +93,34 @@ mutate the `encryption.kek_ref` and `encryption.wrapped_dek`
 fields, re-sign with the operator's signing keypair (unchanged),
 and atomically replace the manifest at its repo key. The replica
 copy is kept in sync.
+
+**What is rewrapped:**
+
+- every backup manifest wrapped under `--old-kek-ref`,
+  **including soft-deleted (tombstoned) ones** — `backup undelete`
+  can resurrect them until they are purged, so they must stay
+  decryptable after the old KEK is gone (`tombstoned_rotated` in
+  the JSON body);
+- every **WAL segment manifest** (`wal/<deployment>/<timeline>/<segment>.json`).
+  Each carries its own wrapped DEK, which `wal fetch` — the
+  `restore_command` every PITR runs — unwraps per segment. The
+  `wal_considered` / `wal_rotated` / `wal_already_rotated` /
+  `wal_failed` counters report them. On a WORM repo whose backend
+  refuses to overwrite a locked segment manifest, that segment is
+  reported as a failure: keep the old KEK until it ages out of
+  retention;
+- the repository's shared-DEK slot (only after everything above
+  is clean).
+
+`kms rotate --apply` exits 1 with `kms.rotate_incomplete` whenever
+anything still depends on the old KEK (`failed`,
+`replica_failures` or `wal_failed` > 0), and only a clean run
+prints "old KEK can be retired".
+
+Run the rotation in a maintenance window: stop `wal stream` /
+pause `archive_command` first (or re-run the rotation after
+swapping the key — see Resumability), since a segment archived
+under the old key while the pass runs is not in its listing.
 
 ### 3. Swap the active KEK
 
@@ -163,13 +199,15 @@ matching that tenant's references.
 ## Resumability
 
 A rotation interrupted partway through is safely re-runnable
-with the same args. Manifests already rotated (their
-`kek_ref == --new-kek-ref`) are counted as `already_rotated`
-and skipped. Loop until `rotated == 0`:
+with the same args. Manifests and WAL segments already rotated
+(their `kek_ref == --new-kek-ref`, or already wrapped under the
+new key — what a local backup or segment written after you
+swapped `kek.bin` looks like) are counted as `already_rotated` /
+`wal_already_rotated` and skipped. Loop until nothing is left:
 
 ```bash
 while pg_hardstorage kms rotate ... --apply --quiet -o json \
-    | jq '.result.rotated' | grep -qv '^0$'; do :; done
+    | jq '.result.rotated + .result.wal_rotated' | grep -qv '^0$'; do :; done
 ```
 
 ## Cloud-KMS rotation
@@ -197,7 +235,8 @@ Transit / PKCS#11), there are two flavours of rotation:
 
 With `--apply`, one `kms.rotate` event is emitted to the
 [audit chain](../../operations/operator-guide.md#8-audit-log)
-per rotated manifest. The chain remains consistent across
+per run, carrying the aggregate counters (WAL counters
+included). The chain remains consistent across
 rotation; nothing about the audit log changes.
 
 ## Troubleshooting

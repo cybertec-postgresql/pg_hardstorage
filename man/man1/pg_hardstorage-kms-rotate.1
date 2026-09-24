@@ -13,8 +13,9 @@ pg_hardstorage-kms-rotate - Re-wrap every encrypted backup's DEK with a new KEK
 
 .SH DESCRIPTION
 .PP
-Walk every committed (non-tombstoned) backup manifest in the
-repo. For each manifest wrapped with --old-kek-ref:
+Walk every committed backup manifest in the repo — soft-deleted
+(tombstoned) ones included, since undelete can still resurrect them —
+and every WAL segment manifest. For each one wrapped with --old-kek-ref:
 
 .RS
 .IP "  1." 5
@@ -32,6 +33,14 @@ Atomically rewrite the manifest at its repo key (and the
  replica copy if present).
 
 .RE
+
+.PP
+WAL segment manifests (wal///\&.json)
+carry their own wrapped DEK, which wal fetch unwraps during PITR, so
+they are rewrapped the same way (they are unsigned; steps 4 and the
+replica do not apply). A segment the backend refuses to overwrite
+(WORM lock) is reported as a failure: the old KEK is then still
+needed for it.
 
 .PP
 Chunks are NOT re-encrypted. Per-chunk keys are derived via HKDF
@@ -53,8 +62,12 @@ rotated (their KEKRef == --new-kek-ref) are counted as
 
 .PP
 Default mode is dry-run; pass --apply to actually rewrite. With
---apply, one kms.rotate audit event is emitted per rotated
-manifest.
+--apply, one kms.rotate audit event is emitted per run.
+
+.PP
+Exits non-zero whenever anything still depends on the old KEK — a
+failed manifest, replica or WAL segment — in dry-run too, so a plan
+that cannot complete never reads as clean.
 
 
 .SH OPTIONS
