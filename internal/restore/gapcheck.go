@@ -431,7 +431,7 @@ func checkOneGap(target, stop pglogrepl.LSN, stopKnown bool, startStr, endStr st
 		fmt.Sprintf("restore: target_lsn %s %s a known WAL gap (%s..%s, %d bytes, detected %s on slot %q TLI %d, source=%s) — this target is unreachable from this backup",
 			target.String(), where, startStr, endStr, bytes, detectedAt, slotName, tli, source)).
 		WithSuggestion(&output.Suggestion{
-			Human: "the agent recorded a WAL gap that replay to this target would need to cross. Use `pg_hardstorage wal gaps <deployment>` to inspect the full record history. Either pick a target LSN BELOW gap_start (keeps everything before the gap; gap_start itself is refused because a WAL record can span the segment boundary into the missing range), or, to recover to or past gap_end, restore a backup whose stop_lsn is at or after gap_end (see `pg_hardstorage list <deployment>`): no backup taken before the gap can replay across it. The underlying slot issue is investigated via `pg_hardstorage repair slot <deployment>`.",
+			Human:   "the agent recorded a WAL gap that replay to this target would need to cross. Use `pg_hardstorage wal gaps <deployment>` to inspect the full record history. Either pick a target LSN BELOW gap_start (keeps everything before the gap; gap_start itself is refused because a WAL record can span the segment boundary into the missing range), or, to recover to or past gap_end, restore a backup whose stop_lsn is at or after gap_end (see `pg_hardstorage list <deployment>`): no backup taken before the gap can replay across it. The underlying slot issue is investigated via `pg_hardstorage repair slot <deployment>`.",
 			Command: "pg_hardstorage wal gaps " + deployment,
 			DocURL:  "https://docs.pghardstorage.org/runbooks/wal-gap-detected",
 		})
