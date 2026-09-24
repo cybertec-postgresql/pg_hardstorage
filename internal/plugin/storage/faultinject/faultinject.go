@@ -369,12 +369,22 @@ func (m *Middleware) FreeSpace(ctx context.Context) (storage.FreeSpaceInfo, erro
 	return storage.FreeSpaceOf(ctx, m.inner)
 }
 
+// ReapStaging forwards the staging reaper so `repo gc` sees through
+// the wrapper to a backend that has staging temps to reap.
+func (m *Middleware) ReapStaging(ctx context.Context, olderThan time.Duration) (storage.ReapStats, error) {
+	if r, ok := m.inner.(storage.StagingReapAware); ok {
+		return r.ReapStaging(ctx, olderThan)
+	}
+	return storage.ReapStats{Unsupported: true}, nil
+}
+
 // Compile-time assertions that we satisfy StoragePlugin and forward
 // every optional capability interface.
 var (
-	_ storage.StoragePlugin  = (*Middleware)(nil)
-	_ storage.RegionAware    = (*Middleware)(nil)
-	_ storage.FreeSpaceAware = (*Middleware)(nil)
+	_ storage.StoragePlugin    = (*Middleware)(nil)
+	_ storage.RegionAware      = (*Middleware)(nil)
+	_ storage.FreeSpaceAware   = (*Middleware)(nil)
+	_ storage.StagingReapAware = (*Middleware)(nil)
 )
 
 // ErrInjected is the canonical sentinel an operator can use as a

@@ -65,12 +65,14 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"net/http"
 	"net/url"
 	"strings"
 	"sync"
 
 	vaultapi "github.com/hashicorp/vault/api"
 
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/airgap"
 	stdkms "github.com/cybertec-postgresql/pg_hardstorage/internal/kms"
 )
 
@@ -118,6 +120,12 @@ func builder(ctx context.Context, kekRef string, cfg map[string]any) (stdkms.Pro
 	addr, mount, name, err := parseKEKRef(kekRef)
 	if err != nil {
 		return nil, err
+	}
+	// Air-gap gate, as aws-kms and azblob do: under `airgapped: strict`
+	// the Vault address must be loopback/private or allowlisted. Without
+	// it the KEKRef's host was dialled unchecked.
+	if err := airgap.Default().EndpointAllowed(addr); err != nil {
+		return nil, fmt.Errorf("vault-transit: %w", err)
 	}
 
 	apiCfg := vaultapi.DefaultConfig()
@@ -310,13 +318,30 @@ func (p *Provider) UnwrapDEK(ctx context.Context, wrapped []byte) ([]byte, error
 	}
 	pt, err := p.client.Decrypt(ctx, p.mount, p.keyName, string(wrapped))
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", stdkms.ErrUnwrap, err)
+		return nil, stdkms.UnwrapFailure(ctx, classifyVault(err), "vault-transit: Decrypt", err)
 	}
 	dek, err := base64.StdEncoding.DecodeString(pt)
 	if err != nil {
 		return nil, fmt.Errorf("%w: decode plaintext: %v", stdkms.ErrUnwrap, err)
 	}
 	return dek, nil
+}
+
+// classifyVault maps a Vault API error onto the kms error classes by
+// HTTP status: 429 (rate limit) and 5xx (sealed, standby, internal)
+// are transient, 401/403 are a token / policy problem. 400 — which is
+// how Transit answers undecryptable ciphertext — stays ErrUnwrap.
+func classifyVault(err error) error {
+	var re *vaultapi.ResponseError
+	if errors.As(err, &re) {
+		switch s := re.StatusCode; {
+		case s == http.StatusTooManyRequests || s >= 500:
+			return stdkms.ErrUnavailable
+		case s == http.StatusUnauthorized || s == http.StatusForbidden:
+			return stdkms.ErrAccessDenied
+		}
+	}
+	return stdkms.ErrUnwrap
 }
 
 // Shred implements kms.Provider.  Calls Vault's
@@ -390,30 +415,30 @@ func (p *Provider) assertOpen() error {
 // key name, everything before it is the mount.
 func parseKEKRef(kekRef string) (addr, mount, name string, err error) {
 	if !strings.HasPrefix(kekRef, Scheme+"://") {
-		return "", "", "", fmt.Errorf("vault-transit: KEKRef %q does not have the %q:// prefix", kekRef, Scheme)
+		return "", "", "", fmt.Errorf("vault-transit: KEKRef %q does not have the %q:// prefix", stdkms.RedactKEKRef(kekRef), Scheme)
 	}
 	rest := strings.TrimPrefix(kekRef, Scheme+"://")
 	if rest == "" {
-		return "", "", "", fmt.Errorf("vault-transit: empty resource in KEKRef %q", kekRef)
+		return "", "", "", fmt.Errorf("vault-transit: empty resource in KEKRef %q", stdkms.RedactKEKRef(kekRef))
 	}
 	// First segment is host[:port]; the rest is mount/.../name.
 	slash := strings.IndexByte(rest, '/')
 	if slash < 0 {
-		return "", "", "", fmt.Errorf("vault-transit: KEKRef %q must include /<mount>/<key>", kekRef)
+		return "", "", "", fmt.Errorf("vault-transit: KEKRef %q must include /<mount>/<key>", stdkms.RedactKEKRef(kekRef))
 	}
 	host := rest[:slash]
 	pathPart := rest[slash+1:]
 	if host == "" {
-		return "", "", "", fmt.Errorf("vault-transit: empty host in KEKRef %q", kekRef)
+		return "", "", "", fmt.Errorf("vault-transit: empty host in KEKRef %q", stdkms.RedactKEKRef(kekRef))
 	}
 
 	parts := strings.Split(pathPart, "/")
 	if len(parts) < 2 {
-		return "", "", "", fmt.Errorf("vault-transit: KEKRef %q must include both <mount> and <key>", kekRef)
+		return "", "", "", fmt.Errorf("vault-transit: KEKRef %q must include both <mount> and <key>", stdkms.RedactKEKRef(kekRef))
 	}
 	for _, seg := range parts {
 		if seg == "" {
-			return "", "", "", fmt.Errorf("vault-transit: KEKRef %q contains empty path segment", kekRef)
+			return "", "", "", fmt.Errorf("vault-transit: KEKRef %q contains empty path segment", stdkms.RedactKEKRef(kekRef))
 		}
 	}
 	name = parts[len(parts)-1]

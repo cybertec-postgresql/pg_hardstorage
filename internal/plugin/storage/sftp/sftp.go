@@ -31,9 +31,14 @@
 //
 //  1. Stat the destination — if present, return ErrAlreadyExists.
 //  2. Write to "<dst>.hstmp-<rand>".
-//  3. fsync (via Posix_rename if the server supports it; else
-//     best-effort).
-//  4. Rename `<tmp>` -> `<dst>`.
+//  3. fsync the temp via fsync@openssh.com when the server offers
+//     it (OpenSSH >= 6.5); a server without it cannot be asked to.
+//  4. Commit: hardlink@openssh.com (IfNotExists) or
+//     posix-rename@openssh.com (overwrite, atomic replace).
+//
+// The directory entry itself is not fsynced — SFTP has no way to —
+// so Capabilities reports neither InlineDurable nor
+// DurabilityBarrier.
 //
 // The TOCTOU window between the stat and the write is
 // inherent to SFTP and the same posture rsync / scp ship
@@ -76,8 +81,9 @@ func init() {
 
 // Plugin is the SSH/SFTP-backed StoragePlugin.
 type Plugin struct {
-	// NopBarrier: the SFTP plugin does not issue the optional
-	// fsync@openssh.com extension, so Barrier is a no-op.
+	// NopBarrier: Put fsyncs each staged file itself
+	// (fsync@openssh.com, when offered), and SFTP cannot fsync a
+	// directory, so there is nothing for Barrier to add.
 	// Capabilities reports neither InlineDurable nor
 	// DurabilityBarrier — callers needing durability use
 	// DurabilityInline (the default) here.
@@ -370,7 +376,18 @@ func (p *Plugin) Put(ctx context.Context, key string, r io.Reader, opts storage.
 		return storage.PutResult{}, fmt.Errorf("sftp: create tmp %s: %w", tmp, err)
 	}
 	written, copyErr := io.Copy(f, r)
+	var syncErr error
+	if copyErr == nil {
+		// Flush the staged bytes before anything publishes them: a
+		// rename/link of an un-synced file can survive a server crash
+		// as a truncated object at the real key.
+		syncErr = syncStaged(cli, f)
+	}
 	closeErr := f.Close()
+	if syncErr != nil {
+		_ = cli.Remove(tmp)
+		return storage.PutResult{}, fmt.Errorf("sftp: fsync %s: %w", tmp, syncErr)
+	}
 	if copyErr != nil {
 		_ = cli.Remove(tmp)
 		return storage.PutResult{}, fmt.Errorf("sftp: copy to %s: %w", tmp, copyErr)
@@ -409,9 +426,16 @@ func (p *Plugin) Put(ctx context.Context, key string, r io.Reader, opts storage.
 			_ = cli.Remove(tmp)
 			return storage.PutResult{}, storage.ErrAlreadyExists
 		}
-	} else {
-		// last-writer-wins semantics: remove dst if present so
-		// rename succeeds (sftp Rename semantics vary).
+	} else if _, posix := cli.HasExtension("posix-rename@openssh.com"); !posix {
+		// Last-writer-wins. posix-rename@openssh.com (below, via
+		// atomicRename) REPLACES the destination atomically, so the
+		// key is never absent. Only a server without it needs the
+		// destination removed first — plain SFTP Rename refuses an
+		// existing target — and there the guarantee is weaker: the
+		// key is briefly missing (a racer can create it in the gap
+		// and then be overwritten), and a connection lost in the gap
+		// loses the object. Removing unconditionally used to impose
+		// that on every server.
 		_ = cli.Remove(full)
 	}
 	if err := p.atomicRename(cli, tmp, full); err != nil {
@@ -419,6 +443,19 @@ func (p *Plugin) Put(ctx context.Context, key string, r io.Reader, opts storage.
 		return storage.PutResult{}, fmt.Errorf("sftp: rename %s -> %s: %w", tmp, full, err)
 	}
 	return storage.PutResult{Key: key, Size: written}, nil
+}
+
+// syncStaged flushes a staged file to stable storage via the
+// fsync@openssh.com extension (every OpenSSH server since 6.5). A
+// server without it cannot be asked to fsync at all; the Put then
+// proceeds without, and Capabilities keeps InlineDurable false. A
+// package variable so tests can observe the call — the in-process
+// test server does not implement the extension.
+var syncStaged = func(cli *sftp.Client, f *sftp.File) error {
+	if _, ok := cli.HasExtension("fsync@openssh.com"); !ok {
+		return nil
+	}
+	return f.Sync()
 }
 
 // isAlreadyExists detects the SFTP "file already exists"
@@ -706,6 +743,42 @@ func randomSuffix() string {
 // ".hstmp-" marker so the two can never collide.
 func isStagingName(name string) bool {
 	return strings.Contains(name, ".hstmp-")
+}
+
+// ReapStaging implements storage.StagingReapAware: it removes
+// "<key>.hstmp-<rand>" temps under the repo root last modified more
+// than olderThan ago — left by a Put whose process or connection died
+// between the upload and the commit. List hides these names, so
+// nothing else ever finds them.
+func (p *Plugin) ReapStaging(ctx context.Context, olderThan time.Duration) (storage.ReapStats, error) {
+	var st storage.ReapStats
+	cli, err := p.conn()
+	if err != nil {
+		return st, err
+	}
+	cutoff := time.Now().Add(-olderThan)
+	w := cli.Walk(p.root)
+	for w.Step() {
+		if err := ctx.Err(); err != nil {
+			return st, err
+		}
+		if werr := w.Err(); werr != nil {
+			if isNotExist(werr) {
+				continue
+			}
+			return st, fmt.Errorf("sftp: reap staging walk: %w", werr)
+		}
+		fi := w.Stat()
+		if fi.IsDir() || !isStagingName(fi.Name()) || !fi.ModTime().Before(cutoff) {
+			continue
+		}
+		if rerr := cli.Remove(w.Path()); rerr != nil && !isNotExist(rerr) {
+			return st, fmt.Errorf("sftp: reap staging %s: %w", w.Path(), rerr)
+		}
+		st.Removed++
+		st.Bytes += fi.Size()
+	}
+	return st, nil
 }
 
 // Sanity import used to reference the net package symbol via

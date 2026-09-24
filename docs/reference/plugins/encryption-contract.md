@@ -119,16 +119,22 @@ without bringing PKCS#11 into the binary.
 Decrypts a previously-wrapped DEK using the cloud-side
 KEK.  Returns the 32-byte plaintext DEK.
 
-Authentication failure (wrong KEK, deleted KEK, network
-auth refused) surfaces as **`ErrUnwrap`**:
+Failures are classified, and the provider's typed cause is
+always wrapped with `%w` so `errors.As` still reaches it:
+
+| Class | Meaning | Sentinel | Restore / verify code |
+| --- | --- | --- | --- |
+| Genuine unwrap failure | wrong / disabled / deleted KEK, tampered or foreign ciphertext | `kms.ErrUnwrap` | `*.kek_mismatch` |
+| Transient | throttling, 429, 5xx, dependency timeout | `kms.ErrUnavailable` (`kms.IsUnreachable` reports true) | `kms.unreachable` (exit 8) |
+| Credentials | AccessDenied / 401 / 403 / expired token | `kms.ErrAccessDenied` | `*.kek_resolve_failed` |
+| Network | DNS, refused, reset, timeout | the transport error itself | `kms.unreachable` (exit 8) |
+| Cancelled | the caller's context ended | `context.Canceled` / `DeadlineExceeded` | not a key problem |
+
+Providers build the error with the shared helper:
 
 ```go
-return nil, fmt.Errorf("aws-kms: %w: %s", kms.ErrUnwrap, awsErr)
+return nil, kms.UnwrapFailure(ctx, classify(err), "aws-kms: Decrypt", err)
 ```
-
-Callers `errors.Is(err, kms.ErrUnwrap)` to distinguish
-"wrong key" from "network error" from "key scheduled for
-deletion".
 
 ### `Shred(ctx) error`
 

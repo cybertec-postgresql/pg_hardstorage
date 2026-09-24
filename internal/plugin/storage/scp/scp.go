@@ -101,17 +101,28 @@ func init() {
 
 // Plugin is the SSH-exec-backed StoragePlugin.
 type Plugin struct {
-	// NopBarrier: SCP has no remote-fsync mechanism, so Barrier is
-	// a no-op. Capabilities reports neither InlineDurable nor
-	// DurabilityBarrier — callers needing durability use
-	// DurabilityInline (the default) here.
+	// NopBarrier: Put syncs each staged file and its directory
+	// itself (remote `sync`), so there is nothing deferred for
+	// Barrier to flush. Capabilities still reports neither
+	// InlineDurable nor DurabilityBarrier: directories created by
+	// `mkdir -p` are not synced in their parents, and `sync` on a
+	// remote without per-file support degrades to a global flush
+	// whose completion POSIX does not promise.
 	storage.NopBarrier
 
 	root string
 
-	mu     sync.Mutex
-	ssh    *ssh.Client
-	closed bool
+	// Dial parameters, kept for reconnection (keepalive.go).
+	host   string
+	cfgssh *ssh.ClientConfig
+
+	mu         sync.Mutex
+	ssh        *ssh.Client
+	kaStop     chan struct{}
+	gen        uint64 // connection generation; teardown of gen N must not kill gen N+1
+	dead       bool   // set when the transport is found dead; cleared by redial
+	lastRedial time.Time
+	closed     bool
 }
 
 // Name implements storage.StoragePlugin.
@@ -210,13 +221,12 @@ func (p *Plugin) Open(_ context.Context, cfg storage.StorageConfig) error {
 		HostKeyCallback: hk,
 		Timeout:         15 * time.Second,
 	}
-	conn, err := ssh.Dial("tcp", host, cfgssh)
-	if err != nil {
-		return fmt.Errorf("scp: dial %s: %w", host, err)
-	}
-	p.ssh = conn
+	p.host = host
+	p.cfgssh = cfgssh
 	p.root = root
-	return nil
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.dialLocked()
 }
 
 // Close idempotently tears down the SSH client.
@@ -227,6 +237,10 @@ func (p *Plugin) Close() error {
 		return nil
 	}
 	p.closed = true
+	if p.kaStop != nil {
+		close(p.kaStop)
+		p.kaStop = nil
+	}
 	if p.ssh != nil {
 		err := p.ssh.Close()
 		p.ssh = nil
@@ -294,7 +308,10 @@ func (p *Plugin) Put(ctx context.Context, key string, r io.Reader, opts storage.
 	}
 
 	tmp := full + ".hstmp-" + randomSuffix()
-	written, err := p.uploadVia(ctx, "cat > "+shellQuote(tmp), r)
+	// Flush the staged bytes before anything publishes them: a link or
+	// rename of an un-synced file can survive a crash as a truncated
+	// object at the real key.
+	written, err := p.uploadVia(ctx, "cat > "+shellQuote(tmp)+" && "+syncCommand(tmp), r)
 	if err != nil {
 		_, _ = p.runShell(ctx, "rm -f "+shellQuote(tmp))
 		return storage.PutResult{}, fmt.Errorf("scp: write tmp %s: %w", tmp, err)
@@ -314,7 +331,8 @@ func (p *Plugin) Put(ctx context.Context, key string, r io.Reader, opts storage.
 		// (issue #31's fix), the backup lease, audit-chain event
 		// slots — it silently broke the contract this backend
 		// advertises via ConditionalPut (concurrency audit).
-		if _, lerr := p.runShell(ctx, "ln -T "+shellQuote(tmp)+" "+shellQuote(full)); lerr != nil {
+		if _, lerr := p.runShell(ctx, "ln -T "+shellQuote(tmp)+" "+shellQuote(full)+
+			" && "+syncCommand(path.Dir(full))); lerr != nil {
 			_, _ = p.runShell(ctx, "rm -f "+shellQuote(tmp))
 			if strings.Contains(lerr.Error(), "File exists") {
 				return storage.PutResult{}, storage.ErrAlreadyExists
@@ -327,7 +345,8 @@ func (p *Plugin) Put(ctx context.Context, key string, r io.Reader, opts storage.
 
 	// `mv -T` (rename(2)) is atomic on the same filesystem — correct
 	// for the last-writer-wins (IfNotExists=false) path only.
-	if _, err := p.runShell(ctx, "mv -T "+shellQuote(tmp)+" "+shellQuote(full)); err != nil {
+	if _, err := p.runShell(ctx, "mv -T "+shellQuote(tmp)+" "+shellQuote(full)+
+		" && "+syncCommand(path.Dir(full))); err != nil {
 		_, _ = p.runShell(ctx, "rm -f "+shellQuote(tmp))
 		return storage.PutResult{}, fmt.Errorf("scp: mv %s -> %s: %w", tmp, full, err)
 	}
@@ -526,7 +545,8 @@ func (p *Plugin) RenameIfNotExists(ctx context.Context, src, dst string) error {
 	if err := p.mkdirAll(ctx, path.Dir(dstFull)); err != nil {
 		return err
 	}
-	if _, lerr := p.runShell(ctx, "ln -T "+shellQuote(srcFull)+" "+shellQuote(dstFull)); lerr != nil {
+	if _, lerr := p.runShell(ctx, "ln -T "+shellQuote(srcFull)+" "+shellQuote(dstFull)+
+		" && "+syncCommand(path.Dir(dstFull))); lerr != nil {
 		if strings.Contains(lerr.Error(), "File exists") {
 			return storage.ErrAlreadyExists
 		}
@@ -534,6 +554,43 @@ func (p *Plugin) RenameIfNotExists(ctx context.Context, src, dst string) error {
 	}
 	_, _ = p.runShell(ctx, "rm -f "+shellQuote(srcFull))
 	return nil
+}
+
+// ReapStaging implements storage.StagingReapAware: it removes
+// "<key>.hstmp-<rand>" temps under the repo root last modified more
+// than olderThan ago — left by a Put whose process or connection died
+// between the upload and the commit. List hides these names, so
+// nothing else ever finds them.
+func (p *Plugin) ReapStaging(ctx context.Context, olderThan time.Duration) (storage.ReapStats, error) {
+	var st storage.ReapStats
+	if err := p.assertOpen(); err != nil {
+		return st, err
+	}
+	out, err := p.runShell(ctx, reapStagingCommand(p.root, olderThan))
+	// Count what was removed even when find failed part way.
+	for _, line := range strings.Split(out, "\n") {
+		n, perr := strconv.ParseInt(strings.TrimSpace(line), 10, 64)
+		if perr != nil {
+			continue
+		}
+		st.Removed++
+		st.Bytes += n
+	}
+	if err != nil {
+		return st, fmt.Errorf("scp: reap staging: %w", err)
+	}
+	return st, nil
+}
+
+// reapStagingCommand prints the size of, then deletes, every staging
+// temp under root older than olderThan (rounded up to whole minutes:
+// -mmin +N is "more than N minutes").
+func reapStagingCommand(root string, olderThan time.Duration) string {
+	mins := int64((olderThan + time.Minute - 1) / time.Minute)
+	q := shellQuote(root)
+	return "if [ ! -e " + q + " ]; then exit 0; fi; " +
+		"find " + q + " -type f -name '*.hstmp-*' -mmin +" + strconv.FormatInt(mins, 10) +
+		` -printf '%s\n' -delete`
 }
 
 // SetRetention is unsupported on plain SSH-exec — there's no
@@ -560,14 +617,31 @@ func (p *Plugin) SetRetention(ctx context.Context, key string, until time.Time, 
 // failure — retrying after a short jittered pause keeps the plugin
 // correct against DEFAULT sshd configs (the contract suite's
 // ParallelPuts runs against one).
+//
+// A session that cannot be opened because the TRANSPORT is gone
+// (keepalive teardown, peer restart, reset) marks the connection dead
+// and is retried once over a fresh dial — see keepalive.go.
 func (p *Plugin) newSession() (*ssh.Session, error) {
 	var lastErr error
+	redialed := false
 	for attempt := 0; attempt < 5; attempt++ {
-		sess, err := p.ssh.NewSession()
+		cli, gen, cerr := p.conn()
+		if cerr != nil {
+			return nil, cerr
+		}
+		sess, err := cli.NewSession()
 		if err == nil {
 			return sess, nil
 		}
 		lastErr = err
+		if isTransportGone(err) {
+			p.markDead(gen)
+			if redialed {
+				return nil, err
+			}
+			redialed = true
+			continue
+		}
 		msg := err.Error()
 		if !strings.Contains(msg, "rejected") && !strings.Contains(msg, "open failed") {
 			return nil, err
@@ -670,7 +744,14 @@ func (p *Plugin) streamRead(ctx context.Context, command string, classify func(e
 		_ = sess.Close()
 		return nil, fmt.Errorf("scp: start command: %w", err)
 	}
-	return &sessionReader{sess: sess, stdout: stdout, ctx: ctx, classify: classify}, nil
+	sr := &sessionReader{sess: sess, stdout: stdout, ctx: ctx, classify: classify}
+	// A Read blocked in the SSH stdout pipe does not look at ctx; tear
+	// the session down on cancellation so the blocked Read returns.
+	sr.stopCancel = context.AfterFunc(ctx, func() {
+		_ = sess.Signal(ssh.SIGTERM)
+		_ = sess.Close()
+	})
+	return sr, nil
 }
 
 // sessionReader pairs an ssh.Session with its stdout pipe so
@@ -688,16 +769,25 @@ type sessionReader struct {
 	// classify turns the remote command's failure into a typed storage
 	// error the caller can act on. Optional.
 	classify func(error) error
+
+	// stopCancel detaches the ctx-cancellation teardown (streamRead).
+	stopCancel func() bool
 }
 
-// Read implements io.Reader. Returns the context's error before
-// reading so a cancellation surfaces promptly rather than waiting
-// for the SSH stream to time out.
+// Read implements io.Reader. A cancelled context surfaces as its own
+// error: before reading, and after a read that the cancellation
+// interrupted (streamRead closes the session on cancel, which is what
+// unblocks a Read parked in the SSH pipe).
 func (s *sessionReader) Read(p []byte) (int, error) {
 	if err := s.ctx.Err(); err != nil {
 		return 0, err
 	}
 	n, err := s.stdout.Read(p)
+	if err != nil {
+		if cerr := s.ctx.Err(); cerr != nil {
+			return n, cerr
+		}
+	}
 	if !errors.Is(err, io.EOF) {
 		return n, err
 	}
@@ -744,6 +834,9 @@ func (s *sessionReader) reap() {
 // Close implements io.Closer. Waits on the remote command first so
 // the exit status surfaces, then tears down the SSH session.
 func (s *sessionReader) Close() error {
+	if s.stopCancel != nil {
+		s.stopCancel()
+	}
 	// Reap the exit status if Read has not already (a caller that
 	// closes early, before EOF, still gets the failure reported).
 	s.reap()
@@ -806,7 +899,7 @@ func (p *Plugin) mkdirAll(ctx context.Context, dir string) error {
 func (p *Plugin) assertOpen() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.closed || p.ssh == nil {
+	if p.closed || p.cfgssh == nil {
 		return errors.New("scp: plugin not open")
 	}
 	return nil
@@ -827,6 +920,14 @@ func shellQuote(s string) string {
 		return "''"
 	}
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// syncCommand flushes one path (a staged file, or the directory whose
+// entry a commit just changed) to stable storage. GNU coreutils >= 8.24
+// and BusyBox sync a named file; an older sync that refuses arguments
+// falls back to a global flush rather than to no flush at all.
+func syncCommand(p string) string {
+	return "{ sync -- " + shellQuote(p) + " 2>/dev/null || sync; }"
 }
 
 // statNotFoundMarker is printed by statCommand when the path is

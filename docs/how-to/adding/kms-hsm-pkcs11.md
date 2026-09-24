@@ -145,6 +145,16 @@ pg_hardstorage kms verify --repo file:///srv/pg_hardstorage/repo
 | `aes-gcm` (default) | `CKK_AES` | `C_Encrypt` with `CKM_AES_GCM`, fresh 12-byte IV | `[12-byte IV | ciphertext | 16-byte GCM tag]` |
 | `rsa-oaep` | RSA keypair | `C_Encrypt` with `CKM_RSA_PKCS_OAEP` | opaque ciphertext (RSA modulus length) |
 
+## Several providers in one process
+
+The PKCS#11 module is loaded and initialised once per process,
+and the token logged in once per (module, slot); each provider
+gets its own session. An agent running a backup while a restore
+or verify opens the same KEK therefore shares the login instead
+of fighting over it: the token is logged out and the module
+finalised only when the last provider closes, and a token that is
+already logged in (`CKR_USER_ALREADY_LOGGED_IN`) is accepted.
+
 ## FIPS posture
 
 HSMs are typically FIPS 140-2 / 140-3 validated; the module

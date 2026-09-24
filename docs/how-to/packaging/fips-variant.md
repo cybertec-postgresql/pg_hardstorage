@@ -54,8 +54,13 @@ GOEXPERIMENT=boringcrypto CGO_ENABLED=1 \
         ./cmd/pg_hardstorage
 ```
 
-The `fips` build tag is the runtime selector:
-`internal/fips.Enabled()` returns `true` in this flavour.
+The `fips` build tag selects the flavour, but
+`internal/fips.Enabled()` returns `true` only when a validated
+module is actually active: BoringCrypto (`crypto/boring.Enabled()`)
+or the Go FIPS 140-3 module (`crypto/fips140.Enabled()`, e.g. with
+`GODEBUG=fips140=on`). A `-tags fips` build without
+`GOEXPERIMENT=boringcrypto` therefore reports FIPS `false` and
+variant `default` instead of claiming a posture it does not have.
 The `pg_hardstorage version` subcommand surfaces the variant
 so operators see at a glance which flavour is running.
 

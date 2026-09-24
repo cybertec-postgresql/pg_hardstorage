@@ -169,6 +169,76 @@ func isFSStagingName(name string) bool {
 		strings.Contains(name, ".excl-")
 }
 
+// isReapableStagingName is the subset of isFSStagingName the staging
+// reaper may delete: names this backend's own writers produce. The
+// bare ".tmp" suffix is left alone — it is not ours to judge.
+func isReapableStagingName(name string) bool {
+	return strings.Contains(name, ".hstmp-") ||
+		strings.Contains(name, ".deferred-") ||
+		strings.Contains(name, ".excl-")
+}
+
+// ReapStaging implements storage.StagingReapAware: it removes staging
+// temps (see isReapableStagingName) last modified more than olderThan
+// ago — the leftovers of a writer that died between staging and
+// publishing. List hides these names, so nothing else ever finds them.
+// Deferred chunks this process has staged but not yet published are
+// spared whatever their age; Barrier still needs them.
+func (p *Plugin) ReapStaging(ctx context.Context, olderThan time.Duration) (storage.ReapStats, error) {
+	var st storage.ReapStats
+	if p.root == "" {
+		return st, errors.New("fs: plugin not opened")
+	}
+	p.mu.Lock()
+	pending := make(map[string]bool, len(p.deferred))
+	for _, dw := range p.deferred {
+		pending[dw.staging] = true
+	}
+	p.mu.Unlock()
+	cutoff := time.Now().Add(-olderThan)
+	dirs := map[string]bool{}
+	err := filepath.WalkDir(p.root, func(path string, d stdfs.DirEntry, err error) error {
+		if cerr := ctx.Err(); cerr != nil {
+			return cerr
+		}
+		if err != nil {
+			if errors.Is(err, stdfs.ErrNotExist) {
+				return nil
+			}
+			return err
+		}
+		if d.IsDir() || !isReapableStagingName(d.Name()) || pending[path] {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			if errors.Is(err, stdfs.ErrNotExist) {
+				return nil
+			}
+			return err
+		}
+		if !info.ModTime().Before(cutoff) {
+			return nil
+		}
+		if err := os.Remove(path); err != nil {
+			if errors.Is(err, stdfs.ErrNotExist) {
+				return nil
+			}
+			return fmt.Errorf("fs: reap staging %q: %w", path, err)
+		}
+		st.Removed++
+		st.Bytes += info.Size()
+		dirs[filepath.Dir(path)] = true
+		return nil
+	})
+	for dir := range dirs {
+		if serr := syncDir(dir); serr != nil && err == nil {
+			err = serr
+		}
+	}
+	return st, err
+}
+
 // randHex returns 16 hex chars of crypto-random for staging-temp
 // names — collision-free in practice, and O_EXCL guards the rest.
 func randHex() string {
@@ -301,7 +371,7 @@ func (p *Plugin) Put(ctx context.Context, key string, r io.Reader, opts storage.
 	if err != nil {
 		return storage.PutResult{}, err
 	}
-	if err := os.MkdirAll(filepath.Dir(full), repoDirMode); err != nil {
+	if err := mkdirAllDurable(filepath.Dir(full)); err != nil {
 		return storage.PutResult{}, fmt.Errorf("fs: mkdir parent of %q: %w", key, err)
 	}
 
@@ -639,7 +709,7 @@ func (p *Plugin) RenameIfNotExists(ctx context.Context, src, dst string) error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(dstFull), repoDirMode); err != nil {
+	if err := mkdirAllDurable(filepath.Dir(dstFull)); err != nil {
 		return fmt.Errorf("fs: mkdir parent of %q: %w", dst, err)
 	}
 	if err := os.Link(srcFull, dstFull); err != nil {
@@ -683,6 +753,56 @@ func (p *Plugin) SetRetention(_ context.Context, _ string, _ time.Time, _ storag
 // platform-split: barrier_linux.go uses a single syncfs(2);
 // barrier_other.go fsyncs each deferred file + dir individually.
 
+// mkdirAllDurable is os.MkdirAll plus an fsync of the PARENT of every
+// directory it had to create.
+//
+// A new directory's name lives in its parent. Put and
+// RenameIfNotExists fsync the leaf directory after committing the
+// object, which makes the object's entry durable — but not the entry
+// of a directory MkdirAll just created (a fresh chunks/sha256/ab/cd
+// bucket, a new manifests/<deployment>/). A power loss could drop the
+// whole new directory, and every object in it, although each Put had
+// reported durable success.
+//
+// The common case (parent already exists) costs one Stat and no fsync.
+func mkdirAllDurable(dir string) error {
+	if fi, err := os.Stat(dir); err == nil && fi.IsDir() {
+		return nil
+	}
+	// Collect the missing components, deepest first, up to the first
+	// existing ancestor.
+	var missing []string
+	for d := dir; ; {
+		if _, err := os.Stat(d); err == nil {
+			break
+		} else if !errors.Is(err, stdfs.ErrNotExist) {
+			return err
+		}
+		missing = append(missing, d)
+		parent := filepath.Dir(d)
+		if parent == d {
+			break
+		}
+		d = parent
+	}
+	if err := os.MkdirAll(dir, repoDirMode); err != nil {
+		return err
+	}
+	// Shallowest first, so each parent's entry is on disk before its
+	// child's. A concurrent creator of the same component is fine: the
+	// entry exists either way, and syncing it twice is harmless.
+	for i := len(missing) - 1; i >= 0; i-- {
+		if err := syncDir(filepath.Dir(missing[i])); err != nil {
+			return fmt.Errorf("fsync parent of new directory %q: %w", missing[i], err)
+		}
+	}
+	return nil
+}
+
+// dirSyncHook, when set (tests only), observes every syncDir call —
+// fsync itself cannot be seen from userspace.
+var dirSyncHook func(dir string)
+
 // syncDir fsyncs a directory inode so a metadata change (rename,
 // link, unlink, create) committed within it survives a system
 // crash.  Required after every metadata-modifying syscall
@@ -703,6 +823,9 @@ func (p *Plugin) SetRetention(_ context.Context, _ string, _ time.Time, _ storag
 // data/metadata change.  The caller can retry; the underlying
 // modification is already in place either way.
 func syncDir(dir string) error {
+	if dirSyncHook != nil {
+		dirSyncHook(dir)
+	}
 	d, err := os.Open(dir)
 	if err != nil {
 		// A non-existent dir means nothing to fsync — typical for

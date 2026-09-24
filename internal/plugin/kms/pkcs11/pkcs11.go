@@ -471,22 +471,28 @@ type parsedRef struct {
 // deliberately straightforward.
 func parseKEKRef(kekRef string) (parsedRef, error) {
 	if !strings.HasPrefix(kekRef, Scheme+"://") {
-		return parsedRef{}, fmt.Errorf("pkcs11: KEKRef %q does not have the %q:// prefix", kekRef, Scheme)
+		return parsedRef{}, fmt.Errorf("pkcs11: KEKRef %q does not have the %q:// prefix", stdkms.RedactKEKRef(kekRef), Scheme)
 	}
 	u, err := url.Parse(kekRef)
 	if err != nil {
-		return parsedRef{}, fmt.Errorf("pkcs11: parse KEKRef %q: %w", kekRef, err)
+		// *url.Error's text quotes the whole URL — PIN included — so
+		// report only its inner cause.
+		var uerr *url.Error
+		if errors.As(err, &uerr) {
+			err = uerr.Err
+		}
+		return parsedRef{}, fmt.Errorf("pkcs11: parse KEKRef %q: %w", stdkms.RedactKEKRef(kekRef), err)
 	}
 	if u.Scheme != Scheme {
 		return parsedRef{}, fmt.Errorf("pkcs11: KEKRef scheme %q, want %q", u.Scheme, Scheme)
 	}
 	tokenLabel := u.Host
 	if tokenLabel == "" {
-		return parsedRef{}, fmt.Errorf("pkcs11: empty token label in %q", kekRef)
+		return parsedRef{}, fmt.Errorf("pkcs11: empty token label in %q", stdkms.RedactKEKRef(kekRef))
 	}
 	keyPath := strings.TrimPrefix(u.Path, "/")
 	if keyPath == "" {
-		return parsedRef{}, fmt.Errorf("pkcs11: empty key label in %q", kekRef)
+		return parsedRef{}, fmt.Errorf("pkcs11: empty key label in %q", stdkms.RedactKEKRef(kekRef))
 	}
 	if strings.Contains(keyPath, "/") {
 		return parsedRef{}, fmt.Errorf("pkcs11: key label %q must not contain '/'", keyPath)

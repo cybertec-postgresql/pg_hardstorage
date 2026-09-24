@@ -41,6 +41,7 @@ import (
 	"fmt"
 	"io"
 	"iter"
+	"net/http"
 	"net/url"
 	"os"
 	"strconv"
@@ -48,12 +49,14 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/aws/retry"
 	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
 
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/airgap"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
 )
 
@@ -256,6 +259,22 @@ func (p *Plugin) Open(ctx context.Context, cfg storage.StorageConfig) error {
 		o.UsePathStyle = usePathStyle
 	})
 
+	// Air-gap gate. `airgapped: strict` promises every outbound path is
+	// checked, and this plugin checked none: a custom ?endpoint= and the
+	// public AWS endpoint alike were dialled unconditionally. Check what
+	// the client will actually talk to — the resolved BaseEndpoint also
+	// picks up AWS_ENDPOINT_URL(_S3) from the environment — and, with
+	// none, the regional AWS host. That is the name an operator
+	// allowlists (s3.<region>.amazonaws.com), including behind a VPC
+	// gateway endpoint.
+	effective := aws.ToString(client.Options().BaseEndpoint)
+	if effective == "" {
+		effective = "https://s3." + awsCfg.Region + ".amazonaws.com"
+	}
+	if err := airgap.Default().EndpointAllowed(effective); err != nil {
+		return fmt.Errorf("s3: %w", err)
+	}
+
 	p.client = client
 	p.bucket = bucket
 	p.prefix = prefix
@@ -382,7 +401,11 @@ func (p *Plugin) Put(ctx context.Context, key string, r io.Reader, opts storage.
 		}
 	}
 
-	out, err := p.client.PutObject(ctx, in)
+	var callOpts []func(*s3.Options)
+	if opts.IfNotExists {
+		callOpts = append(callOpts, retryConditionalConflict)
+	}
+	out, err := p.client.PutObject(ctx, in, callOpts...)
 	if err != nil {
 		if isPreconditionFailed(err) {
 			return storage.PutResult{}, fmt.Errorf("%w: %s", storage.ErrAlreadyExists, key)
@@ -561,7 +584,7 @@ func (p *Plugin) RenameIfNotExists(ctx context.Context, src, dst string) error {
 		Key:         aws.String(p.fullKey(dst)),
 		CopySource:  aws.String(url.PathEscape(p.bucket + "/" + p.fullKey(src))),
 		IfNoneMatch: aws.String("*"),
-	})
+	}, retryConditionalConflict)
 	if err != nil {
 		if isPreconditionFailed(err) {
 			return fmt.Errorf("%w: %s", storage.ErrAlreadyExists, dst)
@@ -651,7 +674,9 @@ func isNotFound(err error) bool {
 
 // isPreconditionFailed reports whether err corresponds to a
 // PreconditionFailed (412) — what S3 returns when If-None-Match
-// rejects an overwrite.
+// rejects an overwrite. The HTTP status is checked as well as the
+// code: some S3-compatible stores answer 412 with an empty or
+// non-standard error body.
 func isPreconditionFailed(err error) bool {
 	var ae smithy.APIError
 	if errors.As(err, &ae) {
@@ -660,5 +685,27 @@ func isPreconditionFailed(err error) bool {
 			return true
 		}
 	}
-	return false
+	var re *awshttp.ResponseError
+	return errors.As(err, &re) && re.HTTPStatusCode() == http.StatusPreconditionFailed
+}
+
+// conditionalConflictAttempts bounds the retries of a conditional
+// write that S3 rejected with 409 ConditionalRequestConflict.
+const conditionalConflictAttempts = 5
+
+// retryConditionalConflict makes the SDK retry, with its usual
+// backoff, a conditional write answered with 409
+// ConditionalRequestConflict.
+//
+// S3 returns that when another conditional write to the same key is
+// in flight, and documents it as retryable: the retry either succeeds
+// or meets the racer's committed object as 412, which Put maps to
+// ErrAlreadyExists. The SDK's default retryer does not know the code,
+// so a benign race used to surface as a hard failure of a chunk or
+// manifest write. The SDK rewinds a seekable body itself; a
+// non-seekable one fails as it did before.
+func retryConditionalConflict(o *s3.Options) {
+	o.Retryer = retry.AddWithMaxAttempts(
+		retry.AddWithErrorCodes(o.Retryer, "ConditionalRequestConflict"),
+		conditionalConflictAttempts)
 }

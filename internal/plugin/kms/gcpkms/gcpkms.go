@@ -56,6 +56,7 @@ import (
 
 	gcpkmsv1 "cloud.google.com/go/kms/apiv1"
 	kmspb "cloud.google.com/go/kms/apiv1/kmspb"
+	"github.com/googleapis/gax-go/v2/apierror"
 	"google.golang.org/api/option"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 
@@ -221,6 +222,38 @@ var castagnoli = crc32.MakeTable(crc32.Castagnoli)
 
 func crc32c(b []byte) int64 { return int64(crc32.Checksum(b, castagnoli)) }
 
+// gRPC status codes classifyGCP distinguishes. Spelled out rather
+// than imported: the grpc module is only an indirect dependency, and
+// codes.Code is a stable wire enum (google.rpc.Code).
+const (
+	grpcDeadlineExceeded  = 4
+	grpcPermissionDenied  = 7
+	grpcResourceExhausted = 8
+	grpcAborted           = 10
+	grpcInternal          = 13
+	grpcUnavailable       = 14
+	grpcUnauthenticated   = 16
+)
+
+// classifyGCP maps a Cloud KMS error — a gRPC status from the default
+// transport, or a googleapi.Error over REST, both normalised by
+// apierror — onto the kms error classes. InvalidArgument (bad
+// ciphertext), FailedPrecondition (version disabled / destroyed),
+// NotFound and the rest genuinely concern the key and stay ErrUnwrap.
+func classifyGCP(err error) error {
+	ae, ok := apierror.ParseError(err, false)
+	if !ok || ae.GRPCStatus() == nil {
+		return stdkms.ErrUnwrap
+	}
+	switch uint32(ae.GRPCStatus().Code()) {
+	case grpcUnavailable, grpcResourceExhausted, grpcInternal, grpcAborted, grpcDeadlineExceeded:
+		return stdkms.ErrUnavailable
+	case grpcPermissionDenied, grpcUnauthenticated:
+		return stdkms.ErrAccessDenied
+	}
+	return stdkms.ErrUnwrap
+}
+
 func (p *Provider) WrapDEK(ctx context.Context, dek []byte) ([]byte, error) {
 	if err := p.assertOpen(); err != nil {
 		return nil, err
@@ -279,7 +312,7 @@ func (p *Provider) UnwrapDEK(ctx context.Context, wrapped []byte) ([]byte, error
 		AdditionalAuthenticatedDataCrc32C: wrapperspb.Int64(crc32c(aad)),
 	})
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", stdkms.ErrUnwrap, err)
+		return nil, stdkms.UnwrapFailure(ctx, classifyGCP(err), "gcp-kms: Decrypt", err)
 	}
 	// A DEK corrupted in the response would fail loudly one layer
 	// down (every chunk's AEAD open), but failing HERE names the
@@ -384,25 +417,25 @@ func (p *Provider) assertOpen() error {
 //	  → keyName="projects/p/locations/l/keyRings/r/cryptoKeys/k", versionRef="3"
 func parseKEKRef(kekRef string) (keyName, versionRef string, err error) {
 	if !strings.HasPrefix(kekRef, Scheme+"://") {
-		return "", "", fmt.Errorf("gcp-kms: KEKRef %q does not have the %q:// prefix", kekRef, Scheme)
+		return "", "", fmt.Errorf("gcp-kms: KEKRef %q does not have the %q:// prefix", stdkms.RedactKEKRef(kekRef), Scheme)
 	}
 	resource := strings.TrimPrefix(kekRef, Scheme+"://")
 	resource = strings.TrimSpace(resource)
 	if resource == "" {
-		return "", "", fmt.Errorf("gcp-kms: empty resource path in KEKRef %q", kekRef)
+		return "", "", fmt.Errorf("gcp-kms: empty resource path in KEKRef %q", stdkms.RedactKEKRef(kekRef))
 	}
 	// Validate the basic shape: projects/.../locations/.../keyRings/.../cryptoKeys/...
 	if !strings.HasPrefix(resource, "projects/") ||
 		!strings.Contains(resource, "/locations/") ||
 		!strings.Contains(resource, "/keyRings/") ||
 		!strings.Contains(resource, "/cryptoKeys/") {
-		return "", "", fmt.Errorf("gcp-kms: KEKRef %q is not a CryptoKey resource path (expected projects/.../cryptoKeys/...)", kekRef)
+		return "", "", fmt.Errorf("gcp-kms: KEKRef %q is not a CryptoKey resource path (expected projects/.../cryptoKeys/...)", stdkms.RedactKEKRef(kekRef))
 	}
 	if i := strings.Index(resource, "/cryptoKeyVersions/"); i >= 0 {
 		keyName = resource[:i]
 		versionRef = strings.TrimPrefix(resource[i:], "/cryptoKeyVersions/")
 		if versionRef == "" {
-			return "", "", fmt.Errorf("gcp-kms: KEKRef %q has empty version suffix", kekRef)
+			return "", "", fmt.Errorf("gcp-kms: KEKRef %q has empty version suffix", stdkms.RedactKEKRef(kekRef))
 		}
 		return keyName, versionRef, nil
 	}

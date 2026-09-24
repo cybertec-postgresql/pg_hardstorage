@@ -29,13 +29,13 @@ package fips
 // Enabled reports whether the binary is the FIPS variant.
 // The implementation is build-tag-gated (`enabled_fips.go`
 // vs `enabled_default.go`).
-func Enabled() bool { return enabled }
+func Enabled() bool { return enabled() }
 
 // Variant returns the operator-readable build flavour.  Same
 // information as Enabled, in a form suitable for the JSON
 // schema's `variant` field and audit-event Body.
 func Variant() string {
-	if enabled {
+	if enabled() {
 		return "fips"
 	}
 	return "default"

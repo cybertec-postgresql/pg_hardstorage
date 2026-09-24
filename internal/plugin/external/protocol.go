@@ -294,33 +294,43 @@ func (c *Client) Call(ctx context.Context, method string, params any) (json.RawM
 		return nil, fmt.Errorf("plugin: stdout: %w", err)
 	}
 	cmd.Stderr = os.Stderr // mirror plugin diagnostics
+	// Bound Wait when a grandchild of the plugin still holds its
+	// stdout/stderr open after the plugin itself is gone.
+	cmd.WaitDelay = 2 * time.Second
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("plugin: start: %w", err)
+	}
+	// abort ends the plugin on an error path. Kill alone left the
+	// process a zombie for the host's lifetime (only Wait reaps it),
+	// one per failed RPC; Wait also releases the pipes.
+	abort := func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
 	}
 
 	var paramBytes json.RawMessage
 	if params != nil {
 		paramBytes, err = json.Marshal(params)
 		if err != nil {
-			_ = cmd.Process.Kill()
+			abort()
 			return nil, fmt.Errorf("plugin: marshal params: %w", err)
 		}
 	}
 	req := Request{Method: method, Params: paramBytes}
 	reqBytes, err := json.Marshal(req)
 	if err != nil {
-		_ = cmd.Process.Kill()
+		abort()
 		return nil, fmt.Errorf("plugin: marshal request: %w", err)
 	}
 	if _, err := stdin.Write(append(reqBytes, '\n')); err != nil {
-		_ = cmd.Process.Kill()
+		abort()
 		return nil, fmt.Errorf("plugin: write request: %w", err)
 	}
 	stdin.Close()
 
 	resp, err := readResponse(stdout)
 	if err != nil {
-		_ = cmd.Process.Kill()
+		abort()
 		return nil, err
 	}
 	if waitErr := cmd.Wait(); waitErr != nil {

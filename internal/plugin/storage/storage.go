@@ -387,3 +387,20 @@ func RegionOf(sp StoragePlugin) string {
 	}
 	return RegionUnknown
 }
+
+// CleanupTimeout bounds a rollback run under CleanupContext.
+const CleanupTimeout = 30 * time.Second
+
+// CleanupContext returns a context for undoing a half-finished write:
+// it keeps ctx's values but not its cancellation, and is bounded by
+// CleanupTimeout.
+//
+// The rollback is needed precisely when something went wrong, and a
+// cancelled or expired caller context is one of the commonest things to
+// go wrong. Reusing that context meant the cleanup request never left
+// the process: a Put whose retention call failed on cancellation left
+// an UNLOCKED object at a chunk key, which the next IfNotExists Put then
+// deduped against as though it were committed and protected.
+func CleanupContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), CleanupTimeout)
+}

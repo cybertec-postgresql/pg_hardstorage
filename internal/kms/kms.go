@@ -113,6 +113,48 @@ type Provider interface {
 // scheduled for deletion."
 var ErrUnwrap = errors.New("kms: DEK unwrap failed")
 
+// ErrUnavailable marks a provider call that failed for a reason
+// that says nothing about the key: throttling, a 5xx / internal
+// error, a dependency timeout. It is retryable, and IsUnreachable
+// reports it so callers map it to the transient `kms.unreachable`
+// exit rather than to a key mismatch.
+var ErrUnavailable = errors.New("kms: provider temporarily unavailable")
+
+// ErrAccessDenied marks a provider call refused because the
+// credentials in use may not perform it on this key (IAM / RBAC /
+// Vault policy), or are expired or invalid. The key itself may be
+// fine; the fix is on the credentials side.
+var ErrAccessDenied = errors.New("kms: access denied")
+
+// UnwrapFailure builds the error an UnwrapDEK returns when its
+// provider call failed with err. class is the provider's reading of
+// err — ErrUnavailable, ErrAccessDenied, or ErrUnwrap (nil means
+// ErrUnwrap) — and op names the call ("aws-kms: Decrypt").
+//
+// Every UnwrapDEK used to wrap every failure as ErrUnwrap with %v.
+// That reported throttling, AccessDenied, a 5xx and a cancelled
+// context alike as `restore.kek_mismatch` ("the KEK may have been
+// rotated, disabled, or scheduled for deletion"), sending operators
+// after a key problem that did not exist, and %v dropped the typed
+// cause so nothing downstream could tell them apart. Here:
+//
+//   - a cancelled / expired context is returned as itself;
+//   - a network-class failure is never an unwrap failure;
+//   - everything else carries its class AND the original cause, both
+//     reachable through errors.Is / errors.As.
+func UnwrapFailure(ctx context.Context, class error, op string, err error) error {
+	if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Errorf("%s: %w", op, err)
+	}
+	if class == nil {
+		class = ErrUnwrap
+	}
+	if class == ErrUnwrap && IsUnreachable(err) {
+		return fmt.Errorf("%s: %w", op, err)
+	}
+	return fmt.Errorf("%w: %s: %w", class, op, err)
+}
+
 // ErrShredFailed wraps Shred errors that aren't network
 // failures.  Cloud KMS often refuses Shred with structured
 // errors (key already pending deletion, key in different
@@ -162,11 +204,11 @@ func (r *Registry) Open(ctx context.Context, kekRef string, cfg map[string]any) 
 	r.mu.RUnlock()
 	if !ok {
 		return nil, fmt.Errorf("%w: %q (no provider registered for scheme %q)",
-			ErrUnknownScheme, kekRef, scheme)
+			ErrUnknownScheme, RedactKEKRef(kekRef), scheme)
 	}
 	p, err := b(ctx, kekRef, cfg)
 	if err != nil {
-		return nil, fmt.Errorf("kms: open %q: %w", kekRef, err)
+		return nil, fmt.Errorf("kms: open %q: %w", RedactKEKRef(kekRef), err)
 	}
 	return p, nil
 }
