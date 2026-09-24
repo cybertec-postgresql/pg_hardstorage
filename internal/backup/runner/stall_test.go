@@ -14,8 +14,8 @@ import (
 type nopSink struct{}
 
 func (nopSink) OnTablespaceStart(int, basebackup.TablespaceInfo) error { return nil }
-func (nopSink) OnTablespaceData(int, []byte) error                    { return nil }
-func (nopSink) OnTablespaceEnd(int) error                             { return nil }
+func (nopSink) OnTablespaceData(int, []byte) error                     { return nil }
+func (nopSink) OnTablespaceEnd(int) error                              { return nil }
 
 // The --stall-timeout watchdog was reset only by emitted events, and
 // none is emitted while BASE_BACKUP streams — so any healthy backup that

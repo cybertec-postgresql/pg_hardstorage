@@ -9,8 +9,8 @@ import (
 	"time"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup"
-	"github.com/cybertec-postgresql/pg_hardstorage/internal/pg/basebackup"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/output"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/pg/basebackup"
 )
 
 // ErrIOStarved is the cancel cause the stall watchdog aborts a backup
