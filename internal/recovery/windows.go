@@ -196,10 +196,16 @@ func Windows(ctx context.Context, sp storage.StoragePlugin, deployment string, o
 			// is the hole's start, not hi. Without this the window
 			// advertised a PITR range straight across a gap that
 			// `wal list --gaps-only` plainly detects.
+			//
+			// hi is the EXCLUSIVE end of the newest segment (the first
+			// byte of a segment that does not exist yet), while
+			// FirstWALHoleInRange scans an INCLUSIVE range: step back
+			// one byte, exactly as restore's gapcheck does, or every
+			// window reports a fake hole at the frontier.
 			fromLSN, ferr := pglogrepl.ParseLSN(m.StopLSN)
 			toLSN, terr := pglogrepl.ParseLSN(hi)
 			if ferr == nil && terr == nil && toLSN > fromLSN {
-				if hole, found, herr := inventory.FirstWALHoleInRange(ctx, sp, deployment, m.Timeline, fromLSN, toLSN); herr == nil && found {
+				if hole, found, herr := inventory.FirstWALHoleInRange(ctx, sp, deployment, m.Timeline, fromLSN, toLSN-1); herr == nil && found {
 					w.LatestRestoreLSN = hole.String()
 					w.Gaps = append(w.Gaps, WindowGap{
 						StartLSN: hole.String(),
