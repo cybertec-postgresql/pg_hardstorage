@@ -338,6 +338,16 @@ Four data-flow modes, default-conservative:
 | `open` | Everything (with credentials always masked).  Dev / staging only. |
 | `local-only` | Refuses any provider that isn't local (Ollama, llama-cpp).  Auto-selected for `data_classification: confidential` or higher. |
 
+The mode applies to everything that carries operator or cluster
+data: your prompts, tool results, and the data sections of the
+session's system prompt — the skill's pre-loaded tool output
+(`read_doctor`, `list_deployments`, ...) and any operator context.
+Tool results served by `pg_hardstorage llm --mcp-server` are redacted
+the same way; under `local-only` the MCP server refuses tool calls,
+because it cannot see which model its client forwards results to.
+Only text the binary authors itself (skill template, runbook index,
+command catalog, rules) is sent unredacted.
+
 The mode is per-deployment, not per-call.  An operator who runs
 `llm` against a deployment classified `confidential` cannot
 accidentally route its data to OpenAI — the binary refuses to

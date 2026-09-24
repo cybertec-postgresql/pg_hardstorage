@@ -46,6 +46,7 @@ import (
 	"sync"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/llm/docs"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/llm/privacy"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/llm/skills"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/llm/tools"
 )
@@ -85,6 +86,14 @@ type Server struct {
 
 	// Info is what we advertise on initialize.
 	Info ServerInfo
+
+	// Privacy is the operator's llm.privacy mode.  The MCP client
+	// forwards every tool result to its own model provider, so the
+	// results get the same redaction the chat path applies; empty
+	// means privacy.Default.  Under local-only the server refuses
+	// tools/call outright: it cannot see which model the client
+	// talks to, so it cannot vouch that the endpoint is local.
+	Privacy privacy.Mode
 
 	// initialized guards the strict ordering MCP requires:
 	// `initialize` must be the first request, and every other
@@ -237,6 +246,20 @@ func (s *Server) handleToolsCall(ctx context.Context, req *rpcRequest) {
 			fmt.Sprintf("tools/call: %q is not read-only;+ MCP server refuses mutation tools", params.Name))
 		return
 	}
+	mode := s.Privacy
+	if mode == "" {
+		mode = privacy.Default
+	}
+	if mode == privacy.ModeLocalOnly {
+		s.writeResult(req.ID, map[string]any{
+			"isError": true,
+			"content": []map[string]any{{
+				"type": "text",
+				"text": "privacy: local-only mode refuses to serve tool results over MCP (the server cannot verify that the client's model endpoint is loopback / RFC-1918); use `pg_hardstorage llm chat` with a local provider instead",
+			}},
+		})
+		return
+	}
 	if params.Arguments == nil {
 		params.Arguments = map[string]any{}
 	}
@@ -244,12 +267,13 @@ func (s *Server) handleToolsCall(ctx context.Context, req *rpcRequest) {
 	if err != nil {
 		// Surface as a tool-result with isError=true (per MCP
 		// spec, tool errors are not JSON-RPC errors — they're
-		// successful tool calls that returned an error).
+		// successful tool calls that returned an error).  The
+		// error carries the child's stderr, so it is redacted too.
 		s.writeResult(req.ID, map[string]any{
 			"isError": true,
 			"content": []map[string]any{{
 				"type": "text",
-				"text": err.Error(),
+				"text": privacy.Redact(mode, err.Error()),
 			}},
 		})
 		return
@@ -261,7 +285,7 @@ func (s *Server) handleToolsCall(ctx context.Context, req *rpcRequest) {
 	s.writeResult(req.ID, map[string]any{
 		"content": []map[string]any{{
 			"type": "text",
-			"text": string(body),
+			"text": privacy.Redact(mode, string(body)),
 		}},
 	})
 }

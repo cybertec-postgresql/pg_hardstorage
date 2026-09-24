@@ -5,6 +5,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/llm/mcp"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/llm/privacy"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/output"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/version"
 )
@@ -25,14 +26,22 @@ func runMCPServer(cmd *cobra.Command) error {
 		return output.NewError("llm.skill_load_failed",
 			"llm --mcp-server: load skills: "+err.Error()).Wrap(err)
 	}
+	// Same privacy source of truth as the chat path: tool results
+	// served here reach the MCP client's model provider, so they get
+	// the configured redaction (and local-only refuses them).
+	mode, modeErr := privacy.Parse(loadLLMConfigFromFile().Privacy)
+	if modeErr != nil {
+		return output.NewError("config.bad_privacy_mode", modeErr.Error()).Wrap(modeErr)
+	}
 	toolReg, _, _ := buildLiveToolRegistry(nil, cmd.Root())
 
 	srv := &mcp.Server{
-		In:     cmd.InOrStdin(),
-		Out:    cmd.OutOrStdout(),
-		Err:    cmd.ErrOrStderr(),
-		Tools:  toolReg,
-		Skills: skillSet,
+		In:      cmd.InOrStdin(),
+		Out:     cmd.OutOrStdout(),
+		Err:     cmd.ErrOrStderr(),
+		Tools:   toolReg,
+		Skills:  skillSet,
+		Privacy: mode,
 		Info: mcp.ServerInfo{
 			Name:    "pg_hardstorage",
 			Version: version.Version,
