@@ -614,11 +614,15 @@ func streamOpenAISSE(ctx context.Context, rd io.Reader, yield func(Chunk, error)
 			yield(Chunk{}, err)
 			return
 		}
+		// SSE field syntax: "data:" then at most ONE optional space
+		// (WHATWG HTML §9.2.6). Requiring "data: " dropped every line
+		// from servers that omit the space — including their [DONE].
 		line := sc.Text()
-		if !strings.HasPrefix(line, "data: ") {
+		payload, ok := strings.CutPrefix(line, "data:")
+		if !ok {
 			continue
 		}
-		payload := strings.TrimPrefix(line, "data: ")
+		payload = strings.TrimPrefix(payload, " ")
 		if payload == "[DONE]" {
 			done = true
 			break
@@ -627,6 +631,13 @@ func streamOpenAISSE(ctx context.Context, rd io.Reader, yield func(Chunk, error)
 		var delta openaiStreamLine
 		if err := json.Unmarshal([]byte(payload), &delta); err != nil {
 			yield(Chunk{}, fmt.Errorf("openai: parse stream line: %w (raw=%q)", err, payload))
+			return
+		}
+		// A failure after the 200 header is already on the wire can
+		// only be reported in-band, as an {"error":...} event with no
+		// choices. Ignoring it ended the stream as an empty "success".
+		if len(delta.Error) > 0 && string(delta.Error) != "null" {
+			yield(Chunk{}, streamError(delta.Error))
 			return
 		}
 
@@ -709,6 +720,28 @@ func streamOpenAISSE(ctx context.Context, rd io.Reader, yield func(Chunk, error)
 		yield(Chunk{Text: tail}, nil)
 	}
 	yield(Chunk{Done: true, Usage: &usage}, nil)
+}
+
+// streamError renders an in-stream {"error":...} value. OpenAI sends
+// an object {message,type,code}; vLLM uses an integer code; Ollama
+// and some proxies send a bare string. Anything else is quoted raw so
+// the operator still sees what the server said.
+func streamError(raw json.RawMessage) error {
+	var obj struct {
+		Message string `json:"message"`
+		Type    string `json:"type"`
+	}
+	if json.Unmarshal(raw, &obj) == nil && obj.Message != "" {
+		if obj.Type != "" {
+			return fmt.Errorf("openai: stream error (%s): %s", obj.Type, obj.Message)
+		}
+		return fmt.Errorf("openai: stream error: %s", obj.Message)
+	}
+	var str string
+	if json.Unmarshal(raw, &str) == nil && str != "" {
+		return fmt.Errorf("openai: stream error: %s", str)
+	}
+	return fmt.Errorf("openai: stream error: %s", raw)
 }
 
 // thinkFilter strips <think>...</think> and
@@ -1013,6 +1046,8 @@ type openaiToolFunction struct {
 type openaiStreamLine struct {
 	Choices []openaiChoice `json:"choices"`
 	Usage   *openaiUsage   `json:"usage,omitempty"`
+	// Error is kept raw: its shape varies by server (see streamError).
+	Error json.RawMessage `json:"error,omitempty"`
 }
 
 type openaiChoice struct {
