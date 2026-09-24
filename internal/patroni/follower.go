@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"strings"
 	"sync"
 	"time"
 )
@@ -273,24 +272,18 @@ func (f *Follower) observeSystemID(ctx context.Context) (string, bool, error) {
 // top-level `system_identifier` field (newer Patroni surfaces it).
 // Returns ("", false, nil) when the field is absent.
 //
-// It uses a plain http.Client rather than the shared patroni.Client's
-// configured transport / basic-auth: the client exposes no accessor for
-// those, and widening its public surface is out of this change's scope
-// (see the report — the cleaner follow-up is a Cluster.SystemIdentifier
-// field on the shared type). This covers the common open-/cluster case.
+// It goes through the shared patroni.Client (doRaw), so the probe
+// carries the same basic auth and transport (TLS, timeout) as the
+// leader poll. A bare http.Client here got 401 from an auth-protected
+// Patroni on every tick; since a probe error aborts the poll, the
+// follower then never observed a leader again.
 // Patroni normally emits system_identifier as a JSON string; we also
 // tolerate a JSON number for robustness.
 func (f *Follower) probeSystemIDHTTP(ctx context.Context) (string, bool, error) {
-	base := strings.TrimRight(f.client.BaseURL(), "/")
-	if base == "" {
+	if f.client.BaseURL() == "" {
 		return "", false, errors.New("patroni: follower has no base URL")
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/cluster", nil)
-	if err != nil {
-		return "", false, err
-	}
-	hc := &http.Client{Timeout: DefaultTimeout}
-	resp, err := hc.Do(req)
+	resp, err := f.client.doRaw(ctx, http.MethodGet, "/cluster", nil)
 	if err != nil {
 		return "", false, err
 	}

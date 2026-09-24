@@ -21,16 +21,17 @@ pg_hardstorage dsa locate [flags]
 ### Options
 
 ```
-      --article string       GDPR article: art_15_access | art_17_erasure | other (default "art_17_erasure")
-      --deployment string    restrict scan to one deployment (default: all)
-  -h, --help                 help for locate
-      --note string          operator note recorded in the report (e.g. ticket ref)
-      --repo string          repository URL (required)
-      --skip-sign            compute the report but do not sign / persist it (testing)
-      --subject-id string    opaque subject identifier (hashed before recording; required)
-      --tenant string        tenant containing the subject's data (required)
-      --window-from string   only backups stopped at/after this RFC3339 timestamp
-      --window-to string     only backups stopped at/before this RFC3339 timestamp
+      --allow-unknown-tenant   sign a report even when no backup in scope carries --tenant (asserts the tenant holds nothing; default: refuse, since a typo would otherwise yield a signed zero report)
+      --article string         GDPR article: art_15_access | art_17_erasure | other (default "art_17_erasure")
+      --deployment string      restrict scan to one deployment (default: all)
+  -h, --help                   help for locate
+      --note string            operator note recorded in the report (e.g. ticket ref)
+      --repo string            repository URL (required)
+      --skip-sign              compute the report but do not sign / persist it (testing)
+      --subject-id string      opaque subject identifier (hashed before recording; required)
+      --tenant string          tenant containing the subject's data (required)
+      --window-from string     only backups stopped at/after this RFC3339 timestamp
+      --window-to string       only backups stopped at/before this RFC3339 timestamp
 ```
 
 ### Options inherited from parent commands

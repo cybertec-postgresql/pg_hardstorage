@@ -56,7 +56,10 @@ Examples:
   fleet search --query 'deployment:db1 type:full since:7d' --repo s3://...
   fleet search --query 'pg_version:17 timeline:3'         --repo file:///srv/...
 
-Tombstoned (soft-deleted) manifests are excluded.`,
+Tombstoned (soft-deleted) manifests are excluded. Manifests are
+signature-verified with the local keyring (as list does); any that
+cannot be read or verified are counted as "unreadable" and flagged,
+because the hit list is then incomplete.`,
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return runFleetSearch(cmd, fleetSearchOptions{
@@ -103,23 +106,35 @@ func runFleetSearch(cmd *cobra.Command, opts fleetSearchOptions) error {
 			fmt.Sprintf("fleet search: %v", err)).Wrap(output.ErrUsage)
 	}
 
+	// Every committed manifest is signed; without the operator's
+	// verifier each one fails verification and the search answers
+	// "0 hits" on a populated repository. Same keyring `list` uses.
+	verifier, err := loadVerifier()
+	if err != nil {
+		return err
+	}
+
 	_, sp, err := openRepo(cmd.Context(), opts.repoURL)
 	if err != nil {
 		return err
 	}
 	defer sp.Close()
 
-	hits, err := search.Search(cmd.Context(), sp, q, search.SearchOptions{Limit: opts.limit})
+	res, err := search.Search(cmd.Context(), sp, q, search.SearchOptions{
+		Limit:    opts.limit,
+		Verifier: verifier,
+	})
 	if err != nil {
 		return output.NewError("fleet.search_failed",
 			fmt.Sprintf("fleet search: %v", err)).Wrap(err)
 	}
 
 	body := fleetSearchBody{
-		RepoURL: opts.repoURL,
-		Query:   q.String(),
-		Hits:    hits,
-		Count:   len(hits),
+		RepoURL:    opts.repoURL,
+		Query:      q.String(),
+		Hits:       res.Hits,
+		Count:      len(res.Hits),
+		Unreadable: res.Unreadable,
 	}
 	return d.Result(output.NewResult(cmd.CommandPath()).WithBody(body))
 }
@@ -129,12 +144,20 @@ type fleetSearchBody struct {
 	Query   string       `json:"query"`
 	Hits    []search.Hit `json:"hits"`
 	Count   int          `json:"count"`
+	// Unreadable counts manifests that failed to read or verify and so
+	// could not be matched: non-zero means the hit list may be
+	// incomplete. Always emitted so a JSON consumer can tell "0 hits"
+	// from "0 hits because nothing verified".
+	Unreadable int `json:"unreadable"`
 }
 
 // WriteText renders the fleet search hits as a tabular summary to w.
 func (b fleetSearchBody) WriteText(w io.Writer) error {
 	bw := &strings.Builder{}
 	fmt.Fprintf(bw, "fleet search — %s\n  query: %s\n  hits:  %d\n", b.RepoURL, b.Query, b.Count)
+	if b.Unreadable > 0 {
+		fmt.Fprintf(bw, "  WARNING: %d manifest(s) could not be read or verified and were not searched; results may be incomplete\n", b.Unreadable)
+	}
 	if b.Count == 0 {
 		_, err := io.WriteString(w, strings.TrimRight(bw.String(), "\n"))
 		return err

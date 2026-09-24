@@ -41,14 +41,26 @@ pg_hardstorage audit export-bundle \
 ### Verify
 
 ```sh
+# On the host that exported it (trusts this host's keyring key):
 pg_hardstorage audit verify-bundle ./acme-april-2026.tar.gz
+
+# Anywhere else: name the exporter's key, obtained out of band.
+pg_hardstorage audit verify-bundle ./acme-april-2026.tar.gz \
+    --trusted-key ./acme-signing.pub          # or --trusted-fingerprint <sha256 hex>
 ```
 
 The verifier extracts the tarball, reconstructs the
-canonical signing input, and verifies the Ed25519
-signature against the embedded public key. A non-zero
-exit means the bundle has been tampered with after
-export.
+canonical signing input, verifies the Ed25519 signature
+against the embedded public key, checks the event chain,
+and finally requires that embedded key to be **trusted**.
+The embedded key alone proves nothing about origin — anyone
+can rewrite the events and re-sign under a fresh key — so
+by default only the verifying host's own keyring key is
+trusted; `--trusted-key` / `--trusted-fingerprint`
+(repeatable) replace that default. A validly signed bundle
+from an untrusted key exits 9 with
+`verify.bundle_untrusted_signer`; any other non-zero exit
+means the bundle has been tampered with after export.
 
 ---
 

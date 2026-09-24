@@ -56,7 +56,11 @@ func (s *Server) refreshScrapeGauges() {
 		string(JobFailed):    0,
 		string(JobCancelled): 0,
 	}
-	jobs, err := s.jobs.List(ListOptions{})
+	// An aggregate, not s.jobs.List: /metrics is unauthenticated, and
+	// listing every job (args, results, progress arrays) per scrape let
+	// anyone who can reach the port make the control plane read its
+	// whole job table on demand.
+	byState, err := s.jobs.CountByState()
 	if err != nil {
 		// Do not publish `counts`: it is seeded to zero for every state
 		// so an idle control plane still emits the full series set, and
@@ -64,8 +68,8 @@ func (s *Server) refreshScrapeGauges() {
 		// nothing running" about a backend we could not read.
 		metrics.SetJobsCensusFailed(true)
 	} else {
-		for _, j := range jobs {
-			counts[string(j.State)]++
+		for st, n := range byState {
+			counts[string(st)] += n
 		}
 		metrics.SetJobsByState(counts)
 		metrics.SetJobsCensusFailed(false)
@@ -98,7 +102,7 @@ func withHTTPMetrics(next http.Handler) http.Handler {
 		sr := &statusRecorder{ResponseWriter: w, code: http.StatusOK}
 		route := routeLabel(r.URL.Path)
 		next.ServeHTTP(sr, r)
-		metrics.HTTPRequest(route, r.Method, codeLabel(sr.code), time.Since(start).Seconds())
+		metrics.HTTPRequest(route, methodLabel(r.Method), codeLabel(sr.code), time.Since(start).Seconds())
 	})
 }
 
@@ -121,6 +125,20 @@ func routeLabel(path string) string {
 		return "agents"
 	case strings.HasPrefix(path, "/v1/jobs"):
 		return "jobs"
+	default:
+		return "other"
+	}
+}
+
+// methodLabel folds the request method to a fixed set. The method is
+// client-chosen and the endpoint unauthenticated, so labelling on it
+// verbatim let anyone mint an unbounded number of series (one per
+// invented method) and grow the registry without limit.
+func methodLabel(m string) string {
+	switch m {
+	case http.MethodGet, http.MethodHead, http.MethodPost, http.MethodPut,
+		http.MethodPatch, http.MethodDelete, http.MethodOptions:
+		return m
 	default:
 		return "other"
 	}

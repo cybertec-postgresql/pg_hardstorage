@@ -30,7 +30,7 @@ you want:
 
 | Expression | Meaning |
 | --- | --- |
-| `every 6h` | Every six hours, starting from agent boot. |
+| `every 6h` | Every six hours, counted from the task's last run (a never-run task fires as soon as the agent starts). |
 | `daily_at 02:00` | Every day at 02:00 in the agent host's **local time zone**. |
 | `at 2026-04-28T02:00:00Z` | One-shot at the exact RFC3339 moment. |
 | `off` | Clear the schedule (the task no longer fires). |
@@ -42,6 +42,22 @@ spanning time zones, either run the agents with `TZ=UTC` or use
 timestamps carry their own offset (RFC3339). We deliberately avoid
 cron syntax — it's a bug-magnet and one of the highest-friction
 surfaces in backup tooling.
+
+**Restarts.** The agent records each task's last run in
+`<state dir>/agent-schedule.json` and resumes from it on start, so a
+restart never pushes a task out:
+
+- `every` — next run is *last run + interval*; if that moment passed
+  while the agent was down, or the task has never run, it fires
+  immediately.
+- `daily_at` — keeps its slot; if a slot was missed while the agent
+  was down, it fires once immediately, then returns to the slot.
+- `at` — a one-shot that already ran is not re-run.
+
+An unreadable state file is reported (`schedule.state_unreadable`
+event) and treated as empty, so tasks err toward running now rather
+than later; a failed write is reported as
+`schedule.state_write_failed`.
 
 ## Steps
 
@@ -174,8 +190,8 @@ deployments:
 ```
 
 For deeply staggered bursts (every 6h with offset), use
-`every: "6h"` — the agent's tick is wall-clock-aligned so
-restarts don't reset the cadence.
+`every: "6h"` — the cadence is resumed from the persisted last
+run, so restarts don't reset it.
 
 ## Schedules and the LLM helper
 

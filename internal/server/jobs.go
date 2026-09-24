@@ -121,9 +121,17 @@ type ListOptions struct {
 
 // ClaimOptions tunes Claim.
 type ClaimOptions struct {
-	AgentID     string
+	AgentID string
+	// Deployments is the set of deployment names the claiming agent
+	// manages. It is an allowlist: an EMPTY set matches NOTHING (the
+	// claim returns ErrNoJobs). An agent that declares no deployments
+	// has nothing it can back up or restore, so "empty = any" would
+	// only let a misconfigured agent drain -- and fail -- every
+	// deployment's queue.
 	Deployments []string
-	Kinds       []JobKind
+	// Kinds filters by job kind. Empty matches every kind: agents that
+	// predate kind advertisement send none and still run backups.
+	Kinds []JobKind
 
 	// MaxConcurrent caps how many jobs may be in JobRunning state at
 	// once. A claim is refused with ErrNoJobs once the running count
@@ -315,6 +323,12 @@ func (r *JobRegistry) Get(id string) (*Job, error) {
 // metrics scrape published as an all-zero census.
 func (r *JobRegistry) List(opts ListOptions) ([]Job, error) {
 	return r.backend.List(context.Background(), opts)
+}
+
+// CountByState returns the per-state job census (see
+// JobBackend.CountByState).
+func (r *JobRegistry) CountByState() (map[JobState]int, error) {
+	return r.backend.CountByState(context.Background())
 }
 
 // Claim atomically transitions the oldest queued job matching opts

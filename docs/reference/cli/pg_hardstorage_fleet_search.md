@@ -32,7 +32,10 @@ Examples:
   fleet search --query 'deployment:db1 type:full since:7d' --repo s3://...
   fleet search --query 'pg_version:17 timeline:3'         --repo file:///srv/...
 
-Tombstoned (soft-deleted) manifests are excluded.
+Tombstoned (soft-deleted) manifests are excluded. Manifests are
+signature-verified with the local keyring (as list does); any that
+cannot be read or verified are counted as "unreadable" and flagged,
+because the hit list is then incomplete.
 
 ```
 pg_hardstorage fleet search --query '<expr>' --repo <url> [flags]

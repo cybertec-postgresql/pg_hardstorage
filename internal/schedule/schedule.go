@@ -28,11 +28,13 @@
 //     stop. A transient backup failure must not silently kill the
 //     scheduler.
 //
-//   - LastRun is in-memory only in v0.1. On agent restart every task
-//     is "due now" and runs immediately. Persistent scheduling lands
-//     via pg_timetable integration — operators already running
-//     PG (everyone) get a PG-native scheduler, audited via SQL, with
-//     no embedded-DB sidecar.
+//   - LastRun persists across restarts when the engine is given a
+//     LastRunStore (the agent uses a JSON file in its state dir). A
+//     restart then resumes each task's cadence from its last run; a
+//     slot missed while down, or an `every` task that never ran, is
+//     due immediately. Without a store the engine schedules from
+//     "now", which starves `every` tasks on an agent restarted more
+//     often than their interval — see WithLastRunStore.
 package schedule
 
 import (

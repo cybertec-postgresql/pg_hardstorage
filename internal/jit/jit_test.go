@@ -473,6 +473,26 @@ func TestVerifyAt_TenantMismatch(t *testing.T) {
 	}
 }
 
+// TestVerifyAt_TenantBoundTokenRefusedForTenantlessOp: a token bound
+// to tenant A must not authorise an operation that names no tenant --
+// a tenant-less op (e.g. a repo-wide action) is not "tenant A's", and
+// skipping the check turned a tenant-scoped grant into a fleet-wide
+// one.
+func TestVerifyAt_TenantBoundTokenRefusedForTenantlessOp(t *testing.T) {
+	w := setupJITWorld(t)
+	tok, _ := jit.Issue(w.signer, jit.IssueOptions{
+		Principal: "p", Scope: []string{"kms.shred"}, Reason: "r",
+		Duration: time.Hour, Tenant: "tenant-a",
+	})
+	_ = w.store.Put(context.Background(), tok)
+	err := jit.VerifyAt(context.Background(), w.store, w.resolver, tok, jit.CheckOptions{
+		Operation: "kms.shred",
+	})
+	if !errors.Is(err, jit.ErrTenantMismatch) {
+		t.Errorf("err = %v, want ErrTenantMismatch", err)
+	}
+}
+
 // TestVerifyAt_TenantAgnosticToken
 func TestVerifyAt_TenantAgnosticToken(t *testing.T) {
 	w := setupJITWorld(t)

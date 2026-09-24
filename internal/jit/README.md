@@ -8,10 +8,14 @@ break-glass operations.
 An operator with standing authority issues a token (`jit issue <principal>
 --scope kms.shred --duration 1h --reason ...`). The token is signed with the
 operator's ed25519 manifest-signing key, persisted at `jit/<id>.json` in the
-repo, and stamped into the audit chain. The principal redeems the token on a
-destructive command; the command verifies signature + expiry + scope +
-revocation marker. Revocation drops a `<id>.json.revoked` sentinel that every
-redeem path checks.
+repo, and stamped into the audit chain. `jit verify` checks signature + expiry
++ scope + tenant + revocation marker (a tenant-bound token never verifies for
+an operation in another tenant or in no tenant). Revocation drops a
+`<id>.json.revoked` sentinel that verification checks.
+
+Not yet wired: destructive commands do not accept a `--jit-token` or call
+`VerifyAt`; they are gated by approvals (`../approval/`). Until that lands a
+token is advisory, checked by `jit verify` in operator tooling.
 
 ## Key files
 

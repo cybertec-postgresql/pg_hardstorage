@@ -188,13 +188,16 @@ func newApprovalRequestCmd() *cobra.Command {
 	_ = c.MarkFlagRequired("repo")
 	c.Flags().StringVar(&op, "op", "", "namespaced op being approved (e.g. backup.delete, kms.shred) (required)")
 	_ = c.MarkFlagRequired("op")
-	c.Flags().StringVar(&target, "target", "", "target identifier (e.g. a backup ID)")
+	c.Flags().StringVar(&target, "target", "",
+		"target the destructive op will act on, exactly as that command names it (backup ID, repo URL, keyring dir) (required)")
+	_ = c.MarkFlagRequired("target")
 	c.Flags().StringVar(&reason, "reason", "", "free-form reason for the destructive op")
 	c.Flags().StringVar(&tenant, "tenant", "", "tenant scope")
-	c.Flags().IntVar(&threshold, "threshold", 2, "number of distinct approvals required (≥ 1)")
+	c.Flags().IntVar(&threshold, "threshold", 2,
+		"number of distinct approvals required (≥ 1, and ≥ the operator minimum "+approval.EnvMinThreshold+", default 2)")
 	DurationDaysVar(c.Flags(), &ttl, "ttl", 24*time.Hour, "how long this request stays approvable")
 	c.Flags().StringArrayVar(&approverKeys, "approver-key", nil,
-		"path to an approver's ed25519 public-key PEM (repeatable; need at least --threshold)")
+		"path to an approver's ed25519 public-key PEM (repeatable; need at least --threshold; each must be on the trusted roster "+approval.EnvRoster+")")
 	return c
 }
 
@@ -214,13 +217,23 @@ func runApprovalRequest(cmd *cobra.Command, repoURL, op, target, reason, tenant 
 		keys = append(keys, body)
 	}
 
+	// The gate only counts votes from the operator's trusted roster and
+	// floors the threshold at the configured minimum. Checking the same
+	// policy here refuses a request that could never be redeemed,
+	// instead of letting approvers sign it first.
+	policy, perr := approval.LoadPolicy()
+	if perr != nil {
+		return output.NewError("config.approval_policy_invalid",
+			fmt.Sprintf("approval request: %v", perr)).Wrap(perr)
+	}
+
 	repoMeta, sp, err := openRepo(cmd.Context(), repoURL)
 	if err != nil {
 		return err
 	}
 	defer sp.Close()
 
-	store := approval.NewStore(sp)
+	store := approval.NewStore(sp).WithPolicy(policy)
 	req, err := store.Create(cmd.Context(), approval.CreateOptions{
 		Op:           approval.Op(op),
 		Initiator:    initiatorFromEnv(),
@@ -232,8 +245,7 @@ func runApprovalRequest(cmd *cobra.Command, repoURL, op, target, reason, tenant 
 		TTL:          ttl,
 	})
 	if err != nil {
-		return output.NewError("approval.create_failed",
-			fmt.Sprintf("approval request: %v", err)).Wrap(err)
+		return mapApprovalPolicyError("approval request", err)
 	}
 
 	// Audit-chain emission — best-effort; failure surfaces as a
@@ -272,6 +284,29 @@ func runApprovalRequest(cmd *cobra.Command, repoURL, op, target, reason, tenant 
 		CreatedAt:    req.CreatedAt,
 		ExpiresAt:    req.ExpiresAt,
 	}))
+}
+
+// mapApprovalPolicyError maps the approval-policy refusals to structured
+// CLI errors; anything else is a generic create failure.
+func mapApprovalPolicyError(opName string, err error) error {
+	rosterHint := &output.Suggestion{
+		Human: "put each trusted approver's ed25519 public-key PEM in <config-dir>/approvers/ " +
+			"(or point " + approval.EnvRoster + " at a directory or PEM file); the roster is read " +
+			"on the host running the destructive op, never from the repository",
+	}
+	switch {
+	case errors.Is(err, approval.ErrNoTrustedRoster):
+		return output.NewError("config.approval_roster_missing",
+			fmt.Sprintf("%s: %v", opName, err)).WithSuggestion(rosterHint).Wrap(err)
+	case errors.Is(err, approval.ErrUntrustedApprover):
+		return output.NewError("auth.approver_untrusted",
+			fmt.Sprintf("%s: %v", opName, err)).WithSuggestion(rosterHint).Wrap(err)
+	case errors.Is(err, approval.ErrBelowMinThreshold):
+		return output.NewError("usage.threshold_below_policy",
+			fmt.Sprintf("%s: %v", opName, err)).Wrap(output.ErrUsage)
+	}
+	return output.NewError("approval.create_failed",
+		fmt.Sprintf("%s: %v", opName, err)).Wrap(err)
 }
 
 func newApprovalApproveCmd() *cobra.Command {
@@ -416,6 +451,7 @@ func runApprovalStatus(cmd *cobra.Command, id, repoURL string) error {
 		ApprovalCount: count,
 		Status:        string(st),
 		ExpiresAt:     req.ExpiresAt,
+		ConsumedAt:    req.ConsumedAt,
 	}
 	for _, a := range req.Approvals {
 		body.Approvals = append(body.Approvals, approvalEntry{
@@ -679,6 +715,7 @@ type approvalStatusBody struct {
 	ApprovalCount int             `json:"approval_count"`
 	Status        string          `json:"status"`
 	ExpiresAt     time.Time       `json:"expires_at"`
+	ConsumedAt    *time.Time      `json:"consumed_at,omitempty"`
 	Approvals     []approvalEntry `json:"approvals,omitempty"`
 }
 
@@ -720,6 +757,9 @@ func (b approvalStatusBody) WriteText(w io.Writer) error {
 	}
 	fmt.Fprintf(bw, "  Status:       %s (%d/%d approvals)\n", b.Status, b.ApprovalCount, b.Threshold)
 	fmt.Fprintf(bw, "  Expires:      %s\n", b.ExpiresAt.Format(time.RFC3339))
+	if b.ConsumedAt != nil {
+		fmt.Fprintf(bw, "  Redeemed:     %s (single-use; cannot authorise another op)\n", b.ConsumedAt.Format(time.RFC3339))
+	}
 	if len(b.Approvals) > 0 {
 		fmt.Fprintf(bw, "  Approvals:\n")
 		tw := tabwriter.NewWriter(bw, 0, 0, 2, ' ', 0)

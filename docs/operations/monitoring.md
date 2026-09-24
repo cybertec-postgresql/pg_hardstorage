@@ -38,7 +38,12 @@ format (`text/plain; version=0.0.4`):
   `/healthz`/`/readyz`), so a scraper needs no operator bearer
   token. It carries control-plane state: HTTP-request counters,
   job counts by state, agent liveness, configured-repo count,
-  and build info.
+  and build info. Because anyone who can reach the port can
+  scrape it, a scrape is kept cheap and bounded: the job census
+  is one aggregate count per state (not a read of every job),
+  and the HTTP `method` label folds non-standard methods to
+  `other`. Restrict who reaches it with mTLS or a private
+  interface if the aggregate counts themselves are sensitive.
 - **Agent** — opt-in. Start the agent with
   `--metrics-listen <host:port>` (empty disables it; a loopback
   bind such as `127.0.0.1:9187` is the safe default). The chosen

@@ -206,9 +206,12 @@ func NewStore(sp storage.StoragePlugin, opts ...StoreOption) *Store {
 
 // ----- User CRUD -----
 
-// CreateUser persists a new user.  Generates the ID + Meta if
-// the caller didn't.  Refuses duplicates (matches by userName,
-// case-insensitive per RFC 7643 §3.4.1).
+// CreateUser persists a new user.  The ID is always server-assigned
+// (RFC 7643 §3.1): a client-supplied id is ignored, because honouring
+// it let a create name an EXISTING user's id and overwrite that
+// record.  The write is create-only (IfNotExists) as a second guard.
+// Refuses duplicates (matches by userName, case-insensitive per
+// RFC 7643 §3.4.1).
 func (s *Store) CreateUser(ctx context.Context, u *User) (*User, error) {
 	if u == nil || u.UserName == "" {
 		return nil, fmt.Errorf("%w: userName required", ErrInvalidPayload)
@@ -228,9 +231,7 @@ func (s *Store) CreateUser(ctx context.Context, u *User) (*User, error) {
 	}
 
 	now := s.now().UTC()
-	if u.ID == "" {
-		u.ID = newID(now, u.UserName)
-	}
+	u.ID = newID(now, u.UserName)
 	u.Schemas = []string{SchemaUser}
 	u.Meta = Meta{
 		ResourceType: "User",
@@ -238,7 +239,7 @@ func (s *Store) CreateUser(ctx context.Context, u *User) (*User, error) {
 		LastModified: now,
 		Location:     "/scim/v2/Users/" + u.ID,
 	}
-	if err := s.putUserLocked(ctx, u); err != nil {
+	if err := s.putUserLocked(ctx, u, true); err != nil {
 		return nil, err
 	}
 	return u, nil
@@ -284,7 +285,7 @@ func (s *Store) ReplaceUser(ctx context.Context, id string, u *User) (*User, err
 		LastModified: now,
 		Location:     existing.Meta.Location,
 	}
-	if err := s.putUserLocked(ctx, u); err != nil {
+	if err := s.putUserLocked(ctx, u, false); err != nil {
 		return nil, err
 	}
 	return u, nil
@@ -310,7 +311,7 @@ func (s *Store) PatchUser(ctx context.Context, id string, ops []PatchOperation) 
 	}
 	now := s.now().UTC()
 	u.Meta.LastModified = now
-	if err := s.putUserLocked(ctx, u); err != nil {
+	if err := s.putUserLocked(ctx, u, false); err != nil {
 		return nil, err
 	}
 	return u, nil
@@ -407,9 +408,8 @@ func (s *Store) CreateGroup(ctx context.Context, g *Group) (*Group, error) {
 		}
 	}
 	now := s.now().UTC()
-	if g.ID == "" {
-		g.ID = newID(now, g.DisplayName)
-	}
+	// Server-assigned, create-only: see CreateUser.
+	g.ID = newID(now, g.DisplayName)
 	g.Schemas = []string{SchemaGroup}
 	g.Meta = Meta{
 		ResourceType: "Group",
@@ -417,7 +417,7 @@ func (s *Store) CreateGroup(ctx context.Context, g *Group) (*Group, error) {
 		LastModified: now,
 		Location:     "/scim/v2/Groups/" + g.ID,
 	}
-	if err := s.putGroupLocked(ctx, g); err != nil {
+	if err := s.putGroupLocked(ctx, g, true); err != nil {
 		return nil, err
 	}
 	return g, nil
@@ -463,7 +463,7 @@ func (s *Store) ReplaceGroup(ctx context.Context, id string, g *Group) (*Group, 
 		LastModified: now,
 		Location:     existing.Meta.Location,
 	}
-	if err := s.putGroupLocked(ctx, g); err != nil {
+	if err := s.putGroupLocked(ctx, g, false); err != nil {
 		return nil, err
 	}
 	return g, nil
@@ -484,7 +484,7 @@ func (s *Store) PatchGroup(ctx context.Context, id string, ops []PatchOperation)
 		}
 	}
 	g.Meta.LastModified = s.now().UTC()
-	if err := s.putGroupLocked(ctx, g); err != nil {
+	if err := s.putGroupLocked(ctx, g, false); err != nil {
 		return nil, err
 	}
 	return g, nil
@@ -568,7 +568,9 @@ func (s *Store) read(ctx context.Context, key string) ([]byte, error) {
 	return io.ReadAll(rd)
 }
 
-func (s *Store) putUserLocked(ctx context.Context, u *User) error {
+// putUserLocked writes u. create=true makes the write create-only
+// (IfNotExists), so a create can never replace an existing resource.
+func (s *Store) putUserLocked(ctx context.Context, u *User, create bool) error {
 	key, err := userKeyForID(u.ID)
 	if err != nil {
 		return err
@@ -579,14 +581,19 @@ func (s *Store) putUserLocked(ctx context.Context, u *User) error {
 	}
 	_, err = s.sp.Put(ctx, key,
 		strings.NewReader(string(body)),
-		storage.PutOptions{ContentLength: int64(len(body))})
+		storage.PutOptions{ContentLength: int64(len(body)), IfNotExists: create})
+	if errors.Is(err, storage.ErrAlreadyExists) {
+		return fmt.Errorf("%w: user id %q already exists", ErrConflict, u.ID)
+	}
 	if err != nil {
 		return fmt.Errorf("scim: put user: %w", err)
 	}
 	return nil
 }
 
-func (s *Store) putGroupLocked(ctx context.Context, g *Group) error {
+// putGroupLocked writes g. create=true makes the write create-only
+// (IfNotExists), so a create can never replace an existing resource.
+func (s *Store) putGroupLocked(ctx context.Context, g *Group, create bool) error {
 	key, err := groupKeyForID(g.ID)
 	if err != nil {
 		return err
@@ -597,7 +604,10 @@ func (s *Store) putGroupLocked(ctx context.Context, g *Group) error {
 	}
 	_, err = s.sp.Put(ctx, key,
 		strings.NewReader(string(body)),
-		storage.PutOptions{ContentLength: int64(len(body))})
+		storage.PutOptions{ContentLength: int64(len(body)), IfNotExists: create})
+	if errors.Is(err, storage.ErrAlreadyExists) {
+		return fmt.Errorf("%w: group id %q already exists", ErrConflict, g.ID)
+	}
 	if err != nil {
 		return fmt.Errorf("scim: put group: %w", err)
 	}

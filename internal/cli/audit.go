@@ -319,8 +319,8 @@ and incident review:
   # All backup-namespace actions in the last week
   audit summary --repo <url> --since 7d --action-prefix backup.
 
-  # Per-tenant deletion volume
-  audit summary --repo <url> --since 720h --action backup.delete
+  # Deletion volume per action under backup.delete
+  audit summary --repo <url> --since 720h --action-prefix backup.delete
 
 The result is a map of action → count plus a total, rendered as
 a JSON body or a tabular text view.`,
@@ -501,6 +501,13 @@ func runAuditVerifyChain(cmd *cobra.Command, repoURL string) error {
 		OK:                 res.OK,
 	}
 	if !res.OK {
+		// Render the findings FIRST: the error message only carries
+		// counts, and which events mismatch / break / are misfiled is
+		// exactly what the operator needs to start investigating.
+		// Returning the error alone dropped that list.
+		if err := d.Result(output.NewResult(cmd.CommandPath()).WithBody(body)); err != nil {
+			return err
+		}
 		// verify.* namespace → ExitVerifyFailed (9). Tampered audit
 		// log is a real corruption finding.
 		return output.NewError("verify.audit_chain_broken",

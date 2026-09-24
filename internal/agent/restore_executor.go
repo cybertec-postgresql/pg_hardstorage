@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup"
@@ -38,10 +40,15 @@ import (
 //	  "to_action":  "pause"|"promote"|"shutdown",
 //	  "to_timeline": "latest"|"<n>",
 //	  "to_inclusive": true,                   // PG default: true
+//	  "to_latest":  true,                     // replay the whole archive (no target)
+//	  "skip_gap_check": false,                // --skip-gap-check override
+//	  "allow_foreign_cluster": false,         // --force-foreign
+//	  "tablespace_mapping": ["/old=/new"],
+//	  "restore_roots": ["/srv/restores"],     // stamped by the server, not the client
 //	  "verify_after": true                    // pg_verifybackup gate
 //	}
 //
-// At most one of to / to_lsn / to_name may be set; the executor
+// At most one of to / to_lsn / to_name / to_latest may be set; the executor
 // surfaces a structured error otherwise so the operator gets a
 // parseable code rather than a half-finished restore.
 type RestoreExecutor struct {
@@ -138,6 +145,25 @@ func (e *RestoreExecutor) Execute(ctx context.Context, job *ControlPlaneJob, pro
 	if err != nil {
 		return nil, err
 	}
+	// Write-root gate. target_dir and every tablespace destination are
+	// directories this restore creates and fills, so they are checked
+	// together against the control plane's restore_roots (stamped into
+	// the job by the enqueue route; absent = unconstrained). Re-checked
+	// here rather than trusted from the route so a job queued by a
+	// control plane that skipped the check -- an older release checked
+	// only target_dir -- still cannot write a tablespace into /etc.
+	roots, err := restoreRootsArg(job.Args["restore_roots"])
+	if err != nil {
+		return nil, err
+	}
+	if err := checkRestoreWriteRoot("target_dir", targetDir, roots); err != nil {
+		return nil, err
+	}
+	for _, m := range tsRemap {
+		if err := checkRestoreWriteRoot("tablespace_mapping destination", m.New, roots); err != nil {
+			return nil, err
+		}
+	}
 
 	// Parse the `to` time target ONCE, here, and reuse it for both seed
 	// resolution and the armed recovery_target_time (buildRecoveryFromArgs).
@@ -199,6 +225,12 @@ func (e *RestoreExecutor) Execute(ctx context.Context, job *ControlPlaneJob, pro
 	}
 
 	allowOverwrite, _ := job.Args["allow_overwrite"].(bool)
+	// allow_foreign_cluster is the CLI's --force-foreign: with
+	// allow_overwrite, also replace a target holding a DIFFERENT cluster.
+	allowForeign, err := boolArg(job.Args, "allow_foreign_cluster")
+	if err != nil {
+		return nil, err
+	}
 
 	rec, err := buildRecoveryFromArgs(job.Args, targetTime)
 	if err != nil {
@@ -250,15 +282,16 @@ func (e *RestoreExecutor) Execute(ctx context.Context, job *ControlPlaneJob, pro
 	}
 
 	res, err := restore.Restore(ctx, restore.Options{
-		RepoURL:         repoURL,
-		Deployment:      job.Deployment,
-		BackupID:        backupID,
-		TargetDir:       targetDir,
-		Verifier:        e.verifier,
-		AllowOverwrite:  allowOverwrite,
-		Recovery:        rec,
-		TablespaceRemap: tsRemap,
-		KEKForRef:       kekFor,
+		RepoURL:             repoURL,
+		Deployment:          job.Deployment,
+		BackupID:            backupID,
+		TargetDir:           targetDir,
+		Verifier:            e.verifier,
+		AllowOverwrite:      allowOverwrite,
+		AllowForeignCluster: allowForeign,
+		Recovery:            rec,
+		TablespaceRemap:     tsRemap,
+		KEKForRef:           kekFor,
 		// Cloud-KMS-encrypted backups unwrap the DEK server-side. Provider
 		// settings come from the config's `kms.providers` entry for the
 		// manifest's own KEKRef, falling back to the host's ambient cloud
@@ -347,7 +380,22 @@ func buildRecoveryFromArgs(args map[string]any, targetTime time.Time) (*restore.
 	hasLSN := toLSN != ""
 	hasTime := toTime != ""
 	hasName := toName != ""
-	if !hasLSN && !hasTime && !hasName {
+	// to_latest mirrors the CLI's --to-latest: arm recovery with NO
+	// target, which PG defines as replay-to-end-of-archive. Without it
+	// a dispatched DR restore booted with only the WAL bundled in the
+	// backup and silently ignored everything archived since.
+	toLatest, err := boolArg(args, "to_latest")
+	if err != nil {
+		return nil, err
+	}
+	skipGap, err := boolArg(args, "skip_gap_check")
+	if err != nil {
+		return nil, err
+	}
+	if toLatest && (hasLSN || hasTime || hasName) {
+		return nil, errors.New("restore-executor: to_latest recovers through ALL archived WAL and cannot be combined with to, to_lsn or to_name")
+	}
+	if !hasLSN && !hasTime && !hasName && !toLatest {
 		// No PITR target → caller wants a plain full restore.
 		// Skip recovery configuration entirely; PG will start as a
 		// fresh primary.
@@ -367,7 +415,8 @@ func buildRecoveryFromArgs(args map[string]any, targetTime time.Time) (*restore.
 		return nil, errors.New("restore-executor: at most one of to, to_lsn, to_name may be set")
 	}
 	r := &restore.Recovery{
-		Enable: true,
+		Enable:       true,
+		SkipGapCheck: skipGap,
 	}
 	// Inclusive defaults to true (matches PG's own default + CLI's
 	// rendering). Operator opts out via "to_inclusive": false.
@@ -488,4 +537,71 @@ func parseTablespaceMappingArg(raw any) (restore.TablespaceRemap, error) {
 		return nil, fmt.Errorf("restore-executor: %w", err)
 	}
 	return rm, nil
+}
+
+// restoreRootsArg decodes the server-stamped restore_roots job arg (a
+// JSON array of absolute paths). Absent = no roots configured.
+func restoreRootsArg(raw any) ([]string, error) {
+	if raw == nil {
+		return nil, nil
+	}
+	var out []string
+	switch v := raw.(type) {
+	case []string:
+		out = v
+	case []any:
+		for i, e := range v {
+			s, ok := e.(string)
+			if !ok {
+				return nil, fmt.Errorf("restore-executor: restore_roots[%d] is not a string (%T)", i, e)
+			}
+			out = append(out, s)
+		}
+	default:
+		return nil, fmt.Errorf("restore-executor: restore_roots must be an array of paths, got %T", raw)
+	}
+	return out, nil
+}
+
+// checkRestoreWriteRoot refuses a restore write destination that is not
+// an absolute, already-normalised path, or (when roots is non-empty)
+// that is not at or under one of roots. Normalisation is required
+// rather than applied so "/srv/restores/../../etc" is refused outright
+// instead of being quietly compared as "/etc". Same rules as the
+// server's validateRestoreTargetDir.
+func checkRestoreWriteRoot(what, path string, roots []string) error {
+	if !filepath.IsAbs(path) {
+		return fmt.Errorf("restore-executor: %s %q must be absolute", what, path)
+	}
+	if clean := filepath.Clean(path); clean != path {
+		return fmt.Errorf("restore-executor: %s %q is not normalised (want %q)", what, path, clean)
+	}
+	if len(roots) == 0 {
+		return nil
+	}
+	for _, root := range roots {
+		rel, err := filepath.Rel(filepath.Clean(root), path)
+		if err != nil {
+			continue
+		}
+		if rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return nil
+		}
+	}
+	return fmt.Errorf("restore-executor: %s %q is outside the control plane's restore roots %v; refusing", what, path, roots)
+}
+
+// boolArg reads an optional boolean job arg. Absent is false; a
+// non-bool value is an error rather than a silent false, so a
+// malformed body cannot quietly drop a safety override.
+func boolArg(args map[string]any, key string) (bool, error) {
+	raw, ok := args[key]
+	if !ok || raw == nil {
+		return false, nil
+	}
+	b, ok := raw.(bool)
+	if !ok {
+		return false, fmt.Errorf("restore-executor: %s must be a bool, got %T", key, raw)
+	}
+	return b, nil
 }

@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"runtime"
 	"sort"
 	"strings"
@@ -51,8 +52,9 @@ import (
 //     declares both backup AND retention schedules per deployment).
 //   - Single process = single set of credentials, single audit
 //     stream, single source of "what's currently running."
-//   - Crash-only design fits — restart the agent and every task is
-//     immediately due (since v0.1 stores LastRun in-memory only).
+//   - Crash-only design fits — each task's last run is persisted in
+//     the state dir, so a restart resumes the cadence and anything
+//     that fell due while the agent was down runs immediately.
 //
 // systemd is the right wrapper around this binary, not a replacement
 // for the scheduler.
@@ -126,6 +128,18 @@ func runAgentControlPlane(cmd *cobra.Command, baseURL, tokenFile, agentID, metri
 			deployments = append(deployments, name)
 		}
 		sort.Strings(deployments)
+	}
+	// The deployment list is what the control plane matches claims
+	// against. An agent that manages nothing can run nothing, so
+	// refuse to start rather than poll forever (older control planes
+	// read an empty list as "any deployment" and handed this agent
+	// every job, which it then failed).
+	if len(deployments) == 0 {
+		return output.NewError("config.no_deployments",
+			"agent --control-plane: no deployments configured (add a `deployments:` block to pg_hardstorage.yaml naming the deployments this agent may run jobs for)").
+			WithSuggestion(&output.Suggestion{
+				Human: "see `pg_hardstorage init` for the Day-0 walkthrough",
+			})
 	}
 
 	if agentID == "" {
@@ -255,7 +269,23 @@ func runAgent(cmd *cobra.Command, dryRun bool, metricsListen string) error {
 		return err
 	}
 
+	// Persisted last-run times: without them every start schedules
+	// `every` tasks a full interval out, and an agent restarted more
+	// often than the interval never backs up. An unreadable record is
+	// reported and treated as empty (tasks run now, not later).
+	lastRuns, lrErr := schedule.OpenFileLastRunStore(
+		filepath.Join(p.State.Value, "agent-schedule.json"),
+		func(err error) {
+			_ = d.Event(cmd.Context(), output.NewEvent(output.SeverityWarning, "agent", "schedule.state_write_failed").
+				WithBody(map[string]any{"error": err.Error()}))
+		})
+	if lrErr != nil {
+		_ = d.Event(cmd.Context(), output.NewEvent(output.SeverityWarning, "agent", "schedule.state_unreadable").
+			WithBody(map[string]any{"error": lrErr.Error()}))
+	}
+
 	engine := schedule.New(
+		schedule.WithLastRunStore(lastRuns),
 		schedule.WithOnStart(func(name string, due time.Time) {
 			_ = d.Event(cmd.Context(), output.NewEvent(output.SeverityInfo, "agent", "task.started").
 				WithBody(map[string]any{"task": name, "due_at": due.UTC().Format(time.RFC3339)}))
@@ -543,6 +573,10 @@ func buildDrillTask(name string, dep config.DeploymentConfig, kmsCfg config.KMSC
 // Validates required deployment fields (PGConnection, Repo) up
 // front so the engine never registers a task that's guaranteed to
 // fail at firing time.
+// resolveAgentPaths is paths.Resolve with the default options; a
+// variable so tests can make fire-time resolution fail.
+var resolveAgentPaths = func() (*paths.Paths, error) { return paths.Resolve(paths.DefaultOptions()) }
+
 func buildBackupTask(name string, dep config.DeploymentConfig, kmsCfg config.KMSConfig, signer *backup.Signer, verifier *backup.Verifier) (*schedule.Task, error) {
 	if dep.PGConnection == "" {
 		return nil, errors.New("missing pg_connection")
@@ -571,17 +605,22 @@ func buildBackupTask(name string, dep config.DeploymentConfig, kmsCfg config.KMS
 			// an instance-profile refresh). The config snapshot itself
 			// is still read once at start: editing kms.providers or
 			// kek_ref needs an agent reload.
-			var enc *runner.EncryptionConfig
-			if p, perr := paths.Resolve(paths.DefaultOptions()); perr == nil {
-				var eerr error
-				enc, eerr = runner.ResolveEncryption(ctx, runner.EncryptionRequest{
-					KeyringDir: p.Keyring.Value,
-					KEKRef:     dep.KEKRef,
-					KMSConfig:  kmsCfg.ProviderConfig(dep.KEKRef),
-				})
-				if eerr != nil {
-					return fmt.Errorf("agent backup %s: %w", name, eerr)
-				}
+			//
+			// A paths failure fails the run: without the keyring
+			// location the encryption posture is unknown, and guessing
+			// "plaintext" is how an encrypted repo gets unencrypted
+			// backups.
+			p, perr := resolveAgentPaths()
+			if perr != nil {
+				return fmt.Errorf("agent backup %s: resolve keyring path (refusing to back up with an unknown encryption posture): %w", name, perr)
+			}
+			enc, eerr := runner.ResolveEncryption(ctx, runner.EncryptionRequest{
+				KeyringDir: p.Keyring.Value,
+				KEKRef:     dep.KEKRef,
+				KMSConfig:  kmsCfg.ProviderConfig(dep.KEKRef),
+			})
+			if eerr != nil {
+				return fmt.Errorf("agent backup %s: %w", name, eerr)
 			}
 			if enc != nil && enc.Provider != nil {
 				defer enc.Provider.Close()

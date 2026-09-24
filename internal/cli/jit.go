@@ -43,9 +43,13 @@ operator's ed25519 signing key.  Use case: an operator under
 supervised access needs to perform a destructive operation
 (kms shred, repo gc --apply, etc.) without holding a permanent
 elevated token.  An admin issues a short-TTL token scoped to
-the specific operation; the operator passes the token to the
-destructive command; the audit chain records both issuance and
-consumption.
+the specific operation; the audit chain records issuance and
+revocation.
+
+Enforcement status: destructive commands do NOT yet accept or check
+a JIT token -- they are gated by --require-approval. Use
+"jit verify" to check a token (e.g. in a wrapper script) before
+running the command; a token alone does not authorise anything.
 
 Operationally:
 
@@ -55,8 +59,10 @@ Operationally:
         --reason "GDPR Art. 17 erasure request #4421" \
         --repo s3://acme
 
-    # operator consumes (future commit will wire --jit-token
-    # into kms shred + other destructive commands)
+    # operator (or a wrapper) checks the token, then runs the
+    # approval-gated command; kms shred does not take the token
+    pg_hardstorage jit verify --repo s3://acme \
+        --token <token> --operation kms.shred --tenant <tenant>
     pg_hardstorage kms shred --repo s3://acme \
         --confirm-keyring <keyring-dir> --require-approval <id> --yes
 
@@ -370,19 +376,41 @@ func runJitShow(cmd *cobra.Command, repoURL, id string) error {
 		return output.NewError("jit.get_failed",
 			fmt.Sprintf("jit show: %v", err)).Wrap(err)
 	}
-	revocation, _ := store.GetRevocation(cmd.Context(), id)
+	// ErrTokenNotFound from GetRevocation means "no marker" (not
+	// revoked). Any other error means we could not tell: discarding it
+	// reported a possibly-revoked token as active, the permissive
+	// answer on the surface used to confirm a revocation took effect.
+	// Render what we know with status unknown, then exit non-zero.
+	revocation, rerr := store.GetRevocation(cmd.Context(), id)
+	if errors.Is(rerr, jit.ErrTokenNotFound) {
+		rerr = nil
+	}
 	body := jitShowBody{
 		Token:           tok,
 		Revocation:      revocation,
 		EffectiveStatus: computeShowStatus(tok, revocation != nil),
 	}
-	return d.Result(output.NewResult(cmd.CommandPath()).WithBody(body))
+	if rerr != nil {
+		body.EffectiveStatus = jit.StatusUnknown
+		body.RevocationError = rerr.Error()
+	}
+	if err := d.Result(output.NewResult(cmd.CommandPath()).WithBody(body)); err != nil {
+		return err
+	}
+	if rerr != nil {
+		return output.NewError("jit.revocation_unknown",
+			fmt.Sprintf("jit show: token %s: revocation status could not be read: %v", id, rerr)).Wrap(rerr)
+	}
+	return nil
 }
 
 type jitShowBody struct {
 	Token           *jit.Token      `json:"token"`
 	Revocation      *jit.Revocation `json:"revocation,omitempty"`
 	EffectiveStatus jit.Status      `json:"effective_status"`
+	// RevocationError is set when the revocation marker could not be
+	// read; EffectiveStatus is then "unknown".
+	RevocationError string `json:"revocation_error,omitempty"`
 }
 
 // WriteText renders the full token body plus revocation status as
@@ -404,6 +432,9 @@ func (b jitShowBody) WriteText(w io.Writer) error {
 	fmt.Fprintf(bw, "  Reason:              %s\n", t.Reason)
 	fmt.Fprintf(bw, "  Public-key SHA-256:  %s\n", t.PublicKeyFingerprint)
 	fmt.Fprintf(bw, "  Effective status:    %s\n", b.EffectiveStatus)
+	if b.RevocationError != "" {
+		fmt.Fprintf(bw, "  Revocation check:    FAILED (%s)\n", b.RevocationError)
+	}
 	if b.Revocation != nil {
 		fmt.Fprintln(bw)
 		fmt.Fprintln(bw, "Revocation:")

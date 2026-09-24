@@ -120,7 +120,7 @@ deployment names) never become series.
 
 | Metric | Type | Labels | Meaning |
 | --- | --- | --- | --- |
-| `pg_hardstorage_http_requests_total` | counter | `route`, `method`, `code` | Control-plane HTTP requests served. |
+| `pg_hardstorage_http_requests_total` | counter | `route`, `method`, `code` | Control-plane HTTP requests served. `method` is one of `GET`, `HEAD`, `POST`, `PUT`, `PATCH`, `DELETE`, `OPTIONS`, or `other` for anything else, so client-chosen methods cannot mint unbounded series. |
 | `pg_hardstorage_http_request_duration_seconds` | histogram | `route` | Request handling latency. |
 | `pg_hardstorage_jobs` | gauge | `state` | Jobs known to the control plane by state (`queued`/`running`/`completed`/`failed`/`cancelled`); idle states report 0. |
 | `pg_hardstorage_agents` | gauge | `state` | Registered agents by liveness (`active`/`total`). |

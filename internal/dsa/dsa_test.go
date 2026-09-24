@@ -579,3 +579,44 @@ func stringContains(s, substr string) bool {
 func jsonMarshalIndent(v any, prefix, indent string) ([]byte, error) {
 	return json.MarshalIndent(v, prefix, indent)
 }
+
+// TestLocate_IncludesTombstonedBackups pins that a soft-deleted backup
+// is still located. A tombstone is recoverable (`backup undelete`) and
+// its chunks stay in the repository until GC, so the subject's data is
+// still held: an Article 15/17 report that omitted it would understate
+// what the controller holds. The entry is flagged Tombstoned so the
+// operator can tell the two apart.
+func TestLocate_IncludesTombstonedBackups(t *testing.T) {
+	f := newFixture(t)
+	now := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
+	f.commitTenantBackup(t, "db1", "tenant-a", "kms://acme/a", now.Add(-time.Hour), "1")
+	f.commitTenantBackup(t, "db1", "tenant-a", "kms://acme/a", now, "2")
+	deadID := "db1.full." + now.Add(-time.Hour).Format("20060102T150405Z") + ".1"
+	if err := f.manifests.SoftDelete(context.Background(), "db1", deadID, "test", "test"); err != nil {
+		t.Fatalf("SoftDelete: %v", err)
+	}
+
+	r, err := f.locator.Locate(context.Background(), dsa.LocateOptions{
+		SubjectID: "user-42", Tenant: "tenant-a", Article: dsa.ArticleAccess,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.ManifestsAffected != 2 || len(r.AffectedBackups) != 2 {
+		t.Fatalf("affected = %d (%d entries), want 2 incl. the tombstoned one", r.ManifestsAffected, len(r.AffectedBackups))
+	}
+	var sawDead bool
+	for _, ab := range r.AffectedBackups {
+		if ab.BackupID == deadID {
+			sawDead = true
+			if !ab.Tombstoned {
+				t.Errorf("%s: Tombstoned = false, want true", deadID)
+			}
+		} else if ab.Tombstoned {
+			t.Errorf("%s: live backup flagged Tombstoned", ab.BackupID)
+		}
+	}
+	if !sawDead {
+		t.Errorf("tombstoned backup %s missing from report", deadID)
+	}
+}

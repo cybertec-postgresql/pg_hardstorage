@@ -41,6 +41,34 @@ func genApproverKeys(t *testing.T, tmp, prefix string) (privPath, pubPath string
 	if err := os.WriteFile(pubPath, pubPEM, 0o644); err != nil {
 		t.Fatal(err)
 	}
+	// Enrol the key in this test's trusted-approver roster: the gate
+	// only counts votes from the operator's roster, so a key the tests
+	// generate must be on it. The minimum drops to 1 so the many 1-of-1
+	// fixtures keep exercising the flow they were written for; the
+	// default minimum of 2 is pinned by the approval package's tests.
+	rosterDir := filepath.Join(tmp, "trusted-approvers")
+	if err := os.MkdirAll(rosterDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(rosterDir, prefix+".pem"), pubPEM, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PG_HARDSTORAGE_APPROVAL_ROSTER", rosterDir)
+	t.Setenv("PG_HARDSTORAGE_APPROVAL_MIN_THRESHOLD", "1")
+	return privPath, pubPath
+}
+
+// genUntrustedApproverKeys is genApproverKeys without the roster
+// enrolment: a key only the request creator vouches for.
+func genUntrustedApproverKeys(t *testing.T, tmp, prefix string) (privPath, pubPath string) {
+	t.Helper()
+	sub := filepath.Join(tmp, "untrusted-"+prefix)
+	if err := os.MkdirAll(sub, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	rosterBefore := os.Getenv("PG_HARDSTORAGE_APPROVAL_ROSTER")
+	privPath, pubPath = genApproverKeys(t, sub, prefix)
+	t.Setenv("PG_HARDSTORAGE_APPROVAL_ROSTER", rosterBefore)
 	return privPath, pubPath
 }
 
@@ -174,6 +202,7 @@ func TestApproval_CLI_NotAllowedKey(t *testing.T) {
 		"approval", "request",
 		"--repo", repoURL,
 		"--op", "backup.delete",
+		"--target", "db1.full.20260427T0900Z",
 		"--threshold", "1",
 		"--approver-key", pubA,
 		"-o", "json",

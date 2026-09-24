@@ -73,6 +73,7 @@ func newDsaLocateCmd() *cobra.Command {
 		windowFrom string
 		windowTo   string
 		skipSign   bool
+		allowUnk   bool
 	)
 	c := &cobra.Command{
 		Use:          "locate",
@@ -83,6 +84,7 @@ func newDsaLocateCmd() *cobra.Command {
 				repoURL: repoURL, subjectID: subjectID, tenant: tenant,
 				article: article, note: note, deployment: deployment,
 				windowFrom: windowFrom, windowTo: windowTo, skipSign: skipSign,
+				allowUnknownTenant: allowUnk,
 			})
 		},
 	}
@@ -106,6 +108,8 @@ func newDsaLocateCmd() *cobra.Command {
 		"only backups stopped at/before this RFC3339 timestamp")
 	c.Flags().BoolVar(&skipSign, "skip-sign", false,
 		"compute the report but do not sign / persist it (testing)")
+	c.Flags().BoolVar(&allowUnk, "allow-unknown-tenant", false,
+		"sign a report even when no backup in scope carries --tenant (asserts the tenant holds nothing; default: refuse, since a typo would otherwise yield a signed zero report)")
 	return c
 }
 
@@ -119,6 +123,9 @@ type dsaLocateFlags struct {
 	windowFrom string
 	windowTo   string
 	skipSign   bool
+	// allowUnknownTenant permits a report for a tenant no manifest in
+	// scope carries -- see LocateOptions.RequireKnownTenant.
+	allowUnknownTenant bool
 }
 
 func runDsaLocate(cmd *cobra.Command, f dsaLocateFlags) error {
@@ -137,6 +144,11 @@ func runDsaLocate(cmd *cobra.Command, f dsaLocateFlags) error {
 		Article:    article,
 		Note:       f.note,
 		Deployment: f.deployment,
+		// A mistyped --tenant matches nothing and would sign a
+		// zero-affected report: the Article 17 instruction to shred
+		// nothing, filed as evidence the request was handled. Refused
+		// unless the operator explicitly asserts the tenant is empty.
+		RequireKnownTenant: !f.allowUnknownTenant,
 	}
 	if f.windowFrom != "" {
 		t, err := time.Parse(time.RFC3339, f.windowFrom)
@@ -176,6 +188,15 @@ func runDsaLocate(cmd *cobra.Command, f dsaLocateFlags) error {
 	ms := backup.NewManifestStore(sp)
 	loc := dsa.NewLocator(ms, verifier)
 	report, err := loc.Locate(cmd.Context(), opts)
+	if errors.Is(err, dsa.ErrUnknownTenant) {
+		return output.NewError("usage.unknown_tenant",
+			fmt.Sprintf("dsa locate: no backup in scope carries tenant %q", f.tenant)).
+			Wrap(output.ErrUsage).
+			WithSuggestion(&output.Suggestion{
+				Human: "check the spelling of --tenant (and --deployment); pass --allow-unknown-tenant " +
+					"only to certify that this tenant holds no backups at all",
+			})
+	}
 	if err != nil {
 		return output.NewError("dsa.locate_failed",
 			fmt.Sprintf("dsa locate: %v", err)).Wrap(err)
@@ -203,7 +224,23 @@ func runDsaLocate(cmd *cobra.Command, f dsaLocateFlags) error {
 			"deployments_affected": report.DeploymentsAffected,
 		},
 	})
-	return d.Result(output.NewResult(cmd.CommandPath()).WithBody(dsaReportBody{Report: report}))
+	if rerr := d.Result(output.NewResult(cmd.CommandPath()).WithBody(dsaReportBody{Report: report})); rerr != nil {
+		return rerr
+	}
+	// Body first (the report is real, signed, and records the shortfall
+	// in its signed bytes), then a non-zero exit: manifests that could
+	// not be read may hold the subject's data, so the report is not a
+	// complete answer to the request and automation must not file it
+	// as one.
+	if report.ManifestsUnreadable > 0 {
+		return output.NewError("verify.dsa_incomplete",
+			fmt.Sprintf("dsa locate: %d manifest(s) could not be read or verified; report %s is incomplete",
+				report.ManifestsUnreadable, report.ID)).
+			WithSuggestion(&output.Suggestion{
+				Human: "investigate the unreadable manifests (pg_hardstorage integrity run / repair manifest), then re-run dsa locate",
+			})
+	}
+	return nil
 }
 
 // ----- list -----
