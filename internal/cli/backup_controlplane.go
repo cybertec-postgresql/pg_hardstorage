@@ -37,11 +37,34 @@ func runBackupControlPlane(cmd *cobra.Command, opts runOptions) error {
 		return err
 	}
 
+	// Flags the agent cannot honour are refused, not dropped: each one
+	// changes what backup gets taken (or how safely), so a dispatch
+	// that ignored it would report success for a backup the operator
+	// did not ask for. Checked before anything is sent.
+	if err := refuseUnsupportedControlPlaneFlags(cmd, "backup", map[string]string{
+		"pg-connection":          "the agent connects with its own deployment config",
+		"kek":                    "the KEK comes from the agent's deployment kek_ref / keyring",
+		"kms-config":             "cloud-KMS settings come from the agent's own config (kms.providers)",
+		"tde":                    "source TDE is declared in the agent's deployment tde: block",
+		"tde-engine":             "source TDE is declared in the agent's deployment tde: block",
+		"tde-key-ref":            "source TDE is declared in the agent's deployment tde: block",
+		"allow-concurrent":       "the backup lease is governed by the agent's deployment config",
+		"ignore-capacity":        "the agent runs no capacity pre-flight to skip",
+		"capacity-safety-factor": "the agent runs no capacity pre-flight",
+		"verbose":                "per-file progress is not streamed through the control plane",
+	}); err != nil {
+		return err
+	}
+
 	// Body fields ride into Job.Args. The agent's BackupExecutor
 	// reads:
 	//   - fast (bool)
 	//   - label (string)
-	//   - inactivity_timeout (duration string)
+	//   - include_wal (bool)
+	//   - incremental_from (backup ID or "latest")
+	//   - stall_timeout (duration string; --stall-timeout)
+	//   - inactivity_timeout (duration string; API-only streaming
+	//     watchdog override, no CLI flag)
 	//
 	// repo flows alongside Args so the server can fall back to its
 	// own --repo when the operator doesn't pass one.
@@ -51,6 +74,15 @@ func runBackupControlPlane(cmd *cobra.Command, opts runOptions) error {
 	}
 	if opts.label != "" {
 		body["label"] = opts.label
+	}
+	if opts.includeWAL {
+		body["include_wal"] = true
+	}
+	if opts.incrementalFrom != "" {
+		body["incremental_from"] = opts.incrementalFrom
+	}
+	if opts.stallTimeout > 0 {
+		body["stall_timeout"] = opts.stallTimeout.String()
 	}
 	if opts.repoURL != "" {
 		body["repo"] = opts.repoURL

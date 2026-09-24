@@ -314,7 +314,7 @@ silently dropped:
 | Command | Forwarded | Refused |
 | --- | --- | --- |
 | `restore` | `--to`, `--to-lsn`, `--to-name`, `--to-latest`, `--to-action`, `--to-timeline`, `--to-exclusive`, `--force`, `--force-foreign`, `--skip-gap-check`, `--tablespace-mapping`, `--verify` (only when set explicitly) | `--preview` (there is no remote preview — it would run a real restore), `--require-threshold-attestation`, `--verify-restore`, `--kms-config`, `--chain-staging-root`, `--reset-chain-staging` |
-| `backup` | `--fast`, `--label`, `--stall-timeout`, `--incremental-from`, `--include-wal` | `--tenant`, `--encrypt`/`--no-encrypt`, `--kek`, `--kms-config`, `--tde*`, `--allow-concurrent`, `--ignore-capacity` |
+| `backup` | `--fast`, `--label`, `--stall-timeout`, `--incremental-from`, `--include-wal` | `--pg-connection`, `--tenant`, `--encrypt`/`--no-encrypt`, `--kek`, `--kms-config`, `--tde`/`--tde-engine`/`--tde-key-ref`, `--allow-concurrent`, `--ignore-capacity`, `--capacity-safety-factor`, `--verbose` |
 
 Ctrl-C while the CLI is polling cancels the job on the control plane
 and exits `5` (`aborted.context_cancelled`); the agent running it
