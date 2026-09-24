@@ -108,18 +108,24 @@ type ManifestFailure struct {
 
 // ChunkSection summarises chunk presence + content verification.
 type ChunkSection struct {
-	DistinctReferenced int            `json:"distinct_referenced"`
-	PresenceChecked    int            `json:"presence_checked"`
-	Sampled            int            `json:"sampled"`
-	Verified           int            `json:"verified"`
-	Mismatched         int            `json:"mismatched"`
-	Missing            int            `json:"missing"`
-	Skipped            int            `json:"skipped"` // skipped because encrypted + no key
-	Failures           []ChunkFailure `json:"failures,omitempty"`
+	DistinctReferenced int `json:"distinct_referenced"`
+	PresenceChecked    int `json:"presence_checked"`
+	Sampled            int `json:"sampled"`
+	Verified           int `json:"verified"`
+	Mismatched         int `json:"mismatched"`
+	Missing            int `json:"missing"`
+	// PresenceUnchecked counts chunks whose existence Stat failed for a
+	// reason OTHER than not-found (throttling, network, permission).
+	// They are reported as failures with reason "stat_failed" — the run
+	// could not vouch for them — but not as Missing: a 503 is not
+	// evidence that a backup lost a chunk.
+	PresenceUnchecked int            `json:"presence_unchecked,omitempty"`
+	Skipped           int            `json:"skipped"` // skipped because encrypted + no key
+	Failures          []ChunkFailure `json:"failures,omitempty"`
 }
 
 // ChunkFailure is one chunk that didn't pass.  Reason values:
-// "missing" | "hash_mismatch" | "fetch_failed".
+// "missing" | "stat_failed" | "hash_mismatch" | "fetch_failed".
 type ChunkFailure struct {
 	ChunkHash    string   `json:"chunk_hash"`
 	Reason       string   `json:"reason"`
@@ -326,9 +332,27 @@ func (e *Engine) Execute(ctx context.Context, deployment string, strategy Strate
 		sampleSet[h] = struct{}{}
 	}
 	for _, h := range hashes {
+		if err := ctx.Err(); err != nil {
+			// Cancelled: abort rather than record every remaining
+			// chunk as missing and sign that as an attestation.
+			return nil, fmt.Errorf("integrity: run aborted: %w", err)
+		}
 		run.Chunks.PresenceChecked++
 		_, err := e.sp.Stat(ctx, repo.ChunkKey(h))
 		if err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, fmt.Errorf("integrity: run aborted: %w", ctxErr)
+			}
+			if !errors.Is(err, storage.ErrNotFound) {
+				run.Chunks.PresenceUnchecked++
+				run.Chunks.Failures = append(run.Chunks.Failures, ChunkFailure{
+					ChunkHash:    h.String(),
+					Reason:       "stat_failed",
+					Detail:       err.Error(),
+					ReferencedBy: dedupeIDs(chunkRefs[h]),
+				})
+				continue
+			}
 			run.Chunks.Missing++
 			run.Chunks.Failures = append(run.Chunks.Failures, ChunkFailure{
 				ChunkHash:    h.String(),
@@ -385,8 +409,16 @@ func finishRun(run *Run, now time.Time) {
 	}
 	if run.Manifests.SignaturesFail > 0 ||
 		run.Chunks.Missing > 0 || run.Chunks.Mismatched > 0 ||
-		len(run.Chunks.Failures) > 0 {
+		len(run.Chunks.Failures) > run.Chunks.PresenceUnchecked {
 		run.Status = StatusFoundIssues
+		return
+	}
+	// Nothing wrong was FOUND, but some chunks could not be checked
+	// (transient Stat failures): the run did not complete its job, which
+	// is what StatusError means — not "issues found", which would page
+	// someone about data loss over a throttled backend.
+	if run.Chunks.PresenceUnchecked > 0 {
+		run.Status = StatusError
 		return
 	}
 	run.Status = StatusOK

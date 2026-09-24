@@ -154,11 +154,13 @@ actually there.
 | Leaf | Meaning |
 | --- | --- |
 | `conflict.repo_exists`, `conflict.deployment_exists`, `conflict.sink_exists`, `conflict.standby_exists`, `conflict.timetravel_exists`, `conflict.roster_exists` | Resource with that name is already configured |
-| `conflict.repo_read_only` | Repo is in read-only mode (legal hold, scheduled retire) |
+| `conflict.repo_read_only` | Repo is in read-only mode (legal hold, scheduled retire). Every mutating command refuses, including `repair attestation`, `repair manifest`, `repair chunks --apply`, `repair scrub --heal`, `repo wipe` and `repo bundle import`. |
 | `conflict.manifest_held`, `conflict.chain_has_held_links` | Backup or one of its parents is on legal hold |
 | `conflict.chain_has_live_descendants` | Refused to delete; descendants would orphan (also raised by `rotate --apply` when an incremental lands mid-rotation) |
 | `conflict.backup_lease_lost` | A running backup was aborted because another process took over the deployment's backup lease (stall longer than the lease TTL, clock jump, overlapping scheduler) |
 | `conflict.hold_exists` | `hold add` would weaken an active hold (earlier or finite expiry on an indefinite hold, different holder); `--force` replaces it and audits `hold.replace` |
+| `conflict.gc_backup_in_flight` | `repo gc --apply` / `repair chunks --orphans --apply` refused to start — or stopped between delete batches — because a backup holds a live lease (it may have deduplicated against chunks the sweep would delete). Retry-safe once the backup finishes; replaces `repo.gc.live_backup_lease` (which exited 1). |
+| `conflict.legal_hold` | `repo wipe` refused: at least one backup is under an active legal hold (an unreadable hold marker counts as active). Release the holds, or pass `--override-legal-holds` with an approved n-of-m request — never with `--force` — and the held backups are named in the pre-wipe audit event. |
 | `conflict.checkpoint_mismatch`, `conflict.chunks_missing`, `conflict.no_live_manifests` | Repo state would be inconsistent |
 | `conflict.approval_pending`, `conflict.already_signed`, `conflict.already_revoked` | Approval-flow state machine refused |
 | `conflict.too_many_connections` | PG refused another replication / regular connection |
@@ -177,8 +179,11 @@ treat any `verify.*` exit as an alert.
 | --- | --- |
 | `verify.checksum_mismatch`, `verify.chunk_size_mismatch`, `verify.short_assembly`, `verify.scrub_mismatch` | CAS chunk corruption |
 | `verify.missing_chunks` | Manifest references a chunk not present in the repo |
+| `verify.scrub_unverifiable_manifests` | `repo scrub` / `repair scrub`: manifests that would not verify or parse were skipped, so their chunks are unscrubbed (possible tampering, not bit rot). Both commands exit 9 on it, `--heal` included. |
+| `verify.scrub_key_unavailable` | `repo scrub` / `repair scrub`: encrypted manifests (backup or WAL segment) whose DEK this host cannot resolve (keyring/KEK/KMS access) were skipped. A key-access gap, never reported as a mismatch or healed; exit 9. |
 | `verify.manifest_signature`, `verify.replica_signature`, `verify.dsa_signature`, `verify.integrity_signature` | Signature verification failed |
 | `verify.attestation_invalid`, `verify.attestation_quorum`, `verify.attestation_roster`, `verify.attestation_subject` | Attestation refused |
+| `verify.attestation_untrusted_key` | `repair attestation` refused to re-sign: the manifest is signed by a key that is neither the current keyring key nor a trusted retired operator key (`<keyring>/trusted-keys/*.pem`, `--trusted-key`). A manifest's embedded key is part of the manifest, so a valid self-signature proves nothing about who signed it. |
 | `verify.kek_mismatch`, `verify.kek_resolve_failed`, `verify.bad_wrapped_dek` | KEK / DEK decrypt failed |
 | `auth.kms_access_denied` | The cloud KMS refused the credentials in use (restore / verify) — fix the IAM / key / vault policy; the key itself was not found to be wrong (exit 3) |
 | `verify.envelope_break` | Envelope-encryption tag did not validate |
@@ -233,6 +238,7 @@ field is where the recovery hint lives.
 | `restore.*` | Restore pipeline (`restore.failed`, `restore.kek_mismatch`, `restore.kek_resolve_failed`, `restore.target_in_wal_gap`, `restore.timeline_history_unreachable`, `restore.unknown_scheme`) |
 | `wal.*` | WAL streaming / fetch (`wal.slot_missing`, `wal.slot_ensure_failed`, `wal.slot_repair_failed`, `wal.fetch.*`, `wal.gap_purge_failed`, `wal.push_failed`, `wal.stream_error`, `wal.system_identifier_changed` — the DSN reached a different cluster than this `wal stream` process started on (permanent), `wal.segment_size_probe_failed` — `wal_segment_size` could not be read on a connected cluster; retried, never assumed) |
 | `repo.*` | Repo lifecycle, GC, scrub, replicate (`repo.open_failed`, `repo.gc.*`, `repo.scrub.*`, `repo.check.*`, `repo.replicate.*`, `repo.wal_prune.failed`, `repo.wal_prune.incomplete` — `wal prune` finished but `segments_failed > 0`; the result body lists each failure, re-run once fixed, `repo.wipe.partial`) |
+| `repo.check.manifests_unreadable` | `repo check` could not READ some manifests (storage errors such as an S3 500): the check is incomplete (exit 1, body still emitted, `healthy: false`). Distinct from `verify.signature_failures` (exit 9), which is reserved for manifest bytes that were read and failed Ed25519 verification or parsing. |
 | `repo.replicate.incomplete` | `repo replicate` finished but the destination is NOT a complete replica (some manifests/chunks failed or are missing). Non-zero exit so `replicate && rm source` can't trust a partial DR copy — re-run until it exits 0, then `repo replicate verify`. |
 | `repair.*` | Manifest / attestation / chunk repair |
 | `manifest.*` | Manifest parse / validation at restore-plan time (`manifest.invalid`) |
@@ -260,7 +266,7 @@ field is where the recovery hint lives.
 | `partial.restore_incomplete` | `partial restore` extracted nothing for at least one requested table: not found (catalog or `--relfilenode-map`), or absent from this backup (no main fork). The result body is printed first and lists both; exit 1 |
 | `combine.*` | `pg_combinebackup` orchestration |
 | `paths.*`, `init.*`, `config.*` | Bootstrap (`config.invalid`, `config.load_failed` — also an explicit `-c` file that does not exist; `config.kek_ref_unknown_scheme`; `config.defined_elsewhere` — an edit targets a deployment/sink defined in a `conf.d` drop-in or `PG_HARDSTORAGE_CONFIG`; `config.approval_roster_missing` — no trusted approver roster configured; `config.approval_policy_invalid` — unreadable roster or malformed `PG_HARDSTORAGE_APPROVAL_MIN_THRESHOLD`) |
-| `compliance.*`, `integrity.*`, `insider.*` | Compliance / integrity scanning |
+| `compliance.*`, `integrity.*`, `insider.*` | Compliance / integrity scanning. `integrity.run_incomplete` (exit 1): `integrity run` could not complete — deployments could not be listed, or chunk presence checks failed for a reason other than not-found (throttling, permissions). The run is still signed and stored with `status: error`, so the gap is on record; it is never reported as a clean pass. Real findings stay `verify.integrity_issues` (exit 9). |
 | `llm.*` | LLM provider, skill loading, MCP server |
 | `history.*` | Restore-history slice |
 | `hold.*`, `rotate.*`, `jit.*` | Legal hold, KMS rotation, JIT credentials |

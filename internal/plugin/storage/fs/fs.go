@@ -694,6 +694,24 @@ func (p *Plugin) Delete(ctx context.Context, key string) error {
 	return nil
 }
 
+// DeleteLazy (storage.LazyDeleter) is Delete without the parent
+// directory fsync: the unlink is visible immediately but may be undone
+// by a crash. Only for garbage whose resurrection is harmless — gc's
+// orphan chunks. See storage.LazyDeleter.
+func (p *Plugin) DeleteLazy(ctx context.Context, key string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	full, err := p.resolve(key)
+	if err != nil {
+		return err
+	}
+	if err := os.Remove(full); err != nil && !errors.Is(err, stdfs.ErrNotExist) {
+		return fmt.Errorf("fs: delete %q: %w", key, err)
+	}
+	return nil
+}
+
 // RenameIfNotExists atomically links src -> dst (failing if dst exists)
 // and unlinks src. link(2) is atomic on every POSIX system; on EEXIST
 // we get ErrAlreadyExists without ever touching dst.

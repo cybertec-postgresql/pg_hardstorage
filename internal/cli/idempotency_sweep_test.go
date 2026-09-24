@@ -36,7 +36,9 @@ import (
 )
 
 // repoDigest hashes the repo's durable state, excluding the audit
-// chain (every run appends its own events) and mtime-only changes.
+// chain (every run appends its own events), gc's run records and writer
+// pins under gc/ (per-run fence bookkeeping — every `repo gc --apply`
+// publishes its own), and mtime-only changes.
 func repoDigest(t *testing.T, root string) string {
 	t.Helper()
 	h := sha256.New()
@@ -49,7 +51,7 @@ func repoDigest(t *testing.T, root string) string {
 			return nil
 		}
 		rel, _ := filepath.Rel(root, path)
-		if strings.HasPrefix(rel, "audit/") {
+		if strings.HasPrefix(rel, "audit/") || strings.HasPrefix(rel, "gc/") {
 			return nil
 		}
 		paths = append(paths, rel)

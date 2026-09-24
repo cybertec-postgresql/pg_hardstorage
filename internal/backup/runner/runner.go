@@ -903,6 +903,19 @@ func take(ctx context.Context, opts TakeOptions, abortCtx *context.Context) (*Re
 	// one. So the guarantee above holds for every chunk the gate could
 	// actually reach, and the count of the ones it could not is
 	// surfaced rather than folded into a clean pass.
+	//
+	// The re-Stat alone is still a timing guard: a gc could delete an
+	// adopted chunk AFTER the Stat and before the commit is visible. The
+	// commit fence (repo.BeginCommitFence / Confirm, gcfence.go) closes
+	// that for real: it pins the adopted chunks against a running gc and
+	// waits out its in-flight delete batch before the Stat, and checks
+	// afterwards that no gc run could have swept them mid-commit.
+	fence, err := repo.BeginCommitFence(ctx, sp, cas.AdoptedHashes(),
+		repo.FenceOptions{Owner: "backup " + opts.Deployment + "/" + backupID})
+	if err != nil {
+		span.SetStatus(codes.Error, err.Error())
+		return nil, fmt.Errorf("backup: gc fence: %w", err)
+	}
 	unchecked, err := verifyAdoptedChunks(ctx, sp, cas)
 	if err != nil {
 		span.SetStatus(codes.Error, err.Error())
@@ -934,6 +947,13 @@ func take(ctx context.Context, opts TakeOptions, abortCtx *context.Context) (*Re
 		return nil, fmt.Errorf("backup: commit manifest %s: %w", backupID, err)
 	}
 	commitSpan.End()
+	if err := fence.Confirm(ctx); err != nil {
+		// The manifest IS committed but references a chunk a gc run
+		// deleted while the commit was in progress: fail loudly — a
+		// backup reported as good must be restorable.
+		span.SetStatus(codes.Error, err.Error())
+		return nil, fmt.Errorf("backup %s: %w", backupID, err)
+	}
 
 	// 7. Re-read + verify with the user-supplied Verifier — proves the
 	//    just-written manifest is consumable by the rest of the system.

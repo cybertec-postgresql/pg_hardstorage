@@ -1,25 +1,16 @@
 package cli
 
-// The `repair scrub` command verifies WAL chunks by re-decoding each WAL
-// segment manifest through a LOCAL anonymous struct rather than through
-// walsink.SegmentManifest — the real type would pull an import cycle. The
-// source comment states the resulting constraint plainly:
-//
-//	Stable as long as the manifest's `chunks[].hash` key stays.
-//
-// Nothing enforced that. If the producer's JSON tag ever drifts,
-// json.Unmarshal still SUCCEEDS against the local struct and simply
-// yields zero chunks — so scrubManifestAware verifies zero WAL chunks
-// and the scrub reports a clean repository while every WAL chunk goes
-// unexamined. A corruption scanner that silently scans nothing is worse
-// than no scanner: it produces a green result an operator will trust.
-//
-// These tests bind the decoder to the producing type, so the drift the
-// comment warns about turns the suite red at the moment the tag changes.
+// The scrubs read WAL segment manifests through the PRODUCER's own type
+// (walsink.ParseSegmentManifest) — they need its encryption envelope to
+// decrypt the chunks (issue #106). The old local anonymous-struct decoder
+// could drift from the producer's JSON tags and silently decode zero
+// chunks; decoding with the real type removes that class of bug, and
+// these tests pin the remaining contract: the producer's bytes round-trip,
+// and every failure is an error (counted as an unverifiable manifest by
+// the caller), never an empty chunk list.
 
 import (
 	"context"
-	"encoding/json"
 	"net/url"
 	"strings"
 	"testing"
@@ -60,20 +51,18 @@ func hashN(b byte) repo.Hash {
 	return h
 }
 
-// The contract test: bytes produced by the REAL producer type must decode
-// to the exact hashes it carried.
-func TestScrubWALManifestHashes_MatchesProducerEncoding(t *testing.T) {
+func TestReadWALSegmentManifest_MatchesProducerEncoding(t *testing.T) {
 	sp := scrubTestStore(t)
 	want := []repo.Hash{hashN(0x11), hashN(0x22), hashN(0x33)}
-
 	m := &walsink.SegmentManifest{
-		Schema:        "wal-segment-manifest/v1",
+		Schema:        walsink.Schema,
 		Deployment:    "dep",
 		Timeline:      1,
 		SegmentNumber: 7,
 		SegmentName:   "000000010000000000000007",
 		SegmentSize:   16 << 20,
 		CreatedAt:     time.Unix(0, 0).UTC(),
+		Encryption:    &walsink.EncryptionInfo{Scheme: "aes-256-gcm", KEKRef: "local:default", WrappedDEK: "AAAA"},
 	}
 	for i, h := range want {
 		m.Chunks = append(m.Chunks, walsink.ChunkRef{Hash: h, Offset: int64(i) * 100, Len: 100})
@@ -82,87 +71,54 @@ func TestScrubWALManifestHashes_MatchesProducerEncoding(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	putBytes(t, sp, "wal/dep/000000010000000000000007.json", body)
+	key := "wal/dep/00000001/000000010000000000000007.json"
+	putBytes(t, sp, key, body)
 
-	got, err := scrubWALManifestHashes(context.Background(), sp, "wal/dep/000000010000000000000007.json")
-	if err != nil {
-		t.Fatalf("scrubWALManifestHashes: %v", err)
-	}
-	if len(got) != len(want) {
-		t.Fatalf("decoded %d hashes from a manifest carrying %d — `repair scrub` would verify "+
-			"only those and still report the repository clean", len(got), len(want))
-	}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Errorf("hash[%d] = %s, want %s", i, got[i], want[i])
-		}
-	}
-}
-
-// The drift this guards against, spelled out: a manifest whose chunk
-// entries use a different key decodes to nothing without an error. The
-// caller treats (nil, nil) as "this segment has no chunks", not as a
-// problem — which is why the contract test above has to exist.
-func TestScrubWALManifestHashes_TagDriftDecodesToNothingSilently(t *testing.T) {
-	sp := scrubTestStore(t)
-	drifted := []byte(`{"schema":"wal-segment-manifest/v1","chunks":[` +
-		`{"chunk_hash":"1111111111111111111111111111111111111111111111111111111111111111"}]}`)
-	putBytes(t, sp, "wal/dep/drift.json", drifted)
-
-	got, err := scrubWALManifestHashes(context.Background(), sp, "wal/dep/drift.json")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(got) != 0 {
-		t.Fatalf("got %d hashes; the point of this test is that drift yields ZERO "+
-			"with no error — if that changed, revisit the guard above", len(got))
-	}
-}
-
-// A malformed hash is dropped rather than reported. That is deliberate
-// (a scrub should not die on one bad byte), but it must not take the
-// manifest's GOOD hashes down with it.
-func TestScrubWALManifestHashes_MalformedHashDoesNotDropTheGoodOnes(t *testing.T) {
-	sp := scrubTestStore(t)
-	good := hashN(0xAB)
-	raw := map[string]any{
-		"schema": "wal-segment-manifest/v1",
-		"chunks": []any{
-			map[string]any{"hash": "zznothex"},                             // not hex
-			map[string]any{"hash": "abcd"},                                 // right alphabet, wrong length
-			map[string]any{"hash": strings.Repeat("ab", len(repo.Hash{}))}, // valid
-			map[string]any{"hash": ""},                                     // empty
-		},
-	}
-	body, err := json.Marshal(raw)
+	got, err := readWALSegmentManifest(context.Background(), sp, key)
 	if err != nil {
 		t.Fatal(err)
 	}
-	putBytes(t, sp, "wal/dep/mixed.json", body)
-
-	got, err := scrubWALManifestHashes(context.Background(), sp, "wal/dep/mixed.json")
-	if err != nil {
-		t.Fatalf("scrubWALManifestHashes: %v", err)
+	if len(got.Chunks) != len(want) {
+		t.Fatalf("decoded %d chunks from a manifest carrying %d", len(got.Chunks), len(want))
 	}
-	if len(got) != 1 || got[0] != good {
-		t.Fatalf("got %d hashes (%s), want exactly the one valid entry %s — a scrub that "+
-			"drops verifiable chunks alongside unparseable ones under-reports corruption",
-			len(got), got, good)
+	for i := range want {
+		if got.Chunks[i].Hash != want[i] {
+			t.Errorf("hash[%d] = %s, want %s", i, got.Chunks[i].Hash, want[i])
+		}
+	}
+	if got.Encryption == nil || got.Encryption.KEKRef != "local:default" {
+		t.Errorf("encryption envelope not decoded: %+v", got.Encryption)
 	}
 }
 
-// Storage and parse failures must be distinguishable from "no chunks":
-// the caller skips the manifest on error but treats a nil slice as a
-// segment with nothing to verify.
-func TestScrubWALManifestHashes_ErrorsAreErrors(t *testing.T) {
+// Every failure is an error — the caller counts it as an unverifiable
+// manifest — and never a manifest with nothing to verify.
+func TestReadWALSegmentManifest_ErrorsAreErrors(t *testing.T) {
 	sp := scrubTestStore(t)
-
-	if _, err := scrubWALManifestHashes(context.Background(), sp, "wal/dep/absent.json"); err == nil {
-		t.Error("a missing manifest must return an error, not an empty hash list")
+	ctx := context.Background()
+	if _, err := readWALSegmentManifest(ctx, sp, "wal/dep/00000001/absent.json"); err == nil {
+		t.Error("a missing manifest must return an error")
 	}
-
 	putBytes(t, sp, "wal/dep/garbage.json", []byte("{not json"))
-	if _, err := scrubWALManifestHashes(context.Background(), sp, "wal/dep/garbage.json"); err == nil {
-		t.Error("an unparseable manifest must return an error, not an empty hash list")
+	if _, err := readWALSegmentManifest(ctx, sp, "wal/dep/garbage.json"); err == nil {
+		t.Error("an unparseable manifest must return an error")
+	}
+	putBytes(t, sp, "wal/dep/badhash.json",
+		[]byte(`{"schema":"`+walsink.Schema+`","chunks":[{"hash":"zznothex"}]}`))
+	if _, err := readWALSegmentManifest(ctx, sp, "wal/dep/badhash.json"); err == nil {
+		t.Error("a manifest with an unparseable chunk hash must fail as a whole, not drop the chunk")
+	}
+}
+
+func TestIsWALSegmentKey(t *testing.T) {
+	for key, want := range map[string]bool{
+		"wal/db1/00000001/000000010000000000000007.json":          true,
+		"wal/db1/gaps/00000001-1700000000.json":                   false,
+		"wal/db1/00000001/000000010000000000000007.json.tmp.abcd": false,
+		"wal/db1/00000001/000000010000000000000007.history":       false,
+	} {
+		if got := isWALSegmentKey(key); got != want {
+			t.Errorf("isWALSegmentKey(%q) = %v, want %v", key, got, want)
+		}
 	}
 }

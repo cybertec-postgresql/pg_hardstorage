@@ -553,7 +553,11 @@ func (d *DockerCellRuntime) retentionStep(ctx context.Context, argv ...string) e
 			ErrCellNotReady, d.Container, argv[1], err)
 	}
 	combined := append(append([]byte{}, stdout...), stderr...)
-	if bytes.Contains(combined, []byte(`"code": "repo.gc.live_backup_lease"`)) {
+	// gc's live-lease refusal is conflict.gc_backup_in_flight (exit 7)
+	// since fix/repo; the old repo.gc.live_backup_lease is still matched
+	// so a cell running an older binary defers the same way.
+	if bytes.Contains(combined, []byte(`"code": "conflict.gc_backup_in_flight"`)) ||
+		bytes.Contains(combined, []byte(`"code": "repo.gc.live_backup_lease"`)) {
 		return fmt.Errorf("%w: %s: a backup lease is still live", ErrRetentionDeferred, d.CellName)
 	}
 	// The error document follows gc's safety-floor warning; keep the

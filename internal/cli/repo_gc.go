@@ -9,18 +9,15 @@ import (
 	"io"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/spf13/cobra"
-	"golang.org/x/sync/errgroup"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/approval"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/audit"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/output"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo"
-	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo/casdefault"
 )
 
 // GCOp is the approval-namespace string the `repo gc --apply`
@@ -125,6 +122,19 @@ func runRepoGC(cmd *cobra.Command, repoURL string, apply bool, approvalID string
 	}
 	defer sp.Close()
 
+	// In -o json the command's output is ONE document: the Result. An
+	// Event emitted beside it made gc print two JSON documents, which a
+	// `repo gc -o json | jq` pipeline cannot parse. Notices therefore go
+	// into the result body in JSON mode and stay events otherwise.
+	var notices []repoGCNotice
+	notify := func(sev output.Severity, code string, body map[string]any) {
+		if d.Renderer().Name() == "json" {
+			notices = append(notices, repoGCNotice{Severity: sev.String(), Code: code, Detail: body})
+			return
+		}
+		_ = d.Event(cmd.Context(), output.NewEvent(sev, "repo.gc", code).WithBody(body))
+	}
+
 	// Only refuse on --apply: a dry-run never mutates and the operator
 	// asking "what *would* I delete?" is a perfectly valid read-only
 	// query. Same posture for the approval gate — dry-runs don't
@@ -146,41 +156,22 @@ func runRepoGC(cmd *cobra.Command, repoURL string, apply bool, approvalID string
 			gateReq = req
 		}
 	} else if approvalID != "" {
-		// Dry-runs ignore --require-approval rather than refuse —
-		// the operator might just be sanity-checking that the
-		// approval is queued before they pull the trigger.
-		// We surface a notice so they don't think the gate
-		// fired.
-		_ = DispatcherFrom(cmd).Event(cmd.Context(),
-			output.NewEvent(output.SeverityNotice, "repo.gc", "approval_skipped_dry_run").
-				WithBody(map[string]any{
-					"approval_id": approvalID,
-					"hint":        "the gate fires only on --apply; this dry-run does not consult the approval",
-				}))
+		// Dry-runs ignore --require-approval rather than refuse — the
+		// operator might just be sanity-checking that the approval is
+		// queued before they pull the trigger. Say so, so they don't
+		// think the gate fired.
+		notify(output.SeverityNotice, "approval_skipped_dry_run", map[string]any{
+			"approval_id": approvalID,
+			"hint":        "the gate fires only on --apply; this dry-run does not consult the approval",
+		})
 	}
 
-	// Tombstone-grace: a 0 flag value means "disable" (caller
-	// explicitly opts out — historical aggressive behaviour); a
-	// non-zero value flows through; the package default is
-	// applied when CollectReferencesOptions.TombstoneGrace is its
-	// zero value, but here the flag default is already the
-	// package default so we always pass it through explicitly.
+	// Tombstone-grace and chunk-age floor: a 0 flag value means
+	// "disable" — mapped to the underlying API's negative sentinel.
 	graceForCall := tombstoneGrace
 	if graceForCall == 0 {
-		graceForCall = -1 // disable in the underlying API
+		graceForCall = -1
 	}
-	refs, err := repo.CollectReferencesWithOptions(cmd.Context(), sp,
-		repo.CollectReferencesOptions{TombstoneGrace: graceForCall})
-	if err != nil {
-		return output.NewError("repo.gc.collect_refs_failed",
-			fmt.Sprintf("repo gc: collect references: %v", err)).Wrap(err)
-	}
-	// Chunk-age floor: an unreferenced chunk younger than this is
-	// kept, so a `--apply` racing an in-flight backup (whose chunks
-	// are durable but whose manifest hasn't committed yet) can't reap
-	// them out from under it.  A 0 flag value means "disable" — maps
-	// to the underlying API's negative-disables sentinel, same shape
-	// as --tombstone-grace.
 	minAgeForCall := minChunkAge
 	if minAgeForCall == 0 {
 		minAgeForCall = -1
@@ -190,8 +181,7 @@ func runRepoGC(cmd *cobra.Command, repoURL string, apply bool, approvalID string
 	// are what stop --apply from reaping an in-flight backup's chunks
 	// (durable but not yet manifest-committed) or a just-soft-deleted
 	// manifest's chunks before `backup undelete` could recover them.
-	// A 0 or negative flag value disables a floor (resolved to <= 0
-	// above). On --apply that removes a real guardrail, so say so
+	// On --apply a disabled floor removes a real guardrail, so say so
 	// loudly — an operator who passed `--min-chunk-age 0` thinking it
 	// meant "use the default" needs to see they disarmed it. Dry-runs
 	// delete nothing, so the warning is --apply-only.
@@ -204,190 +194,69 @@ func runRepoGC(cmd *cobra.Command, repoURL string, apply bool, approvalID string
 			disabled = append(disabled, "min-chunk-age")
 		}
 		if len(disabled) > 0 {
-			_ = d.Event(cmd.Context(),
-				output.NewEvent(output.SeverityWarning, "repo.gc", "safety_floor_disabled").
-					WithBody(map[string]any{
-						"disabled_floors": disabled,
-						"impact":          "with these floors disabled, --apply can delete an in-flight backup's chunks (durable but not yet manifest-committed) and a just-soft-deleted manifest's chunks before `backup undelete` could recover them — both unrecoverable",
-						"hint":            "omit the flag (or pass a positive duration) to keep the 24h default floor; here 0 means DISABLE, not 'use default'",
-					}))
+			notify(output.SeverityWarning, "safety_floor_disabled", map[string]any{
+				"disabled_floors": disabled,
+				"impact":          "with these floors disabled, --apply can delete an in-flight backup's chunks (durable but not yet manifest-committed) and a just-soft-deleted manifest's chunks before `backup undelete` could recover them — both unrecoverable",
+				"hint":            "omit the flag (or pass a positive duration) to keep the 24h default floor; here 0 means DISABLE, not 'use default'",
+			})
 		}
 	}
 
-	orphanOpts := repo.FindOrphansOptions{MinAge: minAgeForCall}
-	hashes, err := repo.FindOrphansWithOptions(cmd.Context(), sp, refs, orphanOpts)
-	if err != nil {
-		return output.NewError("repo.gc.find_orphans_failed",
-			fmt.Sprintf("repo gc: find orphans: %v", err)).Wrap(err)
-	}
-
-	// Stale staging files: `*.json.tmp.<rand>` left by a commit whose
-	// process died between the tmp Put and the atomic rename.  No
-	// chunk sweep reclaims these (they live under manifests//wal/, not
-	// chunks/), so gc is the natural place to reap them.  Same age
-	// floor as chunks.
-	staleTmp, err := repo.FindStaleTempManifests(cmd.Context(), sp, orphanOpts)
-	if err != nil {
-		return output.NewError("repo.gc.find_stale_temp_failed",
-			fmt.Sprintf("repo gc: find stale staging files: %v", err)).Wrap(err)
-	}
-
-	// Account bytes — Stat is O(orphan count) but that's the same shape
-	// the actual delete loop has anyway.
-	bytes, err := sumChunkBytes(cmd.Context(), sp, hashes)
-	if err != nil {
-		return output.NewError("repo.gc.size_failed",
-			fmt.Sprintf("repo gc: stat orphans: %v", err)).Wrap(err)
+	// The sweep. repo.Sweep holds the whole safety protocol (see
+	// internal/repo/gcfence.go): the run record writers fence against,
+	// the settle before the deciding snapshot, and per-batch
+	// checkpoints that re-read writer pins, re-scan backup leases and
+	// re-scan manifests committed since the snapshot. Backup leases are
+	// defence in depth for writers that predate the fence: a live one
+	// refuses the start, and one that appears mid-sweep stops it.
+	res, serr := repo.Sweep(cmd.Context(), sp, repo.SweepOptions{
+		TombstoneGrace: graceForCall,
+		MinChunkAge:    minAgeForCall,
+		Apply:          apply,
+		LiveLeases: func(ctx context.Context) ([]string, error) {
+			return findLiveBackupLeases(ctx, sp, time.Now().UTC())
+		},
+		DeleteConcurrency: gcDeleteConcurrency,
+		OnWarning: func(msg string) {
+			notify(output.SeverityWarning, "cleanup_incomplete", map[string]any{"detail": msg})
+		},
+	})
+	if serr != nil && res == nil {
+		return mapSweepError(serr)
 	}
 
 	body := repoGCBody{
-		DryRun:           !apply,
-		ManifestRefCount: refs.Len(),
-		OrphanCount:      len(hashes),
-		BytesReclaimable: bytes,
-		StaleTempCount:   len(staleTmp),
+		DryRun:            !apply,
+		ManifestRefCount:  res.RefCount,
+		OrphanCount:       len(res.Orphans),
+		BytesReclaimable:  res.OrphanBytes,
+		StaleTempCount:    len(res.StaleTemps),
+		RunID:             res.RunID,
+		SkippedReferenced: res.SkippedReferenced,
+		StoppedEarly:      res.StoppedEarly,
 	}
 
-	// partialErr, when non-nil, records that some deletions failed. We
-	// defer returning it until after the result body + audit event are
-	// emitted so a partial sweep still reports what it reclaimed.
+	// partialErr, when non-nil, records that the sweep did not complete
+	// (delete failures, or a sweep that had to stop). It is returned
+	// only after the result body and audit event are emitted, so a
+	// partial sweep still reports what it reclaimed.
 	var partialErr error
 	if apply {
-		// Live-lease guard (dedup-vs-GC race, part 1). The chunk-age
-		// floor only protects chunks an in-flight backup WROTE (young
-		// mtime); chunks it DEDUPLICATED against are old by definition
-		// — an orphan from a failed run yesterday whose content
-		// reappears in today's data gets a dedup hit that never
-		// touches the object. Deleting it here corrupts a backup that
-		// commits successfully minutes later. A live lease means such
-		// a backup may be in flight, so refuse; leases expire within
-		// their TTL (15 min default), so a crashed holder never blocks
-		// gc for long.
-		if live, lerr := findLiveBackupLeases(cmd.Context(), sp, time.Now().UTC()); lerr != nil {
-			return output.NewError("repo.gc.lease_scan_failed",
-				fmt.Sprintf("repo gc: scan backup leases: %v", lerr)).Wrap(lerr)
-		} else if len(live) > 0 {
-			return output.NewError("repo.gc.live_backup_lease",
-				fmt.Sprintf("repo gc: refusing --apply while backups are in flight for: %s", strings.Join(live, ", "))).
-				WithSuggestion(&output.Suggestion{
-					Human: "an in-flight backup may have deduplicated against chunks this sweep would delete — re-run after the backups finish (a crashed holder's lease expires within its TTL, 15 minutes by default)",
-				})
-		}
-
-		// Re-collect references (dedup-vs-GC race, part 2): the first
-		// snapshot may be minutes old by now, and a backup that
-		// committed since then can reference chunks the snapshot saw
-		// as orphans. Deletion decisions use the FRESH set.
-		refsAtDelete, rerr := repo.CollectReferencesWithOptions(cmd.Context(), sp,
-			repo.CollectReferencesOptions{TombstoneGrace: graceForCall})
-		if rerr != nil {
-			return output.NewError("repo.gc.collect_refs_failed",
-				fmt.Sprintf("repo gc: re-collect references before delete: %v", rerr)).Wrap(rerr)
-		}
-
-		// Second lease scan (dedup-vs-GC race, part 3). The scan above
-		// ran BEFORE the re-collect, and the re-collect is a full
-		// manifest walk — minutes on a large repository. A backup that
-		// starts during it acquires its lease after the first scan and
-		// can dedup-adopt an orphan this sweep is about to delete. Scan
-		// again now so the unguarded window shrinks from the re-collect
-		// duration to the delete loop itself. The remaining sliver is
-		// closed from the other side: the backup runner re-Stats every
-		// adopted chunk at manifest-commit and refuses to commit over a
-		// hole, whatever the interleaving.
-		if live, lerr := findLiveBackupLeases(cmd.Context(), sp, time.Now().UTC()); lerr != nil {
-			return output.NewError("repo.gc.lease_scan_failed",
-				fmt.Sprintf("repo gc: re-scan backup leases: %v", lerr)).Wrap(lerr)
-		} else if len(live) > 0 {
-			return output.NewError("repo.gc.live_backup_lease",
-				fmt.Sprintf("repo gc: a backup started during the reference re-collect (lease for: %s); refusing to sweep", strings.Join(live, ", "))).
-				WithSuggestion(&output.Suggestion{
-					Human: "the in-flight backup may have deduplicated against chunks this sweep would delete — re-run after it finishes",
-				})
-		}
-
-		cas := casdefault.New(sp)
-		var (
-			mu           sync.Mutex
-			deleted      int
-			deletedBytes int64
-			failures     []string
-		)
-		// Deletes run concurrently. Each one stays individually durable
-		// (the fs backend fsyncs the chunk's directory), but one at a
-		// time that fsync is a journal commit per chunk: ~1.4 ms on a
-		// busy disk, so the soak's 43k-chunk sweeps took minutes, and a
-		// remote backend pays a round trip per chunk. Concurrent fsyncs
-		// share commits; concurrent requests overlap their latency.
-		var g errgroup.Group
-		g.SetLimit(gcDeleteConcurrency)
-		for _, h := range hashes {
-			if refsAtDelete.Has(h) {
-				// Referenced by a manifest committed after the first
-				// snapshot — not an orphan anymore.
-				continue
-			}
-			g.Go(func() error {
-				// Stat-then-delete so a race-induced miss doesn't blow the
-				// whole sweep — we account only what we actually removed.
-				info, statErr := sp.Stat(cmd.Context(), repo.ChunkKey(h))
-				delErr := cas.DeleteChunk(cmd.Context(), h)
-				mu.Lock()
-				defer mu.Unlock()
-				if delErr != nil {
-					failures = append(failures, fmt.Sprintf("%s: %v", h, delErr))
-					return nil
-				}
-				deleted++
-				if statErr == nil {
-					deletedBytes += info.Size
-				}
-				return nil
-			})
-		}
-		_ = g.Wait() // workers record failures; they never return one
-		sort.Strings(failures)
-		body.Applied = deleted
-		body.BytesReclaimed = deletedBytes
-
-		// Reap stale staging files.  Best-effort: a tmp object under
-		// an active object-lock retention can't be deleted until the
-		// lock expires — that surfaces as a delete failure we report
-		// rather than fail the whole sweep on; a later gc reaps it
-		// once the lock lapses.
-		var tmpDeleted int
-		for _, key := range staleTmp {
-			if delErr := sp.Delete(cmd.Context(), key); delErr != nil {
-				failures = append(failures, fmt.Sprintf("%s: %v", key, delErr))
-				continue
-			}
-			tmpDeleted++
-		}
-		body.StaleTempDeleted = tmpDeleted
-		// Capture the true failure count BEFORE truncating the
-		// per-hash detail list — otherwise the partial-failure error
-		// reports "17 deletions failed" when 100 actually did.
-		failureCount := len(failures)
+		body.Applied = res.Deleted
+		body.BytesReclaimed = res.DeletedBytes
+		body.StaleTempDeleted = res.StaleTempDeleted
+		failureCount := len(res.Failures)
+		failures := res.Failures
 		const maxFailures = 16
 		if failureCount > maxFailures {
 			failures = append(failures[:maxFailures:maxFailures],
 				fmt.Sprintf("... +%d more", failureCount-maxFailures))
 		}
 		body.Failures = failures
-
-		if failureCount > 0 {
-			// Some deletes failed — surface as a structured error so the
-			// exit code reflects "the cleanup was partial." Use the
-			// generic-error namespace; nothing in our exit-code map flags
-			// this as preflight or verify.
-			//
-			// Deletions DID occur, so we must NOT return here and
-			// discard the computed body (Applied / BytesReclaimed /
-			// Failures) or skip the approval-gated audit event.  Stash
-			// the error and let control fall through to the audit
-			// emission + d.Result below; the error is returned last so
-			// the operator still gets the structured result body AND a
-			// non-zero exit.
+		switch {
+		case serr != nil:
+			partialErr = mapSweepError(serr)
+		case failureCount > 0:
 			partialErr = output.NewError("repo.gc.partial_failure",
 				fmt.Sprintf("repo gc: %d deletion(s) failed (of %d orphan chunk(s) + %d stale staging file(s))",
 					failureCount, body.OrphanCount, body.StaleTempCount)).
@@ -396,22 +265,10 @@ func runRepoGC(cmd *cobra.Command, repoURL string, apply bool, approvalID string
 				})
 		}
 
-		// Audit emission for the gated apply. We only write an audit
-		// event when an approval gated the action — un-gated GC is
-		// already covered by the structured Result the dispatcher
-		// emits, and writing audit on every cron-driven GC would be
-		// noise. Best-effort.
+		// Audit emission for the gated apply. Only when an approval
+		// gated the action — un-gated GC is covered by the structured
+		// Result, and an audit event per cron-driven GC would be noise.
 		if gateReq != nil {
-			body := map[string]any{
-				"url":             repoURL,
-				"approval_id":     gateReq.ID,
-				"approval_op":     string(gateReq.Op),
-				"threshold":       gateReq.Threshold,
-				"approvers":       len(gateReq.Approvals),
-				"orphans_found":   len(hashes),
-				"orphans_deleted": deleted,
-				"bytes_reclaimed": deletedBytes,
-			}
 			audit.NewStoreWithRetention(sp, repoMeta.WORM).AppendOrLog(cmd.Context(), &audit.Event{
 				Action: "repo.gc",
 				Tenant: gateReq.Tenant,
@@ -420,7 +277,16 @@ func runRepoGC(cmd *cobra.Command, repoURL string, apply bool, approvalID string
 					Tenant: gateReq.Tenant,
 				},
 				Timestamp: time.Now().UTC(),
-				Body:      body,
+				Body: map[string]any{
+					"url":             repoURL,
+					"approval_id":     gateReq.ID,
+					"approval_op":     string(gateReq.Op),
+					"threshold":       gateReq.Threshold,
+					"approvers":       len(gateReq.Approvals),
+					"orphans_found":   len(res.Orphans),
+					"orphans_deleted": res.Deleted,
+					"bytes_reclaimed": res.DeletedBytes,
+				},
 			})
 		}
 	}
@@ -428,41 +294,47 @@ func runRepoGC(cmd *cobra.Command, repoURL string, apply bool, approvalID string
 		body.ApprovalID = gateReq.ID
 	}
 
-	// Sort hashes lex for deterministic output (FindOrphans already
-	// does this; making it explicit here documents the contract).
-	sort.Slice(hashes, func(i, j int) bool { return hashes[i].String() < hashes[j].String() })
+	// Orphans are sorted by hash (repo.Sweep's contract).
 	const maxListedHashes = 64
-	for i, h := range hashes {
+	for i, h := range res.Orphans {
 		if i >= maxListedHashes {
-			body.Hashes = append(body.Hashes, fmt.Sprintf("... +%d more", len(hashes)-maxListedHashes))
+			body.Hashes = append(body.Hashes, fmt.Sprintf("... +%d more", len(res.Orphans)-maxListedHashes))
 			break
 		}
 		body.Hashes = append(body.Hashes, h.String())
 	}
+	body.Notices = notices
 	if err := d.Result(output.NewResult(cmd.CommandPath()).WithBody(body)); err != nil {
 		return err
 	}
-	// Signal the partial-failure exit code last, after the result body
-	// and audit event have been emitted.
 	return partialErr
 }
 
-// sumChunkBytes Stats every orphan once to compute the total reclaim
-// estimate. We don't fail the GC on Stat misses (a chunk that's
-// already gone simply contributes 0 bytes) — the dry-run is a
-// best-effort estimate, not an exact count.
-func sumChunkBytes(ctx context.Context, sp storage.StoragePlugin, hashes []repo.Hash) (int64, error) {
-	var total int64
-	for _, h := range hashes {
-		info, err := sp.Stat(ctx, repo.ChunkKey(h))
-		if err != nil {
-			// Non-fatal: a missing chunk during dry-run is still an
-			// orphan candidate; just count 0 for it.
-			continue
-		}
-		total += info.Size
+// mapSweepError maps a repo.Sweep failure onto the CLI's error codes. A
+// live backup lease is a CONFLICT (exit 7, retry-safe once the backup
+// finishes) — exit-codes.md documents lease / in-progress conflicts as
+// exit 7, and gc used to exit 1 for it.
+func mapSweepError(err error) error {
+	if errors.Is(err, repo.ErrSweepBackupInFlight) {
+		return output.NewError("conflict.gc_backup_in_flight",
+			fmt.Sprintf("repo gc: refusing to sweep while backups are in flight: %v", err)).
+			WithSuggestion(&output.Suggestion{
+				Human: "an in-flight backup may have deduplicated against chunks this sweep would delete — re-run after the backups finish (a crashed holder's lease expires within its TTL, 15 minutes by default)",
+			}).Wrap(err)
 	}
-	return total, nil
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return output.NewError("aborted.gc", fmt.Sprintf("repo gc: %v", err)).Wrap(err)
+	}
+	return output.NewError("repo.gc.failed", fmt.Sprintf("repo gc: %v", err)).Wrap(err)
+}
+
+// repoGCNotice is a warning/notice carried in the result body in JSON
+// mode (where emitting it as a separate event would break the
+// one-document contract).
+type repoGCNotice struct {
+	Severity string         `json:"severity"`
+	Code     string         `json:"code"`
+	Detail   map[string]any `json:"detail,omitempty"`
 }
 
 // repoGCBody is the v1-stable result body.
@@ -478,6 +350,17 @@ type repoGCBody struct {
 	Hashes           []string `json:"hashes,omitempty"`
 	Failures         []string `json:"failures,omitempty"`
 	ApprovalID       string   `json:"approval_id,omitempty"`
+	// RunID names this sweep's run record (gc/runs/<id>.json) — the
+	// object concurrent writers fence against. --apply only.
+	RunID string `json:"run_id,omitempty"`
+	// SkippedReferenced counts orphans spared at delete time because a
+	// manifest committed after the snapshot, or a writer's pin, claimed
+	// them.
+	SkippedReferenced int `json:"skipped_referenced,omitempty"`
+	// StoppedEarly says why the sweep stopped before its last batch.
+	StoppedEarly string `json:"stopped_early,omitempty"`
+	// Notices carries warnings in JSON mode (see runRepoGC).
+	Notices []repoGCNotice `json:"notices,omitempty"`
 }
 
 // WriteText renders the operator-facing form.
@@ -506,6 +389,9 @@ func (b repoGCBody) WriteText(w io.Writer) error {
 		}
 	} else if b.OrphanCount > 0 || b.StaleTempCount > 0 {
 		fmt.Fprintf(bw, "  (pass --apply to actually delete)\n")
+	}
+	if b.StoppedEarly != "" {
+		fmt.Fprintf(bw, "  ✗ stopped early: %s\n", b.StoppedEarly)
 	}
 	if len(b.Hashes) > 0 && b.OrphanCount > 0 {
 		fmt.Fprintln(bw, "  hashes:")

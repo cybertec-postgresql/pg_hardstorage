@@ -303,7 +303,44 @@ pg_hardstorage repo gc file:///srv/backups --apply    # delete orphans
 Walks every manifest (including tombstoned), builds the live chunk
 set, lists everything in `chunks/sha256/` and reports the difference.
 Result body carries `bytes_reclaimable` (dry-run) or `bytes_reclaimed`
-(applied).
+(applied). In `-o json` the output is a single document; warnings
+(for example a disabled safety floor) are in the body's `notices`.
+
+#### gc safety: running `--apply` next to live writers
+
+`repo gc --apply` is safe to run while backups, `wal stream`,
+`wal push`, `repo replicate` and bundle imports write to the same
+repository. The hazard is a writer that **deduplicates against** an
+orphan chunk (it adopts the existing object instead of writing it —
+no new mtime, so `--min-chunk-age` does not protect it) and commits a
+manifest referencing it while gc is deleting it. gc and the writers
+share an exclusion protocol (implemented in
+`internal/repo/gcfence.go`):
+
+- gc publishes a **run record** under `gc/runs/` before it starts,
+  heartbeats it, and waits a settle period (60 s, overlapped with the
+  initial walk) before taking the snapshot that decides deletions.
+- gc deletes in batches. Before each batch it publishes a checkpoint,
+  reads writer **pins** (`gc/pins/`), re-scans backup leases (a backup
+  that starts mid-sweep stops the sweep: `conflict.gc_backup_in_flight`,
+  exit 7, retry-safe) and re-scans for manifests committed since the
+  snapshot. Pinned or newly referenced chunks are spared.
+- gc never deletes a chunk younger than the start of its own run, even
+  with `--min-chunk-age 0`.
+- A writer about to commit a manifest over adopted chunks reads the
+  run records first. If a gc run is live it pins those chunks and waits
+  for the run's in-flight batch to finish, then re-checks the chunks
+  exist before committing. If no run was live and the commit took
+  longer than the writer budget (30 s), it re-checks after committing;
+  a chunk swept in that window fails the operation loudly instead of
+  leaving an unrestorable manifest reported as good.
+
+Hosts must agree on the time to well within the run-record TTL
+(2 minutes), as they already must for backup leases. Run records are
+kept 24 h; pins expire after 6 h. Orphan deletions are not
+individually fsynced on the fs backend (a crash can resurrect an
+orphan, which the next run reaps), which is what keeps a sweep of tens
+of thousands of chunks to seconds.
 
 ### usage
 

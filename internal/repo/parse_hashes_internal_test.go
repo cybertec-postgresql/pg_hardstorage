@@ -10,6 +10,7 @@ package repo
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -55,13 +56,13 @@ func FuzzParseHexHash(f *testing.F) {
 	})
 }
 
-func FuzzParseChunkHashes(f *testing.F) {
+func FuzzExtractBackupChunkHashes(f *testing.F) {
 	f.Add([]byte(`{"files":[{"chunks":[{"hash":"aa"},{"hash":"bb"}]}]}`))
 	f.Add([]byte(`{}`))
 	f.Add([]byte(`not json`))
 	f.Add([]byte(``))
 	f.Fuzz(func(t *testing.T, body []byte) {
-		hashes, err := parseChunkHashes(body) // never panic
+		hashes, err := extractChunkHashes(body, harvestBackup) // never panic
 		if err != nil {
 			return
 		}
@@ -79,12 +80,12 @@ func FuzzParseChunkHashes(f *testing.F) {
 		set := map[string]bool{}
 		for _, fl := range probe.Files {
 			for _, c := range fl.Chunks {
-				set[c.Hash] = true
+				set[strings.ToLower(c.Hash)] = true
 			}
 		}
 		for _, h := range hashes {
-			if !set[h] {
-				t.Fatalf("parseChunkHashes returned hash %q absent from the input", h)
+			if !set[h.String()] {
+				t.Fatalf("extractChunkHashes returned hash %s absent from the input", h)
 			}
 		}
 	})

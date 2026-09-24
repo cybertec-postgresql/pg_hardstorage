@@ -4,6 +4,9 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
+
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo"
 )
 
 // TestMain isolates every CLI test from the developer's / CI runner's
@@ -24,6 +27,12 @@ func TestMain(m *testing.M) {
 	os.Unsetenv("PG_HARDSTORAGE_CONFIG")
 	os.Unsetenv("PG_HARDSTORAGE_CONFIG_DIR")
 	os.Unsetenv("PG_HARDSTORAGE_ROOT")
+	// `repo gc --apply` waits GCFenceSettle (60s) before its deciding
+	// snapshot so writers that read "no gc running" can finish their
+	// commit; nothing in this package commits concurrently with a gc
+	// except the tests that set these explicitly, so compress it.
+	repo.GCFenceSettle = 200 * time.Millisecond
+	repo.GCFenceWriterBudget = 100 * time.Millisecond
 	code := m.Run()
 	_ = os.RemoveAll(home)
 	os.Exit(code)

@@ -1,7 +1,7 @@
 package repo_test
 
 // `repo replicate --verify` decides whether a destination faithfully
-// mirrors a source. Its chunk half rests on parseChunkHashes, a local
+// mirrors a source. Its chunk half rests on extractChunkHashes, a local
 // anonymous decode of `files[].chunks[].hash` that exists because
 // importing internal/backup into internal/repo is a cycle. The source
 // comment asserts the coupling and nothing enforced it:
@@ -10,7 +10,7 @@ package repo_test
 //	v1 contract.
 //
 // If backup.Manifest's tags drift, json.Unmarshal still SUCCEEDS,
-// parseChunkHashes returns zero hashes, and the verify loop never runs:
+// extractChunkHashes returns zero hashes, and the verify loop never runs:
 // ChunksConsidered stays 0, ChunksMissing stays 0, and AnyMissing() —
 // which is ManifestsMissing + ChunksMissing + ... > 0 — is false. The
 // command reports the replica consistent having examined none of its
@@ -44,7 +44,7 @@ func TestVerifyReplicate_CountsChunksFromARealBackupManifest(t *testing.T) {
 	}
 	if r.ChunksConsidered == 0 {
 		t.Fatalf("verified a replica with ChunksConsidered=0 while its manifest references "+
-			"chunks — parseChunkHashes and backup.Manifest have drifted apart, so `repo "+
+			"chunks — extractChunkHashes and backup.Manifest have drifted apart, so `repo "+
 			"replicate --verify` reports %q having examined no chunk at all", r.Verdict)
 	}
 	if r.Verdict != repo.VerdictConsistent {
@@ -59,7 +59,7 @@ func TestVerifyReplicate_CountsChunksFromARealBackupManifest(t *testing.T) {
 // cannot supply the finding on its own.
 //
 // The obvious version of this test (replicate=false, leaving both the
-// manifest and the chunk absent) passes even when parseChunkHashes
+// manifest and the chunk absent) passes even when extractChunkHashes
 // returns nothing, because ManifestsMissing alone trips AnyMissing.
 // Verified: under a renamed ChunkRef tag that version stayed green.
 func TestVerifyReplicate_MissingChunkIsFoundViaTheRealManifest(t *testing.T) {

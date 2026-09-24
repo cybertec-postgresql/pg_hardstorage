@@ -178,6 +178,22 @@ the hash check (exit code 9). The storage backend has corrupted
 bytes for the listed chunks; heal from a replica with
 `pg_hardstorage repair scrub --heal --replica <replica-url>`.
 
+**`verify.scrub_key_unavailable`** — encrypted manifests (backup
+or WAL segment) whose data key this host cannot unwrap were
+skipped: the keyring holding `kek.bin` is absent, the KEK is
+wrong, or the KMS is unreachable. Nothing was found wrong with
+the stored bytes — re-run where the key is available. `--heal`
+does not clear this finding (there is nothing to heal).
+
+**`verify.scrub_unverifiable_manifests`** — manifests that fail
+signature verification or will not parse were skipped, so their
+chunks were not scrubbed. Investigate with `repo check`; a bad
+signature is potential tampering.
+
+Both scrubs read WAL chunks through each segment manifest's own
+encryption envelope, exactly as `wal fetch` does, so encrypted
+WAL is verified rather than reported as corruption.
+
 **`Not at replica` equals the mismatch count** — this is a
 result-body field, not an error code: every corrupted chunk was
 also missing at the replica. The replica isn't fully populated,

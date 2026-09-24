@@ -272,10 +272,10 @@ func runRepoReplicate(cmd *cobra.Command, from, to string, includeWAL, dryRun bo
 	// replica. Replication is idempotent, so the operator re-runs until
 	// it exits clean before trusting the DR copy. Dry-runs never trip
 	// this (they don't write).
-	if !dryRun && (res.ManifestsFailed > 0 || res.ChunksFailed > 0 || res.ChunksMissing > 0 || res.WALManifestsFailed > 0 || res.WALAuxFailed > 0) {
+	if !dryRun && !res.Clean() {
 		return output.NewError("repo.replicate.incomplete",
-			fmt.Sprintf("repo replicate: destination is INCOMPLETE — manifests_failed=%d chunks_failed=%d chunks_missing=%d wal_manifests_failed=%d wal_aux_failed=%d; do NOT delete the source until a re-run exits clean",
-				res.ManifestsFailed, res.ChunksFailed, res.ChunksMissing, res.WALManifestsFailed, res.WALAuxFailed)).
+			fmt.Sprintf("repo replicate: destination is INCOMPLETE — manifests_failed=%d manifest_replicas_failed=%d chunks_failed=%d chunks_missing=%d wal_manifests_failed=%d wal_aux_failed=%d; do NOT delete the source until a re-run exits clean",
+				res.ManifestsFailed, res.ManifestReplicasFailed, res.ChunksFailed, res.ChunksMissing, res.WALManifestsFailed, res.WALAuxFailed)).
 			WithSuggestion(&output.Suggestion{
 				Human: "replication is idempotent — re-run `repo replicate` until it exits 0, then confirm with `repo replicate verify` before retiring the source.",
 			})
@@ -337,8 +337,11 @@ func (r repoReplicateBody) WriteText(w io.Writer) error {
 		fmt.Fprintln(bw, "  ⚠ WAL not replicated: the source archives WAL, this run did not copy it (no --include-wal).")
 		fmt.Fprintln(bw, "    Backups without embedded WAL cannot be restored from this replica.")
 	}
-	if r.ManifestsFailed == 0 && r.ChunksFailed == 0 && r.ChunksMissing == 0 &&
-		r.ManifestReplicasFailed == 0 {
+	if r.ManifestsRefreshed > 0 || r.WALManifestsRefreshed > 0 {
+		fmt.Fprintf(bw, "  Refreshed: %d manifest(s), %d WAL manifest(s) rewritten at source (e.g. kms rotate) updated on the replica\n",
+			r.ManifestsRefreshed, r.WALManifestsRefreshed)
+	}
+	if r.Clean() {
 		fmt.Fprintln(bw, "  ✓ replication clean")
 	} else {
 		fmt.Fprintln(bw, "  ✗ replication had findings — see JSON body for details")

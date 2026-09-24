@@ -3,6 +3,7 @@ package cli_test
 import (
 	"context"
 	"io"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -383,7 +384,8 @@ func TestRepair_Attestation_ReSignsReplicaToo(t *testing.T) {
 	// Forge a key rotation: commit a manifest signed by a throwaway
 	// key the current keyring (w.verifier) does NOT recognise. This
 	// stamps BOTH the primary and replica with the stale signature.
-	foreign, _, err := keystore.LoadOrGenerate(t.TempDir())
+	oldKeyring := t.TempDir()
+	foreign, _, err := keystore.LoadOrGenerate(oldKeyring)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -399,12 +401,14 @@ func TestRepair_Attestation_ReSignsReplicaToo(t *testing.T) {
 	}
 
 	// No --force: against the current verifier the primary is invalid,
-	// so the re-sign proceeds without it.
+	// so the re-sign proceeds without it. The rotated-away key is
+	// declared trusted (--trusted-key) — the real rotation workflow.
 	out, errb, exit := runCLI(t,
 		"repair", "attestation", "db1", id,
 		"--repo", w.repoURL,
 		"--actor", "ops@acme",
 		"--reason", "key rotation",
+		"--trusted-key", filepath.Join(oldKeyring, keystore.PublicKeyFile),
 		"-o", "json",
 	)
 	if exit != int(output.ExitOK) {

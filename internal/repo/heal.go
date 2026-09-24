@@ -235,24 +235,6 @@ func healOne(ctx context.Context, dst, replica storage.StoragePlugin, h Hash, op
 		return
 	}
 
-	// 3. Is the local copy already clean? Compare on-disk envelope
-	//    bytes byte-for-byte. If they match, the operator may have
-	//    already healed this chunk between scrub and heal — count it
-	//    AlreadyOK, no write needed.
-	//
-	//    We compare envelope bytes rather than running the CAS plaintext
-	//    verification because Heal is storage-layer: at this layer we
-	//    don't have the encryption keys to round-trip. The envelope-byte
-	//    comparison is a strict-superset of the plaintext check (if
-	//    envelope bytes match, plaintext does too).
-	if localBytes, lerr := readKey(ctx, dst, chunkKey); lerr == nil {
-		if bytes.Equal(localBytes, replicaBytes) {
-			res.AlreadyOK++
-			emitProgress(opts, h, "already_ok")
-			return
-		}
-	}
-
 	// 3b. The replica's bytes must at least be a well-formed chunk
 	//     envelope before they are allowed to REPLACE anything. Heal
 	//     cannot verify the plaintext hash keylessly (that needs the
@@ -310,6 +292,27 @@ func healOne(ctx context.Context, dst, replica storage.StoragePlugin, h Hash, op
 			return
 		}
 		contentVerified = true
+	}
+
+	// 3d. Is the local copy already identical to the replica's? Then
+	//     there is nothing to write — but "identical" is only good news
+	//     AFTER the replica's copy was checked above. This comparison
+	//     used to run first and short-circuit everything: a chunk rotted
+	//     BEFORE it was replicated is byte-identical on both sides, so
+	//     heal reported it AlreadyOK — a clean bill of health for a
+	//     chunk scrub had just flagged and that no copy can restore.
+	//     Now an identical-but-corrupt pair has already failed at 3b/3c;
+	//     reaching here means the replica's bytes passed every check
+	//     heal can make, so matching them is a genuine AlreadyOK (the
+	//     operator healed it between scrub and heal). For an encrypted
+	//     chunk those checks stop at the envelope, which the CLI's
+	//     keyed re-verify covers, exactly as for a Healed one.
+	if localBytes, lerr := readKey(ctx, dst, chunkKey); lerr == nil {
+		if bytes.Equal(localBytes, replicaBytes) {
+			res.AlreadyOK++
+			emitProgress(opts, h, "already_ok")
+			return
+		}
 	}
 
 	if opts.DryRun {

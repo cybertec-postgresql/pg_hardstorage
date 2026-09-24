@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"sort"
-	"strings"
 	"sync"
 	"time"
 
@@ -137,146 +136,31 @@ func CollectReferences(ctx context.Context, sp storage.StoragePlugin) (*RefSet, 
 // The two shapes are: backup manifests have `files[].chunks[].hash`,
 // WAL segment manifests have `chunks[].hash`. We walk both.
 func CollectReferencesWithOptions(ctx context.Context, sp storage.StoragePlugin, opts CollectReferencesOptions) (*RefSet, error) {
-	refs := NewRefSet()
-	grace := opts.effectiveGrace()
-	now := opts.effectiveNow()
-	graceCutoff := now.Add(-grace)
-
-	// Build the set of tombstoned backup IDs first; chunks reachable
-	// only via these manifests are GC candidates — but ONLY when the
-	// tombstone is older than the grace window.  Tombstones inside
-	// the grace window are treated as live so that an Undelete that
-	// fires before grace elapses recovers a fully-restorable backup.
-	tombstoned := map[string]struct{}{}
-	for info, err := range sp.List(ctx, "manifests/") {
-		if err != nil {
-			return nil, err
-		}
-		// Cooperative cancellation point. The underlying List call
-		// already propagates ctx, but on a million-object repo the
-		// inner loop body (Split + map insert) can run many thousand
-		// iterations between yields — an explicit check here keeps
-		// Ctrl-C interruptive even when the storage backend is
-		// streaming pages aggressively.
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		if !strings.HasSuffix(info.Key, "/manifest.json.tombstone") {
-			continue
-		}
-		// Skip tombstones that are still inside the grace window —
-		// their manifest's chunks must remain referenced so an
-		// Undelete recovers a working backup.  When ModTime is the
-		// zero value (backend doesn't expose it) we conservatively
-		// treat the tombstone as YOUNG (still in grace) so silent
-		// data loss is impossible; the operator can disable the
-		// grace explicitly via TombstoneGrace<0 if they want the
-		// historical aggressive behaviour.
-		if grace > 0 {
-			tombstoneAge := info.ModTime
-			if tombstoneAge.IsZero() || tombstoneAge.After(graceCutoff) {
-				continue
-			}
-		}
-		// Key on DEPLOYMENT + backup id, from
-		// manifests/<dep>/backups/<id>/manifest.json.tombstone.
-		//
-		// The id alone is not a safe key. Nothing relates a manifest's
-		// BackupID to its Deployment — Manifest.Validate requires both
-		// to be non-empty and never compares them — so keying on the id
-		// made a tombstone in one deployment suppress a LIVE manifest
-		// carrying the same id in another. That manifest's chunks would
-		// drop out of the reference set and `repo gc --apply` would
-		// delete the data of a backup nobody deleted, in a different
-		// deployment.
-		//
-		// The runner's generated ids ("<dep>.<type>.<ts>.<rand>") make a
-		// collision impossible in normal use, but the safety of the most
-		// destructive path here should not rest on a naming convention
-		// that is nowhere enforced. Scoping the key costs nothing and
-		// imposes no id format, so custom or legacy ids keep working.
-		parts := strings.Split(info.Key, "/")
-		if len(parts) >= 4 {
-			tombstoned[parts[1]+"/"+parts[3]] = struct{}{}
-		}
+	// One List per prefix (manifests/ used to be listed twice — once for
+	// tombstones, once for manifests), concurrent manifest reads. The
+	// walk itself lives in manifestSnapshot.scan (gcsweep.go) so gc's
+	// incremental rescans and this one-shot collection cannot drift.
+	//
+	// Tombstones: keyed on DEPLOYMENT + backup id, from
+	// manifests/<dep>/backups/<id>/manifest.json.tombstone. The id alone
+	// is not a safe key — nothing relates a manifest's BackupID to its
+	// Deployment, so an id-only key let a tombstone in one deployment
+	// suppress a LIVE manifest with the same id in another, and gc would
+	// delete the data of a backup nobody deleted. A tombstone inside the
+	// grace window (or with an unknown ModTime) keeps its manifest live.
+	//
+	// WAL (wal/<dep>/<TLI>/<seg>.json) and logical-stream
+	// (logical/<dep>/<stream>/<lsn>.json) segment manifests are walked
+	// too: both write their chunks into the SAME shared CAS, and a prefix
+	// left out of this walk would have its chunks reaped as orphans.
+	// Staging temps are skipped by BASENAME only (isStaleTempKey): a
+	// committed segment under a deployment whose name contains
+	// ".json.tmp." must still be harvested.
+	snap := &manifestSnapshot{refs: NewRefSet(), harvested: map[string]storage.ObjectInfo{}, opts: opts}
+	if err := snap.scan(ctx, sp, false); err != nil {
+		return nil, err
 	}
-
-	// Walk backup manifests under manifests/<dep>/backups/<id>/manifest.json.
-	for info, err := range sp.List(ctx, "manifests/") {
-		if err != nil {
-			return nil, err
-		}
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		if !strings.HasSuffix(info.Key, "/manifest.json") {
-			continue
-		}
-		parts := strings.Split(info.Key, "/")
-		// manifests/<dep>/backups/<id>/manifest.json → 5 parts
-		if len(parts) >= 5 {
-			if _, dead := tombstoned[parts[1]+"/"+parts[3]]; dead {
-				continue
-			}
-		}
-		if err := harvestManifest(ctx, sp, info.Key, refs, harvestBackup); err != nil {
-			return nil, err
-		}
-	}
-
-	// Walk WAL segment manifests under wal/<dep>/<TLI>/<seg>.json.
-	for info, err := range sp.List(ctx, "wal/") {
-		if err != nil {
-			return nil, err
-		}
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		if !strings.HasSuffix(info.Key, ".json") {
-			continue
-		}
-		// Skip staging temps — basename-scoped, never a full-key match: a
-		// committed segment under a deployment whose NAME contains
-		// ".json.tmp." (validateStorageID permits dots) must still be
-		// harvested, or its chunks drop from the ref set and gc reaps live
-		// WAL. See isStaleTempKey.
-		if isStaleTempKey(info.Key) {
-			continue
-		}
-		if err := harvestManifest(ctx, sp, info.Key, refs, harvestWAL); err != nil {
-			return nil, err
-		}
-	}
-
-	// Walk logical-stream segment manifests under
-	// logical/<dep>/<stream>/<startLSN>.json. The chunked logical sink
-	// (internal/logical/sinks/chunked) writes its CDC batches as chunks in
-	// the SAME shared CAS (chunks/sha256/) as backups and WAL, but records
-	// them under this THIRD prefix. Without walking it, every chunk a
-	// logical stream archived looks unreferenced and `repo gc --apply`
-	// reaps it — silently destroying the logical replication archive. Same
-	// {"chunks":[{"hash":...}]} shape as a WAL segment manifest.
-	for info, err := range sp.List(ctx, "logical/") {
-		if err != nil {
-			return nil, err
-		}
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		if !strings.HasSuffix(info.Key, ".json") {
-			continue
-		}
-		// Basename-scoped temp skip (see the WAL walk above): a logical
-		// segment under a deployment name containing ".json.tmp." must be
-		// harvested, not skipped, or gc reaps the logical archive's chunks.
-		if isStaleTempKey(info.Key) {
-			continue
-		}
-		if err := harvestManifest(ctx, sp, info.Key, refs, harvestWAL); err != nil {
-			return nil, err
-		}
-	}
-	return refs, nil
+	return snap.refs, nil
 }
 
 type harvestKind int
@@ -310,6 +194,17 @@ type walManifestShape struct {
 func harvestManifest(ctx context.Context, sp storage.StoragePlugin, key string, refs *RefSet, kind harvestKind) error {
 	rc, err := sp.Get(ctx, key)
 	if err != nil {
+		// Deleted between our List and this Get — `wal prune`,
+		// retention or `backup delete` running beside gc. A manifest
+		// that no longer exists references nothing, so its absence is
+		// the correct contribution to the live set. Aborting instead
+		// failed every gc that overlapped a prune, which on a busy
+		// shared repository meant gc never completed. Only ErrNotFound
+		// is skipped: any other read failure still aborts, because an
+		// unread manifest that DOES exist would under-count references.
+		if errors.Is(err, storage.ErrNotFound) {
+			return nil
+		}
 		return err
 	}
 	defer rc.Close()
@@ -493,9 +388,7 @@ func FindOrphansWithOptions(ctx context.Context, sp storage.StoragePlugin, refs 
 		}
 		orphans = append(orphans, hash)
 	}
-	sort.Slice(orphans, func(i, j int) bool {
-		return orphans[i].String() < orphans[j].String()
-	})
+	sortHashes(orphans)
 	return orphans, nil
 }
 
@@ -562,9 +455,7 @@ func FindMissing(ctx context.Context, sp storage.StoragePlugin, refs *RefSet) ([
 		hashes = append(hashes, h)
 	}
 	refs.mu.Unlock()
-	sort.Slice(hashes, func(i, j int) bool {
-		return hashes[i].String() < hashes[j].String()
-	})
+	sortHashes(hashes)
 
 	var missing []Hash
 	for _, h := range hashes {
@@ -619,9 +510,7 @@ func Scrub(ctx context.Context, cas *CAS, refs *RefSet, limit int) (ScrubResult,
 	}
 	refs.mu.Unlock()
 
-	sort.Slice(hashes, func(i, j int) bool {
-		return hashes[i].String() < hashes[j].String()
-	})
+	sortHashes(hashes)
 	if limit > 0 && limit < len(hashes) {
 		hashes = hashes[:limit]
 	}
