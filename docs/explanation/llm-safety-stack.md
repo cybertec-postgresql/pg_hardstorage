@@ -123,7 +123,9 @@ cannot fake it.
 The n-of-m threshold is set on each request, not in configuration:
 
 ```sh
-pg_hardstorage approval request --threshold 2 ...
+pg_hardstorage approval request --op kms.shred --target <kek-ref> \
+    --threshold 2 --approver-key alice.pem --approver-key bob.pem \
+    --reason "decommission tenant" --repo <repo-url>
 ```
 
 `--threshold` is the number of distinct allowlisted approvals the

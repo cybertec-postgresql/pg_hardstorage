@@ -47,6 +47,7 @@ import (
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup/runner"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/output"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/pg/testkit"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/encryption"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo"
@@ -102,6 +103,10 @@ func TestKMSRoundtrip_LocalKEK_BackupRestore(t *testing.T) {
 	//    itself is wrapped under our KEK before landing in the
 	//    manifest.
 	res, err := runner.Take(ctx, runner.TakeOptions{
+		// Restorable backups: this fixture archives no WAL, so the backup
+		// must embed its own, or restore refuses it (preflight.backup_wal_missing)
+		// — such a data directory could never reach consistency.
+		IncludeWAL:   true,
 		PGConnString: srv.DSN,
 		RepoURL:      repoURL,
 		Deployment:   "kms-rt",
@@ -165,8 +170,11 @@ func TestKMSRoundtrip_LocalKEK_BackupRestore(t *testing.T) {
 	if err == nil {
 		t.Fatal("restore without KEKForRef should fail; got nil error")
 	}
-	// The restore step's error is wrapped through output.NewError;
-	// we just want to see the human-pointer text the operator gets.
+	// Refused for the KEK, not for anything else a restore can refuse
+	// (a missing-WAL preflight once made this pass for the wrong reason).
+	if code := errCode(err); code != "config.no_kek_resolver" {
+		t.Fatalf("no-KEK restore refused with %q, want config.no_kek_resolver: %v", code, err)
+	}
 	t.Logf("no-KEK restore correctly refused: %v", err)
 
 	// 7. Negative control: restore with a WRONG KEK MUST fail
@@ -198,12 +206,11 @@ func TestKMSRoundtrip_LocalKEK_BackupRestore(t *testing.T) {
 	// AES-GCM-SIV / GCM exposes a typed `ErrAuthenticationFailed`
 	// the restore step propagates verbatim — assert on it so a
 	// future re-wrap of the error class is loud.
+	if code := errCode(err); code != "restore.kek_mismatch" {
+		t.Fatalf("wrong-KEK restore refused with %q, want restore.kek_mismatch: %v", code, err)
+	}
 	if !errors.Is(err, encryption.ErrAuthenticationFailed) {
 		t.Logf("wrong-KEK restore failed (but not via ErrAuthenticationFailed): %v", err)
-		// Don't t.Fatal — the structured error may wrap the
-		// AES error through output.NewError, which strips
-		// errors.Is sentinel matching.  The text-level
-		// assertion below catches that case too.
 	}
 	t.Logf("wrong-KEK restore correctly refused: %v", err)
 
@@ -266,4 +273,13 @@ func TestKMSRoundtrip_LocalKEK_BackupRestore(t *testing.T) {
 		t.Errorf("restored PG_VERSION = %q, want %q (decryption may have produced wrong bytes)",
 			gotVer, wantVer)
 	}
+}
+
+// errCode returns the structured code of err, or "" if it carries none.
+func errCode(err error) string {
+	var oe *output.Error
+	if errors.As(err, &oe) {
+		return oe.Code
+	}
+	return ""
 }

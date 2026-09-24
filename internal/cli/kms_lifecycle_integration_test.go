@@ -194,7 +194,7 @@ func TestIntegration_KEKRef_RestoreOnDifferentHost(t *testing.T) {
 	}
 	writeKMSConfig(t, hostACfg, srv.DSN, repoURL, kekRef)
 
-	out, stderr, exit := runCmd(t, "backup", "db1", "--fast", "--output", "json")
+	out, stderr, exit := runCmd(t, "backup", "db1", "--fast", "--include-wal", "--output", "json")
 	if exit != 0 {
 		t.Fatalf("backup exit=%d\n%s\n%s", exit, out, stderr)
 	}
@@ -297,7 +297,7 @@ func TestIntegration_KEKRef_CrossKEKDedupIsRefused(t *testing.T) {
 
 	// Backup 1 establishes the chunk corpus under key-a.
 	writeKMSConfig(t, cfgDir, srv.DSN, repoURL, "life-kms://vault/key-a")
-	out, stderr, exit := runCmd(t, "backup", "db1", "--fast", "--output", "json")
+	out, stderr, exit := runCmd(t, "backup", "db1", "--fast", "--include-wal", "--output", "json")
 	if exit != 0 {
 		t.Fatalf("first backup exit=%d\n%s\n%s", exit, out, stderr)
 	}
@@ -305,7 +305,7 @@ func TestIntegration_KEKRef_CrossKEKDedupIsRefused(t *testing.T) {
 
 	// Backup 2 under a DIFFERENT ref would dedup against those chunks.
 	writeKMSConfig(t, cfgDir, srv.DSN, repoURL, "life-kms://vault/key-b")
-	out, stderr, exit = runCmd(t, "backup", "db1", "--fast", "--output", "json")
+	out, stderr, exit = runCmd(t, "backup", "db1", "--fast", "--include-wal", "--output", "json")
 	if exit == 0 {
 		t.Fatalf("backup under a second kek_ref SUCCEEDED; it has adopted chunks "+
 			"encrypted under the first ref's DEK and is unrestorable\n%s", out)
@@ -354,7 +354,7 @@ func TestIntegration_KEKRef_MultiRefRepo(t *testing.T) {
 		if out, stderr, exit := runCmd(t, "repo", "init", repoURL, "--output", "json"); exit != 0 {
 			t.Fatalf("repo init exit=%d\n%s\n%s", exit, out, stderr)
 		}
-		out, stderr, exit := runCmd(t, "backup", "db1", "--fast", "--output", "json")
+		out, stderr, exit := runCmd(t, "backup", "db1", "--fast", "--include-wal", "--output", "json")
 		if exit != 0 {
 			t.Fatalf("backup under %s exit=%d\n%s\n%s", ref, exit, out, stderr)
 		}
@@ -415,7 +415,7 @@ func TestIntegration_KEKRef_StaleConfigAfterRotation(t *testing.T) {
 	}
 	writeKMSConfig(t, cfgDir, srv.DSN, repoURL, oldRef)
 
-	out, stderr, exit := runCmd(t, "backup", "db1", "--fast", "--output", "json")
+	out, stderr, exit := runCmd(t, "backup", "db1", "--fast", "--include-wal", "--output", "json")
 	if exit != 0 {
 		t.Fatalf("first backup exit=%d\n%s\n%s", exit, out, stderr)
 	}
@@ -424,7 +424,7 @@ func TestIntegration_KEKRef_StaleConfigAfterRotation(t *testing.T) {
 	// The operator rotates but forgets the config edit. Config is still
 	// the source of truth for NEW backups, so this must keep using the
 	// old ref rather than drifting to something else.
-	out, stderr, exit = runCmd(t, "backup", "db1", "--fast", "--output", "json")
+	out, stderr, exit = runCmd(t, "backup", "db1", "--fast", "--include-wal", "--output", "json")
 	if exit != 0 {
 		t.Fatalf("second backup exit=%d\n%s\n%s", exit, out, stderr)
 	}

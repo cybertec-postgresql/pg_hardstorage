@@ -96,11 +96,10 @@ func newWalStreamProgressTicker(
 // Start launches the ticker goroutine.  Non-blocking.
 // Must be paired with Stop on the same instance.
 //
-// ctx cancellation is honoured at the next tick (no per-event
-// preemption: a tick fired moments before ctx.Done would still
-// emit).  This is intentional — operators reading the output
-// want the last-known-good throughput sample, not a missing
-// one because the stream happened to end mid-tick.
+// On ctx cancellation or Stop, any advance since the last tick is
+// flushed as one final event — operators reading the output want
+// the last-known-good throughput sample, not a missing one because
+// the stream happened to end mid-tick.
 func (p *walStreamProgressTicker) Start(ctx context.Context) {
 	go p.run(ctx)
 }
@@ -139,11 +138,23 @@ func (p *walStreamProgressTicker) run(ctx context.Context) {
 	// period, which is what an operator expects.
 	prevLSN := p.startLSN
 	prevAt := p.now()
+	// flush reports what advanced since the last tick. A `--once` run
+	// (whose context is cancelled when its segment commits) can finish
+	// before the first tick; without this, --verbose would report no
+	// progress at all for the whole run.
+	flush := func() {
+		if curLSN := p.sink.SyncedLSN(); curLSN != prevLSN {
+			p.emit(buildProgressEvent(
+				p.deployment, p.timeline, p.startLSN, prevLSN, curLSN, p.now().Sub(prevAt), p.sink.SegmentSize()))
+		}
+	}
 	for {
 		select {
 		case <-ctx.Done():
+			flush()
 			return
 		case <-p.stop:
+			flush()
 			return
 		case tickAt := <-t.C:
 			curLSN := p.sink.SyncedLSN()

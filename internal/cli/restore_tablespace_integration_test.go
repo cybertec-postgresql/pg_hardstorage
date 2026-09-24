@@ -71,7 +71,7 @@ func TestIntegration_RestoreNonDefaultTablespace_VerifyPasses(t *testing.T) {
 		t.Fatalf("init exit %d", exit)
 	}
 	if _, stderr, exit := runCmd(t, "backup", "pg",
-		"--pg-connection", srv.DSN, "--repo", repoURL, "--fast", "--output", "json"); exit != 0 {
+		"--pg-connection", srv.DSN, "--repo", repoURL, "--fast", "--include-wal", "--output", "json"); exit != 0 {
 		t.Fatalf("backup exit %d: %s", exit, stderr)
 	}
 
