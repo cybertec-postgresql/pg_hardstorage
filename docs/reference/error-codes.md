@@ -165,6 +165,8 @@ treat any `verify.*` exit as an alert.
 | --- | --- |
 | `verify.checksum_mismatch`, `verify.chunk_size_mismatch`, `verify.short_assembly`, `verify.scrub_mismatch` | CAS chunk corruption |
 | `verify.missing_chunks` | Manifest references a chunk not present in the repo |
+| `verify.scrub_unverifiable_manifests` | `repo scrub` / `repair scrub`: manifests that would not verify or parse were skipped, so their chunks are unscrubbed (possible tampering, not bit rot). Both commands exit 9 on it, `--heal` included. |
+| `verify.scrub_key_unavailable` | `repo scrub` / `repair scrub`: encrypted manifests (backup or WAL segment) whose DEK this host cannot resolve (keyring/KEK/KMS access) were skipped. A key-access gap, never reported as a mismatch or healed; exit 9. |
 | `verify.manifest_signature`, `verify.replica_signature`, `verify.dsa_signature`, `verify.integrity_signature` | Signature verification failed |
 | `verify.attestation_invalid`, `verify.attestation_quorum`, `verify.attestation_roster`, `verify.attestation_subject` | Attestation refused |
 | `verify.kek_mismatch`, `verify.kek_resolve_failed`, `verify.bad_wrapped_dek` | KEK / DEK decrypt failed |

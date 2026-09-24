@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -1041,19 +1040,32 @@ func runRepairScrub(cmd *cobra.Command, repoURL string, limit int, heal bool, re
 			fmt.Sprintf("repair scrub: %v", err)).Wrap(err)
 	}
 	body := repairScrubBody{
-		Sampled:         res.Sampled,
-		OK:              res.OK,
-		MismatchCount:   len(res.Mismatches),
-		BytesVerified:   res.Bytes,
-		ReferencedTotal: refsTotal,
+		Sampled:                 res.Sampled,
+		OK:                      res.OK,
+		MismatchCount:           len(res.Mismatches),
+		BytesVerified:           res.Bytes,
+		ReferencedTotal:         refsTotal,
+		UnverifiableManifests:   res.UnverifiableManifests,
+		KeyUnavailableManifests: res.KeyUnavailableManifests,
+		KeyUnavailableChunks:    res.KeyUnavailableChunks,
 	}
 	for _, h := range res.Mismatches {
 		body.Mismatches = append(body.Mismatches, h.String())
 	}
 
-	// No mismatches → done, nothing to heal.
+	// coverage is the verdict for what this run could NOT look at. It
+	// is returned after the body on every path that would otherwise exit
+	// 0: `repair scrub` counted skipped manifests and never reported
+	// them, so a run that skipped every manifest printed "no integrity
+	// failures" and exited 0 (repo scrub already refused that).
+	coverage := scrubCoverageError("repair scrub", repoURL, res, refsTotal)
+
+	// No mismatches → nothing to heal.
 	if len(res.Mismatches) == 0 {
-		return d.Result(output.NewResult(cmd.CommandPath()).WithBody(body))
+		if rerr := d.Result(output.NewResult(cmd.CommandPath()).WithBody(body)); rerr != nil {
+			return rerr
+		}
+		return coverage
 	}
 
 	// Mismatches present. If the operator didn't ask for --heal, this
@@ -1079,19 +1091,7 @@ func runRepairScrub(cmd *cobra.Command, repoURL string, limit int, heal bool, re
 	// Carry the destination repo's WORM policy so healed chunks are re-locked
 	// on a compliance repo (the heal's IfNotExists Put carries no retention).
 	healUntil, healMode := wormPolicyFor(scrubMeta)
-	// Skip the synthetic all-zero repo.Hash{} KEK-missing marker that
-	// scrubManifestAware (~1375) appends for manifests we can't decrypt.
-	// It isn't a real chunk: feeding it to repo.Heal makes Heal Stat a
-	// nonexistent zero-hash chunk and forces a misleading
-	// verify.heal_incomplete. reverifyChunksPlaintext already skips it;
-	// mirror that here.
-	healTargets := make([]repo.Hash, 0, len(res.Mismatches))
-	for _, h := range res.Mismatches {
-		if h == (repo.Hash{}) {
-			continue
-		}
-		healTargets = append(healTargets, h)
-	}
+	healTargets := res.Mismatches
 	healRes, herr := repo.Heal(cmd.Context(), sp, replicaSP, healTargets, repo.HealOptions{
 		RetainUntil:   healUntil,
 		RetentionMode: healMode,
@@ -1151,7 +1151,12 @@ func runRepairScrub(cmd *cobra.Command, repoURL string, limit int, heal bool, re
 				Human: "heal replaced the local chunks with the replica's bytes, but those bytes do not decrypt to the expected content — the replica is corrupt for these chunks too. They must be re-backed-up from a live source; no good copy exists in either repo.",
 			})
 	}
-	return d.Result(output.NewResult(cmd.CommandPath()).WithBody(body))
+	if rerr := d.Result(output.NewResult(cmd.CommandPath()).WithBody(body)); rerr != nil {
+		return rerr
+	}
+	// Every mismatch healed — but "all healed" is not "all clean" when
+	// part of the repository was never looked at.
+	return coverage
 }
 
 // Result body shapes — stable per the v1 schema commitment.
@@ -1233,6 +1238,13 @@ type repairScrubBody struct {
 	// replica was consulted so audits show the source-of-truth.
 	HealResult *repo.HealResult `json:"heal,omitempty"`
 	ReplicaURL string           `json:"replica_url,omitempty"`
+
+	// Coverage gaps — see scrubCoverageError. Non-zero means the run's
+	// verdict covers less of the repository than it appears to, and the
+	// command exits non-zero.
+	UnverifiableManifests   int `json:"unverifiable_manifests,omitempty"`
+	KeyUnavailableManifests int `json:"key_unavailable_manifests,omitempty"`
+	KeyUnavailableChunks    int `json:"key_unavailable_chunks,omitempty"`
 }
 
 // WriteText renders the scrub result — sample size, mismatch list, and any
@@ -1242,8 +1254,20 @@ func (b repairScrubBody) WriteText(w io.Writer) error {
 	fmt.Fprintf(bw, "repair scrub\n")
 	fmt.Fprintf(bw, "  sampled %d / %d referenced chunks (%s verified)\n",
 		b.Sampled, b.ReferencedTotal, humanBytes(b.BytesVerified))
+	if b.UnverifiableManifests > 0 {
+		fmt.Fprintf(bw, "  ! %d manifest(s) could not be verified or read — their chunks were NOT scrubbed\n", b.UnverifiableManifests)
+	}
+	if b.KeyUnavailableManifests > 0 || b.KeyUnavailableChunks > 0 {
+		fmt.Fprintf(bw, "  ! %d encrypted manifest(s) / %d chunk(s) could not be decrypted on this host — NOT scrubbed (key access, not bit rot)\n",
+			b.KeyUnavailableManifests, b.KeyUnavailableChunks)
+	}
+	covered := b.UnverifiableManifests == 0 && b.KeyUnavailableManifests == 0 && b.KeyUnavailableChunks == 0
 	if b.MismatchCount == 0 {
-		fmt.Fprintln(bw, "  ✓ no integrity failures")
+		if covered {
+			fmt.Fprintln(bw, "  ✓ no integrity failures")
+		} else {
+			fmt.Fprintln(bw, "  no integrity failures in what was scrubbed — coverage incomplete (see above)")
+		}
 	} else {
 		fmt.Fprintf(bw, "  ✗ %d chunk(s) failed integrity check:\n", b.MismatchCount)
 		writeHashLines(bw, b.Mismatches)
@@ -1255,7 +1279,11 @@ func (b repairScrubBody) WriteText(w io.Writer) error {
 			fmt.Fprintf(bw, "    Failed:         %d\n", b.HealResult.Failed)
 			fmt.Fprintf(bw, "    Bytes copied:   %s\n", humanBytes(b.HealResult.BytesCopied))
 			if b.HealResult.NotAtReplica == 0 && b.HealResult.Failed == 0 {
-				fmt.Fprintln(bw, "    ✓ all mismatches healed")
+				if covered {
+					fmt.Fprintln(bw, "    ✓ all mismatches healed")
+				} else {
+					fmt.Fprintln(bw, "    all found mismatches healed — but coverage is incomplete (see above)")
+				}
 			}
 		}
 	}
@@ -1283,6 +1311,23 @@ type scrubResultAgg struct {
 	// "sampled 0, 0 mismatches" — a clean bill of health over a repo
 	// it never looked inside.
 	UnverifiableManifests int
+
+	// KeyUnavailableManifests counts ENCRYPTED manifests (backup or WAL
+	// segment) whose DEK could not be resolved on this host, so their
+	// chunks were not scrubbed; KeyUnavailableChunks counts individual
+	// chunks a manifest's CAS had no decryptor for. Both are key-access
+	// gaps, never mismatches: see scrubCoverageError.
+	KeyUnavailableManifests int
+	KeyUnavailableChunks    int
+	KeyUnavailable          []string
+}
+
+// noteKeyUnavailable records one manifest whose DEK could not be resolved.
+func (a *scrubResultAgg) noteKeyUnavailable(what, reason string) {
+	a.KeyUnavailableManifests++
+	if len(a.KeyUnavailable) < maxKeyUnavailableListed {
+		a.KeyUnavailable = append(a.KeyUnavailable, what+": "+reason)
+	}
 }
 
 // hashListForMsg renders a hash slice for an error message, capping the
@@ -1395,10 +1440,40 @@ func reverifyChunksPlaintext(ctx context.Context, sp storage.StoragePlugin, targ
 		}
 	}
 
-	// Anything still pending is a WAL chunk (unencrypted, default CAS)
-	// or a chunk we couldn't locate in a readable manifest. Verify via
-	// the default CAS; if it can't be read/round-tripped, treat it as
-	// still-bad — heal cannot claim a success it can't confirm.
+	// Anything still pending is a WAL chunk or a chunk we couldn't
+	// locate in a readable manifest. WAL chunks are read through their
+	// segment's own (decrypting) CAS — the plain CAS used here before
+	// failed every encrypted WAL chunk and turned a successful heal into
+	// verify.heal_unverified.
+	if len(pending) > 0 {
+		walCAS := newWALScrubCASCache(sp)
+		for info, lerr := range sp.List(ctx, "wal/") {
+			if lerr != nil {
+				return nil, lerr
+			}
+			if len(pending) == 0 {
+				break
+			}
+			if !isWALSegmentKey(info.Key) {
+				continue
+			}
+			seg, serr := readWALSegmentManifest(ctx, sp, info.Key)
+			if serr != nil {
+				continue
+			}
+			segCAS, _ := walCAS.casFor(ctx, seg)
+			if segCAS == nil {
+				continue
+			}
+			for _, ref := range seg.Chunks {
+				verify(segCAS, ref.Hash)
+			}
+		}
+	}
+	// Whatever is STILL pending was not found in any readable manifest
+	// with a usable key: verify via the default CAS; if it can't be
+	// read/round-tripped, treat it as still-bad — heal cannot claim a
+	// success it can't confirm.
 	if len(pending) > 0 {
 		defaultCAS := casdefault.New(sp)
 		for h := range pending {
@@ -1504,6 +1579,10 @@ func scrubManifestAware(ctx context.Context, sp storage.StoragePlugin, limit, wi
 		body, gerr := cas.GetChunkBytes(ctx, h)
 		if gerr != nil {
 			agg.Sampled++
+			if isKeyUnavailableErr(gerr) {
+				agg.KeyUnavailableChunks++
+				return
+			}
 			agg.Mismatches = append(agg.Mismatches, h)
 			return
 		}
@@ -1555,12 +1634,13 @@ func scrubManifestAware(ctx context.Context, sp storage.StoragePlugin, limit, wi
 			}
 			cas, cerr := buildVerifyCAS(ctx, sp, m, nil)
 			if cerr != nil {
-				// Encrypted manifest whose KEK isn't on this host:
-				// can't verify its chunks.  Surface as one synthetic
-				// "mismatch" so the operator knows it's not a clean
-				// scrub; the suggestion in the structured error
-				// points at --kek-file if/when that flag lands.
-				agg.Mismatches = append(agg.Mismatches, repo.Hash{})
+				// Encrypted manifest whose KEK isn't on this host: its
+				// chunks cannot be verified. That is a finding of its
+				// own class, reported by scrubCoverageError — it used to
+				// be a synthetic all-zero "mismatch", which rendered as a
+				// corrupt chunk 000…0 and which --heal skipped and then
+				// declared healed.
+				agg.noteKeyUnavailable("backup "+m.BackupID, cerr.Error())
 				continue
 			}
 			for _, f := range m.Files {
@@ -1583,13 +1663,12 @@ func scrubManifestAware(ctx context.Context, sp storage.StoragePlugin, limit, wi
 		}
 	}
 
-	// Walk WAL segment manifests with the default CAS.  WAL chunks
-	// today are not encrypted at the manifest level (walsink writes
-	// through casdefault.New, not NewEncrypted), so the plain CAS
-	// reads them back correctly.  If a future walsink revision
-	// encrypts WAL chunks the manifest schema will grow an Encryption
-	// block — this loop will need a buildVerifyCAS-style switch then.
-	defaultCAS := casdefault.New(sp)
+	// Walk WAL segment manifests. Since issue #106 a segment manifest
+	// carries its own encryption envelope, so each segment's chunks are
+	// read through the CAS that envelope resolves to (walScrubCASCache)
+	// — the plain CAS this loop used before reported every encrypted WAL
+	// chunk as bit rot.
+	walCAS := newWALScrubCASCache(sp)
 	for info, lerr := range sp.List(ctx, "wal/") {
 		if lerr != nil {
 			// A transient List failure must NOT be swallowed: silently
@@ -1604,17 +1683,30 @@ func scrubManifestAware(ctx context.Context, sp storage.StoragePlugin, limit, wi
 		if limit > 0 && agg.Sampled >= limit {
 			break
 		}
-		hashes, herr := scrubWALManifestHashes(ctx, sp, info.Key)
+		if !isWALSegmentKey(info.Key) {
+			continue // gap-state records and other non-segment .json
+		}
+		seg, herr := readWALSegmentManifest(ctx, sp, info.Key)
 		if herr != nil {
-			// Skip un-readable WAL manifests; verify command will
-			// surface them.  Don't fail the scrub on one bad file.
+			if ctx.Err() != nil {
+				return agg, distinctRefs, ctx.Err()
+			}
+			// One bad file must not stop the walk, but it is COUNTED:
+			// its chunks went unscrubbed (same rule as backup
+			// manifests above).
+			agg.UnverifiableManifests++
 			continue
 		}
-		for _, h := range hashes {
+		segCAS, reason := walCAS.casFor(ctx, seg)
+		if segCAS == nil {
+			agg.noteKeyUnavailable("wal "+info.Key, reason)
+			continue
+		}
+		for _, ref := range seg.Chunks {
 			if err := ctx.Err(); err != nil {
 				return agg, distinctRefs, err
 			}
-			verifyChunk(defaultCAS, h)
+			verifyChunk(segCAS, ref.Hash)
 			if limit > 0 && agg.Sampled >= limit {
 				break
 			}
@@ -1622,44 +1714,4 @@ func scrubManifestAware(ctx context.Context, sp storage.StoragePlugin, limit, wi
 	}
 
 	return agg, distinctRefs, nil
-}
-
-// scrubWALManifestHashes reads a WAL segment manifest at key and
-// returns the list of chunk hashes it references.  Used by
-// scrubManifestAware to verify WAL chunks alongside backup chunks.
-// Errors from the underlying storage are propagated; a malformed
-// manifest returns a parse error.
-func scrubWALManifestHashes(ctx context.Context, sp storage.StoragePlugin, key string) ([]repo.Hash, error) {
-	rc, err := sp.Get(ctx, key)
-	if err != nil {
-		return nil, err
-	}
-	defer rc.Close()
-	body, err := io.ReadAll(rc)
-	if err != nil {
-		return nil, err
-	}
-	// Partial decode — we only need the chunk hashes.  Tracking the
-	// full SegmentManifest type from internal/pg/walsink would
-	// pull an import cycle, so we re-decode locally.  Stable as
-	// long as the manifest's `chunks[].hash` key stays.
-	var m struct {
-		Chunks []struct {
-			Hash string `json:"hash"`
-		} `json:"chunks"`
-	}
-	if err := json.Unmarshal(body, &m); err != nil {
-		return nil, err
-	}
-	out := make([]repo.Hash, 0, len(m.Chunks))
-	for _, c := range m.Chunks {
-		var h repo.Hash
-		raw, derr := hex.DecodeString(c.Hash)
-		if derr != nil || len(raw) != len(h) {
-			continue
-		}
-		copy(h[:], raw)
-		out = append(out, h)
-	}
-	return out, nil
 }

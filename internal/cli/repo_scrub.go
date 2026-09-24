@@ -132,18 +132,20 @@ func runRepoScrub(cmd *cobra.Command, urlArg string, samplePercent int, fullScan
 	}
 
 	body := repoScrubBody{
-		ReferencedTotal:       refsTotal,
-		Sampled:               agg.Sampled,
-		OK:                    agg.OK,
-		MismatchCount:         len(agg.Mismatches),
-		SampleWindow:          agg.WindowStart,
-		SampleWindows:         agg.WindowCount,
-		UnverifiableManifests: agg.UnverifiableManifests,
-		BytesScanned:          agg.Bytes,
-		SamplePercent:         samplePercent,
-		StartedAt:             startedAt,
-		StoppedAt:             stoppedAt,
-		DurationMS:            stoppedAt.Sub(startedAt).Milliseconds(),
+		ReferencedTotal:         refsTotal,
+		Sampled:                 agg.Sampled,
+		OK:                      agg.OK,
+		MismatchCount:           len(agg.Mismatches),
+		SampleWindow:            agg.WindowStart,
+		SampleWindows:           agg.WindowCount,
+		UnverifiableManifests:   agg.UnverifiableManifests,
+		KeyUnavailableManifests: agg.KeyUnavailableManifests,
+		KeyUnavailableChunks:    agg.KeyUnavailableChunks,
+		BytesScanned:            agg.Bytes,
+		SamplePercent:           samplePercent,
+		StartedAt:               startedAt,
+		StoppedAt:               stoppedAt,
+		DurationMS:              stoppedAt.Sub(startedAt).Milliseconds(),
 	}
 	for _, h := range agg.Mismatches {
 		body.Mismatches = append(body.Mismatches, h.String())
@@ -177,24 +179,16 @@ func runRepoScrub(cmd *cobra.Command, urlArg string, samplePercent int, fullScan
 				DocURL:  "docs/runbooks/scrub-mismatch.md",
 			})
 	}
-	if agg.UnverifiableManifests > 0 {
-		// Reported AFTER the body so the operator still gets the
-		// numbers. A manifest that fails signature verification is the
-		// scrub's own business, not somebody else's: reporting "0
-		// mismatches" while N manifests went unread is the one answer
-		// this command must not give.
-		if rerr := d.Result(output.NewResult(cmd.CommandPath()).WithBody(body)); rerr != nil {
-			return rerr
-		}
-		return output.NewError("verify.scrub_unverifiable_manifests",
-			fmt.Sprintf("repo scrub: %d manifest(s) could not be verified or read, so their chunks were not scrubbed (sampled %d of %d referenced)",
-				agg.UnverifiableManifests, agg.Sampled, refsTotal)).
-			WithSuggestion(&output.Suggestion{
-				Human:   "a manifest that fails Ed25519 verification is potential tampering, not bit rot; the chunks behind it are unscrubbed either way. Investigate with `pg_hardstorage repo check` and the audit chain.",
-				Command: fmt.Sprintf("pg_hardstorage repo check --repo %s", urlArg),
-			})
+	// Coverage gaps (unverifiable manifests, encrypted manifests whose
+	// KEK is not on this host) are reported AFTER the body so the
+	// operator still gets the numbers: reporting "0 mismatches" while N
+	// manifests went unread is the one answer this command must not
+	// give. A missing KEK used to surface as a corrupted chunk with hash
+	// 000…0 — and an audit-chain mismatch event — which it is not.
+	if rerr := d.Result(output.NewResult(cmd.CommandPath()).WithBody(body)); rerr != nil {
+		return rerr
 	}
-	return d.Result(output.NewResult(cmd.CommandPath()).WithBody(body))
+	return scrubCoverageError("repo scrub", urlArg, agg, refsTotal)
 }
 
 // repoScrubBody is the v1-stable result. Distinct from the
@@ -215,13 +209,17 @@ type repoScrubBody struct {
 	// scrubbed because the manifest itself would not verify or read.
 	// Non-zero means this run's "no mismatches" covers less of the repo
 	// than it appears to.
-	UnverifiableManifests int       `json:"unverifiable_manifests,omitempty"`
-	BytesScanned          int64     `json:"bytes_scanned"`
-	Mismatches            []string  `json:"mismatches,omitempty"`
-	SamplePercent         int       `json:"sample_percent"`
-	StartedAt             time.Time `json:"started_at"`
-	StoppedAt             time.Time `json:"stopped_at"`
-	DurationMS            int64     `json:"duration_ms"`
+	UnverifiableManifests int `json:"unverifiable_manifests,omitempty"`
+	// KeyUnavailableManifests / KeyUnavailableChunks: encrypted data this
+	// host could not decrypt, so could not scrub. Key access, not rot.
+	KeyUnavailableManifests int       `json:"key_unavailable_manifests,omitempty"`
+	KeyUnavailableChunks    int       `json:"key_unavailable_chunks,omitempty"`
+	BytesScanned            int64     `json:"bytes_scanned"`
+	Mismatches              []string  `json:"mismatches,omitempty"`
+	SamplePercent           int       `json:"sample_percent"`
+	StartedAt               time.Time `json:"started_at"`
+	StoppedAt               time.Time `json:"stopped_at"`
+	DurationMS              int64     `json:"duration_ms"`
 }
 
 // WriteText renders the scrub result — sample size, mismatch list, and
@@ -237,6 +235,10 @@ func (b repoScrubBody) WriteText(w io.Writer) error {
 		fmt.Fprintf(bw, "  Unverifiable:      %d manifest(s) — their chunks were NOT scrubbed\n",
 			b.UnverifiableManifests)
 	}
+	if b.KeyUnavailableManifests > 0 || b.KeyUnavailableChunks > 0 {
+		fmt.Fprintf(bw, "  Key unavailable:   %d manifest(s) / %d chunk(s) — encrypted, NOT scrubbed (no key on this host)\n",
+			b.KeyUnavailableManifests, b.KeyUnavailableChunks)
+	}
 	if b.SampleWindows > 1 {
 		fmt.Fprintf(bw, "  Window:            chunks %d.. (1 of %d; a full cycle covers the repo)\n",
 			b.SampleWindow, b.SampleWindows)
@@ -248,8 +250,10 @@ func (b repoScrubBody) WriteText(w io.Writer) error {
 		for _, h := range b.Mismatches {
 			fmt.Fprintf(bw, "    %s\n", h)
 		}
-	} else {
+	} else if b.UnverifiableManifests == 0 && b.KeyUnavailableManifests == 0 && b.KeyUnavailableChunks == 0 {
 		fmt.Fprintln(bw, "  ✓ no integrity findings")
+	} else {
+		fmt.Fprintln(bw, "  no mismatches in what was scrubbed — coverage incomplete (see above)")
 	}
 	_, err := io.WriteString(w, strings.TrimRight(bw.String(), "\n"))
 	return err
