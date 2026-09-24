@@ -573,6 +573,10 @@ func buildDrillTask(name string, dep config.DeploymentConfig, kmsCfg config.KMSC
 // Validates required deployment fields (PGConnection, Repo) up
 // front so the engine never registers a task that's guaranteed to
 // fail at firing time.
+// resolveAgentPaths is paths.Resolve with the default options; a
+// variable so tests can make fire-time resolution fail.
+var resolveAgentPaths = func() (*paths.Paths, error) { return paths.Resolve(paths.DefaultOptions()) }
+
 func buildBackupTask(name string, dep config.DeploymentConfig, kmsCfg config.KMSConfig, signer *backup.Signer, verifier *backup.Verifier) (*schedule.Task, error) {
 	if dep.PGConnection == "" {
 		return nil, errors.New("missing pg_connection")
@@ -601,17 +605,22 @@ func buildBackupTask(name string, dep config.DeploymentConfig, kmsCfg config.KMS
 			// an instance-profile refresh). The config snapshot itself
 			// is still read once at start: editing kms.providers or
 			// kek_ref needs an agent reload.
-			var enc *runner.EncryptionConfig
-			if p, perr := paths.Resolve(paths.DefaultOptions()); perr == nil {
-				var eerr error
-				enc, eerr = runner.ResolveEncryption(ctx, runner.EncryptionRequest{
-					KeyringDir: p.Keyring.Value,
-					KEKRef:     dep.KEKRef,
-					KMSConfig:  kmsCfg.ProviderConfig(dep.KEKRef),
-				})
-				if eerr != nil {
-					return fmt.Errorf("agent backup %s: %w", name, eerr)
-				}
+			//
+			// A paths failure fails the run: without the keyring
+			// location the encryption posture is unknown, and guessing
+			// "plaintext" is how an encrypted repo gets unencrypted
+			// backups.
+			p, perr := resolveAgentPaths()
+			if perr != nil {
+				return fmt.Errorf("agent backup %s: resolve keyring path (refusing to back up with an unknown encryption posture): %w", name, perr)
+			}
+			enc, eerr := runner.ResolveEncryption(ctx, runner.EncryptionRequest{
+				KeyringDir: p.Keyring.Value,
+				KEKRef:     dep.KEKRef,
+				KMSConfig:  kmsCfg.ProviderConfig(dep.KEKRef),
+			})
+			if eerr != nil {
+				return fmt.Errorf("agent backup %s: %w", name, eerr)
 			}
 			if enc != nil && enc.Provider != nil {
 				defer enc.Provider.Close()

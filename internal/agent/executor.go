@@ -143,17 +143,21 @@ func (b *BackupExecutor) runBackup(ctx context.Context, job *ControlPlaneJob, pr
 	// on the keyring ⇒ encrypt. Without this, control-plane backups
 	// were silently plaintext even in an --encrypt repo, and
 	// plaintext-hash dedup welds those manifests onto encrypted chunks.
-	var enc *runner.EncryptionConfig
-	if p, perr := paths.Resolve(paths.DefaultOptions()); perr == nil {
-		var eerr error
-		enc, eerr = runner.ResolveEncryption(ctx, runner.EncryptionRequest{
-			KeyringDir: p.Keyring.Value,
-			KEKRef:     dep.KEKRef,
-			KMSConfig:  b.kms.ProviderConfig(dep.KEKRef),
-		})
-		if eerr != nil {
-			return nil, fmt.Errorf("backup-executor: %w", eerr)
-		}
+	//
+	// A paths failure fails the job rather than leaving enc nil: an
+	// unknown keyring location is an unknown encryption posture, and
+	// defaulting to plaintext is the unsafe guess.
+	p, perr := resolveExecutorPaths()
+	if perr != nil {
+		return nil, fmt.Errorf("backup-executor: resolve keyring path (refusing to back up with an unknown encryption posture): %w", perr)
+	}
+	enc, eerr := runner.ResolveEncryption(ctx, runner.EncryptionRequest{
+		KeyringDir: p.Keyring.Value,
+		KEKRef:     dep.KEKRef,
+		KMSConfig:  b.kms.ProviderConfig(dep.KEKRef),
+	})
+	if eerr != nil {
+		return nil, fmt.Errorf("backup-executor: %w", eerr)
 	}
 	// The provider holds SDK connection state; close it once the
 	// backup has wrapped its DEK.
@@ -211,6 +215,10 @@ func (b *BackupExecutor) runBackup(ctx context.Context, job *ControlPlaneJob, pr
 func repoMatches(a, b string) bool {
 	return strings.TrimRight(a, "/") == strings.TrimRight(b, "/")
 }
+
+// resolveExecutorPaths is paths.Resolve with the default options; a
+// variable so tests can make resolution fail.
+var resolveExecutorPaths = func() (*paths.Paths, error) { return paths.Resolve(paths.DefaultOptions()) }
 
 // backupJobArgs is the decoded Job.Args of a JobBackup.
 type backupJobArgs struct {

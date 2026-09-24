@@ -3,12 +3,14 @@ package agent
 import (
 	"context"
 	"crypto/rand"
+	"errors"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/config"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/paths"
 )
 
 // TestParseBackupJobArgs pins the arg set `backup --control-plane`
@@ -42,6 +44,32 @@ func TestParseBackupJobArgs_MalformedIsAnError(t *testing.T) {
 		if _, err := parseBackupJobArgs(args); err == nil {
 			t.Errorf("args %v: want an error", args)
 		}
+	}
+}
+
+// TestBackupExecutor_PathsFailureFailsJob: a control-plane backup must
+// not fall back to plaintext when the keyring location cannot be
+// resolved (enc used to stay nil and runner.Take ran unencrypted).
+func TestBackupExecutor_PathsFailureFailsJob(t *testing.T) {
+	prev := resolveExecutorPaths
+	resolveExecutorPaths = func() (*paths.Paths, error) { return nil, errors.New("synthetic paths failure") }
+	t.Cleanup(func() { resolveExecutorPaths = prev })
+
+	priv, pub, err := backup.GenerateKeypair(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signer, _ := backup.LoadSigner(priv)
+	verifier, _ := backup.LoadVerifier(pub)
+	repoURL := "file://" + t.TempDir()
+	e := NewBackupExecutor(map[string]config.DeploymentConfig{
+		"db1": {PGConnection: "postgres://u@127.0.0.1:1/db", Repo: repoURL},
+	}, config.KMSConfig{}, signer, verifier)
+	_, err = e.Execute(context.Background(), &ControlPlaneJob{
+		ID: "j1", Kind: "backup", Deployment: "db1", RepoURL: repoURL,
+	}, func(map[string]any) {})
+	if err == nil || !strings.Contains(err.Error(), "synthetic paths failure") {
+		t.Fatalf("want the paths failure, not a plaintext attempt; got %v", err)
 	}
 }
 
