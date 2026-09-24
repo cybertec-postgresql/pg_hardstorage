@@ -90,7 +90,7 @@ func (r CASRetention) retainUntil() time.Time {
 // also be concurrency-safe (every plugin we ship is).
 type CAS struct {
 	sp       storage.StoragePlugin
-	seen     sync.Map               // Hash -> struct{}
+	seen     sync.Map               // Hash -> seenEntry
 	writer   compression.Compressor // codec used for new Put calls
 	registry *compression.CodecRegistry
 
@@ -172,6 +172,59 @@ type CAS struct {
 
 	// adopt guards the one-shot cross-DEK check. See ensureAdoptable.
 	adopt adoptGuard
+
+	// now is the clock for seen-entry trust (seenWriteTrust). nil means
+	// time.Now; tests inject a fake to age entries deterministically.
+	now func() time.Time
+}
+
+// seenEntry is what the positive cache remembers about a hash.
+//
+// writtenAt is set only when THIS CAS wrote the chunk (a successful
+// IfNotExists Put) and is the zero time for every entry established by
+// verification instead — a hint-confirmed Stat, a lost IfNotExists race,
+// or a verified GetChunkBytes read. The distinction decides whether a
+// later cache hit may vouch for the chunk on its own; see seenWriteTrust.
+type seenEntry struct {
+	writtenAt time.Time
+}
+
+// seenWriteTrust bounds how long a cache hit may vouch for a chunk
+// without the commit-time existence gate.
+//
+// THE INVARIANT: a PutChunk that returns Deduped is either (a) a hit on a
+// chunk this CAS itself wrote less than seenWriteTrust ago, or (b)
+// recorded in the adopted set, so the commit-time gates (backup runner,
+// walsink, FenceAdoptedCommit) re-Stat it before a manifest referencing
+// it is published.
+//
+// (a) is safe because a chunk we wrote carries OUR write as its mtime,
+// and `repo gc --apply` never deletes a chunk younger than its
+// --min-chunk-age floor; the window is kept far below every floor this
+// project ships or recommends (24h default, 10m in the soak), so a
+// segment or backup that commits shortly after the hit commits over a
+// chunk gc cannot yet touch.
+//
+// Everything else is (b). A cache entry is a memory of the chunk's
+// presence at SOME past moment, and a long-lived CAS — the single one a
+// `wal stream` session reuses for days — outlives the manifests that
+// last referenced the chunk: they get pruned, gc sweeps the now-orphaned
+// chunk, and the cache still says "present". Returning Deduped from that
+// memory without adoption committed a segment over a deleted chunk with
+// no gate ever looking. An entry established by verification (Stat hit,
+// lost race, verified read) was never protected by an mtime of ours at
+// all, so it gets no trust window.
+//
+// Marking a hit adopted costs one Stat per distinct hash at commit, not a
+// storage round trip per hit, and only for hashes outside the window.
+const seenWriteTrust = 5 * time.Minute
+
+// clock returns the CAS's time source.
+func (c *CAS) clock() time.Time {
+	if c.now != nil {
+		return c.now()
+	}
+	return time.Now()
 }
 
 // adoptGuard tracks the one-shot verification that chunks ALREADY in
@@ -335,6 +388,75 @@ func (c *CAS) ForgetAdopted(hashes ...Hash) {
 	for _, h := range hashes {
 		c.adopted.Delete(h)
 	}
+}
+
+// ForgetChunk drops every memory this CAS holds of hash — the positive
+// cache entry and any adoption — so the next PutChunk of that content
+// takes the full path and, if the chunk is gone, rewrites it.
+//
+// A commit-time gate that finds an adopted chunk MISSING must call this
+// before the caller retries. Otherwise the retry's PutChunk hits the
+// stale cache entry, is adopted again without writing, and the gate
+// fails again: a long-lived writer (`wal stream`) would loop on the same
+// segment forever instead of re-pushing the chunk it still holds.
+// VerifyAdopted does it for its callers.
+func (c *CAS) ForgetChunk(hashes ...Hash) {
+	for _, h := range hashes {
+		c.unmarkSeen(h)
+		c.adopted.Delete(h)
+	}
+}
+
+// adoptedStatConcurrency caps the parallel Stat fan-out in
+// VerifyAdopted — the same bound the backup runner's gate uses.
+const adoptedStatConcurrency = 32
+
+// VerifyAdopted re-Stats hashes (normally the adopted refs of the
+// manifest about to be committed) and reports which are gone.
+//
+// Missing hashes are also dropped from the CAS (ForgetChunk), so a retry
+// rewrites them instead of adopting a memory. unchecked counts Stats that
+// failed for a reason other than not-found: the chunk's presence was
+// assumed, not proven, and callers surface that rather than folding it
+// into a clean pass. err is non-nil only when ctx ends.
+func (c *CAS) VerifyAdopted(ctx context.Context, hashes []Hash) (missing []Hash, unchecked int, err error) {
+	if len(hashes) == 0 {
+		return nil, 0, nil
+	}
+	var (
+		mu  sync.Mutex
+		wg  sync.WaitGroup
+		sem = make(chan struct{}, adoptedStatConcurrency)
+	)
+	for _, h := range hashes {
+		if err := ctx.Err(); err != nil {
+			wg.Wait()
+			return missing, unchecked, err
+		}
+		sem <- struct{}{}
+		wg.Add(1)
+		go func(h Hash) {
+			defer func() { <-sem; wg.Done() }()
+			_, serr := c.sp.Stat(ctx, ChunkKey(h))
+			if serr == nil {
+				return
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if errors.Is(serr, storage.ErrNotFound) {
+				missing = append(missing, h)
+				return
+			}
+			unchecked++
+		}(h)
+	}
+	wg.Wait()
+	if err := ctx.Err(); err != nil {
+		return missing, unchecked, err
+	}
+	c.ForgetChunk(missing...)
+	sortHashes(missing)
+	return missing, unchecked, nil
 }
 
 // CASOption configures a CAS at construction.
@@ -581,8 +703,17 @@ func (c *CAS) PutChunk(ctx context.Context, body []byte) (ChunkInfo, error) {
 	// for diagnostic purposes.
 	info := ChunkInfo{Hash: hash, Size: int64(len(body))}
 
-	// Fast path: we've already seen this hash. Skip the storage roundtrip.
-	if _, ok := c.seen.Load(hash); ok {
+	// Fast path: we've already seen this hash. Skip the storage roundtrip
+	// — but a hit only vouches for the chunk on its own inside
+	// seenWriteTrust of our own write. Any other hit is recorded as
+	// adopted so the commit-time gate re-Stats it: the cache remembers
+	// that the chunk WAS present, and gc may have swept it since the
+	// manifests that referenced it were pruned. See seenWriteTrust.
+	if v, ok := c.seen.Load(hash); ok {
+		e, _ := v.(seenEntry)
+		if e.writtenAt.IsZero() || c.clock().Sub(e.writtenAt) >= seenWriteTrust {
+			c.markAdopted(hash)
+		}
 		c.dedupInMem.Add(1)
 		info.Deduped = true
 		return info, nil
@@ -601,7 +732,7 @@ func (c *CAS) PutChunk(ctx context.Context, body []byte) (ChunkInfo, error) {
 				if err := c.ensureAdoptable(ctx, hash); err != nil {
 					return ChunkInfo{}, err
 				}
-				c.markSeen(hash)
+				c.markSeen(hash, seenEntry{})
 				c.markAdopted(hash)
 				c.dedupStorage.Add(1)
 				info.Deduped = true
@@ -666,14 +797,14 @@ func (c *CAS) PutChunk(ctx context.Context, body []byte) (ChunkInfo, error) {
 	_, err = c.sp.Put(ctx, key, bytes.NewReader(envelope), putOpts)
 	switch {
 	case err == nil:
-		c.markSeen(hash)
+		c.markSeen(hash, seenEntry{writtenAt: c.clock()})
 		c.dedupMiss.Add(1)
 		return info, nil
 	case errors.Is(err, storage.ErrAlreadyExists):
 		if aerr := c.ensureAdoptable(ctx, hash); aerr != nil {
 			return ChunkInfo{}, aerr
 		}
-		c.markSeen(hash)
+		c.markSeen(hash, seenEntry{})
 		c.markAdopted(hash)
 		c.dedupStorage.Add(1)
 		info.Deduped = true
@@ -797,7 +928,7 @@ func (c *CAS) GetChunkBytes(ctx context.Context, hash Hash) ([]byte, error) {
 	// of a backup through one CAS, and an uncounted Store grew the cache
 	// one entry per chunk read — O(chunks) memory — while leaving
 	// seenCount blind to entries a later unmarkSeen would decrement.
-	c.markSeen(hash)
+	c.markSeen(hash, seenEntry{})
 	return body, nil
 }
 
@@ -917,8 +1048,11 @@ func (c *CAS) DeleteChunk(ctx context.Context, hash Hash) error {
 // on long-lived CAS instances (memory-leak audit #1). Clearing never
 // affects correctness: a dropped entry costs at most one extra existence
 // check on its next reference, behind the IfNotExists Put backstop.
-func (c *CAS) markSeen(hash Hash) {
-	if _, loaded := c.seen.LoadOrStore(hash, struct{}{}); loaded {
+//
+// An existing entry is overwritten (so the latest establishment wins —
+// a fresh write re-arms the trust window) but counted once.
+func (c *CAS) markSeen(hash Hash, e seenEntry) {
+	if _, loaded := c.seen.Swap(hash, e); loaded {
 		return // already present — don't double-count
 	}
 	if c.seenCap <= 0 {
