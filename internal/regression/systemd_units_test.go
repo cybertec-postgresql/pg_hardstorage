@@ -210,7 +210,7 @@ func TestRPMSpecPackagesEveryUnitInTheRightSection(t *testing.T) {
 		if !strings.Contains(install, "%{_unitdir}/"+name) {
 			t.Errorf("%s is not installed in %%install", name)
 		}
-		if !regexp.MustCompile(`(?m)^%\{_unitdir\}/`+regexp.QuoteMeta(name)+`$`).MatchString(files) {
+		if !regexp.MustCompile(`(?m)^%\{_unitdir\}/` + regexp.QuoteMeta(name) + `$`).MatchString(files) {
 			t.Errorf("%s is not listed in %%files — rpmbuild rejects installed-but-unpackaged files", name)
 		}
 	}
