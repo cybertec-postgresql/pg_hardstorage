@@ -161,3 +161,38 @@ func TestRun_RetentionGCFailureMarksReport(t *testing.T) {
 		t.Errorf("failure kind = %q, want retention", rep.Failures[0].Kind)
 	}
 }
+
+// Cells must not all restore-verify at the same iteration: each verify
+// materialises a whole cluster, and in lockstep they stacked 4x12 GB.
+func TestRun_CellsVerifyAtDifferentPhases(t *testing.T) {
+	validate.ResetForTesting()
+	emit, events, mu := collectEvents(t)
+	var cells []validate.CellRuntime
+	for _, n := range []string{"ubuntu-2204-pg15-arm", "rockylinux-9-pg16-arm", "debian-12-pg17-arm", "ubuntu-2204-pg18-arm"} {
+		cells = append(cells, &validate.FakeCellRuntime{NameStr: n})
+	}
+	if _, err := validate.Run(context.Background(), validate.RunOptions{
+		Seed: 1, Duration: 200 * time.Millisecond,
+		Loop:   validate.LoopOptions{BackupEvery: 1, VerifyEvery: 25, RetentionInterval: -1},
+		Faults: defaultFaults(), Cells: cells, OnEvent: emit,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	first := map[string]int{}
+	for _, e := range *events {
+		if e.Op == "verify_started" {
+			if _, ok := first[e.Cell]; !ok {
+				first[e.Cell] = e.Iteration % 25
+			}
+		}
+	}
+	phases := map[int]bool{}
+	for _, p := range first {
+		phases[p] = true
+	}
+	if len(first) < 2 || len(phases) < 2 {
+		t.Fatalf("verify phases per cell = %v; cells must not verify in lockstep", first)
+	}
+}

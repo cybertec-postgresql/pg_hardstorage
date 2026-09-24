@@ -241,6 +241,12 @@ func runCellLoop(
 	gate *retentionGate,
 ) {
 	rng := rand.New(rand.NewSource(opts.Seed ^ hashName(cell.Name())))
+	// Each cell verifies at its own phase of the VerifyEvery cycle. A
+	// restore-verify materialises the whole cluster in a sandbox (12 GB
+	// per enterprise_heavy cell), and cells that start together stay in
+	// step: every cell verifying at the same iteration stacked 4x12 GB of
+	// sandboxes at once and walked the host towards the disk guard.
+	verifyPhase := int(uint64(hashName(cell.Name())) % uint64(opts.Loop.VerifyEvery))
 	cr.UpFor = 0
 	startedAt := time.Now()
 
@@ -569,7 +575,7 @@ func runCellLoop(
 
 			// 4. Restore-verify every M iterations (only if we
 			// have a backup to verify).
-			if iter%opts.Loop.VerifyEvery == 0 && lastBackupID != "" {
+			if (iter+verifyPhase)%opts.Loop.VerifyEvery == 0 && lastBackupID != "" {
 				emit(Event{Cell: cr.Name, Op: "verify_started",
 					Iteration: iter, Detail: lastBackupID})
 				cr.RestoresAttempted++
