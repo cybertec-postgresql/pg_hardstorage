@@ -268,7 +268,15 @@ func (p *Plugin) Put(ctx context.Context, key string, r io.Reader, opts storage.
 			// Uploaded but not locked. Delete it so a retry re-uploads and
 			// re-locks rather than leaving an UNLOCKED object a dedup hit
 			// (IfNotExists) would treat as a committed, protected object.
-			_ = p.Delete(ctx, key)
+			// Detached context: the retention call may have failed BECAUSE
+			// ctx was cancelled, and a cleanup on that ctx never leaves the
+			// process.
+			cctx, cancel := storage.CleanupContext(ctx)
+			derr := p.Delete(cctx, key)
+			cancel()
+			if derr != nil {
+				return storage.PutResult{}, fmt.Errorf("gcs: apply retention to %s: %w; rollback failed, an UNLOCKED object remains at the key: %w", key, rerr, derr)
+			}
 			return storage.PutResult{}, fmt.Errorf("gcs: apply retention to %s: %w", key, rerr)
 		}
 	}
