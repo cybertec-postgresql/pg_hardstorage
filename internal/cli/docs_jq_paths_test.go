@@ -91,6 +91,9 @@ func scanLines(t *testing.T, root string, fn func(rel string, n int, line string
 				return nil
 			}
 			if info.IsDir() {
+				if n := info.Name(); len(n) > 1 && n[0] == '.' && n != ".." {
+					return filepath.SkipDir // .git, .claude/worktrees, …: not part of the module (go tooling skips them too)
+				}
 				switch info.Name() {
 				case "vendor", ".git", "test-runs", "node_modules":
 					return filepath.SkipDir
