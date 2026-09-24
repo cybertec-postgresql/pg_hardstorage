@@ -437,6 +437,26 @@ func TestBuild_PGMajorMismatch(t *testing.T) {
 	}
 }
 
+// TestBuild_PGMajorMismatch_ManifestMajor: manifests record the bare
+// PG major (runner.buildManifest stores pgVersion.Major, e.g. 17), not
+// a server_version_num. The uniformity check must fire on that shape
+// too — it previously divided 17 by 10000, got 0, and skipped.
+func TestBuild_PGMajorMismatch_ManifestMajor(t *testing.T) {
+	sp, signer, verifier := newRepo(t)
+	t0 := time.Now().UTC().Add(-2 * time.Hour)
+	full := mkFull("db1.full.m", t0)
+	full.PGVersion = 17
+	inc := mkInc("db1.incremental_lsn.m", full.BackupID, t0.Add(time.Hour))
+	inc.PGVersion = 18
+	commitManifest(t, sp, signer, full)
+	commitManifest(t, sp, signer, inc)
+
+	_, err := combine.Build(context.Background(), sp, "db1", inc.BackupID, verifier)
+	if oe, ok := err.(*output.Error); !ok || oe.Code != "chain.pg_major_mismatch" {
+		t.Fatalf("want chain.pg_major_mismatch for a 17→18 chain; got %v", err)
+	}
+}
+
 // TestBuild_NonIncrementalMiddleLink: a full backup that wrongly carries a
 // ParentBackupID lands as a NON-anchor link; only the anchor may be full.
 func TestBuild_NonIncrementalMiddleLink(t *testing.T) {
