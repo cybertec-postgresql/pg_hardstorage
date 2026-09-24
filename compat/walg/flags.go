@@ -7,6 +7,8 @@ import (
 	"net/url"
 	"os"
 	"strings"
+
+	"github.com/cybertec-postgresql/pg_hardstorage/compat/walg/translate"
 )
 
 // walgEnv is the set of WAL-G env vars + the small number of CLI
@@ -101,19 +103,13 @@ func loadEnv() walgEnv {
 // "default".  WAL-G itself has no equivalent because every host
 // owns exactly one repo prefix; the native CLI requires a
 // deployment name as the first positional, so we synthesise one.
+//
+// Delegates to translate.DeploymentName so the name matches what
+// `compat translate --from walg` wrote into pg_hardstorage.yaml
+// (sanitized, Unix-socket PGHOST → "default").
 func (e walgEnv) deploymentName() string {
-	if e.deployment != "" {
-		return e.deployment
-	}
-	if e.pgHost != "" {
-		// Use the bare host (strip any port artefacts that snuck in).
-		host := e.pgHost
-		if i := strings.IndexAny(host, ":/"); i >= 0 {
-			host = host[:i]
-		}
-		return host
-	}
-	return "default"
+	name, _, _ := translate.DeploymentName(e.deployment, e.pgHost)
+	return name
 }
 
 // mapEnvToNativeArgs renders the union of WAL-G env vars into the

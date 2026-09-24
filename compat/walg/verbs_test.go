@@ -75,7 +75,7 @@ func TestBackupPush_Default_DispatchesIncremental(t *testing.T) {
 		t.Fatalf("exit code %d (expected 0 with stub dispatch)", exit)
 	}
 	want := []string{
-		"backup", "db.example.com",
+		"backup", "db_example_com",
 		"--pg-connection", "postgres://pgbackup@db.example.com/postgres",
 		"--repo", "s3://acme/wal-g",
 		"--incremental-from", "latest",
@@ -131,7 +131,7 @@ func TestBackupFetch_Latest(t *testing.T) {
 	// (it reads the repository, not a live PG), so it must not be
 	// injected here even though PGHOST is set.
 	want := []string{
-		"restore", "db.example.com", "latest",
+		"restore", "db_example_com", "latest",
 		"--target", "/tmp/restore",
 		"--repo", "s3://acme/wal-g", "--to-latest",
 	}
@@ -156,7 +156,7 @@ func TestBackupFetch_NamedBackup(t *testing.T) {
 	// --to-backup flag. A named backup must be the backup-id positional,
 	// and --pg-connection must NOT be injected (bug #46).
 	want := []string{
-		"restore", "db.example.com", "base_000000010000000000000010",
+		"restore", "db_example_com", "base_000000010000000000000010",
 		"--target", "/tmp/restore",
 		"--repo", "s3://acme/wal-g", "--to-latest",
 	}
@@ -216,7 +216,7 @@ func TestWalPush(t *testing.T) {
 		t.Fatalf("exit %d", exit)
 	}
 	want := []string{
-		"wal", "push", "db.example.com",
+		"wal", "push", "db_example_com",
 		"/var/lib/postgresql/15/pg_wal/000000010000000000000003",
 		"--pg-connection", "postgres://postgres@db.example.com/postgres",
 		"--repo", "s3://acme/wal-g",

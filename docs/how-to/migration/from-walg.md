@@ -234,6 +234,16 @@ retention floor, then WAL-G retires.
   KEK never leaves the KMS provider; chunks are encrypted
   at rest with a per-backup DEK that's wrapped under the
   KEK in the manifest.
+- **Deployment name.** Without `PG_HARDSTORAGE_DEPLOYMENT`,
+  the shim and `compat translate --from walg` derive the same
+  name from `PGHOST`: port stripped, illegal characters turned
+  into `_` (`db.prod.internal` → `db_prod_internal`), and a
+  Unix-socket `PGHOST` (`/var/run/postgresql`) becomes
+  `default`.  Earlier shim builds used the dotted host verbatim
+  (and an empty name for a socket); backups taken under such a
+  name stay restorable natively (`pg_hardstorage restore
+  db.prod.internal …`), but the shim now starts a new lineage —
+  take a fresh `backup-push --full` after upgrading.
 - **`backup-fetch` arms end-of-archive recovery.** WAL-G
   writes no recovery settings; the shim runs native
   `restore --to-latest`, which writes `recovery.signal` and a
