@@ -171,6 +171,41 @@ func validateRestoreTargetDir(target string, allowedRoots []string) error {
 	return fmt.Errorf("target_dir %q is outside the allowed roots", target)
 }
 
+// validateRestoreTablespaceMapping checks a restore body's
+// tablespace_mapping (a JSON array of "OLD=NEW" strings, as the CLI's
+// --tablespace-mapping produces). The syntax goes through the same
+// parser the agent uses; each NEW destination must then pass the
+// target_dir rules — absolute, already normalised (so a "/root/../etc"
+// cannot slip past a lexical prefix test), and under one of
+// allowedRoots when any are configured. Absent / null is fine.
+func validateRestoreTablespaceMapping(raw any, allowedRoots []string) error {
+	if raw == nil {
+		return nil
+	}
+	arr, ok := raw.([]any)
+	if !ok {
+		return fmt.Errorf("tablespace_mapping must be an array of \"OLD=NEW\" strings, got %T", raw)
+	}
+	entries := make([]string, 0, len(arr))
+	for i, e := range arr {
+		str, ok := e.(string)
+		if !ok {
+			return fmt.Errorf("tablespace_mapping[%d] is not a string (%T)", i, e)
+		}
+		entries = append(entries, str)
+	}
+	remap, err := restore.ParseTablespaceRemap(entries)
+	if err != nil {
+		return err
+	}
+	for _, m := range remap {
+		if err := validateRestoreTargetDir(m.New, allowedRoots); err != nil {
+			return fmt.Errorf("tablespace_mapping destination: %s", strings.Replace(err.Error(), "target_dir", "path", 1))
+		}
+	}
+	return nil
+}
+
 // validateRestorePITRArgs checks the PG-typed PITR fields on a restore
 // enqueue body so the operator gets a precise local error instead of a
 // queued job that fails as soon as the agent tries to translate the
@@ -752,10 +787,12 @@ func (s *Server) handleEnqueueVerify(w http.ResponseWriter, r *http.Request, dep
 //	  "allow_overwrite": false,                  // refuse non-empty target unless true
 //	  "to":         "5 minutes ago",             // optional PITR target (natural-language)
 //	  "to_lsn":     "0/3000028",                 // optional PITR target (LSN)
-//	  "verify_after": true                       // optional pg_verifybackup gate
+//	  "verify_after": true,                      // optional pg_verifybackup gate
+//	  "tablespace_mapping": ["/old=/new"]        // optional; each NEW gated like target_dir
 //	}
 //
-// Required: backup_id, target_dir. Everything else flows into
+// Required: backup_id, target_dir. restore_roots in the body is
+// ignored; the server stamps its own configured roots there. Everything else flows into
 // Job.Args; the agent's RestoreExecutor parses them.
 func (s *Server) handleEnqueueRestore(w http.ResponseWriter, r *http.Request, deployment string) {
 	// Body is required (backup_id + target_dir) but may arrive chunked
@@ -797,6 +834,25 @@ func (s *Server) handleEnqueueRestore(w http.ResponseWriter, r *http.Request, de
 		s.writeError(w, http.StatusBadRequest, "usage.bad_target_dir",
 			"deployments/<n>/restores: "+err.Error())
 		return
+	}
+	// Every tablespace_mapping destination is a directory the restore
+	// writes, exactly like target_dir, so it gets the same gate.
+	// Checking only target_dir left restore_roots decorative: a client
+	// with a compliant target_dir could still map a tablespace onto
+	// /etc or /root.
+	if err := validateRestoreTablespaceMapping(args["tablespace_mapping"], s.cfg.RestoreRoots); err != nil {
+		s.writeError(w, http.StatusBadRequest, "usage.bad_tablespace_mapping",
+			"deployments/<n>/restores: "+err.Error())
+		return
+	}
+	// restore_roots rides into Job.Args so the agent can re-check
+	// target_dir and every mapping destination (defence in depth; the
+	// agent has no roots of its own). It is SERVER-authoritative: a
+	// client-supplied value is discarded, never merged, so a client
+	// cannot widen the roots it is being held to.
+	delete(args, "restore_roots")
+	if len(s.cfg.RestoreRoots) > 0 {
+		args["restore_roots"] = append([]string(nil), s.cfg.RestoreRoots...)
 	}
 	if code, msg, ok := validateRestorePITRArgs(args); !ok {
 		s.writeError(w, http.StatusBadRequest, code,

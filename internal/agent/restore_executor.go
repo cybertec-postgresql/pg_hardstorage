@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup"
@@ -137,6 +139,25 @@ func (e *RestoreExecutor) Execute(ctx context.Context, job *ControlPlaneJob, pro
 	tsRemap, err := parseTablespaceMappingArg(job.Args["tablespace_mapping"])
 	if err != nil {
 		return nil, err
+	}
+	// Write-root gate. target_dir and every tablespace destination are
+	// directories this restore creates and fills, so they are checked
+	// together against the control plane's restore_roots (stamped into
+	// the job by the enqueue route; absent = unconstrained). Re-checked
+	// here rather than trusted from the route so a job queued by a
+	// control plane that skipped the check -- an older release checked
+	// only target_dir -- still cannot write a tablespace into /etc.
+	roots, err := restoreRootsArg(job.Args["restore_roots"])
+	if err != nil {
+		return nil, err
+	}
+	if err := checkRestoreWriteRoot("target_dir", targetDir, roots); err != nil {
+		return nil, err
+	}
+	for _, m := range tsRemap {
+		if err := checkRestoreWriteRoot("tablespace_mapping destination", m.New, roots); err != nil {
+			return nil, err
+		}
 	}
 
 	// Parse the `to` time target ONCE, here, and reuse it for both seed
@@ -488,4 +509,56 @@ func parseTablespaceMappingArg(raw any) (restore.TablespaceRemap, error) {
 		return nil, fmt.Errorf("restore-executor: %w", err)
 	}
 	return rm, nil
+}
+
+// restoreRootsArg decodes the server-stamped restore_roots job arg (a
+// JSON array of absolute paths). Absent = no roots configured.
+func restoreRootsArg(raw any) ([]string, error) {
+	if raw == nil {
+		return nil, nil
+	}
+	var out []string
+	switch v := raw.(type) {
+	case []string:
+		out = v
+	case []any:
+		for i, e := range v {
+			s, ok := e.(string)
+			if !ok {
+				return nil, fmt.Errorf("restore-executor: restore_roots[%d] is not a string (%T)", i, e)
+			}
+			out = append(out, s)
+		}
+	default:
+		return nil, fmt.Errorf("restore-executor: restore_roots must be an array of paths, got %T", raw)
+	}
+	return out, nil
+}
+
+// checkRestoreWriteRoot refuses a restore write destination that is not
+// an absolute, already-normalised path, or (when roots is non-empty)
+// that is not at or under one of roots. Normalisation is required
+// rather than applied so "/srv/restores/../../etc" is refused outright
+// instead of being quietly compared as "/etc". Same rules as the
+// server's validateRestoreTargetDir.
+func checkRestoreWriteRoot(what, path string, roots []string) error {
+	if !filepath.IsAbs(path) {
+		return fmt.Errorf("restore-executor: %s %q must be absolute", what, path)
+	}
+	if clean := filepath.Clean(path); clean != path {
+		return fmt.Errorf("restore-executor: %s %q is not normalised (want %q)", what, path, clean)
+	}
+	if len(roots) == 0 {
+		return nil
+	}
+	for _, root := range roots {
+		rel, err := filepath.Rel(filepath.Clean(root), path)
+		if err != nil {
+			continue
+		}
+		if rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return nil
+		}
+	}
+	return fmt.Errorf("restore-executor: %s %q is outside the control plane's restore roots %v; refusing", what, path, roots)
 }
