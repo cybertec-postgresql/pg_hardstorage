@@ -51,7 +51,7 @@ func rotateWALSegments(ctx context.Context, sp storage.StoragePlugin, opts Rotat
 		if err != nil {
 			return fmt.Errorf("list WAL segment manifests: %w", err)
 		}
-		if _, ok := walSegmentManifestDeployment(info.Key); ok {
+		if _, ok := WALSegmentManifestDeployment(info.Key); ok {
 			keys = append(keys, info.Key)
 		}
 	}
@@ -61,7 +61,7 @@ func rotateWALSegments(ctx context.Context, sp storage.StoragePlugin, opts Rotat
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		deployment, _ := walSegmentManifestDeployment(key)
+		deployment, _ := WALSegmentManifestDeployment(key)
 		res.WALConsidered++
 		outcome, err := rotateOneWALSegment(ctx, sp, key, opts)
 		switch outcome {
@@ -148,12 +148,12 @@ func rotateOneWALSegment(ctx context.Context, sp storage.StoragePlugin, key stri
 	return rotateOutcomeRotated, nil
 }
 
-// walSegmentManifestDeployment reports whether key is a committed WAL
+// WALSegmentManifestDeployment reports whether key is a committed WAL
 // segment manifest — exactly wal/<dep>/<8 hex>/<24 hex>.json — and
 // returns its deployment. Everything else under wal/ (history and
 // .backup/.partial auxiliaries, gap records, commit tmp files) is not
 // an envelope carrier and is ignored.
-func walSegmentManifestDeployment(key string) (string, bool) {
+func WALSegmentManifestDeployment(key string) (string, bool) {
 	parts := strings.Split(key, "/")
 	if len(parts) != 4 || parts[0] != "wal" || parts[1] == "" {
 		return "", false

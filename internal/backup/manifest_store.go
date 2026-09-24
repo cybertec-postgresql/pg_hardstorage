@@ -768,8 +768,27 @@ func (ms *ManifestStore) backfillDeploymentIndex(ctx context.Context, names []st
 // the wrong key is rejected.
 func (ms *ManifestStore) ListAttestationless(ctx context.Context, deployment string) iter.Seq2[*Manifest, error] {
 	return func(yield func(*Manifest, error) bool) {
+		for e, err := range ms.listAttestationless(ctx, deployment, false) {
+			if !yield(e.Manifest, err) {
+				return
+			}
+		}
+	}
+}
+
+// ListAttestationlessIncludingTombstoned is ListAttestationless plus
+// the soft-deleted manifests, each flagged. Same trust posture: scope
+// and inspection only. `kms shred` needs it — a tombstoned backup is
+// still resurrectable by `backup undelete` until it is purged, so it is
+// part of what a shred makes unrecoverable.
+func (ms *ManifestStore) ListAttestationlessIncludingTombstoned(ctx context.Context, deployment string) iter.Seq2[ManifestEntry, error] {
+	return ms.listAttestationless(ctx, deployment, true)
+}
+
+func (ms *ManifestStore) listAttestationless(ctx context.Context, deployment string, includeTombstoned bool) iter.Seq2[ManifestEntry, error] {
+	return func(yield func(ManifestEntry, error) bool) {
 		if err := validateStorageID("deployment", deployment); err != nil {
-			yield(nil, err)
+			yield(ManifestEntry{}, err)
 			return
 		}
 		prefix := "manifests/" + deployment + "/backups/"
@@ -780,7 +799,7 @@ func (ms *ManifestStore) ListAttestationless(ctx context.Context, deployment str
 		tombstoned := map[string]struct{}{}
 		for info, err := range ms.sp.List(ctx, prefix) {
 			if err != nil {
-				yield(nil, err)
+				yield(ManifestEntry{}, err)
 				return
 			}
 			switch {
@@ -798,14 +817,16 @@ func (ms *ManifestStore) ListAttestationless(ctx context.Context, deployment str
 		for _, key := range manifestKeys {
 			rel := strings.TrimPrefix(key, prefix)
 			slash := strings.IndexByte(rel, '/')
+			dead := false
 			if slash > 0 {
-				if _, dead := tombstoned[rel[:slash]]; dead {
-					continue
-				}
+				_, dead = tombstoned[rel[:slash]]
+			}
+			if dead && !includeTombstoned {
+				continue
 			}
 			rc, err := ms.sp.Get(ctx, key)
 			if err != nil {
-				if !yield(nil, err) {
+				if !yield(ManifestEntry{}, err) {
 					return
 				}
 				continue
@@ -813,13 +834,13 @@ func (ms *ManifestStore) ListAttestationless(ctx context.Context, deployment str
 			body, rerr := ReadAllLimited(rc, MaxManifestBytes)
 			_ = rc.Close()
 			if rerr != nil {
-				if !yield(nil, rerr) {
+				if !yield(ManifestEntry{}, rerr) {
 					return
 				}
 				continue
 			}
 			m, perr := ParseAttestationless(body)
-			if !yield(m, perr) {
+			if !yield(ManifestEntry{Manifest: m, Tombstoned: dead}, perr) {
 				return
 			}
 		}

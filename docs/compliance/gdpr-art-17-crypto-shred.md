@@ -106,8 +106,17 @@ anything.
    `Target = <keyring-path>`.
 2. Verify `--confirm-keyring` matches the resolved keyring
    path (defends against compromise).
+0. Refuse a read-only repository (`conflict.repo_read_only`,
+   exit 7) — shred redeems an approval and writes the audit
+   chain.
 3. Re-enumerate affected backups (canonical scope at shred
-   time).
+   time). The scope counts every object whose `kek_ref`
+   resolves to the local `kek.bin` — `local:default` *and*
+   refs a local rotation stamped (`local:v2`, …) — including
+   soft-deleted backups (still resurrectable by `backup
+   undelete`), stale replica copies, and WAL segment manifests
+   (`affected_wal_segment_count`: PITR through them dies with
+   the key).
 4. Write an audit event:
 
    ```json
@@ -122,7 +131,8 @@ anything.
        "approval_id": "appr-7f2a...",
        "keyring_dir": "/var/lib/pg_hardstorage/keyring",
        "affected_backup_count": 247,
-       "affected_backup_ids": ["db1.full.20260228T030001Z", ...]
+       "affected_backup_ids": ["db1.full.20260228T030001Z", ...],
+       "affected_wal_segment_count": 8121
      }
    }
    ```

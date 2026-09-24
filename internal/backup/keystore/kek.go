@@ -55,6 +55,15 @@ func assertKEKFileMode(path string) error {
 // records WHICH ref so restore can pick the right resolver.
 const KEKRefLocal = "local:default"
 
+// IsLocalRef reports whether ref resolves to the local keyring's
+// kek.bin — "", "local:default", and every other local:* ref a local
+// rotation stamps (see KEKResolver). Anything that must know "which
+// objects does THIS kek.bin protect" (kms shred's blast radius, kms
+// verify) matches with this, never with == KEKRefLocal.
+func IsLocalRef(ref string) bool {
+	return ref == "" || strings.HasPrefix(ref, "local:")
+}
+
 // LoadOrGenerateKEK reads the KEK from <keyringDir>/kek.bin, or
 // generates and writes a fresh one if absent.
 //
@@ -249,7 +258,7 @@ func KEKResolver(keyringDir string) func(ref string) ([encryption.KeyLen]byte, e
 		// key material. Restricting this resolver to exactly
 		// "local:default" made every rotated backup unrestorable by
 		// any shipped code path.
-		if strings.HasPrefix(ref, "local:") {
+		if IsLocalRef(ref) {
 			ref = KEKRefLocal
 		}
 		switch ref {
