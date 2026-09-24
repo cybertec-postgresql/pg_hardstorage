@@ -243,6 +243,17 @@ func (ms *ManifestStore) Commit(ctx context.Context, m *Manifest, signer *Signer
 		if errors.Is(err, storage.ErrAlreadyExists) {
 			return ErrAlreadyCommitted
 		}
+		// The manifest IS written — only its WORM lock failed. Returning
+		// the error as-is left a live, unlocked manifest behind a
+		// "commit failed" (no replica, parent check skipped). The repo
+		// asked for WORM, so an unlocked manifest is not an acceptable
+		// commit: roll it back and fail cleanly (the orphan chunks are
+		// reaped by gc; the caller retries).
+		var rerr *retentionApplyError
+		if errors.As(err, &rerr) {
+			return ms.rollbackPrimaryCommit(ctx, primaryKey,
+				fmt.Errorf("backup: commit primary %q: WORM retention could not be applied, so the commit was rolled back: %w", primaryKey, err))
+		}
 		return fmt.Errorf("backup: commit primary %q: %w", primaryKey, err)
 	}
 
@@ -370,11 +381,25 @@ func (ms *ManifestStore) commitAtomic(ctx context.Context, key string, body []by
 		}
 		if err := ms.sp.SetRetention(ctx, key, opts.RetainUntil, mode); err != nil &&
 			!errors.Is(err, storage.ErrUnsupported) {
-			return fmt.Errorf("apply retention to %s: %w", key, err)
+			return &retentionApplyError{key: key, err: err}
 		}
 	}
 	return nil
 }
+
+// retentionApplyError: the object at key was committed, but applying
+// its WORM retention failed. Distinct type so Commit can tell "nothing
+// was written" from "written but unlocked".
+type retentionApplyError struct {
+	key string
+	err error
+}
+
+func (e *retentionApplyError) Error() string {
+	return fmt.Sprintf("apply retention to %s: %v", e.key, e.err)
+}
+
+func (e *retentionApplyError) Unwrap() error { return e.err }
 
 // replicaCommitAttempts / replicaCommitBackoff bound how hard Commit
 // retries a failed replica write. The replica is the redundancy copy that
@@ -1091,7 +1116,8 @@ func (ms *ManifestStore) SoftDelete(ctx context.Context, deployment, backupID, p
 	// back, so no orphan can survive on either side.
 	descendants, err = ms.findLiveDescendants(ctx, deployment, backupID)
 	if err != nil {
-		return fmt.Errorf("backup: SoftDelete: re-scan descendants: %w", err)
+		return ms.rollbackOnRecheckError(ctx, deployment, []string{backupID}, "SoftDelete",
+			fmt.Errorf("re-scan descendants: %w", err))
 	}
 	if len(descendants) > 0 {
 		if _, rbErr := ms.removeTombstone(ctx, deployment, backupID); rbErr != nil {
@@ -1113,7 +1139,8 @@ func (ms *ManifestStore) SoftDelete(ctx context.Context, deployment, backupID, p
 	// tombstone back and refuse, exactly as the pre-check would have.
 	h, herr := ms.GetHold(ctx, deployment, backupID)
 	if herr != nil && !errors.Is(herr, storage.ErrNotFound) {
-		return fmt.Errorf("backup: SoftDelete: hold re-check: %w", herr)
+		return ms.rollbackOnRecheckError(ctx, deployment, []string{backupID}, "SoftDelete",
+			fmt.Errorf("hold re-check: %w", herr))
 	}
 	if h != nil && h.ActiveAt(time.Now().UTC()) {
 		if _, rbErr := ms.removeTombstone(ctx, deployment, backupID); rbErr != nil {
@@ -1246,7 +1273,12 @@ func (ms *ManifestStore) SoftDeleteCascade(ctx context.Context, deployment, back
 	// any still-live descendant of the root means a child slipped in, so we
 	// roll back all tombstones we installed and refuse.
 	if live, rescanErr := ms.findLiveDescendants(ctx, deployment, backupID); rescanErr != nil {
-		return deleted, fmt.Errorf("backup: SoftDeleteCascade: re-scan descendants: %w", rescanErr)
+		if err := ms.rollbackOnRecheckError(ctx, deployment, deleted, "SoftDeleteCascade",
+			fmt.Errorf("re-scan descendants: %w", rescanErr)); errors.Is(err, errTombstonesRemain) {
+			return deleted, err
+		} else {
+			return nil, err
+		}
 	} else if len(live) > 0 {
 		if rbErr := ms.rollbackTombstones(ctx, deployment, deleted); rbErr != nil {
 			return nil, fmt.Errorf("backup: SoftDeleteCascade: a child of %s committed concurrently; rolling back the cascade's tombstones failed — those chains may now be tombstoned-but-orphaned (run `backup undelete` on the affected backups): %w",
@@ -1273,7 +1305,12 @@ func (ms *ManifestStore) SoftDeleteCascade(ctx context.Context, deployment, back
 			if errors.Is(herr, storage.ErrNotFound) {
 				continue
 			}
-			return deleted, fmt.Errorf("backup: SoftDeleteCascade: hold re-check %s: %w", id, herr)
+			if err := ms.rollbackOnRecheckError(ctx, deployment, deleted, "SoftDeleteCascade",
+				fmt.Errorf("hold re-check %s: %w", id, herr)); errors.Is(err, errTombstonesRemain) {
+				return deleted, err
+			} else {
+				return nil, err
+			}
 		}
 		if h == nil || !h.ActiveAt(now) {
 			continue
@@ -1314,6 +1351,29 @@ func (ms *ManifestStore) rollbackTombstones(ctx context.Context, deployment stri
 		return errors.Join(rbErrs...)
 	}
 	return nil
+}
+
+// errTombstonesRemain marks a rollbackOnRecheckError result whose
+// rollback failed: the tombstones ARE in place.
+var errTombstonesRemain = errors.New("tombstones remain in place")
+
+// rollbackOnRecheckError handles a post-write re-check (descendants or
+// holds) that could not RUN. The delete used to return that error while
+// keeping its tombstones — the caller saw a failure, the backup was
+// nevertheless gone from List, and nothing said so. A check that cannot
+// prove the delete safe must undo it, exactly like one that proves it
+// unsafe. The rollback runs detached from ctx: a cancelled ctx is a
+// common reason the re-check failed. When the rollback itself fails,
+// the error says precisely which tombstones remain (and matches
+// errTombstonesRemain).
+func (ms *ManifestStore) rollbackOnRecheckError(ctx context.Context, deployment string, ids []string, op string, cause error) error {
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 60*time.Second)
+	defer cancel()
+	if rbErr := ms.rollbackTombstones(rctx, deployment, ids); rbErr != nil {
+		return fmt.Errorf("backup: %s: post-write re-check failed and rolling back failed — %d tombstone(s) REMAIN in place (%s); verify with `backup list --include-deleted` and `backup undelete` if unintended: %w",
+			op, len(ids), strings.Join(ids, ", "), errors.Join(errTombstonesRemain, cause, rbErr))
+	}
+	return fmt.Errorf("backup: %s: post-write re-check failed, so the delete was NOT applied (tombstones rolled back): %w", op, cause)
 }
 
 // SoftDeleteBatch soft-deletes many backups with a SINGLE scan of the
@@ -1390,7 +1450,12 @@ func (ms *ManifestStore) SoftDeleteBatch(ctx context.Context, deployment string,
 	// the batch's tombstones if so.
 	cs2, err := ms.loadChainSnapshot(ctx, deployment)
 	if err != nil {
-		return installed, fmt.Errorf("backup: SoftDeleteBatch: re-scan: %w", err)
+		if rerr := ms.rollbackOnRecheckError(ctx, deployment, installed, "SoftDeleteBatch",
+			fmt.Errorf("re-scan: %w", err)); errors.Is(rerr, errTombstonesRemain) {
+			return installed, rerr
+		} else {
+			return nil, rerr
+		}
 	}
 	if id, dep, bad := firstOrphaningDelete(cs2, batch, installed); bad {
 		var rbErrs []error
@@ -1425,7 +1490,12 @@ func (ms *ManifestStore) SoftDeleteBatch(ctx context.Context, deployment string,
 			if errors.Is(herr, storage.ErrNotFound) {
 				continue
 			}
-			return installed, fmt.Errorf("backup: SoftDeleteBatch: hold re-check %s: %w", id, herr)
+			if rerr := ms.rollbackOnRecheckError(ctx, deployment, installed, "SoftDeleteBatch",
+				fmt.Errorf("hold re-check %s: %w", id, herr)); errors.Is(rerr, errTombstonesRemain) {
+				return installed, rerr
+			} else {
+				return nil, rerr
+			}
 		}
 		if h == nil || !h.ActiveAt(nowAfter) {
 			continue
@@ -1575,24 +1645,14 @@ func (ms *ManifestStore) Undelete(ctx context.Context, deployment, backupID stri
 	// unrestorable while still listing as live. Walk the chain and
 	// fail closed, naming the first dead ancestor; UndeleteForce
 	// remains the eyes-open override.
-	cur := m
-	for cur.ParentBackupID != "" {
-		parentDead, perr := ms.IsTombstoned(ctx, deployment, cur.ParentBackupID)
-		if perr != nil {
-			return false, fmt.Errorf("backup: Undelete: tombstone check on ancestor %s: %w", cur.ParentBackupID, perr)
+	if dead, aerr := ms.firstTombstonedAncestor(ctx, deployment, m); aerr != nil {
+		return false, aerr
+	} else if dead != "" {
+		return false, &UndeleteParentTombstonedError{
+			Deployment: deployment,
+			BackupID:   backupID,
+			Ancestor:   dead,
 		}
-		if parentDead {
-			return false, &UndeleteParentTombstonedError{
-				Deployment: deployment,
-				BackupID:   backupID,
-				Ancestor:   cur.ParentBackupID,
-			}
-		}
-		parent, perr2 := ms.readManifestUnverified(ctx, deployment, cur.ParentBackupID)
-		if perr2 != nil {
-			return false, fmt.Errorf("backup: Undelete: read ancestor %s: %w", cur.ParentBackupID, perr2)
-		}
-		cur = parent
 	}
 
 	// Everything above ran while the manifest was still HIDDEN — and a
@@ -1661,7 +1721,67 @@ func (ms *ManifestStore) Undelete(ctx context.Context, deployment, backupID stri
 			Missing:     missing,
 		}
 	}
+
+	// Ancestors, again, at the visibility point. The pre-flight walk ran
+	// while this backup was still tombstoned, so a concurrent SoftDelete
+	// of an ancestor saw no live descendant, passed its own post-write
+	// recheck, and may have landed before our flip — leaving a live
+	// incremental on a tombstoned parent. (If it lands AFTER the flip,
+	// SoftDelete's own recheck sees this live child and rolls itself
+	// back.) Re-walk and undo the flip if so.
+	deadAnc, aerr := ms.firstTombstonedAncestor(ctx, deployment, m)
+	if aerr != nil {
+		return true, &UndeleteUnverifiedError{Deployment: deployment, BackupID: backupID, Cause: aerr}
+	}
+	if deadAnc != "" {
+		if err := ms.reinstallTombstone(ctx, deployment, backupID, markerBytes, mrdErr); err != nil {
+			return true, fmt.Errorf("backup: Undelete: ancestor %s was tombstoned concurrently and re-tombstoning %s failed — it is live on a dead parent; soft-delete it again or undelete the ancestor: %w",
+				deadAnc, backupID, err)
+		}
+		return false, &UndeleteParentTombstonedError{Deployment: deployment, BackupID: backupID, Ancestor: deadAnc}
+	}
 	return true, nil
+}
+
+// firstTombstonedAncestor walks m's parent chain and returns the first
+// tombstoned ancestor's ID ("" when the whole chain is live).
+func (ms *ManifestStore) firstTombstonedAncestor(ctx context.Context, deployment string, m *Manifest) (string, error) {
+	cur := m
+	seen := map[string]bool{}
+	for cur.ParentBackupID != "" {
+		if seen[cur.ParentBackupID] {
+			return "", fmt.Errorf("backup: Undelete: parent chain of %s has a cycle at %s", m.BackupID, cur.ParentBackupID)
+		}
+		seen[cur.ParentBackupID] = true
+		parentDead, perr := ms.IsTombstoned(ctx, deployment, cur.ParentBackupID)
+		if perr != nil {
+			return "", fmt.Errorf("backup: Undelete: tombstone check on ancestor %s: %w", cur.ParentBackupID, perr)
+		}
+		if parentDead {
+			return cur.ParentBackupID, nil
+		}
+		parent, perr2 := ms.readManifestUnverified(ctx, deployment, cur.ParentBackupID)
+		if perr2 != nil {
+			return "", fmt.Errorf("backup: Undelete: read ancestor %s: %w", cur.ParentBackupID, perr2)
+		}
+		cur = parent
+	}
+	return "", nil
+}
+
+// reinstallTombstone puts a just-removed marker back — the ORIGINAL
+// bytes when we have them, so policy/reason/timestamps survive the
+// round trip; a fresh marker otherwise.
+func (ms *ManifestStore) reinstallTombstone(ctx context.Context, deployment, backupID string, marker []byte, markerErr error) error {
+	if markerErr == nil && len(marker) > 0 {
+		err := storage.CommitExclusive(ctx, ms.sp, TombstonePath(deployment, backupID), marker, storage.PutOptions{})
+		if err == nil || errors.Is(err, storage.ErrAlreadyExists) {
+			return nil
+		}
+		return err
+	}
+	_, err := ms.softDeleteUnchecked(ctx, deployment, backupID, "undelete-rollback", "ancestor tombstoned during undelete")
+	return err
 }
 
 // readRaw fetches a key's bytes, for the marker round-trip above.
