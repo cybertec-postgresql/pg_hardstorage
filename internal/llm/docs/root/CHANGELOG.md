@@ -21,6 +21,12 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **`--cpu-profile`, `--mem-profile` and `--profile-port` were silently
+  ignored after a subcommand flag.** They are read before the subcommand
+  resolves, by a parse that stopped at the first flag it did not know —
+  so `repo gc --repo X --cpu-profile p.pprof` profiled nothing while
+  `--cpu-profile p.pprof repo gc --repo X` worked. They now work in any
+  position.
 - **`backup --include-wal` failed on a busy database.** `BASE_BACKUP`
   sends the WAL written during the backup at the end, and nothing pinned
   it meanwhile, so under sustained writes it was recycled first
@@ -318,6 +324,14 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Changed
 
+- **`repo gc --apply` deletes chunks 16 at a time.** It deleted them one
+  by one, and each delete waits for its directory fsync — a journal
+  commit, ~1.4 ms on a busy disk — so a sweep of 43,000 chunks took over
+  a minute locally and 4–6 minutes on the heavy soak's loaded host; a
+  remote backend paid a network round trip per chunk. Deletes stay
+  individually durable; concurrent ones share commits and overlap
+  latency (16,562 chunks: 8.7 s). Found by running retention in the
+  soak for the first time.
 - **The LLM helper's system prompt shrank from 150 KB to 64 KB.**
   `hotCommandPaths` baked the full `--help` of 38 commands into every
   prompt. Its comment estimated "~200-400 tokens" per entry; measured
