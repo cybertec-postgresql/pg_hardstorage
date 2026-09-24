@@ -64,15 +64,18 @@ func runWalList(cmd *cobra.Command, deployment, repoURL string, tliFilter uint32
 	if err != nil {
 		return err
 	}
+	// Timeline-aware: a new timeline must be covered from its fork, which
+	// segment numbers alone cannot tell (see findLineageGaps).
+	gaps := findLineageGaps(segs, repoTimelineForks(cmd.Context(), sp, deployment, segs))
 	body := walListBody{
 		Deployment: deployment,
 		Timelines:  summariseTimelines(segs),
-		GapCount:   countGaps(segs),
+		GapCount:   len(gaps),
 	}
 	if !gapsOnly {
 		body.Segments = segs
 	}
-	body.Gaps = findGaps(segs)
+	body.Gaps = gaps
 	return d.Result(output.NewResult(cmd.CommandPath()).WithBody(body))
 }
 
@@ -278,10 +281,6 @@ func deploymentSegmentSize(ctx context.Context, sp storage.StoragePlugin, keys [
 		// defensible answer.
 	}
 	return walsink.DefaultSegmentSize, readAny
-}
-
-func countGaps(segs []walSegment) int {
-	return len(findGaps(segs))
 }
 
 // summariseTimelines counts segments per timeline. For the at-a-

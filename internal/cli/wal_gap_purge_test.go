@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -355,5 +357,48 @@ func TestWalGapPurge_Orphans_ReapsGapForPastGraceTombstone(t *testing.T) {
 				"tombstoned PAST grace (dead) — routine cleanup would never make progress.\n"+
 				"records: %+v", all)
 		}
+	}
+}
+
+// TestWalGapPurge_Orphans_UnreadableManifestFailsClosed: a backup
+// manifest that cannot be READ (storage fault, truncation, corruption)
+// says nothing about whether its timeline is live. --orphans used to
+// skip every per-manifest error, so the unreadable backup's timeline
+// fell out of the live set and gap records it still needed were
+// reaped — restore then loses the ability to refuse a PITR into that
+// hole. Only a signature failure (a manifest this repo would never
+// restore from anyway) may be skipped; anything else must abort before
+// deleting.
+func TestWalGapPurge_Orphans_UnreadableManifestFailsClosed(t *testing.T) {
+	w := newReadWorld(t)
+	idA := commitBackupOnTLIWithID(t, w, "db1", "db1.a.20260101T000000Z", 1, []byte("older"))
+	commitBackupOnTLI(t, w, "db1", 3, []byte("live"))
+	seedGap(t, w, "db1", 2, time.Date(2026, 5, 2, 12, 0, 0, 0, time.UTC))
+
+	// Corrupt A's manifest in place: TLI 1 becomes unknowable.
+	path := filepath.Join(strings.TrimPrefix(w.repoURL, "file://"),
+		"manifests", "db1", "backups", idA, "manifest.json")
+	if err := os.WriteFile(path, []byte("{not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	stdout, stderr, exit := runCLI(t, "wal", "gap-purge", "db1",
+		"--repo", w.repoURL, "--orphans", "--yes", "-o", "json")
+	if exit == int(output.ExitOK) {
+		t.Fatalf("gap-purge --orphans succeeded with an unreadable manifest:\n%s", stdout)
+	}
+	if !strings.Contains(stderr, "wal.gap_purge_scan_failed") {
+		t.Errorf("expected wal.gap_purge_scan_failed:\n%s", stderr)
+	}
+	all, _ := gapstate.New(w.sp).List(context.Background(), "db1")
+	kept := false
+	for _, r := range all {
+		if r.Timeline == 2 {
+			kept = true
+		}
+	}
+	if !kept {
+		t.Fatalf("gap on TLI 2 was reaped although the backup that may cross it could "+
+			"not be read; surviving records: %+v", all)
 	}
 }

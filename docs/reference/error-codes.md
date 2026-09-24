@@ -105,6 +105,7 @@ is fixed.
 | `preflight.backup_wal_missing` | Restore refused: the backup embeds no WAL and the repository holds none on its timeline, so it could never become consistent (recovery would wait forever). Take a new backup with `--include-wal` or with `wal stream` running; `--skip-gap-check` overrides |
 | `preflight.pg_role_missing` | `partial dump`: the role it connects to the sandbox as (default `postgres`) does not exist in the backed-up cluster; pass `--pg-user`. The temporary sandbox is removed |
 | `preflight.chain_target_not_empty` | Replicate-by-chain target already has content |
+| `preflight.system_identifier_changed`, `preflight.wal_segment_size`, `preflight.wal_segment_size_changed` | `wal stream` / `wal push`: the cluster reached is not the one the deployment's WAL was archived from (different `system_identifier`), reports an impossible `wal_segment_size`, or has a different segment size than the archive. `wal stream` checks on every reconnect attempt, not only at startup, and stops rather than retrying |
 
 **Recovery:** read the body, fix the condition (free disk,
 upgrade PG client tools, clear the target dir, …), retry.
@@ -215,8 +216,8 @@ field is where the recovery hint lives.
 | `backup.*` | Backup pipeline (`backup.failed`, `backup.encrypt_no_kek`, `backup.kek_load_failed`, `backup.kms_open_failed`, `backup.compare.*`, `backup.delete.*`, `backup.undelete.*`) |
 | `keyring.*` | Keyring utilities (`keyring.install_failed`, `keyring.install_empty_source` — the initContainer copy refusing an empty or unreadable Secret mount) |
 | `restore.*` | Restore pipeline (`restore.failed`, `restore.kek_mismatch`, `restore.kek_resolve_failed`, `restore.target_in_wal_gap`, `restore.timeline_history_unreachable`, `restore.unknown_scheme`) |
-| `wal.*` | WAL streaming / fetch (`wal.slot_missing`, `wal.slot_ensure_failed`, `wal.slot_repair_failed`, `wal.fetch.*`, `wal.gap_purge_failed`, `wal.push_failed`, `wal.stream_error`) |
-| `repo.*` | Repo lifecycle, GC, scrub, replicate (`repo.open_failed`, `repo.gc.*`, `repo.scrub.*`, `repo.check.*`, `repo.replicate.*`, `repo.wal_prune.failed`, `repo.wipe.partial`) |
+| `wal.*` | WAL streaming / fetch (`wal.slot_missing`, `wal.slot_ensure_failed`, `wal.slot_repair_failed`, `wal.fetch.*`, `wal.gap_purge_failed`, `wal.push_failed`, `wal.stream_error`, `wal.system_identifier_changed` — the DSN reached a different cluster than this `wal stream` process started on (permanent), `wal.segment_size_probe_failed` — `wal_segment_size` could not be read on a connected cluster; retried, never assumed) |
+| `repo.*` | Repo lifecycle, GC, scrub, replicate (`repo.open_failed`, `repo.gc.*`, `repo.scrub.*`, `repo.check.*`, `repo.replicate.*`, `repo.wal_prune.failed`, `repo.wal_prune.incomplete` — `wal prune` finished but `segments_failed > 0`; the result body lists each failure, re-run once fixed, `repo.wipe.partial`) |
 | `repo.replicate.incomplete` | `repo replicate` finished but the destination is NOT a complete replica (some manifests/chunks failed or are missing). Non-zero exit so `replicate && rm source` can't trust a partial DR copy — re-run until it exits 0, then `repo replicate verify`. |
 | `repair.*` | Manifest / attestation / chunk repair |
 | `manifest.*` | Manifest parse / validation at restore-plan time (`manifest.invalid`) |

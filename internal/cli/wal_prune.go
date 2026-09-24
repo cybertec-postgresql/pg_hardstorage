@@ -59,7 +59,13 @@ their end_lsn is below the LSN frontier. Use this to enforce a
 primary rule (the plan's keep_wal_days).
 
 Chunks are NOT deleted by this command. Run 'pg_hardstorage repo
-gc --apply' afterwards to reclaim the now-orphan chunk bytes.`,
+gc --apply' afterwards to reclaim the now-orphan chunk bytes.
+
+Exits non-zero (repo.wal_prune.incomplete) when any segment could not
+be processed (segments_failed > 0), in dry-run and --apply alike; the
+result body with the per-segment failures is still written first.
+Gap records (wal/<deployment>/gaps/) and timeline histories are never
+treated as segments.`,
 		Args:         cobra.ExactArgs(1),
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -121,7 +127,28 @@ func runWalPrune(cmd *cobra.Command, deployment, repoURL string, apply bool, kee
 		WALPruneResult: *res,
 		KeepSince:      keepSince,
 	}
-	return d.Result(output.NewResult(cmd.CommandPath()).WithBody(body))
+	// Render the body first so monitoring keeps the counters and the
+	// per-segment failure detail — the same dual-stream shape as
+	// `repo replicate`.
+	if rerr := d.Result(output.NewResult(cmd.CommandPath()).WithBody(body)); rerr != nil {
+		return rerr
+	}
+	// Then report an INCOMPLETE run through the exit code. It used to
+	// exit 0 with segments_failed > 0, and cron / `wal prune --apply &&
+	// repo gc --apply` pipelines read the exit code, not the counters:
+	// retention looked enforced while WAL it should have removed stayed
+	// (or, in a dry run, the plan silently skipped segments it could not
+	// read). Prune is idempotent, so the remedy is to fix the cause and
+	// re-run until it exits clean.
+	if res.SegmentsFailed > 0 {
+		return output.NewError("repo.wal_prune.incomplete",
+			fmt.Sprintf("wal prune: %d segment(s) could not be processed (%d deleted, %d kept); "+
+				"see the failures in the result body", res.SegmentsFailed, res.SegmentsDeleted, res.SegmentsKept)).
+			WithSuggestion(&output.Suggestion{
+				Human: "fix the per-segment cause listed under `failures` (typically an unreadable manifest or a storage permission error) and re-run — prune is idempotent.",
+			})
+	}
+	return nil
 }
 
 // walPruneBody is the v1-stable Result body. Cron-friendly counters;

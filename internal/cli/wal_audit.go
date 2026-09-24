@@ -52,6 +52,12 @@ on the same timeline. A non-contiguous range is a gap — the "WAL
 got lost between agent disconnect and slot recreate" case the plan
 calls out.
 
+Timeline changes are checked too. When a timeline's history file is
+in the repo (wal/<deployment>/timelines/, captured by wal stream),
+the new timeline must be archived from the segment holding its fork
+point: old-timeline segments past the fork are diverged history and
+do not cover the new timeline's WAL at those positions.
+
 Findings flip the exit code to ExitVerifyFailed (9) so cron-driven
 audits alarm. A ` + "`wal.gap_detected`" + ` audit-chain entry is
 appended on every gap-finding run — bit-rot-style: rare enough to
@@ -87,7 +93,7 @@ func runWalAudit(cmd *cobra.Command, deployment, repoURL string, tliFilter uint3
 	if err != nil {
 		return err
 	}
-	gaps := findGaps(segs)
+	gaps := findLineageGaps(segs, repoTimelineForks(cmd.Context(), sp, deployment, segs))
 	timelines := summariseTimelines(segs)
 	stoppedAt := time.Now().UTC()
 

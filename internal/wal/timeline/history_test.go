@@ -270,3 +270,33 @@ func FuzzHistoryContaining(f *testing.F) {
 		}
 	})
 }
+
+func TestLeavesAt(t *testing.T) {
+	hist := []Switch{
+		{Timeline: 1, SwitchPoint: 0x3000100},
+		{Timeline: 2, SwitchPoint: 0x5000200},
+		{Timeline: 4, SwitchPoint: 0x9000000},
+	}
+	cases := []struct {
+		ancestor uint32
+		want     pglogrepl.LSN
+		ok       bool
+	}{
+		{1, 0x3000100, true}, // direct ancestor
+		{2, 0x5000200, true}, // direct ancestor
+		// 3 is a sibling branch off 2: the lineage shares nothing of 3
+		// past where it left 2.
+		{3, 0x5000200, true},
+		{4, 0x9000000, true},
+		{0, 0, false}, // below every entry: unknown
+	}
+	for _, tc := range cases {
+		got, ok := LeavesAt(hist, tc.ancestor)
+		if ok != tc.ok || got != tc.want {
+			t.Errorf("LeavesAt(%d) = (%s,%v), want (%s,%v)", tc.ancestor, got, ok, tc.want, tc.ok)
+		}
+	}
+	if _, ok := LeavesAt(nil, 1); ok {
+		t.Error("empty history must report unknown")
+	}
+}
