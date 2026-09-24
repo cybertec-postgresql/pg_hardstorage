@@ -90,6 +90,16 @@ func Run(root *cobra.Command) int {
 	root.SetContext(ctx)
 
 	cmd, err := root.ExecuteC()
+	// Close the dispatcher on the way out (after any error Result below
+	// is rendered): sink delivery is asynchronous, and without a drain
+	// the process exits with the last events — typically the failure
+	// alert — still queued. Close is bounded, so a stuck sink cannot
+	// hold the exit hostage.
+	if cmd != nil && cmd.Context() != nil {
+		if d, ok := cmd.Context().Value(dispatcherKey{}).(*output.Dispatcher); ok && d != nil {
+			defer func() { _ = d.Close() }()
+		}
+	}
 	if err == nil {
 		return int(output.ExitOK)
 	}

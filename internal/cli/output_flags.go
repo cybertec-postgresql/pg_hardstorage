@@ -172,6 +172,13 @@ func installDispatcher(cmd *cobra.Command, _ []string) error {
 		return err
 	}
 	d := output.NewDispatcher(r, stdout, stderr)
+	// `llm --mcp-server` owns stdout for its JSON-RPC stream: any event
+	// there (the start-up warnings below, whatever the renderer) is a
+	// frame the MCP client cannot parse. Route events to stderr before
+	// the first one is emitted.
+	if ownsStdoutProtocol(cmd) {
+		d.EventsToStderr()
+	}
 
 	// Resolve the air-gap policy from flag > env > config and seed
 	// the process-wide default BEFORE we build any sink (sink
@@ -241,6 +248,16 @@ func installDispatcher(cmd *cobra.Command, _ []string) error {
 	return nil
 }
 
+// ownsStdoutProtocol reports whether cmd speaks a wire protocol of its
+// own on stdout, so dispatcher events must never be written there.
+func ownsStdoutProtocol(cmd *cobra.Command) bool {
+	if cmd.Name() != "llm" {
+		return false
+	}
+	on, _ := cmd.Flags().GetBool("mcp-server")
+	return on
+}
+
 // tracingShutdownKey is the context key for the tracer's shutdown
 // hook. Tests use it to flush spans manually before asserting.
 type tracingShutdownKey struct{}
@@ -305,7 +322,12 @@ func loadConfigBestEffort(ctx context.Context, d *output.Dispatcher) *config.Loa
 		// own non-EACCES error kinds) still emit the warning —
 		// those ARE actionable and the operator needs to see
 		// them.
-		if !errors.Is(err, fs.ErrPermission) {
+		//
+		// A -c file that does not exist is not warned about here
+		// either: every command that reads config now fails on it
+		// with config.load_failed, and the editing commands
+		// (deployment add, init) legitimately create it.
+		if !errors.Is(err, fs.ErrPermission) && !errors.Is(err, fs.ErrNotExist) {
 			_ = d.Event(ctx, output.NewEvent(output.SeverityWarning, "config", "load_failed").
 				WithBody(map[string]any{"error": err.Error()}))
 		}
