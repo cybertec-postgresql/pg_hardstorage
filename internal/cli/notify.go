@@ -4,6 +4,7 @@ package cli
 import (
 	"fmt"
 	"io"
+	"net/url"
 	"sort"
 	"strings"
 
@@ -55,7 +56,11 @@ Common configurations:
   notify add syslog   --set protocol=tcp --set address=siem.example.com:6514
 
 --set values are passed verbatim into the sink's config map; the
-plugin's builder validates them.
+plugin's builder validates them.  Commas are part of the value (no
+splitting).  Repeating a key builds a list, e.g. for email recipients:
+
+  notify add email --set smtp_host=smtp.example.com --set from=pgh@example.com \
+                   --set to=ops@example.com --set to=dba@example.com
 
 Re-adding a sink with the same name replaces the existing entry —
 unless --no-replace is set, in which case a duplicate name is
@@ -71,8 +76,12 @@ rejected.`,
 		},
 	}
 	c.Flags().StringVar(&name, "name", "", "operator-chosen sink name (default: plugin name)")
-	c.Flags().StringSliceVar(&setKVs, "set", nil,
-		"key=value pairs to merge into the sink's config (repeatable)")
+	// StringArray, not StringSlice: a slice flag splits on commas,
+	// which mangles values that legitimately contain one (a subject
+	// prefix, a JSON header blob).  Multi-value keys are expressed
+	// by repeating the key instead — see runNotifyAdd.
+	c.Flags().StringArrayVar(&setKVs, "set", nil,
+		"key=value pair to merge into the sink's config (repeatable; repeat a key to build a list, e.g. --set to=a@x --set to=b@x)")
 	c.Flags().StringVar(&minSev, "min-severity", "",
 		"convenience for --set min_severity=<level>")
 	c.Flags().BoolVar(&yes, "yes", false,
@@ -92,6 +101,11 @@ func runNotifyAdd(cmd *cobra.Command, name, plugin string, setKVs []string, minS
 			"notify add: plugin name is required").Wrap(output.ErrUsage)
 	}
 
+	// A key given once is a scalar string; a key given N>1 times
+	// becomes a list ([]any, the shape YAML decodes a sequence to,
+	// so the builder sees the same type now and after reload).
+	// Last-one-wins would silently drop all but one recipient of
+	// an email sink's `to`.
 	cfgMap := map[string]any{}
 	for _, kv := range setKVs {
 		k, v, ok := strings.Cut(kv, "=")
@@ -99,7 +113,14 @@ func runNotifyAdd(cmd *cobra.Command, name, plugin string, setKVs []string, minS
 			return output.NewError("usage.bad_set",
 				fmt.Sprintf("notify add: --set %q must be key=value", kv)).Wrap(output.ErrUsage)
 		}
-		cfgMap[k] = v
+		switch prev := cfgMap[k].(type) {
+		case nil:
+			cfgMap[k] = v
+		case string:
+			cfgMap[k] = []any{prev, v}
+		case []any:
+			cfgMap[k] = append(prev, v)
+		}
 	}
 	if minSev != "" {
 		cfgMap["min_severity"] = minSev
@@ -194,23 +215,63 @@ func runNotifyList(cmd *cobra.Command) error {
 	return d.Result(output.NewResult(cmd.CommandPath()).WithBody(notifyListBody{Sinks: out}))
 }
 
-// redactURL keeps the host visible but hides any embedded secret-
-// shaped path. Slack webhooks have the form
-// https://hooks.slack.com/services/T*/B*/X* — the path IS the
-// secret. We replace anything past the third `/` with "****" so
-// `notify list` is safe to paste into a ticket.
+// redactURL keeps the scheme and host visible but hides every
+// place a credential can hide, so `notify list` is safe to paste
+// into a ticket:
+//
+//   - the path: Slack webhooks have the form
+//     https://hooks.slack.com/services/T*/B*/X* — the path IS the
+//     secret — so any non-empty path becomes "/****";
+//   - userinfo: https://user:pass@host carries basic-auth
+//     credentials; user and password are both replaced;
+//   - sensitive query parameters (token, key, secret, sig, ...)
+//     keep their key but lose their value; other keys stay so the
+//     operator can still tell sinks apart;
+//   - the fragment, which some token-in-URL schemes use.
+//
+// Anything that doesn't parse as an absolute URL is fully hidden.
 func redactURL(u string) string {
-	// Find the host part: scheme://host/...
-	idx := strings.Index(u, "://")
-	if idx < 0 {
+	p, err := url.Parse(u)
+	if err != nil || p.Scheme == "" || p.Host == "" {
 		return "****"
 	}
-	rest := u[idx+3:]
-	slash := strings.IndexByte(rest, '/')
-	if slash < 0 {
-		return u
+	var b strings.Builder
+	b.WriteString(p.Scheme + "://")
+	if p.User != nil {
+		b.WriteString("****@")
 	}
-	return u[:idx+3+slash] + "/****"
+	b.WriteString(p.Host)
+	if p.Path != "" || p.RawPath != "" {
+		b.WriteString("/****")
+	}
+	if p.RawQuery != "" {
+		parts := strings.Split(p.RawQuery, "&")
+		for i, part := range parts {
+			k, _, _ := strings.Cut(part, "=")
+			if dk, derr := url.QueryUnescape(k); derr != nil || sensitiveQueryKey(dk) {
+				parts[i] = k + "=****"
+			}
+		}
+		b.WriteString("?" + strings.Join(parts, "&"))
+	}
+	if p.Fragment != "" || p.RawFragment != "" {
+		b.WriteString("#****")
+	}
+	return b.String()
+}
+
+// sensitiveQueryKey reports whether a query parameter name looks
+// like it carries a credential.  Substring match on the lowercased
+// name so api_key, X-Amz-Signature, access_token, sig, ... all hit;
+// over-redacting a harmless key costs nothing in a listing.
+func sensitiveQueryKey(k string) bool {
+	k = strings.ToLower(k)
+	for _, frag := range []string{"token", "key", "secret", "pass", "pwd", "sig", "auth", "cred", "session", "code"} {
+		if strings.Contains(k, frag) {
+			return true
+		}
+	}
+	return false
 }
 
 func newNotifyRemoveCmd() *cobra.Command {
