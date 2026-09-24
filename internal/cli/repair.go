@@ -18,7 +18,6 @@ import (
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/audit"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup"
-	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup/keystore"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/output"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/paths"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
@@ -336,16 +335,9 @@ func wormPolicyFor(repoMeta *repo.Metadata) (time.Time, storage.WORMMode) {
 // loadSignerAndVerifier loads the local keypair (same path
 // loadVerifier uses, but returning both halves).
 func loadSignerAndVerifier() (*backup.Signer, *backup.Verifier, error) {
-	p, err := paths.Resolve(paths.DefaultOptions())
-	if err != nil {
-		return nil, nil, output.NewError("internal", err.Error()).Wrap(err)
-	}
-	signer, verifier, err := keystore.LoadOrGenerate(p.Keyring.Value)
-	if err != nil {
-		return nil, nil, output.NewError("internal",
-			fmt.Sprintf("repair: keystore: %v", err)).Wrap(err)
-	}
-	return signer, verifier, nil
+	// Repair re-signs and verifies with the repository's own key; a key
+	// minted here would re-sign manifests under a key nothing trusts.
+	return loadExistingKeypair("repair")
 }
 
 // currentlyValid reports whether the on-disk manifest verifies

@@ -309,7 +309,7 @@ Result body carries `bytes_reclaimable` (dry-run) or `bytes_reclaimed`
 #### gc safety: running `--apply` next to live writers
 
 `repo gc --apply` is safe to run while backups, `wal stream`,
-`wal push`, `repo replicate` and bundle imports write to the same
+`wal push`, logical streams, `repo replicate` and bundle imports write to the same
 repository. The hazard is a writer that **deduplicates against** an
 orphan chunk (it adopts the existing object instead of writing it —
 no new mtime, so `--min-chunk-age` does not protect it) and commits a

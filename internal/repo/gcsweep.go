@@ -67,7 +67,11 @@ type SweepResult struct {
 	Deleted          int
 	DeletedBytes     int64
 	StaleTempDeleted int
-	Failures         []string // per-key delete failures (uncapped)
+	// StagingReaped / StagingReapedBytes count backend staging files
+	// (hidden from List) left by crashed writers and removed by Apply.
+	StagingReaped      int
+	StagingReapedBytes int64
+	Failures           []string // per-key delete failures (uncapped)
 	// SkippedReferenced counts orphans spared because a manifest
 	// committed after the snapshot, or a writer's pin, claimed them.
 	SkippedReferenced int
@@ -414,6 +418,21 @@ func Sweep(ctx context.Context, sp storage.StoragePlugin, opts SweepOptions) (*S
 			continue
 		}
 		res.StaleTempDeleted++
+	}
+
+	// Backend staging files (.deferred-/.excl-/.hstmp-) a crashed writer
+	// left behind. The backends hide them from List, so neither the
+	// orphan sweep nor the stale-manifest pass can see them and they
+	// leaked forever. Only temps older than DefaultStagingReapAge are
+	// touched — an in-flight write's temp is minutes old. Best-effort: a
+	// failure here is reported, never allowed to fail gc.
+	if st, err := storage.ReapStagingOf(ctx, sp, storage.DefaultStagingReapAge); err != nil {
+		if opts.OnWarning != nil {
+			opts.OnWarning(fmt.Sprintf("reap backend staging files: %v", err))
+		}
+	} else {
+		res.StagingReaped = st.Removed
+		res.StagingReapedBytes = st.Bytes
 	}
 	sort.Strings(res.Failures)
 	return res, nil

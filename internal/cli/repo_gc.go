@@ -245,6 +245,8 @@ func runRepoGC(cmd *cobra.Command, repoURL string, apply bool, approvalID string
 		body.Applied = res.Deleted
 		body.BytesReclaimed = res.DeletedBytes
 		body.StaleTempDeleted = res.StaleTempDeleted
+		body.StagingReaped = res.StagingReaped
+		body.StagingReapedBytes = res.StagingReapedBytes
 		failureCount := len(res.Failures)
 		failures := res.Failures
 		const maxFailures = 16
@@ -339,17 +341,21 @@ type repoGCNotice struct {
 
 // repoGCBody is the v1-stable result body.
 type repoGCBody struct {
-	DryRun           bool     `json:"dry_run"`
-	ManifestRefCount int      `json:"manifest_ref_count"`
-	OrphanCount      int      `json:"orphan_count"`
-	BytesReclaimable int64    `json:"bytes_reclaimable"`
-	Applied          int      `json:"applied,omitempty"`
-	BytesReclaimed   int64    `json:"bytes_reclaimed,omitempty"`
-	StaleTempCount   int      `json:"stale_temp_count,omitempty"`
-	StaleTempDeleted int      `json:"stale_temp_deleted,omitempty"`
-	Hashes           []string `json:"hashes,omitempty"`
-	Failures         []string `json:"failures,omitempty"`
-	ApprovalID       string   `json:"approval_id,omitempty"`
+	DryRun           bool  `json:"dry_run"`
+	ManifestRefCount int   `json:"manifest_ref_count"`
+	OrphanCount      int   `json:"orphan_count"`
+	BytesReclaimable int64 `json:"bytes_reclaimable"`
+	Applied          int   `json:"applied,omitempty"`
+	BytesReclaimed   int64 `json:"bytes_reclaimed,omitempty"`
+	StaleTempCount   int   `json:"stale_temp_count,omitempty"`
+	StaleTempDeleted int   `json:"stale_temp_deleted,omitempty"`
+	// StagingReaped counts backend staging files a crashed writer left
+	// (invisible to List) that this run removed.
+	StagingReaped      int      `json:"staging_reaped,omitempty"`
+	StagingReapedBytes int64    `json:"staging_reaped_bytes,omitempty"`
+	Hashes             []string `json:"hashes,omitempty"`
+	Failures           []string `json:"failures,omitempty"`
+	ApprovalID         string   `json:"approval_id,omitempty"`
 	// RunID names this sweep's run record (gc/runs/<id>.json) — the
 	// object concurrent writers fence against. --apply only.
 	RunID string `json:"run_id,omitempty"`
@@ -380,6 +386,9 @@ func (b repoGCBody) WriteText(w io.Writer) error {
 		fmt.Fprintf(bw, "  ✓ deleted %d (%s reclaimed)\n", b.Applied, humanBytes(b.BytesReclaimed))
 		if b.StaleTempCount > 0 {
 			fmt.Fprintf(bw, "  ✓ removed %d stale staging file(s)\n", b.StaleTempDeleted)
+		}
+		if b.StagingReaped > 0 {
+			fmt.Fprintf(bw, "  ✓ removed %d leftover backend staging file(s) (%s)\n", b.StagingReaped, humanBytes(b.StagingReapedBytes))
 		}
 		if len(b.Failures) > 0 {
 			fmt.Fprintf(bw, "  ✗ %d delete failure(s):\n", len(b.Failures))
