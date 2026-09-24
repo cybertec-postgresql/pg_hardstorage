@@ -138,7 +138,7 @@ func TestBackup_InterruptedByAFailover_FailsHonestly(t *testing.T) {
 	}
 	done := make(chan backupOutcome, 1)
 	go func() {
-		out, code := runBin(8*time.Minute, "backup", "db1", "--repo", repoURL, "-o", "json")
+		out, code := runBin(8*time.Minute, "backup", "db1", "--include-wal", "--repo", repoURL, "-o", "json")
 		done <- backupOutcome{out, code}
 	}()
 
@@ -319,7 +319,7 @@ func TestBackup_InterruptedByAFailover_FailsHonestly(t *testing.T) {
 	// notice is to compare against what a complete capture of the same
 	// cluster looks like — so take one now, with nothing interfering,
 	// and compare file counts.
-	if out, code := runBin(8*time.Minute, "backup", "db1", "--repo", repoURL, "-o", "json"); code != 0 {
+	if out, code := runBin(8*time.Minute, "backup", "db1", "--include-wal", "--repo", repoURL, "-o", "json"); code != 0 {
 		t.Fatalf("the control backup failed (%d), so there is nothing to compare against:\n%s",
 			code, lastLines(out, 1200))
 	}
