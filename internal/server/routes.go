@@ -408,6 +408,33 @@ func redactRepoURL(raw string) string {
 	return u.Redacted()
 }
 
+// redactJobForAPI returns a copy of j safe to show an API client: the
+// repo URL (top-level and the client-supplied Args["repo"]) is
+// redacted, since repo URLs routinely embed credentials (sftp
+// passwords, azblob ?sig= SAS tokens) and job views go to any holder
+// of the operator token -- dashboards, CI logs, `restore
+// --control-plane` output. The claim response is the one place that
+// must NOT use this: the agent opens the repository with the real URL.
+// j itself is never modified (the backend may hand out shared state).
+func redactJobForAPI(j *Job) *Job {
+	if j == nil {
+		return nil
+	}
+	out := *j
+	if out.RepoURL != "" {
+		out.RepoURL = redactRepoURL(out.RepoURL)
+	}
+	if raw, ok := j.Args["repo"].(string); ok && raw != "" {
+		args := make(map[string]any, len(j.Args))
+		for k, v := range j.Args {
+			args[k] = v
+		}
+		args["repo"] = redactRepoURL(raw)
+		out.Args = args
+	}
+	return &out
+}
+
 // redactRepoErr scrubs a repo.Open error for the unauthenticated readyz
 // response. The backend error wraps the raw URL (and may surface the bare
 // password), so replace every occurrence of the raw URL with its redacted
@@ -474,7 +501,7 @@ func (s *Server) handleDeployments(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			for _, dep := range deployments {
-				e := entry{Name: dep, Repo: url}
+				e := entry{Name: dep, Repo: redactRepoURL(url)}
 				// ListAttestationless: this endpoint just reports
 				// counts + last-backup pointers; trust is enforced
 				// at the API auth layer above.  ms.List with nil
@@ -598,7 +625,7 @@ func (s *Server) handleDeploymentBackups(w http.ResponseWriter, r *http.Request,
 				}
 				out = append(out, entry{
 					BackupID:  m.BackupID,
-					Repo:      url,
+					Repo:      redactRepoURL(url),
 					Type:      string(m.Type),
 					PGVersion: m.PGVersion,
 					Timeline:  m.Timeline,
@@ -705,7 +732,7 @@ func (s *Server) handleEnqueueBackup(w http.ResponseWriter, r *http.Request, dep
 		s.writeError(w, http.StatusBadRequest, "usage.bad_enqueue", err.Error())
 		return
 	}
-	s.writeJSON(w, http.StatusAccepted, envelope{Result: job})
+	s.writeJSON(w, http.StatusAccepted, envelope{Result: redactJobForAPI(job)})
 }
 
 // handleEnqueueVerify is POST /v1/deployments/<n>/verifies. Body is
@@ -774,7 +801,7 @@ func (s *Server) handleEnqueueVerify(w http.ResponseWriter, r *http.Request, dep
 		s.writeError(w, http.StatusBadRequest, "usage.bad_enqueue", err.Error())
 		return
 	}
-	s.writeJSON(w, http.StatusAccepted, envelope{Result: job})
+	s.writeJSON(w, http.StatusAccepted, envelope{Result: redactJobForAPI(job)})
 }
 
 // handleEnqueueRestore is POST /v1/deployments/<n>/restores. Body is
@@ -882,7 +909,7 @@ func (s *Server) handleEnqueueRestore(w http.ResponseWriter, r *http.Request, de
 		s.writeError(w, http.StatusBadRequest, "usage.bad_enqueue", err.Error())
 		return
 	}
-	s.writeJSON(w, http.StatusAccepted, envelope{Result: job})
+	s.writeJSON(w, http.StatusAccepted, envelope{Result: redactJobForAPI(job)})
 }
 
 // handleJobs is GET /v1/jobs?state=&kind=&deployment=&limit=.
@@ -918,6 +945,9 @@ func (s *Server) handleJobs(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusInternalServerError, "internal.job_list_failed",
 			"jobs: list: "+err.Error())
 		return
+	}
+	for i := range out {
+		out[i] = *redactJobForAPI(&out[i])
 	}
 	s.writeJSON(w, http.StatusOK, envelope{
 		Result: map[string]any{"jobs": out, "count": len(out)},
@@ -1012,7 +1042,7 @@ func (s *Server) handleJobGet(w http.ResponseWriter, _ *http.Request, id string)
 			"jobs/"+id+": "+err.Error())
 		return
 	}
-	s.writeJSON(w, http.StatusOK, envelope{Result: j})
+	s.writeJSON(w, http.StatusOK, envelope{Result: redactJobForAPI(j)})
 }
 
 func (s *Server) handleJobProgress(w http.ResponseWriter, r *http.Request, id string) {
@@ -1081,7 +1111,7 @@ func (s *Server) handleJobComplete(w http.ResponseWriter, r *http.Request, id st
 		s.writeError(w, http.StatusInternalServerError, "internal", err.Error())
 		return
 	}
-	s.writeJSON(w, http.StatusOK, envelope{Result: j})
+	s.writeJSON(w, http.StatusOK, envelope{Result: redactJobForAPI(j)})
 }
 
 func (s *Server) handleJobCancel(w http.ResponseWriter, r *http.Request, id string) {
@@ -1117,7 +1147,7 @@ func (s *Server) handleJobCancel(w http.ResponseWriter, r *http.Request, id stri
 		s.writeError(w, http.StatusInternalServerError, "internal", err.Error())
 		return
 	}
-	s.writeJSON(w, http.StatusOK, envelope{Result: j})
+	s.writeJSON(w, http.StatusOK, envelope{Result: redactJobForAPI(j)})
 }
 
 // silence unused-import on niche build paths.
