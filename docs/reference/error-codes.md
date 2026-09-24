@@ -66,6 +66,8 @@ Common leaf shapes:
 | `usage.bad_token`, `usage.bad_key_file`, `usage.bad_approver_key` | Cryptographic input did not parse |
 | `usage.confirmation_required`, `usage.confirmation_mismatch` | Typed-keyring confirmation missing or wrong |
 | `usage.conflicting_flags`, `usage.conflicting_targets` | Mutually-exclusive flags both set |
+| `usage.unsupported_flag` | A flag the chosen mode cannot honour, refused instead of silently dropped — e.g. `restore --control-plane` with `--preview` (there is no remote preview; it would run a real restore), `--require-threshold-attestation`, `--verify-restore`, `--kms-config` or `--chain-staging-root` |
+| `usage.bad_tablespace_mapping` | A `--tablespace-mapping` / API `tablespace_mapping` entry is malformed, not normalised, or (control plane) outside `restore_roots` |
 | `usage.unknown_output_format`, `usage.unknown_policy`, `usage.unknown_scheme`, `usage.unknown_shell` | Enum-shaped value out of set |
 
 **Recovery:** read the suggestion, fix the command line,
@@ -115,7 +117,7 @@ upgrade PG client tools, clear the target dir, …), retry.
 
 | Leaf | Meaning |
 | --- | --- |
-| `aborted.context_cancelled` | `ctx.Done()` fired (SIGINT, request deadline) |
+| `aborted.context_cancelled` | `ctx.Done()` fired (SIGINT, request deadline). For `backup`/`restore --control-plane`, the dispatched job is cancelled on the control plane first; the message says so, or names the job if the cancel could not be delivered |
 | `aborted.confirmation_required` | Interactive confirmation refused at the prompt |
 | `aborted.backup_cancelled`, `aborted.restore_cancelled`, `aborted.verify_cancelled` | Operator cancelled a long-running op |
 | `aborted.attestation_valid`, `aborted.primary_intact` | Safety belt fired (e.g. `restore` against a still-healthy primary) |

@@ -2,9 +2,17 @@
 package cli
 
 import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net/http"
+	"net/url"
+	"sort"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -95,8 +103,7 @@ func runBackupControlPlane(cmd *cobra.Command, opts runOptions) error {
 	}
 	job, err := cli.PollUntilTerminal(cmd.Context(), id, progressFn)
 	if err != nil {
-		return output.NewError("dispatch.poll_failed",
-			fmt.Sprintf("backup: poll: %v", err)).Wrap(err)
+		return dispatchPollErr(cmd.Context(), cli, "backup", id, err)
 	}
 
 	switch job.State {
@@ -149,4 +156,77 @@ func (b backupCPResultBody) WriteText(w io.Writer) error {
 	}
 	_, err := io.WriteString(w, strings.TrimRight(bw.String(), "\n"))
 	return err
+}
+
+// refuseUnsupportedControlPlaneFlags returns a usage.unsupported_flag
+// error for the first flag in unsupported the operator explicitly set
+// on cmd. Keyed on Changed (not the value) so a flag whose default is
+// non-empty -- --verify-restore=auto -- only trips when the operator
+// actually typed it. The map value says why the agent cannot honour
+// the flag. Iterated in sorted order so the refusal is deterministic.
+func refuseUnsupportedControlPlaneFlags(cmd *cobra.Command, verb string, unsupported map[string]string) error {
+	names := make([]string, 0, len(unsupported))
+	for n := range unsupported {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	for _, n := range names {
+		if f := cmd.Flags().Lookup(n); f != nil && f.Changed {
+			return output.NewError("usage.unsupported_flag",
+				fmt.Sprintf("%s --control-plane: --%s is not supported in control-plane mode (%s); remove the flag or run the %s locally",
+					verb, n, unsupported[n], verb)).
+				Wrap(output.ErrUsage)
+		}
+	}
+	return nil
+}
+
+// dispatchPollErr maps a PollUntilTerminal failure to the CLI error.
+// An interrupted poll (Ctrl-C / SIGTERM cancels the command context)
+// is NOT a poll failure: the operator stopped waiting, so the job is
+// cancelled on the control plane -- leaving a restore or backup running
+// unattended after the operator hit Ctrl-C is the surprising outcome --
+// and the command exits with the aborted code (5). The cancel request
+// uses a fresh, short context because ctx is already done.
+func dispatchPollErr(ctx context.Context, cli *DispatchClient, verb, jobID string, err error) error {
+	if ctx.Err() == nil || !errors.Is(err, ctx.Err()) {
+		return output.NewError("dispatch.poll_failed",
+			fmt.Sprintf("%s: poll: %v", verb, err)).Wrap(err)
+	}
+	cctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	msg := fmt.Sprintf("%s: interrupted; cancelled control-plane job %s", verb, jobID)
+	if cerr := cancelDispatchedJob(cctx, cli, jobID, "operator interrupted the dispatching CLI"); cerr != nil {
+		msg = fmt.Sprintf("%s: interrupted; could NOT cancel control-plane job %s, which may still be running (cancel it with POST /v1/jobs/%s/cancel): %v",
+			verb, jobID, jobID, cerr)
+	}
+	return output.NewError("aborted.context_cancelled", msg).Wrap(err)
+}
+
+// cancelDispatchedJob POSTs /v1/jobs/<id>/cancel.
+func cancelDispatchedJob(ctx context.Context, cli *DispatchClient, jobID, reason string) error {
+	if err := cli.ensureClient(); err != nil {
+		return err
+	}
+	body, err := json.Marshal(map[string]string{"reason": reason})
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		cli.BaseURL+"/v1/jobs/"+url.PathEscape(jobID)+"/cancel", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	cli.applyAuth(req)
+	resp, err := cli.HTTPClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return fmt.Errorf("status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(raw)))
+	}
+	return nil
 }

@@ -40,6 +40,31 @@ import (
 func runRestoreControlPlane(cmd *cobra.Command, opts restoreOpts) error {
 	d := DispatcherFrom(cmd)
 
+	// --preview promises "plan the restore but do not write anything".
+	// There is no remote preview: the only thing this path can do is
+	// enqueue a real restore (with allow_overwrite when --force is set),
+	// so honouring the flag by ignoring it would execute exactly what
+	// the operator asked NOT to. Refuse; preview locally against the
+	// agent's repo instead (it only reads).
+	if opts.preview {
+		return output.NewError("usage.unsupported_flag",
+			"restore --control-plane: --preview cannot be dispatched (the control plane would run a REAL restore); run `pg_hardstorage restore <deployment> <backup> --preview --repo <url>` locally against the agent's repository instead").
+			Wrap(output.ErrUsage)
+	}
+	// Flags the agent's RestoreExecutor has no way to honour. Each is
+	// refused rather than dropped: an operator who asked for a
+	// threshold-attestation gate or a cluster-start smoke test and got
+	// a restore without one has been told something false.
+	if err := refuseUnsupportedControlPlaneFlags(cmd, "restore", map[string]string{
+		"require-threshold-attestation": "the agent has no threshold roster; verify the attestation locally first",
+		"verify-restore":                "the cluster-start smoke test runs only in a local restore",
+		"kms-config":                    "cloud-KMS settings come from the agent's own config (kms.providers)",
+		"chain-staging-root":            "chain staging lives on the agent host and is not remotely configurable",
+		"reset-chain-staging":           "chain staging lives on the agent host and is not remotely configurable",
+	}); err != nil {
+		return err
+	}
+
 	// Required-field validation. We mirror the server-side checks at
 	// the CLI boundary too so the operator gets a clear local error
 	// rather than a 400 from the server.
@@ -99,6 +124,29 @@ func runRestoreControlPlane(cmd *cobra.Command, opts restoreOpts) error {
 	if opts.toTimeline != "" && opts.toTimeline != "latest" {
 		body["to_timeline"] = opts.toTimeline
 	}
+	if opts.toLatest {
+		// Validated above against --to/--to-lsn/--to-name by
+		// validateRestoreTargets; the agent re-checks.
+		body["to_latest"] = true
+	}
+	if opts.skipGapCheck {
+		body["skip_gap_check"] = true
+	}
+	if opts.forceForeign {
+		body["allow_foreign_cluster"] = true
+	}
+	// --verify is forwarded only when the operator set it: the agent's
+	// verify_after has always defaulted to "no verification" for
+	// control-plane restores, and silently turning the local default
+	// (auto) on for every dispatched restore would change what an
+	// unchanged command line does.
+	if cmd.Flags().Changed("verify") {
+		if _, err := restore.ParseVerifyMode(opts.verifyMode); err != nil {
+			return output.NewError("usage.bad_flag",
+				fmt.Sprintf("restore: --verify: %v", err)).Wrap(output.ErrUsage)
+		}
+		body["verify_after"] = opts.verifyMode
+	}
 	if opts.toExclusive {
 		// CLI flag is `--to-exclusive` (default false → server-side
 		// default true for to_inclusive). When the operator opts out
@@ -155,8 +203,7 @@ func runRestoreControlPlane(cmd *cobra.Command, opts restoreOpts) error {
 	}
 	job, err := cli.PollUntilTerminal(cmd.Context(), id, progressFn)
 	if err != nil {
-		return output.NewError("dispatch.poll_failed",
-			fmt.Sprintf("restore: poll: %v", err)).Wrap(err)
+		return dispatchPollErr(cmd.Context(), cli, "restore", id, err)
 	}
 
 	// Map the terminal state to a CLI exit. Failed/cancelled get
