@@ -35,6 +35,8 @@ import (
 	"os/exec"
 	"strings"
 	"time"
+
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/llm/safety"
 )
 
 // CLIRunner runs subcommands against the same pg_hardstorage binary
@@ -142,9 +144,16 @@ func (r *CLIRunner) RunJSON(ctx context.Context, args ...string) ([]byte, error)
 }
 
 // appendOutputJSON appends `-o json` if the caller hasn't already
-// requested an output mode.  Idempotent.
+// requested an output mode.  Idempotent.  When args carry a `--`
+// terminator the flag goes in front of it: after the terminator
+// cobra reads everything as a positional.
 func appendOutputJSON(args []string) []string {
+	dash := len(args)
 	for i := 0; i < len(args); i++ {
+		if args[i] == "--" {
+			dash = i
+			break
+		}
 		switch args[i] {
 		case "-o", "--output":
 			return args
@@ -153,7 +162,10 @@ func appendOutputJSON(args []string) []string {
 			return args
 		}
 	}
-	return append(args, "-o", "json")
+	out := make([]string, 0, len(args)+2)
+	out = append(out, args[:dash]...)
+	out = append(out, "-o", "json")
+	return append(out, args[dash:]...)
 }
 
 // assertReadOnlyArgs is the local belt-and-braces refusal of
@@ -166,6 +178,11 @@ func appendOutputJSON(args []string) []string {
 // the binary refuses to run without explicit acknowledgement.
 // Anything not on this list is allowed through (read-only by
 // default).
+//
+// It also refuses the root persistent flags with side effects
+// (safety.SideEffectFlagsRefused): those are honoured anywhere in
+// argv, so a model-supplied value like "--cpu-profile=/home/op/.bashrc"
+// would otherwise make the child truncate an arbitrary file.
 func assertReadOnlyArgs(args []string) error {
 	for _, a := range args {
 		switch a {
@@ -173,6 +190,9 @@ func assertReadOnlyArgs(args []string) error {
 			"--confirm-keyring", "--require-approval":
 			return fmt.Errorf("llm tools: refuse to invoke mutation flag %q via the read-only tool surface (skills are read-only; advise+execute lands with its own dispatch path)", a)
 		}
+	}
+	if tok, bad := safety.ContainsSideEffectFlag(args); bad {
+		return fmt.Errorf("llm tools: refuse to invoke global flag %q via the LLM tool surface (it has side effects outside the command's read path)", tok)
 	}
 	return nil
 }
