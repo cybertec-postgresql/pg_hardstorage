@@ -415,30 +415,30 @@ func (p *Provider) assertOpen() error {
 // key name, everything before it is the mount.
 func parseKEKRef(kekRef string) (addr, mount, name string, err error) {
 	if !strings.HasPrefix(kekRef, Scheme+"://") {
-		return "", "", "", fmt.Errorf("vault-transit: KEKRef %q does not have the %q:// prefix", kekRef, Scheme)
+		return "", "", "", fmt.Errorf("vault-transit: KEKRef %q does not have the %q:// prefix", stdkms.RedactKEKRef(kekRef), Scheme)
 	}
 	rest := strings.TrimPrefix(kekRef, Scheme+"://")
 	if rest == "" {
-		return "", "", "", fmt.Errorf("vault-transit: empty resource in KEKRef %q", kekRef)
+		return "", "", "", fmt.Errorf("vault-transit: empty resource in KEKRef %q", stdkms.RedactKEKRef(kekRef))
 	}
 	// First segment is host[:port]; the rest is mount/.../name.
 	slash := strings.IndexByte(rest, '/')
 	if slash < 0 {
-		return "", "", "", fmt.Errorf("vault-transit: KEKRef %q must include /<mount>/<key>", kekRef)
+		return "", "", "", fmt.Errorf("vault-transit: KEKRef %q must include /<mount>/<key>", stdkms.RedactKEKRef(kekRef))
 	}
 	host := rest[:slash]
 	pathPart := rest[slash+1:]
 	if host == "" {
-		return "", "", "", fmt.Errorf("vault-transit: empty host in KEKRef %q", kekRef)
+		return "", "", "", fmt.Errorf("vault-transit: empty host in KEKRef %q", stdkms.RedactKEKRef(kekRef))
 	}
 
 	parts := strings.Split(pathPart, "/")
 	if len(parts) < 2 {
-		return "", "", "", fmt.Errorf("vault-transit: KEKRef %q must include both <mount> and <key>", kekRef)
+		return "", "", "", fmt.Errorf("vault-transit: KEKRef %q must include both <mount> and <key>", stdkms.RedactKEKRef(kekRef))
 	}
 	for _, seg := range parts {
 		if seg == "" {
-			return "", "", "", fmt.Errorf("vault-transit: KEKRef %q contains empty path segment", kekRef)
+			return "", "", "", fmt.Errorf("vault-transit: KEKRef %q contains empty path segment", stdkms.RedactKEKRef(kekRef))
 		}
 	}
 	name = parts[len(parts)-1]

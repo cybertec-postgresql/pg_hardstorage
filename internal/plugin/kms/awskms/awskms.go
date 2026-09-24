@@ -402,12 +402,12 @@ func (p *Provider) assertOpen() error {
 //	aws-kms://<key-id>
 func parseKEKRef(kekRef string) (string, error) {
 	if !strings.HasPrefix(kekRef, Scheme+"://") {
-		return "", fmt.Errorf("aws-kms: KEKRef %q does not have the %q:// prefix", kekRef, Scheme)
+		return "", fmt.Errorf("aws-kms: KEKRef %q does not have the %q:// prefix", stdkms.RedactKEKRef(kekRef), Scheme)
 	}
 	id := strings.TrimPrefix(kekRef, Scheme+"://")
 	id = strings.TrimSpace(id)
 	if id == "" {
-		return "", fmt.Errorf("aws-kms: empty key id in KEKRef %q", kekRef)
+		return "", fmt.Errorf("aws-kms: empty key id in KEKRef %q", stdkms.RedactKEKRef(kekRef))
 	}
 	return id, nil
 }

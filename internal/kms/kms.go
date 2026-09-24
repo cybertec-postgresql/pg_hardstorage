@@ -204,11 +204,11 @@ func (r *Registry) Open(ctx context.Context, kekRef string, cfg map[string]any) 
 	r.mu.RUnlock()
 	if !ok {
 		return nil, fmt.Errorf("%w: %q (no provider registered for scheme %q)",
-			ErrUnknownScheme, kekRef, scheme)
+			ErrUnknownScheme, RedactKEKRef(kekRef), scheme)
 	}
 	p, err := b(ctx, kekRef, cfg)
 	if err != nil {
-		return nil, fmt.Errorf("kms: open %q: %w", kekRef, err)
+		return nil, fmt.Errorf("kms: open %q: %w", RedactKEKRef(kekRef), err)
 	}
 	return p, nil
 }

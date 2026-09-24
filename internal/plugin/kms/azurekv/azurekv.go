@@ -506,26 +506,26 @@ func (p *Provider) assertOpen() error {
 // — the prefix-with-dot triggers literal-host mode.
 func parseKEKRef(kekRef string) (vaultURL, keyName, versionRef string, err error) {
 	if !strings.HasPrefix(kekRef, Scheme+"://") {
-		return "", "", "", fmt.Errorf("azure-kv: KEKRef %q does not have the %q:// prefix", kekRef, Scheme)
+		return "", "", "", fmt.Errorf("azure-kv: KEKRef %q does not have the %q:// prefix", stdkms.RedactKEKRef(kekRef), Scheme)
 	}
 	rest := strings.TrimPrefix(kekRef, Scheme+"://")
 	rest = strings.TrimSpace(rest)
 	if rest == "" {
-		return "", "", "", fmt.Errorf("azure-kv: empty resource in KEKRef %q", kekRef)
+		return "", "", "", fmt.Errorf("azure-kv: empty resource in KEKRef %q", stdkms.RedactKEKRef(kekRef))
 	}
 	parts := strings.SplitN(rest, "/", 3)
 	if len(parts) < 2 {
-		return "", "", "", fmt.Errorf("azure-kv: KEKRef %q must be azure-kv://<vault>/<key>[/<version>]", kekRef)
+		return "", "", "", fmt.Errorf("azure-kv: KEKRef %q must be azure-kv://<vault>/<key>[/<version>]", stdkms.RedactKEKRef(kekRef))
 	}
 	vaultPart := parts[0]
 	keyName = parts[1]
 	if keyName == "" {
-		return "", "", "", fmt.Errorf("azure-kv: empty key name in KEKRef %q", kekRef)
+		return "", "", "", fmt.Errorf("azure-kv: empty key name in KEKRef %q", stdkms.RedactKEKRef(kekRef))
 	}
 	if len(parts) == 3 {
 		versionRef = parts[2]
 		if versionRef == "" {
-			return "", "", "", fmt.Errorf("azure-kv: empty version suffix in KEKRef %q", kekRef)
+			return "", "", "", fmt.Errorf("azure-kv: empty version suffix in KEKRef %q", stdkms.RedactKEKRef(kekRef))
 		}
 	}
 	// vault host: bare name → public-cloud .vault.azure.net;

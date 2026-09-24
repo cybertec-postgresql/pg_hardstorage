@@ -417,25 +417,25 @@ func (p *Provider) assertOpen() error {
 //	  → keyName="projects/p/locations/l/keyRings/r/cryptoKeys/k", versionRef="3"
 func parseKEKRef(kekRef string) (keyName, versionRef string, err error) {
 	if !strings.HasPrefix(kekRef, Scheme+"://") {
-		return "", "", fmt.Errorf("gcp-kms: KEKRef %q does not have the %q:// prefix", kekRef, Scheme)
+		return "", "", fmt.Errorf("gcp-kms: KEKRef %q does not have the %q:// prefix", stdkms.RedactKEKRef(kekRef), Scheme)
 	}
 	resource := strings.TrimPrefix(kekRef, Scheme+"://")
 	resource = strings.TrimSpace(resource)
 	if resource == "" {
-		return "", "", fmt.Errorf("gcp-kms: empty resource path in KEKRef %q", kekRef)
+		return "", "", fmt.Errorf("gcp-kms: empty resource path in KEKRef %q", stdkms.RedactKEKRef(kekRef))
 	}
 	// Validate the basic shape: projects/.../locations/.../keyRings/.../cryptoKeys/...
 	if !strings.HasPrefix(resource, "projects/") ||
 		!strings.Contains(resource, "/locations/") ||
 		!strings.Contains(resource, "/keyRings/") ||
 		!strings.Contains(resource, "/cryptoKeys/") {
-		return "", "", fmt.Errorf("gcp-kms: KEKRef %q is not a CryptoKey resource path (expected projects/.../cryptoKeys/...)", kekRef)
+		return "", "", fmt.Errorf("gcp-kms: KEKRef %q is not a CryptoKey resource path (expected projects/.../cryptoKeys/...)", stdkms.RedactKEKRef(kekRef))
 	}
 	if i := strings.Index(resource, "/cryptoKeyVersions/"); i >= 0 {
 		keyName = resource[:i]
 		versionRef = strings.TrimPrefix(resource[i:], "/cryptoKeyVersions/")
 		if versionRef == "" {
-			return "", "", fmt.Errorf("gcp-kms: KEKRef %q has empty version suffix", kekRef)
+			return "", "", fmt.Errorf("gcp-kms: KEKRef %q has empty version suffix", stdkms.RedactKEKRef(kekRef))
 		}
 		return keyName, versionRef, nil
 	}
