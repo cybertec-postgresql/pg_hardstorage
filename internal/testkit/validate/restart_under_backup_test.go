@@ -140,3 +140,29 @@ func TestTakeBackupOtherOCIExecFailureStillFails(t *testing.T) {
 		t.Fatalf("a missing binary is a real failure, got: %v", err)
 	}
 }
+
+// The third attempt: dockerd refused the exec while the container was
+// restarting, and State.Running was still true.
+func TestTakeBackupContainerRestartingIsCellNotReady(t *testing.T) {
+	d := &DockerCellRuntime{CellName: "c", Container: "cell-c",
+		DockerBin: fakeDockerExecFails(t, "echo true; exit 0",
+			"Error response from daemon: Container 9d6fba02ee7c is restarting, wait until the container is running"),
+		AgentBinary: "/usr/bin/pg_hardstorage", Deployment: "db1", RepoURL: "file:///r"}
+	_, err := d.TakeBackup(context.Background())
+	if !errors.Is(err, ErrCellNotReady) {
+		t.Fatalf("dockerd refused the exec; must be ErrCellNotReady, got: %v", err)
+	}
+}
+
+// "is not running" from pg_hardstorage itself (about PostgreSQL) is a
+// real result: only dockerd's own refusal line counts.
+func TestTakeBackupProductSaysNotRunningStillFails(t *testing.T) {
+	d := &DockerCellRuntime{CellName: "c", Container: "cell-c",
+		DockerBin: fakeDockerExecFails(t, "echo true; exit 0",
+			`{"error":{"code":"internal","message":"the database server is not running"}}`),
+		AgentBinary: "/usr/bin/pg_hardstorage", Deployment: "db1", RepoURL: "file:///r"}
+	_, err := d.TakeBackup(context.Background())
+	if err == nil || errors.Is(err, ErrCellNotReady) {
+		t.Fatalf("pg_hardstorage's own failure must stay a failure, got: %v", err)
+	}
+}

@@ -459,6 +459,7 @@ func cellDownDockerErr(err error) bool {
 	}
 	s := err.Error()
 	return strings.Contains(s, "is not running") ||
+		strings.Contains(s, "is restarting, wait until the container is running") ||
 		strings.Contains(s, "No such container") ||
 		strings.Contains(s, "no such container")
 }
@@ -481,11 +482,34 @@ func (d *DockerCellRuntime) containerRunning(ctx context.Context) bool {
 }
 
 // isContainerGoneExecError reports whether a docker exec failed because
-// the container's namespaces were gone — runc's "error executing setns
-// process" — rather than for anything the exec'd program did.
+// Docker could not run anything in the container, rather than for
+// anything the exec'd program did:
+//   - runc's "error executing setns process": the container's namespaces
+//     no longer exist;
+//   - dockerd refusing the exec ("Error response from daemon: ... is
+//     restarting, wait until the container is running", "... is not
+//     running", "No such container").
+//
+// The dockerd phrases count only on a line carrying dockerd's own
+// "Error response from daemon:" prefix — pg_hardstorage's output can
+// say "... is not running" about PostgreSQL, and that is a real result.
 func isContainerGoneExecError(stdout, stderr []byte) bool {
-	const marker = "error executing setns process"
-	return bytes.Contains(stderr, []byte(marker)) || bytes.Contains(stdout, []byte(marker))
+	for _, out := range [][]byte{stderr, stdout} {
+		if bytes.Contains(out, []byte("error executing setns process")) {
+			return true
+		}
+		for _, line := range bytes.Split(out, []byte("\n")) {
+			if !bytes.Contains(line, []byte("Error response from daemon:")) {
+				continue
+			}
+			for _, phrase := range []string{"is restarting", "is not running", "No such container", "no such container"} {
+				if bytes.Contains(line, []byte(phrase)) {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 // containerPositivelyStopped reports whether Docker says the container
@@ -636,8 +660,10 @@ func (d *DockerCellRuntime) TakeBackup(ctx context.Context) (string, error) {
 		// kill: "did not receive an exit event"), so the check above saw
 		// nothing. The exec error is the evidence then — runc could not
 		// join the container's namespaces because they no longer exist, so
-		// pg_hardstorage never ran. Only that message: other OCI exec
-		// failures (a wrong binary path) are real harness failures.
+		// pg_hardstorage never ran. The third attempt then met dockerd
+		// refusing the exec outright ("is restarting"), with Running still
+		// true. Only these messages: other OCI exec failures (a wrong binary
+		// path) are real harness failures.
 		if isContainerGoneExecError(stdout, stderr) {
 			return "", fmt.Errorf("%w: container %s had died under the backup (exec could not join its namespaces): %v",
 				ErrCellNotReady, d.Container, err)
