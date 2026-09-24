@@ -93,6 +93,9 @@ func LoadOrGenerateKEK(keyringDir string) ([encryption.KeyLen]byte, bool, error)
 			return zero, false, fmt.Errorf("keystore: %s is %d bytes, want %d (corrupt or wrong file)",
 				path, len(body), encryption.KeyLen)
 		}
+		if err := rejectZeroKEK(path, body); err != nil {
+			return zero, false, err
+		}
 		var kek [encryption.KeyLen]byte
 		copy(kek[:], body)
 		return kek, false, nil
@@ -152,6 +155,26 @@ func LoadOrGenerateKEK(keyringDir string) ([encryption.KeyLen]byte, bool, error)
 	return kek, true, nil
 }
 
+// rejectZeroKEK refuses an all-zero key. ShredKEK zeroes the file before
+// unlinking it, so a crash in between (older binaries zeroed in place)
+// left a 32-byte kek.bin of zeros that loaded as a perfectly good KEK:
+// backups were then "encrypted" under a publicly known key, and restores
+// of pre-shred backups failed with a baffling unwrap error. crypto/rand
+// never yields 32 zero bytes, so this rejects nothing real.
+func rejectZeroKEK(path string, body []byte) error {
+	for _, b := range body {
+		if b != 0 {
+			return nil
+		}
+	}
+	return fmt.Errorf("keystore: %s is all zeros — the remains of an interrupted `kms shred`, not a key; "+
+		"finish the shred (re-run `kms shred`) or restore kek.bin from backup", path)
+}
+
+// shredPendingName is where ShredKEK moves kek.bin before destroying
+// it, so the canonical path stops being a KEK atomically.
+const shredPendingName = KEKFileName + ".shredding"
+
 // KEKExists reports whether a KEK is present at the canonical path.
 // Used by the backup CLI to decide whether to enable encryption
 // without requiring the operator to opt in explicitly.
@@ -190,7 +213,25 @@ func ShredKEK(keyringDir string) error {
 	if keyringDir == "" {
 		return errors.New("keystore: empty keyring dir")
 	}
-	path := filepath.Join(keyringDir, KEKFileName)
+	canonical := filepath.Join(keyringDir, KEKFileName)
+	path := filepath.Join(keyringDir, shredPendingName)
+
+	// Rename-then-zero. Moving kek.bin aside first makes the canonical
+	// path stop being a KEK in one atomic step; zeroing in place (the
+	// old order) meant a crash between the overwrite and the unlink
+	// left an all-zero kek.bin that loaded as a key. A crash after the
+	// rename leaves only kek.bin.shredding, which the next ShredKEK
+	// finishes.
+	if _, err := os.Stat(canonical); err == nil {
+		if err := os.Rename(canonical, path); err != nil {
+			return fmt.Errorf("keystore: move %s aside for shred: %w", canonical, err)
+		}
+		if err := fsutil.SyncDir(keyringDir); err != nil {
+			return fmt.Errorf("keystore: fsync %s after rename: %w", keyringDir, err)
+		}
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("keystore: stat %s: %w", canonical, err)
+	}
 
 	info, err := os.Stat(path)
 	if err != nil {
@@ -200,10 +241,7 @@ func ShredKEK(keyringDir string) error {
 		return fmt.Errorf("keystore: stat %s: %w", path, err)
 	}
 	// Best-effort overwrite. Open for write (no O_TRUNC; we want to
-	// hit the same bytes), zero them, fsync, then unlink. A failure
-	// after the overwrite but before the unlink leaves a file of
-	// zeros — still inert but visible; the next ShredKEK call
-	// removes it (we treat zero-byte content as "shred-pending").
+	// hit the same bytes), zero them, fsync, then unlink.
 	f, err := os.OpenFile(path, os.O_WRONLY, 0)
 	if err != nil {
 		return fmt.Errorf("keystore: open %s for shred: %w", path, err)
@@ -280,6 +318,9 @@ func KEKResolver(keyringDir string) func(ref string) ([encryption.KeyLen]byte, e
 			if len(body) != encryption.KeyLen {
 				return zero, fmt.Errorf("keystore: %s is %d bytes, want %d",
 					path, len(body), encryption.KeyLen)
+			}
+			if err := rejectZeroKEK(path, body); err != nil {
+				return zero, err
 			}
 			var kek [encryption.KeyLen]byte
 			copy(kek[:], body)
