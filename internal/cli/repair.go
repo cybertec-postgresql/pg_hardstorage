@@ -941,60 +941,38 @@ func runRepairChunks(cmd *cobra.Command, repoURL string, orphans, apply bool, mi
 			body.Chunks = append(body.Chunks, h.String())
 		}
 		if apply {
-			// Same dedup-vs-GC guards as `repo gc --apply` (which see):
-			// the age floor cannot protect chunks an in-flight backup
-			// DEDUPLICATED against — those are old by definition — so
-			// refuse under a live backup lease, and re-collect
-			// references so a backup committed since the snapshot
-			// keeps its chunks.
-			if live, lerr := findLiveBackupLeases(cmd.Context(), sp, time.Now().UTC()); lerr != nil {
-				return output.NewError("repair.lease_scan_failed",
-					fmt.Sprintf("repair chunks: scan backup leases: %v", lerr)).Wrap(lerr)
-			} else if len(live) > 0 {
-				return output.NewError("repair.live_backup_lease",
-					fmt.Sprintf("repair chunks: refusing --apply while backups are in flight for: %s", strings.Join(live, ", "))).
-					WithSuggestion(&output.Suggestion{
-						Human: "an in-flight backup may have deduplicated against chunks this sweep would delete — re-run after the backups finish (a crashed holder's lease expires within its TTL, 15 minutes by default)",
-					})
-			}
-			refsAtDelete, rerr := repo.CollectReferences(cmd.Context(), sp)
-			if rerr != nil {
-				return output.NewError("repair.collect_refs_failed",
-					fmt.Sprintf("repair chunks: re-collect references before delete: %v", rerr)).Wrap(rerr)
-			}
-			// Second lease scan — parity with `repo gc --apply` (its
-			// "part 3"): the scan above ran BEFORE the re-collect, and
-			// the re-collect is a full manifest walk that can take
-			// minutes on a large repository. A backup that starts
-			// during it acquires its lease after the first scan and
-			// can dedup-adopt an orphan this sweep is about to
-			// delete. Scanning again shrinks the unguarded window
-			// from the re-collect's duration to the delete loop
-			// itself; the remaining sliver is closed from the other
-			// side by the writer's commit-time adopted-chunk re-stat.
-			if live, lerr := findLiveBackupLeases(cmd.Context(), sp, time.Now().UTC()); lerr != nil {
-				return output.NewError("repair.lease_scan_failed",
-					fmt.Sprintf("repair chunks: re-scan backup leases: %v", lerr)).Wrap(lerr)
-			} else if len(live) > 0 {
-				return output.NewError("repair.live_backup_lease",
-					fmt.Sprintf("repair chunks: a backup started during the reference re-collect (lease for: %s); refusing to sweep", strings.Join(live, ", "))).
-					WithSuggestion(&output.Suggestion{
-						Human: "the in-flight backup may have deduplicated against chunks this sweep would delete — re-run after it finishes",
-					})
-			}
-			cas := casdefault.New(sp)
-			deleted := 0
-			for _, h := range hashes {
-				if refsAtDelete.Has(h) {
-					continue // referenced by a manifest committed since the snapshot
+			// The same engine and the same safety protocol as `repo gc
+			// --apply` (repo.Sweep; internal/repo/gcfence.go): a run
+			// record writers fence against, a settle before the deciding
+			// snapshot, and per-batch checkpoints that honour writer
+			// pins, re-scan backup leases and re-scan manifests committed
+			// since the snapshot. The previous hand-rolled loop re-
+			// collected once and then deleted for as long as it took,
+			// with a backup free to adopt and commit over any chunk in
+			// between.
+			res, serr := repo.Sweep(cmd.Context(), sp, repo.SweepOptions{
+				MinChunkAge: minAgeForCall,
+				Apply:       true,
+				LiveLeases: func(ctx context.Context) ([]string, error) {
+					return findLiveBackupLeases(ctx, sp, time.Now().UTC())
+				},
+			})
+			if serr != nil {
+				if errors.Is(serr, repo.ErrSweepBackupInFlight) {
+					return output.NewError("conflict.gc_backup_in_flight",
+						fmt.Sprintf("repair chunks: refusing to sweep while backups are in flight: %v", serr)).
+						WithSuggestion(&output.Suggestion{
+							Human: "an in-flight backup may have deduplicated against chunks this sweep would delete — re-run after the backups finish (a crashed holder's lease expires within its TTL, 15 minutes by default)",
+						}).Wrap(serr)
 				}
-				if err := cas.DeleteChunk(cmd.Context(), h); err != nil {
-					return output.NewError("repair.delete_failed",
-						fmt.Sprintf("repair chunks: delete %s: %v", h, err)).Wrap(err)
-				}
-				deleted++
+				return output.NewError("repair.delete_failed",
+					fmt.Sprintf("repair chunks: %v", serr)).Wrap(serr)
 			}
-			body.Applied = deleted
+			if len(res.Failures) > 0 {
+				return output.NewError("repair.delete_failed",
+					fmt.Sprintf("repair chunks: %d deletion(s) failed: %s", len(res.Failures), res.Failures[0]))
+			}
+			body.Applied = res.Deleted
 		}
 		return d.Result(output.NewResult(cmd.CommandPath()).WithBody(body))
 	}

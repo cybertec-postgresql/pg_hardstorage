@@ -146,6 +146,7 @@ actually there.
 | `conflict.repo_exists`, `conflict.deployment_exists`, `conflict.sink_exists`, `conflict.standby_exists`, `conflict.timetravel_exists`, `conflict.roster_exists` | Resource with that name is already configured |
 | `conflict.repo_read_only` | Repo is in read-only mode (legal hold, scheduled retire). Every mutating command refuses, including `repair attestation`, `repair manifest`, `repair chunks --apply`, `repair scrub --heal`, `repo wipe` and `repo bundle import`. |
 | `conflict.manifest_held`, `conflict.chain_has_held_links` | Backup or one of its parents is on legal hold |
+| `conflict.gc_backup_in_flight` | `repo gc --apply` / `repair chunks --orphans --apply` refused to start — or stopped between delete batches — because a backup holds a live lease (it may have deduplicated against chunks the sweep would delete). Retry-safe once the backup finishes; replaces `repo.gc.live_backup_lease` (which exited 1). |
 | `conflict.legal_hold` | `repo wipe` refused: at least one backup is under an active legal hold (an unreadable hold marker counts as active). Release the holds, or pass `--override-legal-holds` with an approved n-of-m request — never with `--force` — and the held backups are named in the pre-wipe audit event. |
 | `conflict.chain_has_live_descendants` | Refused to delete; descendants would orphan |
 | `conflict.checkpoint_mismatch`, `conflict.chunks_missing`, `conflict.no_live_manifests` | Repo state would be inconsistent |
