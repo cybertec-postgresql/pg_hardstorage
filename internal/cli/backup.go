@@ -359,6 +359,13 @@ func runBackup(cmd *cobra.Command, opts runOptions) error {
 			body.WALArchived = &archived
 			if !archived {
 				body.RestoreNeeds = fmt.Sprintf("WAL through %s (timeline %d) in the repository", res.StopLSN, res.Timeline)
+			}
+			// In JSON mode the command emits exactly one Result
+			// document; the same facts ride in wal_archived /
+			// restore_needs there. Emitting the event as well put a
+			// second JSON document on stdout and broke every consumer
+			// that parses `backup -o json` (the release gate caught it).
+			if !archived && !suppressEvents {
 				_ = d.Event(cmd.Context(), output.NewEvent(output.SeverityWarning, "backup", "not_yet_restorable").
 					WithSubject(output.Subject{Deployment: res.Deployment, BackupID: res.BackupID}).
 					WithBody(map[string]any{
