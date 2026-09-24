@@ -10,6 +10,7 @@ import (
 
 	"github.com/jackc/pglogrepl"
 
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/logical/commitlsn"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/logical/sinks/chunked"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/pg/logicalreceiver"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
@@ -35,15 +36,17 @@ func TestSink_FlushOnRecord(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// A commit message padded past BatchBytes → flush; SyncedLSN is
+	// the commit's end LSN.
 	rec := logicalreceiver.Record{
 		WALStart: pglogrepl.LSN(0x1000),
-		Data:     make([]byte, 64), // > BatchBytes → flush
+		Data:     append(commitlsn.Message(0x1040), make([]byte, 64)...),
 	}
 	if err := s.OnRecord(context.Background(), rec); err != nil {
 		t.Fatal(err)
 	}
-	if got := s.SyncedLSN(); uint64(got) <= 0x1000 {
-		t.Errorf("SyncedLSN = %s; expected > 0x1000", got)
+	if got := s.SyncedLSN(); uint64(got) != 0x1040 {
+		t.Errorf("SyncedLSN = %s; expected the commit end 0/1040", got)
 	}
 }
 

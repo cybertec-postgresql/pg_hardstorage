@@ -22,6 +22,8 @@ import (
 	"net/url"
 	"sort"
 	"strings"
+
+	"github.com/cybertec-postgresql/pg_hardstorage/compat/internal/redact"
 )
 
 // EnvFile is the parsed env-file representation.  Keys appear in
@@ -110,31 +112,23 @@ func Translate(env *EnvFile) (*Result, error) {
 	b.WriteString("\n")
 	b.WriteString("deployments:\n")
 
-	name := env.KV["PG_HARDSTORAGE_DEPLOYMENT"]
-	derived := false
-	if name == "" {
-		name = env.KV["PGHOST"]
-		derived = name != ""
-	}
-	if name == "" {
-		name = "default"
-	}
-	// Strip any port artefact from PGHOST.
-	if i := strings.IndexAny(name, ":/"); i >= 0 {
-		name = name[:i]
-	}
-	// A deployment name must match [a-zA-Z][a-zA-Z0-9_-]{1,63}
-	// (internal/config.validDeploymentNameRegexp). Production WAL-G
-	// hosts are dotted FQDNs — "db.prod.internal" would be emitted
-	// verbatim and then rejected by the loader, with nothing in the
-	// output explaining why. Sanitize, and tell the operator both that
-	// we did and how to choose the name themselves.
-	if sanitized := sanitizeDeploymentName(name); sanitized != name {
+	name, raw, derived := DeploymentName(env.KV["PG_HARDSTORAGE_DEPLOYMENT"], env.KV["PGHOST"])
+	switch {
+	case raw == "" && env.KV["PG_HARDSTORAGE_DEPLOYMENT"] == "" && env.KV["PGHOST"] != "":
+		out.Warnings = append(out.Warnings,
+			fmt.Sprintf("PGHOST %q is a Unix-socket directory, not a host name; using deployment name %q — set PG_HARDSTORAGE_DEPLOYMENT to choose your own",
+				env.KV["PGHOST"], name))
+	case raw != "" && name != raw:
+		// A deployment name must match [a-zA-Z][a-zA-Z0-9_-]{0,62}
+		// (internal/config). Production WAL-G hosts are dotted FQDNs —
+		// "db.prod.internal" would be emitted verbatim and then
+		// rejected by the loader, with nothing in the output explaining
+		// why. Tell the operator both that we rewrote it and how to
+		// choose the name themselves.
 		out.Warnings = append(out.Warnings,
 			fmt.Sprintf("deployment name %q is not a legal deployment name (must match [a-zA-Z][a-zA-Z0-9_-]{1,63}); using %q — set PG_HARDSTORAGE_DEPLOYMENT to choose your own",
-				name, sanitized))
-		name = sanitized
-	} else if derived {
+				raw, name))
+	case derived:
 		out.Warnings = append(out.Warnings,
 			fmt.Sprintf("deployment name %q was derived from PGHOST; set PG_HARDSTORAGE_DEPLOYMENT to choose your own", name))
 	}
@@ -246,7 +240,7 @@ func Translate(env *EnvFile) (*Result, error) {
 			// handled above
 		default:
 			out.Unmapped = append(out.Unmapped,
-				fmt.Sprintf("%s = %s", k, env.KV[k]))
+				fmt.Sprintf("%s = %s", k, redact.Value(k, env.KV[k])))
 		}
 	}
 
@@ -261,6 +255,37 @@ func sortedKeys(m map[string]string) []string {
 	}
 	sort.Strings(keys)
 	return keys
+}
+
+// DeploymentName resolves the deployment name for a WAL-G environment:
+// PG_HARDSTORAGE_DEPLOYMENT (explicit), else PGHOST, else "default".
+// It is the ONE derivation shared by this translator and the runtime
+// shim (compat/walg): the translator writes the name into
+// pg_hardstorage.yaml and the shim addresses the repository by it, so
+// any divergence splits config and repo.
+//
+// A port artefact is stripped ("db:5432" → "db"), and a Unix-socket
+// PGHOST ("/var/run/postgresql") yields no host at all and falls back
+// to "default" — it used to produce an empty name at runtime, and
+// archive_command failed on every segment. The result is sanitized to
+// what internal/config accepts.
+//
+// raw is the pre-sanitize candidate ("" when nothing usable was set)
+// and derived reports that it came from PGHOST, so callers can say
+// why the name looks the way it does.
+func DeploymentName(explicit, pgHost string) (name, raw string, derived bool) {
+	raw = explicit
+	if raw == "" {
+		raw = pgHost
+		derived = raw != ""
+	}
+	if i := strings.IndexAny(raw, ":/"); i >= 0 {
+		raw = raw[:i]
+	}
+	if raw == "" {
+		return "default", "", false
+	}
+	return sanitizeDeploymentName(raw), raw, derived
 }
 
 // sanitizeDeploymentName coerces a derived name into the shape

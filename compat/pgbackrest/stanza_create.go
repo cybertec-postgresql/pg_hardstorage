@@ -53,6 +53,17 @@ func runStanzaCreate(a pgbackrestArgs) error {
 		return fmt.Errorf("pg-hardstorage-pgbackrest: stanza-create: repo init failed (exit %d)", rc)
 	}
 
+	// The repository itself carries no cipher setting natively —
+	// encryption is per backup, keyed by the deployment's KEK — so
+	// say where the operator's cipher request actually has to land.
+	if cipherRequested(a) {
+		fmt.Fprintln(stderrWriter,
+			"pg-hardstorage-pgbackrest: stanza-create: --repo1-cipher-type="+a.repo1CipherType+
+				" is NOT applied to the repository and --repo1-cipher-pass is NOT used; "+
+				"configure a KEK (`pg_hardstorage init --encrypt`, or `kek_ref:` for this deployment in "+
+				"pg_hardstorage.yaml). The shim's `backup` forwards --encrypt and fails until one exists.")
+	}
+
 	// Hint operators that the YAML stub still needs writing.
 	fmt.Fprintln(stderrWriter,
 		"pg-hardstorage-pgbackrest: stanza-create: repository initialised. "+

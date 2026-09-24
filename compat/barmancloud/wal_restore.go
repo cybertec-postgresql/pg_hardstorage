@@ -130,11 +130,10 @@ func runWalRestore(cmd *cobra.Command, f commonFlags, s3Path, stanza, walName, o
 	// path (pg_wal/RECOVERYXLOG).  We absolutise the output
 	// against PGDATA so the native CLI can write the file
 	// directly without a chdir.
-	pgdata := envLookup("PGDATA")
-	if pgdata == "" {
-		return fmt.Errorf("pg-hardstorage-barmancloud: wal-restore: PGDATA env var unset")
+	absOut, err := resolveWALPath("wal-restore", outRel)
+	if err != nil {
+		return err
 	}
-	absOut := pgdata + "/" + outRel
 
 	args := []string{
 		"wal", "fetch", deployment, walName, absOut,

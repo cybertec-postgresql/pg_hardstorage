@@ -51,11 +51,11 @@ func (f flowSetup) Run(ctx context.Context, env *Env) error {
 	}
 
 	// 2. Friendly deployment name.  Default = dbname portion of the
-	//    DSN, falling back to "db1".  Cobra-compatible: only
-	//    alphanumerics + dash/underscore, since it lands in the
-	//    backup-ID path.
+	//    DSN, falling back to "db1" when that is empty or not a legal
+	//    deployment name (the config loader's rule — see
+	//    validateDeploymentName).
 	defaultName := dbnameFromDSN(pgConn)
-	if defaultName == "" {
+	if validateDeploymentName(defaultName) != nil {
 		defaultName = "db1"
 	}
 	name, err := env.Prompter.PromptValid(
@@ -209,22 +209,14 @@ func validateDSN(s string) error {
 	return nil
 }
 
-// validateDeploymentName mirrors the constraint the backup-ID
-// generator imposes: alphanumerics, dash, underscore.  Anything
-// outside that set is rejected so it never lands in a manifest key.
+// validateDeploymentName applies the config loader's own rule
+// (config.ValidDeploymentName: leading letter, then [A-Za-z0-9_-],
+// at most 63 characters). A private, looser copy used to accept names
+// like "1db" or "_x" that the loader rejects — so the wizard wrote a
+// pg_hardstorage.yaml that no longer loaded, locking the operator out
+// of every command until they hand-edited it.
 func validateDeploymentName(s string) error {
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return errors.New("empty name")
-	}
-	for _, r := range s {
-		ok := (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') ||
-			(r >= '0' && r <= '9') || r == '-' || r == '_'
-		if !ok {
-			return fmt.Errorf("only [A-Za-z0-9_-] allowed (got %q)", r)
-		}
-	}
-	return nil
+	return config.ValidDeploymentName(s)
 }
 
 // validateRepoURL accepts the URL schemes the storage registry actually
@@ -319,23 +311,30 @@ func persistDeployment(env *Env, name, pgConn, repoURL string) error {
 		doc.Content = append(doc.Content, key, val)
 		depsNode = val
 	}
-	newDep := &yaml.Node{Kind: yaml.MappingNode, Content: []*yaml.Node{
-		{Kind: yaml.ScalarNode, Value: "pg_connection"}, {Kind: yaml.ScalarNode, Value: pgConn},
-		{Kind: yaml.ScalarNode, Value: "repo"}, {Kind: yaml.ScalarNode, Value: repoURL},
-	}}
-	// Overwrite if already present (re-running setup with the same
-	// name is the "update my settings" path).
-	replaced := false
-	for i := 0; i+1 < len(depsNode.Content); i += 2 {
-		if depsNode.Content[i].Value == name {
-			depsNode.Content[i+1] = newDep
-			replaced = true
-			break
+	// Re-running setup with the same name is the "update my settings"
+	// path: update pg_connection and repo IN the existing mapping. It
+	// used to swap in a fresh two-key node, silently dropping the
+	// deployment's kek_ref, retention, schedules, patroni block — the
+	// settings the wizard never asks about.
+	if dep := mappingChild(depsNode, name); dep != nil && dep.Kind == yaml.MappingNode {
+		setMappingScalar(dep, "pg_connection", pgConn)
+		setMappingScalar(dep, "repo", repoURL)
+	} else {
+		newDep := &yaml.Node{Kind: yaml.MappingNode}
+		setMappingScalar(newDep, "pg_connection", pgConn)
+		setMappingScalar(newDep, "repo", repoURL)
+		replaced := false
+		for i := 0; i+1 < len(depsNode.Content); i += 2 {
+			if depsNode.Content[i].Value == name {
+				depsNode.Content[i+1] = newDep // e.g. an empty `db1:` entry
+				replaced = true
+				break
+			}
 		}
-	}
-	if !replaced {
-		depsNode.Content = append(depsNode.Content,
-			&yaml.Node{Kind: yaml.ScalarNode, Value: name}, newDep)
+		if !replaced {
+			depsNode.Content = append(depsNode.Content,
+				&yaml.Node{Kind: yaml.ScalarNode, Value: name}, newDep)
+		}
 	}
 
 	out, err := yaml.Marshal(&root)
@@ -349,9 +348,17 @@ func persistDeployment(env *Env, name, pgConn, repoURL string) error {
 	// config already gone. A stale tmp from an earlier crashed setup
 	// is removed rather than refused: setup is interactive and
 	// single-writer, and wedging it on leftover state helps nobody.
+	//
+	// Mode 0600: the file carries pg_connection DSNs, which routinely
+	// embed passwords (it was written 0644 — world-readable). An
+	// operator who made it stricter still (0400) keeps that.
+	mode := os.FileMode(0o600)
+	if fi, err := os.Stat(cfgPath); err == nil && fi.Mode().Perm()&^0o600 == 0 {
+		mode = fi.Mode().Perm()
+	}
 	tmp := cfgPath + ".tmp"
 	_ = os.Remove(tmp)
-	if err := fsutil.WriteFileSync(tmp, out, 0o644); err != nil {
+	if err := fsutil.WriteFileSync(tmp, out, mode); err != nil {
 		return err
 	}
 	if err := os.Rename(tmp, cfgPath); err != nil {
@@ -374,6 +381,21 @@ func mappingChild(m *yaml.Node, key string) *yaml.Node {
 		}
 	}
 	return nil
+}
+
+// setMappingScalar sets key to a plain scalar value in mapping m,
+// replacing the existing value node when the key is present so the
+// key's position survives.
+func setMappingScalar(m *yaml.Node, key, value string) {
+	for i := 0; i+1 < len(m.Content); i += 2 {
+		if m.Content[i].Value == key {
+			m.Content[i+1] = &yaml.Node{Kind: yaml.ScalarNode, Value: value}
+			return
+		}
+	}
+	m.Content = append(m.Content,
+		&yaml.Node{Kind: yaml.ScalarNode, Value: key},
+		&yaml.Node{Kind: yaml.ScalarNode, Value: value})
 }
 
 // bumpConfigInMemory adds the new deployment to the in-memory

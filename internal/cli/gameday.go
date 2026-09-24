@@ -77,10 +77,14 @@ func newGameDayRunCmd() *cobra.Command {
 --dry-run prints the planned actions and always passes; without it the
 scenario drives the fault for real.
 
-  s3_throttle       injects backend failures and asserts recovery.
+  s3_throttle       injects a write-failure storm into the repository and
+                    asserts writes fail during it and one after it reads
+                    back intact. Needs --repo; refuses without one.
   patroni_failover  reads the current leader, POSTs /switchover, waits
                     for a different member to take the leader lock, and
-                    re-measures replication-slot continuity. It needs
+                    re-measures replication-slot continuity on the NEW
+                    leader (patroni.slot, or the leader-role entry of
+                    patroni.slots). It needs
                     --deployment naming a deployment with patroni.url
                     configured; without one it refuses rather than
                     reporting a pass.
@@ -115,7 +119,7 @@ Use 'gameday list' to see registered scenarios.`,
 				FaultDuration: faultDuration,
 				DryRun:        dryRun,
 				Patroni:       drv,
-				ObserveSlot:   gameDayObserveSlot(deployment, repoURL),
+				ObserveSlot:   gameDayObserveSlot(deployment, repoURL, drv),
 			})
 		},
 	}

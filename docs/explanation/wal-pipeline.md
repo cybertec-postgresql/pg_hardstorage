@@ -56,6 +56,14 @@ we ACK.**  Killing the agent for a long time will bloat
 no-gap guarantee.  See [the slot bloat
 runbook](../reference/runbooks/index.md) for the operator side.
 
+Logical streams ACK at **transaction commit boundaries** only: every
+CDC sink (chunked, webhook, s3events) confirms the end LSN of the
+last pgoutput commit message it has durably stored, never an LSN
+derived from a row's position and payload size. A batch that ends
+mid-transaction does not move the slot, so after a restart PostgreSQL
+re-sends that whole transaction — the already-stored part arrives a
+second time (at-least-once) — rather than skipping it.
+
 ---
 
 ## What flows where

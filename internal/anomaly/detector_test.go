@@ -101,7 +101,7 @@ func TestDetector_StableBaseline_NoFlag(t *testing.T) {
 
 // TestDetector_OutlierFlagged: a 10x larger backup obviously breaks
 // the baseline. We rely on the actual stddev (which is 0 for a
-// constant baseline) → degenerate path uses ±Inf.
+// constant baseline) → the zero-variance path flags any change.
 func TestDetector_OutlierFlagged(t *testing.T) {
 	d := &anomaly.Detector{}
 	prior := makeSamples(10, 1_000_000_000, 60, 100)
@@ -233,9 +233,8 @@ func TestDetector_WindowTrim(t *testing.T) {
 }
 
 // TestDetector_DegenerateZeroStddev: when every prior has the
-// identical value, stddev=0 and the detector uses ±Inf for any
-// non-matching candidate. Make sure infinity propagates cleanly into
-// AbsZ, gets flagged, and doesn't NaN the report.
+// identical value, stddev=0 and any non-matching candidate is
+// flagged via the zero-variance path without NaN-ing the report.
 func TestDetector_DegenerateZeroStddev(t *testing.T) {
 	d := &anomaly.Detector{}
 	prior := makeSamples(5, 1000, 60, 100)
@@ -283,9 +282,14 @@ func TestDetector_FilterSelfFromPriors(t *testing.T) {
 func TestDetector_ReasonHumanReadable(t *testing.T) {
 	d := &anomaly.Detector{}
 	prior := makeSamples(5, 1000, 60, 100)
+	// Give logical_bytes some spread so the z-score form (not the
+	// zero-variance form) is what's rendered.
+	for i := range prior {
+		prior[i].LogicalBytes += int64(i * 10)
+	}
 	candidate := anomaly.Sample{
 		BackupID: "db1.full.outlier", Type: "full",
-		LogicalBytes: 100000, DurationSeconds: 60, FileCount: 100,
+		LogicalBytes: 100000, DurationSeconds: 60, FileCount: 100, UniqueChunkCount: 100,
 	}
 	rep, _ := d.Score("db1", prior, candidate)
 	if !rep.AnyFlagged || len(rep.Reasons) == 0 {

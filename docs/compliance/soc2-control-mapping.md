@@ -92,6 +92,27 @@ pass/fail/not-applicable status, evidence (a one-line
 summary of what the verdict is based on), and a
 remediation field for failed controls.
 
+Verdict rules that matter to an auditor:
+
+- **A1.2 / A.8.13 (verification)** pass only when the window
+  holds at least one successful `verify.run` and no failed
+  one. Runs that all failed, or were all skipped, fail the
+  control. With `--deployment`, only that deployment's runs
+  count.
+- **Unverifiable manifests.** A manifest that fails signature
+  verification is listed under `signature_failed` (and at the
+  top of the Markdown) rather than silently dropped. It is
+  reported regardless of window — its timestamp is itself
+  unauthenticated — and the encryption (CC6.1 …) and replica
+  (A1.3) controls fail while any are present.
+- **Unreadable evidence.** If a section's read fails (audit-log
+  search, manifest walk, chain verify), the error is listed
+  under `section_errors` and every control mapped onto that
+  section fails. A zero that means "could not read" is never
+  scored as "nothing happened" — e.g. CC8.1 no longer passes
+  as "no destructive operations" when the audit log was
+  unreadable.
+
 JSON form (for ingest into a GRC platform):
 
 ```sh

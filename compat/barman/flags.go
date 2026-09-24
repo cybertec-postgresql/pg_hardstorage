@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"io"
 	"strings"
+
+	"github.com/cybertec-postgresql/pg_hardstorage/compat/internal/pitrtime"
 )
 
 // recoverArgs is what `barman recover` parsing collects before the
@@ -74,6 +76,9 @@ var recoverFlagTable = []flagMap{
 		// --target-time -> --to "<t>"
 		pick: func(r *recoverArgs) bool { return r.targetTime != "" },
 		apply: func(r *recoverArgs, n *[]string, _ io.Writer) error {
+			if err := pitrtime.RequireExplicitZone("Barman", "--target-time", r.targetTime); err != nil {
+				return err
+			}
 			*n = append(*n, "--to", r.targetTime)
 			return nil
 		},
@@ -107,6 +112,21 @@ var recoverFlagTable = []flagMap{
 		// reach it and the restore was always refused.
 		pick: func(r *recoverArgs) bool { return r.targetImmed },
 		apply: func(_ *recoverArgs, _ *[]string, _ io.Writer) error {
+			return nil
+		},
+	},
+	{
+		// No target at all -> --to-latest. `barman recover` without a
+		// target copies every archived WAL file and PostgreSQL replays
+		// all of it; the native default instead stops at the backup's
+		// consistency point, which silently discarded everything
+		// archived after the backup. --target-xid never reaches here
+		// (it refuses above).
+		pick: func(r *recoverArgs) bool {
+			return r.targetTime == "" && r.targetName == "" && !r.targetImmed && r.targetXID == ""
+		},
+		apply: func(_ *recoverArgs, n *[]string, _ io.Writer) error {
+			*n = append(*n, "--to-latest")
 			return nil
 		},
 	},

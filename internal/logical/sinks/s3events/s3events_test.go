@@ -14,6 +14,7 @@ import (
 
 	"github.com/jackc/pglogrepl"
 
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/logical/commitlsn"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/logical/sinks/s3events"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/pg/logicalreceiver"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
@@ -305,17 +306,17 @@ func TestSyncedLSN_AdvancesOnSuccessfulPut(t *testing.T) {
 	if got := sink.SyncedLSN(); got != 0 {
 		t.Errorf("initial SyncedLSN = %d, want 0", got)
 	}
-	// WALStart=16, a 1-byte payload, but ServerWALEnd=48 (the server's
-	// global end-of-WAL, far past this record's data). SyncedLSN — which is
-	// reported to PG as confirmed_flush — must be the end of the RECEIVED
-	// data (16+1=17), NOT the ServerWALEnd (48). Confirming 48 would tell PG
-	// "I have everything through 48" while the sink holds one byte at 16;
-	// on a reconnect PG would skip 17..48 and any commit in that window is
-	// lost. This asserts we never confirm the server's global WAL position.
-	_ = sink.OnRecord(context.Background(), rec(16, 48, "x"))
+	// A commit at WALStart=16 whose transaction ends at 17, but
+	// ServerWALEnd=4096 (the server's global end-of-WAL, far past this
+	// commit). SyncedLSN — reported to PG as confirmed_flush — must be the
+	// commit's end LSN (17), NOT the ServerWALEnd and NOT
+	// WALStart+len(Data) (16+26=42). Confirming either would tell PG "I
+	// have everything through it"; on a reconnect PG would skip any commit
+	// in that window and it is lost.
+	_ = sink.OnRecord(context.Background(), rec(16, 4096, string(commitlsn.Message(17))))
 	if got := sink.SyncedLSN(); got != 17 {
-		t.Errorf("SyncedLSN after Put = %d, want 17 (WALStart+len, NOT the "+
-			"ServerWALEnd 48 — confirming that would advance the slot past unreceived data)", got)
+		t.Errorf("SyncedLSN after Put = %d, want 17 (the commit end LSN, NOT the "+
+			"ServerWALEnd or WALStart+len — both advance the slot past unreceived data)", got)
 	}
 }
 
@@ -360,16 +361,16 @@ func TestPutFailure_WithDeadLetter_AdvancesSlot(t *testing.T) {
 		DeadLetter: dl,
 	})
 	defer sink.Close()
-	err := sink.OnRecord(context.Background(), rec(16, 48, "x"))
+	err := sink.OnRecord(context.Background(), rec(16, 4096, string(commitlsn.Message(17))))
 	if err != nil {
 		t.Errorf("expected nil error when dead-letter accepts; got %v", err)
 	}
 	if len(dl.envelopes) != 1 {
 		t.Fatalf("expected 1 dead-letter envelope; got %d", len(dl.envelopes))
 	}
-	// Advances to the received-data end (16+len("x")=17), not ServerWALEnd 48.
+	// Advances to the dead-lettered commit's end LSN, not ServerWALEnd.
 	if got := sink.SyncedLSN(); got != 17 {
-		t.Errorf("SyncedLSN should advance past dead-letter to 17 (WALStart+len); got %d", got)
+		t.Errorf("SyncedLSN should advance past dead-letter to 17 (commit end); got %d", got)
 	}
 	_, _, deadLettered, _ := sink.StatsSnapshot()
 	if deadLettered != 1 {

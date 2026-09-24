@@ -33,6 +33,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -76,11 +77,42 @@ func attachCommonFlags(c *cobra.Command, f *commonFlags, withUserName bool) {
 	c.Flags().String("compression", "", "(silently mapped: gzip → balanced)")
 	c.Flags().String("history", "", "(unused; barman-cloud's history dir)")
 	c.Flags().String("tags", "", "(silently ignored)")
-	c.Flags().String("encryption", "", "(refused at native KMS)")
+	// --encryption asks S3 for server-side encryption (AES256 /
+	// aws:kms). The native S3 plugin has no per-request SSE setting,
+	// so the flag used to parse into a no-op and objects landed
+	// unencrypted unless the bucket happened to default-encrypt. It
+	// is registered only so it can be refused by name.
+	c.Flags().String("encryption", "", "(refused: native encrypts client-side under the deployment's KEK)")
+	c.PreRunE = func(cmd *cobra.Command, _ []string) error {
+		if fl := cmd.Flags().Lookup("encryption"); fl != nil && fl.Changed {
+			return fmt.Errorf("pg-hardstorage-barmancloud: --encryption=%s is not supported: pg_hardstorage "+
+				"does not request S3 server-side encryption. Encrypt client-side instead (set `kek_ref:` for "+
+				"the deployment in pg_hardstorage.yaml, or create a keyring KEK with `pg_hardstorage init "+
+				"--encrypt`) and/or enable default encryption on the bucket, then drop --encryption "+
+				"(in CNPG: barmanObjectStore.data/wal.encryption)", fl.Value.String())
+		}
+		return nil
+	}
 	c.Flags().String("max-archive-size", "", "(silently honoured at native chunk floor)")
 	c.Flags().String("min-chunk-size", "", "(silently ignored — native uses FastCDC)")
 	c.Flags().String("read-timeout", "", "(silently honoured)")
 	c.Flags().Bool("verbose", false, "(silently honoured)")
+}
+
+// resolveWALPath absolutises PostgreSQL's %p for the native CLI. CNPG
+// renders %p relative to PGDATA (pg_wal/...), but a hand-written
+// archive_command / restore_command may already pass an absolute path;
+// blindly prefixing PGDATA turned that into /pgdata//var/lib/... which
+// does not exist. PGDATA is only required for a relative path.
+func resolveWALPath(verb, p string) (string, error) {
+	if filepath.IsAbs(p) {
+		return p, nil
+	}
+	pgdata := envLookup("PGDATA")
+	if pgdata == "" {
+		return "", fmt.Errorf("pg-hardstorage-barmancloud: %s: PGDATA env var unset (needed to resolve relative path %q)", verb, p)
+	}
+	return filepath.Join(pgdata, p), nil
 }
 
 // bcEnv carries the AWS_* / WAL_* env vars the shim threads

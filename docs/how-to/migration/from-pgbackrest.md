@@ -99,7 +99,8 @@ pg_hardstorage compat translate --from pgbackrest \
     --out-file /etc/pg_hardstorage/pg_hardstorage.yaml
 
 # 3. Review the YAML — every unmapped pgBackRest setting
-#    surfaces as a comment + on stderr.
+#    surfaces as a comment + on stderr (secret values
+#    redacted on stderr).
 $EDITOR /etc/pg_hardstorage/pg_hardstorage.yaml
 
 # 4. Initialise the new repo (different from the existing
@@ -134,6 +135,38 @@ divergence.
 (PG 17 page-level incremental — the modern equivalent).
 `--archive-async` and friends silently drop because native
 streaming is already async via the replication slot.
+
+`archive-get` (your `restore_command`) exits **1** only when
+the segment is genuinely absent from the repository — PostgreSQL's
+end-of-archive signal.  Every other failure (storage outage,
+stanza missing from `pg_hardstorage.yaml`, a refused flag, bad
+argv) exits **126**, which makes PostgreSQL abort recovery
+instead of promoting with WAL still unreplayed.
+
+`restore` maps pgBackRest's `--type`:
+
+| `--type`                       | native behaviour |
+|--------------------------------|------------------|
+| unset / `default`              | `restore --to-latest` — replay every archived segment |
+| `immediate`                    | stop at the backup's consistency point |
+| `time` / `lsn` / `name`        | `--to` / `--to-lsn` / `--to-name` with `--target` |
+| `standby`                      | `pg_hardstorage standby create` — hot standby, never promoted |
+| `xid` / `preserve` / `none`    | refused (exit 2) with the native alternative |
+
+A recovery-target time must carry an explicit UTC offset
+(`2026-04-27 09:42:00+02`, `... UTC`): pgBackRest lets
+PostgreSQL read an offset-less time in the server's
+`TimeZone`, pg_hardstorage would read it as UTC, so the shim
+refuses it rather than stop at the wrong instant.
+
+`--repo1-cipher-type=aes-256-cbc` makes the shim's `backup`
+pass native `--encrypt`: the backup is encrypted under the
+deployment's KEK (keyring `kek.bin` from
+`pg_hardstorage init --encrypt`, or `kek_ref:` in
+`pg_hardstorage.yaml`) and **fails** if no KEK is configured,
+instead of silently running unencrypted.  The passphrase in
+`--repo1-cipher-pass` is never used.  `archive-push` encrypts
+WAL whenever that KEK exists — configure it before cutover.
 
 After the shim is wired, the rest of the cutover (steps 1-8
 below) proceeds exactly as documented — the shim simply

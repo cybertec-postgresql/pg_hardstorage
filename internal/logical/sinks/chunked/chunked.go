@@ -29,6 +29,7 @@ import (
 	"github.com/jackc/pglogrepl"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup/chunker"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/logical/commitlsn"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/pg/logicalreceiver"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo"
@@ -116,7 +117,14 @@ type Sink struct {
 	startLSN pglogrepl.LSN // start LSN of the in-flight batch
 	endLSN   pglogrepl.LSN // last record's WALStart + len(Data)
 
-	// syncedLSN is the EndLSN of the most-recently-committed batch.
+	// commitLSN is the highest transaction end LSN among the pgoutput
+	// commit messages in the in-flight batch (0 = none yet). It, not
+	// endLSN, is what a flush may confirm: endLSN is synthetic (see
+	// package commitlsn) and can lie past commits not yet received.
+	commitLSN pglogrepl.LSN
+
+	// syncedLSN is the commit end LSN through which every transaction
+	// is durably committed in some batch — the value confirmed to PG.
 	// Read by SyncedLSN under no lock (atomic) so the receive loop's
 	// status ticker doesn't fight Flush for the mutex.
 	syncedLSN atomic.Uint64
@@ -171,6 +179,9 @@ func (s *Sink) OnRecord(ctx context.Context, rec logicalreceiver.Record) error {
 		s.startLSN = rec.WALStart
 	}
 	s.endLSN = rec.WALStart + pglogrepl.LSN(len(rec.Data))
+	if end, ok := commitlsn.FromMessage(rec.Data); ok && end > s.commitLSN {
+		s.commitLSN = end
+	}
 	s.buf.Write(rec.Data)
 	s.records++
 
@@ -256,7 +267,13 @@ func (s *Sink) flushLocked(ctx context.Context) error {
 		return err
 	}
 
-	s.syncedLSN.Store(uint64(s.endLSN))
+	// Confirm only a commit this batch made durable. A batch that
+	// ends mid-transaction leaves syncedLSN at the previous commit, so
+	// after a restart PG re-sends that transaction whole (duplicating
+	// the part already archived — at-least-once) instead of skipping it.
+	if s.commitLSN > pglogrepl.LSN(s.syncedLSN.Load()) {
+		s.syncedLSN.Store(uint64(s.commitLSN))
+	}
 	s.lastFlush.Store(time.Now().UnixNano())
 
 	// Reset state for the next batch.
@@ -264,6 +281,7 @@ func (s *Sink) flushLocked(ctx context.Context) error {
 	s.records = 0
 	s.startLSN = 0
 	s.endLSN = 0
+	s.commitLSN = 0
 	return nil
 }
 

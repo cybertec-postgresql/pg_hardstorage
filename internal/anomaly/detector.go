@@ -16,8 +16,9 @@
 //
 //  1. Compute mean μ and sample stddev σ of each metric over the
 //     most-recent N priors of the same deployment + same type.
-//  2. For the candidate sample, score = (x - μ) / σ, capped at ±∞
-//     (we explicitly handle σ == 0).
+//  2. For the candidate sample, score = (x - μ) / σ. When σ == 0
+//     (a constant baseline) there is no z-score: the Score is marked
+//     zero_variance and flags iff the candidate differs from μ.
 //  3. If |score| > threshold, flag it.
 //
 // We deliberately do NOT implement seasonal / time-of-week
@@ -96,6 +97,12 @@ type Score struct {
 	Z       float64 `json:"z"`
 	AbsZ    float64 `json:"abs_z"`
 	Flagged bool    `json:"flagged"`
+
+	// ZeroVariance is true when every baseline sample had the same
+	// value (StdDev == 0). A z-score is undefined there, so Z and
+	// AbsZ are reported as 0 and Flagged simply means "the candidate
+	// differs from the constant baseline".
+	ZeroVariance bool `json:"zero_variance,omitempty"`
 }
 
 // Report is the detector's per-Sample output. AnyFlagged is the
@@ -222,27 +229,37 @@ func (d *Detector) Score(deployment string, prior []Sample, candidate Sample) (*
 		}
 		mean, stddev := meanStdDev(xs)
 		x := getX(candidate)
-		var z float64
 		if stddev == 0 {
-			// Degenerate case: every prior had identical value.
-			// If the candidate matches, score is 0; if it differs,
-			// it's "infinitely anomalous" — we use a finite sentinel
-			// (signed math.MaxFloat64 / 2) instead of math.Inf so
-			// that downstream JSON serialization survives:
-			// `encoding/json` rejects ±Inf and NaN per RFC 8259, so
-			// emitting +Inf here breaks the audit-chain append with
-			//   audit: append "anomaly.detected" failed (chain may
-			//   have a gap): json: unsupported value: +Inf
-			// and the chain gets a gap.  /2 keeps room for any
-			// downstream arithmetic without overflowing to +Inf.
-			if x == mean {
-				z = 0
-			} else {
-				z = float64(sign(x-mean)) * (math.MaxFloat64 / 2)
+			// Degenerate case: every prior had the identical value,
+			// so there is no spread to measure a distance in and a
+			// z-score is undefined. Say so explicitly rather than
+			// inventing one: ±Inf breaks encoding/json (RFC 8259
+			// has no Inf — the audit-chain append of
+			// anomaly.detected would fail and leave a gap), and the
+			// finite ±MaxFloat64/2 sentinel that replaced it was a
+			// meaningless 8.98e+307 in the JSON and overflowed the
+			// int64 split in fmtFloat into "z=-" in the Reason.
+			// Any departure from a perfectly constant baseline is
+			// still flagged — that is the conservative reading.
+			flagged := x != mean
+			rep.Scores = append(rep.Scores, Score{
+				Metric:       metric,
+				Value:        x,
+				Mean:         mean,
+				Flagged:      flagged,
+				ZeroVariance: true,
+			})
+			if flagged {
+				rep.AnyFlagged = true
+				rep.Reasons = append(rep.Reasons,
+					string(metric)+": value "+fmtFloat(x)+
+						" vs constant baseline "+fmtFloat(mean)+
+						" (zero variance across "+itoa(len(xs))+
+						" priors; z undefined, any change flags)")
 			}
-		} else {
-			z = (x - mean) / stddev
+			return
 		}
+		z := (x - mean) / stddev
 		absZ := math.Abs(z)
 		flagged := absZ > threshold
 		rep.Scores = append(rep.Scores, Score{
@@ -296,18 +313,6 @@ func meanStdDev(xs []float64) (mean, stddev float64) {
 	// n-1 (sample stddev), not n.
 	variance := sqSum / float64(len(xs)-1)
 	return mean, math.Sqrt(variance)
-}
-
-// sign returns 1 for x>0, -1 for x<0, 0 for x==0. Used to pick the
-// signed infinity in the σ==0 degenerate path.
-func sign(x float64) int {
-	switch {
-	case x > 0:
-		return 1
-	case x < 0:
-		return -1
-	}
-	return 0
 }
 
 // fmtFloat is a small "render this for human eyeballs" helper. Avoids

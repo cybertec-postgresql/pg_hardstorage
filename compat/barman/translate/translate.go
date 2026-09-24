@@ -6,6 +6,8 @@ import (
 	"io"
 	"sort"
 	"strings"
+
+	"github.com/cybertec-postgresql/pg_hardstorage/compat/internal/redact"
 )
 
 // Result is the outcome of a translate run: the rendered YAML, plus
@@ -24,6 +26,12 @@ type Unmapped struct {
 	Value   string
 	Reason  string
 }
+
+// RedactedValue is Value made safe to echo to stderr: credentials are
+// replaced (secret-looking keys, passwords embedded in conninfo or
+// URLs). The unmapped list lands in terminals and logs; Value itself
+// stays intact for callers that need it.
+func (u Unmapped) RedactedValue() string { return redact.Value(u.Key, u.Value) }
 
 // Translate reads a Barman INI from r and emits a pg_hardstorage
 // YAML deployment file.  Multiple sections become multiple

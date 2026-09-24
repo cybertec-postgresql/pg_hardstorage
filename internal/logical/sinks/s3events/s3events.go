@@ -55,6 +55,7 @@ import (
 
 	"github.com/jackc/pglogrepl"
 
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/logical/commitlsn"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/pg/logicalreceiver"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
 )
@@ -248,14 +249,11 @@ func (s *Sink) OnRecord(ctx context.Context, rec logicalreceiver.Record) error {
 		s.bufferSince = s.now()
 	}
 	s.buffered = append(s.buffered, rec)
-	// The confirmed LSN must be the end of data we actually RECEIVED, not
-	// rec.ServerWALEnd — that is the server's GLOBAL end-of-WAL at emission
-	// time, which races ahead of the logical decode stream. Reporting it
-	// back as confirmed_flush advances the slot past commits this sink never
-	// received; on a reconnect/failover PG will not resend them and they are
-	// lost. WALStart+len(Data) bounds the slot to bytes we hold — the same
-	// safe value the chunked sink uses. (It only ever moves the slot LESS
-	// far than ServerWALEnd, so it cannot lose data.)
+	// bufferEnd is the batch's recorded LSN range end only. It is NOT
+	// what gets confirmed: neither rec.ServerWALEnd (the server's global
+	// end-of-WAL) nor WALStart+len(Data) (synthetic, can overshoot a
+	// commit not yet received) is safe. flushLocked confirms the batch's
+	// last commit end LSN instead — see package commitlsn.
 	if end := rec.WALStart + pglogrepl.LSN(len(rec.Data)); end > s.bufferEnd {
 		s.bufferEnd = end
 	}
@@ -349,10 +347,11 @@ func (s *Sink) flushLocked(ctx context.Context) error {
 	if putErr == nil {
 		s.stats.BatchesWritten.Add(1)
 		s.stats.RecordsWritten.Add(uint64(len(batch)))
-		// Advance syncedLSN so PG can release WAL.  endLSN is the end of
-		// the RECEIVED data (highest WALStart+len(Data) in the batch), which
-		// is monotonic and never overshoots data we hold — see OnRecord.
-		s.syncedLSN.Store(uint64(endLSN))
+		// Advance syncedLSN so PG can release WAL — to the last commit
+		// this batch stored, never past it (see OnRecord). Monotonic:
+		// flushes run unlocked, so a slower earlier batch must not pull
+		// the confirm back.
+		commitlsn.Advance(&s.syncedLSN, commitlsn.Highest(batch))
 		return nil
 	}
 
@@ -406,7 +405,7 @@ func (s *Sink) flushLocked(ctx context.Context) error {
 			key, putErr, dlErr)
 	}
 	s.stats.BatchesDeadLettered.Add(1)
-	s.syncedLSN.Store(uint64(endLSN))
+	commitlsn.Advance(&s.syncedLSN, commitlsn.Highest(batch))
 	return nil
 }
 

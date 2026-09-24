@@ -22,6 +22,7 @@ import (
 //
 //	archive_command = 'barman-wal-archive db1 %p'
 func NewWALArchiveRoot(stdout, stderr io.Writer) *cobra.Command {
+	var testOnly bool
 	c := &cobra.Command{
 		Use:   "barman-wal-archive [<barman-host>] <server-name> <wal-path>",
 		Short: "Archive one PostgreSQL WAL segment (Barman compat)",
@@ -55,6 +56,19 @@ loop is safe.`,
 			// The trailing two positionals are the same in both, so
 			// read from the end rather than branching on length.
 			server, segPath := args[len(args)-2], args[len(args)-1]
+			if testOnly {
+				// Upstream --test checks that the Barman side is
+				// reachable and configured for SERVER_NAME, and ships
+				// nothing (WAL_PATH is conventionally DUMMY). The shim's
+				// equivalent is reading the deployment's repository:
+				// a read-only `list` fails the same way a push would
+				// (missing deployment config, unreachable storage).
+				native, err := injectDeploymentFlags([]string{"list", server}, server, false)
+				if err != nil {
+					return err
+				}
+				return dispatchNative(stdout, stderr, native)
+			}
 			// wal push derives system_identifier from the segment
 			// header (issue #8) so --pg-connection is unnecessary.
 			// Skip it from config so a deployment without a
@@ -71,6 +85,24 @@ loop is safe.`,
 			}
 			return dispatchNative(stdout, stderr, native)
 		},
+	}
+	// barman-wal-archive's documented options. They used to be
+	// unregistered, so an archive_command carrying any of them died
+	// with "unknown flag" and PostgreSQL retried it forever while WAL
+	// piled up. The SSH-side options (-U/--user, --port, -c/--config)
+	// describe the transport to the Barman host, which the shim does
+	// not use; the compression switches choose what the Barman side
+	// stores, and native compression is a repository setting. All are
+	// accepted and have nothing to act on.
+	c.Flags().BoolVarP(&testOnly, "test", "t", false,
+		"test that the repository for SERVER_NAME is reachable; archive nothing")
+	c.Flags().StringP("user", "U", "", "(ignored: SSH user on the Barman host)")
+	c.Flags().String("port", "", "(ignored: SSH port on the Barman host)")
+	c.Flags().StringP("config", "c", "", "(ignored: Barman config on the Barman host)")
+	c.Flags().BoolP("gzip", "z", false, "(ignored: native compression is a repository setting)")
+	c.Flags().BoolP("bzip2", "j", false, "(ignored: native compression is a repository setting)")
+	for _, name := range []string{"xz", "snappy", "zstd", "lz4"} {
+		c.Flags().Bool(name, false, "(ignored: native compression is a repository setting)")
 	}
 	c.SilenceUsage = true
 	c.SilenceErrors = true

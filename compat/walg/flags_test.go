@@ -156,16 +156,23 @@ func TestDeploymentName(t *testing.T) {
 		{
 			name: "PGHOST is the fallback",
 			in:   walgEnv{pgHost: "db.example.com"},
-			want: "db.example.com",
+			want: "db_example_com",
 		},
 		{
 			name: "PGHOST with port artefact strips it",
 			in:   walgEnv{pgHost: "db.example.com:5432"},
-			want: "db.example.com",
+			want: "db_example_com",
 		},
 		{
 			name: "no host -> default",
 			in:   walgEnv{},
+			want: "default",
+		},
+		{
+			// Unix-socket PGHOST used to yield "" and every
+			// archive_command failed.
+			name: "unix-socket PGHOST -> default",
+			in:   walgEnv{pgHost: "/var/run/postgresql"},
 			want: "default",
 		},
 	}

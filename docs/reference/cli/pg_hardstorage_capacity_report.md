@@ -22,8 +22,8 @@ cumulative logical bytes).
 
 The result includes:
 
-  - Total bytes_per_day (slope of the global fit, weighted by each
-    deployment's current footprint)
+  - Total bytes_per_day (sum of the per-deployment slopes; R² is
+    weighted by each deployment's current footprint)
   - Projected bytes at the horizon (current + slope*horizon)
   - R² and a categorical confidence (high|medium|low|insufficient)
   - Per-deployment slice with each deployment's slope and R²

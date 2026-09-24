@@ -41,6 +41,7 @@ import (
 
 	"github.com/jackc/pglogrepl"
 
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/logical/commitlsn"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/pg/logicalreceiver"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
 )
@@ -320,8 +321,8 @@ func (s *Sink) Flush(ctx context.Context) error {
 	return s.flushLocked(ctx)
 }
 
-// SyncedLSN returns the last successfully-POSTed batch's
-// EndLSN.  Read by the receive loop's status ticker.
+// SyncedLSN returns the highest commit end LSN among the
+// successfully-POSTed (or dead-lettered) batches.  Read by the receive loop's status ticker.
 func (s *Sink) SyncedLSN() pglogrepl.LSN {
 	return pglogrepl.LSN(s.syncedLSN.Load())
 }
@@ -367,9 +368,14 @@ func (s *Sink) flushLocked(ctx context.Context) error {
 		return fmt.Errorf("webhook: encode batch: %w", err)
 	}
 
+	// The slot may only be confirmed up to the last commit this batch
+	// delivers — never endLSN, which is WALStart+len(Data) and can lie
+	// past commits not yet received (see package commitlsn).
+	commitLSN := commitlsn.Highest(batch)
+
 	postErr := s.postWithRetries(ctx, body, batchID)
 	if postErr == nil {
-		s.syncedLSN.Store(uint64(endLSN))
+		commitlsn.Advance(&s.syncedLSN, commitLSN)
 		s.postsSucceeded.Add(1)
 		s.totalRecordsPosted.Add(int64(len(batch)))
 		return nil
@@ -415,7 +421,7 @@ func (s *Sink) flushLocked(ctx context.Context) error {
 			batchID, postErr, err)
 	}
 	s.batchesDeadLettered.Add(1)
-	s.syncedLSN.Store(uint64(endLSN))
+	commitlsn.Advance(&s.syncedLSN, commitLSN)
 	return nil
 }
 

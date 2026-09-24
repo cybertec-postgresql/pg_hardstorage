@@ -79,14 +79,27 @@ cutover playbook.`,
 // the pgBackRest and Barman shims.  Other failures exit 1.
 func Execute() int {
 	root := NewRoot(os.Stdout, os.Stderr)
-	if err := root.Execute(); err != nil {
+	cmd, err := root.ExecuteC()
+	if err != nil {
 		// Refusals already printed to stderr; print other errors.
 		if _, ok := err.(*shimError); !ok {
 			fmt.Fprintln(os.Stderr, err)
 		}
-		return ExitCode(err)
+		return exitCodeFor(cmd, err)
 	}
 	return 0
+}
+
+// exitCodeFor maps a failed invocation to its process status. wal-fetch
+// is PostgreSQL's restore_command, where a plain nonzero exit means
+// "end of archive, promote": a failure cobra raised before the verb
+// ran (wrong argc, unknown flag) never touched the repository, so it
+// must abort recovery instead of reading as ExitCode's generic 1.
+func exitCodeFor(cmd *cobra.Command, err error) int {
+	if _, ok := err.(*shimError); !ok && cmd != nil && cmd.Name() == "wal-fetch" {
+		return exitAbortRecovery
+	}
+	return ExitCode(err)
 }
 
 // refusedVerb is one entry in the static refusal table.

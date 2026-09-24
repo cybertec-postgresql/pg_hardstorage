@@ -234,23 +234,22 @@ func TestGameDay_S3Throttle_DrivesFaultInjection(t *testing.T) {
 	}
 }
 
-// TestGameDay_S3Throttle_NoRepoIsContractOnly: without --repo, the
-// scenario falls back to the pass-by-contract path (no live fault
-// injection, but the run still passes and records the invariant).
-// This preserves the existing ad-hoc behaviour.
-func TestGameDay_S3Throttle_NoRepoIsContractOnly(t *testing.T) {
-	stdout, _, exit := runCmd(t,
+// TestGameDay_S3Throttle_NoRepoRefuses: without --repo there is
+// nothing to inject a storm into. The scenario used to "pass by
+// contract" — exit 0 having driven nothing — and now refuses as a
+// usage error, like agent_kill and patroni_split_brain.
+func TestGameDay_S3Throttle_NoRepoRefuses(t *testing.T) {
+	stdout, stderr, exit := runCmd(t,
 		"gameday", "run", "s3_throttle",
 		"--output", "json")
-	if exit != int(output.ExitOK) {
-		t.Fatalf("contract-only run should pass; got %d\n%s", exit, stdout)
+	if exit != int(output.ExitMisuse) {
+		t.Fatalf("s3_throttle without --repo should exit ExitMisuse; got %d\n%s\n%s", exit, stdout, stderr)
 	}
-	if !strings.Contains(stdout, `"pass": true`) {
-		t.Errorf("expected pass=true:\n%s", stdout)
+	if strings.Contains(stdout, `"pass": true`) {
+		t.Errorf("a run that drove nothing reported pass=true:\n%s", stdout)
 	}
-	// Contract-only run should NOT mention fault_active / fault_observed.
-	if strings.Contains(stdout, `"fault_active"`) {
-		t.Errorf("contract-only run should not drive fault injection:\n%s", stdout)
+	if !strings.Contains(stderr, "usage.missing_flag") {
+		t.Errorf("expected usage.missing_flag:\n%s", stderr)
 	}
 }
 

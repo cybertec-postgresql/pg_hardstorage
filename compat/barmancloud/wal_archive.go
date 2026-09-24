@@ -68,11 +68,10 @@ func runWalArchive(cmd *cobra.Command, f commonFlags, s3Path, stanza, walRel str
 	// `pg_wal/000000...`.  That path is RELATIVE to PGDATA;
 	// the native CLI's wal-push wants the absolute path so it
 	// can mmap the segment.
-	pgdata := envLookup("PGDATA")
-	if pgdata == "" {
-		return fmt.Errorf("pg-hardstorage-barmancloud: wal-archive: PGDATA env var unset")
+	absPath, err := resolveWALPath("wal-archive", walRel)
+	if err != nil {
+		return err
 	}
-	absPath := pgdata + "/" + walRel
 
 	args := []string{
 		"wal", "push", deployment, absPath,

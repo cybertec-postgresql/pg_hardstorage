@@ -97,7 +97,8 @@ pg_hardstorage compat translate --from walg \
     --out-file /etc/pg_hardstorage/pg_hardstorage.yaml
 
 # 3. Review the YAML — every unmapped WALG_ setting surfaces
-#    as a comment + on stderr.
+#    as a comment + on stderr (secret values such as
+#    AWS_SECRET_ACCESS_KEY are redacted on stderr).
 $EDITOR /etc/pg_hardstorage/pg_hardstorage.yaml
 
 # 4. Initialise the new repo (different from the existing
@@ -234,6 +235,35 @@ retention floor, then WAL-G retires.
   KEK never leaves the KMS provider; chunks are encrypted
   at rest with a per-backup DEK that's wrapped under the
   KEK in the manifest.
+- **Deployment name.** Without `PG_HARDSTORAGE_DEPLOYMENT`,
+  the shim and `compat translate --from walg` derive the same
+  name from `PGHOST`: port stripped, illegal characters turned
+  into `_` (`db.prod.internal` → `db_prod_internal`), and a
+  Unix-socket `PGHOST` (`/var/run/postgresql`) becomes
+  `default`.  Earlier shim builds used the dotted host verbatim
+  (and an empty name for a socket); backups taken under such a
+  name stay restorable natively (`pg_hardstorage restore
+  db.prod.internal …`), but the shim now starts a new lineage —
+  take a fresh `backup-push --full` after upgrading.
+- **`backup-fetch` arms end-of-archive recovery.** WAL-G
+  writes no recovery settings; the shim runs native
+  `restore --to-latest`, which writes `recovery.signal` and a
+  managed `postgresql.auto.conf` block with `restore_command`
+  and **no** recovery target, so starting the cluster replays
+  every archived segment and promotes.  Your own
+  `standby.signal` still wins (the node stays a standby), and a
+  `recovery_target_*` you add composes with it.  The managed
+  block also sets `recovery_target_action = 'pause'`,
+  `recovery_target_timeline = 'latest'` and
+  `recovery_target_inclusive = true` (PostgreSQL's defaults);
+  because `postgresql.auto.conf` is read last, change those in
+  that block, not in `postgresql.conf`.
+- **`wal-fetch` exit codes.** As `restore_command`, the shim
+  exits **1** only when the segment is genuinely absent
+  (PostgreSQL's end-of-archive signal).  Any other failure —
+  S3 5xx, expired credentials, a broken `WALG_*` setting, bad
+  argv — exits **126**, so PostgreSQL aborts recovery instead
+  of promoting with WAL still unreplayed.
 
 ## Troubleshooting
 

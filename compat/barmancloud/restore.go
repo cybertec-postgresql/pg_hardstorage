@@ -58,6 +58,17 @@ func runRestore(cmd *cobra.Command, f commonFlags, s3Path, stanza, backupID, rec
 		"restore", deployment, backupID,
 		"--target", recoveryDir,
 		"--repo", repoURL,
+		// barman-cloud-restore only lays down the base backup; the
+		// caller (CNPG's recovery bootstrap, or an operator) sets up
+		// restore_command, the signal file and any target, and
+		// PostgreSQL replays every archived segment by default. A
+		// plain native restore instead arms recovery_target=
+		// 'immediate', which drops all WAL archived after the backup
+		// and collides with CNPG's own recovery_target_* ("multiple
+		// recovery targets specified"). --to-latest arms
+		// restore_command with no target; promote is the action CNPG
+		// always configures for its own targets.
+		"--to-latest", "--to-action", "promote",
 	}
 
 	res := dispatchNative(args)

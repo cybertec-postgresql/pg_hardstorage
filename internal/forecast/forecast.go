@@ -13,8 +13,9 @@
 //
 // Design discipline:
 //
-//   - Linear regression on observable points (manifest StoppedAt +
-//     logical bytes) produces a slope (bytes/day, manifests/day) +
+//   - Linear regression on observable points (full-backup StoppedAt
+//     + logical bytes, i.e. database size over time) produces a slope
+//     (bytes/day, manifests/day) +
 //     R² for confidence reporting. We never claim more than the
 //     data supports — sparse-data deployments get "low confidence"
 //     and a note explaining why.
@@ -132,14 +133,17 @@ type RepoSummary struct {
 type DeploymentForecast struct {
 	Name string `json:"name"`
 
-	// Current state — the freshest backup we observed.
+	// Current state. CurrentBytes is the logical size of the newest
+	// full/snapshot backup — the database's size; an incremental's
+	// size is a delta and only stands in when no full is visible.
 	CurrentBytes     int64     `json:"current_bytes"`
 	CurrentManifests int       `json:"current_manifests"`
 	LatestStoppedAt  time.Time `json:"latest_stopped_at,omitempty"`
 	OldestStoppedAt  time.Time `json:"oldest_stopped_at,omitempty"`
 
-	// SamplesObserved is the number of manifests in the baseline
-	// window. Below MinSamples (3) we can't fit a meaningful line.
+	// SamplesObserved is the number of full/snapshot manifests in
+	// the baseline window — the size samples the growth fit runs on.
+	// Below MinSamples (3) we can't fit a meaningful line.
 	SamplesObserved int `json:"samples_observed"`
 
 	// Growth rates derived from regression. Zero on insufficient
@@ -378,20 +382,39 @@ type sample struct {
 	bytes int64
 }
 
+// sizesDatabase reports whether a manifest's logical bytes measure
+// the whole database. A full or snapshot backup lists every file at
+// its full size; a PG 17 incremental_lsn backup lists the changed
+// relation files only, so its "size" is a delta against the parent
+// and would read as the database shrinking to a sliver every time an
+// incremental lands between two fulls.
+func sizesDatabase(m *backup.Manifest) bool {
+	return m.Type != backup.BackupTypeIncremental
+}
+
 // buildDeploymentForecast walks one deployment's manifests and
 // computes the growth picture. All errors here are swallowed (the
 // forecast is best-effort by design — a partial fleet projection is
 // more useful than a hard failure).
+//
+// What is modelled: the logical size of one full backup, i.e. the
+// database's on-source size, regressed against time. That is the
+// quantity that actually grows when the database grows. It is NOT
+// the repository footprint — that is (retained backups × size)
+// shrunk by dedup and compression, and depends on a retention policy
+// this report does not see. An earlier version regressed the running
+// TOTAL of every backup's size, which is "bytes ever written without
+// retention or dedup": a constant 100 GiB database with daily fulls
+// then "grew" 100 GiB/day and projected +36 TiB/year.
 func buildDeploymentForecast(ctx context.Context, store *backup.ManifestStore, dep string, opts Options) DeploymentForecast {
 	out := DeploymentForecast{Name: dep, Projections: zeroProjections(opts)}
 
-	cumulativeByDay := map[int64]int64{} // unix-day → cumulative bytes
-	var allSamples []sample
-	var inWindow []sample
+	var inWindow []sample // every in-window manifest: drives manifests/day
+	var sizes []sample    // in-window full/snapshot sizes: drives bytes/day
 
 	manifestCount := 0
-	var current int64
-	var latest, oldest time.Time
+	var current, latestAny int64
+	var latest, latestSized, oldest time.Time
 
 	for m, lerr := range store.List(ctx, dep, opts.Verifier) {
 		if lerr != nil {
@@ -406,81 +429,62 @@ func buildDeploymentForecast(ctx context.Context, store *backup.ManifestStore, d
 		}
 		if m.StoppedAt.After(latest) {
 			latest = m.StoppedAt
+			latestAny = size
+		}
+		if sizesDatabase(m) && m.StoppedAt.After(latestSized) {
+			latestSized = m.StoppedAt
 			current = size
 		}
-		allSamples = append(allSamples, sample{at: m.StoppedAt, bytes: size})
 
 		// Window-bounded accumulator. The growth-rate fit only
 		// sees backups in [Now - BaselineWindow, Now].
 		if !m.StoppedAt.Before(opts.Now.Add(-opts.BaselineWindow)) &&
 			!m.StoppedAt.After(opts.Now) {
 			inWindow = append(inWindow, sample{at: m.StoppedAt, bytes: size})
-			day := m.StoppedAt.UTC().Truncate(24 * time.Hour).Unix()
-			// Cumulative bytes up to and including this manifest's
-			// day. We track per-day cumulative to feed the
-			// regression on a daily series; a deployment with N
-			// backups per day still contributes N to the
-			// manifest count but the size series is daily-totaled.
-			cumulativeByDay[day] += size
+			if sizesDatabase(m) {
+				sizes = append(sizes, sample{at: m.StoppedAt, bytes: size})
+			}
 		}
+	}
+	// A deployment with only incrementals visible (its fulls aged out
+	// or were retained elsewhere) has no whole-database size; the
+	// newest manifest is the best number we have, and the fit below
+	// will report insufficient data rather than regress deltas.
+	if latestSized.IsZero() {
+		current = latestAny
 	}
 
 	out.CurrentManifests = manifestCount
 	out.CurrentBytes = current
 	out.LatestStoppedAt = latest
 	out.OldestStoppedAt = oldest
-	out.SamplesObserved = len(inWindow)
-
-	// Build the daily cumulative series for regression. Sort by day,
-	// running-sum the daily totals.
-	type dailyPoint struct {
-		day        int64
-		cumulative int64
-	}
-	days := make([]int64, 0, len(cumulativeByDay))
-	for d := range cumulativeByDay {
-		days = append(days, d)
-	}
-	sort.Slice(days, func(i, j int) bool { return days[i] < days[j] })
-
-	var series []dailyPoint
-	var running int64
-	for _, d := range days {
-		running += cumulativeByDay[d]
-		series = append(series, dailyPoint{day: d, cumulative: running})
-	}
+	out.SamplesObserved = len(sizes)
 
 	// Regression and confidence.
-	if len(inWindow) < MinSamples {
+	if len(sizes) < MinSamples {
 		out.Confidence = "insufficient"
-		out.Note = fmt.Sprintf("fewer than %d manifests in baseline window; projection assumes zero growth from current size",
+		out.Note = fmt.Sprintf("fewer than %d full backups in baseline window; projection assumes zero growth from current size",
 			MinSamples)
 		out.Projections = projectFlat(out.CurrentBytes, manifestCount, opts)
 		return out
 	}
 
-	// Convert series to (x=days-since-baseline-start, y=cumulative-bytes)
-	// for the linear fit. x in days keeps the slope in bytes/day.
-	bxs := make([]float64, len(series))
-	bys := make([]float64, len(series))
-	startDay := series[0].day
-	for i, p := range series {
-		bxs[i] = float64(p.day - startDay)
-		bys[i] = float64(p.cumulative)
-	}
-	slope, _, r2 := linearRegress(bxs, bys)
+	slope, r2 := sizeSlope(sizes)
 
 	// manifests per day = manifest count / window-days-spanned
 	manifestRate := manifestsPerDay(inWindow, opts.Now)
 
-	out.BytesPerDay = math.Max(0, slope) // negative slope is meaningless for a backup repo
+	// A shrinking database is real (VACUUM FULL, dropped tables), but
+	// a capacity plan that banks on continued shrinkage under-provisions;
+	// project no growth instead.
+	out.BytesPerDay = math.Max(0, slope)
 	out.ManifestsPerDay = manifestRate
 	out.RSquared = r2
 
 	switch {
-	case r2 >= 0.85 && len(inWindow) >= 5:
+	case r2 >= 0.85 && len(sizes) >= 5:
 		out.Confidence = "high"
-	case r2 >= 0.5 && len(inWindow) >= 3:
+	case r2 >= 0.5 && len(sizes) >= 3:
 		out.Confidence = "medium"
 	default:
 		out.Confidence = "low"
@@ -499,6 +503,29 @@ func buildDeploymentForecast(ctx context.Context, store *backup.ManifestStore, d
 		})
 	}
 	return out
+}
+
+// sizeSlope fits size = a + b·t over the samples with t in
+// fractional days since the earliest one, so b is bytes/day. Returns
+// (slope, R²).
+func sizeSlope(ss []sample) (float64, float64) {
+	if len(ss) == 0 {
+		return 0, 0
+	}
+	t0 := ss[0].at
+	for _, s := range ss {
+		if s.at.Before(t0) {
+			t0 = s.at
+		}
+	}
+	xs := make([]float64, len(ss))
+	ys := make([]float64, len(ss))
+	for i, s := range ss {
+		xs[i] = s.at.Sub(t0).Hours() / 24
+		ys[i] = float64(s.bytes)
+	}
+	slope, _, r2 := linearRegress(xs, ys)
+	return slope, r2
 }
 
 // projectFlat builds the "no growth" projection set for deployments
@@ -688,10 +715,24 @@ func bytesToMonthlyCost(b int64, pricePerGBMonth float64) float64 {
 	return math.Round(cost*100) / 100
 }
 
-// detectAnomalies splits the baseline window into "tail" (last
-// AnomalyTailWindow) and "baseline" (rest) and flags deployments
-// whose tail rate differs from the baseline rate by >
-// AnomalyMultiplier×.
+// detectAnomalies splits each deployment's in-window full-backup size
+// series at the start of the tail window (last AnomalyTailWindow) and
+// compares growth RATES — bytes per day the database gained — on
+// either side:
+//
+//   - baseline rate: least-squares slope of size over the pre-tail
+//     samples;
+//   - recent rate: (newest size − last pre-tail size) / the days
+//     between them. Anchoring on the last pre-tail backup means a
+//     single tail backup — the normal case on a weekly schedule —
+//     still measures growth over the real elapsed time.
+//
+// An earlier version divided SUMMED backup bytes by each side's
+// sample span and floored a one-sample span to a day: the tail of a
+// weekly schedule became "one whole backup per day" against ~11
+// weeks of summed bytes, and every weekly deployment read as a
+// sudden_uptick. A baseline that did not grow has no rate to take a
+// ratio against and is skipped rather than flagged on noise.
 //
 // We re-walk because the per-deployment forecast already discards
 // the tail/baseline split; a separate pass keeps the data flow
@@ -706,46 +747,40 @@ func detectAnomalies(ctx context.Context, store *backup.ManifestStore, fcs []Dep
 		if err := ctx.Err(); err != nil {
 			return out
 		}
-		var tailBytes, baselineBytes int64
-		var tailDays, baselineDays float64
-		var firstTail, lastTail, firstBase, lastBase time.Time
+		var pre, tail []sample
 		for m, lerr := range store.List(ctx, fc.Name, opts.Verifier) {
-			if lerr != nil {
+			if lerr != nil || !sizesDatabase(m) {
 				continue
 			}
 			if m.StoppedAt.Before(opts.Now.Add(-opts.BaselineWindow)) ||
 				m.StoppedAt.After(opts.Now) {
 				continue
 			}
-			size := manifestLogicalBytes(m)
-			if !m.StoppedAt.Before(tailStart) {
-				tailBytes += size
-				if firstTail.IsZero() || m.StoppedAt.Before(firstTail) {
-					firstTail = m.StoppedAt
-				}
-				if m.StoppedAt.After(lastTail) {
-					lastTail = m.StoppedAt
-				}
+			s := sample{at: m.StoppedAt, bytes: manifestLogicalBytes(m)}
+			if m.StoppedAt.Before(tailStart) {
+				pre = append(pre, s)
 			} else {
-				baselineBytes += size
-				if firstBase.IsZero() || m.StoppedAt.Before(firstBase) {
-					firstBase = m.StoppedAt
-				}
-				if m.StoppedAt.After(lastBase) {
-					lastBase = m.StoppedAt
-				}
+				tail = append(tail, s)
 			}
 		}
-		tailDays = anomalySpanDays(firstTail, lastTail)
-		baselineDays = anomalySpanDays(firstBase, lastBase)
-		if tailDays == 0 || baselineDays == 0 {
+		if len(pre) < 2 || len(tail) == 0 {
 			continue
 		}
-		tailRate := float64(tailBytes) / tailDays
-		baselineRate := float64(baselineBytes) / baselineDays
-		if baselineRate == 0 {
+		byTime := func(ss []sample) {
+			sort.Slice(ss, func(i, j int) bool { return ss[i].at.Before(ss[j].at) })
+		}
+		byTime(pre)
+		byTime(tail)
+		baselineRate, _ := sizeSlope(pre)
+		if baselineRate <= 0 {
 			continue
 		}
+		anchor, newest := pre[len(pre)-1], tail[len(tail)-1]
+		days := newest.at.Sub(anchor.at).Hours() / 24
+		if days <= 0 {
+			continue
+		}
+		tailRate := float64(newest.bytes-anchor.bytes) / days
 		mult := tailRate / baselineRate
 		if mult >= AnomalyMultiplier {
 			out = append(out, GrowthAnomaly{
@@ -756,7 +791,9 @@ func detectAnomalies(ctx context.Context, store *backup.ManifestStore, fcs []Dep
 				MultiplierObserved:  mult,
 				MultiplierThreshold: AnomalyMultiplier,
 			})
-		} else if mult > 0 && 1.0/mult >= AnomalyMultiplier {
+		} else if mult <= 1.0/AnomalyMultiplier {
+			// Includes growth that stalled (mult 0) or reversed
+			// (mult < 0): both are a break from a growing baseline.
 			out = append(out, GrowthAnomaly{
 				Deployment:          fc.Name,
 				Reason:              "sudden_drop",
@@ -769,15 +806,4 @@ func detectAnomalies(ctx context.Context, store *backup.ManifestStore, fcs []Dep
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Deployment < out[j].Deployment })
 	return out
-}
-
-func anomalySpanDays(first, last time.Time) float64 {
-	if first.IsZero() || last.IsZero() {
-		return 0
-	}
-	span := last.Sub(first).Hours() / 24
-	if span < 1 {
-		span = 1
-	}
-	return span
 }

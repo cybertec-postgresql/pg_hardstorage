@@ -42,37 +42,41 @@ func TestMapToNativeArgs(t *testing.T) {
 		{
 			name: "target-action pause",
 			in:   recoverArgs{targetAction: "pause"},
-			want: []string{"--to-action", "pause"},
+			want: []string{"--to-latest", "--to-action", "pause"},
 		},
 		{
 			name: "target-action promote (case-insensitive)",
 			in:   recoverArgs{targetAction: "Promote"},
-			want: []string{"--to-action", "promote"},
+			want: []string{"--to-latest", "--to-action", "promote"},
 		},
 		{
 			name:     "target-action garbage -> warn + drop",
 			in:       recoverArgs{targetAction: "wibble"},
-			want:     nil,
+			want:     []string{"--to-latest"},
 			wantWarn: []string{"--target-action=wibble"},
 		},
 		{
 			name:     "remote-ssh-command dropped + warn",
 			in:       recoverArgs{remoteSSHCmd: "ssh restore@db"},
+			want:     []string{"--to-latest"},
 			wantWarn: []string{"--remote-ssh-command"},
 		},
 		{
 			name:     "get-wal dropped + warn",
 			in:       recoverArgs{getWAL: ptrBool(true)},
+			want:     []string{"--to-latest"},
 			wantWarn: []string{"--get-wal"},
 		},
 		{
 			name:     "no-get-wal dropped + warn",
 			in:       recoverArgs{getWAL: ptrBool(false)},
+			want:     []string{"--to-latest"},
 			wantWarn: []string{"--no-get-wal"},
 		},
 		{
 			name:     "retry knobs dropped + warn",
 			in:       recoverArgs{retryN: "3"},
+			want:     []string{"--to-latest"},
 			wantWarn: []string{"--retry-times/--retry-sleep"},
 		},
 		{

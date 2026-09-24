@@ -53,7 +53,7 @@ func writeHeader(bw *strings.Builder, r *Report) {
 	fmt.Fprintf(bw, "| Generated at | %s |\n", r.GeneratedAt.Format(time.RFC3339))
 	fmt.Fprintf(bw, "| Walk duration | %d ms |\n", r.DurationMS)
 	fmt.Fprintln(bw)
-	fmt.Fprintln(bw, "_Linear regression on observed manifest commit history. Confidence per deployment reflects sample count + R² of the fit; sparse-data deployments project flat. The forecast is a planning tool, not a guarantee._")
+	fmt.Fprintln(bw, "_Linear regression of full-backup size (database size) over time. Confidence per deployment reflects sample count + R² of the fit; sparse-data deployments project flat. The forecast is a planning tool, not a guarantee._")
 	fmt.Fprintln(bw)
 }
 
@@ -182,11 +182,12 @@ func writeNotesSection(bw *strings.Builder, r *Report) {
 	fmt.Fprintln(bw, "## Methodology notes")
 	fmt.Fprintln(bw)
 	fmt.Fprintln(bw, "- Sizes are **logical bytes** (sum of `FileEntry.Size` from each manifest). Logical = on-source data size, before dedup / compression / encryption. Operators reason about repo growth in terms of \"what your DB looks like\", not what bytes ended up on S3.")
-	fmt.Fprintf(bw, "- Growth rate is fitted by ordinary least-squares linear regression on the per-day cumulative-bytes series. R² = goodness of fit; we surface it raw so operators can apply their own quality threshold.\n")
+	fmt.Fprintf(bw, "- Growth rate is fitted by ordinary least-squares linear regression of each full/snapshot backup's logical size against time — how fast the database itself grows. Incremental backups are excluded (their size is a delta). R² = goodness of fit; we surface it raw so operators can apply their own quality threshold.\n")
+	fmt.Fprintln(bw, "- Projected sizes are the size of **one full backup** at each horizon, not the repository footprint: that is retained backups × size, reduced by dedup + compression, and depends on the retention policy. Multiply by the number of retained fulls for a no-dedup upper bound.")
 	fmt.Fprintf(bw, "- Confidence: **insufficient** if fewer than %d manifests in the baseline window; **low** otherwise unless R² ≥ 0.5 (medium) or R² ≥ 0.85 with ≥ 5 samples (high).\n", MinSamples)
-	fmt.Fprintf(bw, "- Anomaly detection compares the rate over the last %s to the rate over the rest of the baseline window; a multiplier ≥ %.1f surfaces a `sudden_uptick` finding.\n",
-		AnomalyTailWindow, AnomalyMultiplier)
-	fmt.Fprintln(bw, "- A negative regression slope is clamped to 0 — a backup repo's logical bytes don't shrink in any operationally meaningful way; that signal would be from manifests being deleted, which is a different report.")
+	fmt.Fprintf(bw, "- Anomaly detection compares the size growth rate since the last backup before the final %s to the fitted growth rate before it; a multiplier ≥ %.1f surfaces `sudden_uptick`, ≤ %.2f `sudden_drop`. Deployments whose baseline did not grow are not scored.\n",
+		AnomalyTailWindow, AnomalyMultiplier, 1/AnomalyMultiplier)
+	fmt.Fprintln(bw, "- A negative regression slope is clamped to 0 — databases do shrink (VACUUM FULL, dropped tables), but a capacity plan that banks on continued shrinkage under-provisions.")
 	fmt.Fprintln(bw, "- Cost projection is a strictly linear conversion at the operator-supplied price; cloud tariffs include request fees + egress + lifecycle storage classes that the operator's billing system handles, not us.")
 	fmt.Fprintln(bw)
 	fmt.Fprintln(bw, "---")
