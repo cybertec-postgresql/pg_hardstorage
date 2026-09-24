@@ -86,10 +86,14 @@ func (e *PushgatewayEmitter) OnEvent(ev Event) {
 		cm.Restores++
 	case "verify_failed":
 		cm.RestoresFailed++
-		cm.Pass = 0
 	case "fault_apply":
 		cm.Faults++
-	case "setup_failed":
+	case "cell_failed":
+		// The orchestrator emits cell_failed for every failure it
+		// records (recordFailure), so the gauge reaches exactly the
+		// report's verdict. Keying it on a hand-picked list of *_failed
+		// ops (verify, setup) left backup, seed, sidecar and retention
+		// failures showing pass=1 for a run whose report said FAIL.
 		cm.Pass = 0
 	}
 }

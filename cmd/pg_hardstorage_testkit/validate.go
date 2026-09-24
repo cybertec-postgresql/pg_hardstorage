@@ -34,6 +34,7 @@ func newValidateCmd() *cobra.Command {
 		verifyEvery       int
 		retentionEvery    time.Duration
 		retentionMaxDefer int
+		maxBackupGap      time.Duration
 		iterInterval      time.Duration
 		hostPortBase      int
 		dockerBin         string
@@ -166,6 +167,7 @@ fleet.`,
 					VerifyEvery:           verifyEvery,
 					RetentionInterval:     retentionEvery,
 					RetentionMaxDeferrals: retentionMaxDefer,
+					MaxBackupGap:          maxBackupGap,
 					FaultProbability:      faultRate,
 					HealWindow:            healWindow,
 				},
@@ -256,6 +258,9 @@ fleet.`,
 	c.Flags().IntVar(&retentionMaxDefer, "retention-max-deferrals", 0,
 		"fail the run when one repository's gc is deferred this many retention windows in a row "+
 			"(0 = default 4, negative never fails)")
+	c.Flags().DurationVar(&maxBackupGap, "max-backup-gap", 0,
+		"fail a cell that goes this long without a backup getting through, e.g. because a fault left it down "+
+			"(0 = default 1h, negative disables the bound; a cell with no backup at all still fails)")
 	c.Flags().DurationVar(&iterInterval, "iter-interval", 10*time.Second,
 		"sleep between iterations")
 	c.Flags().IntVar(&hostPortBase, "host-port-base", 15432,

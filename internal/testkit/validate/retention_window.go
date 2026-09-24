@@ -90,7 +90,7 @@ func (st *retentionState) deferred(r *retentionRepo, window int, reason string, 
 		"a lease that never expires or a fleet that never drains keeps the repository growing unbounded",
 		strings.Join(r.cells, ", "), r.deferred, reason)
 	emit(Event{Cell: cell, Op: "retention_deferred_too_long", Iteration: window, Err: msg})
-	reportFailure(report.Failure{
+	recordFailure(emit, report.Failure{
 		At: time.Now().UTC(), Cell: cell, Iteration: window,
 		Kind: "retention", Message: msg,
 	})
@@ -118,7 +118,7 @@ func runRetentionWindow(ctx context.Context, cells []CellRuntime, gate *retentio
 	// fail records a real retention failure against the cell that ran it.
 	fail := func(cell, op string, err error) {
 		emit(Event{Cell: cell, Op: op, Iteration: window, Err: err.Error()})
-		reportFailure(report.Failure{
+		recordFailure(emit, report.Failure{
 			At: time.Now().UTC(), Cell: cell, Iteration: window,
 			Kind: "retention", Message: err.Error(),
 		})

@@ -171,6 +171,16 @@ type LoopOptions struct {
 	// stuck backup hiding behind "the next window retries" while the
 	// repository grows for the rest of the run.
 	RetentionMaxDeferrals int
+
+	// MaxBackupGap is how long a cell may go without proof of life — a
+	// backup that completed, or that PostgreSQL refused over injected
+	// source corruption — before it fails as cell_down. Default 1h:
+	// longer than a fault's heal window, a retention window's hold (up
+	// to RetentionQuiesceTimeout) and a slow backup combined, so only a
+	// cell that stays down is caught. Negative disables the bound; a
+	// cell whose dispatched backups ALL skipped still fails at the end
+	// of the run.
+	MaxBackupGap time.Duration
 }
 
 // RetentionApplier is implemented by runtimes that can apply retention
@@ -215,5 +225,8 @@ func (o *LoopOptions) defaults() {
 	}
 	if o.RetentionMaxDeferrals == 0 {
 		o.RetentionMaxDeferrals = 4
+	}
+	if o.MaxBackupGap == 0 {
+		o.MaxBackupGap = time.Hour
 	}
 }
