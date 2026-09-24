@@ -156,8 +156,10 @@ type LoopOptions struct {
 	RetentionInterval time.Duration
 
 	// RetentionQuiesceTimeout bounds how long a retention window waits
-	// for in-flight backups and verifies to drain. Default 5m — one cell
-	// waiting out a long PG recovery must not stall the whole fleet.
+	// for in-flight backups and verifies to drain. Default 10m: on a
+	// saturated host heavy backups ran 2-7 minutes, so 5m never drained
+	// a fleet of 8; still bounded, so one cell waiting out a long PG
+	// recovery (up to 30m) does not stall the rest.
 	RetentionQuiesceTimeout time.Duration
 }
 
@@ -195,6 +197,6 @@ func (o *LoopOptions) defaults() {
 		o.RetentionInterval = 15 * time.Minute
 	}
 	if o.RetentionQuiesceTimeout == 0 {
-		o.RetentionQuiesceTimeout = 5 * time.Minute
+		o.RetentionQuiesceTimeout = 10 * time.Minute
 	}
 }
