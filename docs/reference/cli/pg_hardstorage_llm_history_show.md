@@ -21,8 +21,9 @@ pg_hardstorage llm history show <session-id> [flags]
 ### Options
 
 ```
-  -h, --help               help for show
-      --principal string   operator principal (default: $USER)
+  -h, --help                      help for show
+      --history-key-file string   path to the 32-byte hex key file the transcripts were recorded with (as passed to llm chat --history-key-file); default: derive from the local KEK
+      --principal string          operator principal (default: $USER)
 ```
 
 ### Options inherited from parent commands

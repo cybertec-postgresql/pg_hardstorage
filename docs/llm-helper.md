@@ -159,6 +159,11 @@ To pull the full transcript for one session:
 pg_hardstorage llm history show <session-id>
 ```
 
+If the session was recorded with `llm chat --history-key-file <path>`,
+pass the same `--history-key-file <path>` to `llm history
+list/show/shred` — those transcripts are encrypted under that key,
+not the one derived from the local KEK.
+
 Or export a signed evidence bundle suitable for an auditor:
 
 ```bash

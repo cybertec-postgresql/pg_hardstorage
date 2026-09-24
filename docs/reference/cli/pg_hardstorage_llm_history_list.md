@@ -21,8 +21,9 @@ pg_hardstorage llm history list [flags]
 ### Options
 
 ```
-  -h, --help               help for list
-      --principal string   operator principal to scope to (default: $USER); pass '*' to list every principal on the host
+  -h, --help                      help for list
+      --history-key-file string   path to the 32-byte hex key file the transcripts were recorded with (as passed to llm chat --history-key-file); default: derive from the local KEK
+      --principal string          operator principal to scope to (default: $USER); pass '*' to list every principal on the host
 ```
 
 ### Options inherited from parent commands
