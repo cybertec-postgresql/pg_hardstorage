@@ -69,6 +69,7 @@ Common leaf shapes:
 | `usage.unsupported_flag` | A flag the chosen mode cannot honour, refused instead of silently dropped — e.g. `restore --control-plane` with `--preview` (there is no remote preview; it would run a real restore), `--require-threshold-attestation`, `--verify-restore`, `--kms-config` or `--chain-staging-root` |
 | `usage.bad_tablespace_mapping` | A `--tablespace-mapping` / API `tablespace_mapping` entry is malformed, not normalised, or (control plane) outside `restore_roots` |
 | `usage.unknown_output_format`, `usage.unknown_policy`, `usage.unknown_scheme`, `usage.unknown_shell` | Enum-shaped value out of set |
+| `usage.unknown_deployment`, `usage.unknown_tenant` | A `--deployment` / `--tenant` filter names nothing in the repo — refused rather than reporting a vacuous clean result (`dsa locate --allow-unknown-tenant` certifies a tenant that holds no backups) |
 
 **Recovery:** read the suggestion, fix the command line,
 re-run.
@@ -176,6 +177,7 @@ treat any `verify.*` exit as an alert.
 | `verify.residency_violation` | Data-residency policy refused the action |
 | `verify.wal_gap_detected` | A Patroni-failover WAL gap covers the requested PITR window |
 | `verify.heal_incomplete`, `verify.integrity_issues`, `verify.insider_findings` | Resilience checks surfaced findings |
+| `verify.dsa_incomplete` | `dsa locate` could not read or verify some manifests: the report is signed and persisted with its unreadable count, but is not a complete answer to the request |
 
 **Recovery:** never auto-retry.  Treat as a P1 incident;
 follow the relevant

@@ -9,7 +9,11 @@ pg_hardstorage cannot peek into encrypted chunk content (and shouldn't — the
 keystore is outside our trust boundary). The natural unit of GDPR compliance is
 the *tenant*: each tenant has its own KEK, and `kms shred` operates at tenant
 granularity. So DSA reports walk manifests filtered by tenant and enumerate
-every affected backup + its `KEKRef`.
+every affected backup + its `KEKRef`. Soft-deleted (tombstoned) backups are
+included and flagged `tombstoned`: until GC they are recoverable, so the data
+is still held. A tenant no manifest carries is refused (`usage.unknown_tenant`)
+unless `--allow-unknown-tenant` certifies it is empty, and a scan with
+unreadable manifests exits `verify.dsa_incomplete` after rendering the report.
 
 The operator supplies an opaque `subject_id` (UUID, hashed email, internal user
 ID, ...) and asserts the tenant boundary. We SHA-256-hash the raw `subject_id`
