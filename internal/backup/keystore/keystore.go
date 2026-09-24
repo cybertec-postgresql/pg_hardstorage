@@ -70,6 +70,39 @@ func LoadOrGenerate(keyringDir string) (*backup.Signer, *backup.Verifier, error)
 	}
 }
 
+// ErrNoKeypair is returned by Load when the keyring holds no signing
+// keypair at all.
+var ErrNoKeypair = errors.New("keystore: no signing keypair in the keyring")
+
+// Load is the load-only counterpart of LoadOrGenerate: it never writes.
+// Read-only commands (list, show, status, doctor, verify, kms verify,
+// retention plans) must use it. Generating from a read-only path minted
+// a fresh keypair on any host with an empty or mis-pointed keyring — so
+// `doctor` "fixed" a missing keyring by creating a key that verifies
+// none of the repo's manifests, and a later backup silently signed
+// under it, splitting the repo across two keys.
+func Load(keyringDir string) (*backup.Signer, *backup.Verifier, error) {
+	privPath := filepath.Join(keyringDir, PrivateKeyFile)
+	pubPath := filepath.Join(keyringDir, PublicKeyFile)
+	privExists, err := fileExists(privPath)
+	if err != nil {
+		return nil, nil, err
+	}
+	pubExists, err := fileExists(pubPath)
+	if err != nil {
+		return nil, nil, err
+	}
+	switch {
+	case privExists && pubExists:
+		return load(privPath, pubPath)
+	case privExists != pubExists:
+		return nil, nil, fmt.Errorf("keystore: only one of {%s, %s} exists; manage the pair together",
+			PrivateKeyFile, PublicKeyFile)
+	default:
+		return nil, nil, fmt.Errorf("%w (%s)", ErrNoKeypair, keyringDir)
+	}
+}
+
 // fileExists returns whether path is a regular file. Returns an error
 // for any non-NotExist stat failure (permission denied, etc.).
 func fileExists(path string) (bool, error) {

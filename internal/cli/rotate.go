@@ -14,7 +14,6 @@ import (
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/audit"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup"
-	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup/keystore"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup/retention"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/config"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/output"
@@ -152,14 +151,11 @@ func runRotate(cmd *cobra.Command, opts rotateOpts) error {
 	// Resolve verifier the same way restore does — every manifest we
 	// touch must have a valid signature, otherwise the safety story
 	// (the signed-manifest commitment) is broken.
-	p, err := paths.Resolve(paths.DefaultOptions())
+	// Load-only: this verb must never mint a keypair (see
+	// loadExistingKeypair).
+	_, verifier, err := loadExistingKeypair("rotate")
 	if err != nil {
-		return output.NewError("internal", err.Error()).Wrap(err)
-	}
-	_, verifier, err := keystore.LoadOrGenerate(p.Keyring.Value)
-	if err != nil {
-		return output.NewError("internal",
-			fmt.Sprintf("rotate: signing key: %v", err)).Wrap(err)
+		return err
 	}
 
 	repoMeta, sp, err := repo.Open(cmd.Context(), opts.repoURL)

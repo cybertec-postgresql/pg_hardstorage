@@ -13,9 +13,7 @@ import (
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/audit"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup"
-	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup/keystore"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/output"
-	"github.com/cybertec-postgresql/pg_hardstorage/internal/paths"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/encryption"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo"
@@ -168,14 +166,11 @@ func runKMSRotate(cmd *cobra.Command, f kmsRotateFlags) error {
 	// keyring so we can re-sign rotated manifests. The signing key
 	// is unchanged across KEK rotation — only the encryption layer
 	// rotates.
-	p, err := paths.Resolve(paths.DefaultOptions())
+	// Load-only: this verb must never mint a keypair (see
+	// loadExistingKeypair).
+	signer, verifier, err := loadExistingKeypair("kms rotate")
 	if err != nil {
-		return output.NewError("internal", err.Error()).Wrap(err)
-	}
-	signer, verifier, err := keystore.LoadOrGenerate(p.Keyring.Value)
-	if err != nil {
-		return output.NewError("internal",
-			fmt.Sprintf("kms rotate: signing key: %v", err)).Wrap(err)
+		return err
 	}
 
 	repoMeta, sp, err := openRepo(cmd.Context(), f.repoURL)

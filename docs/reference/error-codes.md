@@ -131,6 +131,7 @@ upgrade PG client tools, clear the target dir, …), retry.
 | `notfound.backup`, `notfound.backup_before_time`, `notfound.backup_tombstoned` | Backup ID / time-pin / liveness mismatch |
 | `notfound.deployment`, `notfound.repo`, `notfound.sink` | Configuration entity missing |
 | `notfound.wal_segment`, `notfound.wal_segment_name` | WAL not present in the repo |
+| `notfound.signing_key` | The keyring holds no signing keypair. Read-only and maintenance verbs (list, show, status, doctor, kms verify/rotate, rotate, backup delete) never create one — point `PG_HARDSTORAGE_KEYRING_DIR` at the keyring that signed the repo; only `init` / `backup` mint a keypair |
 | `notfound.session`, `notfound.token`, `notfound.skill`, `notfound.skill_snapshot` | LLM session / skill state |
 | `notfound.replica_manifest`, `notfound.attestation` | Manifest / attestation absent |
 

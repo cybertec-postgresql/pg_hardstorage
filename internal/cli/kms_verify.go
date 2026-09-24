@@ -158,10 +158,11 @@ func runKmsVerify(cmd *cobra.Command, f kmsVerifyFlags) error {
 	if err != nil {
 		return output.NewError("internal", err.Error()).Wrap(err)
 	}
-	_, verifier, err := keystore.LoadOrGenerate(p.Keyring.Value)
+	// Load-only: this verb must never mint a keypair (see
+	// loadExistingKeypair).
+	_, verifier, err := loadExistingKeypair("kms verify")
 	if err != nil {
-		return output.NewError("internal",
-			fmt.Sprintf("kms verify: signing key: %v", err)).Wrap(err)
+		return err
 	}
 
 	resolver, err := buildKMSVerifyResolver(p.Keyring.Value, f)
