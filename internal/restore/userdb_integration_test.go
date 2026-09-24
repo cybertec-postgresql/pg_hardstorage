@@ -77,6 +77,10 @@ func TestIntegration_UserDatabaseRestored(t *testing.T) {
 	signer, _ := backup.LoadSigner(priv)
 	verifier, _ := backup.LoadVerifier(pub)
 	bres, err := runner.Take(ctx, runner.TakeOptions{
+		// Restorable backups: this fixture archives no WAL, so the backup
+		// must embed its own, or restore refuses it (preflight.backup_wal_missing)
+		// — such a data directory could never reach consistency.
+		IncludeWAL:   true,
 		PGConnString: srv.DSN, RepoURL: repoURL, Deployment: "db1",
 		Signer: signer, Verifier: verifier, Fast: true, IncludeManifest: true,
 	})
