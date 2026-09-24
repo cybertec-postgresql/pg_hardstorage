@@ -61,6 +61,27 @@ func runBackendContract(t *testing.T, factory func(t *testing.T) server.JobBacke
 		}
 	})
 
+	// CountByState is the /metrics census; it must agree with the rows.
+	t.Run("CountByState", func(t *testing.T) {
+		b := factory(t)
+		ctx := context.Background()
+		for i := 0; i < 3; i++ {
+			if _, err := b.Enqueue(ctx, server.EnqueueOptions{Kind: server.JobBackup, Deployment: "db1"}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if _, err := b.Claim(ctx, server.ClaimOptions{AgentID: "a", Deployments: []string{"db1"}}); err != nil {
+			t.Fatal(err)
+		}
+		got, err := b.CountByState(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got[server.JobQueued] != 2 || got[server.JobRunning] != 1 {
+			t.Errorf("CountByState = %v, want queued=2 running=1", got)
+		}
+	})
+
 	t.Run("FullLifecycle", func(t *testing.T) {
 		b := factory(t)
 		ctx := context.Background()

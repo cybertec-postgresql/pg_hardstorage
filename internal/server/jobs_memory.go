@@ -158,6 +158,17 @@ func (b *MemoryBackend) Claim(_ context.Context, opts ClaimOptions) (*Job, error
 	return cloneJob(pick), nil
 }
 
+// CountByState implements JobBackend.
+func (b *MemoryBackend) CountByState(_ context.Context) (map[JobState]int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	out := map[JobState]int{}
+	for _, j := range b.jobs {
+		out[j.State]++
+	}
+	return out, nil
+}
+
 // AppendProgress implements JobBackend.
 func (b *MemoryBackend) AppendProgress(_ context.Context, id string, ev ProgressEvent) error {
 	b.mu.Lock()

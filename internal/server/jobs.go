@@ -325,6 +325,12 @@ func (r *JobRegistry) List(opts ListOptions) ([]Job, error) {
 	return r.backend.List(context.Background(), opts)
 }
 
+// CountByState returns the per-state job census (see
+// JobBackend.CountByState).
+func (r *JobRegistry) CountByState() (map[JobState]int, error) {
+	return r.backend.CountByState(context.Background())
+}
+
 // Claim atomically transitions the oldest queued job matching opts
 // to JobRunning, subject to the registry's concurrency cap.
 func (r *JobRegistry) Claim(opts ClaimOptions) (*Job, error) {

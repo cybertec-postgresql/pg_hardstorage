@@ -74,6 +74,12 @@ type JobBackend interface {
 	// Returns the number reaped.
 	SweepAbandoned(ctx context.Context, deadline time.Duration) (int, error)
 
+	// CountByState returns the number of jobs in each state. It is the
+	// /metrics census: an aggregate, never a walk of every job row (a
+	// List would drag every progress array across the wire on each
+	// unauthenticated scrape). States with no jobs may be absent.
+	CountByState(ctx context.Context) (map[JobState]int, error)
+
 	// Close releases backend resources. Memory backend is a no-op;
 	// PG backend closes the pgx pool.
 	Close() error

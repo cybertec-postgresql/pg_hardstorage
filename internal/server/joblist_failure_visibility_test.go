@@ -35,10 +35,15 @@ import (
 
 var errJobBackendDown = errors.New("job backend unavailable")
 
-// errListBackend fails List; everything else behaves normally.
+// errListBackend fails List and the /metrics census (CountByState);
+// everything else behaves normally.
 type errListBackend struct{ *server.MemoryBackend }
 
 func (errListBackend) List(context.Context, server.ListOptions) ([]server.Job, error) {
+	return nil, errJobBackendDown
+}
+
+func (errListBackend) CountByState(context.Context) (map[server.JobState]int, error) {
 	return nil, errJobBackendDown
 }
 

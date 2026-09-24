@@ -367,6 +367,32 @@ func (b *PGBackend) claimRow(ctx context.Context, q pgQuerier, opts ClaimOptions
 	return j, nil
 }
 
+// CountByState implements JobBackend: one aggregate row per state, so
+// a /metrics scrape costs an index-sized scan, not every job's args,
+// result and progress arrays.
+func (b *PGBackend) CountByState(ctx context.Context) (map[JobState]int, error) {
+	rows, err := b.pool.Query(ctx, `SELECT state, count(*) FROM phs.jobs GROUP BY state`)
+	if err != nil {
+		return nil, fmt.Errorf("pgbackend: count by state: %w", err)
+	}
+	defer rows.Close()
+	out := map[JobState]int{}
+	for rows.Next() {
+		var (
+			state string
+			n     int64
+		)
+		if err := rows.Scan(&state, &n); err != nil {
+			return nil, fmt.Errorf("pgbackend: count by state: scan: %w", err)
+		}
+		out[JobState(state)] = int(n)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("pgbackend: count by state: %w", err)
+	}
+	return out, nil
+}
+
 // AppendProgress implements JobBackend.
 func (b *PGBackend) AppendProgress(ctx context.Context, id string, ev ProgressEvent) error {
 	if ev.At.IsZero() {
