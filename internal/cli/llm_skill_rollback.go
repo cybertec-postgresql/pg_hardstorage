@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -29,7 +30,9 @@ import (
 // `<targetdir>/<name>.skill.yaml`.  This prevents the install
 // path from being subverted by a sneaky filename like
 // `../etc/passwd.skill.yaml` and keeps rollback's lookup
-// table-stakes simple.
+// table-stakes simple.  The name itself is untrusted too (it comes
+// from the YAML), so it must pass validSkillName before it is
+// joined into a path.
 func newLlmSkillInstallCmd() *cobra.Command {
 	var targetDir string
 	c := &cobra.Command{
@@ -46,6 +49,9 @@ func newLlmSkillInstallCmd() *cobra.Command {
 			if err != nil {
 				return output.NewError("llm.skill_load_failed",
 					fmt.Sprintf("llm skill install: %v", err)).Wrap(err)
+			}
+			if err := checkSkillName(s.Name); err != nil {
+				return err
 			}
 			if issues := s.Lint(); len(issues) > 0 {
 				return output.NewError("llm.skill_lint_failed",
@@ -100,8 +106,14 @@ func newLlmSkillInstallCmd() *cobra.Command {
 // newLlmSkillRollbackCmd implements `pg_hardstorage llm skill
 // rollback <name>`.  Finds the most recent snapshot of
 // `<name>.skill.yaml` under the operator-overlay directory and
-// swaps it back into place, archiving the current file under a
-// fresh snapshot so the rollback itself is reversible.
+// swaps it back into place.  The file being replaced is archived as
+// `<name>.skill.yaml.rolledback.<stamp>` — deliberately OUTSIDE the
+// snapshot series: archiving it as an ordinary snapshot would give
+// it the newest timestamp, so the next rollback would re-install the
+// very version the operator just rolled away from instead of going
+// one step further back.  Snapshots therefore form a strict stack of
+// versions older than the active file; the archive is kept so the
+// operator can `llm skill install` it by hand to undo a rollback.
 func newLlmSkillRollbackCmd() *cobra.Command {
 	var targetDir string
 	c := &cobra.Command{
@@ -112,6 +124,9 @@ func newLlmSkillRollbackCmd() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			d := DispatcherFrom(cmd)
 			name := args[0]
+			if err := checkSkillName(name); err != nil {
+				return err
+			}
 			if targetDir == "" {
 				targetDir = resolveSkillTargetDir()
 			}
@@ -133,11 +148,12 @@ func newLlmSkillRollbackCmd() *cobra.Command {
 			latest := snapshots[len(snapshots)-1]
 			finalPath := filepath.Join(targetDir, name+".skill.yaml")
 
-			// Archive current (if any) under a fresh snapshot so
-			// `rollback` is itself reversible by another rollback.
+			// Archive current (if any) outside the snapshot series
+			// (see the function comment) so the rollback can be
+			// undone by hand without polluting the rollback stack.
 			postSnapshot := ""
 			if _, statErr := os.Stat(finalPath); statErr == nil {
-				postSnapshot = filepath.Join(targetDir, snapshotFilename(name, time.Now().UTC()))
+				postSnapshot = filepath.Join(targetDir, rolledBackFilename(name, time.Now().UTC()))
 				if err := copyFile(finalPath, postSnapshot); err != nil {
 					return output.NewError("llm.skill_rollback_failed",
 						fmt.Sprintf("llm skill rollback: archive current %s: %v", finalPath, err)).Wrap(err)
@@ -147,8 +163,9 @@ func newLlmSkillRollbackCmd() *cobra.Command {
 				return output.NewError("llm.skill_rollback_failed",
 					fmt.Sprintf("llm skill rollback: restore %s from %s: %v", finalPath, latest, err)).Wrap(err)
 			}
-			// Remove the snapshot we just rolled FROM — otherwise
-			// repeated rollbacks would oscillate between two versions.
+			// Pop the snapshot we just restored: it is the active
+			// file now, and leaving it would make the next rollback
+			// a no-op instead of a step further back.
 			if err := os.Remove(latest); err != nil {
 				// Non-fatal: the new file is in place, the operator
 				// just has one extra snapshot file lying around.
@@ -190,6 +207,9 @@ func newLlmSkillHistoryCmd() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			d := DispatcherFrom(cmd)
 			name := args[0]
+			if err := checkSkillName(name); err != nil {
+				return err
+			}
 			if targetDir == "" {
 				targetDir = resolveSkillTargetDir()
 			}
@@ -240,8 +260,45 @@ func snapshotFilename(name string, when time.Time) string {
 	return fmt.Sprintf("%s.skill.yaml.%s.%09d", name, stamp, when.Nanosecond())
 }
 
+// rolledBackFilename names the archive `rollback` writes for the
+// file it replaces.  The `rolledback.` infix keeps it out of
+// snapshotNameRe, so it never becomes a rollback candidate.
+func rolledBackFilename(name string, when time.Time) string {
+	stamp := strings.ReplaceAll(when.Format(time.RFC3339), ":", "-")
+	return fmt.Sprintf("%s.skill.yaml.rolledback.%s.%09d", name, stamp, when.Nanosecond())
+}
+
+// snapshotSuffixRe matches exactly the suffix snapshotFilename
+// appends (UTC RFC3339 with dashes for colons, then 9-digit nanos).
+// Anything else sharing the `<name>.skill.yaml.` prefix — the
+// `.tmp` fsutil.WriteFileAtomic stages through, a `.rolledback.`
+// archive, an editor backup — is not a snapshot; a bare prefix match
+// would let those sort last and be "restored" by rollback.
+var snapshotSuffixRe = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z\.\d{9}$`)
+
+// validSkillName is the grammar a skill name must follow before it
+// is joined into an overlay path: lowercase alphanumerics, `-` and
+// `_`, not starting with a separator.  No `/`, `..` or `.` means no
+// path traversal and no ambiguity with the `.skill.yaml.<stamp>`
+// snapshot suffix.  Every builtin skill already conforms.
+var validSkillName = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]*$`)
+
+// checkSkillName refuses a name that fails validSkillName with a
+// usage error.
+func checkSkillName(name string) error {
+	if validSkillName.MatchString(name) {
+		return nil
+	}
+	return output.NewError("llm.skill_invalid_name",
+		fmt.Sprintf("invalid skill name %q: must match %s", name, validSkillName.String())).
+		WithSuggestion(&output.Suggestion{
+			Human: "skill names are lowercase letters, digits, '-' and '_' (e.g. `incident`, `my-skill`)",
+		}).Wrap(output.ErrUsage)
+}
+
 // listSkillSnapshots returns the snapshot files for <name>,
-// sorted oldest-first.  An empty list is the "no snapshots"
+// sorted oldest-first.  Only exact snapshotFilename names count
+// (see snapshotSuffixRe).  An empty list is the "no snapshots"
 // response, not an error.
 func listSkillSnapshots(dir, name string) ([]string, error) {
 	entries, err := os.ReadDir(dir)
@@ -258,14 +315,9 @@ func listSkillSnapshots(dir, name string) ([]string, error) {
 			continue
 		}
 		n := e.Name()
-		if !strings.HasPrefix(n, prefix) {
+		if !strings.HasPrefix(n, prefix) || !snapshotSuffixRe.MatchString(n[len(prefix):]) {
 			continue
 		}
-		// Defensive: if `n` matches the prefix exactly we'd be
-		// looking at the active file, not a snapshot.  ReadDir
-		// only returns the entry's name; the active skill file
-		// is `<name>.skill.yaml` (no trailing suffix), which
-		// fails the prefix-with-dot check.
 		snaps = append(snaps, filepath.Join(dir, n))
 	}
 	sort.Strings(snaps)

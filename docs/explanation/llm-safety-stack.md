@@ -284,7 +284,12 @@ the binary.  Implications:
   increment the version, and `pg_hardstorage llm skill install
   <file>` into the operator overlay (any existing version is
   snapshotted for rollback).  No binary rebuild, no Debian package
-  release.
+  release.  The skill's `name:` must match `^[a-z0-9][a-z0-9_-]*$`
+  (it becomes the overlay filename, so `/` and `..` are refused).
+  Each `llm skill rollback <name>` steps one version further back;
+  the file it replaces is kept as
+  `<name>.skill.yaml.rolledback.<timestamp>` (not a rollback
+  candidate) — `llm skill install` that file to undo a rollback.
 - **Skill isolation.**  A bug in the incident skill cannot
   touch the restore skill.  Each skill loads independently, has
   its own tool allowlist, its own guardrails, its own RBAC scope.
