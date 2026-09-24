@@ -109,6 +109,17 @@ type Options struct {
 	// silent data-loss risk flip to "required" in CI.
 	VerifyMode string
 
+	// PGVerifyBackup, when non-empty, runs the external
+	// pg_verifybackup gate (Verify) against TargetDir. It runs
+	// inside Restore, BEFORE the VerifyMode boot test, because the
+	// boot test runs recovery in TargetDir itself: pg_control is
+	// rewritten and backup_label consumed, after which
+	// pg_verifybackup can only report mismatches. The outcome lands
+	// in Result.Verify. When the gate refuses (VerifyRequire),
+	// Restore returns that error together with a Result carrying
+	// Verify, and the boot test does not run.
+	PGVerifyBackup VerifyMode
+
 	// KEKForRef resolves a manifest's EncryptionInfo.KEKRef to the
 	// matching 32-byte KEK. Required when restoring an encrypted
 	// backup; ignored for unencrypted backups.
@@ -210,6 +221,26 @@ type Result struct {
 	StartedAt         time.Time     `json:"started_at"`
 	StoppedAt         time.Time     `json:"stopped_at"`
 	Duration          time.Duration `json:"-"`
+
+	// Verify is the pg_verifybackup outcome when
+	// Options.PGVerifyBackup was set; nil otherwise. Not part of
+	// the frozen Result JSON: callers render it in their own body.
+	Verify *VerifyResult `json:"-"`
+}
+
+// runPGVerifyGate runs the Options.PGVerifyBackup gate (see there
+// for why it must precede the boot test). On refusal it returns a
+// Result holding just the identity + Verify outcome, so the caller
+// can still report what was checked.
+func runPGVerifyGate(ctx context.Context, mode VerifyMode, m *backup.Manifest, targetDir string) (*VerifyResult, *Result, error) {
+	if mode == "" {
+		return nil, nil, nil
+	}
+	v, err := Verify(ctx, targetDir, mode)
+	if err != nil {
+		return v, &Result{BackupID: m.BackupID, Deployment: m.Deployment, TargetDir: targetDir, Verify: v}, err
+	}
+	return v, nil, nil
 }
 
 // MarshalJSON emits duration_ms as whole milliseconds (see Result doc).
@@ -766,6 +797,13 @@ func Restore(ctx context.Context, opts Options) (res *Result, err error) {
 			}))
 	}
 
+	// L2b — external pg_verifybackup, strictly BEFORE the L3 boot
+	// test below (see Options.PGVerifyBackup).
+	pgVerify, refused, pgvErr := runPGVerifyGate(ctx, opts.PGVerifyBackup, m, opts.TargetDir)
+	if pgvErr != nil {
+		return refused, pgvErr
+	}
+
 	// L3 — post-restore cluster-start smoke test.  Catches
 	// the issue-#7-class bug class (empty PGDATA dirs missing,
 	// permissions broken, tablespace symlinks dangling) that
@@ -834,6 +872,7 @@ func Restore(ctx context.Context, opts Options) (res *Result, err error) {
 		StartedAt:         startedAt,
 		StoppedAt:         stoppedAt,
 		Duration:          stoppedAt.Sub(startedAt),
+		Verify:            pgVerify,
 	}
 	emit(output.NewEvent(output.SeverityInfo, "restore", "completed").
 		WithSubject(output.Subject{Deployment: m.Deployment, BackupID: m.BackupID}).
@@ -2128,6 +2167,13 @@ func restoreIncrementalChain(ctx context.Context, opts Options, sp storage.Stora
 			}))
 	}
 
+	// L2b — external pg_verifybackup before the boot test, as on the
+	// full-restore path (see Options.PGVerifyBackup).
+	pgVerify, refused, pgvErr := runPGVerifyGate(chainCtx, opts.PGVerifyBackup, leaf, opts.TargetDir)
+	if pgvErr != nil {
+		return refused, pgvErr
+	}
+
 	// L3 — post-restore cluster-start smoke test, honouring
 	// Options.VerifyMode exactly like the full-restore path (see
 	// Restore ~L671).  The chain path previously ran no L3 and never
@@ -2194,6 +2240,7 @@ func restoreIncrementalChain(ctx context.Context, opts Options, sp storage.Stora
 		StartedAt:         startedAt,
 		StoppedAt:         stoppedAt,
 		Duration:          stoppedAt.Sub(startedAt),
+		Verify:            pgVerify,
 	}
 	emit(output.NewEvent(output.SeverityInfo, "restore", "completed").
 		WithSubject(output.Subject{Deployment: leaf.Deployment, BackupID: leaf.BackupID}).

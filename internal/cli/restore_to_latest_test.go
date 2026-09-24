@@ -52,8 +52,10 @@ func TestRestoreToLatest_WritesRecoveryFilesWithoutTarget(t *testing.T) {
 			t.Errorf("postgresql.auto.conf missing %q:\n%s", want, got)
 		}
 	}
-	for _, forbidden := range []string{"recovery_target_lsn", "recovery_target_time ", "recovery_target_name"} {
-		if strings.Contains(got, forbidden) {
+	// Every target is explicitly reset to '' (so an inherited one
+	// cannot apply); what must never appear is a non-empty value.
+	for _, g := range []string{"recovery_target", "recovery_target_lsn", "recovery_target_time", "recovery_target_name", "recovery_target_xid"} {
+		if forbidden := g + " = '"; strings.Contains(strings.ReplaceAll(got, g+" = ''", ""), forbidden) {
 			t.Errorf("postgresql.auto.conf contains %q — a target was set for a "+
 				"no-target recovery; PG would stop early or FATAL:\n%s", forbidden, got)
 		}

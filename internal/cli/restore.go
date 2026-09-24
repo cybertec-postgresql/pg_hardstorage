@@ -47,7 +47,12 @@ half is what verifies the manifest signature.
 Refuses to write into a non-empty target unless --force is passed.
 Use --preview to inspect what a real restore would do without
 touching disk. Use --verify=auto|skip|require to control the post-
-restore pg_verifybackup gate.
+restore pg_verifybackup gate; it runs on the directory exactly as
+restored, before the --verify-restore boot test. The boot test starts
+PostgreSQL in the target with a private socket, log and trust-only
+pg_hba (the restored pg_hba.conf is not consulted) and puts back
+postgresql.auto.conf afterwards; what remains is what a first start
+leaves (recovery replayed, backup_label renamed to backup_label.old).
 
 PITR (replaying WAL up to a target):
   --to "5 minutes ago"        natural-language relative time
@@ -61,7 +66,10 @@ PITR (replaying WAL up to a target):
 When any of --to / --to-lsn / --to-name is set, recovery.signal is
 dropped in the target dir and a recovery_target_* block is appended
 to postgresql.auto.conf. The restore_command points back at this
-binary's wal-fetch shim.`,
+binary's wal-fetch shim. Recovery settings a previous restore left in
+the backed-up postgresql.auto.conf are removed, and every recovery
+target the new block does not set is reset to '', so inherited
+targets never combine with the requested one.`,
 		Args:         cobra.ExactArgs(2),
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -423,6 +431,11 @@ func runRestore(cmd *cobra.Command, opts restoreOpts) error {
 		ChainStagingRoot:    opts.chainStagingRoot,
 		ResetChainStaging:   opts.resetChainStaging,
 		VerifyMode:          opts.verifyRestoreMode,
+		// pg_verifybackup runs INSIDE Restore, before the boot test:
+		// booting runs recovery in the target (pg_control rewritten,
+		// backup_label consumed), so running it afterwards — as this
+		// command used to — failed every restore that was booted.
+		PGVerifyBackup: verifyMode,
 		// Always wire the KEK resolver. It's a no-op for unencrypted
 		// backups (Restore only consults it when manifest.Encryption
 		// is non-nil) and the right resolver for encrypted ones.
@@ -447,8 +460,16 @@ func runRestore(cmd *cobra.Command, opts restoreOpts) error {
 			_ = d.Event(cmd.Context(), e)
 		},
 	})
+	// A pg_verifybackup refusal (--verify=require) comes back with a
+	// Result carrying the verification outcome: render it like any
+	// other result so the operator sees what failed, then exit with
+	// the verify error.
+	var verifyErr error
 	if err != nil {
-		return err
+		if res == nil || res.Verify == nil {
+			return err
+		}
+		verifyErr = err
 	}
 
 	// Advise on the restore_command's runtime dependency: PG recovery
@@ -478,10 +499,10 @@ func runRestore(cmd *cobra.Command, opts restoreOpts) error {
 		}
 	}
 
-	// Post-restore verification gate.
-	verify, verifyErr := restore.Verify(cmd.Context(), opts.targetDir, verifyMode)
-	// Even on require-failure we want to attach the VerifyResult to
-	// the output so the user sees what happened. Render then return.
+	// The pg_verifybackup outcome (run by Restore before the boot
+	// test). Even on require-failure it is attached to the output so
+	// the user sees what happened. Render then return.
+	verify := res.Verify
 	body := restoreResultBody{
 		BackupID:          res.BackupID,
 		Deployment:        res.Deployment,
