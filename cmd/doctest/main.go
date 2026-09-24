@@ -28,7 +28,10 @@
 // # Assertions
 //
 //   - `expect-exit=N` — block must exit with that code.
-//     Default: 0.
+//     Default: 0.  A block's exit is the status of its FIRST
+//     failing command (errexit rules: commands tested by
+//     if / && / || do not count; pipefail is on), else 0 —
+//     not merely its last command's.
 //   - `expect-match="re"` — block stdout must match the
 //     regex (Go syntax).  Default: no match check.
 //   - `skip-in-ci="..."` — block is skipped when the
@@ -548,6 +551,10 @@ func buildScript(blocks []block, tmpdir string, env fileEnv) (string, map[int]st
 	// regardless, and we capture each block's exit
 	// individually.  Subshells per-block contain failures.
 	b.WriteString("set +e\n")
+	// pipefail + errtrace: a pipeline fails when any stage fails, and
+	// the per-block ERR trap below also sees failures inside functions
+	// and subshells.
+	b.WriteString("set -o pipefail -E\n")
 	// Make the binary discoverable on PATH.  Tutorials say
 	// `pg_hardstorage backup …` not `${PG_HARDSTORAGE_BIN}
 	// backup …`; the runner injects the binary's directory
@@ -578,14 +585,31 @@ func buildScript(blocks []block, tmpdir string, env fileEnv) (string, map[int]st
 		// "this was skipped, did not execute."
 		if reason := shouldSkip(blk, env.CI); reason != "" {
 			fmt.Fprintf(&b, "# === block %d (line %d) — SKIPPED: %s ===\n", i, blk.line, reason)
-			fmt.Fprintf(&b, ": >block.%s.stdout\n", key)
-			fmt.Fprintf(&b, ": >block.%s.stderr\n", key)
-			fmt.Fprintf(&b, "echo skipped > block.%s.exit\n\n", key)
+			fmt.Fprintf(&b, ": >\"$DOCTEST_TMPDIR\"/block.%s.stdout\n", key)
+			fmt.Fprintf(&b, ": >\"$DOCTEST_TMPDIR\"/block.%s.stderr\n", key)
+			fmt.Fprintf(&b, "echo skipped > \"$DOCTEST_TMPDIR\"/block.%s.exit\n\n", key)
 			continue
 		}
+		// A block's status is its FIRST failing command's, not just its
+		// last command's: with plain `set +e` and no pipefail, a block
+		// whose first command failed and whose last was an echo passed,
+		// as did any failure piped into another command. The ERR trap
+		// (inherited into functions and subshells by `set -E`) records
+		// the first failure with errexit's own rules — commands tested
+		// by if / && / || do not count — without leaving the shell,
+		// whose state (cwd, exports) the next block builds on.
+		//
+		// Result files are written by absolute path: a block that `cd`s
+		// must not move where its (or later blocks') results land.
+		res := "\"$DOCTEST_TMPDIR\"/block." + key
 		fmt.Fprintf(&b, "# === block %d (line %d) ===\n", i, blk.line)
-		fmt.Fprintf(&b, "{\n%s\n} >block.%s.stdout 2>block.%s.stderr\n", blk.body, key, key)
-		fmt.Fprintf(&b, "echo $? > block.%s.exit\n\n", key)
+		b.WriteString("__doctest_fail=0\n")
+		b.WriteString("trap '__doctest_st=$?; [ \"$__doctest_fail\" -ne 0 ] || __doctest_fail=$__doctest_st' ERR\n")
+		fmt.Fprintf(&b, "{\n%s\n} >%s.stdout 2>%s.stderr\n", blk.body, res, res)
+		b.WriteString("__doctest_rc=$?\n")
+		b.WriteString("trap - ERR\n")
+		b.WriteString("[ \"$__doctest_fail\" -ne 0 ] && __doctest_rc=$__doctest_fail\n")
+		fmt.Fprintf(&b, "echo $__doctest_rc > %s.exit\n\n", res)
 	}
 	return b.String(), keys
 }
