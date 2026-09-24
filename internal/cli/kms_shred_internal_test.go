@@ -7,6 +7,8 @@ import (
 	"testing"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup/keystore"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/pg/walsink"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage/fs"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo"
@@ -54,7 +56,8 @@ func TestScanAffectedBackups_IncludesStaleReplica(t *testing.T) {
 	plantEncManifestAt(t, sp, backup.PrimaryPath("db1", "b1"), "db1", "b1", "kek:new")
 	plantEncManifestAt(t, sp, backup.ReplicaPath("b1"), "db1", "b1", "kek:old")
 
-	affected, err := scanAffectedBackups(context.Background(), sp, "kek:old")
+	scope, err := scanAffectedBackups(context.Background(), sp, "kek:old")
+	affected := scope.IDs
 	if err != nil {
 		t.Fatalf("scan: %v", err)
 	}
@@ -72,7 +75,54 @@ func TestScanAffectedBackups_IncludesStaleReplica(t *testing.T) {
 	}
 
 	// Scanning for the new kek finds the primary (once).
-	if a, _ := scanAffectedBackups(context.Background(), sp, "kek:new"); len(a) != 1 || a[0] != "b1" {
-		t.Errorf("scan for kek:new = %v, want [b1]", a)
+	if s, _ := scanAffectedBackups(context.Background(), sp, "kek:new"); len(s.IDs) != 1 || s.IDs[0] != "b1" {
+		t.Errorf("scan for kek:new = %v, want [b1]", s.IDs)
+	}
+}
+
+// The shred target is the local kek.bin, which the keystore resolves for
+// EVERY local:* ref. After a local rotation the manifests say
+// "local:v2"; the scan matched only the literal "local:default", skipped
+// tombstoned backups and ignored WAL, so dry-run and the audit record
+// said "0 affected" for a repo the shred was about to make entirely
+// unrecoverable.
+func TestScanAffectedBackups_CountsEveryRefResolvingToTheLocalKEK(t *testing.T) {
+	sp := shredTestSP(t)
+	ctx := context.Background()
+	plantEncManifestAt(t, sp, backup.PrimaryPath("db1", "rotated"), "db1", "rotated", "local:v2")
+	plantEncManifestAt(t, sp, backup.PrimaryPath("db1", "legacy"), "db1", "legacy", "local:default")
+	plantEncManifestAt(t, sp, backup.PrimaryPath("db1", "dead"), "db1", "dead", "local:v2")
+	plantEncManifestAt(t, sp, backup.PrimaryPath("db1", "cloud"), "db1", "cloud", "aws-kms://alias/x")
+	tomb := []byte(`{"reason":"test"}`)
+	if _, err := sp.Put(ctx, backup.TombstonePath("db1", "dead"), bytes.NewReader(tomb),
+		storage.PutOptions{ContentLength: int64(len(tomb))}); err != nil {
+		t.Fatal(err)
+	}
+	for i, ref := range []string{"local:v2", "local:default", "aws-kms://alias/x"} {
+		seg := &walsink.SegmentManifest{
+			Schema: walsink.Schema, Deployment: "db1", Timeline: 1,
+			SegmentName: walsink.SegmentFileName(1, uint64(i+1), walsink.SegmentSize),
+			Encryption:  &walsink.EncryptionInfo{Scheme: "aes-256-gcm", KEKRef: ref, WrappedDEK: "x", EnvelopeVersion: 1},
+		}
+		raw, _ := seg.MarshalToBytes()
+		if _, err := sp.Put(ctx, walsink.SegmentPath("db1", 1, seg.SegmentName), bytes.NewReader(raw),
+			storage.PutOptions{ContentLength: int64(len(raw))}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	scope, err := scanAffectedBackups(ctx, sp, keystore.KEKRefLocal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]bool{}
+	for _, id := range scope.IDs {
+		got[id] = true
+	}
+	if len(scope.IDs) != 3 || !got["rotated"] || !got["legacy"] || !got["dead"] {
+		t.Errorf("affected = %v, want rotated+legacy+dead (not the cloud-KMS backup)", scope.IDs)
+	}
+	if scope.WALSegments != 2 {
+		t.Errorf("affected WAL segments = %d, want 2", scope.WALSegments)
 	}
 }

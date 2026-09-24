@@ -69,7 +69,8 @@ func TestPutHold_PreservesHeldAt(t *testing.T) {
 	// were to (incorrectly) update HeldAt.
 	time.Sleep(5 * time.Millisecond)
 
-	if err := store.PutHold(context.Background(), m.Deployment, m.BackupID, "bob", "updated"); err != nil {
+	if _, err := store.PutHoldWithOptions(context.Background(), m.Deployment, m.BackupID, backup.PutHoldOptions{
+		Holder: "bob", Reason: "updated", Force: true}); err != nil {
 		t.Fatal(err)
 	}
 	h1, _ := store.GetHold(context.Background(), m.Deployment, m.BackupID)
@@ -150,5 +151,52 @@ func TestIsHeld_Absent(t *testing.T) {
 	}
 	if held {
 		t.Error("absent hold must report false")
+	}
+}
+
+// `hold add` on a backup that already carried an indefinite legal hold
+// silently overwrote it — a re-add with --until 1d (or by a different
+// holder) turned a regulatory hold into one that expired tomorrow.
+// PutHoldUntil must refuse to weaken an active hold; only an explicit
+// Force replaces it, and it reports what it replaced.
+func TestPutHold_RefusesWeakening(t *testing.T) {
+	store, _, signer, _ := newStore(t)
+	m := sampleManifest()
+	ctx := context.Background()
+	if err := store.Commit(ctx, m, signer, backup.CommitOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PutHold(ctx, m.Deployment, m.BackupID, "legal", "litigation #7"); err != nil {
+		t.Fatal(err)
+	}
+	soon := time.Now().UTC().Add(24 * time.Hour)
+	for name, o := range map[string]backup.PutHoldOptions{
+		"finite over indefinite": {Holder: "legal", Reason: "oops", ExpiresAt: soon},
+		"different holder":       {Holder: "mallory", Reason: "mine now"},
+	} {
+		_, err := store.PutHoldWithOptions(ctx, m.Deployment, m.BackupID, o)
+		if !errors.Is(err, backup.ErrHoldWeaken) {
+			t.Errorf("%s: err=%v, want ErrHoldWeaken", name, err)
+		}
+		h, _ := store.GetHold(ctx, m.Deployment, m.BackupID)
+		if h.ExpiresAt != nil || h.Holder != "legal" {
+			t.Fatalf("%s: the indefinite legal hold was weakened: %+v", name, h)
+		}
+	}
+	// Re-asserting the same indefinite hold is fine.
+	if err := store.PutHold(ctx, m.Deployment, m.BackupID, "legal", "litigation #7 (ref)"); err != nil {
+		t.Fatalf("same-holder indefinite re-add: %v", err)
+	}
+	prev, err := store.PutHoldWithOptions(ctx, m.Deployment, m.BackupID, backup.PutHoldOptions{
+		Holder: "legal", Reason: "released early", ExpiresAt: soon, Force: true})
+	if err != nil || prev == nil || prev.ExpiresAt != nil {
+		t.Fatalf("forced replace: prev=%+v err=%v, want the indefinite hold back", prev, err)
+	}
+	// Finite → shorter finite is also a weakening; longer is an extension.
+	if err := store.PutHoldUntil(ctx, m.Deployment, m.BackupID, "legal", "", soon.Add(-time.Hour)); !errors.Is(err, backup.ErrHoldWeaken) {
+		t.Errorf("shorter expiry: err=%v, want ErrHoldWeaken", err)
+	}
+	if err := store.PutHoldUntil(ctx, m.Deployment, m.BackupID, "legal", "", soon.Add(time.Hour)); err != nil {
+		t.Errorf("extension refused: %v", err)
 	}
 }

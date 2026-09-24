@@ -245,8 +245,10 @@ func TestPutHoldUntil_OverwritePreservesHeldAt(t *testing.T) {
 	// Sleep briefly then update with --until.
 	time.Sleep(10 * time.Millisecond)
 	future := time.Now().UTC().Add(time.Hour)
-	if err := store.PutHoldUntil(context.Background(), "db1", "A",
-		"ops-2", "extended", future); err != nil {
+	// A different holder replacing an active hold is a weakening, so
+	// it needs the explicit override (see TestPutHold_RefusesWeakening).
+	if _, err := store.PutHoldWithOptions(context.Background(), "db1", "A", backup.PutHoldOptions{
+		Holder: "ops-2", Reason: "extended", ExpiresAt: future, Force: true}); err != nil {
 		t.Fatal(err)
 	}
 	updated, err := store.GetHold(context.Background(), "db1", "A")
@@ -285,7 +287,9 @@ func TestPutHoldUntil_OverwriteAtomicNoAbsentWindow(t *testing.T) {
 	commitChain(t, store, signer, "db1", []chainLink{
 		{id: "A", btype: backup.BackupTypeFull},
 	})
-	if err := store.PutHold(context.Background(), "db1", "A", "ops", "first"); err != nil {
+	// Finite initial hold so each edit below is an extension (a finite
+	// edit of an indefinite hold would be refused as a weakening).
+	if err := store.PutHoldUntil(context.Background(), "db1", "A", "ops", "first", time.Now().UTC().Add(time.Minute)); err != nil {
 		t.Fatal(err)
 	}
 	if held, err := store.IsHeld(context.Background(), "db1", "A"); err != nil || !held {

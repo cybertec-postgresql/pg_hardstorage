@@ -38,6 +38,7 @@ import (
 	"fmt"
 	stdio "io"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -324,9 +325,12 @@ func AcquireBackupLease(ctx context.Context, sp storage.StoragePlugin, deploymen
 	// longer land at all: it must win the claim first, and the claim was
 	// taken the moment the winner passed this point.
 	//
-	// Claims are never deleted. Removing one would let a reclaimer still
-	// holding that stale token re-win it and overwrite a live lease —
-	// exactly the window being closed. They are only written when a
+	// A USED claim is never deleted. Removing one would let a reclaimer
+	// still holding that stale token re-win it and overwrite a live
+	// lease — exactly the window being closed. (A claim whose overwrite
+	// failed is dropped: no lease was taken with it. One abandoned by a
+	// dead winner is superseded by a next generation after wedgeGrace;
+	// see claimBreakKey.) They are only written when a
 	// crashed holder is reclaimed (a released lease leaves none), and
 	// each is a few hundred bytes, so the accumulation is proportional
 	// to crashes rather than to backups.
@@ -355,11 +359,28 @@ func AcquireBackupLease(ctx context.Context, sp storage.StoragePlugin, deploymen
 		leaseHookAfterStaleRecheck()
 	}
 	// Win the right to break THIS lease before touching it.
-	if err := l.claimBreak(ctx, recheck, owner); err != nil {
+	claimKey, err := l.claimBreakKey(ctx, recheck, owner)
+	if err != nil {
 		return nil, err
+	}
+	// Re-read once more with the claim in hand: if a previous-generation
+	// claimant (see claimBreakKey) woke up and already succeeded, the
+	// stored lease is no longer our victim and we must not overwrite it.
+	if cur, cerr := l.read(ctx); cerr != nil || cur.Owner != recheck.Owner || !cur.AcquiredAt.Equal(recheck.AcquiredAt) {
+		if cerr != nil && !errors.Is(cerr, storage.ErrNotFound) {
+			l.dropClaim(ctx, claimKey)
+			return nil, fmt.Errorf("backup: recheck stale lease for %q: %w", deployment, cerr)
+		}
+		return nil, ErrBackupInProgress
 	}
 	body = l.freshBody(owner)
 	if err := l.put(ctx, body, false); err != nil {
+		// The claim is the SOLE right to succeed this lease. Keeping it
+		// after failing to use it wedged the deployment: every later
+		// acquirer lost the same claim to nobody and reported
+		// backup-in-progress forever (one transient 503 → backups stop
+		// silently). We never returned held, so releasing it is safe.
+		l.dropClaim(ctx, claimKey)
 		return nil, fmt.Errorf("backup: retake stale lease for %q: %w", deployment, err)
 	}
 	if leaseHookAfterReclaimPut != nil {
@@ -592,13 +613,81 @@ type breakClaim struct {
 	ClaimedAt   time.Time `json:"claimed_at"`
 }
 
-// claimBreak takes the exclusive right to break `victim`.
-//
-// Returns ErrBackupInProgress when another reclaimer already holds the
-// claim — it is breaking, or has broken, this same lease, so we must
-// not. Any other error is reported as-is: failing to establish
-// exclusivity must never be read as having established it.
+// maxClaimGenerations bounds how many abandoned claims one stale lease
+// can accumulate before we stop healing automatically (each generation
+// needs wedgeGrace of silence, so this is ~a working day of dead
+// winners — beyond that something is systematically wrong and a human
+// should look; `doctor` still names the claim).
+const maxClaimGenerations = 8
+
+// claimBreak is claimBreakKey without the key (tests, wedge fixtures).
 func (l *Lease) claimBreak(ctx context.Context, victim leaseBody, owner string) error {
+	_, err := l.claimBreakKey(ctx, victim, owner)
+	return err
+}
+
+// claimBreakKey takes the exclusive right to break `victim` and returns
+// the claim object it created.
+//
+// Claims are generational. Generation 0 is breakClaimKey (what doctor's
+// wedge detector names); a claim whose winner vanished — older than
+// wedgeGrace while its victim is still the stored lease, which the
+// caller has just re-read — is abandoned, and the next generation's key
+// is raced for with the same create-if-absent exclusivity. Previously a
+// winner that died between claim and overwrite wedged the deployment
+// until an operator deleted the claim by hand.
+//
+// Returns ErrBackupInProgress when a live reclaimer holds the claim —
+// it is breaking, or has broken, this same lease, so we must not. Any
+// other error is reported as-is: failing to establish exclusivity must
+// never be read as having established it.
+func (l *Lease) claimBreakKey(ctx context.Context, victim leaseBody, owner string) (string, error) {
+	for gen := 0; gen < maxClaimGenerations; gen++ {
+		key := breakClaimKey(l.deployment, victim)
+		if gen > 0 {
+			key = fmt.Sprintf("%s.%d", strings.TrimSuffix(key, ".json"), gen) + ".json"
+		}
+		err := l.putClaim(ctx, key, victim, owner)
+		if !errors.Is(err, ErrBackupInProgress) {
+			return key, err
+		}
+		prev, rerr := l.readClaim(ctx, key)
+		if rerr != nil || l.now().Sub(prev.ClaimedAt) < wedgeGrace {
+			// Unreadable (refuse on doubt) or a winner that may still be
+			// mid-succession.
+			return "", ErrBackupInProgress
+		}
+	}
+	return "", ErrBackupInProgress
+}
+
+// dropClaim best-effort removes a claim we won but could not use. It
+// runs detached from ctx: the usual reason we are here is that ctx's
+// operation just failed, and a cancelled ctx must not leave the wedge.
+func (l *Lease) dropClaim(ctx context.Context, key string) {
+	dctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
+	_ = l.sp.Delete(dctx, key)
+}
+
+func (l *Lease) readClaim(ctx context.Context, key string) (breakClaim, error) {
+	var c breakClaim
+	rc, err := l.sp.Get(ctx, key)
+	if err != nil {
+		return c, err
+	}
+	defer rc.Close()
+	raw, err := stdio.ReadAll(stdio.LimitReader(rc, maxLeaseBodyBytes))
+	if err != nil {
+		return c, err
+	}
+	if err := json.Unmarshal(raw, &c); err != nil {
+		return c, err
+	}
+	return c, nil
+}
+
+func (l *Lease) putClaim(ctx context.Context, key string, victim leaseBody, owner string) error {
 	enc, err := json.Marshal(&breakClaim{
 		Schema:      LeaseSchema,
 		Deployment:  l.deployment,
@@ -610,7 +699,7 @@ func (l *Lease) claimBreak(ctx context.Context, victim leaseBody, owner string) 
 	if err != nil {
 		return fmt.Errorf("backup: encode break claim for %q: %w", l.deployment, err)
 	}
-	_, err = l.sp.Put(ctx, breakClaimKey(l.deployment, victim), bytes.NewReader(enc),
+	_, err = l.sp.Put(ctx, key, bytes.NewReader(enc),
 		storage.PutOptions{ContentLength: int64(len(enc)), IfNotExists: true})
 	switch {
 	case err == nil:

@@ -7,8 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/kms"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/encryption"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
 )
@@ -110,6 +112,14 @@ type VerifyEnvelopesOptions struct {
 	//
 	// Required.
 	KEKResolver func(ref string) ([encryption.KeyLen]byte, error)
+
+	// UnwrapDEK is the KMS-aware unwrap path (keystore.UnwrapDEK):
+	// consulted for a ref KEKResolver does not recognise. A cloud KEK
+	// never leaves the HSM, so a raw-bytes resolver can only ever
+	// answer "unknown" for it — without this every cloud-KMS-wrapped
+	// manifest classified as kek_unknown and a healthy repo exited 9.
+	// Optional; nil keeps the resolver-only behaviour.
+	UnwrapDEK func(ctx context.Context, kekRef string, wrapped []byte) ([]byte, error)
 
 	// DeploymentFilter restricts the walk to a single deployment.
 	// Empty walks every deployment.
@@ -254,7 +264,7 @@ func VerifyEnvelopes(ctx context.Context, sp storage.StoragePlugin, opts VerifyE
 				emitFinding(opts, f)
 				continue
 			}
-			classifyEnvelope(res, opts, deployment, m)
+			classifyEnvelope(ctx, res, opts, deployment, m)
 		}
 	}
 
@@ -265,7 +275,7 @@ func VerifyEnvelopes(ctx context.Context, sp storage.StoragePlugin, opts VerifyE
 // classifyEnvelope inspects one manifest's encryption block and updates
 // res accordingly. Pure function over (manifest, opts) — no I/O beyond
 // the KEKResolver call.
-func classifyEnvelope(res *VerifyEnvelopesResult, opts VerifyEnvelopesOptions, deployment string, m *Manifest) {
+func classifyEnvelope(ctx context.Context, res *VerifyEnvelopesResult, opts VerifyEnvelopesOptions, deployment string, m *Manifest) {
 	f := VerifyEnvelopeFinding{
 		Deployment: deployment,
 		BackupID:   m.BackupID,
@@ -320,6 +330,29 @@ func classifyEnvelope(res *VerifyEnvelopesResult, opts VerifyEnvelopesOptions, d
 	}
 
 	kek, err := opts.KEKResolver(m.Encryption.KEKRef)
+	if err != nil && opts.UnwrapDEK != nil && !strings.HasPrefix(m.Encryption.KEKRef, "local:") && m.Encryption.KEKRef != "" {
+		// Not a key this host holds as bytes: ask the KMS to unwrap.
+		// Only a scheme no provider claims is "unknown"; anything
+		// else (wrong key, denied, unreachable) is a failed unwrap.
+		_, uerr := opts.UnwrapDEK(ctx, m.Encryption.KEKRef, wrapped)
+		switch {
+		case uerr == nil:
+			f.Status = EnvelopeStatusOK
+			res.OK++
+		case errors.Is(uerr, kms.ErrUnknownScheme):
+			f.Status = EnvelopeStatusKEKUnknown
+			f.Reason = fmt.Sprintf("resolve KEK %q: %v", m.Encryption.KEKRef, uerr)
+			res.KEKUnknown++
+			recordFinding(res, f)
+		default:
+			f.Status = EnvelopeStatusUnwrapFailed
+			f.Reason = fmt.Sprintf("unwrap DEK via KMS %q: %v", m.Encryption.KEKRef, uerr)
+			res.UnwrapFailed++
+			recordFinding(res, f)
+		}
+		emitFinding(opts, f)
+		return
+	}
 	if err != nil {
 		f.Status = EnvelopeStatusKEKUnknown
 		f.Reason = fmt.Sprintf("resolve KEK %q: %v", m.Encryption.KEKRef, err)

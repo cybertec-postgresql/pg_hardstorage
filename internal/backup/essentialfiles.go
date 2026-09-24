@@ -113,26 +113,14 @@ func CheckEssentialFiles(m *Manifest, dataDir, configFile, hbaFile, identFile st
 	}
 	dataDir = filepath.Clean(dataDir)
 
-	// Index the manifest's file list by basename.  PG's
-	// backup_manifest paths are relative to the data directory, so
-	// the basename is the right key for the top-level files we
-	// check.  This also dedups — duplicate paths would have failed
-	// Manifest.Validate already.
+	// Index the manifest's file list by path relative to the data
+	// directory (PG's backup_manifest paths are). The always-required
+	// files are top-level; the config files are looked up at the path
+	// their GUC names, which need not be top-level or carry the
+	// default basename (hba_file = <PGDATA>/conf/hba.conf is legal).
 	present := make(map[string]bool, len(m.Files))
 	for i := range m.Files {
-		// We only care about top-level entries; nested paths like
-		// "base/16384/..." cannot match a basename in our required
-		// set without an accident, but filepath.Base normalises
-		// either way.
-		p := m.Files[i].Path
-		if strings.ContainsAny(p, "/\\") {
-			// Top-level files have no path separator.  Skip nested
-			// entries to keep the lookup O(top-level-files) and
-			// avoid a spurious match if a nested directory shares a
-			// basename with a config file.
-			continue
-		}
-		present[p] = true
+		present[strings.TrimPrefix(filepath.ToSlash(m.Files[i].Path), "./")] = true
 	}
 
 	miss := &MissingEssentialFilesError{}
@@ -157,8 +145,18 @@ func CheckEssentialFiles(m *Manifest, dataDir, configFile, hbaFile, identFile st
 			// External config; PG never streamed it; not our gap.
 			continue
 		}
-		if !present[oc.BaseName] {
-			miss.InternalConfigs = append(miss.InternalConfigs, oc.BaseName)
+		// Expect the file where the GUC says it is. Requiring the
+		// hard-coded top-level basename refused every backup of a
+		// server whose hba_file/config_file points at another name or
+		// a subdirectory inside PGDATA — even though BASE_BACKUP
+		// streamed it.
+		rel, rerr := filepath.Rel(dataDir, filepath.Clean(oc.Resolved))
+		if rerr != nil || rel == "." {
+			rel = oc.BaseName
+		}
+		rel = filepath.ToSlash(rel)
+		if !present[rel] {
+			miss.InternalConfigs = append(miss.InternalConfigs, rel)
 		}
 	}
 

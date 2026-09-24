@@ -23,7 +23,9 @@ tags:
 - The free-form *holder* identifier (operator email, ticket
   number, lawyer's name) and *reason* for the hold — both land
   in the marker file and in a tamper-evident audit-chain event
-  (`hold.add` on placement, `hold.remove` on release), so a
+  (`hold.add` on placement, `hold.replace` on an edit, `hold.remove` on
+  release — its actor is the releasing operator, `$USER`, with the
+  released hold's holder in the body), so a
   compliance reviewer can reconstruct every hold action from
   `pg_hardstorage audit search`.
 
@@ -88,6 +90,16 @@ pg_hardstorage hold add db1 db1.full.20260420T020000Z \
 After the expiry the marker stays on disk for audit but no
 longer protects the manifest. Run [`hold purge-expired`](#5-purge-expired-holds)
 periodically to keep the marker directory tidy.
+
+**Re-adding a hold never silently weakens it.** `hold add` on a
+backup that already has an *active* hold may extend it (same
+holder, later expiry or indefinite) and update the reason; it
+refuses with `conflict.hold_exists` (exit 7) when the new hold
+would expire earlier, would put a finite expiry on an indefinite
+hold, or names a different `--holder`. `--force` replaces it
+anyway; every edit of an existing hold is recorded as a
+`hold.replace` audit event carrying the previous holder, reason
+and expiry.
 
 ### 4. List active holds
 

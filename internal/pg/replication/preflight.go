@@ -112,7 +112,30 @@ func (r *PreflightResult) HasFatal() bool {
 // connection uses.  When non-empty, Preflight checks whether it is
 // listed in synchronous_standby_names — see the sync_standby.*
 // findings.  Pass empty to skip that check.
+//
+// appName is also taken as the streamer's slot name: `wal stream`
+// uses the slot name as its application_name (walStreamAppName /
+// --slot), so this needs no call-site change. Use PreflightWithOptions
+// to pass a different slot name.
 func Preflight(ctx context.Context, c *pg.Conn, connectingRole, appName string) (*PreflightResult, error) {
+	return PreflightWithOptions(ctx, c, PreflightOptions{
+		ConnectingRole: connectingRole, AppName: appName, SlotName: appName,
+	})
+}
+
+// PreflightOptions configures PreflightWithOptions.
+type PreflightOptions struct {
+	ConnectingRole string
+	AppName        string
+	// SlotName is the physical slot the streamer uses. When that slot
+	// already exists, a full slot table is not a problem — the
+	// streamer reuses it and never runs CREATE_REPLICATION_SLOT.
+	SlotName string
+}
+
+// PreflightWithOptions is Preflight with an explicit slot name.
+func PreflightWithOptions(ctx context.Context, c *pg.Conn, o PreflightOptions) (*PreflightResult, error) {
+	connectingRole, appName := o.ConnectingRole, o.AppName
 	if c == nil {
 		return nil, errors.New("replication: nil connection")
 	}
@@ -145,28 +168,12 @@ func Preflight(ctx context.Context, c *pg.Conn, connectingRole, appName string) 
 	if err != nil {
 		return res, fmt.Errorf("replication: read max_replication_slots: %w", err)
 	}
-	curSlots, err := countReplicationSlots(ctx, c)
+	curSlots, ownSlot, err := countReplicationSlots(ctx, c, o.SlotName)
 	if err != nil {
 		return res, fmt.Errorf("replication: count slots: %w", err)
 	}
-	if maxSlots <= 0 {
-		res.Findings = append(res.Findings, PreflightFinding{
-			Severity:   PreflightFatal,
-			Code:       "max_replication_slots.zero",
-			Message:    "max_replication_slots is 0; the server cannot hold any replication slots",
-			Suggestion: "set max_replication_slots = 10 (or higher) in postgresql.conf and restart PostgreSQL",
-			Observed:   strconv.Itoa(maxSlots),
-			Required:   "> 0",
-		})
-	} else if curSlots >= maxSlots {
-		res.Findings = append(res.Findings, PreflightFinding{
-			Severity:   PreflightFatal,
-			Code:       "max_replication_slots.full",
-			Message:    fmt.Sprintf("all %d replication slots are in use; CREATE_REPLICATION_SLOT will fail", maxSlots),
-			Suggestion: "raise max_replication_slots and restart PostgreSQL, or drop unused slots from pg_replication_slots",
-			Observed:   strconv.Itoa(curSlots),
-			Required:   fmt.Sprintf("< %d (max_replication_slots)", maxSlots),
-		})
+	if f := slotTableFinding(maxSlots, curSlots, ownSlot); f != nil {
+		res.Findings = append(res.Findings, *f)
 	}
 
 	maxSenders, err := readIntSetting(ctx, c, "max_wal_senders")
@@ -316,6 +323,36 @@ func Preflight(ctx context.Context, c *pg.Conn, connectingRole, appName string) 
 	return res, nil
 }
 
+// slotTableFinding judges the slot table. A full table is fatal only
+// when the streamer must CREATE a slot: `wal stream` runs this on
+// every (re)connect attempt, and when its own slot is one of the
+// occupants the table is "full" by construction — refusing then meant
+// a streamer on a server sized exactly for its slots could never
+// restart.
+func slotTableFinding(maxSlots, curSlots int, ownSlotExists bool) *PreflightFinding {
+	switch {
+	case maxSlots <= 0:
+		return &PreflightFinding{
+			Severity:   PreflightFatal,
+			Code:       "max_replication_slots.zero",
+			Message:    "max_replication_slots is 0; the server cannot hold any replication slots",
+			Suggestion: "set max_replication_slots = 10 (or higher) in postgresql.conf and restart PostgreSQL",
+			Observed:   strconv.Itoa(maxSlots),
+			Required:   "> 0",
+		}
+	case curSlots >= maxSlots && !ownSlotExists:
+		return &PreflightFinding{
+			Severity:   PreflightFatal,
+			Code:       "max_replication_slots.full",
+			Message:    fmt.Sprintf("all %d replication slots are in use; CREATE_REPLICATION_SLOT will fail", maxSlots),
+			Suggestion: "raise max_replication_slots and restart PostgreSQL, or drop unused slots from pg_replication_slots",
+			Observed:   strconv.Itoa(curSlots),
+			Required:   fmt.Sprintf("< %d (max_replication_slots)", maxSlots),
+		}
+	}
+	return nil
+}
+
 // syncStandbyNamesContains reports whether name appears in a
 // synchronous_standby_names GUC value. It handles the documented
 // shapes: a wildcard "*"; a bare comma list ("s1, s2"); and the
@@ -389,18 +426,19 @@ func readIntSetting(ctx context.Context, c *pg.Conn, name string) (int, error) {
 }
 
 // countReplicationSlots returns the number of rows in
-// pg_replication_slots.  Compared against max_replication_slots
-// to detect a full slot table.
-func countReplicationSlots(ctx context.Context, c *pg.Conn) (int, error) {
-	const q = `SELECT count(*)::text FROM pg_replication_slots`
-	res := c.PgConn().ExecParams(ctx, q, nil, nil, nil, nil).Read()
+// pg_replication_slots (compared against max_replication_slots to
+// detect a full slot table) and whether slotName is among them.
+func countReplicationSlots(ctx context.Context, c *pg.Conn, slotName string) (int, bool, error) {
+	const q = `SELECT count(*)::text, (count(*) FILTER (WHERE slot_name = $1) > 0)::text FROM pg_replication_slots`
+	res := c.PgConn().ExecParams(ctx, q, [][]byte{[]byte(slotName)}, nil, nil, nil).Read()
 	if res.Err != nil {
-		return 0, res.Err
+		return 0, false, res.Err
 	}
 	if len(res.Rows) == 0 {
-		return 0, nil
+		return 0, false, nil
 	}
-	return strconv.Atoi(string(res.Rows[0][0]))
+	n, err := strconv.Atoi(string(res.Rows[0][0]))
+	return n, slotName != "" && string(res.Rows[0][1]) == "true", err
 }
 
 // countActiveWalSenders returns the number of rows in
@@ -417,12 +455,16 @@ func countActiveWalSenders(ctx context.Context, c *pg.Conn) (int, error) {
 	return strconv.Atoi(string(res.Rows[0][0]))
 }
 
-// roleHasReplication checks pg_roles.rolreplication for the named
-// role.  Returns false if the role doesn't exist, with no error —
-// the streamer's connection attempt will surface the missing role
-// in a more informative way than the preflight could.
+// roleHasReplication reports whether the named role may open a
+// replication connection: PostgreSQL admits a superuser OR a role with
+// REPLICATION, so checking rolreplication alone refused every
+// superuser-run streamer (initdb's bootstrap superuser has
+// rolreplication=true, but a CREATE ROLE ... SUPERUSER does not).
+// Returns false if the role doesn't exist, with no error — the
+// streamer's connection attempt will surface the missing role in a
+// more informative way than the preflight could.
 func roleHasReplication(ctx context.Context, c *pg.Conn, role string) (bool, error) {
-	const q = `SELECT rolreplication::text FROM pg_roles WHERE rolname = $1`
+	const q = `SELECT (rolsuper OR rolreplication)::text FROM pg_roles WHERE rolname = $1`
 	res := c.PgConn().ExecParams(ctx, q, [][]byte{[]byte(role)}, nil, nil, nil).Read()
 	if res.Err != nil {
 		return false, res.Err

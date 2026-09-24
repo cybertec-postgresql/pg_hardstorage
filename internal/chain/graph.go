@@ -118,6 +118,12 @@ type Node struct {
 	// them dashed; analysis still walks them but flags them.
 	Tombstoned bool `json:"tombstoned,omitempty"`
 
+	// CycleBroken marks the cycle member whose parent link was dropped
+	// to break a parent_backup_id cycle (reported as
+	// chain.cycle_detected). It anchors the depth walk for the rest of
+	// the cycle instead of leaving every member at Depth 0.
+	CycleBroken bool `json:"cycle_broken,omitempty"`
+
 	// LogicalBytes = sum of FileEntry.Size for this manifest.
 	LogicalBytes int64 `json:"logical_bytes"`
 
@@ -148,8 +154,12 @@ func (n *Node) IsRoot() bool { return n.Parent == nil && n.ParentBackupID == "" 
 func (n *Node) IsLeaf() bool { return len(n.Children) == 0 }
 
 // IsOrphan reports whether this node refers to a parent that
-// isn't in the graph.
-func (n *Node) IsOrphan() bool { return n.Parent == nil && n.ParentBackupID != "" }
+// isn't in the graph. A node whose parent link was dropped to break a
+// cycle is NOT an orphan: its parent is present, the chain is circular
+// (chain.cycle_detected says so).
+func (n *Node) IsOrphan() bool {
+	return n.Parent == nil && n.ParentBackupID != "" && !n.CycleBroken
+}
 
 // GraphIssue is one integrity finding.
 type GraphIssue struct {
@@ -260,6 +270,21 @@ func BuildGraph(ctx context.Context, sp storage.StoragePlugin, deployment string
 		})
 	}
 
+	linkNodes(g, byID)
+
+	if !opts.SkipAnalysis {
+		AnalyzeChain(g)
+	}
+
+	finish()
+	return g, nil
+}
+
+// linkNodes wires parent/child links for the loaded nodes, breaks
+// cycles, assigns depths, materialises roots/orphans/counts and records
+// the structural issues. Split from BuildGraph so it is testable
+// without a repository.
+func linkNodes(g *Graph, byID map[string]*Node) {
 	// Wire parent/child links.
 	for _, n := range byID {
 		if n.ParentBackupID == "" {
@@ -295,6 +320,7 @@ func BuildGraph(ctx context.Context, sp storage.StoragePlugin, deployment string
 			n.Parent.Children = removeChild(n.Parent.Children, n)
 			n.Parent = nil
 		}
+		n.CycleBroken = true
 		g.Issues = append(g.Issues, GraphIssue{
 			Severity:   "critical",
 			Code:       "chain.cycle_detected",
@@ -314,7 +340,7 @@ func BuildGraph(ctx context.Context, sp storage.StoragePlugin, deployment string
 
 	// Compute Depth via DFS from each root.
 	for _, n := range byID {
-		if n.IsRoot() {
+		if n.IsRoot() || n.CycleBroken {
 			assignDepth(n, 1)
 		}
 	}
@@ -379,13 +405,6 @@ func BuildGraph(ctx context.Context, sp storage.StoragePlugin, deployment string
 			})
 		}
 	}
-
-	if !opts.SkipAnalysis {
-		AnalyzeChain(g)
-	}
-
-	finish()
-	return g, nil
 }
 
 // manifestToNode shapes one Manifest into a Node. Caller wires the

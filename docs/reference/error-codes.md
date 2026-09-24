@@ -140,6 +140,7 @@ upgrade PG client tools, clear the target dir, …), retry.
 | `notfound.backup`, `notfound.backup_before_time`, `notfound.backup_tombstoned` | Backup ID / time-pin / liveness mismatch |
 | `notfound.deployment`, `notfound.repo`, `notfound.sink` | Configuration entity missing |
 | `notfound.wal_segment`, `notfound.wal_segment_name` | WAL not present in the repo |
+| `notfound.signing_key` | The keyring holds no signing keypair. Read-only and maintenance verbs (list, show, status, doctor, kms verify/rotate, rotate, backup delete) never create one — point `PG_HARDSTORAGE_KEYRING_DIR` at the keyring that signed the repo; only `init` / `backup` mint a keypair |
 | `notfound.session`, `notfound.token`, `notfound.skill`, `notfound.skill_snapshot` | LLM session / skill state |
 | `notfound.replica_manifest`, `notfound.attestation` | Manifest / attestation absent |
 
@@ -155,7 +156,9 @@ actually there.
 | `conflict.repo_exists`, `conflict.deployment_exists`, `conflict.sink_exists`, `conflict.standby_exists`, `conflict.timetravel_exists`, `conflict.roster_exists` | Resource with that name is already configured |
 | `conflict.repo_read_only` | Repo is in read-only mode (legal hold, scheduled retire) |
 | `conflict.manifest_held`, `conflict.chain_has_held_links` | Backup or one of its parents is on legal hold |
-| `conflict.chain_has_live_descendants` | Refused to delete; descendants would orphan |
+| `conflict.chain_has_live_descendants` | Refused to delete; descendants would orphan (also raised by `rotate --apply` when an incremental lands mid-rotation) |
+| `conflict.backup_lease_lost` | A running backup was aborted because another process took over the deployment's backup lease (stall longer than the lease TTL, clock jump, overlapping scheduler) |
+| `conflict.hold_exists` | `hold add` would weaken an active hold (earlier or finite expiry on an indefinite hold, different holder); `--force` replaces it and audits `hold.replace` |
 | `conflict.checkpoint_mismatch`, `conflict.chunks_missing`, `conflict.no_live_manifests` | Repo state would be inconsistent |
 | `conflict.approval_pending`, `conflict.already_signed`, `conflict.already_revoked` | Approval-flow state machine refused |
 | `conflict.too_many_connections` | PG refused another replication / regular connection |
@@ -224,7 +227,7 @@ field is where the recovery hint lives.
 
 | Namespace | Domain |
 | --- | --- |
-| `backup.*` | Backup pipeline (`backup.failed`, `backup.encrypt_no_kek`, `backup.kek_load_failed`, `backup.kms_open_failed`, `backup.compare.*`, `backup.delete.*`, `backup.undelete.*`) |
+| `backup.*` | Backup pipeline (`backup.failed`, `backup.encrypt_no_kek`, `backup.kek_load_failed`, `backup.kms_open_failed`, `backup.compare.*`, `backup.delete.*`, `backup.undelete.*`, `backup.parent_read_failed` — `--incremental-from` parent unreadable for a reason other than not-found / tombstoned / signature, which map to `notfound.backup`, `notfound.backup_tombstoned`, `verify.manifest_signature`) |
 | `keyring.*` | Keyring utilities (`keyring.install_failed`, `keyring.install_empty_source` — the initContainer copy refusing an empty or unreadable Secret mount) |
 | `restore.*` | Restore pipeline (`restore.failed`, `restore.kek_mismatch`, `restore.kek_resolve_failed`, `restore.target_in_wal_gap`, `restore.timeline_history_unreachable`, `restore.unknown_scheme`) |
 | `wal.*` | WAL streaming / fetch (`wal.slot_missing`, `wal.slot_ensure_failed`, `wal.slot_repair_failed`, `wal.fetch.*`, `wal.gap_purge_failed`, `wal.push_failed`, `wal.stream_error`, `wal.system_identifier_changed` — the DSN reached a different cluster than this `wal stream` process started on (permanent), `wal.segment_size_probe_failed` — `wal_segment_size` could not be read on a connected cluster; retried, never assumed) |
@@ -233,6 +236,10 @@ field is where the recovery hint lives.
 | `repair.*` | Manifest / attestation / chunk repair |
 | `manifest.*` | Manifest parse / validation at restore-plan time (`manifest.invalid`) |
 | `kms.*` | KMS rotate / shred / verify (`kms.rotate_failed`, `kms.shred_failed`, `kms.verify_failed`); `kms.unreachable` is the only leaf that maps to exit 8 |
+| `backup.archive_lag` | BASE_BACKUP streamed, but `pg_backup_stop` kept waiting for WAL archiving until the stream went silent (PostgreSQL's "still waiting for all required WAL segments to be archived" warnings widen the inactivity window, so this fires only on a real stall). Exit 1. Fix `archive_command` (see `pg_stat_archiver`) and retry. |
+| `backup.io_starved` | `backup --stall-timeout`: no progress (no stream frame and no event) within the timeout — the backup was aborted. Exit 1. Check host disk/network saturation or raise the timeout. |
+| `kms.rotate_incomplete` | `kms rotate --apply` finished but some manifest, replica copy or WAL segment manifest still holds the old KEK (`failed`, `replica_failures` or `wal_failed` > 0). Exit 1. Do NOT retire the old KEK; re-run until it exits 0. |
+| `kms.rotate_plan_failed` | `kms rotate` dry-run whose plan already contains failures (`failed` or `wal_failed` > 0) — `--apply` could not complete. Exit 1. |
 | `chain.*` | Backup-chain integrity (`chain.cycle`, `chain.too_deep`, `chain.no_full_anchor`, `chain.broken_tombstoned`, `chain.degenerate`, `chain.missing_pg_manifest`) |
 | `splitbrain.*` | WAL archive collision: another writer already archived this segment (`splitbrain.content_mismatch` — same cluster, different bytes; `splitbrain.system_identifier_mismatch` — a different cluster, typically a cloned datadir without `pg_resetwal`; `splitbrain.read_failed` — the existing manifest is present but unreadable, refused on doubt). Exit 1. Raised by `wal push` and the streaming sink; see [R7](runbooks/R7-patroni-split-brain.md). |
 | `audit.*` | Audit log (`audit.append_failed`, `audit.anchor_failed`, `audit.verify_failed`, `audit.search_failed`, `audit.export_bundle_failed`, `audit.summary_failed`) |
