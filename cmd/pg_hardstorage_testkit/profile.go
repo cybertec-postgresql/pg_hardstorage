@@ -64,7 +64,7 @@ func newProfileAddCmd() *cobra.Command {
 	c := &cobra.Command{
 		Use: "add", Short: "Add a workload profile",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			p, err := config.LoadProfiles(path)
+			p, err := config.LoadProfilesOrEmpty(path)
 			if err != nil {
 				return err
 			}
