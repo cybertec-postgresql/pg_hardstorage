@@ -12,15 +12,9 @@ import (
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup/keystore"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/output"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/paths"
-	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo"
 )
 
-func setReadOnly(t *testing.T, repoURL string) {
-	t.Helper()
-	if _, err := repo.SetMode(context.Background(), repo.SetModeOptions{URL: repoURL, Mode: repo.ModeReadOnly}); err != nil {
-		t.Fatal(err)
-	}
-}
+// setReadOnly lives in readonly_mutators_test.go.
 
 // M1: every mutating repair / wipe / import path refuses on a repository
 // the operator locked read-only. Each used to write straight through it.
