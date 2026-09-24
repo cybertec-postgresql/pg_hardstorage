@@ -10,6 +10,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/config"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/output"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/paths"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/recovery"
@@ -116,9 +117,9 @@ Read-only; safe at any cadence.`,
 	c.Flags().StringVar(&stalenessWindow, "staleness", "",
 		"verification staleness window (e.g. 7d, 24h); default 7d")
 	c.Flags().Int64Var(&rpoTargetSeconds, "rpo-seconds", 0,
-		"RPO target in seconds (0 = no target check)")
+		"RPO target in seconds (0 = no target check); default: the deployment's slo.rpo_seconds from the config")
 	c.Flags().Int64Var(&rtoTargetSeconds, "rto-seconds", 0,
-		"RTO target in seconds (0 = no target check)")
+		"RTO target in seconds (0 = no target check); default: the deployment's slo.rto_seconds from the config")
 	c.Flags().BoolVar(&skipVerification, "no-verification", false, "skip the verification freshness check")
 	c.Flags().BoolVar(&skipEncryption, "no-encryption", false, "skip the KEK reachability check")
 	c.Flags().BoolVar(&skipWAL, "no-wal", false, "skip the WAL coverage check")
@@ -177,12 +178,25 @@ func runRecoveryReadiness(cmd *cobra.Command, deployment string, f recoveryReadi
 		return output.NewError("internal", err.Error()).Wrap(err)
 	}
 
+	// Targets not given on the command line default to the
+	// deployment's declared SLO (`slo set`), as the help promises; an
+	// explicit flag — including 0, "no target check" — wins.
+	rpoTarget, rtoTarget := f.rpoTargetSeconds, f.rtoTargetSeconds
+	if slo := deploymentSLO(deployment); slo != nil {
+		if !cmd.Flags().Changed("rpo-seconds") {
+			rpoTarget = slo.RPOSeconds
+		}
+		if !cmd.Flags().Changed("rto-seconds") {
+			rtoTarget = slo.RTOSeconds
+		}
+	}
+
 	opts := recovery.Options{
 		Verifier:                    verifier,
 		AssumedThroughput:           throughput,
 		VerificationStalenessWindow: staleness,
-		RPOTargetSeconds:            f.rpoTargetSeconds,
-		RTOTargetSeconds:            f.rtoTargetSeconds,
+		RPOTargetSeconds:            rpoTarget,
+		RTOTargetSeconds:            rtoTarget,
 		SkipVerification:            f.skipVerification,
 		SkipEncryption:              f.skipEncryption,
 		SkipWAL:                     f.skipWAL,
@@ -364,4 +378,24 @@ func writeReadinessSummary(w io.Writer, r *recovery.ReadinessReport) error {
 	fmt.Fprintln(bw, "Use --format markdown for the full report.")
 	_, err := io.WriteString(w, strings.TrimRight(bw.String(), "\n"))
 	return err
+}
+
+// deploymentSLO returns the SLO declared for deployment in the config
+// file, or nil when there is no config, no such deployment, or the
+// config cannot be loaded (readiness then runs without targets, as
+// before; the flags remain the explicit route).
+func deploymentSLO(deployment string) *config.SLOConfig {
+	p, err := paths.Resolve(paths.DefaultOptions())
+	if err != nil {
+		return nil
+	}
+	loaded, err := config.Load(p)
+	if err != nil || loaded == nil {
+		return nil
+	}
+	dep, ok := loaded.Config.Deployments[deployment]
+	if !ok {
+		return nil
+	}
+	return &dep.SLO
 }
