@@ -26,7 +26,9 @@ scenario drives the fault for real.
                     back intact. Needs --repo; refuses without one.
   patroni_failover  reads the current leader, POSTs /switchover, waits
                     for a different member to take the leader lock, and
-                    re-measures replication-slot continuity. It needs
+                    re-measures replication-slot continuity on the NEW
+                    leader (patroni.slot, or the leader-role entry of
+                    patroni.slots). It needs
                     --deployment naming a deployment with patroni.url
                     configured; without one it refuses rather than
                     reporting a pass.
