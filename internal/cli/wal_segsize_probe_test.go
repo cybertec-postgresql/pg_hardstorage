@@ -1,69 +1,53 @@
 package cli
 
-// probeSegmentSize assumes 16 MiB when it cannot read the cluster's
-// wal_segment_size. That assumption is load-bearing: segment size
+// probeSegmentSize must never ASSUME a wal_segment_size. Segment size
 // determines segment NAMES, so on a cluster built with
-// `initdb --wal-segsize 64MB` the assumption names every archived
-// segment wrongly. guardSegmentSize catches that when the deployment
-// already has WAL to compare against — but on a FRESH deployment there
-// is nothing to compare, so the only thing standing between the
-// operator and an unrestorable archive is being told the assumption was
-// made.
+// `initdb --wal-segsize 64MB` an assumed 16 MiB names every archived
+// segment wrongly — and on a FRESH deployment guardSegmentSize has no
+// archived WAL to contradict it, so nothing notices until a restore.
 //
-// The two fallbacks are not the same and must not behave the same:
-//
-//   - CONNECT failure: streamAttempt is about to hit the identical
-//     failure with retry/backoff, so the stream never proceeds on the
-//     assumption. Warning here would be noise on every transient blip.
-//   - QUERY failure on a CONNECTED cluster: the stream DOES proceed on
-//     the assumption. That one must be reported.
-//
-// Only the connect branch is reachable without a live PostgreSQL, so
-// that is what this test pins. The query branch is asserted structurally
-// below instead — see TestProbeSegmentSize_QueryFailureWarns.
+// It used to assume exactly that on a connect failure, quietly, on the
+// theory that streamAttempt would hit the same failure and retry. It
+// did — but the probe ran once, at startup, and was never repeated: a
+// PostgreSQL that was down for the startup probe and up for the first
+// reconnect streamed its whole life at 16 MiB. The probe now fails, and
+// verifyStreamSource re-runs it on every attempt against the cluster
+// that attempt reached (TestIntegration_WalStream_SegSizeProbedOnReconnect
+// drives that end to end).
 
 import (
-	"bytes"
 	"context"
 	"os"
 	"strings"
 	"testing"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/output"
-	"github.com/cybertec-postgresql/pg_hardstorage/internal/pg/walsink"
-	rendererjson "github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/renderer/json"
 )
 
-func TestProbeSegmentSize_ConnectFailureFallsBackQuietly(t *testing.T) {
-	var stdout, stderr bytes.Buffer
-	d := output.NewDispatcher(rendererjson.New(), &stdout, &stderr)
-
+func TestProbeSegmentSize_ConnectFailureIsAnErrorNotAnAssumption(t *testing.T) {
 	// Port 1 refuses immediately; connect_timeout keeps it fast even
 	// where it does not.
 	dsn := "postgres://nobody@127.0.0.1:1/nodb?connect_timeout=1&sslmode=disable"
-	got, err := probeSegmentSize(context.Background(), d, dsn)
-	if err != nil {
-		t.Fatalf("a connect failure must not fail the probe: %v", err)
+	got, err := probeSegmentSize(context.Background(), dsn)
+	if err == nil {
+		t.Fatalf("probe against an unreachable cluster returned %d bytes and no error.\n\n"+
+			"That is an assumed size, and the stream would chop and NAME segments with it; "+
+			"a 64 MiB cluster's archive comes out unrestorable.", got)
 	}
-	if got != walsink.DefaultSegmentSize {
-		t.Errorf("fallback = %d, want %d", got, int64(walsink.DefaultSegmentSize))
+	// The failure must stay on the RETRY path: a PostgreSQL that is down
+	// for a moment is the ordinary case the reconnect loop exists for.
+	if isPermanentStreamSetupError(err) {
+		t.Errorf("connect failure %v classified permanent; the reconnect loop must retry it", err)
 	}
-	combined := stdout.String() + stderr.String()
-	if strings.Contains(combined, "segment_size_probe_failed") {
-		t.Errorf("a connect failure emitted the assumption warning.\n\n"+
-			"streamAttempt is about to report the same connect failure with retry and "+
-			"backoff, so the stream does not proceed on the assumption; warning here "+
-			"would fire on every transient blip and train the operator to ignore it.\n%s",
-			combined)
+	if _, ok := output.AsOutputError(err); !ok {
+		t.Errorf("err = %T, want a structured *output.Error", err)
 	}
 }
 
 // The query-failure branch needs a cluster that accepts a connection and
-// then refuses the setting, which no unit test can stand up. Assert the
-// wiring at the source level instead — the same approach
-// TestWalStream_CallsItsPreflightGuards uses, and for the same reason:
-// the alternative is claiming coverage that does not exist.
-func TestProbeSegmentSize_QueryFailureWarns(t *testing.T) {
+// then refuses the setting, which no unit test can stand up. Assert at
+// the source level that nothing after the query returns the default.
+func TestProbeSegmentSize_QueryFailureDoesNotAssumeTheDefault(t *testing.T) {
 	src, err := os.ReadFile("wal.go")
 	if err != nil {
 		t.Fatalf("read wal.go: %v", err)
@@ -78,19 +62,30 @@ func TestProbeSegmentSize_QueryFailureWarns(t *testing.T) {
 		t.Fatal("could not delimit probeSegmentSize")
 	}
 	fn := body[start : start+end]
-
-	qIdx := strings.Index(fn, "QueryWALSegmentSize(")
-	if qIdx < 0 {
+	if !strings.Contains(fn, "QueryWALSegmentSize(") {
 		t.Fatal("probeSegmentSize no longer queries wal_segment_size")
 	}
-	// Everything after the query is the branch that decides what to do
-	// with a failure to read the setting.
-	tail := fn[qIdx:]
-	if !strings.Contains(tail, "segment_size_probe_failed") {
-		t.Error("probeSegmentSize falls back to the default after a failed " +
-			"wal_segment_size query without emitting segment_size_probe_failed.\n\n" +
-			"The stream then proceeds on an assumption that names every segment, and on " +
-			"a fresh deployment guardSegmentSize has no archived WAL to contradict it. " +
-			"The operator finds out at restore.")
+	if strings.Contains(fn, "DefaultSegmentSize") {
+		t.Error("probeSegmentSize refers to walsink.DefaultSegmentSize: it must return what the " +
+			"cluster reports or an error, never a default.")
+	}
+}
+
+// The permanent refusals of the per-attempt guards must stop the
+// reconnect loop; retrying cannot change which cluster the DSN reaches.
+func TestVerifyStreamSourceRefusalsArePermanent(t *testing.T) {
+	for _, code := range []string{
+		"preflight.system_identifier_changed",
+		"wal.system_identifier_changed",
+		"preflight.wal_segment_size",
+		"preflight.wal_segment_size_changed",
+	} {
+		if !isPermanentStreamSetupError(output.NewError(code, "x")) {
+			t.Errorf("%s is retried; the reconnect loop would repeat the refusal forever", code)
+		}
+	}
+	if isPermanentStreamSetupError(output.NewError("wal.segment_size_probe_failed", "x")) {
+		t.Error("wal.segment_size_probe_failed is permanent; a failed read on a connected " +
+			"cluster is transient and must be retried")
 	}
 }

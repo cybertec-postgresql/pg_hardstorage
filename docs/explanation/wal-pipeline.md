@@ -118,7 +118,18 @@ A few things worth highlighting:
   from `replication.Stream` as a non-`context.Canceled` error.
   The streamer's retry loop sleeps with exponential backoff
   (1s → 30s by default), then re-runs preflight + IDENTIFY_SYSTEM
-  + `EnsureSlot` against the leader-aware DSN — `EnsureSlot`'s
+  + the source guards + `EnsureSlot` against the leader-aware
+  DSN.  The source guards run on **every** attempt, before
+  anything is written for the cluster reached: its
+  `system_identifier` must match both the deployment's archived
+  WAL and the cluster this process first streamed from (else
+  `preflight.system_identifier_changed` /
+  `wal.system_identifier_changed`, permanent), and
+  `wal_segment_size` is re-read from the server — never assumed —
+  and must match the archive (`preflight.wal_segment_size_changed`).
+  A PostgreSQL that is unreachable at startup therefore cannot
+  slip a different cluster, or a wrongly-sized archive, past the
+  checks once it comes up.  `EnsureSlot`'s
   Strategy A path finds a propagated slot, Strategy C recreates
   with `RESERVE_WAL`.  The start-LSN safety check then validates
   the resume position against the (possibly new) `restart_lsn`

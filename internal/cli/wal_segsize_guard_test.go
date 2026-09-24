@@ -9,16 +9,12 @@ package cli
 // recovery breaks. It is the same class of damage the system_identifier
 // guard beside it prevents.
 //
-// probeSegmentSize deliberately falls back to the 16 MiB default when
-// its probe query fails, so a flaky pre-flight never blocks a valid
-// stream. That is a reasonable trade for a CONNECT failure (streaming
-// would fail anyway), but on a cluster built with
-// `initdb --wal-segsize 64MB` it silently produces exactly the
-// mis-named segments that the same function's invalid-value branch
-// refuses to produce, saying "Refusing to stream rather than mis-name
-// segments". This guard is the check that notices, whatever the wrong
-// size came from — a bad probe or a --wal-segment-size flag that does
-// not match the cluster.
+// The live size is always probed from the server now (probeSegmentSize
+// fails rather than assume one), so a mismatch here means the ARCHIVE
+// is at the wrong size — WAL an older build chopped at an assumed 16 MiB
+// when its probe could not connect — or a different cluster admitted
+// under --allow-system-identifier-change. Either way, streaming on would
+// mix two sizes in one lineage.
 
 import (
 	"bytes"
@@ -109,6 +105,29 @@ func TestGuardSegmentSize_RefusesADifferentSizeThanTheArchive(t *testing.T) {
 	}
 }
 
+// The remedy must be one the operator can apply. guardSegmentSize runs
+// only for `wal stream`, which has no --wal-segment-size flag (that is
+// `wal push`'s); telling the operator to pass it sends them to an
+// "unknown flag" error in the middle of an incident.
+func TestGuardSegmentSize_RemedyNamesNoNonexistentFlag(t *testing.T) {
+	ctx, sp := segGuardRepo(t)
+	plantSegmentManifestSized(t, sp, "db1", "7000000000000000001", 1, 5, segGuard64)
+
+	err := guardSegmentSize(ctx, sp, "wal stream", "db1", segGuard16)
+	var oerr *output.Error
+	if !errors.As(err, &oerr) {
+		t.Fatalf("expected an *output.Error; got %v", err)
+	}
+	text := oerr.Message
+	if oerr.Suggestion != nil {
+		text += "\n" + oerr.Suggestion.Human + "\n" + oerr.Suggestion.Command
+	}
+	if strings.Contains(text, "--wal-segment-size") {
+		t.Errorf("`wal stream` has no --wal-segment-size flag, but the refusal tells the "+
+			"operator to pass one:\n%s", text)
+	}
+}
+
 func TestGuardSegmentSize_MatchingSizePasses(t *testing.T) {
 	ctx, sp := segGuardRepo(t)
 	plantSegmentManifestSized(t, sp, "db1", "7000000000000000001", 1, 5, segGuard64)
@@ -164,39 +183,53 @@ func TestFirstSegmentManifestWhere_PredicateSelectsIndependently(t *testing.T) {
 }
 
 // A guard that is never called is worth nothing, and both WAL-stream
-// pre-flights are exactly that shape: pure functions whose unit tests
-// pass just as happily when the call site is deleted. I verified that
-// by deleting the guardSegmentSize call — every test above still
-// passed.
+// source guards are exactly that shape: pure functions whose unit tests
+// pass just as happily when the call site is deleted.
 //
-// There is no unit-testable seam here (the surrounding path needs a
-// live PostgreSQL connection), so this asserts the wiring at the source
-// level, the same way the storage-middleware and fsync guards do. It
-// covers the system-identifier guard too, which had the same exposure.
+// The authoritative call site is verifyStreamSource, which streamAttempt
+// runs on EVERY attempt: a check made once at startup is skipped when
+// PostgreSQL is unreachable then, and the reconnect loop reaches whatever
+// cluster the DSN resolves to later. There is no unit-testable seam (the
+// path needs a live PostgreSQL), so this asserts the wiring at the source
+// level; TestIntegration_WalStream_SysIDGuardSurvivesUnreachableStartup
+// and ..._SegSizeProbedOnReconnect drive it end to end.
 func TestWalStream_CallsItsPreflightGuards(t *testing.T) {
 	src, err := os.ReadFile("wal.go")
 	if err != nil {
 		t.Fatalf("read wal.go: %v", err)
 	}
 	body := string(src)
-	start := strings.Index(body, "func runWalStream(")
-	if start < 0 {
-		t.Fatal("runWalStream not found; this guard needs updating, not deleting")
+	fnBody := func(name string) string {
+		start := strings.Index(body, "func "+name+"(")
+		if start < 0 {
+			t.Fatalf("%s not found; this guard needs updating, not deleting", name)
+		}
+		end := strings.Index(body[start:], "\n}\n")
+		if end < 0 {
+			t.Fatalf("could not delimit %s", name)
+		}
+		return body[start : start+end]
 	}
-	// Bound the search to the stream entry point's own body.
-	end := strings.Index(body[start:], "\n}\n")
-	if end < 0 {
-		t.Fatal("could not delimit runWalStream")
-	}
-	fn := body[start : start+end]
 
-	for _, guard := range []string{"guardSystemIdentifier(", "guardSegmentSize("} {
-		if !strings.Contains(fn, guard) {
-			t.Errorf("runWalStream does not call %s\n\n"+
-				"The guard's own tests call it directly, so they keep passing when the "+
-				"call site goes away. Streaming then proceeds with no pre-flight at all: "+
-				"a foreign cluster's WAL, or a wrong wal_segment_size, enters the lineage "+
-				"unchallenged.", guard)
+	verify := fnBody("verifyStreamSource")
+	for _, guard := range []string{"guardSystemIdentifier(", "checkSysIDContinuity(", "probeSegmentSize(", "guardSegmentSize("} {
+		if !strings.Contains(verify, guard) {
+			t.Errorf("verifyStreamSource does not call %s\n\n"+
+				"Streaming then proceeds without that check on every reconnect: a foreign "+
+				"cluster's WAL, or a wrong wal_segment_size, enters the lineage unchallenged.", guard)
+		}
+	}
+
+	attempt := fnBody("streamAttempt")
+	vIdx := strings.Index(attempt, "verifyStreamSource(")
+	if vIdx < 0 {
+		t.Fatal("streamAttempt does not call verifyStreamSource: the source guards run at most " +
+			"once, at startup, and are skipped for good when PostgreSQL is unreachable then")
+	}
+	// ...and before anything is written or streamed for the cluster.
+	for _, later := range []string{"captureStreamTimelineHistory(", "ensureSlot(", "walsink.New(", "replication.Stream("} {
+		if i := strings.Index(attempt, later); i >= 0 && i < vIdx {
+			t.Errorf("streamAttempt calls %s before verifyStreamSource; the guards must run first", later)
 		}
 	}
 }
