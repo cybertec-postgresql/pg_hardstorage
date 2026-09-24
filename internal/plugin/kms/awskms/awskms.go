@@ -156,15 +156,28 @@ func builder(ctx context.Context, kekRef string, cfg map[string]any) (stdkms.Pro
 	}
 	clientOpts := []func(*kms.Options){}
 	if endpoint != "" {
-		// Endpoint air-gap gate.
-		if err := airgap.Default().EndpointAllowed(endpoint); err != nil {
-			return nil, fmt.Errorf("aws-kms: %w", err)
-		}
 		clientOpts = append(clientOpts, func(o *kms.Options) {
 			o.BaseEndpoint = aws.String(endpoint)
 		})
 	}
 	cli := kms.NewFromConfig(awsCfg, clientOpts...)
+
+	// Air-gap gate on the endpoint the client will actually talk to: the
+	// configured one (the resolved BaseEndpoint also picks up
+	// AWS_ENDPOINT_URL(_KMS)), else the regional AWS host — FIPS variant
+	// when enabled. Checking only an explicit endpoint let the default
+	// public KMS host through under `airgapped: strict`.
+	effective := aws.ToString(cli.Options().BaseEndpoint)
+	if effective == "" {
+		host := "kms"
+		if useFIPS {
+			host = "kms-fips"
+		}
+		effective = "https://" + host + "." + awsCfg.Region + ".amazonaws.com"
+	}
+	if err := airgap.Default().EndpointAllowed(effective); err != nil {
+		return nil, fmt.Errorf("aws-kms: %w", err)
+	}
 
 	return &Provider{
 		kekRef:            kekRef,

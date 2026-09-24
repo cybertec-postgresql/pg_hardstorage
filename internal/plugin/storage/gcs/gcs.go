@@ -54,6 +54,7 @@ import (
 	"iter"
 	"net/http"
 	"net/url"
+	"os"
 	"path"
 	"strings"
 	"sync"
@@ -134,10 +135,24 @@ func (p *Plugin) Open(ctx context.Context, cfg storage.StorageConfig) error {
 	}
 	storageClass := q.Get("storage_class")
 
-	if endpoint != "" {
-		if err := airgap.Default().EndpointAllowed(endpoint); err != nil {
-			return fmt.Errorf("gcs: %w", err)
+	// Air-gap gate on the host the client will actually dial: the
+	// ?endpoint= override, else the emulator the SDK honours via
+	// STORAGE_EMULATOR_HOST, else the public Google host. Checking only
+	// an explicit override let the default public endpoint through under
+	// `airgapped: strict`, which promises every outbound path is checked.
+	effective := endpoint
+	if effective == "" {
+		if emu := os.Getenv("STORAGE_EMULATOR_HOST"); emu != "" {
+			effective = emu
+			if !strings.Contains(effective, "://") {
+				effective = "http://" + effective
+			}
+		} else {
+			effective = "https://storage.googleapis.com"
 		}
+	}
+	if err := airgap.Default().EndpointAllowed(effective); err != nil {
+		return fmt.Errorf("gcs: %w", err)
 	}
 
 	var opts []gcsoption.ClientOption

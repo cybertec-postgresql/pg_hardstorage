@@ -126,6 +126,9 @@ split-horizon DNS, add the **hostname** to the allowlist.
 | `s3` | `?endpoint=` (or `AWS_ENDPOINT_URL[_S3]`); with none, `https://s3.<region>.amazonaws.com`. Allowlist `s3.<region>.amazonaws.com` to use AWS S3 through a VPC endpoint. |
 | `azure-kv` | the vault URL, e.g. `https://<vault>.vault.azure.net/` |
 | `vault-transit` | the Vault address from the KEKRef |
+| `gcs` | `?endpoint=`, else `STORAGE_EMULATOR_HOST`, else `https://storage.googleapis.com` (allowlist it to use GCS through Private Google Access). |
+| `aws-kms` | `endpoint:` (or `AWS_ENDPOINT_URL[_KMS]`); with none, `https://kms.<region>.amazonaws.com` (`kms-fips.` with `use_fips_endpoint`). |
+| control plane | the `--control-plane` URL of `backup`/`restore`/`verify --control-plane`, and the agent's control-plane URL |
 
 ## Troubleshooting
 
