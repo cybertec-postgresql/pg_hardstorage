@@ -147,14 +147,15 @@ func (readDoctor) ReadOnly() bool { return true }
 // report. Non-zero exit with a body is treated as "issues found", not a
 // tool failure.
 func (t *readDoctor) Run(ctx context.Context, args map[string]any) (Result, error) {
-	cmd := []string{"doctor"}
+	dep, err := optDeployment("read_doctor", args)
+	if err != nil {
+		return Result{}, err
+	}
 	// `pg_hardstorage doctor` takes <deployment> as a POSITIONAL
 	// argument, not as `-d <deployment>` — the latter was
 	// rejected with "unknown shorthand flag: 'd' in -d" on the
 	// pilot's case C1.
-	if dep, _ := args["deployment"].(string); dep != "" {
-		cmd = append(cmd, dep)
-	}
+	cmd := withPositionals([]string{"doctor"}, dep)
 	body, err := t.runner.RunJSON(ctx, cmd...)
 	if err != nil {
 		// doctor exits non-zero when issues are present (exit 10);
@@ -203,24 +204,20 @@ func (readStatus) ReadOnly() bool { return true }
 // the caller's args or the operator's config, and returns the structured
 // fleet status.
 func (t *readStatus) Run(ctx context.Context, args map[string]any) (Result, error) {
-	cmd := []string{"status"}
-	dep, _ := args["deployment"].(string)
-	if dep != "" {
-		cmd = append(cmd, dep)
+	dep, err := optDeployment("read_status", args)
+	if err != nil {
+		return Result{}, err
 	}
 	// `pg_hardstorage status` requires --repo.  Resolve from the
 	// caller's args first, fall back to the operator's config —
 	// without this, the CLI fails with `usage.missing_flag`
 	// (pilot case C1: every cluster-state tool failed and the
 	// model returned an empty answer).
-	repo, _ := args["repo"].(string)
-	if repo == "" {
-		repo = repoResolver(dep)
+	cmd := []string{"status"}
+	if cmd, err = withRepo("read_status", cmd, args, dep); err != nil {
+		return Result{}, err
 	}
-	if repo != "" {
-		cmd = append(cmd, "--repo", repo)
-	}
-	body, err := t.runner.RunJSON(ctx, cmd...)
+	body, err := t.runner.RunJSON(ctx, withPositionals(cmd, dep)...)
 	if err != nil {
 		return Result{}, err
 	}
@@ -286,21 +283,20 @@ func (listBackups) ReadOnly() bool { return true }
 // Run shells out to `pg_hardstorage list <deployment>` with --repo
 // resolved from the caller's args or the operator's config.
 func (t *listBackups) Run(ctx context.Context, args map[string]any) (Result, error) {
-	dep, _ := args["deployment"].(string)
+	dep, err := optDeployment("list_backups", args)
+	if err != nil {
+		return Result{}, err
+	}
 	if dep == "" {
 		return Result{}, errors.New("list_backups: deployment is required")
 	}
-	cmd := []string{"list", dep}
 	// `list` requires --repo; resolve from arg or config.  Same
 	// bug class as read_status (pilot case C1).
-	repo, _ := args["repo"].(string)
-	if repo == "" {
-		repo = repoResolver(dep)
+	cmd := []string{"list"}
+	if cmd, err = withRepo("list_backups", cmd, args, dep); err != nil {
+		return Result{}, err
 	}
-	if repo != "" {
-		cmd = append(cmd, "--repo", repo)
-	}
-	body, err := t.runner.RunJSON(ctx, cmd...)
+	body, err := t.runner.RunJSON(ctx, withPositionals(cmd, dep)...)
 	if err != nil {
 		return Result{}, err
 	}
@@ -338,24 +334,29 @@ func (readBackup) ReadOnly() bool { return true }
 // Run shells out to `pg_hardstorage show <deployment> <backup-id>` with
 // --repo resolved from the caller's args or the operator's config.
 func (t *readBackup) Run(ctx context.Context, args map[string]any) (Result, error) {
-	dep, _ := args["deployment"].(string)
-	id, _ := args["backup_id"].(string)
+	dep, err := optDeployment("read_backup", args)
+	if err != nil {
+		return Result{}, err
+	}
+	id, err := argString("read_backup", args, "backup_id")
+	if err != nil {
+		return Result{}, err
+	}
 	if dep == "" || id == "" {
 		return Result{}, errors.New("read_backup: deployment and backup_id are required")
+	}
+	if err := validBackupIDArg("read_backup", id); err != nil {
+		return Result{}, err
 	}
 	// `show <deployment> <backup-id>` requires --repo and takes
 	// two positionals (deployment + backup id).  Resolve repo
 	// from arg or config.  Same bug class as read_status
 	// (pilot case C1).
-	cmd := []string{"show", dep, id}
-	repo, _ := args["repo"].(string)
-	if repo == "" {
-		repo = repoResolver(dep)
+	cmd := []string{"show"}
+	if cmd, err = withRepo("read_backup", cmd, args, dep); err != nil {
+		return Result{}, err
 	}
-	if repo != "" {
-		cmd = append(cmd, "--repo", repo)
-	}
-	body, err := t.runner.RunJSON(ctx, cmd...)
+	body, err := t.runner.RunJSON(ctx, withPositionals(cmd, dep, id)...)
 	if err != nil {
 		return Result{}, err
 	}
@@ -390,11 +391,17 @@ func (readRepoUsage) ReadOnly() bool { return true }
 
 // Run shells out to `pg_hardstorage repo usage <repo>` and returns the result.
 func (t *readRepoUsage) Run(ctx context.Context, args map[string]any) (Result, error) {
-	r, _ := args["repo"].(string)
+	r, err := argString("read_repo_usage", args, "repo")
+	if err != nil {
+		return Result{}, err
+	}
 	if r == "" {
 		return Result{}, errors.New("read_repo_usage: repo URL is required")
 	}
-	body, err := t.runner.RunJSON(ctx, "repo", "usage", r)
+	if err := validRepoArg("read_repo_usage", r); err != nil {
+		return Result{}, err
+	}
+	body, err := t.runner.RunJSON(ctx, withPositionals([]string{"repo", "usage"}, r)...)
 	if err != nil {
 		return Result{}, err
 	}
@@ -434,25 +441,55 @@ func (readAudit) ReadOnly() bool { return true }
 // Run shells out to `pg_hardstorage audit search` with the requested
 // filters and returns the matching entries.
 func (t *readAudit) Run(ctx context.Context, args map[string]any) (Result, error) {
-	r, _ := args["repo"].(string)
+	const tool = "read_audit"
+	r, err := argString(tool, args, "repo")
+	if err != nil {
+		return Result{}, err
+	}
 	if r == "" {
 		return Result{}, errors.New("read_audit: repo URL is required")
 	}
-	cmd := []string{"audit", "search", "--repo", r}
-	if a, _ := args["action"].(string); a != "" {
-		cmd = append(cmd, "--action", a)
+	if err := validRepoArg(tool, r); err != nil {
+		return Result{}, err
 	}
-	if d, _ := args["deployment"].(string); d != "" {
-		cmd = append(cmd, "--deployment", d)
+	d, err := optDeployment(tool, args)
+	if err != nil {
+		return Result{}, err
 	}
-	if s, _ := args["since"].(string); s != "" {
-		cmd = append(cmd, "--since", s)
+	// Flag values use the --flag=value spelling so each value stays
+	// bound to its flag even if it looked like one.
+	cmd := []string{"audit", "search", "--repo=" + r}
+	for _, key := range []string{"action", "since"} {
+		v, err := argString(tool, args, key)
+		if err != nil {
+			return Result{}, err
+		}
+		if v == "" {
+			continue
+		}
+		if err := validFilterArg(tool, key, v); err != nil {
+			return Result{}, err
+		}
+		cmd = append(cmd, "--"+key+"="+v)
 	}
-	switch lim := args["limit"].(type) {
+	if d != "" {
+		cmd = append(cmd, "--deployment="+d)
+	}
+	var lim int
+	switch v := args["limit"].(type) {
+	case nil:
 	case float64:
-		cmd = append(cmd, "--limit", fmt.Sprintf("%d", int(lim)))
+		lim = int(v)
 	case int:
-		cmd = append(cmd, "--limit", fmt.Sprintf("%d", lim))
+		lim = v
+	default:
+		return Result{}, fmt.Errorf("read_audit: limit must be an integer, got %T", v)
+	}
+	if lim < 0 {
+		return Result{}, fmt.Errorf("read_audit: limit must not be negative, got %d", lim)
+	}
+	if lim > 0 {
+		cmd = append(cmd, fmt.Sprintf("--limit=%d", lim))
 	}
 	body, err := t.runner.RunJSON(ctx, cmd...)
 	if err != nil {
@@ -536,6 +573,58 @@ func (searchDocs) Run(_ context.Context, args map[string]any) (Result, error) {
 		Summary: fmt.Sprintf("%d matches: %s", len(matches), strings.Join(ids, ", ")),
 		Body:    map[string]any{"matches": matches, "query": q},
 	}, nil
+}
+
+// optDeployment reads the optional "deployment" argument and enforces
+// the deployment-name grammar on it (see argvalidate.go for why).
+func optDeployment(tool string, args map[string]any) (string, error) {
+	dep, err := argString(tool, args, "deployment")
+	if err != nil || dep == "" {
+		return "", err
+	}
+	if err := validDeploymentArg(tool, dep); err != nil {
+		return "", err
+	}
+	return dep, nil
+}
+
+// withRepo appends --repo to cmd: the model's validated "repo"
+// argument when given, otherwise the operator's configured repo for
+// dep.  The configured value is trusted (it is the operator's own
+// file); the model's is not.
+func withRepo(tool string, cmd []string, args map[string]any, dep string) ([]string, error) {
+	repo, err := argString(tool, args, "repo")
+	if err != nil {
+		return nil, err
+	}
+	if repo != "" {
+		if err := validRepoArg(tool, repo); err != nil {
+			return nil, err
+		}
+	} else {
+		repo = repoResolver(dep)
+	}
+	if repo != "" {
+		cmd = append(cmd, "--repo", repo)
+	}
+	return cmd, nil
+}
+
+// withPositionals appends the non-empty positionals after a `--`
+// terminator, so cobra can never read one as a flag.  With no
+// positionals the terminator is omitted.
+func withPositionals(cmd []string, pos ...string) []string {
+	var keep []string
+	for _, p := range pos {
+		if p != "" {
+			keep = append(keep, p)
+		}
+	}
+	if len(keep) == 0 {
+		return cmd
+	}
+	cmd = append(cmd, "--")
+	return append(cmd, keep...)
 }
 
 // parseAsResult wraps a JSON body into a Result.  We decode to

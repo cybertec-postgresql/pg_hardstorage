@@ -139,7 +139,7 @@ func TestReadStatus_PassesDeployment(t *testing.T) {
 		t.Fatalf("expected 1 call; got %d", len(captured.calls))
 	}
 	args := captured.calls[0]
-	want := []string{"status", "db7", "-o", "json"}
+	want := []string{"status", "-o", "json", "--", "db7"}
 	if !equalStrings(args, want) {
 		t.Errorf("args = %v, want %v", args, want)
 	}
@@ -168,7 +168,7 @@ func TestListBackups_PassesRepoFlag(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"list", "db1", "--repo", "s3://acme/", "-o", "json"}
+	want := []string{"list", "--repo", "s3://acme/", "-o", "json", "--", "db1"}
 	if !equalStrings(captured.calls[0], want) {
 		t.Errorf("args = %v, want %v", captured.calls[0], want)
 	}
@@ -198,9 +198,9 @@ func TestReadAudit_PassesFilters(t *testing.T) {
 		t.Fatal(err)
 	}
 	args := captured.calls[0]
-	wantSubstr := []string{"audit", "search", "--repo", "s3://acme/",
-		"--action", "kms.shred", "--deployment", "db1",
-		"--since", "2026-04-01", "--limit", "20"}
+	wantSubstr := []string{"audit", "search", "--repo=s3://acme/",
+		"--action=kms.shred", "--deployment=db1",
+		"--since=2026-04-01", "--limit=20"}
 	for _, w := range wantSubstr {
 		found := false
 		for _, a := range args {
@@ -351,7 +351,7 @@ func TestReadDoctor_DeploymentIsPositionalNotFlag(t *testing.T) {
 		t.Fatalf("expected 1 call; got %d", len(captured.calls))
 	}
 	args := captured.calls[0]
-	want := []string{"doctor", "db7", "-o", "json"}
+	want := []string{"doctor", "-o", "json", "--", "db7"}
 	if !equalStrings(args, want) {
 		t.Errorf("args = %v, want %v (the bug was passing -d db7 instead of positional)", args, want)
 	}
@@ -378,7 +378,7 @@ func TestReadStatus_ResolvesRepoFromConfig(t *testing.T) {
 		t.Fatal(err)
 	}
 	args := captured.calls[0]
-	want := []string{"status", "billing", "--repo", "s3://prod-billing/", "-o", "json"}
+	want := []string{"status", "--repo", "s3://prod-billing/", "-o", "json", "--", "billing"}
 	if !equalStrings(args, want) {
 		t.Errorf("args = %v, want %v", args, want)
 	}
@@ -404,7 +404,7 @@ func TestReadStatus_ResolvesRepoFromConfig(t *testing.T) {
 		t.Fatal(err)
 	}
 	args = captured.calls[0]
-	want = []string{"status", "billing", "--repo", "s3://override/", "-o", "json"}
+	want = []string{"status", "--repo", "s3://override/", "-o", "json", "--", "billing"}
 	if !equalStrings(args, want) {
 		t.Errorf("args = %v, want %v", args, want)
 	}

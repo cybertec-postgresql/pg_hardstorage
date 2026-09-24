@@ -78,6 +78,29 @@ Three properties this enforces:
 This is what defends against the "the LLM lied to me" failure
 mode: the executed command is byte-equal to the one the user saw.
 
+Before it runs, the command must also pass an argv-hygiene check:
+
+- It must parse against the live command tree — an unknown
+  subcommand, unknown flag, or wrong number of positionals is
+  refused. The skill's `allowed_executes` prefix only bounds the
+  start of the string; the parse bounds the rest.
+- Global flags with side effects outside the command are refused
+  in every spelling: `--cpu-profile`, `--mem-profile`,
+  `--profile-port`, `--otel-endpoint`, `--otel-stdout`,
+  `--config` / `-c`, `--on-error-llm`. The CLI accepts these
+  anywhere on the command line, so `pg_hardstorage doctor
+  --cpu-profile=<path>` would otherwise truncate `<path>`.
+- Shell syntax (quotes, `;`, `|`, `&`, `>`, `$`, backticks) is
+  refused: the command is run directly, never through a shell.
+
+The read-only live-state tools (`read_doctor`, `read_status`,
+`list_backups`, `read_backup`, `read_repo_usage`, `read_audit`)
+apply the same rules to the arguments the model passes them:
+deployment names must match the deployment-name grammar, repository
+URLs must be a URL or an absolute path, no value may start with
+`-`, and positionals are passed after a `--` terminator so the CLI
+can never read one as a flag.
+
 ### Gate 3 — Typed confirmation for destructive operations
 
 For the most dangerous operations — `kms shred`, `repo gc
@@ -145,6 +168,13 @@ restores, and verifications are one cluster of operations;
 destructions are another; jumping between clusters without an
 intervening user statement is treated as evidence of a prompt
 injection or a hallucinated escalation.
+
+Concretely, a command carrying a high-risk verb (`delete`,
+`rotate`, `gc`, `force`, `purge`, `shred`, `wipe`) runs only when
+*you* raised that verb earlier in the session ("please run gc",
+"we need a key rotation"). Only your own prompts count: the model's
+replies and tool output cannot put a verb on-topic, since they are
+exactly what the detector is checking. `/clear` resets the topic set.
 
 This is the "the LLM was malicious / compromised" failure mode.
 It's the gate that catches *the model itself* going wrong, not
@@ -314,6 +344,16 @@ Four data-flow modes, default-conservative:
 | `standard` (default) | Metadata, doctor JSON, error messages, redacted config.  PII detector strips obvious patterns. |
 | `open` | Everything (with credentials always masked).  Dev / staging only. |
 | `local-only` | Refuses any provider that isn't local (Ollama, llama-cpp).  Auto-selected for `data_classification: confidential` or higher. |
+
+The mode applies to everything that carries operator or cluster
+data: your prompts, tool results, and the data sections of the
+session's system prompt — the skill's pre-loaded tool output
+(`read_doctor`, `list_deployments`, ...) and any operator context.
+Tool results served by `pg_hardstorage llm --mcp-server` are redacted
+the same way; under `local-only` the MCP server refuses tool calls,
+because it cannot see which model its client forwards results to.
+Only text the binary authors itself (skill template, runbook index,
+command catalog, rules) is sent unredacted.
 
 The mode is per-deployment, not per-call.  An operator who runs
 `llm` against a deployment classified `confidential` cannot

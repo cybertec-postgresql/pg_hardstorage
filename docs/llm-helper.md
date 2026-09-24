@@ -147,6 +147,11 @@ Per-session events include:
 - `llm.tool_result` — summary of each tool's result
 - `llm.response` — final answer plus token usage
 - `llm.command_warnings` — validator hits, if any
+- `llm.execute_gate` — advise+execute only: every `execute_command`
+  attempt, allowed or refused, with the gate that refused it
+- `llm.execute_anomaly` — advise+execute only: the anomaly
+  detector's verdict (`normal` / `warn` / `severe`) for each command
+  that passed the gates
 - `llm.session_ended` — final tally
 
 To pull the full transcript for one session:

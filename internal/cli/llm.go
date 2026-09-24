@@ -1084,6 +1084,7 @@ func buildLiveToolRegistry(gateState *toolGateState, cmdRoot *cobra.Command) (*t
 			Preview:         gateState.preview,
 			Anomaly:         gateState.anomaly,
 			Runner:          runner,
+			Tree:            cmdTree,
 			AuditCallback:   gateState.auditCallback,
 			AnomalyCallback: gateState.anomalyCallback,
 		})

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/cli/cmdtree"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/llm/safety"
 )
 
@@ -26,6 +27,11 @@ import (
 //  4. PreviewState.Has(cmd)         — replay protection;
 //     execute_command only accepts a string the model JUST
 //     asked preview_command to render, in the SAME turn.
+//  5. Shell syntax and side-effect global flags (--cpu-profile,
+//     --config, ...) refused; see safety.Gate.
+//  6. cmdtree.Validate(Tree, cmd)    — the command must parse
+//     against the real cobra tree (no unknown subcommand or
+//     flag, correct arity).
 //
 // Tool result body:
 //
@@ -72,6 +78,15 @@ type ExecuteCommand struct {
 	// Runner is the CLI runner the actual exec routes through.
 	// Required.  Same shape as the read-only tools' runner.
 	Runner *CLIRunner
+
+	// Tree is the live cobra command tree.  Required: every
+	// command that passes the policy gates is also parsed against
+	// it, and an unknown subcommand, unknown flag or wrong arity
+	// is refused.  The skill's prefix allowlist only bounds the
+	// start of the string; without the parse anything could ride
+	// after "pg_hardstorage doctor".  A nil Tree refuses every
+	// command rather than silently dropping the check.
+	Tree *cmdtree.Node
 
 	// AuditCallback, when non-nil, fires on every gate
 	// outcome (allow + refuse).  The chat orchestrator wires
@@ -121,17 +136,34 @@ func (e *ExecuteCommand) Run(ctx context.Context, args map[string]any) (Result, 
 		return Result{}, errors.New("execute_command: command is required")
 	}
 	decision := safety.Gate(e.Mode, e.Policy, e.Preview, cmd)
+	var parseErr error
+	if decision.Allowed {
+		// Parse gate: the command must resolve against the real
+		// cobra tree.  Runs after the cheap policy gates so a
+		// refusal there keeps its more specific reason.
+		if e.Tree == nil {
+			decision = safety.GateDecision{Reason: "invalid_command"}
+			parseErr = errors.New("command tree unavailable")
+		} else if verr := cmdtree.Validate(e.Tree, cmd, "pg_hardstorage"); verr != nil {
+			decision = safety.GateDecision{Reason: "invalid_command"}
+			parseErr = verr
+		}
+	}
 	if e.AuditCallback != nil {
 		e.AuditCallback(decision, cmd)
 	}
 	if !decision.Allowed {
+		body := map[string]any{
+			"refused": true,
+			"reason":  safety.Reason(decision),
+			"command": cmd,
+		}
+		if parseErr != nil {
+			body["detail"] = parseErr.Error()
+		}
 		return Result{
 			Summary: "execute_command refused",
-			Body: map[string]any{
-				"refused": true,
-				"reason":  safety.Reason(decision),
-				"command": cmd,
-			},
+			Body:    body,
 		}, nil
 	}
 

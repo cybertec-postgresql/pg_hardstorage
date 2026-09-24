@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"unicode"
 )
 
 // AnomalyDetector is the "anomaly refusal" layer of the
@@ -47,7 +48,8 @@ type AnomalyDetector struct {
 	DeploymentScope string
 
 	// RecentTopicTokens is the lowercased set of keywords
-	// extracted from the conversation so far.  Verbs in
+	// extracted from the operator's prompts so far (see
+	// ExtractTopicTokens for why only those).  Verbs in
 	// HighRiskVerbs must appear here for the command to be
 	// `normal`; otherwise the anomaly layer escalates.
 	RecentTopicTokens map[string]struct{}
@@ -131,7 +133,7 @@ func (d *AnomalyDetector) Score(cmd string) AnomalyDecision {
 		// High-risk verb fired.  Did the conversation
 		// recently discuss it?
 		if d.RecentTopicTokens != nil {
-			if _, ok := d.RecentTopicTokens[strings.ToLower(verb)]; ok {
+			if topicMentions(d.RecentTopicTokens, verb) {
 				return AnomalyDecision{
 					Score:  ScoreNormal,
 					Reason: "high-risk verb is on-topic for this conversation",
@@ -219,15 +221,45 @@ func looksLikeIdentifier(s string) bool {
 	return true
 }
 
+// topicMentions reports whether the topic set covers verb, either
+// verbatim or as an inflection operators actually type ("rotation",
+// "rotated", "deleting", "wiped"): a topic token that starts with the
+// verb minus a trailing 'e'.  Only verbs of four or more letters get
+// the stem match, so "gc" must be said as "gc".
+func topicMentions(topic map[string]struct{}, verb string) bool {
+	v := strings.ToLower(verb)
+	if _, ok := topic[v]; ok {
+		return true
+	}
+	if len(v) < 4 {
+		return false
+	}
+	stem := strings.TrimSuffix(v, "e")
+	for t := range topic {
+		if strings.HasPrefix(t, stem) {
+			return true
+		}
+	}
+	return false
+}
+
 // ExtractTopicTokens is a helper for the chat orchestrator to
-// build the RecentTopicTokens set from the assistant's recent
-// turns.  It returns lowercased single-word tokens of length
-// >= 3 that aren't common stop-words; callers union these
-// across the conversation.
+// build the RecentTopicTokens set.  Feed it the OPERATOR's
+// prompts only: the detector exists to catch the model (or text
+// injected into tool output) steering towards a destructive verb,
+// so letting model or tool text vouch for a verb would let it
+// vouch for itself.  It returns lowercased word tokens, split on
+// anything that is not a letter, digit, '_' or '-' (so "gc?" and
+// "key." count), of length >= 2 ("gc" is a high-risk verb), minus
+// common stop-words; callers union these across the conversation.
 func ExtractTopicTokens(text string) map[string]struct{} {
 	out := map[string]struct{}{}
-	for _, t := range tokensOf(text) {
-		if len(t) < 3 {
+	words := strings.FieldsFunc(strings.ToLower(text), func(r rune) bool {
+		return !(r == '-' || r == '_' || unicode.IsLetter(r) || unicode.IsDigit(r))
+	})
+	for _, t := range words {
+		t = strings.Trim(t, "-_")
+		if len(t) < 2 {
 			continue
 		}
 		if isStopWord(t) {
