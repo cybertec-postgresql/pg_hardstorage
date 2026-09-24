@@ -20,6 +20,11 @@ Append a stream to the registry. Does NOT create the slot or the
 publication on the source PG; both must already exist (publication)
 or will be created lazily by 'logical stream' (slot).
 
+The slot name (--slot, or the default pg_hardstorage_logical_<name>)
+must be a valid replication slot name: lower-case letters, digits and
+underscores, at most 63 characters. Stream names that would derive an
+invalid default slot are refused unless --slot is given.
+
 ```
 pg_hardstorage logical add <name> [flags]
 ```

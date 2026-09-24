@@ -67,6 +67,9 @@ Common leaf shapes:
 | `usage.confirmation_required`, `usage.confirmation_mismatch` | Typed-keyring confirmation missing or wrong |
 | `usage.conflicting_flags`, `usage.conflicting_targets` | Mutually-exclusive flags both set |
 | `usage.unknown_output_format`, `usage.unknown_policy`, `usage.unknown_scheme`, `usage.unknown_shell` | Enum-shaped value out of set |
+| `usage.interactive_needs_text` | Interactive `init` wizard under a structured `--output`; pass `--yes` with the answers as flags, or use `-o text` |
+| `usage.follow_needs_stream` | `logs --follow` with a format that promises one finished document (use `-o ndjson` or `-o text`) |
+| `usage.bad_slot` | `logical add`: the slot name (`--slot`, or the default derived from the stream name) is not a valid replication slot name |
 
 **Recovery:** read the suggestion, fix the command line,
 re-run.
@@ -238,7 +241,7 @@ field is where the recovery hint lives.
 | `redact.*` | Logical redaction passes |
 | `partial.*` | Partial / table-level restore |
 | `combine.*` | `pg_combinebackup` orchestration |
-| `paths.*`, `init.*`, `config.*` | Bootstrap (`config.invalid`, `config.load_failed`, `config.kek_ref_unknown_scheme`) |
+| `paths.*`, `init.*`, `config.*` | Bootstrap (`config.invalid`, `config.load_failed` — also an explicit `-c` file that does not exist; `config.kek_ref_unknown_scheme`; `config.defined_elsewhere` — an edit targets a deployment/sink defined in a `conf.d` drop-in or `PG_HARDSTORAGE_CONFIG`) |
 | `compliance.*`, `integrity.*`, `insider.*` | Compliance / integrity scanning |
 | `llm.*` | LLM provider, skill loading, MCP server |
 | `history.*` | Restore-history slice |

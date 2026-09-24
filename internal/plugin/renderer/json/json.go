@@ -1,8 +1,10 @@
 // Package json renders Result and Event values as indented JSON.
 //
-// One JSON document per RenderResult call; one JSON document per
-// RenderEvent call. Use ndjson for streaming commands; this renderer is
-// for one-shot commands and pretty inspection.
+// One JSON document per RenderResult call. The renderer declares
+// output.SingleDocumentRenderer, so the dispatcher never hands it
+// streaming Events for stdout: `cmd -o json` prints exactly one document
+// there, and events go to stderr as NDJSON lines. Use ndjson to stream
+// events on stdout.
 package json
 
 import (
@@ -14,6 +16,8 @@ import (
 
 // Name is the canonical name of this renderer.
 const Name = "json"
+
+var _ output.SingleDocumentRenderer = (*Renderer)(nil)
 
 // Renderer is the indented-JSON renderer.
 type Renderer struct{}
@@ -34,6 +38,11 @@ func (r *Renderer) RenderResult(w io.Writer, res *output.Result) error {
 func (r *Renderer) RenderEvent(w io.Writer, ev *output.Event) error {
 	return marshalIndented(w, ev)
 }
+
+// SingleDocument implements output.SingleDocumentRenderer: stdout
+// carries exactly one JSON document per invocation, so `cmd -o json | jq`
+// never sees a second one.
+func (r *Renderer) SingleDocument() bool { return true }
 
 // SupportsTTY reports false — JSON is for machine consumption.
 func (r *Renderer) SupportsTTY() bool { return false }
