@@ -12,6 +12,20 @@ possible) and return `NoRecovery`. Targeting is a separate concern: `target.go`
 resolves selectors like `agent_random`, `pg_random`, `repo` into a concrete
 `TargetSet` the fault then operates on.
 
+A fault must either produce its effect or say it did not: return
+`ErrNotApplicable` when it cannot on this target (the soak records
+`fault_skipped_not_applicable`), and a `Recovery` must return an error when the
+revert fails (an `inject:` step then fails, a soak records a `recovery`
+failure). In particular:
+
+- `disk_full` never exceeds `max_bytes` (default 256 MiB), so when `fill`% of
+  the free space is above it — any large filesystem — the fault is not
+  applied. After the fill it re-measures and fails if the space was not
+  actually consumed.
+- `pause_archive` SIGSTOPs the `pg_hardstorage wal stream` / `wal push`
+  processes in the target and SIGCONTs them on recovery (failing if one is
+  still stopped); with no archiver running it is not applicable.
+
 Adding a new fault is one Go type plus one registry entry: implement `Name()` to
 match the YAML key, implement `Apply` to perform the action, return a `Recovery`
 (or `NoRecovery`). A scenario references the fault by name plus key=value

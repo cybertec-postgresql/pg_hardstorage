@@ -117,6 +117,12 @@ type runState struct {
 	//     consumes this ref so assert_restored_match knows
 	//     where to start the sandbox cluster.
 	capturedStates map[string]*capturedState
+
+	// lastCLIOutput is the combined stdout+stderr of the most recent
+	// cli_run step; haveCLIOutput says one has run. Feed the
+	// cli_output_contains_any assertion.
+	lastCLIOutput string
+	haveCLIOutput bool
 }
 
 // capturedState is the per-name struct stored in
@@ -1663,6 +1669,11 @@ func runInject(ctx context.Context, st scenario.Step, idx int, state *runState, 
 			emit(out, "step.inject.recovery_failed", map[string]any{
 				"index": idx, "error": rerr.Error(),
 			})
+			// The fault is still applied. Passing here let the scenario
+			// carry on against a degraded cell and blame whatever broke
+			// next on the product.
+			return StepResult{Index: idx, Kind: st.Kind, Pass: false,
+				Message: fmt.Sprintf("inject %q: recovery failed, fault still applied: %v", action, rerr)}
 		}
 	}
 	emit(out, "step.inject.completed", map[string]any{

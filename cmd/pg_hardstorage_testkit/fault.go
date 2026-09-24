@@ -67,7 +67,7 @@ the recognised primitives (run with --help to see the list).
 The actual injection logic lives in the inject package which
 ships separately; this command only manages the catalogue.`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			f, err := config.LoadFaults(path)
+			f, err := config.LoadFaultsOrEmpty(path)
 			if err != nil {
 				return err
 			}

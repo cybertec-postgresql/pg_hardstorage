@@ -77,13 +77,9 @@ steps:
   #    name the synthetic manifest by relative path so we know
   #    the walker reached it.
   - assert:
-      asserts:
-        - kind: cli_stderr_or_stdout_contains_any
-          substrings:
-            - "synthetic-v0_8.json"
-        - kind: cli_stderr_or_stdout_contains_any
-          substrings:
-            - "schema_version"
-            - "migrated"
-            - "schema.unsupported"
-            - "manifest.format"
+      - cli_output_contains_any: [ "synthetic-v0_8.json" ]
+      - cli_output_contains_any:
+          - "schema_version"
+          - "migrated"
+          - "schema.unsupported"
+          - "manifest.format"

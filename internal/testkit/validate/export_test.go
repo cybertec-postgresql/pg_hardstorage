@@ -1,5 +1,7 @@
 package validate
 
+import "time"
+
 // ExtractFieldForTest exposes the unexported extractField
 // helper to the _test package.  Kept in a *_test.go file so
 // it doesn't ship in the production binary.
@@ -22,4 +24,12 @@ func IsRepoAlreadyExistsForTest(err error, output []byte) bool {
 // REINDEX, and anything else must yield "".
 func CorruptIndexNameForTest(err error) string {
 	return corruptIndexName(err)
+}
+
+// SetMidBackupDelayForTest shrinks how long after a backup starts a
+// mid-backup fault is applied; the returned func restores it.
+func SetMidBackupDelayForTest(d time.Duration) func() {
+	old := midBackupDelay
+	midBackupDelay = d
+	return func() { midBackupDelay = old }
 }

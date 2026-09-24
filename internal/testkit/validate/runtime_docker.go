@@ -96,8 +96,8 @@ type DockerCellRuntime struct {
 	// kills the process and parses pgbench's final report
 	// from the captured stdout/stderr.
 	sustainedCmd       *exec.Cmd
-	sustainedStdout    *bytes.Buffer
-	sustainedStderr    *bytes.Buffer
+	sustainedStdout    *lockedBuffer
+	sustainedStderr    *lockedBuffer
 	sustainedStartedAt time.Time
 	sustainedCancel    context.CancelFunc
 	sustainedDone      chan struct{}
@@ -115,8 +115,8 @@ type DockerCellRuntime struct {
 	// mutex guards the fields it writes from the reader in
 	// StopWALStream.
 	walStreamMu       sync.Mutex
-	walStreamStdout   *bytes.Buffer
-	walStreamStderr   *bytes.Buffer
+	walStreamStdout   *lockedBuffer
+	walStreamStderr   *lockedBuffer
 	walStreamCancel   context.CancelFunc
 	walStreamDone     chan struct{}
 	walStreamRunning  bool
@@ -445,25 +445,6 @@ func (d *DockerCellRuntime) locateContainerPGBin(ctx context.Context, binName st
 // test (see runCellLoop).
 var ErrCellNotReady = errors.New("cell not ready: lead container not running")
 
-// cellDownDockerErr reports whether a docker-exec error is the
-// daemon saying the target container is not in a usable state —
-// stopped or removed by a fault.  These phrases originate only
-// from dockerd describing container state, so matching them
-// cannot mask a genuine pg_hardstorage / pg_verifybackup error.
-// Used alongside containerRunning to catch the race where a fault
-// stops the cell *during* an exec (the exec fails, but the
-// container may already be back up by the time we re-inspect).
-func cellDownDockerErr(err error) bool {
-	if err == nil {
-		return false
-	}
-	s := err.Error()
-	return strings.Contains(s, "is not running") ||
-		strings.Contains(s, "is restarting, wait until the container is running") ||
-		strings.Contains(s, "No such container") ||
-		strings.Contains(s, "no such container")
-}
-
 // containerRunning returns true iff `docker inspect` reports
 // State.Running == true for the lead container.  Any inspect
 // failure (missing container, daemon error) returns false so the
@@ -540,6 +521,25 @@ func (d *DockerCellRuntime) GC(ctx context.Context) error {
 		"--min-chunk-age", retentionMinChunkAge.String(), "-o", "json")
 }
 
+// RepoKey identifies the cell's repository: its URL plus the storage
+// environment the agent reaches it with, since two sinks may share a
+// URL shape and differ only in endpoint credentials. Over-distinguishing
+// is harmless (a shared repository is gc'd twice); merging two distinct
+// repositories would leave one never collected.
+func (d *DockerCellRuntime) RepoKey() string {
+	keys := make([]string, 0, len(d.sinkAgentEnv))
+	for k := range d.sinkAgentEnv {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var b strings.Builder
+	b.WriteString(d.RepoURL)
+	for _, k := range keys {
+		b.WriteString("\x00" + k + "=" + d.sinkAgentEnv[k])
+	}
+	return b.String()
+}
+
 func (d *DockerCellRuntime) retentionStep(ctx context.Context, argv ...string) error {
 	if !d.containerRunning(ctx) {
 		return ErrCellNotReady
@@ -577,6 +577,56 @@ func (d *DockerCellRuntime) containerPositivelyStopped(ctx context.Context) bool
 		"inspect", "--format", "{{.State.Running}}",
 		d.Container).Output()
 	return err == nil && strings.TrimSpace(string(out)) == "false"
+}
+
+// cellWentDown classifies a failed agent exec. It returns an error
+// wrapping ErrCellNotReady when there is positive evidence that the
+// container — not pg_hardstorage — ended the exec, and nil when the
+// failure must be scored against the product. bootBefore is the
+// container's StartedAt sampled immediately before THIS exec ("" when
+// unreadable). TakeBackup and VerifyRestore share it so a dying cell is
+// scored the same way whichever operation it interrupted.
+func (d *DockerCellRuntime) cellWentDown(ctx context.Context, op, bootBefore string, stdout, stderr []byte, err error) error {
+	// The container restarted underneath the backup. `docker exec`
+	// children die with the container (exit 137), so the backup was
+	// killed by the testbed, not by pg_hardstorage — the enterprise_
+	// heavy soak lost four backups this way, each within a second of
+	// Docker's unless-stopped policy restarting a cell whose entrypoint
+	// had exited during cgroup_squeeze recovery. Detected precisely:
+	// the container's StartedAt changed across the call. A real
+	// pg_hardstorage crash never restarts its container, so this
+	// cannot hide one; the event stays visible as
+	// backup_skipped_cell_down / verify_skipped_cell_down.
+	if bootBefore != "" {
+		if bootAfter := d.containerStartedAt(ctx); bootAfter != "" && bootAfter != bootBefore {
+			return fmt.Errorf("%w: container %s restarted during the %s (StartedAt %s -> %s): %v",
+				ErrCellNotReady, d.Container, op, bootBefore, bootAfter, err)
+		}
+	}
+	// Or it stopped and has not come back yet: the release soak's first
+	// backup_failed was `docker exec` refusing to enter a container a
+	// SIGKILL fault had just killed (exit 128, "error executing setns
+	// process") — pg_hardstorage never started. Same argument: a
+	// pg_hardstorage failure cannot stop its container. Requires Docker
+	// to say so; an inspect that fails proves nothing.
+	if d.containerPositivelyStopped(ctx) {
+		return fmt.Errorf("%w: container %s stopped during the %s: %v",
+			ErrCellNotReady, d.Container, op, err)
+	}
+	// Docker can lag the truth: on the loaded soak host a SIGKILLed
+	// container stayed "running" for ~30 s after its init died (docker
+	// kill: "did not receive an exit event"), so the check above saw
+	// nothing. The exec error is the evidence then — runc could not
+	// join the container's namespaces because they no longer exist, so
+	// pg_hardstorage never ran. The third attempt then met dockerd
+	// refusing the exec outright ("is restarting"), with Running still
+	// true. Only these messages: other OCI exec failures (a wrong binary
+	// path) are real harness failures.
+	if isContainerGoneExecError(stdout, stderr) {
+		return fmt.Errorf("%w: container %s had died under the %s (exec could not join its namespaces): %v",
+			ErrCellNotReady, d.Container, op, err)
+	}
+	return nil
 }
 
 // TakeBackup invokes `pg_hardstorage backup` inside the
@@ -649,10 +699,17 @@ func (d *DockerCellRuntime) TakeBackup(ctx context.Context) (string, error) {
 	var (
 		stdout, stderr []byte
 		err            error
+		bootBefore     string
 	)
-	bootBefore := d.containerStartedAt(ctx)
 	deadline := time.Now().Add(pgRecoveryBudget)
 	for backoff := time.Second; ; {
+		// StartedAt is sampled per attempt, not once before the loop:
+		// the loop can wait up to pgRecoveryBudget, and a container
+		// restart during that wait (the very recovery it is waiting
+		// out) was otherwise charged to whichever later attempt failed
+		// — turning a genuine pg_hardstorage failure on a healthy,
+		// already-restarted container into backup_skipped_cell_down.
+		bootBefore = d.containerStartedAt(ctx)
 		stdout, stderr, err = d.dockerExecCapture(ctx,
 			d.AgentBinary, "backup", d.Deployment,
 			"--pg-connection", d.containerDSN(),
@@ -682,44 +739,8 @@ func (d *DockerCellRuntime) TakeBackup(ctx context.Context) (string, error) {
 		}
 	}
 	if err != nil {
-		// The container restarted underneath the backup. `docker exec`
-		// children die with the container (exit 137), so the backup was
-		// killed by the testbed, not by pg_hardstorage — the enterprise_
-		// heavy soak lost four backups this way, each within a second of
-		// Docker's unless-stopped policy restarting a cell whose entrypoint
-		// had exited during cgroup_squeeze recovery. Detected precisely:
-		// the container's StartedAt changed across the call. A real
-		// pg_hardstorage crash never restarts its container, so this
-		// cannot hide one; the event stays visible as
-		// backup_skipped_cell_down.
-		if bootBefore != "" {
-			if bootAfter := d.containerStartedAt(ctx); bootAfter != "" && bootAfter != bootBefore {
-				return "", fmt.Errorf("%w: container %s restarted during the backup (StartedAt %s -> %s): %v",
-					ErrCellNotReady, d.Container, bootBefore, bootAfter, err)
-			}
-		}
-		// Or it stopped and has not come back yet: the release soak's first
-		// backup_failed was `docker exec` refusing to enter a container a
-		// SIGKILL fault had just killed (exit 128, "error executing setns
-		// process") — pg_hardstorage never started. Same argument: a
-		// pg_hardstorage failure cannot stop its container. Requires Docker
-		// to say so; an inspect that fails proves nothing.
-		if d.containerPositivelyStopped(ctx) {
-			return "", fmt.Errorf("%w: container %s stopped during the backup: %v",
-				ErrCellNotReady, d.Container, err)
-		}
-		// Docker can lag the truth: on the loaded soak host a SIGKILLed
-		// container stayed "running" for ~30 s after its init died (docker
-		// kill: "did not receive an exit event"), so the check above saw
-		// nothing. The exec error is the evidence then — runc could not
-		// join the container's namespaces because they no longer exist, so
-		// pg_hardstorage never ran. The third attempt then met dockerd
-		// refusing the exec outright ("is restarting"), with Running still
-		// true. Only these messages: other OCI exec failures (a wrong binary
-		// path) are real harness failures.
-		if isContainerGoneExecError(stdout, stderr) {
-			return "", fmt.Errorf("%w: container %s had died under the backup (exec could not join its namespaces): %v",
-				ErrCellNotReady, d.Container, err)
+		if downErr := d.cellWentDown(ctx, "backup", bootBefore, stdout, stderr, err); downErr != nil {
+			return "", downErr
 		}
 		// Diagnostic display still wants combined output —
 		// stderr is where the operator-relevant context
@@ -805,20 +826,25 @@ func (d *DockerCellRuntime) VerifyRestore(ctx context.Context, backupID string) 
 	//
 	// Omitting --to / --to-lsn / --to-name leaves PITR disarmed (the
 	// CLI defaults to "no recovery target" when no --to* is set).
-	out, err := d.dockerExec(ctx,
+	bootBefore := d.containerStartedAt(ctx)
+	stdout, stderr, err := d.dockerExecCapture(ctx,
 		d.AgentBinary, "restore", d.Deployment, backupID,
 		"--repo", d.RepoURL,
 		"--target", target,
 		"--verify", "skip",
 		"--verify-restore", "required")
 	if err != nil {
-		// A fault may have stopped the cell between the gate above
-		// and this exec — re-check (and inspect the error text for
-		// the kill-during-exec race) and soft-skip rather than
-		// reporting a verify failure for a down cell.
-		if !d.containerRunning(ctx) || cellDownDockerErr(err) {
-			return ErrCellNotReady
+		// A fault may have stopped or restarted the cell between the
+		// gate above and this exec. Classified exactly as TakeBackup
+		// does: only positive evidence that the container ended the
+		// exec is a skip. The old check matched dockerd's phrases
+		// against the Go error — which is only "exit status N"; the
+		// daemon's words are in the output — and read an inspect that
+		// FAILED as "stopped", which hid real restore failures.
+		if downErr := d.cellWentDown(ctx, "restore-verify", bootBefore, stdout, stderr, err); downErr != nil {
+			return downErr
 		}
+		out := append(append([]byte{}, stdout...), stderr...)
 		// 4 KiB cap: pg_hardstorage's restore-failure JSON nests the
 		// postverify pg_ctl output + postgresql.log tail; 256 B
 		// truncated the actual reason mid-line.
@@ -834,7 +860,9 @@ func (d *DockerCellRuntime) ApplyFault(ctx context.Context, action string) (inje
 	if d.Targets == nil {
 		return nil, errors.New("ApplyFault: target set not initialised (Setup not called?)")
 	}
-	return inject.DefaultRegistry.Apply(ctx, action, d.Targets)
+	// On behalf of this deployment: repo-corruption faults touch only its
+	// files, not a random file of the repository the fleet shares.
+	return inject.DefaultRegistry.ApplyForDeployment(ctx, action, d.Targets, d.Deployment)
 }
 
 // Teardown closes the pgx connection and brings down the
@@ -915,7 +943,7 @@ func (d *DockerCellRuntime) StartSustainedLoad(ctx context.Context) error {
 	args = append(args, d.PGDatabase)
 
 	bgCtx, cancel := context.WithCancel(context.Background())
-	var stdout, stderr bytes.Buffer
+	var stdout, stderr lockedBuffer
 	// A placeholder Cmd marks the writer as requested-and-running for
 	// SustainedWriterActive; the supervisor owns the real processes.
 	d.sustainedCmd = exec.CommandContext(bgCtx, d.dockerBin())
@@ -937,7 +965,7 @@ func (d *DockerCellRuntime) StartSustainedLoad(ctx context.Context) error {
 // passed without backups having run under sustained writes for most of
 // it. This is the same defect v1.4 found in the WAL-stream sidecar, and
 // the same fix: restart on exit, count the restarts.
-func (d *DockerCellRuntime) superviseSustainedLoad(ctx context.Context, args []string, stdout, stderr *bytes.Buffer) {
+func (d *DockerCellRuntime) superviseSustainedLoad(ctx context.Context, args []string, stdout, stderr *lockedBuffer) {
 	defer close(d.sustainedDone)
 	first := true
 	for {
@@ -957,10 +985,11 @@ func (d *DockerCellRuntime) superviseSustainedLoad(ctx context.Context, args []s
 		first = false
 		full := append([]string{"exec", "-u", d.PGUser, d.Container}, args...)
 		cmd := exec.CommandContext(ctx, d.dockerBin(), full...)
-		d.sustainedMu.Lock()
 		cmd.Stdout = stdout
 		cmd.Stderr = stderr
-		d.sustainedMu.Unlock()
+		// Once ctx kills the docker client, stop waiting for an output
+		// pipe something else still holds open, so the supervisor exits.
+		cmd.WaitDelay = sidecarWaitDelay
 		if err := cmd.Start(); err != nil {
 			continue // container likely down mid-fault; retry after the delay
 		}
@@ -971,6 +1000,37 @@ func (d *DockerCellRuntime) superviseSustainedLoad(ctx context.Context, args []s
 // sustainedRestartDelay spaces pgbench restarts while PostgreSQL is
 // recovering, so a long recovery does not become a tight loop.
 var sustainedRestartDelay = 5 * time.Second
+
+// sustainedStopTimeout bounds how long StopSustainedLoad waits for the
+// supervisor to exit before it reports anyway, so a wedged docker
+// cannot block teardown. A var so tests can shrink it.
+var sustainedStopTimeout = 10 * time.Second
+
+// sidecarWaitDelay is exec.Cmd.WaitDelay for the supervised sidecars.
+const sidecarWaitDelay = 2 * time.Second
+
+// lockedBuffer is a bytes.Buffer safe for exec's output-copier goroutine
+// to write while another goroutine reads it. The sidecar buffers need
+// it: StopSustainedLoad reads the progress stream after at most
+// sustainedStopTimeout even when the supervisor has not exited, and at
+// that point exec may still be copying into the buffer — a plain
+// bytes.Buffer there was a data race.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
 
 // SustainedWriterActive reports whether a writer is actually
 // running. The zero-SustainedClients path leaves sustainedCmd nil,
@@ -989,7 +1049,7 @@ func (d *DockerCellRuntime) StopSustainedLoad(ctx context.Context) (*report.Load
 	d.sustainedCancel()
 	select {
 	case <-d.sustainedDone:
-	case <-time.After(10 * time.Second):
+	case <-time.After(sustainedStopTimeout):
 		// docker wedged; do not block teardown
 	}
 
@@ -1075,7 +1135,7 @@ func (d *DockerCellRuntime) StartWALStream(ctx context.Context) error {
 		return errors.New("StartWALStream: already running")
 	}
 	d.walStreamRunning = true
-	var stdout, stderr bytes.Buffer
+	var stdout, stderr lockedBuffer
 	d.walStreamStdout = &stdout
 	d.walStreamStderr = &stderr
 	bgCtx, cancel := context.WithCancel(context.Background())
@@ -1115,7 +1175,7 @@ const walStreamRestartDelay = 2 * time.Second
 // Restarts are counted rather than merely retried: a cell whose sidecar
 // had to be re-attached ten times is telling you something about the
 // fault schedule, and StopWALStream reports it.
-func (d *DockerCellRuntime) superviseWALStream(ctx context.Context, done chan struct{}, stdout, stderr *bytes.Buffer) {
+func (d *DockerCellRuntime) superviseWALStream(ctx context.Context, done chan struct{}, stdout, stderr *lockedBuffer) {
 	defer close(done)
 	first := true
 	for {
@@ -1146,6 +1206,7 @@ func (d *DockerCellRuntime) superviseWALStream(ctx context.Context, done chan st
 		cmd := exec.CommandContext(ctx, d.dockerBin(), full...)
 		cmd.Stdout = stdout
 		cmd.Stderr = stderr
+		cmd.WaitDelay = sidecarWaitDelay
 		if err := cmd.Start(); err != nil {
 			// The container is probably down mid-fault. Loop and
 			// retry; the delay above bounds the spin.

@@ -73,3 +73,28 @@ func TestRetentionGate_EnterGivesUpWhenTheRunEnds(t *testing.T) {
 		t.Fatal("enter blocked past its context")
 	}
 }
+
+// The timeout must be decided by the timer that wakes the waiter, not by
+// re-reading the clock afterwards. quiesce armed its timer and only then
+// computed its deadline, so the timer fired a hair before the deadline:
+// a waiter woken by it (or one that missed the wake entirely, because the
+// timer fired before it began waiting) saw "not yet", waited again — and
+// with the fleet still busy nothing was left to wake it. Short timeouts
+// make that window likely; many rounds make it certain to show up.
+func TestRetentionGate_QuiesceTimerWakeEndsTheWait(t *testing.T) {
+	g := newRetentionGate()
+	ctx := context.Background()
+	g.enter(ctx)
+	for i := range 2000 {
+		done := make(chan bool, 1)
+		go func() { done <- g.quiesce(ctx, time.Duration(i%4)*time.Microsecond+time.Nanosecond) }()
+		select {
+		case ok := <-done:
+			if ok {
+				t.Fatal("quiesce must not succeed while an operation is in flight")
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("round %d: quiesce re-waited after its timer fired and never returned", i)
+		}
+	}
+}

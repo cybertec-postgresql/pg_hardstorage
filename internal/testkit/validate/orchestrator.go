@@ -48,6 +48,12 @@ type RunOptions struct {
 	OnEvent func(Event)
 }
 
+// recoveryTimeout bounds one fault revert. Generous — a revert may
+// restart a container and wait for PostgreSQL — but finite, so a wedged
+// revert fails as recovery_failed instead of holding the run past its
+// deadline. A var so tests can shrink it.
+var recoveryTimeout = 10 * time.Minute
+
 // defaultSetupConcurrency is the fallback applied when
 // RunOptions.SetupConcurrency == 0.  Picked to keep a
 // reasonable host responsive during the bring-up storm of
@@ -165,6 +171,7 @@ func Run(ctx context.Context, opts RunOptions) (*report.Report, error) {
 		// reported zero unrevertable faults regardless of how many
 		// recovery_failed events fired.
 		rep.FaultStats.RecoveryFails += c.RecoveryFails
+		rep.FaultStats.ApplyFails += c.FaultApplyFails
 	}
 	// Move any cell-attributed failures into rep.Failures so
 	// AddFailure semantics match — but the loop already
@@ -204,6 +211,16 @@ func ResetForTesting() {
 	pendingMu.Lock()
 	pendingFailures = nil
 	pendingMu.Unlock()
+}
+
+// recordFailure is the one way a failure enters the report: it
+// announces it on the event stream as cell_failed (so live consumers —
+// the Pushgateway pass gauge — reach the same verdict the report does)
+// and stores it. Returns reportFailure's "first failure for this cell".
+func recordFailure(emit func(Event), f report.Failure) bool {
+	emit(Event{Cell: f.Cell, Iteration: f.Iteration, Op: "cell_failed",
+		Detail: f.Kind, Err: f.Message})
+	return reportFailure(f)
 }
 
 // reportFailure stores a failure for the orchestrator to splice
@@ -266,6 +283,7 @@ func runCellLoop(
 		case <-ctx.Done():
 			cr.Pass = false
 			cr.FirstFailureMsg = "cancelled before setup: " + ctx.Err().Error()
+			emit(Event{Cell: cr.Name, Op: "cell_failed", Detail: "cancelled", Err: cr.FirstFailureMsg})
 			return
 		}
 	}
@@ -286,7 +304,7 @@ func runCellLoop(
 		cr.Pass = false
 		cr.FirstFailureMsg = "setup failed: " + err.Error()
 		emit(Event{Cell: cr.Name, Op: "setup_failed", Err: err.Error()})
-		reportFailure(report.Failure{
+		recordFailure(emit, report.Failure{
 			At: time.Now().UTC(), Cell: cr.Name, Iteration: 0,
 			Kind: "setup", Message: err.Error(),
 		})
@@ -309,7 +327,7 @@ func runCellLoop(
 		cr.Pass = false
 		cr.FirstFailureMsg = "seed failed: " + err.Error()
 		emit(Event{Cell: cr.Name, Op: "seed_failed", Err: err.Error()})
-		reportFailure(report.Failure{
+		recordFailure(emit, report.Failure{
 			At: time.Now().UTC(), Cell: cr.Name, Iteration: 0,
 			Kind: "seed", Message: err.Error(),
 		})
@@ -329,7 +347,7 @@ func runCellLoop(
 		cr.Pass = false
 		cr.FirstFailureMsg = "sustained load failed to start: " + err.Error()
 		emit(Event{Cell: cr.Name, Op: "sustained_load_failed", Err: err.Error()})
-		reportFailure(report.Failure{
+		recordFailure(emit, report.Failure{
 			At: time.Now().UTC(), Cell: cr.Name, Iteration: 0,
 			Kind: "sustained_load", Message: err.Error(),
 		})
@@ -359,7 +377,7 @@ func runCellLoop(
 		cr.Pass = false
 		cr.FirstFailureMsg = "wal stream failed to start: " + err.Error()
 		emit(Event{Cell: cr.Name, Op: "wal_stream_failed", Err: err.Error()})
-		reportFailure(report.Failure{
+		recordFailure(emit, report.Failure{
 			At: time.Now().UTC(), Cell: cr.Name, Iteration: 0,
 			Kind: "wal_stream", Message: err.Error(),
 		})
@@ -382,6 +400,45 @@ func runCellLoop(
 	}()
 
 	var lastBackupID string
+
+	// Repo-corruption faults (manifest_targeted_corruption,
+	// truncated/missing_wal_segment) damage this cell's own backups —
+	// DockerCellRuntime scopes them to its deployment. A restore of a
+	// backup that existed when such a fault landed may then rightly be
+	// refused: that is the product DETECTING the damage, the success
+	// signal. lastBackupAt / corruptedAt tell those restores from a
+	// genuine failure: only a backup completed BEFORE the latest
+	// corruption can carry it.
+	var lastBackupAt, corruptedAt time.Time
+
+	// Proof of life. A cell a fault killed for good skips every later
+	// backup and verify as *_skipped_cell_down, and skips are rightly not
+	// failures — so without a floor such a cell PASSED having measured
+	// nothing. A backup that completed, or that PostgreSQL refused over
+	// injected source corruption, proves the cell and the product ran;
+	// going MaxBackupGap without one fails the cell (checked on every
+	// skipped backup), and so does a run in which the cell's backups were
+	// dispatched and none ever got that far (checked at the end).
+	lastAlive := time.Now()
+	backupsDispatched, backupsAlive := 0, 0
+	cellDown := func(iter int, msg string) bool {
+		if recordFailure(emit, report.Failure{
+			At: time.Now().UTC(), Cell: cr.Name, Iteration: iter,
+			Kind: "cell_down", Message: msg,
+		}) {
+			cr.Pass = false
+			cr.FirstFailureMsg = msg
+			return true
+		}
+		return false
+	}
+	defer func() {
+		if cr.Pass && backupsDispatched > 0 && backupsAlive == 0 {
+			cellDown(cr.LastIteration, fmt.Sprintf(
+				"none of the cell's %d dispatched backups got to run: the cell was down for the whole run",
+				backupsDispatched))
+		}
+	}()
 	for iter := 1; ; iter++ {
 		// Check ctx.Done before each iteration; the loop
 		// exits cleanly when the soak duration elapses.
@@ -418,13 +475,10 @@ func runCellLoop(
 				return false // run ended while a window was open
 			}
 			defer gate.leave()
-			// 2. Maybe inject a fault.
-			if rng.Float64() < opts.Loop.FaultProbability && opts.Faults != nil &&
-				len(opts.Faults.Faults) > 0 {
-				fault := pickWeighted(opts.Faults.Faults, rng)
-				emit(Event{Cell: cr.Name, Op: "fault_apply",
-					Iteration: iter, Detail: fault.Action})
-				recovery, err := cell.ApplyFault(ctx, fault.Action)
+			// settleFault scores one fault application and, if it landed,
+			// waits the heal window and reverts it. Returns true to stop
+			// the cell.
+			settleFault := func(fault config.Fault, recovery inject.Recovery, err error) bool {
 				switch {
 				case err != nil && errors.Is(err, inject.ErrTargetNotRunning):
 					// A fault that fires on a cell a PRIOR fault already
@@ -448,42 +502,65 @@ func runCellLoop(
 					// product failure. Same skip class as cell-down.
 					emit(Event{Cell: cr.Name, Op: "fault_skipped_limit_unreachable",
 						Iteration: iter, Detail: fault.Action})
+				case err != nil && errors.Is(err, inject.ErrNotApplicable):
+					// The fault cannot produce its effect here (disk_full
+					// whose capped spill cannot fill a large filesystem,
+					// pause_archive with no archiver running). Not applied
+					// and not a failure — but never counted as a fault the
+					// product survived, which is what these used to be.
+					emit(Event{Cell: cr.Name, Op: "fault_skipped_not_applicable",
+						Iteration: iter, Detail: fault.Action, Err: err.Error()})
 				case err != nil:
+					cr.FaultApplyFails++
 					emit(Event{Cell: cr.Name, Op: "fault_apply_failed",
 						Iteration: iter, Detail: fault.Action, Err: err.Error()})
-					// Continue — the heal window doesn't
-					// fire and the cell may still recover
-					// on its own.
+					// Not a failure by itself: some catalogues expect an
+					// injector to refuse honestly (inode_exhaustion on an
+					// inode-rich host). A refused fault that nonetheless
+					// left the cell broken is caught by the backup-gap
+					// floor below, not here.
 				default:
 					cr.FaultsApplied++
+					if inject.DefaultRegistry.CorruptsRepo(fault.Action) {
+						corruptedAt = time.Now()
+					}
 					select {
 					case <-ctx.Done():
 					case <-time.After(opts.Loop.HealWindow):
 					}
 					recovered := true
 					if recovery != nil {
-						if rerr := recovery(ctx); rerr != nil {
+						// The revert gets a context of its own. At the run
+						// deadline ctx is already cancelled, and reverting
+						// with it failed every docker call at once — the
+						// fault then stayed applied through teardown and
+						// was reported only as "aborted at deadline".
+						// Bounded, so a wedged revert cannot hold the run.
+						rctx, rcancel := context.WithTimeout(context.WithoutCancel(ctx), recoveryTimeout)
+						rerr := recovery(rctx)
+						rcancel()
+						if rerr != nil {
 							recovered = false
-							if ctx.Err() != nil {
-								// Run-wide deadline elapsed: the
-								// recovery's docker calls were
-								// cancelled by orchestrator shutdown,
-								// not by a genuine fault-cleanup
-								// failure.  Mirrors the
-								// backup_aborted_at_deadline path —
-								// without this distinction every
-								// soak whose 4-min timer happens to
-								// land inside a heal window reports
-								// alarming "recovery_failed" lines
-								// for what is just teardown.
-								emit(Event{Cell: cr.Name,
-									Op:        "recovery_aborted_at_deadline",
-									Iteration: iter, Err: rerr.Error()})
-							} else {
-								cr.RecoveryFails++
-								emit(Event{Cell: cr.Name,
-									Op:        "recovery_failed",
-									Iteration: iter, Err: rerr.Error()})
+							cr.RecoveryFails++
+							emit(Event{Cell: cr.Name,
+								Op:        "recovery_failed",
+								Iteration: iter, Detail: fault.Action, Err: rerr.Error()})
+							// A fault that could not be reverted leaves the
+							// cell in the state the fault created for the
+							// rest of the run — nothing measured on it
+							// afterwards means anything, and a cell a fault
+							// killed for good would otherwise skip every
+							// later backup as cell-down and PASS. It fails
+							// the run as a "recovery" failure: the testbed's,
+							// not the product's.
+							msg := fmt.Sprintf("fault %s could not be reverted: %v", fault.Action, rerr)
+							if recordFailure(emit, report.Failure{
+								At: time.Now().UTC(), Cell: cr.Name, Iteration: iter,
+								Kind: "recovery", Message: msg,
+							}) {
+								cr.Pass = false
+								cr.FirstFailureMsg = msg
+								return true
 							}
 						}
 					}
@@ -500,13 +577,54 @@ func runCellLoop(
 							Iteration: iter, Detail: fault.Action})
 					}
 				}
+				return false
 			}
 
-			// 3. Backup every N iterations.
-			if iter%opts.Loop.BackupEvery == 0 {
+			// 2. Maybe inject a fault.
+			var midBackup *config.Fault
+			if rng.Float64() < opts.Loop.FaultProbability && opts.Faults != nil &&
+				len(opts.Faults.Faults) > 0 {
+				fault := pickWeighted(opts.Faults.Faults, rng)
+				if isMidBackupFault(fault.Action) {
+					// A *_mid_backup fault exists to race a backup: applied
+					// here, before the backup step, it never overlapped one
+					// (drop_relation_mid_backup was never mid-backup). It is
+					// applied during this iteration's backup instead.
+					midBackup = &fault
+				} else {
+					emit(Event{Cell: cr.Name, Op: "fault_apply",
+						Iteration: iter, Detail: fault.Action})
+					recovery, err := cell.ApplyFault(ctx, fault.Action)
+					if settleFault(fault, recovery, err) {
+						return true
+					}
+				}
+			}
+
+			// 3. Backup every N iterations — and whenever a mid-backup
+			// fault is waiting for one.
+			if iter%opts.Loop.BackupEvery == 0 || midBackup != nil {
 				emit(Event{Cell: cr.Name, Op: "backup_started", Iteration: iter})
 				cr.BackupsTaken++
+				var midRes <-chan midBackupResult
+				backupDone := make(chan struct{})
+				if midBackup != nil {
+					midRes = applyDuringBackup(ctx, cell, *midBackup, backupDone,
+						func() { emit(Event{Cell: cr.Name, Op: "fault_apply", Iteration: iter, Detail: midBackup.Action}) })
+				}
 				id, err := cell.TakeBackup(ctx)
+				close(backupDone)
+				if midRes != nil {
+					// Settle the fault before scoring the backup, so every
+					// exit below leaves it reverted.
+					r := <-midRes
+					if r.missed {
+						emit(Event{Cell: cr.Name, Op: "fault_skipped_backup_finished",
+							Iteration: iter, Detail: midBackup.Action})
+					} else if settleFault(*midBackup, r.recovery, r.err) {
+						return true
+					}
+				}
 				switch {
 				case err != nil && ctx.Err() != nil:
 					// Run-wide deadline elapsed mid-backup; the
@@ -525,10 +643,19 @@ func runCellLoop(
 					// A fault knocked the cell offline and
 					// recovery hasn't completed; skip this
 					// dispatch rather than counting it as a
-					// failure.  The next iteration retries.
+					// failure.  The next iteration retries —
+					// within MaxBackupGap.
 					cr.BackupsTaken--
+					backupsDispatched++
 					emit(Event{Cell: cr.Name, Op: "backup_skipped_cell_down",
 						Iteration: iter})
+					if gap := time.Since(lastAlive); opts.Loop.MaxBackupGap > 0 && gap > opts.Loop.MaxBackupGap {
+						if cellDown(iter, fmt.Sprintf(
+							"no backup for %s (bound %s): the cell stayed down — last: %v",
+							gap.Round(time.Second), opts.Loop.MaxBackupGap, err)) {
+							return true
+						}
+					}
 				case isSourceCorruptionFailure(err):
 					// PostgreSQL refused the backup because the SOURCE
 					// data is damaged — a page that failed its checksum,
@@ -552,13 +679,17 @@ func runCellLoop(
 					// Record it as a detection so the cell keeps running
 					// and the rest of its window still measures something.
 					cr.CorruptionDetected++
+					backupsDispatched++
+					backupsAlive++
+					lastAlive = time.Now()
 					emit(Event{Cell: cr.Name, Op: "backup_refused_source_corruption",
 						Iteration: iter, Err: err.Error()})
 				case err != nil:
+					backupsDispatched++
 					cr.BackupsFailed++
 					emit(Event{Cell: cr.Name, Op: "backup_failed",
 						Iteration: iter, Err: err.Error()})
-					if reportFailure(report.Failure{
+					if recordFailure(emit, report.Failure{
 						At: time.Now().UTC(), Cell: cr.Name, Iteration: iter,
 						Kind: "backup", Message: err.Error(),
 					}) {
@@ -567,7 +698,11 @@ func runCellLoop(
 						return true
 					}
 				default:
+					backupsDispatched++
+					backupsAlive++
+					lastAlive = time.Now()
 					lastBackupID = id
+					lastBackupAt = time.Now()
 					emit(Event{Cell: cr.Name, Op: "backup_completed",
 						Iteration: iter, Detail: id})
 				}
@@ -610,11 +745,18 @@ func runCellLoop(
 					cr.RestoresAttempted--
 					emit(Event{Cell: cr.Name, Op: "verify_skipped_cell_down",
 						Iteration: iter})
+				case err != nil && !corruptedAt.IsZero() && lastBackupAt.Before(corruptedAt):
+					// The backup predates a corruption fault this cell
+					// injected into its own repository files; refusing
+					// to restore it is detection, not failure.
+					cr.CorruptionDetected++
+					emit(Event{Cell: cr.Name, Op: "verify_refused_injected_corruption",
+						Iteration: iter, Detail: lastBackupID, Err: err.Error()})
 				case err != nil:
 					cr.RestoresFailed++
 					emit(Event{Cell: cr.Name, Op: "verify_failed",
 						Iteration: iter, Err: err.Error()})
-					if reportFailure(report.Failure{
+					if recordFailure(emit, report.Failure{
 						At: time.Now().UTC(), Cell: cr.Name, Iteration: iter,
 						Kind: "verify", Message: err.Error(),
 					}) {
@@ -642,6 +784,49 @@ func runCellLoop(
 			}
 		}
 	}
+}
+
+// midBackupDelay is how long after a backup starts a mid-backup fault is
+// applied: long enough for the backup to be under way, short enough to
+// land well inside a real one. A var so tests can shrink it.
+var midBackupDelay = 2 * time.Second
+
+// isMidBackupFault reports whether action names a fault meant to race a
+// backup (drop_relation_mid_backup, ...).
+func isMidBackupFault(action string) bool {
+	pa, err := inject.ParseAction(action)
+	return err == nil && strings.HasSuffix(pa.Prefix, "_mid_backup")
+}
+
+// midBackupResult is a mid-backup fault's outcome; missed means the
+// backup ended (or the run did) before the fault was applied, so it was
+// not.
+type midBackupResult struct {
+	recovery inject.Recovery
+	err      error
+	missed   bool
+}
+
+// applyDuringBackup applies fault midBackupDelay after the backup
+// starts, unless backupDone closes first. announce runs just before the
+// fault is applied.
+func applyDuringBackup(ctx context.Context, cell CellRuntime, fault config.Fault, backupDone <-chan struct{}, announce func()) <-chan midBackupResult {
+	res := make(chan midBackupResult, 1)
+	go func() {
+		select {
+		case <-time.After(midBackupDelay):
+		case <-backupDone:
+			res <- midBackupResult{missed: true}
+			return
+		case <-ctx.Done():
+			res <- midBackupResult{missed: true}
+			return
+		}
+		announce()
+		recovery, err := cell.ApplyFault(ctx, fault.Action)
+		res <- midBackupResult{recovery: recovery, err: err}
+	}()
+	return res
 }
 
 // pickWeighted picks a fault using the catalogue's Weight as

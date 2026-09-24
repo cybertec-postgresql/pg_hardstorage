@@ -70,6 +70,10 @@ type CellReport struct {
 	// during BASE_BACKUP. Counted as a failure, it made the
 	// catalogue's own "0 backup_failed" criterion unsatisfiable for
 	// any fleet containing PG 18 and torn_page.
+	//
+	// It also counts restores refused because a repo-corruption fault
+	// this cell injected (into its own deployment's files) damaged the
+	// backup being verified — detection, likewise, not failure.
 	CorruptionDetected int `json:"corruption_detected,omitempty"`
 
 	// RecoveryFails counts faults that were applied but could NOT be
@@ -77,7 +81,13 @@ type CellReport struct {
 	// created for every iteration that follows. Deadline-aborted
 	// recoveries are excluded -- those are orchestrator teardown, not
 	// a cleanup failure.
-	RecoveryFails   int           `json:"recovery_fails"`
+	RecoveryFails int `json:"recovery_fails"`
+
+	// FaultApplyFails counts faults the injector failed to apply for a
+	// reason other than the skip classes (target down, kernel limit
+	// unreachable). Not a failure by itself — some catalogues expect an
+	// injector to refuse — but visible, so a run of them is noticed.
+	FaultApplyFails int           `json:"fault_apply_fails,omitempty"`
 	IterationsRun   int           `json:"iterations_run"`
 	LastIteration   int           `json:"last_iteration"`
 	UpFor           time.Duration `json:"up_for_nanos"`
@@ -201,6 +211,7 @@ type FaultStats struct {
 	TotalApplied  int            `json:"total_applied"`
 	ByPrefix      map[string]int `json:"by_prefix"`
 	RecoveryFails int            `json:"recovery_fails"`
+	ApplyFails    int            `json:"apply_fails,omitempty"`
 }
 
 // Failure carries one assertion-level failure surfaced during
@@ -330,6 +341,7 @@ func (r *Report) WriteMarkdown(w io.Writer) error {
 	fmt.Fprintln(w, "## Fault statistics")
 	fmt.Fprintf(w, "- Total faults applied: %d\n", r.FaultStats.TotalApplied)
 	fmt.Fprintf(w, "- Recovery failures: %d\n", r.FaultStats.RecoveryFails)
+	fmt.Fprintf(w, "- Apply failures: %d\n", r.FaultStats.ApplyFails)
 	if len(r.FaultStats.ByPrefix) > 0 {
 		fmt.Fprintln(w, "")
 		fmt.Fprintln(w, "| Fault | Count |")

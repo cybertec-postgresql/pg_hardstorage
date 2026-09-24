@@ -2,14 +2,17 @@
 package inject
 
 import (
+	"archive/tar"
 	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"os/exec"
+	pathpkg "path"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // ErrTargetNotRunning reports that a docker operation could not be
@@ -150,25 +153,35 @@ func (d *DockerTarget) Start(ctx context.Context) error {
 	return nil
 }
 
-// CopyOut runs `docker cp <container>:<path> -` and returns
-// the tar-stream payload.  For typical chunk-sized files this
-// keeps the implementation simple; the soak driver caps the
-// expected file size.
+// CopyOut runs `docker cp <container>:<path> -` and returns the
+// file's content. docker cp writes a TAR stream to stdout, not the
+// file: returning it as-is handed flip_random_byte an archive, whose
+// flipped byte landed in a header or padding and whose whole body was
+// then written back as the "file". The single regular-file entry is
+// unwrapped here.
 func (d *DockerTarget) CopyOut(ctx context.Context, path string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, d.docker(),
 		"cp", d.Container+":"+path, "-")
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return nil, err
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("docker cp %s:%s: %w (output: %s)",
+			d.Container, path, err, truncate(stderr.Bytes(), dockerErrExcerpt))
 	}
-	if err := cmd.Start(); err != nil {
-		return nil, err
+	tr := tar.NewReader(&stdout)
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			return nil, fmt.Errorf("docker cp %s:%s: no regular file in the archive", d.Container, path)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("docker cp %s:%s: read archive: %w", d.Container, path, err)
+		}
+		if hdr.Typeflag == tar.TypeReg {
+			return io.ReadAll(tr)
+		}
 	}
-	body, rerr := io.ReadAll(stdout)
-	if werr := cmd.Wait(); werr != nil {
-		return body, fmt.Errorf("docker cp %s:%s: %w", d.Container, path, werr)
-	}
-	return body, rerr
 }
 
 // SetMemoryLimit applies a cgroup memory limit via `docker
@@ -301,27 +314,47 @@ func dockerMemoryLimitArg(bytes int64) string {
 	return strconv.FormatInt(bytes, 10)
 }
 
-// CopyIn writes body to <container>:<path> via `docker cp -`.
-// Body is wrapped in a tar header (handled by docker cp's
-// "-" flag) so callers can use it as a flat file write.
+// CopyIn writes body to <container>:<path>. `docker cp - DEST` reads a
+// TAR stream and extracts it into the directory DEST; piping the raw
+// body (as this used to) is rejected by docker, so libfaketime's
+// /etc/faketimerc and flip_random_byte's write-back never landed. The
+// body is wrapped in a one-entry archive extracted into path's parent.
+//
+// An existing file keeps its owner and mode (`docker cp -a` honours the
+// archive's uid/gid): a repo chunk rewritten as root 0644 would fail on
+// permissions instead of on the flipped byte the fault is about.
 func (d *DockerTarget) CopyIn(ctx context.Context, path string, body []byte) error {
-	cmd := exec.CommandContext(ctx, d.docker(),
-		"cp", "-", d.Container+":"+path)
-	stdin, err := cmd.StdinPipe()
+	hdr := &tar.Header{Name: pathpkg.Base(path), Mode: 0o644, Size: int64(len(body)),
+		Typeflag: tar.TypeReg, ModTime: time.Now()}
+	cpArgs := []string{"cp"}
+	if out, err := d.Exec(ctx, "stat", "-c", "%u %g %a", path); err == nil {
+		var uid, gid int
+		var mode string
+		if n, _ := fmt.Sscanf(strings.TrimSpace(string(out)), "%d %d %s", &uid, &gid, &mode); n == 3 {
+			if m, perr := strconv.ParseInt(mode, 8, 64); perr == nil {
+				hdr.Uid, hdr.Gid, hdr.Mode = uid, gid, m
+				cpArgs = append(cpArgs, "-a")
+			}
+		}
+	}
+	var archive bytes.Buffer
+	tw := tar.NewWriter(&archive)
+	if err := tw.WriteHeader(hdr); err != nil {
+		return err
+	}
+	if _, err := tw.Write(body); err != nil {
+		return err
+	}
+	if err := tw.Close(); err != nil {
+		return err
+	}
+	cpArgs = append(cpArgs, "-", d.Container+":"+pathpkg.Dir(path))
+	cmd := exec.CommandContext(ctx, d.docker(), cpArgs...)
+	cmd.Stdin = &archive
+	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return err
-	}
-	if err := cmd.Start(); err != nil {
-		return err
-	}
-	if _, err := stdin.Write(body); err != nil {
-		_ = stdin.Close()
-		_ = cmd.Wait()
-		return err
-	}
-	_ = stdin.Close()
-	if err := cmd.Wait(); err != nil {
-		return fmt.Errorf("docker cp - %s:%s: %w", d.Container, path, err)
+		return fmt.Errorf("docker cp - %s:%s: %w (output: %s)",
+			d.Container, path, err, truncate(out, dockerErrExcerpt))
 	}
 	return nil
 }

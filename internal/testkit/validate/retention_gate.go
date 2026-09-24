@@ -55,16 +55,26 @@ func (g *retentionGate) leave() {
 // ones to finish. On success the window is open (resume closes it); on
 // timeout or ctx end it is closed again and quiesce returns false.
 func (g *retentionGate) quiesce(ctx context.Context, timeout time.Duration) bool {
-	t := time.AfterFunc(timeout, g.wake)
+	// The timer itself decides the timeout: it sets timedOut under the
+	// lock and wakes the waiter. Re-reading the clock against a deadline
+	// computed after arming the timer let a waiter woken by the timer
+	// see "not yet" and wait again with no timer left to wake it — so a
+	// busy fleet stalled the window until something else broadcast.
+	timedOut := false
+	t := time.AfterFunc(timeout, func() {
+		g.mu.Lock()
+		timedOut = true
+		g.cond.Broadcast()
+		g.mu.Unlock()
+	})
 	defer t.Stop()
 	stop := context.AfterFunc(ctx, g.wake)
 	defer stop()
-	deadline := time.Now().Add(timeout)
 
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.pending = true
-	for g.active > 0 && ctx.Err() == nil && time.Now().Before(deadline) {
+	for g.active > 0 && ctx.Err() == nil && !timedOut {
 		g.cond.Wait()
 	}
 	if g.active == 0 && ctx.Err() == nil {
