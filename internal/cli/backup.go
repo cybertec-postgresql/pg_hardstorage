@@ -100,7 +100,7 @@ The repository must already exist — create it with ` + "`" + `pg_hardstorage r
 	c.Flags().BoolVar(&opts.allowConcurrent, "allow-concurrent", false,
 		"skip the per-deployment backup lease and allow a second backup of the same deployment to run concurrently (doubles load on the source)")
 	DurationDaysVar(c.Flags(), &opts.stallTimeout, "stall-timeout", 0,
-		"abort with backup.io_starved if no progress event for this long (0 = disabled; soak drivers pin 5m)")
+		"abort with backup.io_starved if no progress (stream data or event) for this long (0 = disabled; soak drivers pin 5m)")
 	c.Flags().BoolVarP(&opts.verbose, "verbose", "v", false,
 		"emit one line per regular file as it commits to the CAS — file path, "+
 			"logical size, chunk count, deduped chunks, and bytes the CAS actually "+

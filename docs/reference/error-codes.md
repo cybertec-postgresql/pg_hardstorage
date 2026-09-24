@@ -147,6 +147,7 @@ actually there.
 | `conflict.repo_read_only` | Repo is in read-only mode (legal hold, scheduled retire) |
 | `conflict.manifest_held`, `conflict.chain_has_held_links` | Backup or one of its parents is on legal hold |
 | `conflict.chain_has_live_descendants` | Refused to delete; descendants would orphan (also raised by `rotate --apply` when an incremental lands mid-rotation) |
+| `conflict.backup_lease_lost` | A running backup was aborted because another process took over the deployment's backup lease (stall longer than the lease TTL, clock jump, overlapping scheduler) |
 | `conflict.hold_exists` | `hold add` would weaken an active hold (earlier or finite expiry on an indefinite hold, different holder); `--force` replaces it and audits `hold.replace` |
 | `conflict.checkpoint_mismatch`, `conflict.chunks_missing`, `conflict.no_live_manifests` | Repo state would be inconsistent |
 | `conflict.approval_pending`, `conflict.already_signed`, `conflict.already_revoked` | Approval-flow state machine refused |
@@ -222,6 +223,7 @@ field is where the recovery hint lives.
 | `repair.*` | Manifest / attestation / chunk repair |
 | `manifest.*` | Manifest parse / validation at restore-plan time (`manifest.invalid`) |
 | `kms.*` | KMS rotate / shred / verify (`kms.rotate_failed`, `kms.shred_failed`, `kms.verify_failed`); `kms.unreachable` is the only leaf that maps to exit 8 |
+| `backup.io_starved` | `backup --stall-timeout`: no progress (no stream frame and no event) within the timeout — the backup was aborted. Exit 1. Check host disk/network saturation or raise the timeout. |
 | `kms.rotate_incomplete` | `kms rotate --apply` finished but some manifest, replica copy or WAL segment manifest still holds the old KEK (`failed`, `replica_failures` or `wal_failed` > 0). Exit 1. Do NOT retire the old KEK; re-run until it exits 0. |
 | `kms.rotate_plan_failed` | `kms rotate` dry-run whose plan already contains failures (`failed` or `wal_failed` > 0) — `--apply` could not complete. Exit 1. |
 | `chain.*` | Backup-chain integrity (`chain.cycle`, `chain.too_deep`, `chain.no_full_anchor`, `chain.broken_tombstoned`, `chain.degenerate`, `chain.missing_pg_manifest`) |
