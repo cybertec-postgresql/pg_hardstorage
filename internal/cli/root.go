@@ -29,6 +29,19 @@ import (
 // main() should be `os.Exit(cli.Execute())`.
 func Execute() int { return Run(NewRoot()) }
 
+// parseRootFlagsEarly fills the root's persistent flags from args before
+// any subcommand has resolved. Everything else in args belongs to a
+// subcommand the root does not know, so unknown flags are skipped rather
+// than fatal: a strict parse stopped at the first one, and every root
+// flag after it was silently ignored — `repo gc --repo X --cpu-profile P`
+// profiled nothing, while `--cpu-profile P repo gc --repo X` worked.
+func parseRootFlagsEarly(root *cobra.Command, args []string) {
+	prev := root.FParseErrWhitelist.UnknownFlags
+	root.FParseErrWhitelist.UnknownFlags = true
+	defer func() { root.FParseErrWhitelist.UnknownFlags = prev }()
+	_ = root.ParseFlags(args)
+}
+
 // Run executes the given root command. Tests construct a root, set its
 // args / writers, and call Run to observe the same behavior production
 // gets from Execute().
@@ -38,10 +51,8 @@ func Run(root *cobra.Command) int {
 	// startProfiling is a no-op when no flag is set.  We
 	// parse args here without executing so the persistent
 	// flags are populated even when ExecuteC bails early
-	// (e.g. unknown subcommand).  ParseFlags returns an
-	// error for unknown flags but accepts unknown
-	// positional args, which is what we want.
-	_ = root.ParseFlags(os.Args[1:])
+	// (e.g. unknown subcommand).
+	parseRootFlagsEarly(root, os.Args[1:])
 	profH, profErr := startProfiling(root)
 	if profErr != nil {
 		fmt.Fprintln(root.ErrOrStderr(), "error:", profErr)

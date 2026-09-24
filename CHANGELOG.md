@@ -21,6 +21,12 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **`--cpu-profile`, `--mem-profile` and `--profile-port` were silently
+  ignored after a subcommand flag.** They are read before the subcommand
+  resolves, by a parse that stopped at the first flag it did not know —
+  so `repo gc --repo X --cpu-profile p.pprof` profiled nothing while
+  `--cpu-profile p.pprof repo gc --repo X` worked. They now work in any
+  position.
 - **`backup --include-wal` failed on a busy database.** `BASE_BACKUP`
   sends the WAL written during the backup at the end, and nothing pinned
   it meanwhile, so under sustained writes it was recycled first
