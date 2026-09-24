@@ -376,19 +376,41 @@ func runJitShow(cmd *cobra.Command, repoURL, id string) error {
 		return output.NewError("jit.get_failed",
 			fmt.Sprintf("jit show: %v", err)).Wrap(err)
 	}
-	revocation, _ := store.GetRevocation(cmd.Context(), id)
+	// ErrTokenNotFound from GetRevocation means "no marker" (not
+	// revoked). Any other error means we could not tell: discarding it
+	// reported a possibly-revoked token as active, the permissive
+	// answer on the surface used to confirm a revocation took effect.
+	// Render what we know with status unknown, then exit non-zero.
+	revocation, rerr := store.GetRevocation(cmd.Context(), id)
+	if errors.Is(rerr, jit.ErrTokenNotFound) {
+		rerr = nil
+	}
 	body := jitShowBody{
 		Token:           tok,
 		Revocation:      revocation,
 		EffectiveStatus: computeShowStatus(tok, revocation != nil),
 	}
-	return d.Result(output.NewResult(cmd.CommandPath()).WithBody(body))
+	if rerr != nil {
+		body.EffectiveStatus = jit.StatusUnknown
+		body.RevocationError = rerr.Error()
+	}
+	if err := d.Result(output.NewResult(cmd.CommandPath()).WithBody(body)); err != nil {
+		return err
+	}
+	if rerr != nil {
+		return output.NewError("jit.revocation_unknown",
+			fmt.Sprintf("jit show: token %s: revocation status could not be read: %v", id, rerr)).Wrap(rerr)
+	}
+	return nil
 }
 
 type jitShowBody struct {
 	Token           *jit.Token      `json:"token"`
 	Revocation      *jit.Revocation `json:"revocation,omitempty"`
 	EffectiveStatus jit.Status      `json:"effective_status"`
+	// RevocationError is set when the revocation marker could not be
+	// read; EffectiveStatus is then "unknown".
+	RevocationError string `json:"revocation_error,omitempty"`
 }
 
 // WriteText renders the full token body plus revocation status as
@@ -410,6 +432,9 @@ func (b jitShowBody) WriteText(w io.Writer) error {
 	fmt.Fprintf(bw, "  Reason:              %s\n", t.Reason)
 	fmt.Fprintf(bw, "  Public-key SHA-256:  %s\n", t.PublicKeyFingerprint)
 	fmt.Fprintf(bw, "  Effective status:    %s\n", b.EffectiveStatus)
+	if b.RevocationError != "" {
+		fmt.Fprintf(bw, "  Revocation check:    FAILED (%s)\n", b.RevocationError)
+	}
 	if b.Revocation != nil {
 		fmt.Fprintln(bw)
 		fmt.Fprintln(bw, "Revocation:")
