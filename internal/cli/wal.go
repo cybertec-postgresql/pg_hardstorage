@@ -284,7 +284,7 @@ func runWalPush(cmd *cobra.Command, opts walPushOptions) error {
 		return output.NewError("usage.missing_flag",
 			"wal push --tde: cannot derive system_identifier — segment header is ciphertext under TDE and no --pg-connection / --system-identifier given").
 			WithSuggestion(&output.Suggestion{
-				Human:   "set --system-identifier <hex> (recommended for archive_command; obtain once via `SELECT system_identifier FROM pg_control_system()`) or pass --pg-connection so we can fetch it per push",
+				Human:   "set --system-identifier <decimal> (recommended for archive_command; obtain once via `SELECT system_identifier FROM pg_control_system()`) or pass --pg-connection so we can fetch it per push",
 				DocURL:  "docs/explanation/tde-awareness.md",
 				Command: "pg_hardstorage doctor " + opts.deployment,
 			}).Wrap(output.ErrUsage)
