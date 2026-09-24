@@ -161,6 +161,16 @@ type LoopOptions struct {
 	// a fleet of 8; still bounded, so one cell waiting out a long PG
 	// recovery (up to 30m) does not stall the rest.
 	RetentionQuiesceTimeout time.Duration
+
+	// RetentionMaxDeferrals is how many consecutive windows one
+	// repository's gc may be deferred — a live backup lease, a fleet
+	// that did not drain, no cell up to run it — before the run fails.
+	// Default 4 (an hour at the default interval: a killed backup's
+	// lease expires well within that); negative never escalates. One
+	// deferral is benign; one that never clears is a leaked lease or a
+	// stuck backup hiding behind "the next window retries" while the
+	// repository grows for the rest of the run.
+	RetentionMaxDeferrals int
 }
 
 // RetentionApplier is implemented by runtimes that can apply retention
@@ -170,6 +180,10 @@ type LoopOptions struct {
 type RetentionApplier interface {
 	Rotate(ctx context.Context) error
 	GC(ctx context.Context) error
+	// RepoKey identifies the repository the cell's deployment lives
+	// in. Cells with equal keys share one repository, which a window
+	// gc's once; cells with a sink of their own have their own.
+	RepoKey() string
 }
 
 // ErrRetentionDeferred means gc refused to sweep for a documented,
@@ -198,5 +212,8 @@ func (o *LoopOptions) defaults() {
 	}
 	if o.RetentionQuiesceTimeout == 0 {
 		o.RetentionQuiesceTimeout = 10 * time.Minute
+	}
+	if o.RetentionMaxDeferrals == 0 {
+		o.RetentionMaxDeferrals = 4
 	}
 }

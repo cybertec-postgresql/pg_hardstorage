@@ -521,6 +521,25 @@ func (d *DockerCellRuntime) GC(ctx context.Context) error {
 		"--min-chunk-age", retentionMinChunkAge.String(), "-o", "json")
 }
 
+// RepoKey identifies the cell's repository: its URL plus the storage
+// environment the agent reaches it with, since two sinks may share a
+// URL shape and differ only in endpoint credentials. Over-distinguishing
+// is harmless (a shared repository is gc'd twice); merging two distinct
+// repositories would leave one never collected.
+func (d *DockerCellRuntime) RepoKey() string {
+	keys := make([]string, 0, len(d.sinkAgentEnv))
+	for k := range d.sinkAgentEnv {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var b strings.Builder
+	b.WriteString(d.RepoURL)
+	for _, k := range keys {
+		b.WriteString("\x00" + k + "=" + d.sinkAgentEnv[k])
+	}
+	return b.String()
+}
+
 func (d *DockerCellRuntime) retentionStep(ctx context.Context, argv ...string) error {
 	if !d.containerRunning(ctx) {
 		return ErrCellNotReady

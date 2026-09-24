@@ -22,7 +22,14 @@ type retentionCell struct {
 	rotates   atomic.Int32
 	gcs       atomic.Int32
 	gcErr     error
+	// gcFn, when set, decides the n-th gc's result instead of gcErr.
+	gcFn func(n int32) error
+	// repo names the repository this cell's deployment lives in; ""
+	// is the one repository the rest of the fleet shares.
+	repo string
 }
+
+func (r *retentionCell) RepoKey() string { return r.repo }
 
 func (r *retentionCell) TakeBackup(ctx context.Context) (string, error) {
 	r.inflight.Add(1)
@@ -49,9 +56,12 @@ func (r *retentionCell) Rotate(context.Context) error {
 }
 
 func (r *retentionCell) GC(context.Context) error {
-	r.gcs.Add(1)
+	n := r.gcs.Add(1)
 	if r.inflight.Load() != 0 {
 		r.violation.Add(1)
+	}
+	if r.gcFn != nil {
+		return r.gcFn(n)
 	}
 	return r.gcErr
 }
@@ -141,12 +151,65 @@ func TestRun_RetentionDisabledWhenNegative(t *testing.T) {
 	}
 }
 
-// gc refusing over a live lease is the product working: deferred, not failed.
+// gc refusing over a live lease is the product working: deferred, not
+// failed — as long as a later window gets through.
 func TestRun_RetentionDeferredIsNotAFailure(t *testing.T) {
-	cells, _ := newRetentionFleet(2, fmt.Errorf("%w: lease", validate.ErrRetentionDeferred))
+	cells, _ := newRetentionFleet(2, nil)
+	for _, c := range cells {
+		c.gcFn = func(n int32) error {
+			if n%2 == 1 {
+				return fmt.Errorf("%w: lease", validate.ErrRetentionDeferred)
+			}
+			return nil
+		}
+	}
 	rep, evs := runRetention(t, cells, 40*time.Millisecond)
 	if !rep.OverallPass || countOp(evs, "retention_deferred") == 0 {
 		t.Fatalf("a deferred gc must be recorded and must not fail: pass=%v failures=%+v", rep.OverallPass, rep.Failures)
+	}
+}
+
+// A deferral that never clears is not "the next window retries": a
+// backup lease leaked by a killed backup would keep gc away for the
+// whole 8h run while the repository grew, and every window said only
+// retention_deferred. After RetentionMaxDeferrals (default 4)
+// consecutive deferrals of one repository, the run fails.
+func TestRun_RetentionDeferredForeverFailsTheRun(t *testing.T) {
+	cells, _ := newRetentionFleet(2, fmt.Errorf("%w: lease", validate.ErrRetentionDeferred))
+	rep, evs := runRetention(t, cells, 30*time.Millisecond)
+	if countOp(evs, "retention_deferred") < 4 {
+		t.Fatalf("fixture ran only %d deferred windows; need at least 4", countOp(evs, "retention_deferred"))
+	}
+	if rep.OverallPass {
+		t.Fatal("gc was deferred in every window; the run must fail rather than hide a leaked lease")
+	}
+	var kinds []string
+	for _, f := range rep.Failures {
+		kinds = append(kinds, f.Kind)
+	}
+	if len(kinds) == 0 || kinds[0] != "retention" {
+		t.Errorf("failure kinds = %v, want retention", kinds)
+	}
+}
+
+// Cells with their own sinks have their own repositories. gc ran once per
+// window from the first cell that was up, so every other repository was
+// never collected.
+func TestRun_RetentionGCsEveryDistinctRepository(t *testing.T) {
+	cells, _ := newRetentionFleet(3, nil)
+	cells[2].repo = "s3://own-sink"
+	_, evs := runRetention(t, cells, 40*time.Millisecond)
+	windows := countOp(evs, "retention_window_open")
+	if windows == 0 {
+		t.Fatal("no retention window opened")
+	}
+	// The run can end inside the last window, before its gc's.
+	oncePerWindow := func(n int32) bool { return int(n) <= windows && int(n) >= windows-1 && n > 0 }
+	if shared := cells[0].gcs.Load() + cells[1].gcs.Load(); !oncePerWindow(shared) {
+		t.Errorf("shared repository gc'd %d times in %d windows; want once per window", shared, windows)
+	}
+	if own := cells[2].gcs.Load(); !oncePerWindow(own) {
+		t.Errorf("c2's own repository gc'd %d times in %d windows; want once per window", own, windows)
 	}
 }
 
