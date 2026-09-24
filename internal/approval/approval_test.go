@@ -388,6 +388,7 @@ func TestGet_NotFound(t *testing.T) {
 func TestGate_Approved(t *testing.T) {
 	store, _ := newApprovalStore(t)
 	privA, pubA := genKey(t)
+	trustRoster(t, "1", pubA)
 
 	req, err := store.Create(context.Background(), approval.CreateOptions{
 		Op:           "repo.set_mode",

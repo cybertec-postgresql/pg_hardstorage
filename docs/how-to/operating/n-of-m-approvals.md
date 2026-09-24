@@ -42,6 +42,33 @@ the approval is not an operator surface.
 - For each approver: their **private key PEM**, kept on the
   approver's host (mode 0600).
 
+## Configure the trusted approver roster
+
+The request body lives in the repository, so anything in it — the
+approver keys and the threshold included — was chosen by whoever
+wrote it. The gate therefore does **not** trust the request's own
+key list: it counts only votes from keys on the **trusted approver
+roster** configured on the host that runs the destructive op, and it
+requires at least the **configured minimum** number of them.
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `PG_HARDSTORAGE_APPROVAL_ROSTER` | `<config-dir>/approvers` | A directory of ed25519 public-key PEMs (`*.pem`, `*.pub`), or one file holding several PEM blocks. |
+| `PG_HARDSTORAGE_APPROVAL_MIN_THRESHOLD` | `2` | Minimum distinct trusted approvals any gated op needs, whatever the request's `--threshold` says. |
+
+```bash
+install -d -m 0755 /etc/pg_hardstorage/approvers
+install -m 0644 alice.pub bob.pub carol.pub /etc/pg_hardstorage/approvers/
+```
+
+With no roster configured the gate refuses every approval
+(fail-closed). `approval request` checks the same policy and refuses
+a request that could never be redeemed: an approver key that is not
+on the roster (`auth.approver_untrusted`, exit 3) or a `--threshold`
+below the minimum (`usage.threshold_below_policy`, exit 2). Manage
+the roster like the keyring — root-owned, not writable by the
+accounts that can write to the repository.
+
 ## Steps
 
 ### 1. Open a request
@@ -138,10 +165,15 @@ pg_hardstorage kms shred \
     --yes
 ```
 
-The destructive command finds the approved request whose
-`(op, target)` matches and consumes it. A single approval is
-single-use — the destructive op atomically marks it consumed
-to prevent replay.
+The destructive command checks that the request is approved by
+enough trusted approvers, still within its TTL, and bound to exactly
+this `(op, target)` — a request filed without a target authorises
+nothing — and then consumes it. A single approval is single-use: the
+gate writes a write-once consumption marker
+(`approvals/<id>/consumed.json`) before the op runs, so of two
+concurrent redemptions exactly one proceeds, and an op that fails
+after the gate has still spent its approval (open a new request to
+retry). `approval status` shows `Redeemed:` once it is consumed.
 
 ### 5. (Optional) Revoke a request before approval
 
@@ -175,8 +207,9 @@ appr-3e1f9a04c2b18d5a  repo.wipe  pending   1/3        2026-07-06T22:12:00Z  s3:
 | `3 of 5` | Higher-stakes operations on regulated workloads. Survives one out + one absent without blocking the op. |
 | `4 of 7` | Highest tier — board-level / fiduciary destructions. Most regulated environments don't need this; pick smaller unless an audit specifically calls for it. |
 
-`--threshold 1` is technically allowed but defeats the
-purpose. `--threshold 0` is rejected.
+`--threshold 1` is refused unless the operator lowers
+`PG_HARDSTORAGE_APPROVAL_MIN_THRESHOLD` to 1 — a single approver
+defeats the purpose. `--threshold 0` is rejected.
 
 ## Approval lifecycle states
 
@@ -187,7 +220,7 @@ stateDiagram-v2
     pending --> approved: threshold reached
     pending --> revoked: revoke
     pending --> expired: ttl elapsed
-    approved --> consumed: destructive op runs
+    approved --> consumed: destructive op runs (single-use)
     approved --> expired: ttl elapsed before consume
     revoked --> [*]
     expired --> [*]
@@ -227,8 +260,21 @@ approver-key paths from the request.
 doesn't verify. Did the request body change since signing?
 Re-fetch and re-sign.
 
-**`approval.expired`** — the TTL elapsed. Re-open with a
-longer TTL.
+**`approval.expired`** — the TTL elapsed. This applies to approved
+requests too: an approval that was never redeemed lapses at its TTL.
+Re-open with a longer TTL.
+
+**`approval.gate_failed` … not enough approvals from the trusted
+approver roster** — the request's votes come from keys that are not
+on this host's roster, or fewer than the configured minimum. Check
+`PG_HARDSTORAGE_APPROVAL_ROSTER` / `PG_HARDSTORAGE_APPROVAL_MIN_THRESHOLD`
+on the host running the op.
+
+**`approval.gate_failed` … already redeemed** — approvals are
+single-use. Open a new request.
+
+**`config.approval_roster_missing`** — no trusted approver roster is
+configured; see [Configure the trusted approver roster](#configure-the-trusted-approver-roster).
 
 **Destructive op refuses the consumption** — the op's
 `(op, target)` tuple doesn't exactly match the request.

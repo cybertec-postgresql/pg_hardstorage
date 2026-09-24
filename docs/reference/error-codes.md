@@ -68,6 +68,7 @@ Common leaf shapes:
 | `usage.conflicting_flags`, `usage.conflicting_targets` | Mutually-exclusive flags both set |
 | `usage.unsupported_flag` | A flag the chosen mode cannot honour, refused instead of silently dropped — e.g. `restore --control-plane` with `--preview` (there is no remote preview; it would run a real restore), `--require-threshold-attestation`, `--verify-restore`, `--kms-config` or `--chain-staging-root` |
 | `usage.bad_tablespace_mapping` | A `--tablespace-mapping` / API `tablespace_mapping` entry is malformed, not normalised, or (control plane) outside `restore_roots` |
+| `usage.threshold_below_policy` | `approval request --threshold` is below the operator minimum (`PG_HARDSTORAGE_APPROVAL_MIN_THRESHOLD`, default 2) |
 | `usage.unknown_output_format`, `usage.unknown_policy`, `usage.unknown_scheme`, `usage.unknown_shell` | Enum-shaped value out of set |
 | `usage.unknown_deployment`, `usage.unknown_tenant` | A `--deployment` / `--tenant` filter names nothing in the repo — refused rather than reporting a vacuous clean result (`dsa locate --allow-unknown-tenant` certifies a tenant that holds no backups) |
 
@@ -83,6 +84,7 @@ re-run.
 | `auth.denied` | RBAC refused the operation |
 | `auth.key_mismatch` | Operator key does not match the configured roster |
 | `auth.approver_not_allowed` | Approver in an n-of-m flow is not on the roster |
+| `auth.approver_untrusted` | `approval request` named an approver key that is not on the operator's trusted approver roster (`PG_HARDSTORAGE_APPROVAL_ROSTER`) |
 | `auth.approval_op_mismatch`, `auth.approval_target_mismatch` | Approval token bound to a different op or subject |
 
 **Recovery:** rotate credentials, re-run with the right
@@ -228,7 +230,7 @@ field is where the recovery hint lives.
 | `chain.*` | Backup-chain integrity (`chain.cycle`, `chain.too_deep`, `chain.no_full_anchor`, `chain.broken_tombstoned`, `chain.degenerate`, `chain.missing_pg_manifest`) |
 | `splitbrain.*` | WAL archive collision: another writer already archived this segment (`splitbrain.content_mismatch` — same cluster, different bytes; `splitbrain.system_identifier_mismatch` — a different cluster, typically a cloned datadir without `pg_resetwal`; `splitbrain.read_failed` — the existing manifest is present but unreadable, refused on doubt). Exit 1. Raised by `wal push` and the streaming sink; see [R7](runbooks/R7-patroni-split-brain.md). |
 | `audit.*` | Audit log (`audit.append_failed`, `audit.anchor_failed`, `audit.verify_failed`, `audit.search_failed`, `audit.export_bundle_failed`, `audit.summary_failed`) |
-| `approval.*` | n-of-m approval flow |
+| `approval.*` | n-of-m approval flow (`approval.gate_failed` — the gate refused for a reason other than pending/expired/revoked/op-or-target mismatch: votes not from the trusted roster or below the configured minimum, no roster configured, or the approval was already redeemed — approvals are single-use) |
 | `threshold.*` | Threshold-signing (FROST) ceremony |
 | `dsa.*` | Detached signing authority |
 | `roster.*` (under `notfound`/`conflict`) | Operator roster |
@@ -241,7 +243,7 @@ field is where the recovery hint lives.
 | `redact.*` | Logical redaction passes |
 | `partial.*` | Partial / table-level restore |
 | `combine.*` | `pg_combinebackup` orchestration |
-| `paths.*`, `init.*`, `config.*` | Bootstrap (`config.invalid`, `config.load_failed`, `config.kek_ref_unknown_scheme`) |
+| `paths.*`, `init.*`, `config.*` | Bootstrap (`config.invalid`, `config.load_failed`, `config.kek_ref_unknown_scheme`, `config.approval_roster_missing` — no trusted approver roster configured, `config.approval_policy_invalid` — unreadable roster or malformed `PG_HARDSTORAGE_APPROVAL_MIN_THRESHOLD`) |
 | `compliance.*`, `integrity.*`, `insider.*` | Compliance / integrity scanning |
 | `llm.*` | LLM provider, skill loading, MCP server |
 | `history.*` | Restore-history slice |

@@ -29,6 +29,8 @@ they are not an operator surface.
 | `PG_HARDSTORAGE_URL` | Default repository URL when a command takes no `--repo`. |
 | `PG_HARDSTORAGE_BIN` | Path to the `pg_hardstorage` binary to re-invoke for sub-steps. Defaults to the running executable; set it when that path is not re-executable (a wrapper script, a read-only layer). |
 | `PG_HARDSTORAGE_AIRGAPPED` | Refuses every outbound network call not aimed at the repository or the database. |
+| `PG_HARDSTORAGE_APPROVAL_ROSTER` | Trusted approver roster for the n-of-m approval gate: a directory of ed25519 public-key PEMs, or one PEM file. Default `<config-dir>/approvers`. Only votes from these keys count; with no roster the gate refuses every approval. See [n-of-m approvals](../how-to/operating/n-of-m-approvals.md). |
+| `PG_HARDSTORAGE_APPROVAL_MIN_THRESHOLD` | Minimum number of distinct trusted approvals any gated op needs (default `2`), regardless of the request's own threshold. |
 
 ## SSH backends (`scp://`, `sftp://`)
 
