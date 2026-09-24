@@ -13,7 +13,8 @@
 //  3. On claim, executes the job (v0.1: backup only) by invoking
 //     the same primitives the local-schedule path uses — same
 //     backup runner, same retention runner.
-//  4. Streams progress events back as they fire and posts a
+//  4. Streams progress events back as they fire (stopping the job if
+//     the control plane cancels or reassigns it) and posts a
 //     terminal `complete` once the runner returns.
 //
 // Concurrency: one in-flight job at a time. Multi-job concurrency
@@ -372,21 +373,52 @@ func (c *ControlPlaneClient) claim(ctx context.Context) (*ControlPlaneJob, error
 // streaming progress events back as they fire and posting a
 // terminal /complete on return.
 func (c *ControlPlaneClient) runOne(ctx context.Context, job *ControlPlaneJob) {
+	// jobCtx is cancelled when the control plane stops wanting this job
+	// (an operator cancelled it, or it was reaped and reassigned). The
+	// executor runs under it, so a cancelled restore stops writing
+	// instead of running to completion unobserved. Two signals, because
+	// either alone has a blind spot: a progress post answered 409
+	// conflict.job_state is immediate but only fires when the executor
+	// reports; the state watcher catches executors that are silent for
+	// long stretches (a big file upload).
+	jobCtx, cancelJob := context.WithCancelCause(ctx)
+	defer cancelJob(nil)
+
 	progress := func(body map[string]any) {
 		ev := map[string]any{
 			"at":   time.Now().UTC().Format(time.RFC3339Nano),
 			"op":   "agent.progress",
 			"body": body,
 		}
-		if _, err := c.post(ctx, "/v1/jobs/"+job.ID+"/progress", ev, http.StatusAccepted); err != nil {
-			// Progress posts are best-effort; a failure here doesn't
+		resp, err := c.post(jobCtx, "/v1/jobs/"+job.ID+"/progress", ev, http.StatusAccepted)
+		if err != nil {
+			if bytes.Contains(resp, []byte("conflict.job_state")) {
+				cancelJob(errJobNoLongerOurs)
+				return
+			}
+			// Other progress failures are best-effort; they don't
 			// abort the job.
 			fmt.Fprintf(stderrSink, "controlplane: progress: %v\n", err)
 			metrics.ControlPlaneError("progress")
 		}
 	}
 
-	result, runErr := c.JobExecutor.Execute(ctx, job, progress)
+	watchDone := make(chan struct{})
+	go func() {
+		defer close(watchDone)
+		c.watchJobState(jobCtx, job.ID, cancelJob)
+	}()
+
+	result, runErr := c.JobExecutor.Execute(jobCtx, job, progress)
+	cancelJob(nil) // stop the watcher
+	<-watchDone
+	if errors.Is(context.Cause(jobCtx), errJobNoLongerOurs) {
+		// The control plane already holds the terminal state
+		// (cancelled / reaped); /complete would be refused. Say why the
+		// work stopped and move on.
+		fmt.Fprintf(stderrSink, "controlplane: job %s stopped: cancelled or reassigned on the control plane\n", job.ID)
+		return
+	}
 	completeBody := map[string]any{
 		"success": runErr == nil,
 		"result":  result,
@@ -454,6 +486,69 @@ retryLoop:
 	}
 	fmt.Fprintf(stderrSink, "controlplane: complete %q failed after retries: %v (SweepAbandoned will reclaim the job; check the control plane log for the abandoned reason)\n", jobID, lastErr)
 	metrics.ControlPlaneError("complete")
+}
+
+// errJobNoLongerOurs is the cancellation cause recorded when the
+// control plane reports the running job cancelled, finished or assigned
+// to another agent.
+var errJobNoLongerOurs = errors.New("controlplane: job cancelled or reassigned on the control plane")
+
+// watchJobState polls GET /v1/jobs/<id> every PollInterval while the
+// job runs and cancels it (cause errJobNoLongerOurs) once the control
+// plane no longer shows it running under this agent. Transient GET
+// failures are ignored -- losing the control plane for a moment must
+// not kill a healthy backup -- and a 404 (job pruned) counts as gone.
+func (c *ControlPlaneClient) watchJobState(ctx context.Context, jobID string, cancel context.CancelCauseFunc) {
+	t := time.NewTimer(jitteredInterval(c.PollInterval, c.JitterFraction))
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		state, assignedTo, status, err := c.getJobState(ctx, jobID)
+		switch {
+		case err == nil && (state != "running" || (assignedTo != "" && assignedTo != c.AgentID)):
+			cancel(errJobNoLongerOurs)
+			return
+		case err != nil && status == http.StatusNotFound:
+			cancel(errJobNoLongerOurs)
+			return
+		}
+		t.Reset(jitteredInterval(c.PollInterval, c.JitterFraction))
+	}
+}
+
+// getJobState fetches a job's state and assignee. status is the HTTP
+// status (0 when the request itself failed).
+func (c *ControlPlaneClient) getJobState(ctx context.Context, jobID string) (state, assignedTo string, status int, err error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.BaseURL+"/v1/jobs/"+jobID, nil)
+	if err != nil {
+		return "", "", 0, err
+	}
+	if c.Token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.Token)
+	}
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil {
+		return "", "", 0, err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode != http.StatusOK {
+		return "", "", resp.StatusCode, fmt.Errorf("controlplane: GET /v1/jobs/%s: status=%d", jobID, resp.StatusCode)
+	}
+	var env struct {
+		Result struct {
+			State      string `json:"state"`
+			AssignedTo string `json:"assigned_to"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(body, &env); err != nil {
+		return "", "", resp.StatusCode, fmt.Errorf("controlplane: GET /v1/jobs/%s: parse: %w", jobID, err)
+	}
+	return env.Result.State, env.Result.AssignedTo, resp.StatusCode, nil
 }
 
 // /complete retry budget.  The values reflect "transient failures
