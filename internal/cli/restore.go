@@ -117,7 +117,7 @@ targets never combine with the requested one.`,
 	c.Flags().BoolVar(&opts.toExclusive, "to-exclusive", false,
 		"stop recovery just BEFORE the target (default: just after)")
 	c.Flags().BoolVar(&opts.skipGapCheck, "skip-gap-check", false,
-		"bypass the+ WAL-gap pre-flight (operator override; "+
+		"bypass the WAL pre-flights: known WAL gaps, missing timeline history, and a backup whose WAL exists nowhere (operator override; "+
 			"the override is audit-logged)")
 	c.Flags().StringVar(&opts.requireAttestation, "require-threshold-attestation", "",
 		"refuse to restore unless a k-of-n threshold attestation under this roster ID is present "+
@@ -436,6 +436,10 @@ func runRestore(cmd *cobra.Command, opts restoreOpts) error {
 		// backup_label consumed), so running it afterwards — as this
 		// command used to — failed every restore that was booted.
 		PGVerifyBackup: verifyMode,
+		// Independent of `recovery`: a plain restore has no Recovery,
+		// yet its backup-WAL pre-flight names --skip-gap-check as the
+		// override.
+		SkipGapCheck: opts.skipGapCheck,
 		// Always wire the KEK resolver. It's a no-op for unencrypted
 		// backups (Restore only consults it when manifest.Encryption
 		// is non-nil) and the right resolver for encrypted ones.

@@ -120,6 +120,13 @@ type Options struct {
 	// Verify, and the boot test does not run.
 	PGVerifyBackup VerifyMode
 
+	// SkipGapCheck is the operator's --skip-gap-check for the WAL
+	// pre-flights that apply to EVERY restore (today: the
+	// backup-WAL-missing refusal). Recovery.SkipGapCheck cannot carry
+	// it on a plain restore, which has no Recovery at all; either
+	// flag bypasses.
+	SkipGapCheck bool
+
 	// KEKForRef resolves a manifest's EncryptionInfo.KEKRef to the
 	// matching 32-byte KEK. Required when restoring an encrypted
 	// backup; ignored for unencrypted backups.
@@ -339,7 +346,7 @@ func Restore(ctx context.Context, opts Options) (res *Result, err error) {
 	preflightWALContiguity(ctx, sp, opts.Deployment, m, opts.Recovery, emit)
 	// The backup's OWN WAL must exist somewhere, or it can never become
 	// consistent. Refuse before writing anything.
-	if err := preflightBackupWALAvailable(ctx, sp, opts.Deployment, m, opts.Recovery); err != nil {
+	if err := preflightBackupWALAvailable(ctx, sp, opts.Deployment, m, opts.Recovery, opts.SkipGapCheck); err != nil {
 		return nil, err
 	}
 	// Timeline-history reachability: PG probes <N>.history ascending
