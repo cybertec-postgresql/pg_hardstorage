@@ -247,15 +247,17 @@ func runRestore(cmd *cobra.Command, opts restoreOpts) error {
 		return err
 	}
 
-	// Resolve the keyring path the same way the backup command does.
+	// The keyring must already hold the keypair that signed the backups.
+	// Minting one here (on a fresh DR host) cannot verify those manifests
+	// and would sign later backups with a key nothing else trusts; say
+	// what is missing instead (notfound.signing_key → `keyring install`).
 	p, err := paths.Resolve(paths.DefaultOptions())
 	if err != nil {
 		return output.NewError("internal", err.Error()).Wrap(err)
 	}
-	_, verifier, err := keystore.LoadOrGenerate(p.Keyring.Value)
+	_, verifier, err := loadExistingKeypair("restore")
 	if err != nil {
-		return output.NewError("internal",
-			fmt.Sprintf("restore: signing key: %v", err)).Wrap(err)
+		return err
 	}
 
 	// Resolve `latest` to a concrete backup ID. With

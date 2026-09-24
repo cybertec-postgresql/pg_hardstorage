@@ -180,6 +180,7 @@ treat any `verify.*` exit as an alert.
 | `verify.manifest_signature`, `verify.replica_signature`, `verify.dsa_signature`, `verify.integrity_signature` | Signature verification failed |
 | `verify.attestation_invalid`, `verify.attestation_quorum`, `verify.attestation_roster`, `verify.attestation_subject` | Attestation refused |
 | `verify.kek_mismatch`, `verify.kek_resolve_failed`, `verify.bad_wrapped_dek` | KEK / DEK decrypt failed |
+| `auth.kms_access_denied` | The cloud KMS refused the credentials in use (restore / verify) — fix the IAM / key / vault policy; the key itself was not found to be wrong (exit 3) |
 | `verify.envelope_break` | Envelope-encryption tag did not validate |
 | `verify.replica_inconsistent`, `verify.replica_identity_mismatch` | Cross-region replica disagrees with primary |
 | `verify.audit_anchor_mismatch`, `verify.audit_chain_broken` | Audit hash chain is broken |

@@ -150,14 +150,10 @@ func runAuditExportBundle(cmd *cobra.Command, f auditExportBundleFlags) error {
 			fmt.Sprintf("audit export-bundle: --until: %v", err)).Wrap(output.ErrUsage)
 	}
 
-	p, err := paths.Resolve(paths.DefaultOptions())
+	// A freshly minted key would sign a bundle no verifier trusts.
+	bsigner, _, err := loadExistingKeypair("audit export-bundle")
 	if err != nil {
-		return output.NewError("internal", err.Error()).Wrap(err)
-	}
-	bsigner, _, err := keystore.LoadOrGenerate(p.Keyring.Value)
-	if err != nil {
-		return output.NewError("internal",
-			fmt.Sprintf("audit export-bundle: load signer: %v", err)).Wrap(err)
+		return err
 	}
 
 	_, sp, err := openRepo(cmd.Context(), f.repoURL)

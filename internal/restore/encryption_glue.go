@@ -78,6 +78,12 @@ func buildEncryptedCAS(
 					WithSuggestion(&output.Suggestion{
 						Human: "verify network reachability + credentials for the KMS provider, then retry — exit 8 signals a transient infrastructure failure.",
 					}).Wrap(err)
+			case errors.Is(err, kms.ErrAccessDenied):
+				return nil, output.NewError("auth.kms_access_denied",
+					fmt.Sprintf("restore: cloud KMS refused access to %q: %v", info.KEKRef, err)).
+					WithSuggestion(&output.Suggestion{
+						Human: "the credentials in use may not decrypt with this key; grant decrypt/unwrap on it (IAM policy, key grant or vault policy) and retry — the key itself was not found to be wrong",
+					}).Wrap(err)
 			case errors.Is(err, kms.ErrUnwrap):
 				return nil, output.NewError("restore.kek_mismatch",
 					fmt.Sprintf("restore: cloud KMS could not unwrap the DEK for %q: %v", info.KEKRef, err)).

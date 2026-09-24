@@ -180,6 +180,15 @@ func TestBuildEncryptedCAS_CloudKMS_Errors(t *testing.T) {
 			return nil, fmt.Errorf("decrypt: %w", kms.ErrUnwrap)
 		})
 	assert(t, err, "restore.kek_mismatch", output.ExitError)
+
+	// Credentials refused by the provider (kms.ErrAccessDenied) → auth.*
+	// (ExitAuth / 3): a permissions problem, not a wrong key and not an
+	// outage — the operator must fix IAM, not rotate or retry.
+	_, err = buildEncryptedCAS(context.Background(), sp, mk(), nil,
+		func(_ context.Context, _ string, _ []byte) ([]byte, error) {
+			return nil, fmt.Errorf("decrypt: %w", kms.ErrAccessDenied)
+		})
+	assert(t, err, "auth.kms_access_denied", output.ExitAuth)
 }
 
 func TestBuildEncryptedCAS_RejectsMissingResolver(t *testing.T) {
