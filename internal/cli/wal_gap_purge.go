@@ -3,6 +3,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"sort"
@@ -246,9 +247,19 @@ func collectLiveTimelines(ctx context.Context, store *backup.ManifestStore, depl
 	graceCutoff := time.Now().UTC().Add(-repo.DefaultTombstoneGracePeriod)
 	for entry, err := range store.ListIncludingTombstoned(ctx, deployment, verifier) {
 		if err != nil {
-			// Signature/read failures don't define orphan-status:
-			// silently skip — same posture as the old List walk.
-			continue
+			// Only a SIGNATURE failure may be skipped: a manifest that
+			// does not verify is one restore would refuse anyway, so its
+			// timeline cannot need a gap record. Everything else — a
+			// listing error, a storage read fault, a truncated or
+			// corrupt body — leaves the backup's timeline UNKNOWN, and
+			// treating unknown as "not live" reaps gap records a
+			// restorable backup may still cross, silently removing
+			// restore's refusal to PITR into that hole. Fail closed:
+			// abort before anything is deleted.
+			if liveTimelineSkippable(err) {
+				continue
+			}
+			return nil, err
 		}
 		if entry.Manifest == nil {
 			continue
@@ -262,6 +273,18 @@ func collectLiveTimelines(ctx context.Context, store *backup.ManifestStore, depl
 		out[entry.Manifest.Timeline] = struct{}{}
 	}
 	return out, nil
+}
+
+// liveTimelineSkippable reports whether a per-manifest error from the
+// live-timeline walk may be ignored. Signature failures qualify (the
+// manifest is not restorable from this repo). So does a manifest that
+// vanished between List and Get: it was hard-deleted, which only
+// happens after its grace window, so it is not live either.
+func liveTimelineSkippable(err error) bool {
+	return errors.Is(err, backup.ErrBadSignature) ||
+		errors.Is(err, backup.ErrUnsigned) ||
+		errors.Is(err, backup.ErrPublicKeyMismatch) ||
+		errors.Is(err, storage.ErrNotFound)
 }
 
 // walGapPurgeBody is the v1-stable result. DryRun reflects the
