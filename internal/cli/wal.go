@@ -2785,6 +2785,37 @@ func resolveStartLSN(ctx context.Context, sp storage.StoragePlugin, opts walStre
 	}
 	if priorFound {
 		note := fmt.Sprintf("resume-across-timeline-%d", priorTLI)
+		// The old frontier is only a shared position up to where this
+		// timeline's lineage FORKED from the old one. The old primary can
+		// keep writing — and the streamer keep archiving — past that point
+		// before it is fenced; those bytes are diverged history, and this
+		// timeline holds different WAL at the same LSNs. Resuming at such a
+		// frontier asked the new timeline for WAL from there onward, so its
+		// own WAL between the fork and the frontier was never archived, and
+		// segment-number gap detection saw the hand-off as contiguous.
+		// Clamp to the start of the segment holding the switchpoint:
+		// resolveStreamTimeline then opens it on the new timeline, whose
+		// copy of that segment is the whole one (PostgreSQL copies the
+		// pre-fork tail under the new name at promotion).
+		//
+		// No readable history → no clamp: that is the prior behaviour, and
+		// resolveStreamTimeline already warns that history is unreadable.
+		if forkSeg, ok := lineageForkSegmentStart(ctx, sp, opts.deployment, timeline, priorTLI, segSize); ok && forkSeg < priorLSN {
+			if emit != nil {
+				emit(output.NewEvent(output.SeverityWarning, "wal.timeline", "frontier_past_fork").
+					WithSubject(output.Subject{Deployment: opts.deployment, Timeline: timeline}).
+					WithBody(map[string]any{
+						"prior_timeline": priorTLI,
+						"prior_frontier": priorLSN.String(),
+						"resume_lsn":     forkSeg.String(),
+						"message": "the previous timeline was archived past the point this timeline " +
+							"forked from it; that WAL is diverged history. Resuming from the fork " +
+							"segment so this timeline's own WAL there is archived.",
+					}))
+			}
+			priorLSN = forkSeg
+			note += "-from-fork"
+		}
 		warnIfStartBehindRestart(priorLSN, restartLSN, note, segSize, emit)
 		return priorLSN, note, nil
 	}

@@ -129,7 +129,15 @@ A few things worth highlighting:
   and must match the archive (`preflight.wal_segment_size_changed`).
   A PostgreSQL that is unreachable at startup therefore cannot
   slip a different cluster, or a wrongly-sized archive, past the
-  checks once it comes up.  `EnsureSlot`'s
+  checks once it comes up.  After a promotion, when nothing is
+  archived on the new timeline yet, the resume point is the previous
+  timeline's archived frontier — clamped to the start of the segment
+  holding the new timeline's fork point (from its captured
+  `.history`), because old-timeline WAL archived past the fork is
+  diverged history and the new timeline's own WAL there must still be
+  archived.  `wal audit` / `wal list --gaps-only` check the same
+  rule: a new timeline must be covered from its fork segment.
+  `EnsureSlot`'s
   Strategy A path finds a propagated slot, Strategy C recreates
   with `RESERVE_WAL`.  The start-LSN safety check then validates
   the resume position against the (possibly new) `restart_lsn`
