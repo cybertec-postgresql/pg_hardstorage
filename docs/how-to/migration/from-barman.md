@@ -95,6 +95,13 @@ barman recover db1 db1.full.<id> /var/lib/postgresql/restored
 Verb coverage in v1.1: `backup`, `recover`, `list-backup`,
 `show-backup`, `check`, `delete`, plus the dedicated
 `barman-wal-archive` binary for `archive_command` use.
+`barman-wal-archive` accepts its documented options:
+`-U/--user`, `--port`, `-c/--config` and the compression
+switches (`-z`, `-j`, `--xz`, `--snappy`, `--zstd`, `--lz4`)
+parse and are ignored (no SSH hop; compression is a repository
+setting), and `--test` (`barman-wal-archive --test HOST SERVER
+DUMMY`) checks that SERVER's repository is reachable without
+archiving anything.
 15 less-common verbs (`cron`, `archive-wal`, `switch-wal`,
 `diagnose`, `verify`, `keep`, `receive-wal`, `replication-status`,
 `show-server`, `list-server`, `lock-directory-cleanup`,
