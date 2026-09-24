@@ -382,6 +382,36 @@ func Drill(ctx context.Context, repoURL string, deployment string, opts DrillOpt
 			manifest.BackupID, len(outside), strings.Join(outside, ", "))
 	}
 
+	// The mapped tablespace dirs are drill scratch as much as
+	// targetDir: the restore fills them, the sandbox must see them,
+	// and teardown must remove them. Record which already existed
+	// (restore's pre-flight only lets an EMPTY one through) so
+	// teardown deletes what the drill created and merely empties what
+	// the operator pre-created.
+	//
+	// Only MAPPED destinations are ever cleaned: a mapping that covers
+	// just some tablespaces leaves the others at their recorded paths,
+	// which may be live data and are never the drill's to delete.
+	tsDirs := restore.TablespaceDestinations(manifest, opts.TablespaceRemap)
+	scratch := opts.TablespaceRemap.AppliedPaths()
+	if !opts.KeepTargetDir && len(scratch) > 0 {
+		preexisting := map[string]bool{}
+		for _, dir := range scratch {
+			if _, err := os.Lstat(dir); err == nil {
+				preexisting[dir] = true
+			}
+		}
+		defer func() {
+			for _, dir := range scratch {
+				if preexisting[dir] {
+					_ = clearDirContents(dir)
+				} else {
+					_ = os.RemoveAll(dir)
+				}
+			}
+		}()
+	}
+
 	// Phase 3: restore.
 	restoreStart := time.Now().UTC()
 	restoreFn := opts.restoreFn
@@ -449,8 +479,16 @@ func Drill(ctx context.Context, repoURL string, deployment string, opts DrillOpt
 	}
 	verifyRes, verifyErr := verifyFn(ctx, sandbox.Options{
 		DataDir: targetDir,
-		PGMajor: pgMajor,
-		Image:   opts.SandboxImage,
+		// The restored pg_tblspc/<oid> symlinks are absolute; the
+		// sandbox must see the tablespace dirs at those same paths.
+		ExtraBinds: tsDirs,
+		// The backup carries backup_manifest, so a sandbox that cannot
+		// open it is an environment fault (bad bind mount, remote
+		// DOCKER_HOST), not a benign "manifest not captured" skip.
+		// Same as verify --full.
+		ManifestCaptured: len(manifest.PGBackupManifest) > 0,
+		PGMajor:          pgMajor,
+		Image:            opts.SandboxImage,
 	})
 	verifyPhase := DrillPhase{
 		Name:      "verify",
@@ -625,4 +663,19 @@ func drillTargetCleanup(dir string) error {
 		return fmt.Errorf("refusing to clean up non-absolute drill dir %q", dir)
 	}
 	return os.RemoveAll(dir)
+}
+
+// clearDirContents removes everything inside dir but keeps dir itself
+// (an operator-created mapping target the drill only borrowed).
+func clearDirContents(dir string) error {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		if err := os.RemoveAll(filepath.Join(dir, e.Name())); err != nil {
+			return err
+		}
+	}
+	return nil
 }

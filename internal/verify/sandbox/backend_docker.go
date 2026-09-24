@@ -60,6 +60,11 @@ func (dockerBackend) Verify(ctx context.Context, opts Options) (*Result, error) 
 		WaitingFor: wait.ForExec([]string{"/bin/true"}).WithStartupTimeout(60 * time.Second),
 		HostConfigModifier: func(hc *container.HostConfig) {
 			hc.Binds = append(hc.Binds, opts.DataDir+":/var/lib/postgresql/data:ro")
+			// Tablespace dirs at their own absolute paths, so the
+			// data dir's pg_tblspc symlinks resolve (see ExtraBinds).
+			for _, dir := range opts.ExtraBinds {
+				hc.Binds = append(hc.Binds, dir+":"+dir+":ro")
+			}
 		},
 	}
 

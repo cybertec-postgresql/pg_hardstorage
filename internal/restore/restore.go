@@ -1474,6 +1474,14 @@ func writeTablespaceSymlinks(target string, tsDests map[uint32]string) error {
 //
 // Sorted and de-duplicated so the preflight's error ordering does not
 // depend on map iteration.
+// TablespaceDestinations returns the directories a restore of m with
+// remap writes non-default tablespace data into (sorted, deduplicated).
+// Callers that stage a restore elsewhere (the recovery drill) use it to
+// expose and clean up exactly those directories.
+func TablespaceDestinations(m *backup.Manifest, remap TablespaceRemap) []string {
+	return tablespaceDestinations(m, remap)
+}
+
 func tablespaceDestinations(m *backup.Manifest, remap TablespaceRemap) []string {
 	seen := map[string]struct{}{}
 	for _, dir := range tablespaceDestRoots(m, remap) {
