@@ -453,7 +453,7 @@ func Run(ctx context.Context, sc *scenario.Scenario, opts RunOptions) (*Result, 
 			_ = db.Close()
 			db = fresh
 		}
-		ar, _ := assert.RunAll(ctx, assert.Context{DB: db}, sc.Asserts)
+		ar, _ := assert.RunAll(ctx, assert.Context{DB: db, CLIOutput: state.lastCLIOutput, HaveCLIOutput: state.haveCLIOutput}, sc.Asserts)
 		res.AssertResults = ar
 		for _, r := range ar {
 			if !r.Passed {
@@ -617,7 +617,7 @@ func runStep(ctx context.Context, db *sql.DB, st scenario.Step, i int, state *ru
 				db = fresh
 			}
 		}
-		ar, err := assert.RunAll(ctx, assert.Context{DB: db}, st.Asserts)
+		ar, err := assert.RunAll(ctx, assert.Context{DB: db, CLIOutput: state.lastCLIOutput, HaveCLIOutput: state.haveCLIOutput}, st.Asserts)
 		if err != nil {
 			return StepResult{Index: i, Kind: st.Kind, Pass: false,
 				Message: fmt.Sprintf("%d/%d asserts failed", failedCount(ar), len(ar))}

@@ -207,6 +207,11 @@ func runCLIRun(ctx context.Context, st scenario.Step, idx int, state *runState, 
 	})
 
 	runErr := cmd.Run()
+	// Kept for a later `assert: [cli_output_contains_any: ...]`, which
+	// matches "any of" across stdout and stderr — what the single-
+	// substring expect_*_contains fields cannot express.
+	state.lastCLIOutput = stdoutBuf.String() + stderrBuf.String()
+	state.haveCLIOutput = true
 
 	// exec.Run returns *exec.ExitError for non-zero exits;
 	// use ExitCode() to pull the numeric status.  -1 from

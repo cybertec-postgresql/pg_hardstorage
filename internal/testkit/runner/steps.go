@@ -117,6 +117,12 @@ type runState struct {
 	//     consumes this ref so assert_restored_match knows
 	//     where to start the sandbox cluster.
 	capturedStates map[string]*capturedState
+
+	// lastCLIOutput is the combined stdout+stderr of the most recent
+	// cli_run step; haveCLIOutput says one has run. Feed the
+	// cli_output_contains_any assertion.
+	lastCLIOutput string
+	haveCLIOutput bool
 }
 
 // capturedState is the per-name struct stored in
