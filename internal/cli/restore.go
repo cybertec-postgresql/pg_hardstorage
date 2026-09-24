@@ -247,17 +247,10 @@ func runRestore(cmd *cobra.Command, opts restoreOpts) error {
 		return err
 	}
 
-	// The keyring must already hold the keypair that signed the backups.
-	// Minting one here (on a fresh DR host) cannot verify those manifests
-	// and would sign later backups with a key nothing else trusts; say
-	// what is missing instead (notfound.signing_key → `keyring install`).
+	// Resolve the keyring path the same way the backup command does.
 	p, err := paths.Resolve(paths.DefaultOptions())
 	if err != nil {
 		return output.NewError("internal", err.Error()).Wrap(err)
-	}
-	_, verifier, err := loadExistingKeypair("restore")
-	if err != nil {
-		return err
 	}
 
 	// Resolve `latest` to a concrete backup ID. With
@@ -292,6 +285,17 @@ func runRestore(cmd *cobra.Command, opts restoreOpts) error {
 			return output.NewError("usage.bad_time",
 				fmt.Sprintf("restore: --to %q: %v", opts.toTime, perr)).Wrap(output.ErrUsage)
 		}
+	}
+
+	// The keyring must already hold the keypair that signed the backups.
+	// Minting one here (on a fresh DR host) cannot verify those manifests
+	// and would sign later backups with a key nothing else trusts; say
+	// what is missing instead (notfound.signing_key → `keyring install`).
+	// Loaded after flag validation: a malformed invocation is a usage
+	// error (exit 2) whatever the state of the keyring.
+	_, verifier, err := loadExistingKeypair("restore")
+	if err != nil {
+		return err
 	}
 
 	backupID := opts.backupID
