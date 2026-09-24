@@ -32,8 +32,12 @@ func (s *jiraStub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/rest/api/3/search"):
 		out := map[string]any{"issues": []any{}}
 		if s.searchHits > 0 {
+			// Echo the searched summary back as the hit's summary:
+			// the sink only accepts an exact summary match.
 			out = map[string]any{"issues": []any{
-				map[string]any{"key": s.searchHitKey},
+				map[string]any{"key": s.searchHitKey, "fields": map[string]any{
+					"summary": jqlSummaryTerm(r.URL.Query().Get("jql")),
+				}},
 			}}
 		}
 		body, _ := json.Marshal(out)
@@ -64,6 +68,30 @@ func (s *jiraStub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.t.Logf("unexpected JIRA call: %s %s\nbody: %s", r.Method, r.URL.Path, body)
 		http.Error(w, "not implemented", http.StatusNotImplemented)
 	}
+}
+
+// jqlSummaryTerm extracts and unescapes the literal from the
+// `summary ~ "<term>"` clause the sink sends.
+func jqlSummaryTerm(jql string) string {
+	const marker = `summary ~ "`
+	i := strings.Index(jql, marker)
+	if i < 0 {
+		return ""
+	}
+	rest := jql[i+len(marker):]
+	var b strings.Builder
+	for j := 0; j < len(rest); j++ {
+		switch c := rest[j]; {
+		case c == '\\' && j+1 < len(rest):
+			j++
+			b.WriteByte(rest[j])
+		case c == '"':
+			return b.String()
+		default:
+			b.WriteByte(c)
+		}
+	}
+	return b.String()
 }
 
 func mustBuild(t *testing.T, baseURL string, extra map[string]any) output.Sink {
