@@ -32,6 +32,7 @@ import (
 	"context"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/jackc/pglogrepl"
@@ -228,5 +229,76 @@ func TestSink_CommittedSegmentReleasesAdoptedRefs(t *testing.T) {
 	}
 	if got := len(cas.AdoptedHashes()); got != 0 {
 		t.Errorf("AdoptedHashes = %d entries after the only segment committed, want 0", got)
+	}
+}
+
+// TestSink_BatchedSegmentKeepsSharedAdoptedRefUntilItCommits: two
+// segments committed in ONE batch share an adopted chunk. Releasing the
+// adoption set after each commit used to drop that hash as soon as the
+// FIRST segment committed — while the second, already chunked and
+// referencing it, had not. gc sweeping the chunk in between then went
+// unnoticed: the second segment's commit-time check no longer saw the
+// hash as adopted, skipped the Stat, and committed a manifest over a
+// deleted chunk. A hash may be released only once no uncommitted
+// segment of the batch still references it.
+func TestSink_BatchedSegmentKeepsSharedAdoptedRefUntilItCommits(t *testing.T) {
+	body := bytes.Repeat([]byte{0xA7}, int(walsink.SegmentSize))
+	recurring := firstChunkOf(t, body)
+	h := repo.HashOf(recurring)
+
+	sp := openFsRepo(t)
+	if _, err := casdefault.New(sp).PutChunk(context.Background(), recurring); err != nil {
+		t.Fatal(err)
+	}
+
+	// Hold the first segment's chunking until BOTH segments are queued,
+	// so the processor batches them into one flush.
+	bothQueued := make(chan struct{})
+	var once sync.Once
+	commits := 0
+	swept := false
+	s, err := walsink.New(casdefault.New(sp), sp, walsink.Options{
+		Deployment: "db1", Timeline: 1, SystemIdentifier: "7388123456789",
+		FaultHook: func(ctx context.Context, checkpoint string) error {
+			switch checkpoint {
+			case "after_chunk_uploaded":
+				once.Do(func() { <-bothQueued })
+			case "before_manifest_commit":
+				commits++
+				if commits == 2 {
+					// Segment 0 is committed; segment 1 is not. gc sweeps.
+					swept = true
+					if derr := sp.Delete(ctx, repo.ChunkKey(h)); derr != nil {
+						t.Errorf("mid-batch delete: %v", derr)
+					}
+				}
+			}
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Close(context.Background()) })
+
+	two := append(append([]byte(nil), body...), body...)
+	if err := s.OnRecord(context.Background(), replication.XLogRecord{
+		WALStart: pglogrepl.LSN(0), Data: two,
+	}); err != nil {
+		t.Fatalf("OnRecord: %v", err)
+	}
+	close(bothQueued)
+
+	err = s.Close(context.Background())
+	if !swept {
+		t.Fatal("the two segments were not committed in one batch; the scenario did not run")
+	}
+	if err == nil {
+		t.Fatal("segment 1 committed over an adopted chunk gc deleted after segment 0 " +
+			"committed: segment 0's commit released the shared hash from the adoption set " +
+			"while segment 1 still depended on it")
+	}
+	if !strings.Contains(err.Error(), "deduplicated against") {
+		t.Errorf("unexpected refusal: %v", err)
 	}
 }

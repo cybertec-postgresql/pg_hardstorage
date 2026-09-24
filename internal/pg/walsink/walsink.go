@@ -869,7 +869,7 @@ func (s *Sink) flushBatch(batch []chunkedSeg) error {
 		}
 	}
 
-	for _, cs := range batch {
+	for i, cs := range batch {
 		endLSN := cs.startLSN + pglogrepl.LSN(s.segSize)
 		m := &SegmentManifest{
 			Schema:           Schema,
@@ -896,6 +896,7 @@ func (s *Sink) flushBatch(batch []chunkedSeg) error {
 		if err := s.commitManifest(s.procCtx, m); err != nil {
 			return err
 		}
+		s.releaseAdoptedRefs(cs, batch[i+1:])
 
 		// Fault checkpoint: manifest at its canonical key, segment fully
 		// durable; SyncedLSN not yet advanced (PG will resend on resume).
@@ -922,6 +923,46 @@ func (s *Sink) flushBatch(batch []chunkedSeg) error {
 		metrics.WALSegmentArchived(s.opts.Deployment, s.segSize)
 	}
 	return nil
+}
+
+// releaseAdoptedRefs drops a just-committed segment's chunk hashes from
+// the CAS adoption set — except those a later, still-uncommitted segment
+// of the same batch also references.
+//
+// Once a segment manifest is committed, every chunk it references is
+// held by a committed manifest, so gc's orphan sweep can no longer pull
+// one out from under us and the commit-time re-verification has served
+// its purpose for THAT segment. Releasing is required, or a days-long
+// `wal stream` — one CAS for the whole session — retains every
+// deduplicated hash ever seen (memory-leak audit #2).
+//
+// But the adoption set is per-CAS, not per-segment. A batch is chunked
+// in full before any of it commits, so two segments of one batch that
+// share an adopted chunk share ONE entry; releasing it when the first
+// commits blinded the second's verifyAdoptedSegmentRefs, and a gc sweep
+// landing between the two commits went unnoticed — a committed segment
+// over a deleted chunk. Shared hashes are released when the last
+// segment referencing them commits. A failed commit releases nothing:
+// the retry re-verifies the same refs.
+func (s *Sink) releaseAdoptedRefs(committed chunkedSeg, rest []chunkedSeg) {
+	if s.cas == nil {
+		return
+	}
+	var stillNeeded map[repo.Hash]struct{}
+	if len(rest) > 0 {
+		stillNeeded = make(map[repo.Hash]struct{})
+		for _, later := range rest {
+			for _, ref := range later.refs {
+				stillNeeded[ref.Hash] = struct{}{}
+			}
+		}
+	}
+	for _, ref := range committed.refs {
+		if _, keep := stillNeeded[ref.Hash]; keep {
+			continue
+		}
+		s.cas.ForgetAdopted(ref.Hash)
+	}
 }
 
 // procErrStore records the first processing error (first writer wins).
@@ -1024,18 +1065,8 @@ func (s *Sink) commitManifest(ctx context.Context, m *SegmentManifest) error {
 	if commitErr != nil {
 		return commitErr
 	}
-	// The segment manifest is committed (or verified as an
-	// already-committed idempotent re-commit): every chunk it
-	// references is now referenced by a committed manifest, so gc's
-	// orphan sweep can no longer pull one out from under us and the
-	// commit-time re-verification has served its purpose for this
-	// segment.  Release the adopted entries or a days-long
-	// `wal stream` — one CAS for the whole session — would retain
-	// every deduplicated hash ever seen: unbounded growth
-	// (memory-leak audit #2).  A failed commit must NOT release:
-	// the retry re-verifies the same refs.
-	for _, ref := range m.Chunks {
-		s.cas.ForgetAdopted(ref.Hash)
-	}
+	// Releasing this segment's adopted refs is flushBatch's job, not
+	// ours: only it knows which later segments of the same batch —
+	// already chunked, not yet committed — still depend on them.
 	return nil
 }
