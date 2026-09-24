@@ -295,6 +295,13 @@ func runRestore(cmd *cobra.Command, opts restoreOpts) error {
 	backupID := opts.backupID
 	autoResolved := false
 	var resolvedFrom string
+	// JSON mode: stdout carries exactly one document, the Result.
+	// Events (the resolution warnings below, restore progress, the
+	// advisories after it) are suppressed there; what they say that
+	// matters to a machine reader travels in the Result body instead
+	// (skipped_manifests).
+	suppressEvents := d.Renderer().Name() == "json"
+	skippedManifests := 0
 	if backupID == LatestKeyword {
 		// Time-targeted PITR: prefer the time-aware resolver
 		// over the unconstrained latest. The seed must be the
@@ -310,7 +317,8 @@ func runRestore(cmd *cobra.Command, opts restoreOpts) error {
 			// exactly the one that would have won — a closer seed,
 			// meaning less WAL to replay. Say so before the restore
 			// runs; same posture as the `latest` path.
-			if skipped > 0 {
+			skippedManifests = skipped
+			if skipped > 0 && !suppressEvents {
 				_ = d.Event(cmd.Context(), output.NewEvent(output.SeverityWarning, "restore", "time_target_resolved_with_skips").
 					WithSubject(output.Subject{Deployment: opts.deployment}).
 					WithBody(map[string]any{
@@ -335,7 +343,8 @@ func runRestore(cmd *cobra.Command, opts restoreOpts) error {
 			// the operator believes they asked for the newest is a
 			// silently wrong recovery, so say so before the restore
 			// runs and name the way out (an explicit backup ID).
-			if skipped > 0 {
+			skippedManifests = skipped
+			if skipped > 0 && !suppressEvents {
 				_ = d.Event(cmd.Context(), output.NewEvent(output.SeverityWarning, "restore", "latest_resolved_with_skips").
 					WithSubject(output.Subject{Deployment: opts.deployment}).
 					WithBody(map[string]any{
@@ -414,9 +423,8 @@ func runRestore(cmd *cobra.Command, opts restoreOpts) error {
 		}
 	}
 
-	// Wire OnEvent to the dispatcher; suppress in JSON mode so the
-	// final Result is the only document in the stream.
-	suppressEvents := d.Renderer().Name() == "json"
+	// Wire OnEvent to the dispatcher; suppressed in JSON mode (see
+	// suppressEvents above) so the final Result is the only document.
 	kmsProviderFor := deploymentKMSResolver(opts.kmsConfig)
 	res, err := restore.Restore(cmd.Context(), restore.Options{
 		RepoURL:             opts.repoURL,
@@ -523,6 +531,7 @@ func runRestore(cmd *cobra.Command, opts restoreOpts) error {
 	if autoResolved {
 		body.AutoResolved = true
 		body.ResolvedFrom = resolvedFrom
+		body.SkippedManifests = skippedManifests
 	}
 	// Surface tablespace remap in the result body for
 	// forensics. Only populated when the operator passed
@@ -828,6 +837,11 @@ type restoreResultBody struct {
 	Recovery          *recoveryArmed        `json:"recovery,omitempty"`
 	AutoResolved      bool                  `json:"auto_resolved,omitempty"`
 	ResolvedFrom      string                `json:"resolved_from,omitempty"` // "time" | "latest"
+	// SkippedManifests counts manifests the latest / --to resolver
+	// could not read and therefore could not rank: one of them may
+	// have been the better seed. Mirrors the *_resolved_with_skips
+	// warning, which JSON mode does not emit (one document only).
+	SkippedManifests int `json:"skipped_manifests,omitempty"`
 	// TablespaceRemap surfaces the operator-supplied path
 	// redirects when --tablespace-mapping was used. Empty /
 	// nil = no remap requested; the field is omitempty so the
