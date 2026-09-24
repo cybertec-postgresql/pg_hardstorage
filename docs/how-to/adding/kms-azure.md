@@ -28,6 +28,15 @@ soft-deletes whole keys, but pg_hardstorage records the version
 that was active for each backup so you can attribute precisely
 which versions are at risk.
 
+With the unversioned form, each wrapped DEK records the key
+version that wrapped it (from the KID Azure returns), and unwrap
+asks for that version. Rotating the key in Azure
+(`az keyvault key rotate`, or a rotation policy) therefore does
+not strand older backups — as long as the old versions stay
+enabled. Wrapped DEKs written before v1.5.0 carry no version and
+still unwrap with the latest one, so keep any key those backups
+used unrotated, or re-wrap them with `kms rotate` first.
+
 Bare vault names resolve against `*.vault.azure.net`; for
 sovereign clouds the vault host is dotted (and accepted
 verbatim) — same convention as the

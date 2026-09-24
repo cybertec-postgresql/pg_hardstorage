@@ -51,6 +51,7 @@
 package azurekv
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -95,6 +96,15 @@ type Client interface {
 	Delete(ctx context.Context) error
 	Describe(ctx context.Context, version string) (map[string]any, error)
 	Close() error
+}
+
+// VersionReportingClient is an OPTIONAL extension of Client: a Wrap
+// that also reports which key version did the wrapping (the version
+// component of the KID Azure returns). The production client
+// implements it; a Client without it keeps the pre-versioning
+// behaviour.
+type VersionReportingClient interface {
+	WrapVersioned(ctx context.Context, version, alg string, dek []byte) (ciphertext []byte, keyVersion string, err error)
 }
 
 // Provider implements kms.Provider over Azure Key Vault.
@@ -165,15 +175,26 @@ type realClient struct {
 
 // Wrap implements Client by forwarding to azkeys WrapKey.
 func (r *realClient) Wrap(ctx context.Context, version, alg string, dek []byte) ([]byte, error) {
+	ct, _, err := r.WrapVersioned(ctx, version, alg, dek)
+	return ct, err
+}
+
+// WrapVersioned implements VersionReportingClient: WrapKey, plus the
+// version out of the KID the vault answers with.
+func (r *realClient) WrapVersioned(ctx context.Context, version, alg string, dek []byte) ([]byte, string, error) {
 	algo := azkeys.EncryptionAlgorithm(alg)
 	resp, err := r.client.WrapKey(ctx, r.key, version, azkeys.KeyOperationParameters{
 		Algorithm: &algo,
 		Value:     dek,
 	}, nil)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	return resp.Result, nil
+	used := version
+	if resp.KID != nil {
+		used = resp.KID.Version()
+	}
+	return resp.Result, used, nil
 }
 
 // Unwrap implements Client by forwarding to azkeys UnwrapKey.
@@ -287,7 +308,16 @@ func (p *Provider) WrapDEK(ctx context.Context, dek []byte) ([]byte, error) {
 	if err := p.assertOpen(); err != nil {
 		return nil, err
 	}
-	wrapped, err := p.client.Wrap(ctx, p.versionRef, p.wrapAlg, dek)
+	var (
+		wrapped []byte
+		usedVer string
+		err     error
+	)
+	if vc, ok := p.client.(VersionReportingClient); ok {
+		wrapped, usedVer, err = vc.WrapVersioned(ctx, p.versionRef, p.wrapAlg, dek)
+	} else {
+		wrapped, err = p.client.Wrap(ctx, p.versionRef, p.wrapAlg, dek)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("azure-kv: WrapKey: %w", err)
 	}
@@ -303,7 +333,54 @@ func (p *Provider) WrapDEK(ctx context.Context, dek []byte) ([]byte, error) {
 	if len(wrapped) <= len(dek) {
 		return nil, fmt.Errorf("azure-kv: WrapKey returned %d bytes for a %d-byte DEK — refusing to store a wrapped DEK the vault provably cannot unwrap", len(wrapped), len(dek))
 	}
+	// An unversioned KEKRef wraps under whatever version is current.
+	// Record that version with the blob: UnwrapKey with no version uses
+	// the CURRENT one, so after the first Azure-side rotation every
+	// older DEK would fail to unwrap. A pinned KEKRef already names the
+	// version and keeps the raw form.
+	if p.versionRef == "" && usedVer != "" {
+		return encodeVersioned(usedVer, wrapped), nil
+	}
 	return wrapped, nil
+}
+
+// versionedMagic prefixes a wrapped DEK that records the key version
+// that wrapped it: magic || version || ':' || raw vault ciphertext.
+// Blobs without it are legacy raw ciphertext and unwrap exactly as
+// before. A raw RSA-OAEP / AES-KW output starting with these 13 ASCII
+// bytes AND a well-formed version is a 2^-100-class coincidence.
+var versionedMagic = []byte("pghs-azkv:v1:")
+
+// maxKeyVersionLen bounds the recorded version; Azure key versions are
+// 32 hex characters.
+const maxKeyVersionLen = 64
+
+func encodeVersioned(version string, raw []byte) []byte {
+	out := make([]byte, 0, len(versionedMagic)+len(version)+1+len(raw))
+	out = append(out, versionedMagic...)
+	out = append(out, version...)
+	out = append(out, ':')
+	return append(out, raw...)
+}
+
+// decodeVersioned splits a versioned blob; ok is false for a legacy
+// raw blob (or anything not well-formed), which the caller then uses
+// verbatim.
+func decodeVersioned(b []byte) (version string, raw []byte, ok bool) {
+	if !bytes.HasPrefix(b, versionedMagic) {
+		return "", nil, false
+	}
+	rest := b[len(versionedMagic):]
+	i := bytes.IndexByte(rest, ':')
+	if i <= 0 || i > maxKeyVersionLen || i == len(rest)-1 {
+		return "", nil, false
+	}
+	for _, c := range rest[:i] {
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c == '-' || c == '_') {
+			return "", nil, false
+		}
+	}
+	return string(rest[:i]), rest[i+1:], true
 }
 
 // UnwrapDEK implements kms.Provider.
@@ -311,7 +388,12 @@ func (p *Provider) UnwrapDEK(ctx context.Context, wrapped []byte) ([]byte, error
 	if err := p.assertOpen(); err != nil {
 		return nil, err
 	}
-	plain, err := p.client.Unwrap(ctx, p.versionRef, p.wrapAlg, wrapped)
+	version := p.versionRef
+	if v, raw, ok := decodeVersioned(wrapped); ok {
+		// The version that wrapped this DEK, not "latest".
+		version, wrapped = v, raw
+	}
+	plain, err := p.client.Unwrap(ctx, version, p.wrapAlg, wrapped)
 	if err != nil {
 		return nil, stdkms.UnwrapFailure(ctx, classifyAzure(err), "azure-kv: UnwrapKey", err)
 	}
