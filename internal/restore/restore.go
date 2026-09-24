@@ -943,6 +943,11 @@ func validateOptions(o *Options) error {
 		return output.NewError("usage.missing_target_dir",
 			"restore: TargetDir is required").Wrap(output.ErrUsage)
 	}
+	// Canonical form for every path derived from it: with a trailing
+	// slash, the chain path's sibling "<target>.pgcombine-staging"
+	// became "<target>/.pgcombine-staging" — inside the target — and
+	// the final rename into place failed with EINVAL.
+	o.TargetDir = filepath.Clean(o.TargetDir)
 	if o.Verifier == nil {
 		return output.NewError("usage.missing_verifier",
 			"restore: Verifier is required (we don't restore from unverified manifests)").
