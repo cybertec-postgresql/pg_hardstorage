@@ -505,10 +505,21 @@ func Import(ctx context.Context, r io.Reader, sp storage.StoragePlugin, opts Imp
 		return nil, errors.New("bundle: archive did not contain bundle.json")
 	}
 
-	// Every chunk is in. Before a single manifest becomes visible,
-	// confirm the chunks this import ADOPTED rather than wrote are still
-	// there (see the post-commit check below for the race); failing
+	// Every chunk is in. Fence the adopted chunks against a concurrent
+	// `repo gc --apply` (repo.BeginCommitFence: pins them and waits out
+	// a running sweep's in-flight batch), then — before a single
+	// manifest becomes visible — confirm they are still there; failing
 	// here leaves nothing half-imported behind.
+	var adoptedHashes []repo.Hash
+	for _, k := range adoptedChunks {
+		if h, perr := repo.ParseChunkKey(k); perr == nil {
+			adoptedHashes = append(adoptedHashes, h)
+		}
+	}
+	fence, ferr := repo.BeginCommitFence(ctx, sp, adoptedHashes, repo.FenceOptions{Owner: "bundle import"})
+	if ferr != nil {
+		return nil, fmt.Errorf("bundle: %w", ferr)
+	}
 	if swept, err := sweptAdopted(ctx, sp, adoptedChunks); err != nil {
 		return nil, err
 	} else if len(swept) > 0 {
@@ -524,6 +535,9 @@ func Import(ctx context.Context, r io.Reader, sp storage.StoragePlugin, opts Imp
 	// attestation and WAL companions.
 	if err := stage.commit(ctx, sp); err != nil {
 		return nil, err
+	}
+	if err := fence.Confirm(ctx); err != nil {
+		return nil, fmt.Errorf("bundle: %w; re-run the import: it is idempotent, and the re-run writes the missing chunks for real", err)
 	}
 
 	// Import-side half of the dedup-vs-GC gate. An adopted chunk was

@@ -433,7 +433,12 @@ func replicateManifest(ctx context.Context, src, dst storage.StoragePlugin, key,
 		res.ManifestsFailed++
 		return
 	}
-	if !reverifyAdopted(ctx, src, dst, key, adopted, opts, res) {
+	fence, ok := beginDstFence(ctx, dst, key, adopted, opts, res)
+	if !ok {
+		res.ManifestsFailed++
+		return
+	}
+	if !reverifyAdopted(ctx, src, dst, key, adopted, opts, res, false) {
 		recordReplicateFailure(res, key, errors.New("manifest withheld from replica: an adopted chunk vanished from the replica before the manifest committed (concurrent `repo gc --apply` on the replica?) and could not be re-copied; re-run replicate"))
 		res.ManifestsFailed++
 		return
@@ -441,6 +446,10 @@ func replicateManifest(ctx context.Context, src, dst storage.StoragePlugin, key,
 
 	// Then the manifest body itself.
 	if !copyKey(ctx, src, dst, key, body, opts, res, manifestKind, false /* not best-effort */) {
+		return
+	}
+	if !confirmDstFence(ctx, src, dst, key, fence, adopted, opts, res) {
+		res.ManifestsFailed++
 		return
 	}
 
@@ -490,12 +499,59 @@ func replicateWALManifest(ctx context.Context, src, dst storage.StoragePlugin, k
 		res.WALManifestsFailed++
 		return
 	}
-	if !reverifyAdopted(ctx, src, dst, key, adopted, opts, res) {
+	fence, ok := beginDstFence(ctx, dst, key, adopted, opts, res)
+	if !ok {
+		res.WALManifestsFailed++
+		return
+	}
+	if !reverifyAdopted(ctx, src, dst, key, adopted, opts, res, false) {
 		recordReplicateFailure(res, key, errors.New("wal manifest withheld from replica: an adopted chunk vanished from the replica before the manifest committed (concurrent `repo gc --apply` on the replica?) and could not be re-copied; re-run replicate"))
 		res.WALManifestsFailed++
 		return
 	}
-	copyKey(ctx, src, dst, key, body, opts, res, walKind, false)
+	if !copyKey(ctx, src, dst, key, body, opts, res, walKind, false) {
+		return
+	}
+	if !confirmDstFence(ctx, src, dst, key, fence, adopted, opts, res) {
+		res.WALManifestsFailed++
+	}
+}
+
+// beginDstFence starts the gc commit fence (gcfence.go) on the REPLICA
+// for a manifest whose chunks were partly adopted there: a `repo gc
+// --apply` running against the replica cannot then delete them between
+// the re-verify and the manifest landing. DryRun writes nothing and
+// needs no fence.
+func beginDstFence(ctx context.Context, dst storage.StoragePlugin, key string, adopted []Hash, opts ReplicateOptions, res *ReplicateResult) (*CommitFence, bool) {
+	if opts.DryRun || len(adopted) == 0 {
+		return nil, true
+	}
+	fence, err := BeginCommitFence(ctx, dst, adopted, FenceOptions{Owner: "replicate " + key})
+	if err != nil {
+		recordReplicateFailure(res, key, fmt.Errorf("manifest withheld from replica: %w", err))
+		return nil, false
+	}
+	return fence, true
+}
+
+// confirmDstFence completes the fence after the manifest landed. If a
+// replica-side gc run swept an adopted chunk while the manifest was
+// being written, the chunk is re-copied from src (src is
+// authoritative), so the replica ends up whole instead of holding a
+// manifest over a hole.
+func confirmDstFence(ctx context.Context, src, dst storage.StoragePlugin, key string, fence *CommitFence, adopted []Hash, opts ReplicateOptions, res *ReplicateResult) bool {
+	if fence == nil {
+		return true
+	}
+	err := fence.Confirm(ctx)
+	if err == nil {
+		return true
+	}
+	if errors.Is(err, ErrAdoptedChunkSwept) && reverifyAdopted(ctx, src, dst, key, adopted, opts, res, true) {
+		return true
+	}
+	recordReplicateFailure(res, key, fmt.Errorf("replica manifest references a chunk a concurrent replica-side gc deleted and it could not be re-copied: %w; re-run replicate", err))
+	return false
 }
 
 // replicateWALAux copies one WAL auxiliary file (timeline `.history`,
@@ -694,15 +750,19 @@ func bumpKeyFailed(res *ReplicateResult, kind keyKind) {
 // not evidence of loss (the chunk was present at adoption) and
 // deliberately does not block — the identical posture to
 // verifyAdoptedChunks.
-func reverifyAdopted(ctx context.Context, src, dst storage.StoragePlugin, manifestKey string, adopted []Hash, opts ReplicateOptions, res *ReplicateResult) bool {
+//
+// afterCommit re-checks even though the manifest is now at dst: it is
+// the fence's post-commit repair path, where a gc swept a chunk while
+// the manifest was being written.
+func reverifyAdopted(ctx context.Context, src, dst storage.StoragePlugin, manifestKey string, adopted []Hash, opts ReplicateOptions, res *ReplicateResult, afterCommit bool) bool {
 	if len(adopted) == 0 || opts.DryRun {
 		return true
 	}
 	switch _, err := dst.Stat(ctx, manifestKey); {
-	case err == nil:
+	case err == nil && !afterCommit:
 		return true // manifest already at dst: its references pin the chunks
-	case errors.Is(err, storage.ErrNotFound):
-		// new manifest — the race is live; verify below
+	case err == nil, errors.Is(err, storage.ErrNotFound):
+		// new manifest (or post-commit repair) — verify below
 	default:
 		// Cannot tell whether the manifest pins the chunks; verify.
 	}
