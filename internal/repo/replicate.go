@@ -170,6 +170,21 @@ type ReplicateResult struct {
 	Failures []ReplicateFailure `json:"failures,omitempty"`
 }
 
+// Clean reports whether the run left the destination a complete replica
+// of what it considered: no failure counter of ANY kind is non-zero.
+//
+// One definition, used by both the exit code and the text verdict of
+// `repo replicate`. They used to disagree: the exit ignored manifest
+// replica sidecar failures (exit 0 with the redundancy `repair manifest`
+// recovers from missing), and the text ignored WAL manifest and WAL aux
+// failures ("✓ replication clean" over a replica that cannot replay
+// across the failover it exists for).
+func (r *ReplicateResult) Clean() bool {
+	return r.ManifestsFailed == 0 && r.ManifestReplicasFailed == 0 &&
+		r.ChunksFailed == 0 && r.ChunksMissing == 0 &&
+		r.WALManifestsFailed == 0 && r.WALAuxFailed == 0
+}
+
 // Replicate copies committed manifests and their referenced chunks
 // from src to dst. Idempotent: chunks already at dst are skipped via
 // Stat; manifests already at dst are skipped via IfNotExists Put.

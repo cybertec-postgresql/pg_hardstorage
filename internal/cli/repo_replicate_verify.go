@@ -173,10 +173,11 @@ func runRepoReplicateVerify(cmd *cobra.Command, f repoReplicateVerifyFlags) erro
 	// verdict.
 	if res.Verdict != repo.VerdictConsistent {
 		return output.NewError("verify.replica_inconsistent",
-			fmt.Sprintf("repo replicate verify: %s — %d missing, %d drifted",
+			fmt.Sprintf("repo replicate verify: %s — %d missing, %d drifted, %d unparseable manifest(s) whose chunks were not checked",
 				res.Verdict,
-				res.ManifestsMissing+res.ChunksMissing+res.WALManifestsMissing,
-				res.ManifestsContentDrift+res.ChunksContentDrift)).
+				res.ManifestsMissing+res.ChunksMissing+res.WALManifestsMissing+res.WALAuxMissing,
+				res.ManifestsContentDrift+res.ChunksContentDrift+res.WALManifestsContentDrift,
+				res.ManifestsUnparseable)).
 			WithSuggestion(&output.Suggestion{
 				Human:   "review the failures slice + run `repo replicate --from " + f.from + " --to " + f.to + "` to repair",
 				Command: "pg_hardstorage repo replicate --from " + f.from + " --to " + f.to,
@@ -253,9 +254,12 @@ func writeReplicateVerifyMarkdown(w io.Writer, r *repo.ReplicateVerifyResult) er
 		r.ChunksConsidered, r.ChunksPresent,
 		r.ChunksMissing, r.ChunksContentDrift)
 	if r.IncludeWAL {
-		fmt.Fprintf(bw, "| WAL manifests | %d | %d | %d | — |\n",
+		fmt.Fprintf(bw, "| WAL manifests | %d | %d | %d | %d |\n",
 			r.WALManifestsConsidered, r.WALManifestsPresent,
-			r.WALManifestsMissing)
+			r.WALManifestsMissing, r.WALManifestsContentDrift)
+	}
+	if r.ManifestsUnparseable > 0 {
+		fmt.Fprintf(bw, "\n%d manifest(s) could not be parsed at the source — their chunks were NOT checked.\n", r.ManifestsUnparseable)
 	}
 	fmt.Fprintln(bw)
 
@@ -310,8 +314,11 @@ func writeReplicateVerifyCompact(w io.Writer, r *repo.ReplicateVerifyResult) err
 		r.ChunksConsidered, r.ChunksPresent,
 		r.ChunksMissing, r.ChunksContentDrift)
 	if r.IncludeWAL {
-		fmt.Fprintf(bw, "WAL manifests: %d considered, %d present, %d missing\n",
-			r.WALManifestsConsidered, r.WALManifestsPresent, r.WALManifestsMissing)
+		fmt.Fprintf(bw, "WAL manifests: %d considered, %d present, %d missing, %d drifted\n",
+			r.WALManifestsConsidered, r.WALManifestsPresent, r.WALManifestsMissing, r.WALManifestsContentDrift)
+	}
+	if r.ManifestsUnparseable > 0 {
+		fmt.Fprintf(bw, "Unparseable:   %d manifest(s) at the source — their chunks were NOT checked\n", r.ManifestsUnparseable)
 	}
 	if len(r.Failures) > 0 {
 		fmt.Fprintln(bw)
