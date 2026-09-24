@@ -90,9 +90,13 @@ Four prompts come next, in order:
    backup time with the full diagnostic.
 
 2. **What should we call this deployment?**
-   Default: the dbname portion of the URL.  Only `[A-Za-z0-9_-]`
-   allowed.  This becomes the backup-ID prefix and the manifest's
-   `deployment` field.
+   Default: the dbname portion of the URL (or `db1` when that is not
+   a legal name).  Must start with a letter, then `[A-Za-z0-9_-]`, at
+   most 63 characters — the same rule the config loader enforces.
+   This becomes the backup-ID prefix and the manifest's `deployment`
+   field.  Re-running setup with an existing name updates only its
+   connection string and repo; everything else configured for that
+   deployment (`kek_ref`, retention, schedules, …) is kept.
 
 3. **Where should backups go?**
    Default: `file://<state-dir>/repo` — a per-user filesystem path
@@ -130,6 +134,10 @@ Hit Enter (the capital `Y` is the obvious default) and:
 
   Take a first backup right now? [Y/n]
 ```
+
+The config file is written mode `0600` (it holds the connection
+string, password included); a file you have made stricter keeps its
+mode.
 
 Saying yes hops straight into operation `#2` against the deployment
 you just configured — the test that proves the setup actually
