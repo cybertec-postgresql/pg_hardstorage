@@ -20,7 +20,7 @@ Read-only surface over the auto-persisted drill history.
 
 Each `recovery drill` run writes a slim DrillHistoryEntry into
 `recovery/drills/<id>.json` in the repo (suppress with
-`--skip-history`).  This command walks them and reports the
+`--no-history`).  This command walks them and reports the
 list + the rollup summary (pass percent, RTO distribution,
 verdict trend, latest verdict + RTO).
 

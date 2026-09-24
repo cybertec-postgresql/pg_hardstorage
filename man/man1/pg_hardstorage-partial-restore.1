@@ -20,8 +20,17 @@ skipped.
 
 .PP
 Resolution: pass --pg-connection to query pg_class on a live source
-DB, OR --relfilenode-map  to a JSON file (the same shape
-\fBpartial inspect -o json\fR emits).
+DB, OR --relfilenode-map  to a JSON file: the output of
+\fBpartial inspect -o json\fR as saved (or just its table_mappings
+array) is accepted as-is.
+
+.PP
+Tables in a non-default tablespace land under pg_tblspc//...,
+the path pg_relation_filepath() reports. Incremental backups are
+refused (their relation data only exists combined with the chain);
+use a full backup or \fBpartial dump\fR\&. Any requested table that
+yields nothing (not found, or absent from the backup) makes the
+command exit non-zero after the result is printed.
 
 .PP
 The output is a partial PGDATA layout. Run pg_dump against a
