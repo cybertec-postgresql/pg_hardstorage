@@ -2,10 +2,8 @@
 package cli
 
 import (
-	"errors"
 	"fmt"
 	"io"
-	"net/url"
 	"os"
 	"os/exec"
 	"strings"
@@ -113,11 +111,7 @@ func newRedactApplyCmd() *cobra.Command {
 			// The password never goes on psql's argv, where every local
 			// user can read it (ps, /proc/<pid>/cmdline): it is split out
 			// of the DSN and handed over in PGPASSWORD.
-			connNoPW, password, err := splitDSNPassword(pgConn)
-			if err != nil {
-				return output.NewError("usage.bad_flag",
-					fmt.Sprintf("redact apply: --pg-connection: %v", err)).Wrap(output.ErrUsage)
-			}
+			connNoPW, password, _ := splitDSNPassword(pgConn)
 			for _, t := range tableSQLs {
 				body := fmt.Sprintf("BEGIN;\n%s;\nCOMMIT;\n", t.Stmt)
 				pcmd := exec.CommandContext(cmd.Context(), ps,
@@ -261,103 +255,6 @@ type redactBody struct {
 	// SQL is the generated script, set by --print-sql in structured
 	// output modes.
 	SQL string `json:"sql,omitempty"`
-}
-
-// splitDSNPassword removes the password from a libpq connection
-// string (URI or keyword/value form) and returns it separately, so it
-// can be passed to a child process in PGPASSWORD instead of on argv.
-// Returns the DSN unchanged and "" when it carries no password.
-func splitDSNPassword(dsn string) (string, string, error) {
-	if strings.HasPrefix(dsn, "postgres://") || strings.HasPrefix(dsn, "postgresql://") {
-		u, err := url.Parse(dsn)
-		if err != nil {
-			return "", "", err
-		}
-		var pw string
-		if u.User != nil {
-			if p, ok := u.User.Password(); ok {
-				pw = p
-				u.User = url.User(u.User.Username())
-			}
-		}
-		q := u.Query()
-		if p := q.Get("password"); p != "" {
-			pw = p
-		}
-		if q.Has("password") {
-			q.Del("password")
-			u.RawQuery = q.Encode()
-		}
-		return u.String(), pw, nil
-	}
-	// keyword/value: key = value pairs; a value is bare or
-	// single-quoted with backslash escapes (libpq's conninfo grammar).
-	var kept []string
-	var pw string
-	i := 0
-	for i < len(dsn) {
-		for i < len(dsn) && (dsn[i] == ' ' || dsn[i] == '\t' || dsn[i] == '\n') {
-			i++
-		}
-		if i >= len(dsn) {
-			break
-		}
-		start := i
-		for i < len(dsn) && dsn[i] != '=' && dsn[i] != ' ' {
-			i++
-		}
-		key := dsn[start:i]
-		for i < len(dsn) && dsn[i] == ' ' {
-			i++
-		}
-		if i >= len(dsn) || dsn[i] != '=' {
-			return "", "", fmt.Errorf("missing \"=\" after %q in connection string", key)
-		}
-		i++
-		for i < len(dsn) && dsn[i] == ' ' {
-			i++
-		}
-		var val strings.Builder
-		vstart := i
-		if i < len(dsn) && dsn[i] == '\'' {
-			i++
-			closed := false
-			for i < len(dsn) {
-				c := dsn[i]
-				if c == '\\' && i+1 < len(dsn) {
-					val.WriteByte(dsn[i+1])
-					i += 2
-					continue
-				}
-				if c == '\'' {
-					i++
-					closed = true
-					break
-				}
-				val.WriteByte(c)
-				i++
-			}
-			if !closed {
-				return "", "", errors.New("unterminated quoted string in connection string")
-			}
-		} else {
-			for i < len(dsn) && dsn[i] != ' ' {
-				if dsn[i] == '\\' && i+1 < len(dsn) {
-					val.WriteByte(dsn[i+1])
-					i += 2
-					continue
-				}
-				val.WriteByte(dsn[i])
-				i++
-			}
-		}
-		if key == "password" {
-			pw = val.String()
-			continue
-		}
-		kept = append(kept, key+"="+dsn[vstart:i])
-	}
-	return strings.Join(kept, " "), pw, nil
 }
 
 // WriteText renders the redaction outcome — statements run, salt, mode — as
