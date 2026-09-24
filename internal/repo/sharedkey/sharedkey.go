@@ -141,9 +141,18 @@ func Resolve(ctx context.Context, sp storage.StoragePlugin, wantKEKRef string, u
 				continue
 			}
 			res.SawCandidate = true
-			if dek, uerr := unwrap(wrapped); uerr == nil && len(dek) == encryption.KeyLen {
+			dek, uerr := unwrap(wrapped)
+			if uerr == nil && len(dek) == encryption.KeyLen {
 				res.DEK = dek
 				return res, nil
+			}
+			if uerr != nil && !IsDefinitiveUnwrapFailure(uerr) {
+				// A KMS that is throttled or unreachable says nothing
+				// about whether this wrap is ours. Skipping on to the
+				// next candidate could adopt a DIFFERENT legacy DEK than
+				// the one this candidate holds; fail instead and let the
+				// caller retry.
+				return Result{}, fmt.Errorf("sharedkey: unwrap candidate %s: %w", info.Key, uerr)
 			}
 		}
 	}
@@ -184,6 +193,17 @@ func ResolveOrMint(ctx context.Context, sp storage.StoragePlugin, kekRef string,
 	key := sharedDEKKey(kekRef)
 
 	// 1. Authoritative object.
+	//
+	// Only a DEFINITIVE refusal (the wrap does not authenticate under
+	// this KEK) may send us on to the manifest scan below, whose
+	// adoption can overwrite this slot. A transient unwrap failure — KMS
+	// throttling, a network blip, an expired session — used to be folded
+	// into "won't unwrap" as well: the scan then adopted whatever legacy
+	// manifest DEK it found first and OVERWROTE the canonical object with
+	// it. Every writer after that encrypted under a DEK that differs from
+	// the one existing chunks were written with — the issue-#31
+	// divergence, caused by a KMS hiccup. unwrapInto now returns such
+	// failures as errors, and they propagate from here.
 	if wrapped, ok := readWrappedDEK(ctx, sp, key, kekRef); ok {
 		out, err := unwrapInto(wrapped, unwrap)
 		if err != nil || out.Have {
@@ -277,10 +297,15 @@ func ResolveOrMint(ctx context.Context, sp storage.StoragePlugin, kekRef string,
 }
 
 // unwrapInto unwraps a shared-DEK wrapped form into a MintResult. A wrap
-// that won't authenticate under the caller's KEK yields UnusableCandidate
-// (a prior DEK exists but this KEK can't read it) rather than an error.
+// that DEFINITIVELY won't authenticate under the caller's KEK yields
+// UnusableCandidate (a prior DEK exists but this KEK can't read it). Any
+// other unwrap failure is returned as an error: it is not evidence about
+// key custody, and callers must not act on it as if it were.
 func unwrapInto(wrapped []byte, unwrap Unwrapper) (MintResult, error) {
 	dek, uerr := unwrap(wrapped)
+	if uerr != nil && !IsDefinitiveUnwrapFailure(uerr) {
+		return MintResult{}, fmt.Errorf("sharedkey: unwrap shared DEK (transient? retry): %w", uerr)
+	}
 	if uerr != nil || len(dek) != encryption.KeyLen {
 		return MintResult{UnusableCandidate: true}, nil
 	}
@@ -295,6 +320,16 @@ func unwrapInto(wrapped []byte, unwrap Unwrapper) (MintResult, error) {
 		"shared DEK resolved to the all-zero key")
 	out.Have = true
 	return out, nil
+}
+
+// IsDefinitiveUnwrapFailure reports whether an Unwrapper error proves the
+// wrap does not belong to the caller's KEK (AEAD authentication failed),
+// as opposed to a failure to ASK (KMS throttling, network, auth to the
+// KMS itself). Only the former may be treated as "this DEK is not ours".
+// Unwrappers wrap encryption.ErrAuthenticationFailed for that case (the
+// local keywrap and keystore paths do).
+func IsDefinitiveUnwrapFailure(err error) bool {
+	return errors.Is(err, encryption.ErrAuthenticationFailed)
 }
 
 // putSharedDEK writes the shared-DEK envelope at key with IfNotExists, so
