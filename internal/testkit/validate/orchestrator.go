@@ -642,6 +642,12 @@ func mergeLoadStats(cr *report.CellReport, src *report.LoadStats) {
 	if src.TPSAvg != 0 {
 		dst.TPSAvg = src.TPSAvg
 	}
+	if src.SustainedWriterRestarts != 0 {
+		dst.SustainedWriterRestarts = src.SustainedWriterRestarts
+	}
+	if src.SustainedWriterUptimePct != 0 {
+		dst.SustainedWriterUptimePct = src.SustainedWriterUptimePct
+	}
 	if src.LatencyP95Ms != 0 {
 		dst.LatencyP95Ms = src.LatencyP95Ms
 	}

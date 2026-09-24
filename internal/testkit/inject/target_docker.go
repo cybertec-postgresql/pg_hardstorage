@@ -197,10 +197,29 @@ func (d *DockerTarget) CopyOut(ctx context.Context, path string) ([]byte, error)
 // unbounded.
 func (d *DockerTarget) SetMemoryLimit(ctx context.Context, bytes int64) error {
 	arg := dockerMemoryLimitArg(bytes)
+	bootBefore := d.startedAt(ctx)
 	cmd := exec.CommandContext(ctx, d.docker(),
 		"update", "--memory="+arg, "--memory-swap="+arg, d.Container)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
+		// The squeeze raced a container restart: the cgroup it was
+		// writing no longer exists. The enterprise_heavy soak logged 27
+		// of these, and the full errors (once no longer truncated) read
+		//
+		//	write …/memory.swap.max: no such device
+		//	openat2 …/cgroup.controllers: no such file or directory
+		//
+		// — the container's scope vanishing mid-update, usually right
+		// after a signal fault restarted it. That is "target not
+		// running" (the injector's cell-down skip), established from
+		// evidence — the container is down or its StartedAt moved —
+		// not guessed from the errno.
+		if !d.running(ctx) {
+			return fmt.Errorf("%s: %w", d.Container, ErrTargetNotRunning)
+		}
+		if bootAfter := d.startedAt(ctx); bootBefore != "" && bootAfter != "" && bootAfter != bootBefore {
+			return fmt.Errorf("%s restarted during docker update: %w", d.Container, ErrTargetNotRunning)
+		}
 		// Same posture as Exec: a down container is a
 		// pre-existing cell crash, not a cgroup_squeeze failure.
 		if strings.Contains(string(out), "is not running") {
@@ -312,4 +331,19 @@ func truncate(b []byte, n int) string {
 		return string(b)
 	}
 	return string(b[:n]) + "..."
+}
+
+// startedAt returns the container's State.StartedAt ("" if unreadable).
+func (d *DockerTarget) startedAt(ctx context.Context) string {
+	out, err := exec.CommandContext(ctx, d.docker(), "inspect", "--format", "{{.State.StartedAt}}", d.Container).Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// running reports whether the container is currently running.
+func (d *DockerTarget) running(ctx context.Context) bool {
+	out, err := exec.CommandContext(ctx, d.docker(), "inspect", "--format", "{{.State.Running}}", d.Container).Output()
+	return err == nil && strings.TrimSpace(string(out)) == "true"
 }

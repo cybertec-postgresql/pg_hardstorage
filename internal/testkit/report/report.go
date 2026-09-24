@@ -157,6 +157,19 @@ type LoadStats struct {
 	// the disambiguator.
 	SustainedWriterRan bool `json:"sustained_writer_ran,omitempty"`
 
+	// SustainedWriterRestarts counts how often the supervisor had to
+	// restart pgbench. A fault that kills PostgreSQL drops every client
+	// connection and pgbench exits; before the writer was supervised,
+	// that ended the write load for the rest of the cell's run while the
+	// report still showed Writer ✓.
+	SustainedWriterRestarts int `json:"sustained_writer_restarts,omitempty"`
+
+	// SustainedWriterUptimePct is the share of the writer's wall-clock
+	// window in which it was actually producing transactions, measured
+	// from pgbench's 10-second progress samples. The number that says
+	// whether "backups ran under sustained write load" is true.
+	SustainedWriterUptimePct float64 `json:"sustained_writer_uptime_pct,omitempty"`
+
 	// WALStreamRan is the same flag for the wal-stream
 	// sidecar.
 	WALStreamRan bool `json:"wal_stream_ran,omitempty"`
@@ -303,7 +316,7 @@ func (r *Report) WriteMarkdown(w io.Writer) error {
 			}
 			fmt.Fprintf(w, "| %s | %s | %s | %.0f | %.1f ms | %s | %s | %s | %s |\n",
 				c.Name,
-				boolMark(ls.SustainedWriterRan),
+				writerMark(ls),
 				boolMark(ls.WALStreamRan),
 				ls.TPSAvg, ls.LatencyP95Ms,
 				humanBytes(ls.WALBytesWritten),
@@ -420,4 +433,14 @@ func humanBytes(n int64) string {
 	}
 	unit := []string{"KiB", "MiB", "GiB", "TiB", "PiB"}[exp]
 	return fmt.Sprintf("%.2f %s", float64(n)/float64(div), unit)
+}
+
+// writerMark renders the Writer column: whether it ran, and — when it
+// did — how much of the window it was actually writing and how often it
+// had to be restarted. A bare ✓ hid a writer that died minutes in.
+func writerMark(ls *LoadStats) string {
+	if !ls.SustainedWriterRan {
+		return boolMark(false)
+	}
+	return fmt.Sprintf("✓ %.0f%% up, %d restarts", ls.SustainedWriterUptimePct, ls.SustainedWriterRestarts)
 }

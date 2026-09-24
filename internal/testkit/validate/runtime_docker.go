@@ -10,6 +10,7 @@ import (
 	"math/rand"
 	"os/exec"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -101,6 +102,10 @@ type DockerCellRuntime struct {
 	sustainedCancel    context.CancelFunc
 	sustainedDone      chan struct{}
 	walPreCount        int64 // pg_stat_wal.wal_bytes at writer start; 0 = not sampled
+	walPreLSN          string
+	sustainedPGBin     string
+	sustainedMu        sync.Mutex
+	sustainedRestarts  int
 
 	// WAL-stream sidecar state.  Unlike the sustained writer,
 	// this one is SUPERVISED: `docker exec` dies with the
@@ -764,18 +769,21 @@ func (d *DockerCellRuntime) StartSustainedLoad(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("sustained load: %w", err)
 	}
+	d.sustainedPGBin = pgBin
 
-	// Sample WAL counter so StopSustainedLoad can compute
-	// "WAL bytes written during the writer's lifetime".  Best-
-	// effort: pg_stat_wal exists since PG14; older clusters
-	// just leave the counter at zero and the report shows "—".
-	d.walPreCount = d.samplePGStatWAL(ctx)
+	// WAL written is measured as an LSN distance, read through psql in
+	// the container. The old pg_stat_wal counter was read over d.conn,
+	// which dies with the first fault that restarts PostgreSQL, and the
+	// counter resets on crash recovery anyway; every heavy-soak cell
+	// reported "—". LSNs only move forward.
+	d.walPreLSN = d.currentWALLSN(ctx)
 
 	args := []string{
 		pgBin + "/pgbench",
 		"-c", fmt.Sprintf("%d", d.Profile.SustainedClients),
 		"-j", fmt.Sprintf("%d", d.Profile.SustainedClients),
-		"-T", "100000", // effectively forever; we kill on Stop
+		"-T", "100000", // effectively forever; the supervisor stops it
+		"-P", "10", // a progress sample every 10 s, on stderr
 		"--no-vacuum",
 		"-U", d.PGUser,
 	}
@@ -785,34 +793,63 @@ func (d *DockerCellRuntime) StartSustainedLoad(ctx context.Context) error {
 	args = append(args, d.PGDatabase)
 
 	bgCtx, cancel := context.WithCancel(context.Background())
-	full := append([]string{"exec", "-u", d.PGUser, d.Container}, args...)
-	cmd := exec.CommandContext(bgCtx, d.dockerBin(), full...)
-
 	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	if err := cmd.Start(); err != nil {
-		cancel()
-		return fmt.Errorf("sustained load: pgbench start: %w", err)
-	}
-
-	d.sustainedCmd = cmd
+	// A placeholder Cmd marks the writer as requested-and-running for
+	// SustainedWriterActive; the supervisor owns the real processes.
+	d.sustainedCmd = exec.CommandContext(bgCtx, d.dockerBin())
 	d.sustainedStdout = &stdout
 	d.sustainedStderr = &stderr
 	d.sustainedStartedAt = time.Now()
 	d.sustainedCancel = cancel
 	d.sustainedDone = make(chan struct{})
-	go func() {
-		_ = cmd.Wait()
-		close(d.sustainedDone)
-	}()
+	go d.superviseSustainedLoad(bgCtx, args, &stdout, &stderr)
 	return nil
 }
 
-// StopSustainedLoad terminates the pgbench writer started by
-// StartSustainedLoad and parses its final report into
-// LoadStats.  Returns nil/nil when no writer was running so
-// the orchestrator can call Stop unconditionally.
+// superviseSustainedLoad keeps pgbench running for the whole soak.
+//
+// A fault that kills PostgreSQL drops all of pgbench's connections and
+// pgbench exits. Unsupervised, that ended the write load for the rest of
+// the cell's run — typically minutes into an 8 h soak — while the report
+// kept showing "Writer ✓". The first enterprise_heavy soak therefore
+// passed without backups having run under sustained writes for most of
+// it. This is the same defect v1.4 found in the WAL-stream sidecar, and
+// the same fix: restart on exit, count the restarts.
+func (d *DockerCellRuntime) superviseSustainedLoad(ctx context.Context, args []string, stdout, stderr *bytes.Buffer) {
+	defer close(d.sustainedDone)
+	first := true
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		if !first {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(sustainedRestartDelay):
+			}
+			d.sustainedMu.Lock()
+			d.sustainedRestarts++
+			d.sustainedMu.Unlock()
+		}
+		first = false
+		full := append([]string{"exec", "-u", d.PGUser, d.Container}, args...)
+		cmd := exec.CommandContext(ctx, d.dockerBin(), full...)
+		d.sustainedMu.Lock()
+		cmd.Stdout = stdout
+		cmd.Stderr = stderr
+		d.sustainedMu.Unlock()
+		if err := cmd.Start(); err != nil {
+			continue // container likely down mid-fault; retry after the delay
+		}
+		_ = cmd.Wait()
+	}
+}
+
+// sustainedRestartDelay spaces pgbench restarts while PostgreSQL is
+// recovering, so a long recovery does not become a tight loop.
+var sustainedRestartDelay = 5 * time.Second
+
 // SustainedWriterActive reports whether a writer is actually
 // running. The zero-SustainedClients path leaves sustainedCmd nil,
 // which is the same state as "never asked for one" — and that is
@@ -820,32 +857,41 @@ func (d *DockerCellRuntime) StartSustainedLoad(ctx context.Context) error {
 // announces a writer to the event stream.
 func (d *DockerCellRuntime) SustainedWriterActive() bool { return d.sustainedCmd != nil }
 
+// StopSustainedLoad stops the supervised writer and reports what it
+// actually did over its whole window.
 func (d *DockerCellRuntime) StopSustainedLoad(ctx context.Context) (*report.LoadStats, error) {
 	if d.sustainedCmd == nil {
 		return nil, nil
 	}
-	// Cancel triggers SIGKILL on the docker-exec process,
-	// which (because docker exec proxies signals) terminates
-	// pgbench inside the container.  pgbench prints its
-	// summary on TERM as well as on natural exit, so we
-	// expect numbers in stdout regardless.
+	window := time.Since(d.sustainedStartedAt)
 	d.sustainedCancel()
 	select {
 	case <-d.sustainedDone:
-	case <-time.After(5 * time.Second):
-		// pgbench should react within a second; longer means
-		// docker is wedged.  Don't block teardown.
+	case <-time.After(10 * time.Second):
+		// docker wedged; do not block teardown
 	}
 
-	stats := &report.LoadStats{SustainedWriterRan: true}
-	if d.sustainedStdout != nil {
-		tps, p95 := parsePgbenchSummary(d.sustainedStdout.String())
-		stats.TPSAvg = tps
-		stats.LatencyP95Ms = p95
+	d.sustainedMu.Lock()
+	restarts := d.sustainedRestarts
+	progress := ""
+	if d.sustainedStderr != nil {
+		progress = d.sustainedStderr.String()
 	}
-	// WAL bytes written during the writer's lifetime.
-	if post := d.samplePGStatWAL(ctx); post > 0 && d.walPreCount >= 0 {
-		stats.WALBytesWritten = post - d.walPreCount
+	d.sustainedMu.Unlock()
+
+	stats := &report.LoadStats{SustainedWriterRan: true, SustainedWriterRestarts: restarts}
+	tps, p95, samples := parsePgbenchProgress(progress)
+	stats.TPSAvg = tps
+	stats.LatencyP95Ms = p95
+	if window > 0 {
+		up := float64(samples) * 10 / window.Seconds() * 100
+		if up > 100 {
+			up = 100
+		}
+		stats.SustainedWriterUptimePct = up
+	}
+	if post := d.currentWALLSN(ctx); post != "" && d.walPreLSN != "" {
+		stats.WALBytesWritten = d.walLSNDiff(ctx, post, d.walPreLSN)
 	}
 
 	d.sustainedCmd = nil
@@ -854,6 +900,31 @@ func (d *DockerCellRuntime) StopSustainedLoad(ctx context.Context) (*report.Load
 	d.sustainedCancel = nil
 	d.sustainedDone = nil
 	return stats, nil
+}
+
+// currentWALLSN reads pg_current_wal_lsn() through psql inside the
+// container, independent of the soak's own (fault-prone) connection.
+func (d *DockerCellRuntime) currentWALLSN(ctx context.Context) string {
+	if d.sustainedPGBin == "" {
+		return ""
+	}
+	out, err := d.dockerExecAs(ctx, d.PGUser, d.sustainedPGBin+"/psql", "-U", d.PGUser, "-d", d.PGDatabase,
+		"-Atc", "select pg_current_wal_lsn()")
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// walLSNDiff returns post - pre in bytes, computed by PostgreSQL.
+func (d *DockerCellRuntime) walLSNDiff(ctx context.Context, post, pre string) int64 {
+	out, err := d.dockerExecAs(ctx, d.PGUser, d.sustainedPGBin+"/psql", "-U", d.PGUser, "-d", d.PGDatabase,
+		"-Atc", fmt.Sprintf("select pg_wal_lsn_diff('%s', '%s')::bigint", post, pre))
+	if err != nil {
+		return 0
+	}
+	n, _ := strconv.ParseInt(strings.TrimSpace(string(out)), 10, 64)
+	return n
 }
 
 // StartWALStream runs `pg_hardstorage wal stream` inside the
@@ -1524,4 +1595,48 @@ func truncate(b []byte, n int) string {
 		return string(b)
 	}
 	return string(b[:n]) + "…"
+}
+
+// pgbenchProgressRe matches pgbench's -P progress line, e.g.
+//
+//	progress: 10.0 s, 523.4 tps, lat 30.512 ms stddev 12.101, 0 failed
+//
+// PG 15+ appends ", N failed"; older versions omit it. Only the tps and
+// latency fields are read.
+var pgbenchProgressRe = regexp.MustCompile(`progress: [0-9.]+ s, ([0-9.]+) tps, lat ([0-9.]+) ms`)
+
+// parsePgbenchProgress summarises every progress sample across all of
+// the supervised writer's runs: mean tps, the 95th percentile of the
+// 10-second average latencies, and the number of samples (each one is
+// 10 s during which the writer was demonstrably running).
+//
+// The progress stream is used instead of pgbench's end-of-run summary
+// because a supervised writer rarely ends normally: it is killed by a
+// fault or stopped by the soak, and neither prints the summary. Every
+// heavy-soak cell reported 0 tps for exactly that reason.
+func parsePgbenchProgress(s string) (tpsAvg, latP95 float64, samples int) {
+	var tpsSum float64
+	var lats []float64
+	for _, m := range pgbenchProgressRe.FindAllStringSubmatch(s, -1) {
+		tps, err1 := strconv.ParseFloat(m[1], 64)
+		lat, err2 := strconv.ParseFloat(m[2], 64)
+		if err1 != nil || err2 != nil {
+			continue
+		}
+		tpsSum += tps
+		lats = append(lats, lat)
+	}
+	samples = len(lats)
+	if samples == 0 {
+		return 0, 0, 0
+	}
+	sort.Float64s(lats)
+	idx := int(float64(samples)*0.95+0.5) - 1
+	if idx < 0 {
+		idx = 0
+	}
+	if idx >= samples {
+		idx = samples - 1
+	}
+	return tpsSum / float64(samples), lats[idx], samples
 }
