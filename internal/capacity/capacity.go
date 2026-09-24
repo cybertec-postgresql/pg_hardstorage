@@ -142,31 +142,27 @@ func Project(ctx context.Context, sp storage.StoragePlugin, repoURL string, opts
 		return r.PerDeployment[i].Name < r.PerDeployment[j].Name
 	})
 
-	// Aggregate projection: the same linear fit but on the union of
-	// every deployment's samples. We re-fold the per-deployment
-	// cumulatives into a single timeline because the *repo* growth
-	// rate is what the operator's procurement budget cares about,
-	// not the sum of independent per-deployment slopes (which would
-	// over-count if two deployments both grow but at different
-	// times).
+	// Aggregate projection: the *repo* growth rate is what the
+	// operator's procurement budget cares about, and the repo is the
+	// sum of its deployments.
 	r.CurrentBytes = sumDeploymentCurrent(r.PerDeployment)
 	if len(allSamples) >= 3 {
-		// Build a global cumulative timeline: sort all samples by
-		// timestamp, then re-cumulate the per-sample increments.
-		sort.Slice(allSamples, func(i, j int) bool {
-			return allSamples[i].at.Before(allSamples[j].at)
-		})
-		// First convert from per-deployment-cumulative back to deltas,
-		// then re-cumulate globally. Since per-deployment cumulatives
-		// are monotonic, the delta is sample[i].cumulative -
-		// sample[i-1].cumulative within the same deployment — but
-		// we've now interleaved them, so a simpler equivalent: just
-		// sum the per-deployment slopes weighted by their share of
-		// total bytes.
-		var totalSlope float64
+		// The repository's growth rate is the SUM of the per-
+		// deployment rates: every deployment writes into the same
+		// repo, and the derivative of a sum is the sum of the
+		// derivatives. An earlier form took the byte-weighted
+		// average slope and multiplied it by the deployment count,
+		// which only equals the sum when every deployment is the same
+		// size — a fleet of one large and one small deployment was
+		// over- or under-stated by their size skew. R² has no such
+		// additive meaning, so it stays a byte-weighted average: the
+		// big deployments dominate the fleet slope, so their fit
+		// quality should dominate its confidence.
+		var totalSlope int64
 		var totalR2 float64
 		var weightSum float64
 		for _, dp := range r.PerDeployment {
+			totalSlope += dp.BytesPerDay
 			if dp.BytesPerDay <= 0 {
 				continue
 			}
@@ -174,12 +170,11 @@ func Project(ctx context.Context, sp storage.StoragePlugin, repoURL string, opts
 			if w <= 0 {
 				w = 1
 			}
-			totalSlope += float64(dp.BytesPerDay) * w
 			totalR2 += dp.RSquared * w
 			weightSum += w
 		}
+		r.BytesPerDay = totalSlope
 		if weightSum > 0 {
-			r.BytesPerDay = int64(totalSlope / weightSum * float64(len(r.PerDeployment)))
 			r.RSquared = totalR2 / weightSum
 		}
 		r.SamplesUsed = len(allSamples)
