@@ -54,6 +54,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 	"sync"
 
@@ -312,7 +313,7 @@ func (p *Provider) UnwrapDEK(ctx context.Context, wrapped []byte) ([]byte, error
 	}
 	plain, err := p.client.Unwrap(ctx, p.versionRef, p.wrapAlg, wrapped)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", stdkms.ErrUnwrap, err)
+		return nil, stdkms.UnwrapFailure(ctx, classifyAzure(err), "azure-kv: UnwrapKey", err)
 	}
 	// A truncated/empty unwrap would surface one layer down as
 	// repository-wide AEAD failures; failing here names the actual
@@ -321,6 +322,22 @@ func (p *Provider) UnwrapDEK(ctx context.Context, wrapped []byte) ([]byte, error
 		return nil, fmt.Errorf("%w: UnwrapKey returned %d bytes, want a %d-byte DEK", stdkms.ErrUnwrap, len(plain), encryption.KeyLen)
 	}
 	return plain, nil
+}
+
+// classifyAzure maps a Key Vault error onto the kms error classes by
+// HTTP status. 400 (bad ciphertext / algorithm), 404 (key or version
+// gone) and the rest genuinely concern the key and stay ErrUnwrap.
+func classifyAzure(err error) error {
+	var re *azcore.ResponseError
+	if errors.As(err, &re) {
+		switch s := re.StatusCode; {
+		case s == http.StatusTooManyRequests || s >= 500:
+			return stdkms.ErrUnavailable
+		case s == http.StatusUnauthorized || s == http.StatusForbidden:
+			return stdkms.ErrAccessDenied
+		}
+	}
+	return stdkms.ErrUnwrap
 }
 
 // Shred implements kms.Provider.  Calls Azure's DeleteKey,

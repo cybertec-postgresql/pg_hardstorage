@@ -190,7 +190,10 @@ be reached raises `kms.unreachable` (exit 8, transient); a keyring
 that cannot resolve the ref at all raises `restore.kek_resolve_failed`
 (exit 1); one that resolves but does not unwrap raises
 `restore.kek_mismatch` (exit 1). Only the `unreachable` leaf routes to
-exit 8 — the others sit in the generic error bucket. The body carries
+exit 8 — the others sit in the generic error bucket. A throttled or
+5xx answer from a cloud KMS counts as unreachable (retry later); an
+AccessDenied / expired-credentials answer is `kek_resolve_failed`, not
+a key mismatch — check the credentials before suspecting the key. The body carries
 the manifest's `KEKRef` so you know which key the read path was
 looking for.
 
