@@ -56,6 +56,7 @@ import (
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
 
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/airgap"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
 )
 
@@ -257,6 +258,22 @@ func (p *Plugin) Open(ctx context.Context, cfg storage.StorageConfig) error {
 		}
 		o.UsePathStyle = usePathStyle
 	})
+
+	// Air-gap gate. `airgapped: strict` promises every outbound path is
+	// checked, and this plugin checked none: a custom ?endpoint= and the
+	// public AWS endpoint alike were dialled unconditionally. Check what
+	// the client will actually talk to — the resolved BaseEndpoint also
+	// picks up AWS_ENDPOINT_URL(_S3) from the environment — and, with
+	// none, the regional AWS host. That is the name an operator
+	// allowlists (s3.<region>.amazonaws.com), including behind a VPC
+	// gateway endpoint.
+	effective := aws.ToString(client.Options().BaseEndpoint)
+	if effective == "" {
+		effective = "https://s3." + awsCfg.Region + ".amazonaws.com"
+	}
+	if err := airgap.Default().EndpointAllowed(effective); err != nil {
+		return fmt.Errorf("s3: %w", err)
+	}
 
 	p.client = client
 	p.bucket = bucket

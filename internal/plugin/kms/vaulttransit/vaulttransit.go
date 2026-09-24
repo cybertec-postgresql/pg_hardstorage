@@ -71,6 +71,7 @@ import (
 
 	vaultapi "github.com/hashicorp/vault/api"
 
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/airgap"
 	stdkms "github.com/cybertec-postgresql/pg_hardstorage/internal/kms"
 )
 
@@ -118,6 +119,12 @@ func builder(ctx context.Context, kekRef string, cfg map[string]any) (stdkms.Pro
 	addr, mount, name, err := parseKEKRef(kekRef)
 	if err != nil {
 		return nil, err
+	}
+	// Air-gap gate, as aws-kms and azblob do: under `airgapped: strict`
+	// the Vault address must be loopback/private or allowlisted. Without
+	// it the KEKRef's host was dialled unchecked.
+	if err := airgap.Default().EndpointAllowed(addr); err != nil {
+		return nil, fmt.Errorf("vault-transit: %w", err)
 	}
 
 	apiCfg := vaultapi.DefaultConfig()

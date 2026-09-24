@@ -62,6 +62,7 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/Azure/azure-sdk-for-go/sdk/security/keyvault/azkeys"
 
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/airgap"
 	stdkms "github.com/cybertec-postgresql/pg_hardstorage/internal/kms"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/encryption"
 )
@@ -125,6 +126,13 @@ func builder(ctx context.Context, kekRef string, cfg map[string]any) (stdkms.Pro
 		wrapAlg = DefaultWrapAlgorithm
 	}
 	fipsMode, _ := cfg["use_fips_mode"].(bool)
+
+	// Air-gap gate, as azblob and aws-kms do: under `airgapped: strict`
+	// the vault host must be loopback/private or allowlisted. Without
+	// it this provider reached *.vault.azure.net unchecked.
+	if err := airgap.Default().EndpointAllowed(vault); err != nil {
+		return nil, fmt.Errorf("azure-kv: %w", err)
+	}
 
 	cred, err := azidentity.NewDefaultAzureCredential(nil)
 	if err != nil {

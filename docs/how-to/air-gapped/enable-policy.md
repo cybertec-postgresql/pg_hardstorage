@@ -117,6 +117,14 @@ allowlist only — DNS is **deliberately not consulted**:
 If your in-perimeter endpoint resolves to a public IP via
 split-horizon DNS, add the **hostname** to the allowlist.
 
+### Which endpoint each backend checks
+
+| Backend | Endpoint checked at open |
+| --- | --- |
+| `s3` | `?endpoint=` (or `AWS_ENDPOINT_URL[_S3]`); with none, `https://s3.<region>.amazonaws.com`. Allowlist `s3.<region>.amazonaws.com` to use AWS S3 through a VPC endpoint. |
+| `azure-kv` | the vault URL, e.g. `https://<vault>.vault.azure.net/` |
+| `vault-transit` | the Vault address from the KEKRef |
+
 ## Troubleshooting
 
 ### `airgap: hostname "X" is not in the airgap allowlist`
