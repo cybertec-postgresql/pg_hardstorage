@@ -90,7 +90,12 @@ func newLogicalAddCmd() *cobra.Command {
 		Short: "Register a logical-decoding stream",
 		Long: `Append a stream to the registry. Does NOT create the slot or the
 publication on the source PG; both must already exist (publication)
-or will be created lazily by 'logical stream' (slot).`,
+or will be created lazily by 'logical stream' (slot).
+
+The slot name (--slot, or the default pg_hardstorage_logical_<name>)
+must be a valid replication slot name: lower-case letters, digits and
+underscores, at most 63 characters. Stream names that would derive an
+invalid default slot are refused unless --slot is given.`,
 		Args:         cobra.ExactArgs(1),
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -117,11 +122,24 @@ or will be created lazily by 'logical stream' (slot).`,
 			// 'CREATE_REPLICATION_SLOT %s ...' on the server side
 			// receives a well-formed identifier and can't be mis-
 			// parsed by the replication-protocol tokenizer.
-			if slot != "" && !pg.ValidIdentifier(slot) {
+			//
+			// The check runs on the slot that will actually be used.
+			// Without --slot that is derived from the stream name
+			// (logical.Manager.Add's default), and checking only an
+			// explicit --slot let `logical add my-stream` register a
+			// slot no `logical stream` run could ever create.
+			effectiveSlot, source := slot, "--slot"
+			if effectiveSlot == "" {
+				effectiveSlot, source = defaultLogicalSlot(args[0]), "the default slot derived from the stream name"
+			}
+			if !validLogicalSlotName(effectiveSlot) {
 				return output.NewError("usage.bad_slot",
-					fmt.Sprintf("logical add: --slot %q: must be a PG identifier "+
-						"(start with a letter or underscore, then [a-z0-9_], ≤63 chars)",
-						slot)).Wrap(output.ErrUsage)
+					fmt.Sprintf("logical add: %s %q is not a valid replication slot name "+
+						"(lower-case letters, digits and underscores, start with a letter or underscore, ≤63 chars)",
+						source, effectiveSlot)).
+					WithSuggestion(&output.Suggestion{
+						Human: "rename the stream, or pass --slot with a valid slot name",
+					}).Wrap(output.ErrUsage)
 			}
 			if !pg.ValidIdentifier(publication) {
 				return output.NewError("usage.bad_publication",
@@ -158,6 +176,21 @@ or will be created lazily by 'logical stream' (slot).`,
 	_ = c.MarkFlagRequired("publication")
 	c.Flags().StringVar(&sinkKind, "sink", "chunked", "sink kind (currently: chunked)")
 	return c
+}
+
+// defaultLogicalSlot mirrors logical.Manager.Add's default slot name.
+func defaultLogicalSlot(stream string) string {
+	return "pg_hardstorage_logical_" + stream
+}
+
+// validLogicalSlotName applies PostgreSQL's replication-slot rule
+// (ReplicationSlotValidateName: lower-case letters, digits, underscore,
+// at most NAMEDATALEN-1 bytes) on top of the identifier shape the
+// unquoted replication command needs. Upper case is refused: the
+// replication grammar folds the unquoted name, so the slot created and
+// the slot later looked up by its registered name would differ.
+func validLogicalSlotName(s string) bool {
+	return pg.ValidIdentifier(s) && s == strings.ToLower(s)
 }
 
 // --- list -------------------------------------------------------------
