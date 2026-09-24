@@ -115,6 +115,12 @@ type ReplicateResult struct {
 	ManifestsSkipped    int `json:"manifests_skipped"`    // already at dst
 	ManifestsTombstoned int `json:"manifests_tombstoned"` // skipped because src tombstoned
 	ManifestsFailed     int `json:"manifests_failed"`
+	// ManifestsRefreshed counts manifests already at dst whose bytes
+	// differed from src and were rewritten — a manifest rewritten in
+	// place at src (`kms rotate` re-wraps the DEK) whose replica still
+	// carried the old wrapping. Without the refresh the replica kept a
+	// manifest only the ROTATED-AWAY KEK can open.
+	ManifestsRefreshed int `json:"manifests_refreshed,omitempty"`
 
 	// ManifestReplicasFailed counts manifest REPLICA sidecars
 	// (manifests/_replicas/<id>.manifest.json) that could not be
@@ -148,6 +154,7 @@ type ReplicateResult struct {
 	WALManifestsCopied     int `json:"wal_manifests_copied,omitempty"`
 	WALManifestsSkipped    int `json:"wal_manifests_skipped,omitempty"`
 	WALManifestsFailed     int `json:"wal_manifests_failed,omitempty"`
+	WALManifestsRefreshed  int `json:"wal_manifests_refreshed,omitempty"`
 
 	// WAL auxiliary files: timeline `.history`, `.backup`, and `.partial`
 	// files. They are stored as direct bytes (not chunked) and are
@@ -252,10 +259,14 @@ func Replicate(ctx context.Context, src, dst storage.StoragePlugin, opts Replica
 		if !strings.HasSuffix(info.Key, "/manifest.json.tombstone") {
 			continue
 		}
-		// Layout: manifests/<dep>/backups/<id>/manifest.json.tombstone
-		parts := strings.Split(info.Key, "/")
-		if len(parts) >= 4 {
-			tombstoned[parts[3]] = struct{}{}
+		// Layout: manifests/<dep>/backups/<id>/manifest.json.tombstone.
+		// Keyed on DEPLOYMENT + id, never the id alone: nothing ties a
+		// manifest's BackupID to its deployment, so an id-only key let a
+		// tombstone in one deployment withhold a LIVE backup carrying the
+		// same id in another from the replica (the gc.go reference walk
+		// was fixed the same way).
+		if k := tombstoneKey(info.Key); k != "" {
+			tombstoned[k] = struct{}{}
 		}
 	}
 
@@ -295,7 +306,7 @@ func Replicate(ctx context.Context, src, dst storage.StoragePlugin, opts Replica
 		var backupID string
 		if len(parts) >= 5 {
 			backupID = parts[3]
-			if _, dead := tombstoned[backupID]; dead {
+			if _, dead := tombstoned[parts[1]+"/"+parts[3]]; dead {
 				res.ManifestsTombstoned++
 				continue
 			}
@@ -501,11 +512,18 @@ const (
 // replication failure.
 func copyKey(ctx context.Context, src, dst storage.StoragePlugin, key string, body []byte, opts ReplicateOptions, res *ReplicateResult, kind keyKind, bestEffort bool) bool {
 	if opts.DryRun {
-		// Predict whether this would have been a copy or a skip.
+		// Predict whether this would have been a copy, a refresh or a skip.
 		if _, serr := dst.Stat(ctx, key); errors.Is(serr, storage.ErrNotFound) {
 			bumpKeyCopied(res, kind)
 			res.BytesCopied += int64(len(body))
 		} else if serr == nil {
+			if kind != walAuxKind && !bestEffort {
+				if db, derr := readKey(ctx, dst, key); derr == nil && !bytes.Equal(db, body) {
+					bumpKeyRefreshed(res, kind)
+					res.BytesCopied += int64(len(body))
+					return true
+				}
+			}
 			bumpKeySkipped(res, kind)
 		}
 		// We don't emit a "would-fail" prediction for stat errors
@@ -522,8 +540,7 @@ func copyKey(ctx context.Context, src, dst storage.StoragePlugin, key string, bo
 		res.BytesCopied += int64(len(body))
 		return true
 	case errors.Is(err, storage.ErrAlreadyExists):
-		bumpKeySkipped(res, kind)
-		return true
+		return refreshKey(ctx, dst, key, body, opts, res, kind, bestEffort)
 	default:
 		if bestEffort {
 			// Best-effort failures are not primary-replication
@@ -536,6 +553,64 @@ func copyKey(ctx context.Context, src, dst storage.StoragePlugin, key string, bo
 		recordReplicateFailure(res, key, fmt.Errorf("put dst: %w", err))
 		bumpKeyFailed(res, kind)
 		return false
+	}
+}
+
+// refreshKey handles a key that already exists at dst: identical bytes
+// are a skip; DIFFERENT bytes mean src rewrote the object in place after
+// it was replicated, and the replica must follow.
+//
+// Manifests are the objects this happens to: `kms rotate` rewrites every
+// manifest with its DEK re-wrapped under the new KEK. The IfNotExists
+// Put above counted the stale replica as "skipped" and verify (size
+// only) called it consistent, so after the old KEK is retired the DR
+// copy of every backup was unopenable — discovered at the one moment a
+// replica is needed.
+//
+// The comparison is on the bytes (manifests are small). Aux WAL files
+// are immutable and chunks are content-addressed, so neither can drift
+// without being corrupt; they keep the skip. A refresh that dst refuses
+// — typically a WORM lock on the replica's old version — is reported as
+// a failure of that key, not swallowed: the operator must know the
+// replica holds a stale manifest.
+func refreshKey(ctx context.Context, dst storage.StoragePlugin, key string, body []byte, opts ReplicateOptions, res *ReplicateResult, kind keyKind, bestEffort bool) bool {
+	if kind == walAuxKind {
+		bumpKeySkipped(res, kind)
+		return true
+	}
+	existing, rerr := readKey(ctx, dst, key)
+	if rerr == nil && bytes.Equal(existing, body) {
+		bumpKeySkipped(res, kind)
+		return true
+	}
+	fail := func(err error) bool {
+		recordReplicateFailure(res, key, err)
+		if bestEffort {
+			res.ManifestReplicasFailed++
+			return true
+		}
+		bumpKeyFailed(res, kind)
+		return false
+	}
+	if rerr != nil {
+		return fail(fmt.Errorf("read dst to compare an existing key: %w", rerr))
+	}
+	putOpts := storage.PutOptions{ContentLength: int64(len(body))}
+	putOpts.RetainUntil, putOpts.RetentionMode = opts.retentionPut()
+	if _, err := dst.Put(ctx, key, bytes.NewReader(body), putOpts); err != nil {
+		return fail(fmt.Errorf("replica holds a STALE copy (src was rewritten, e.g. by `kms rotate`) and the refresh was refused — a WORM lock on the replica's copy blocks it until the lock expires: %w", err))
+	}
+	bumpKeyRefreshed(res, kind)
+	res.BytesCopied += int64(len(body))
+	return true
+}
+
+func bumpKeyRefreshed(res *ReplicateResult, kind keyKind) {
+	switch kind {
+	case manifestKind:
+		res.ManifestsRefreshed++
+	case walKind:
+		res.WALManifestsRefreshed++
 	}
 }
 
@@ -684,6 +759,9 @@ func copyChunk(ctx context.Context, src, dst storage.StoragePlugin, h Hash, opts
 	// Already at dst?
 	switch _, err := dst.Stat(ctx, chunkKey); {
 	case err == nil:
+		if !extendDstRetention(ctx, dst, chunkKey, opts, res) {
+			return chunkFailed
+		}
 		res.ChunksSkipped++
 		return chunkAdopted
 	case errors.Is(err, storage.ErrNotFound):
@@ -721,6 +799,9 @@ func copyChunk(ctx context.Context, src, dst storage.StoragePlugin, h Hash, opts
 		// Race: a concurrent writer won the put. Both copies have the
 		// same bytes (CAS contract), but the bytes at dst are THEIRS,
 		// not ours — adopted, same as a stat hit.
+		if !extendDstRetention(ctx, dst, chunkKey, opts, res) {
+			return chunkFailed
+		}
 		res.ChunksSkipped++
 		return chunkAdopted
 	default:
@@ -728,6 +809,28 @@ func copyChunk(ctx context.Context, src, dst storage.StoragePlugin, h Hash, opts
 		res.ChunksFailed++
 		return chunkFailed
 	}
+}
+
+// extendDstRetention makes a chunk that was ALREADY at dst carry this
+// run's WORM deadline. A chunk this run copies is locked at Put; one it
+// adopts was locked by whichever earlier run wrote it — possibly under a
+// shorter policy — and a manifest replicated today with a later deadline
+// would reference a chunk that becomes deletable first (the same gap
+// CAS.ensureRetention closes on the backup path). A refusal withholds
+// the manifest: better a reported failure than a replica whose
+// retention promise is false. ErrUnsupported only reaches here when the
+// operator accepted an unenforced WORM destination; there is no lock.
+func extendDstRetention(ctx context.Context, dst storage.StoragePlugin, key string, opts ReplicateOptions, res *ReplicateResult) bool {
+	if opts.DryRun || opts.DstWORM.IsZero() {
+		return true
+	}
+	until, mode := opts.retentionPut()
+	if err := dst.SetRetention(ctx, key, until, mode); err != nil && !errors.Is(err, storage.ErrUnsupported) {
+		recordReplicateFailure(res, key, fmt.Errorf("extend retention of existing replica chunk to %s: %w", until.UTC().Format(time.RFC3339), err))
+		res.ChunksFailed++
+		return false
+	}
+	return true
 }
 
 // readKey reads an entire object's body. Used for manifests and chunks
@@ -760,9 +863,11 @@ func extractChunkHashes(body []byte, kind harvestKind) ([]Hash, error) {
 		var hashes []Hash
 		for _, f := range m.Files {
 			for _, c := range f.Chunks {
-				if h, err := parseHexHash(c.Hash); err == nil {
-					hashes = append(hashes, h)
+				h, err := parseHexHash(c.Hash)
+				if err != nil {
+					return nil, unparseableReplicaRef(c.Hash, err)
 				}
+				hashes = append(hashes, h)
 			}
 		}
 		return hashes, nil
@@ -773,13 +878,33 @@ func extractChunkHashes(body []byte, kind harvestKind) ([]Hash, error) {
 		}
 		var hashes []Hash
 		for _, c := range m.Chunks {
-			if h, err := parseHexHash(c.Hash); err == nil {
-				hashes = append(hashes, h)
+			h, err := parseHexHash(c.Hash)
+			if err != nil {
+				return nil, unparseableReplicaRef(c.Hash, err)
 			}
+			hashes = append(hashes, h)
 		}
 		return hashes, nil
 	}
 	return nil, fmt.Errorf("repo replicate: unknown harvest kind %v", kind)
+}
+
+// unparseableReplicaRef fails a manifest's replication CLOSED when it
+// names a chunk hash we cannot parse — the gc.go posture. Dropping the
+// reference silently copied the manifest WITHOUT that chunk: the
+// replica then held a backup that reports restorable and is not.
+func unparseableReplicaRef(hash string, err error) error {
+	return fmt.Errorf("manifest references an unparseable chunk hash %q: %w (refusing to replicate a manifest whose chunk set is unknown)", hash, err)
+}
+
+// tombstoneKey returns "<dep>/<id>" for a
+// manifests/<dep>/backups/<id>/manifest.json.tombstone key, or "".
+func tombstoneKey(key string) string {
+	parts := strings.Split(key, "/")
+	if len(parts) < 5 {
+		return ""
+	}
+	return parts[1] + "/" + parts[3]
 }
 
 // recordReplicateFailure appends to res.Failures with a length cap so
