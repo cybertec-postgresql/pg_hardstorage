@@ -77,7 +77,9 @@ func newGameDayRunCmd() *cobra.Command {
 --dry-run prints the planned actions and always passes; without it the
 scenario drives the fault for real.
 
-  s3_throttle       injects backend failures and asserts recovery.
+  s3_throttle       injects a write-failure storm into the repository and
+                    asserts writes fail during it and one after it reads
+                    back intact. Needs --repo; refuses without one.
   patroni_failover  reads the current leader, POSTs /switchover, waits
                     for a different member to take the leader lock, and
                     re-measures replication-slot continuity. It needs

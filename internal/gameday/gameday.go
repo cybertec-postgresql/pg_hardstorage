@@ -19,9 +19,15 @@
 //     BASE_BACKUP runs over a replication connection that PostgreSQL
 //     tears down on disconnect.
 //
-//   - s3_throttle — wrap the storage plugin with a fault-injecting
-//     middleware that returns 503 for `duration` and asserts the
-//     operation completes (under the bandwidth/retry budget).
+//   - s3_throttle — wraps the repository's storage plugin with a
+//     fault-injecting middleware, asserts a write fails loudly during
+//     the storm, and that a write after it lands and reads back
+//     byte-identical. Needs --repo; without one it refuses
+//     (Misconfigured) rather than passing. It does not run a full
+//     backup: the product has no application-level retry for a storm
+//     to be absorbed by (object-store SDK retries sit below the
+//     injection point), so "backup completes under throttling" is not
+//     something this layer can drive honestly.
 //
 //   - patroni_failover — drives a real switchover: reads the current
 //     leader, POSTs /switchover, waits for a different member to take
