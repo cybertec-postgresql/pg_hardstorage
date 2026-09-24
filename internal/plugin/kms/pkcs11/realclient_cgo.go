@@ -15,7 +15,8 @@
 //	DestroyKey            → C_FindObjectsInit + C_DestroyObject
 //	DescribeKey           → C_GetAttributeValue (CKA_KEY_TYPE,
 //	                        CKA_LABEL, CKA_MODULUS_BITS, …)
-//	Close                 → C_Logout + C_CloseSession + C_Finalize
+//	Close                 → C_CloseSession; C_Logout / C_Finalize only
+//	                        for the last user in the process
 //
 // The session is a single CK_SESSION_HANDLE; PKCS#11 sessions
 // are cheap to keep open and the alternative (open/close per
@@ -42,10 +43,13 @@ import (
 // backend.
 func Built() bool { return true }
 
-// cgoClient holds the open session + key-handle cache.
+// cgoClient holds this provider's session + key-handle cache. The
+// module and the token login are shared process-wide through
+// sharedModules (module_share.go); only the session is ours.
 type cgoClient struct {
 	ctx     *pkcs11.Ctx
 	session pkcs11.SessionHandle
+	lease   *sessionLease
 
 	// keyCache maps (CKA_LABEL, CKA_CLASS) → object handle so
 	// repeated wraps don't FindObjects every time.  The class is
@@ -64,44 +68,74 @@ type cacheKey struct {
 	class uint
 }
 
-// newRealClient opens the PKCS#11 module, finds the named
-// token, opens a session, and logs in with the supplied PIN.
-// The session is held open for the lifetime of the Provider.
-func newRealClient(_ context.Context, cfg realClientConfig) (Client, error) {
-	c := pkcs11.New(cfg.ModulePath)
-	if c == nil {
-		return nil, fmt.Errorf("pkcs11: load module %q: returned nil context", cfg.ModulePath)
-	}
-	if err := c.Initialize(); err != nil {
-		// CKR_CRYPTOKI_ALREADY_INITIALIZED is fine — the host
-		// process already loaded the module.
-		var perr pkcs11.Error
-		if !errors.As(err, &perr) || perr != pkcs11.CKR_CRYPTOKI_ALREADY_INITIALIZED {
-			return nil, fmt.Errorf("pkcs11: Initialize: %w", err)
-		}
-	}
+// cgoModule adapts *pkcs11.Ctx to moduleOps, translating the two
+// "someone in this process got there first" return codes.
+type cgoModule struct{ c *pkcs11.Ctx }
 
-	slot, err := resolveSlot(c, cfg)
+func (m cgoModule) Initialize() error {
+	err := m.c.Initialize()
+	var perr pkcs11.Error
+	if errors.As(err, &perr) && perr == pkcs11.CKR_CRYPTOKI_ALREADY_INITIALIZED {
+		return errAlreadyInitialized
+	}
+	return err
+}
+
+func (m cgoModule) OpenSession(slot uint) (uint, error) {
+	s, err := m.c.OpenSession(slot, pkcs11.CKF_SERIAL_SESSION|pkcs11.CKF_RW_SESSION)
+	return uint(s), err
+}
+
+func (m cgoModule) Login(sess uint, pin string) error {
+	err := m.c.Login(pkcs11.SessionHandle(sess), pkcs11.CKU_USER, pin)
+	var perr pkcs11.Error
+	if errors.As(err, &perr) && perr == pkcs11.CKR_USER_ALREADY_LOGGED_IN {
+		return errAlreadyLoggedIn
+	}
+	return err
+}
+
+func (m cgoModule) Logout(sess uint) error { return m.c.Logout(pkcs11.SessionHandle(sess)) }
+
+func (m cgoModule) CloseSession(sess uint) error {
+	return m.c.CloseSession(pkcs11.SessionHandle(sess))
+}
+
+func (m cgoModule) Finalize() error {
+	err := m.c.Finalize()
+	var perr pkcs11.Error
+	if errors.As(err, &perr) && perr == pkcs11.CKR_CRYPTOKI_NOT_INITIALIZED {
+		return nil
+	}
+	return err
+}
+
+func (m cgoModule) Destroy() { m.c.Destroy() }
+
+// sharedModules is the process-wide module registry.
+var sharedModules = newModuleRegistry(func(path string) (moduleOps, error) {
+	c := pkcs11.New(path)
+	if c == nil {
+		return nil, fmt.Errorf("pkcs11: load module %q: returned nil context", path)
+	}
+	return cgoModule{c: c}, nil
+})
+
+// newRealClient opens a session on the named token, logged in with the
+// supplied PIN, through the shared module registry: the module is
+// initialised and the token logged in only by the first user in the
+// process. The session is held open for the lifetime of the Provider.
+func newRealClient(_ context.Context, cfg realClientConfig) (Client, error) {
+	lease, err := sharedModules.open(cfg.ModulePath, cfg.PIN, func(m moduleOps) (uint, error) {
+		return resolveSlot(m.(cgoModule).c, cfg)
+	})
 	if err != nil {
-		_ = c.Finalize()
 		return nil, err
 	}
-
-	sess, err := c.OpenSession(slot, pkcs11.CKF_SERIAL_SESSION|pkcs11.CKF_RW_SESSION)
-	if err != nil {
-		_ = c.Finalize()
-		return nil, fmt.Errorf("pkcs11: OpenSession slot=%d: %w", slot, err)
-	}
-
-	if err := c.Login(sess, pkcs11.CKU_USER, cfg.PIN); err != nil {
-		_ = c.CloseSession(sess)
-		_ = c.Finalize()
-		return nil, fmt.Errorf("pkcs11: Login (CKU_USER) on slot=%d: %w", slot, err)
-	}
-
 	return &cgoClient{
-		ctx:      c,
-		session:  sess,
+		ctx:      lease.ops.(cgoModule).c,
+		session:  pkcs11.SessionHandle(lease.session),
+		lease:    lease,
 		keyCache: map[cacheKey]pkcs11.ObjectHandle{},
 	}, nil
 }
@@ -329,29 +363,17 @@ func (cc *cgoClient) DescribeKey(_ context.Context, keyLabel string) (map[string
 	return out, nil
 }
 
-// Close logs out and finalises the library.  Safe to call
-// twice (the underlying calls return CKR_USER_NOT_LOGGED_IN /
-// CKR_SESSION_HANDLE_INVALID; we don't propagate those).
+// Close releases this provider's session. The token is logged out and
+// the module finalised only when this was the last user in the process
+// (see module_share.go). Idempotent.
 func (cc *cgoClient) Close() error {
-	if cc.ctx == nil {
+	if cc.lease == nil {
 		return nil
 	}
-	_ = cc.ctx.Logout(cc.session)
-	_ = cc.ctx.CloseSession(cc.session)
-	if err := cc.ctx.Finalize(); err != nil {
-		var perr pkcs11.Error
-		if errors.As(err, &perr) && perr == pkcs11.CKR_CRYPTOKI_NOT_INITIALIZED {
-			err = nil
-		}
-		if err != nil {
-			cc.ctx.Destroy()
-			cc.ctx = nil
-			return fmt.Errorf("Finalize: %w", err)
-		}
-	}
-	cc.ctx.Destroy()
+	err := cc.lease.close()
+	cc.lease = nil
 	cc.ctx = nil
-	return nil
+	return err
 }
 
 // buildMech builds a pkcs11.Mechanism for the requested wrap
