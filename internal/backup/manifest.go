@@ -13,6 +13,8 @@ import (
 	"path"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo"
 )
@@ -404,9 +406,20 @@ var ErrAmbiguousManifest = errors.New("manifest: ambiguous document")
 // manifest. A duplicate key has no such role — the schema has no map
 // fields, so every key is fixed and appearing twice is never legitimate.
 //
-// Keys are compared case-insensitively because Go's decoder matches
-// them that way: {"backup_id":"a","Backup_ID":"b"} binds b, so the
-// case-variant is the same attack wearing a hat.
+// Keys are compared under encoding/json's OWN folding because Go's
+// decoder matches them that way: {"backup_id":"a","Backup_ID":"b"}
+// binds b, so the case-variant is the same attack wearing a hat. That
+// folding is Unicode simple folding, not strings.ToLower: "ſ" (U+017F)
+// matches "s", so "ſchema" used to pass a ToLower-based guard as a
+// distinct key while Go bound it to Schema.
+//
+// And a key must be plain lowercase ASCII (the only thing this schema
+// writes: snake_case, no maps). A disguised key that appears ALONE —
+// "Backup_ID", or "bacKup_id" with a Kelvin sign — is no duplicate,
+// yet Go binds it to the field and re-serialises it canonically (so the
+// signature verifies) while a case-sensitive reader finds no such field.
+// Future additive fields are snake_case too, so this rejects nothing
+// legitimate.
 func rejectDuplicateKeys(raw []byte) error {
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.UseNumber()
@@ -441,7 +454,13 @@ func checkNoDupKeys(dec *json.Decoder, path string) error {
 			if !ok {
 				return nil
 			}
-			folded := strings.ToLower(key)
+			if !isSchemaKey(key) {
+				return fmt.Errorf("%w: object %s has key %q, which is not lowercase-ASCII "+
+					"snake_case; encoding/json would still bind it to a field by case/Unicode "+
+					"folding while other readers would not, so the file does not have one "+
+					"meaning and must not be trusted or re-signed", ErrAmbiguousManifest, path, key)
+			}
+			folded := jsonFoldKey(key)
 			if prev, dup := seen[folded]; dup {
 				where := path
 				if where == "" {
@@ -467,6 +486,48 @@ func checkNoDupKeys(dec *json.Decoder, path string) error {
 		_, _ = dec.Token() // closing ']'
 	}
 	return nil
+}
+
+// isSchemaKey reports whether key uses only [a-z0-9_] — the alphabet of
+// every key this schema has ever written.
+func isSchemaKey(key string) bool {
+	if key == "" {
+		return false
+	}
+	for i := 0; i < len(key); i++ {
+		c := key[i]
+		if (c < 'a' || c > 'z') && (c < '0' || c > '9') && c != '_' {
+			return false
+		}
+	}
+	return true
+}
+
+// jsonFoldKey folds key exactly as encoding/json's foldName does (ASCII
+// upper-casing, then the smallest rune of each Unicode simple-fold
+// orbit), so two keys collide here iff Go's decoder would bind them to
+// the same field.
+func jsonFoldKey(key string) string {
+	var b strings.Builder
+	for _, r := range key {
+		if r < utf8.RuneSelf {
+			if 'a' <= r && r <= 'z' {
+				r -= 'a' - 'A'
+			}
+			b.WriteRune(r)
+			continue
+		}
+		for {
+			r2 := unicode.SimpleFold(r)
+			if r2 <= r {
+				r = r2
+				break
+			}
+			r = r2
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
 }
 
 // ParseAttestationless parses on-disk bytes WITHOUT signature
@@ -572,9 +633,18 @@ func matchPublicKeys(embeddedPEM string, verifier *Verifier) error {
 // unsigned, its embedded key is unparseable, or — the case that matters —
 // the signature does not match the embedded key (content tampered).
 func VerifyEmbedded(raw []byte) (*Manifest, error) {
+	// Same one-meaning and schema gates as ParseAndVerify: this is the
+	// gate `repair attestation` re-signs behind, and re-signing an
+	// ambiguous document would launder it under the operator's key.
+	if err := rejectDuplicateKeys(raw); err != nil {
+		return nil, err
+	}
 	var m Manifest
 	if err := json.Unmarshal(raw, &m); err != nil {
 		return nil, fmt.Errorf("manifest: parse: %w", err)
+	}
+	if m.Schema != Schema {
+		return nil, fmt.Errorf("manifest: schema %q is not supported; expected %q", m.Schema, Schema)
 	}
 	if m.Attestation == nil {
 		return nil, ErrUnsigned

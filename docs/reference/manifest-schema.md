@@ -155,11 +155,20 @@ canonical signing bytes.
 | --- | --- | --- |
 | `ParseAndVerify(raw, verifier)` | yes | Production reads; the only public-key-trusted entry point |
 | `ParseAttestationless(raw)` | no | `repair attestation` / `repair manifest` only — paths whose entire purpose is to handle broken signatures |
+| `VerifyEmbedded(raw)` | against its own embedded key | `repair attestation`'s "self-consistent, safe to re-sign" gate |
+
+All three first require the document to have exactly one meaning:
+every object key must be lowercase-ASCII `snake_case` (the only
+alphabet the schema writes) and no key may repeat — compared under
+`encoding/json`'s own case/Unicode folding, so `Backup_ID`,
+`ſchema` (U+017F) or `bacKup_id` (Kelvin sign) count as the
+field they would bind to. Otherwise they return `ErrAmbiguousManifest`.
 
 `ParseAndVerify` errors:
 
 | Error | Meaning |
 | --- | --- |
+| `ErrAmbiguousManifest` | A key repeats (under JSON folding) or is not lowercase-ASCII snake_case; Go would bind one value while other readers see another |
 | `ErrUnsigned` | Manifest has no `attestation` block |
 | `ErrPublicKeyMismatch` | Signature is genuine but the embedded public key differs from the verifier's; not signed by a trusted party |
 | `manifest: unsupported signature scheme "…"` | `attestation.scheme` is not `ed25519` |
