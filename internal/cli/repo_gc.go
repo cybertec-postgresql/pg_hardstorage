@@ -9,9 +9,11 @@ import (
 	"io"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/spf13/cobra"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/approval"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/audit"
@@ -25,6 +27,9 @@ import (
 // destructive op binds to. Dry-runs (no --apply) need no approval —
 // they only read.
 const GCOp = approval.Op("repo.gc")
+
+// gcDeleteConcurrency bounds the chunk deletes a sweep runs at once.
+const gcDeleteConcurrency = 16
 
 // newRepoGCCmd implements `pg_hardstorage repo gc`. The same primitives
 // power `repair chunks --orphans` — but the two commands have
@@ -302,27 +307,46 @@ func runRepoGC(cmd *cobra.Command, repoURL string, apply bool, approvalID string
 		}
 
 		cas := casdefault.New(sp)
-		var deleted int
-		var deletedBytes int64
-		var failures []string
+		var (
+			mu           sync.Mutex
+			deleted      int
+			deletedBytes int64
+			failures     []string
+		)
+		// Deletes run concurrently. Each one stays individually durable
+		// (the fs backend fsyncs the chunk's directory), but one at a
+		// time that fsync is a journal commit per chunk: ~1.4 ms on a
+		// busy disk, so the soak's 43k-chunk sweeps took minutes, and a
+		// remote backend pays a round trip per chunk. Concurrent fsyncs
+		// share commits; concurrent requests overlap their latency.
+		var g errgroup.Group
+		g.SetLimit(gcDeleteConcurrency)
 		for _, h := range hashes {
 			if refsAtDelete.Has(h) {
 				// Referenced by a manifest committed after the first
 				// snapshot — not an orphan anymore.
 				continue
 			}
-			// Stat-then-delete so a race-induced miss doesn't blow the
-			// whole sweep — we account only what we actually removed.
-			info, statErr := sp.Stat(cmd.Context(), repo.ChunkKey(h))
-			if delErr := cas.DeleteChunk(cmd.Context(), h); delErr != nil {
-				failures = append(failures, fmt.Sprintf("%s: %v", h, delErr))
-				continue
-			}
-			deleted++
-			if statErr == nil {
-				deletedBytes += info.Size
-			}
+			g.Go(func() error {
+				// Stat-then-delete so a race-induced miss doesn't blow the
+				// whole sweep — we account only what we actually removed.
+				info, statErr := sp.Stat(cmd.Context(), repo.ChunkKey(h))
+				delErr := cas.DeleteChunk(cmd.Context(), h)
+				mu.Lock()
+				defer mu.Unlock()
+				if delErr != nil {
+					failures = append(failures, fmt.Sprintf("%s: %v", h, delErr))
+					return nil
+				}
+				deleted++
+				if statErr == nil {
+					deletedBytes += info.Size
+				}
+				return nil
+			})
 		}
+		_ = g.Wait() // workers record failures; they never return one
+		sort.Strings(failures)
 		body.Applied = deleted
 		body.BytesReclaimed = deletedBytes
 
