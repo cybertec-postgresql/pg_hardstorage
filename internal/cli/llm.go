@@ -155,11 +155,12 @@ func newLlmDoctorCmd() *cobra.Command {
   - cheatsheet drift guard passes against the live cobra tree
   - validator catches a planted invalid command
   - hot-command paths all resolve in the catalog
-  - a known-good probe round-trips to the provider
+  - a known-good probe round-trips to the provider (the child probe
+    inherits --provider / --endpoint / --model)
 
-Each check returns pass/fail with a one-line summary.  Exits
-non-zero when any check fails.  Read-only and cheap; safe to
-run in CI.`,
+Each check returns pass/fail with a one-line summary.  Exits 1
+(runtime failure, not 2 = misuse) when any check fails.
+Read-only and cheap; safe to run in CI.`,
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return runLlmDoctor(cmd)
@@ -298,7 +299,7 @@ func runLlmDoctor(cmd *cobra.Command) error {
 	// cost / latency.  We ask the model to echo a literal token
 	// and check the response contains it.
 	checkStart = time.Now()
-	body.Checks = append(body.Checks, roundTripProbe(cmd, time.Since(checkStart)))
+	body.Checks = append(body.Checks, roundTripProbe(cmd, flagProvider, flagEndpoint, flagModel))
 
 	// Aggregate.
 	body.OK = true
@@ -317,14 +318,19 @@ func runLlmDoctor(cmd *cobra.Command) error {
 // ("Exits non-zero when any check fails.").  The full report is
 // still emitted (via the dispatcher) either way, so the operator
 // sees every ✓/✗ row regardless of exit status.
+//
+// The error is deliberately NOT wrapped in output.ErrUsage: a failed
+// check (provider outage, missing key, drift) is a runtime failure,
+// and exit 2 would tell cron/CI to "fix the invocation" when the
+// command line was fine.  llm.* has no exit route, so it lands on
+// ExitError (1).
 func doctorResult(d *output.Dispatcher, cmd *cobra.Command, body llmDoctorBody) error {
 	if renderErr := d.Result(output.NewResult(cmd.CommandPath()).WithBody(body)); renderErr != nil {
 		return renderErr
 	}
 	if !body.OK {
 		return output.NewError("llm.doctor_failed",
-			"llm doctor: one or more checks failed — see the report above").
-			Wrap(output.ErrUsage)
+			"llm doctor: one or more checks failed — see the report above")
 	}
 	return nil
 }
@@ -333,8 +339,11 @@ func doctorResult(d *output.Dispatcher, cmd *cobra.Command, body llmDoctorBody) 
 // confirm the provider responds.  We can't reuse the open
 // provider directly because the chat session does too much
 // (skill loading, tool registry, etc.); a child `llm ask`
-// exercises the full path the operator uses.
-func roundTripProbe(cmd *cobra.Command, _ time.Duration) llmDoctorCheck {
+// exercises the full path the operator uses.  provider / endpoint /
+// model are the operator's --provider / --endpoint / --model; they
+// are forwarded so the child probes the provider doctor just
+// reported on, not whatever env/config would pick without them.
+func roundTripProbe(cmd *cobra.Command, provider, endpoint, model string) llmDoctorCheck {
 	checkStart := time.Now()
 	// Use our own binary path — should always be argv[0]'s
 	// resolved form.  Falls back to PATH lookup if we can't
@@ -356,8 +365,7 @@ func roundTripProbe(cmd *cobra.Command, _ time.Duration) llmDoctorCheck {
 			Latency: time.Since(checkStart).Round(time.Millisecond).String(),
 		}
 	}
-	probe := "Reply with exactly one word: 'pong' (no preamble, no quotes, no markdown)."
-	c := exec.CommandContext(cmd.Context(), bin, "llm", "ask", probe, "-o", "json")
+	c := exec.CommandContext(cmd.Context(), bin, llmDoctorProbeArgs(provider, endpoint, model)...)
 	c.Env = append(append([]string{}, os.Environ()...), "PG_HARDSTORAGE_LLM_TEMPERATURE=0")
 	var stdout bytes.Buffer
 	c.Stdout = &stdout
@@ -389,6 +397,20 @@ func roundTripProbe(cmd *cobra.Command, _ time.Duration) llmDoctorCheck {
 		}(),
 		Latency: time.Since(checkStart).Round(time.Millisecond).String(),
 	}
+}
+
+// llmDoctorProbeArgs builds the argv for the round-trip probe's
+// child `llm ask`.  Empty overrides are omitted so the child
+// resolves env/config the same way the parent did.
+func llmDoctorProbeArgs(provider, endpoint, model string) []string {
+	probe := "Reply with exactly one word: 'pong' (no preamble, no quotes, no markdown)."
+	args := []string{"llm", "ask", probe, "-o", "json"}
+	for _, kv := range [][2]string{{"--provider", provider}, {"--endpoint", endpoint}, {"--model", model}} {
+		if kv[1] != "" {
+			args = append(args, kv[0], kv[1])
+		}
+	}
+	return args
 }
 
 // cheatsheetDriftDetail re-runs the drift-guard logic at runtime
