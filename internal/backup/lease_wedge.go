@@ -11,11 +11,14 @@
 // The window is tiny (claim → put, normally sub-millisecond) but the
 // paths through it are frequent: since Release started tombstoning
 // (see leaseBody.Released), EVERY acquire-after-release runs a
-// succession, not just the rare crashed-holder reclaim. Automatic
-// healing would need a second-order claim protocol whose own races
-// would dwarf the problem, so the posture is: DETECT loudly, remediate
-// by hand. InspectLeaseSuccession is the detector; `doctor` surfaces
-// it with the exact object to delete.
+// succession, not just the rare crashed-holder reclaim.
+//
+// Two mitigations now bound it. A reclaimer whose overwrite FAILS
+// deletes its own claim (it never returned held). A claim abandoned
+// for wedgeGrace heals on the next acquire via a next-generation claim
+// (claimBreakKey) — so a dead winner costs an hour of backups, not all
+// of them. InspectLeaseSuccession still DETECTS the wedge so `doctor`
+// can surface it (with the exact object to delete) inside that hour.
 package backup
 
 import (
