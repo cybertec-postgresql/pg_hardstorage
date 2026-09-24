@@ -475,13 +475,10 @@ func runCellLoop(
 				return false // run ended while a window was open
 			}
 			defer gate.leave()
-			// 2. Maybe inject a fault.
-			if rng.Float64() < opts.Loop.FaultProbability && opts.Faults != nil &&
-				len(opts.Faults.Faults) > 0 {
-				fault := pickWeighted(opts.Faults.Faults, rng)
-				emit(Event{Cell: cr.Name, Op: "fault_apply",
-					Iteration: iter, Detail: fault.Action})
-				recovery, err := cell.ApplyFault(ctx, fault.Action)
+			// settleFault scores one fault application and, if it landed,
+			// waits the heal window and reverts it. Returns true to stop
+			// the cell.
+			settleFault := func(fault config.Fault, recovery inject.Recovery, err error) bool {
 				switch {
 				case err != nil && errors.Is(err, inject.ErrTargetNotRunning):
 					// A fault that fires on a cell a PRIOR fault already
@@ -580,13 +577,54 @@ func runCellLoop(
 							Iteration: iter, Detail: fault.Action})
 					}
 				}
+				return false
 			}
 
-			// 3. Backup every N iterations.
-			if iter%opts.Loop.BackupEvery == 0 {
+			// 2. Maybe inject a fault.
+			var midBackup *config.Fault
+			if rng.Float64() < opts.Loop.FaultProbability && opts.Faults != nil &&
+				len(opts.Faults.Faults) > 0 {
+				fault := pickWeighted(opts.Faults.Faults, rng)
+				if isMidBackupFault(fault.Action) {
+					// A *_mid_backup fault exists to race a backup: applied
+					// here, before the backup step, it never overlapped one
+					// (drop_relation_mid_backup was never mid-backup). It is
+					// applied during this iteration's backup instead.
+					midBackup = &fault
+				} else {
+					emit(Event{Cell: cr.Name, Op: "fault_apply",
+						Iteration: iter, Detail: fault.Action})
+					recovery, err := cell.ApplyFault(ctx, fault.Action)
+					if settleFault(fault, recovery, err) {
+						return true
+					}
+				}
+			}
+
+			// 3. Backup every N iterations — and whenever a mid-backup
+			// fault is waiting for one.
+			if iter%opts.Loop.BackupEvery == 0 || midBackup != nil {
 				emit(Event{Cell: cr.Name, Op: "backup_started", Iteration: iter})
 				cr.BackupsTaken++
+				var midRes <-chan midBackupResult
+				backupDone := make(chan struct{})
+				if midBackup != nil {
+					midRes = applyDuringBackup(ctx, cell, *midBackup, backupDone,
+						func() { emit(Event{Cell: cr.Name, Op: "fault_apply", Iteration: iter, Detail: midBackup.Action}) })
+				}
 				id, err := cell.TakeBackup(ctx)
+				close(backupDone)
+				if midRes != nil {
+					// Settle the fault before scoring the backup, so every
+					// exit below leaves it reverted.
+					r := <-midRes
+					if r.missed {
+						emit(Event{Cell: cr.Name, Op: "fault_skipped_backup_finished",
+							Iteration: iter, Detail: midBackup.Action})
+					} else if settleFault(*midBackup, r.recovery, r.err) {
+						return true
+					}
+				}
 				switch {
 				case err != nil && ctx.Err() != nil:
 					// Run-wide deadline elapsed mid-backup; the
@@ -746,6 +784,49 @@ func runCellLoop(
 			}
 		}
 	}
+}
+
+// midBackupDelay is how long after a backup starts a mid-backup fault is
+// applied: long enough for the backup to be under way, short enough to
+// land well inside a real one. A var so tests can shrink it.
+var midBackupDelay = 2 * time.Second
+
+// isMidBackupFault reports whether action names a fault meant to race a
+// backup (drop_relation_mid_backup, ...).
+func isMidBackupFault(action string) bool {
+	pa, err := inject.ParseAction(action)
+	return err == nil && strings.HasSuffix(pa.Prefix, "_mid_backup")
+}
+
+// midBackupResult is a mid-backup fault's outcome; missed means the
+// backup ended (or the run did) before the fault was applied, so it was
+// not.
+type midBackupResult struct {
+	recovery inject.Recovery
+	err      error
+	missed   bool
+}
+
+// applyDuringBackup applies fault midBackupDelay after the backup
+// starts, unless backupDone closes first. announce runs just before the
+// fault is applied.
+func applyDuringBackup(ctx context.Context, cell CellRuntime, fault config.Fault, backupDone <-chan struct{}, announce func()) <-chan midBackupResult {
+	res := make(chan midBackupResult, 1)
+	go func() {
+		select {
+		case <-time.After(midBackupDelay):
+		case <-backupDone:
+			res <- midBackupResult{missed: true}
+			return
+		case <-ctx.Done():
+			res <- midBackupResult{missed: true}
+			return
+		}
+		announce()
+		recovery, err := cell.ApplyFault(ctx, fault.Action)
+		res <- midBackupResult{recovery: recovery, err: err}
+	}()
+	return res
 }
 
 // pickWeighted picks a fault using the catalogue's Weight as

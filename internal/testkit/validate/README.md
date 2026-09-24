@@ -55,6 +55,11 @@ count as `corruption_detected`. Repo-corruption faults (`manifest_targeted_corru
 cell's deployment (`inject.Registry.ApplyForDeployment`), so they cannot damage
 — and blame — another cell sharing the repository.
 
+A fault whose name ends in `_mid_backup` (e.g. `drop_relation_mid_backup`) is
+not applied in the fault step: the iteration takes a backup and the fault is
+applied ~2 s into it, so it really races the backup. If the backup finishes
+first the fault is skipped (`fault_skipped_backup_finished`).
+
 Fault reverts run with their own bounded context, so a fault in flight at the
 run deadline is still reverted before teardown.
 

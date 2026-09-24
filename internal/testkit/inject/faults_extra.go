@@ -163,8 +163,10 @@ func (checkpointStormFault) Apply(ctx context.Context, args Args, ts TargetSet) 
 // --- drop_relation_mid_backup ----------------------------------------
 
 // dropRelationFault creates a sizeable relation, forces it to
-// disk, then drops it — all under the cover of a running backup
-// (the soak's iteration loop runs backups continuously).  The
+// disk, then drops it — all under the cover of a running backup.
+// The fault itself does not start one: the soak orchestrator
+// applies every *_mid_backup fault ~2 s into a backup it starts
+// for the purpose (a scenario must sequence its own).  The
 // product invariant under test: a backup either includes the
 // table cleanly or refuses the snapshot — never "manifest names
 // a relfilenode that no longer exists in the catalog."
