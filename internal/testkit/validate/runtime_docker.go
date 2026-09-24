@@ -480,6 +480,20 @@ func (d *DockerCellRuntime) containerRunning(ctx context.Context) bool {
 	return strings.TrimSpace(string(out)) == "true"
 }
 
+// containerPositivelyStopped reports whether Docker says the container
+// is not running. Unlike containerRunning, an inspect error is "don't
+// know" (false), not "stopped" — it decides whether a failure is blamed
+// on the testbed, so it must not be a way to hide one.
+func (d *DockerCellRuntime) containerPositivelyStopped(ctx context.Context) bool {
+	if d.Container == "" {
+		return false
+	}
+	out, err := exec.CommandContext(ctx, d.dockerBin(),
+		"inspect", "--format", "{{.State.Running}}",
+		d.Container).Output()
+	return err == nil && strings.TrimSpace(string(out)) == "false"
+}
+
 // TakeBackup invokes `pg_hardstorage backup` inside the
 // container.
 func (d *DockerCellRuntime) TakeBackup(ctx context.Context) (string, error) {
@@ -598,6 +612,16 @@ func (d *DockerCellRuntime) TakeBackup(ctx context.Context) (string, error) {
 				return "", fmt.Errorf("%w: container %s restarted during the backup (StartedAt %s -> %s): %v",
 					ErrCellNotReady, d.Container, bootBefore, bootAfter, err)
 			}
+		}
+		// Or it stopped and has not come back yet: the release soak's first
+		// backup_failed was `docker exec` refusing to enter a container a
+		// SIGKILL fault had just killed (exit 128, "error executing setns
+		// process") — pg_hardstorage never started. Same argument: a
+		// pg_hardstorage failure cannot stop its container. Requires Docker
+		// to say so; an inspect that fails proves nothing.
+		if d.containerPositivelyStopped(ctx) {
+			return "", fmt.Errorf("%w: container %s stopped during the backup: %v",
+				ErrCellNotReady, d.Container, err)
 		}
 		// Diagnostic display still wants combined output —
 		// stderr is where the operator-relevant context
