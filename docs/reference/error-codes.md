@@ -144,8 +144,9 @@ actually there.
 | Leaf | Meaning |
 | --- | --- |
 | `conflict.repo_exists`, `conflict.deployment_exists`, `conflict.sink_exists`, `conflict.standby_exists`, `conflict.timetravel_exists`, `conflict.roster_exists` | Resource with that name is already configured |
-| `conflict.repo_read_only` | Repo is in read-only mode (legal hold, scheduled retire) |
+| `conflict.repo_read_only` | Repo is in read-only mode (legal hold, scheduled retire). Every mutating command refuses, including `repair attestation`, `repair manifest`, `repair chunks --apply`, `repair scrub --heal`, `repo wipe` and `repo bundle import`. |
 | `conflict.manifest_held`, `conflict.chain_has_held_links` | Backup or one of its parents is on legal hold |
+| `conflict.legal_hold` | `repo wipe` refused: at least one backup is under an active legal hold (an unreadable hold marker counts as active). Release the holds, or pass `--override-legal-holds` with an approved n-of-m request — never with `--force` — and the held backups are named in the pre-wipe audit event. |
 | `conflict.chain_has_live_descendants` | Refused to delete; descendants would orphan |
 | `conflict.checkpoint_mismatch`, `conflict.chunks_missing`, `conflict.no_live_manifests` | Repo state would be inconsistent |
 | `conflict.approval_pending`, `conflict.already_signed`, `conflict.already_revoked` | Approval-flow state machine refused |
@@ -169,6 +170,7 @@ treat any `verify.*` exit as an alert.
 | `verify.scrub_key_unavailable` | `repo scrub` / `repair scrub`: encrypted manifests (backup or WAL segment) whose DEK this host cannot resolve (keyring/KEK/KMS access) were skipped. A key-access gap, never reported as a mismatch or healed; exit 9. |
 | `verify.manifest_signature`, `verify.replica_signature`, `verify.dsa_signature`, `verify.integrity_signature` | Signature verification failed |
 | `verify.attestation_invalid`, `verify.attestation_quorum`, `verify.attestation_roster`, `verify.attestation_subject` | Attestation refused |
+| `verify.attestation_untrusted_key` | `repair attestation` refused to re-sign: the manifest is signed by a key that is neither the current keyring key nor a trusted retired operator key (`<keyring>/trusted-keys/*.pem`, `--trusted-key`). A manifest's embedded key is part of the manifest, so a valid self-signature proves nothing about who signed it. |
 | `verify.kek_mismatch`, `verify.kek_resolve_failed`, `verify.bad_wrapped_dek` | KEK / DEK decrypt failed |
 | `verify.envelope_break` | Envelope-encryption tag did not validate |
 | `verify.replica_inconsistent`, `verify.replica_identity_mismatch` | Cross-region replica disagrees with primary |

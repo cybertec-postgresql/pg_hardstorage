@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -71,20 +73,34 @@ the operator typing --apply (and, for the most destructive paths,
 // is supposed to detect. The operator MUST pass --force to override.
 func newRepairAttestationCmd() *cobra.Command {
 	var (
-		repoURL string
-		actor   string
-		reason  string
-		force   bool
+		repoURL     string
+		actor       string
+		reason      string
+		force       bool
+		trustedKeys []string
 	)
 	c := &cobra.Command{
-		Use:          "attestation <deployment> <backup-id>",
-		Short:        "Re-sign a manifest with the current keypair (audited)",
+		Use:   "attestation <deployment> <backup-id>",
+		Short: "Re-sign a manifest with the current keypair (audited)",
+		Long: `Re-sign a manifest whose attestation no longer verifies with the
+current keypair — the signing-key rotation case — and record the
+re-sign in the audit chain.
+
+The manifest must be signed by a key this host TRUSTS: the current
+keyring's public key, a retired operator public key installed under
+<keyring>/` + trustedKeysDirName + `/*.pem, or one passed with --trusted-key.
+A manifest signed by any other key is refused: its embedded key is
+part of the manifest itself, so a valid self-signature proves only
+that whoever wrote the file also signed it — re-signing it would
+launder attacker-supplied content under the operator's key.`,
 		Args:         cobra.ExactArgs(2),
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runRepairAttestation(cmd, args[0], args[1], repoURL, actor, reason, force)
+			return runRepairAttestation(cmd, args[0], args[1], repoURL, actor, reason, force, trustedKeys)
 		},
 	}
+	c.Flags().StringArrayVar(&trustedKeys, "trusted-key", nil,
+		"PEM file of a retired operator public key whose signatures may be re-signed (repeatable; also read from <keyring>/"+trustedKeysDirName+"/*.pem)")
 	c.Flags().StringVar(&repoURL, "repo", "",
 		"repository URL — must already exist (required)")
 	_ = c.MarkFlagRequired("repo")
@@ -97,7 +113,7 @@ func newRepairAttestationCmd() *cobra.Command {
 	return c
 }
 
-func runRepairAttestation(cmd *cobra.Command, deployment, backupID, repoURL, actor, reason string, force bool) error {
+func runRepairAttestation(cmd *cobra.Command, deployment, backupID, repoURL, actor, reason string, force bool, trustedKeyFiles []string) error {
 	d := DispatcherFrom(cmd)
 	signer, verifier, err := loadSignerAndVerifier()
 	if err != nil {
@@ -108,6 +124,13 @@ func runRepairAttestation(cmd *cobra.Command, deployment, backupID, repoURL, act
 		return err
 	}
 	defer sp.Close()
+	// Read-only is a repository-wide lock the operator set on purpose
+	// (`repo set-mode read-only`); every mutating path refuses under
+	// it, and a repair is no exception — the operator flips the mode
+	// back when they mean to write.
+	if err := assertRepoWritable(cmd.Context(), sp, "repair attestation"); err != nil {
+		return err
+	}
 
 	primaryKey := backup.PrimaryPath(deployment, backupID)
 	body, err := readManifestKey(cmd.Context(), sp, primaryKey)
@@ -170,6 +193,20 @@ func runRepairAttestation(cmd *cobra.Command, deployment, backupID, repoURL, act
 			})
 	}
 
+	// The content is authentic RELATIVE TO ITS OWN KEY — and that key
+	// is part of the file. An attacker with write access to the
+	// repository generates a keypair, signs forged content, embeds the
+	// public half, and VerifyEmbedded is satisfied. Re-signing that with
+	// the operator key would turn a forgery the restore path refuses
+	// into one it trusts. So the embedded key must be one the operator
+	// already trusts: the current keyring key (the --force re-sign
+	// case) or a recorded retired operator key (the rotation case this
+	// command exists for).
+	trustedBy, terr := trustedSignerOf(body, verifier, trustedKeyFiles)
+	if terr != nil {
+		return terr
+	}
+
 	if err := m.Sign(signer); err != nil {
 		return output.NewError("repair.attestation.sign",
 			fmt.Sprintf("repair attestation: sign: %v", err)).Wrap(err)
@@ -229,6 +266,7 @@ func runRepairAttestation(cmd *cobra.Command, deployment, backupID, repoURL, act
 			"forced":               force,
 			"original_fingerprint": origFingerprint,
 			"new_fingerprint":      newFingerprint,
+			"trusted_by":           trustedBy,
 		},
 	}
 	auditWriteErr := auditStore.Append(cmd.Context(), auditEv)
@@ -437,6 +475,11 @@ func runRepairManifest(cmd *cobra.Command, deployment, backupID, repoURL string,
 		return err
 	}
 	defer sp.Close()
+	// Every branch below may write (rebuild the replica or overwrite the
+	// primary), so refuse up front on a read-only repository.
+	if err := assertRepoWritable(cmd.Context(), sp, "repair manifest"); err != nil {
+		return err
+	}
 
 	// Carry the repo's WORM policy so a rebuilt replica / overwritten primary
 	// is locked like the commit-time copy (a compliance repo must not get an
@@ -840,6 +883,15 @@ func runRepairChunks(cmd *cobra.Command, repoURL string, orphans, apply bool, mi
 		return mapRepoOpenErr(repoURL, err)
 	}
 	defer sp.Close()
+	if apply {
+		// Read-only is a repository-wide lock the operator set on purpose
+		// (`repo set-mode read-only`); every mutating path refuses under
+		// it, and a repair is no exception — the operator flips the mode
+		// back when they mean to write.
+		if err := assertRepoWritable(cmd.Context(), sp, "repair chunks --apply"); err != nil {
+			return err
+		}
+	}
 
 	refs, err := repo.CollectReferences(cmd.Context(), sp)
 	if err != nil {
@@ -1025,6 +1077,13 @@ func runRepairScrub(cmd *cobra.Command, repoURL string, limit int, heal bool, re
 		return mapRepoOpenErr(repoURL, err)
 	}
 	defer sp.Close()
+	if heal {
+		// --heal rewrites chunks; refuse before the (possibly long)
+		// scrub rather than after it, on a read-only repository.
+		if err := assertRepoWritable(cmd.Context(), sp, "repair scrub --heal"); err != nil {
+			return err
+		}
+	}
 
 	// Per-manifest scrub: every backup manifest carries its own
 	// encryption block (KEK ref + wrapped DEK), so the CAS that can
@@ -1714,4 +1773,48 @@ func scrubManifestAware(ctx context.Context, sp storage.StoragePlugin, limit, wi
 	}
 
 	return agg, distinctRefs, nil
+}
+
+// trustedKeysDirName is the keyring subdirectory holding retired
+// operator public keys (PEM) whose signatures `repair attestation` may
+// carry forward to the current key.
+const trustedKeysDirName = "trusted-keys"
+
+// trustedSignerOf returns a description of the trusted key that signed
+// body, or a structured refusal when none did. Trusted keys: the
+// current keyring verifier, every <keyring>/trusted-keys/*.pem, and
+// every --trusted-key file. A key file that cannot be read or parsed is
+// an error, not a silent skip — the operator named it on purpose.
+func trustedSignerOf(body []byte, current *backup.Verifier, extraFiles []string) (string, error) {
+	if _, err := backup.ParseAndVerify(body, current); err == nil {
+		return "keyring", nil
+	}
+	var files []string
+	if p, err := paths.Resolve(paths.DefaultOptions()); err == nil && p.Keyring.Value != "" {
+		matches, _ := filepath.Glob(filepath.Join(p.Keyring.Value, trustedKeysDirName, "*.pem"))
+		sort.Strings(matches)
+		files = append(files, matches...)
+	}
+	files = append(files, extraFiles...)
+	for _, f := range files {
+		pem, err := os.ReadFile(f)
+		if err != nil {
+			return "", output.NewError("usage.bad_flag",
+				fmt.Sprintf("repair attestation: read trusted key %s: %v", f, err)).Wrap(output.ErrUsage)
+		}
+		v, err := backup.LoadVerifier(pem)
+		if err != nil {
+			return "", output.NewError("usage.bad_flag",
+				fmt.Sprintf("repair attestation: parse trusted key %s: %v", f, err)).Wrap(output.ErrUsage)
+		}
+		if _, err := backup.ParseAndVerify(body, v); err == nil {
+			return f, nil
+		}
+	}
+	return "", output.NewError("verify.attestation_untrusted_key",
+		fmt.Sprintf("repair attestation: refusing to re-sign — the manifest is signed by key %s, which is neither the current keyring key nor a trusted retired operator key",
+			extractAttestationFingerprint(body))).
+		WithSuggestion(&output.Suggestion{
+			Human: "a manifest's embedded public key is part of the manifest, so a valid self-signature proves nothing about WHO signed it. If this really is your previous signing key, install its public half under <keyring>/" + trustedKeysDirName + "/ (or pass --trusted-key <pem>) and re-run; otherwise treat the manifest as forged and recover with `repair manifest` or a fresh backup.",
+		})
 }

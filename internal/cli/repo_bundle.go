@@ -168,6 +168,11 @@ func newRepoBundleImportCmd() *cobra.Command {
 				return err
 			}
 			defer sp.Close()
+			// Import writes chunks and manifests: refuse on a repository
+			// the operator locked read-only.
+			if err := assertRepoWritable(cmd.Context(), sp, "repo bundle import"); err != nil {
+				return err
+			}
 
 			// Supply the codec set so import verifies each chunk's
 			// content address against its PLAINTEXT. Chunks are stored

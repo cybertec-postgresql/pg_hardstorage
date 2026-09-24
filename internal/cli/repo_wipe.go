@@ -2,8 +2,10 @@
 package cli
 
 import (
+	"context"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 	"time"
 
@@ -11,7 +13,9 @@ import (
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/approval"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/audit"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/output"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo"
 )
 
@@ -48,7 +52,7 @@ func newRepoWipeCmd() *cobra.Command {
 		requireApproval string
 		yes             bool
 	)
-	var force bool
+	var force, overrideHolds bool
 	c := &cobra.Command{
 		Use:   "wipe <url>",
 		Short: "Permanently delete every object in the repo (n-of-m approval, or --force for non-WORM repos)",
@@ -92,7 +96,7 @@ witness once the audit chain is gone.`,
 			if repoURL == "" {
 				return missingFlagErr(cmd, "--repo (or the first positional <url>)")
 			}
-			return runRepoWipe(cmd, repoURL, reason, requireApproval, force, yes)
+			return runRepoWipe(cmd, repoURL, reason, requireApproval, force, yes, overrideHolds)
 		},
 	}
 	c.Flags().StringVar(&repoURL, "repo", "",
@@ -103,12 +107,14 @@ witness once the audit chain is gone.`,
 		"approval request ID for the strict n-of-m gate (mandatory for WORM/compliance repos)")
 	c.Flags().BoolVar(&force, "force", false,
 		"skip the n-of-m approval on an ordinary (non-WORM) repo; still requires --yes")
+	c.Flags().BoolVar(&overrideHolds, "override-legal-holds", false,
+		"wipe even though backups are under an active legal hold; only with --require-approval (never with --force), and the held backups are recorded in the pre-wipe audit event")
 	c.Flags().BoolVar(&yes, "yes", false,
 		"acknowledge that this op is irreversible (always required)")
 	return c
 }
 
-func runRepoWipe(cmd *cobra.Command, url, reason, approvalID string, force, yes bool) error {
+func runRepoWipe(cmd *cobra.Command, url, reason, approvalID string, force, yes, overrideHolds bool) error {
 	d := DispatcherFrom(cmd)
 
 	repoMeta, sp, err := openRepo(cmd.Context(), url)
@@ -116,6 +122,39 @@ func runRepoWipe(cmd *cobra.Command, url, reason, approvalID string, force, yes 
 		return err
 	}
 	defer sp.Close()
+
+	// A read-only repository is locked on purpose; wiping it is the
+	// most mutating thing this binary can do. Flip the mode first.
+	if err := assertRepoWritable(cmd.Context(), sp, "repo wipe"); err != nil {
+		return err
+	}
+	if overrideHolds && approvalID == "" {
+		return output.NewError("usage.bad_flag",
+			"repo wipe: --override-legal-holds requires --require-approval (an n-of-m approval); --force alone can never destroy held backups").
+			Wrap(output.ErrUsage)
+	}
+
+	// Legal holds. `backup delete`, retention and gc all refuse to
+	// remove a held backup; `repo wipe --force --yes` deleted them along
+	// with everything else — a single operator could destroy data under
+	// a legal hold that no other path in the product can touch. Refuse
+	// while ANY hold is active. An unreadable hold marker counts as
+	// active (ListHolds reports it with no expiry): failing to read the
+	// thing that says "do not delete" is no licence to delete.
+	held, herr := activeHeldBackups(cmd.Context(), sp, time.Now().UTC())
+	if herr != nil {
+		return output.NewError("repo.wipe.hold_scan_failed",
+			fmt.Sprintf("repo wipe: scan legal holds: %v", herr)).Wrap(herr)
+	}
+	if len(held) > 0 && !overrideHolds {
+		return output.NewError("conflict.legal_hold",
+			fmt.Sprintf("repo wipe: refusing — %d backup(s) are under an active legal hold: %s",
+				len(held), strings.Join(capList(held, 16), ", "))).
+			WithSuggestion(&output.Suggestion{
+				Human:   "release the holds (`pg_hardstorage hold remove`) once the matter allows it, or — for a sanctioned destruction — pass --override-legal-holds together with an approved n-of-m request; the held backups are then named in the pre-wipe audit event",
+				Command: "pg_hardstorage hold list --repo " + url,
+			})
+	}
 
 	// Authorisation policy (issue #57): a WORM/compliance repo keeps the
 	// mandatory n-of-m posture — --force is refused, an approval is the
@@ -184,6 +223,11 @@ func runRepoWipe(cmd *cobra.Command, url, reason, approvalID string, force, yes 
 		// --force path: no approval. Record the bypass explicitly so
 		// the audit trail shows a single operator authorised this.
 		body["forced"] = true
+	}
+	if len(held) > 0 {
+		// Only reachable with --override-legal-holds + an approval:
+		// record exactly which held backups this wipe destroys.
+		body["legal_holds_overridden"] = held
 	}
 	audit.NewStoreWithRetention(sp, repoMeta.WORM).AppendOrLog(cmd.Context(), &audit.Event{
 		Action:    "repo.wipe",
@@ -281,4 +325,29 @@ func (b repoWipeBody) WriteText(w io.Writer) error {
 	}
 	_, err := io.WriteString(w, bw.String())
 	return err
+}
+
+// activeHeldBackups returns "<deployment>/<backup-id>" for every backup
+// whose legal hold is active at now, sorted.
+func activeHeldBackups(ctx context.Context, sp storage.StoragePlugin, now time.Time) ([]string, error) {
+	holds, err := backup.NewManifestStore(sp).ListHolds(ctx, "")
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, h := range holds {
+		if h.ActiveAt(now) {
+			out = append(out, h.Deployment+"/"+h.BackupID)
+		}
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+// capList returns at most n entries of list, with a "+N more" marker.
+func capList(list []string, n int) []string {
+	if len(list) <= n {
+		return list
+	}
+	return append(append([]string(nil), list[:n]...), fmt.Sprintf("… +%d more", len(list)-n))
 }
