@@ -93,10 +93,20 @@ sinks:
       to: ["dba@example.com"]
       cc: ["ops@example.com"]
       min_severity: error
+      timeout: 30s          # whole SMTP conversation; default 30s
 ```
 
 `min_severity: error` is the right default; nobody wants email
 on every WAL keepalive.
+
+`timeout` bounds one delivery end to end — dial, TLS handshake
+and the SMTP conversation. A relay that accepts the TCP
+connection and then stalls fails that delivery after `timeout`
+instead of holding up shutdown; cancelling the emitting command
+aborts an in-flight delivery immediately. Under
+`airgapped: strict` the `smtp_host` must be loopback, private
+(RFC1918 / RFC4193) or on the air-gap allowlist, or the sink is
+refused at startup.
 
 ## Microsoft Teams (`teams`)
 

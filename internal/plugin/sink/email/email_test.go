@@ -373,9 +373,9 @@ func TestEmail_RegistersWithDefaultRegistry(t *testing.T) {
 
 func TestEmail_DotStuffing_PreservedThroughSMTP(t *testing.T) {
 	// A line beginning with `.` would be interpreted as end-of-data
-	// without dot-stuffing per RFC 5321 §4.5.2. The sink prefixes
-	// such lines with an extra `.`; the fake server undoes the
-	// prefix on receive. Round-trip a body whose suggestion line
+	// without dot-stuffing per RFC 5321 §4.5.2. net/smtp's DATA
+	// writer prefixes such lines with an extra `.`; the fake server
+	// undoes the prefix on receive. Round-trip a body whose suggestion line
 	// starts with `.` — we use a custom Body field via WithBody.
 	srv := &fakeSMTP{}
 	host, port := startFakeSMTP(t, srv)
