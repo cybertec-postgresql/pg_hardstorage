@@ -824,19 +824,38 @@ func verifyBundleEvents(files map[string][]byte, manifest *BundleManifest) (Bund
 		}
 	}
 
-	// Linkage, only where the slice is genuinely consecutive.
-	integ.LinkageAsserted = true
-	for i := 1; i < len(events); i++ {
-		if events[i].Sequence != events[i-1].Sequence+1 {
-			integ.SequenceGaps++
-			integ.LinkageAsserted = false
-			continue
+	// Linkage, only where the slice is genuinely consecutive — and only
+	// within a shard. The chain is sharded per deployment/tenant, each
+	// shard an independent chain with its own sequence numbers, while
+	// the bundle holds events merged across shards in timestamp order.
+	// Comparing neighbours in that merged order checks db1's event
+	// against db2's and reports a break on every genuine multi-shard
+	// bundle. The shard is derived from the event itself, exactly as
+	// Append derived it, so a verifier needs nothing from the repo.
+	byShard := map[string][]*Event{}
+	var shards []string
+	for _, ev := range events {
+		k := shardKeyFor(ev)
+		if _, seen := byShard[k]; !seen {
+			shards = append(shards, k)
 		}
-		if events[i].PrevHash != events[i-1].Hash {
-			return integ, fmt.Errorf("audit: bundle chain break at sequence %d: event %s "+
-				"records prev_hash %s but the preceding event hashes to %s",
-				events[i].Sequence, events[i].ID,
-				short12(events[i].PrevHash), short12(events[i-1].Hash))
+		byShard[k] = append(byShard[k], ev)
+	}
+	integ.LinkageAsserted = true
+	for _, k := range shards {
+		chain := byShard[k]
+		for i := 1; i < len(chain); i++ {
+			if chain[i].Sequence != chain[i-1].Sequence+1 {
+				integ.SequenceGaps++
+				integ.LinkageAsserted = false
+				continue
+			}
+			if chain[i].PrevHash != chain[i-1].Hash {
+				return integ, fmt.Errorf("audit: bundle chain break at sequence %d (%s): event %s "+
+					"records prev_hash %s but the preceding event hashes to %s",
+					chain[i].Sequence, shardLabel(k), chain[i].ID,
+					short12(chain[i].PrevHash), short12(chain[i-1].Hash))
+			}
 		}
 	}
 
