@@ -417,9 +417,17 @@ func Restore(ctx context.Context, opts Options) (res *Result, err error) {
 	if err := preflightTarget(opts.TargetDir, opts.AllowOverwrite, m.SystemIdentifier, opts.AllowForeignCluster); err != nil {
 		return nil, err
 	}
-	if err := preflightTablespaceTargets(
-		tablespaceDestinations(m, opts.TablespaceRemap), opts.AllowOverwrite); err != nil {
-		return nil, err
+	// A target holding a checkpoint for THIS backup is a resume: its
+	// tablespace dirs legitimately hold what the interrupted attempt
+	// already wrote (and checkpointed). Refusing them made such a
+	// restore impossible to resume; clearing them under --force would
+	// delete files the checkpoint says are done. A checkpoint for a
+	// different backup is refused loudly further down (3a).
+	if !resumesBackup(opts.TargetDir, m.BackupID) {
+		if err := preflightTablespaceTargets(
+			tablespaceDestinations(m, opts.TablespaceRemap), opts.AllowOverwrite); err != nil {
+			return nil, err
+		}
 	}
 	if err := os.MkdirAll(opts.TargetDir, 0o700); err != nil {
 		return nil, output.NewError("internal",
@@ -1279,6 +1287,14 @@ func hasFile(entries []os.DirEntry, name string) bool {
 // match logic will refuse loudly if the contents disagree with the
 // requested backup. False positives here just defer the loud
 // refusal to the restore loop, which is fine.
+// resumesBackup reports whether target carries a restore checkpoint
+// for backupID, i.e. this run resumes an interrupted restore of the
+// same backup. An unreadable checkpoint is not a resume.
+func resumesBackup(target, backupID string) bool {
+	cp, err := LoadCheckpoint(target)
+	return err == nil && cp != nil && cp.BackupID == backupID
+}
+
 func targetIsResumeEligible(target string, entries []os.DirEntry) (bool, error) {
 	for _, e := range entries {
 		if e.Name() == CheckpointFilename {
