@@ -189,6 +189,10 @@ func runRecoveryReadiness(cmd *cobra.Command, deployment string, f recoveryReadi
 	}
 	if !f.skipEncryption {
 		opts.KEKResolver = recovery.KeystoreKEKResolver(p.Keyring.Value)
+		// Cloud-KMS KEKRefs are checked by unwrapping the DEK, the way
+		// restore does; provider settings from the config's
+		// `kms.providers` entry for the ref (issue #44).
+		opts.DEKUnwrapper = recovery.KeystoreDEKResolver(p.Keyring.Value, deploymentKMSResolver(nil))
 	}
 
 	r, err := recovery.Readiness(cmd.Context(), sp, deployment, opts)
