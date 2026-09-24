@@ -17,20 +17,25 @@ Example block:
 asserts:
   - count_exact:   { table: users, value: 1000000 }
   - count_range:   { table: orders, min: 800000, max: 900000 }
-  - digest_match:  { table: users, columns: [id, email], algo: crc64iso,
-                     expected: "abc..." }
   - lsn_at_least:  "0/3F5A1B40"
-  - pg_amcheck:    { passes: true }
-  - audit_chain_intact: true
-  - no_orphan_chunks:   true
+  - sql:           { query: "SELECT 1", expected: { rows: [[1]] } }
+  - cli_output_contains_any: [ "repo.format.future", "runbooks/" ]
 ```
+
+`cli_output_contains_any` matches the combined stdout+stderr of the scenario's
+most recent `cli_run` step and fails if none has run.
+
+An `assert:` step must list at least one assertion, and step keys are checked
+strictly: an unknown key (for example `assert: {asserts: [...]}`) is a parse
+error, not a silently empty step.
 
 ## Key files / subdirs
 
-- `assert.go` — DSL kinds + registry. Currently: `count_exact`, `count_range`,
-  `lsn_at_least`, `audit_chain_intact`, `pg_amcheck`, `pg_verifybackup`, `sql`,
-  `digest_match`, `page_aware_hash_match`, `schema_fingerprint_match`,
-  `no_orphan_chunks`, `no_uncommitted_manifests`, `prom_metric`
+- `assert.go` — DSL kinds. Implemented: `count_exact`, `count_range`,
+  `lsn_at_least`, `sql`, `cli_output_contains_any`. Reserved and **failing**
+  until a runner implements them: `pg_amcheck`, `pg_verifybackup`,
+  `audit_chain_intact`, `no_orphan_chunks`, `no_uncommitted_manifests` (they
+  used to pass without checking anything). Any other kind fails as unknown.
 - `assert_test.go` — per-kind unit tests
 
 ## Read next

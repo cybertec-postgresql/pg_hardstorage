@@ -14,6 +14,12 @@
 //	  - audit_chain_intact: true
 //	  - no_orphan_chunks:   true
 //	  - no_uncommitted_manifests: true
+//	  - cli_output_contains_any: [ "repo.format.future", "runbooks/" ]
+//
+// pg_amcheck, pg_verifybackup, audit_chain_intact, no_orphan_chunks and
+// no_uncommitted_manifests are reserved: no runner implements them yet,
+// and they FAIL rather than pass unchecked. cli_output_contains_any
+// matches the combined output of the scenario's most recent cli_run.
 //
 // The runner takes the parsed list, the scenario context (a *sql.DB
 // for the running PG, a path to the repo, etc.), and runs each
@@ -123,6 +129,13 @@ type Context struct {
 	// expected values from a sidecar file written by the load engine.
 	CheckpointFile string
 	CheckpointAt   string
+
+	// CLIOutput is the combined stdout+stderr of the scenario's most
+	// recent cli_run step, for cli_output_contains_any. HaveCLIOutput
+	// says a cli_run has run at all, so an assert placed before one
+	// fails instead of matching against nothing.
+	CLIOutput     string
+	HaveCLIOutput bool
 }
 
 // Run evaluates one assertion against ctx.
@@ -136,14 +149,16 @@ func Run(ctx context.Context, ac Context, a Assertion) Result {
 		return runLSNAtLeast(ctx, ac, a.Args)
 	case "sql":
 		return runSQL(ctx, ac, a.Args)
-	case "pg_amcheck", "pg_verifybackup":
-		// Real implementations live in the testkit binary's runner —
-		// they shell out to the PG client tools. The DSL parser is
-		// where they're declared; the runner here returns a stub
-		// "skipped" result so unit tests of Parse work without a PG.
-		return Result{Kind: a.Kind, Passed: true, Message: "deferred to scenario runner (needs " + a.Kind + " binary)"}
-	case "audit_chain_intact", "no_orphan_chunks", "no_uncommitted_manifests":
-		return Result{Kind: a.Kind, Passed: true, Message: "deferred to scenario runner (needs repo handle)"}
+	case "cli_output_contains_any":
+		return runCLIOutputContainsAny(ac, a.Args)
+	case "pg_amcheck", "pg_verifybackup", "audit_chain_intact", "no_orphan_chunks", "no_uncommitted_manifests":
+		// Declared in the DSL but implemented by no runner. They used
+		// to return Passed: true ("deferred to scenario runner"), so a
+		// scenario asserting audit_chain_intact passed against a broken
+		// chain. Fail until one is really implemented; a cli_run step
+		// (e.g. `audit verify-chain`) checks the same thing today.
+		return Result{Kind: a.Kind, Passed: false,
+			Message: a.Kind + " is not implemented by the scenario runner; use a cli_run step instead"}
 	}
 	return Result{Kind: a.Kind, Passed: false, Message: "unknown assertion kind"}
 }
@@ -171,6 +186,36 @@ func RunAll(ctx context.Context, ac Context, list []Assertion) ([]Result, error)
 var ErrAssertionFailed = errors.New("assert: at least one assertion failed")
 
 // --- per-kind runners --------------------------------------------------
+
+// runCLIOutputContainsAny passes when the last cli_run's combined
+// output contains at least one of the listed substrings.
+func runCLIOutputContainsAny(ac Context, args any) Result {
+	const kind = "cli_output_contains_any"
+	list, ok := args.([]any)
+	if !ok || len(list) == 0 {
+		return Result{Kind: kind, Passed: false, Message: "args must be a non-empty list of substrings"}
+	}
+	if !ac.HaveCLIOutput {
+		return Result{Kind: kind, Passed: false, Message: "no cli_run step ran before this assert"}
+	}
+	var want []string
+	for _, v := range list {
+		sub, ok := v.(string)
+		if !ok || sub == "" {
+			return Result{Kind: kind, Passed: false, Message: "every substring must be a non-empty string"}
+		}
+		if strings.Contains(ac.CLIOutput, sub) {
+			return Result{Kind: kind, Passed: true, Message: fmt.Sprintf("output contains %q", sub)}
+		}
+		want = append(want, sub)
+	}
+	out := ac.CLIOutput
+	if len(out) > 512 {
+		out = out[:512] + "…"
+	}
+	return Result{Kind: kind, Passed: false,
+		Message: fmt.Sprintf("output contains none of %q (output: %s)", want, out)}
+}
 
 func runCountExact(ctx context.Context, ac Context, args any) Result {
 	m, ok := args.(map[string]any)
