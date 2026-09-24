@@ -95,7 +95,9 @@ var mappingByKey = map[string]mappingRow{
 		// Native YAML uses retention.{keep_fulls,keep_for}.  keep_for
 		// is parsed by the agent with time.ParseDuration, which rejects
 		// "days"/"weeks"/"months" — so convert the Barman window into a
-		// Go-parseable hour count (7 days -> 168h).
+		// Go-parseable hour count (7 days -> 168h).  The policy must be
+		// named: an empty retention.policy is GFS with the default
+		// buckets, which ignores keep_for / keep_fulls entirely.
 		up := strings.ToUpper(strings.TrimSpace(v))
 		switch {
 		case strings.HasPrefix(up, "RECOVERY WINDOW OF "):
@@ -104,10 +106,10 @@ var mappingByKey = map[string]mappingRow{
 			if !ok {
 				return "", true, fmt.Sprintf("unrecognised recovery window %q (expected e.g. \"7 DAYS\")", window)
 			}
-			return fmt.Sprintf("retention:\n  keep_for: %s", dur), false, ""
+			return fmt.Sprintf("retention:\n  policy: simple\n  keep_for: %s", dur), false, ""
 		case strings.HasPrefix(up, "REDUNDANCY "):
 			n := strings.TrimSpace(strings.TrimPrefix(up, "REDUNDANCY "))
-			return fmt.Sprintf("retention:\n  keep_fulls: %s", n), false, ""
+			return fmt.Sprintf("retention:\n  policy: count\n  keep_fulls: %s", n), false, ""
 		default:
 			return "", true, fmt.Sprintf("unrecognised retention_policy %q", v)
 		}

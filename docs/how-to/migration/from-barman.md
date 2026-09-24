@@ -42,7 +42,7 @@ tags:
 | `archive_command`        | WAL streaming via slot (no `archive_command` change) |
 | Streaming-only mode      | Default: agent uses replication slot |
 | `barman check`           | `pg_hardstorage doctor`            |
-| Retention policy         | `retention:` in deployment config  |
+| Retention policy         | `retention:` in deployment config — `RECOVERY WINDOW OF N DAYS` → `policy: simple` + `keep_for`, `REDUNDANCY N` → `policy: count` + `keep_fulls` |
 | `barman switch-wal`      | Inferred — backup commit triggers WAL switch automatically |
 | `barman-cloud-backup`    | Cloud storage backend (`s3://`, `gs://`, `azure://`) |
 
