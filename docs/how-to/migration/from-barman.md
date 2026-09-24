@@ -198,6 +198,21 @@ local-target by design (run the restore where the target
 PG will run). For remote restores, run the agent on the
 target host and use `pg_hardstorage restore` from there.
 
+Through the `barman` shim, `recover` keeps Barman's recovery
+semantics:
+
+- **No target** → every archived WAL segment is replayed
+  (native `restore --to-latest`), exactly as Barman copies all
+  archived WAL.  Only `--target-immediate` stops at the
+  backup's consistency point.
+- **`--target-time` needs an explicit UTC offset**
+  (`2026-04-27 09:42:00+02`, `... UTC`).  Barman lets PostgreSQL
+  read an offset-less time in the server's `TimeZone`;
+  pg_hardstorage would read it as UTC and stop at a different
+  instant, so the shim refuses it rather than guess.
+- **`--target-xid`** is refused (no native XID target); use an
+  LSN or a time.
+
 ### `barman-cli` companion package
 
 We don't ship a separate companion package. The agent

@@ -133,7 +133,7 @@ func TestBackupFetch_Latest(t *testing.T) {
 	want := []string{
 		"restore", "db.example.com", "latest",
 		"--target", "/tmp/restore",
-		"--repo", "s3://acme/wal-g",
+		"--repo", "s3://acme/wal-g", "--to-latest",
 	}
 	if !slicesEqual(got, want) {
 		t.Errorf("dispatch:\n got %v\nwant %v", got, want)
@@ -158,7 +158,7 @@ func TestBackupFetch_NamedBackup(t *testing.T) {
 	want := []string{
 		"restore", "db.example.com", "base_000000010000000000000010",
 		"--target", "/tmp/restore",
-		"--repo", "s3://acme/wal-g",
+		"--repo", "s3://acme/wal-g", "--to-latest",
 	}
 	if !slicesEqual(got, want) {
 		t.Errorf("dispatch:\n got %v\nwant %v", got, want)

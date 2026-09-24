@@ -21,8 +21,8 @@ import (
 // Recovery-target time / LSN are not part of WAL-G's backup-fetch
 // surface (WAL-G uses recovery.signal / standby.signal in the
 // destination dir for that).  The shim restores to the named
-// backup; PITR continues to work via PG's native recovery_target_*
-// settings.
+// backup and arms end-of-archive recovery (--to-latest); PITR
+// continues to work via PG's native recovery_target_* settings.
 func newBackupFetchCmd(stderr io.Writer) *cobra.Command {
 	c := &cobra.Command{
 		Use:           "backup-fetch DESTINATION BACKUP_NAME",
@@ -68,6 +68,17 @@ func runBackupFetch(stderr io.Writer, args []string) error {
 	}
 	out := []string{native[0], env.deploymentName(), backupID, "--target", target}
 	out = append(out, native[1:]...)
+	// WAL-G writes no recovery configuration: the operator adds a
+	// signal file and any recovery_target_* themselves, and PostgreSQL
+	// replays every archived segment by default. A plain native restore
+	// would instead arm standby.signal + recovery_target='immediate' +
+	// promote — dropping all WAL archived after the backup, promoting a
+	// node the operator meant as a standby, and colliding with an
+	// operator-set recovery_target_time ("multiple recovery targets
+	// specified"). --to-latest arms restore_command with NO target
+	// under recovery.signal: an operator's standby.signal still wins,
+	// and their own target composes with it.
+	out = append(out, "--to-latest")
 
 	if rc := dispatchNative(out); rc != 0 {
 		return fmt.Errorf("pg-hardstorage-walg: backup-fetch: native CLI exited %d", rc)

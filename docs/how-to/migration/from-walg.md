@@ -234,6 +234,19 @@ retention floor, then WAL-G retires.
   KEK never leaves the KMS provider; chunks are encrypted
   at rest with a per-backup DEK that's wrapped under the
   KEK in the manifest.
+- **`backup-fetch` arms end-of-archive recovery.** WAL-G
+  writes no recovery settings; the shim runs native
+  `restore --to-latest`, which writes `recovery.signal` and a
+  managed `postgresql.auto.conf` block with `restore_command`
+  and **no** recovery target, so starting the cluster replays
+  every archived segment and promotes.  Your own
+  `standby.signal` still wins (the node stays a standby), and a
+  `recovery_target_*` you add composes with it.  The managed
+  block also sets `recovery_target_action = 'pause'`,
+  `recovery_target_timeline = 'latest'` and
+  `recovery_target_inclusive = true` (PostgreSQL's defaults);
+  because `postgresql.auto.conf` is read last, change those in
+  that block, not in `postgresql.conf`.
 - **`wal-fetch` exit codes.** As `restore_command`, the shim
   exits **1** only when the segment is genuinely absent
   (PostgreSQL's end-of-archive signal).  Any other failure —
