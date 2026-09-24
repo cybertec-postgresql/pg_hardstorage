@@ -215,7 +215,7 @@ field is where the recovery hint lives.
 
 | Namespace | Domain |
 | --- | --- |
-| `backup.*` | Backup pipeline (`backup.failed`, `backup.encrypt_no_kek`, `backup.kek_load_failed`, `backup.kms_open_failed`, `backup.compare.*`, `backup.delete.*`, `backup.undelete.*`) |
+| `backup.*` | Backup pipeline (`backup.failed`, `backup.encrypt_no_kek`, `backup.kek_load_failed`, `backup.kms_open_failed`, `backup.compare.*`, `backup.delete.*`, `backup.undelete.*`, `backup.parent_read_failed` — `--incremental-from` parent unreadable for a reason other than not-found / tombstoned / signature, which map to `notfound.backup`, `notfound.backup_tombstoned`, `verify.manifest_signature`) |
 | `keyring.*` | Keyring utilities (`keyring.install_failed`, `keyring.install_empty_source` — the initContainer copy refusing an empty or unreadable Secret mount) |
 | `restore.*` | Restore pipeline (`restore.failed`, `restore.kek_mismatch`, `restore.kek_resolve_failed`, `restore.target_in_wal_gap`, `restore.timeline_history_unreachable`, `restore.unknown_scheme`) |
 | `wal.*` | WAL streaming / fetch (`wal.slot_missing`, `wal.slot_ensure_failed`, `wal.slot_repair_failed`, `wal.fetch.*`, `wal.gap_purge_failed`, `wal.push_failed`, `wal.stream_error`) |

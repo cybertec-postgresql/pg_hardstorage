@@ -18,6 +18,7 @@ import (
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/capacity"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/output"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/paths"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/restore"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/wal/inventory"
@@ -456,12 +457,7 @@ func loadIncrementalConfig(ctx context.Context, repoURL, deployment, parentID st
 	store := backup.NewManifestStore(sp)
 	parent, err := store.Read(ctx, deployment, parentID, verifier)
 	if err != nil {
-		return nil, output.NewError("notfound.backup",
-			fmt.Sprintf("backup --incremental-from: parent %q not found in repo: %v",
-				parentID, err)).
-			WithSuggestion(&output.Suggestion{
-				Human: "verify the parent backup ID with `pg_hardstorage list <deployment>`",
-			}).Wrap(err)
+		return nil, incrementalParentReadError(parentID, err)
 	}
 	if len(parent.PGBackupManifest) == 0 {
 		return nil, output.NewError("usage.bad_flag",
@@ -473,6 +469,40 @@ func loadIncrementalConfig(ctx context.Context, repoURL, deployment, parentID st
 		ParentBackupID:   parent.BackupID,
 		ParentPGManifest: parent.PGBackupManifest,
 	}, nil
+}
+
+// incrementalParentReadError maps a failed read of the --incremental-from
+// parent per error class. Every failure used to become notfound.backup
+// (exit 6), so a parent whose signature does not verify — possible
+// tampering — or a repository that was merely unreachable told the
+// operator "that backup does not exist" and sent them to `list`.
+func incrementalParentReadError(parentID string, err error) error {
+	switch {
+	case errors.Is(err, storage.ErrNotFound):
+		return output.NewError("notfound.backup",
+			fmt.Sprintf("backup --incremental-from: parent %q not found in repo", parentID)).
+			WithSuggestion(&output.Suggestion{
+				Human: "verify the parent backup ID with `pg_hardstorage list <deployment>`",
+			}).Wrap(err)
+	case errors.Is(err, backup.ErrTombstoned):
+		return output.NewError("notfound.backup_tombstoned",
+			fmt.Sprintf("backup --incremental-from: parent %q is soft-deleted; an incremental on it would be an orphan", parentID)).
+			WithSuggestion(&output.Suggestion{
+				Human: "undelete the parent first (`backup undelete`), or take a full backup",
+			}).Wrap(err)
+	case errors.Is(err, backup.ErrBadSignature), errors.Is(err, backup.ErrPublicKeyMismatch),
+		errors.Is(err, backup.ErrUnsigned), errors.Is(err, backup.ErrAmbiguousManifest):
+		return output.NewError("verify.manifest_signature",
+			fmt.Sprintf("backup --incremental-from: parent %q does not verify against the trusted signing key: %v", parentID, err)).
+			WithSuggestion(&output.Suggestion{
+				Human: "do not chain onto it: run `pg_hardstorage repo check` (a manifest that fails verification is potential tampering), or take a full backup",
+			}).Wrap(err)
+	}
+	return output.NewError("backup.parent_read_failed",
+		fmt.Sprintf("backup --incremental-from: read parent %q: %v", parentID, err)).
+		WithSuggestion(&output.Suggestion{
+			Human: "the repository could not be read (not a missing backup); check storage reachability and retry",
+		}).Wrap(err)
 }
 
 // Sanity import to keep `repo` referenced (loadIncrementalConfig

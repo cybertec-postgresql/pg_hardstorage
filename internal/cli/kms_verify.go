@@ -184,8 +184,8 @@ func runKmsVerify(cmd *cobra.Command, f kmsVerifyFlags) error {
 	}
 
 	res, err := backup.VerifyEnvelopes(cmd.Context(), sp, backup.VerifyEnvelopesOptions{
-		Verifier:         verifier,
-		KEKResolver:      resolver,
+		Verifier:    verifier,
+		KEKResolver: resolver,
 		// Cloud-KMS refs are verified by asking the provider to unwrap
 		// (the KEK never leaves the HSM), with provider settings from
 		// the kms.providers entry matching each manifest's own ref.
