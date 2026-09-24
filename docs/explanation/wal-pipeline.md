@@ -152,9 +152,13 @@ Fatal findings (refuse to start streaming):
 - `wal_level.too_low` — physical replication needs `replica` or
   `logical`.
 - `max_replication_slots.zero` / `.full` — slot table has no room.
+  `.full` is only raised when the streamer must CREATE its slot; a
+  table that is full because the streamer's own slot already exists
+  is fine (it is reused on every restart).
 - `max_wal_senders.zero` / `.saturated` — wal-sender pool is full.
-- `role.no_replication` — the connecting role lacks the
-  `REPLICATION` attribute.
+- `role.no_replication` — the connecting role is neither a
+  superuser nor has the `REPLICATION` attribute (PostgreSQL admits
+  either).
 
 Warning findings (proceed with the warning attached to the
 start event):
