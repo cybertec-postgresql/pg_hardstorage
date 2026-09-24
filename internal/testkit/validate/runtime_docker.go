@@ -522,35 +522,47 @@ const retentionKeepFulls = 3
 // the soak running gc beside a live streamer is what exercises it.
 const retentionMinChunkAge = 10 * time.Minute
 
-// ApplyRetention rotates the cell's repository to a count policy and
-// garbage-collects what that released — what a deployment's scheduled
-// rotate + gc does.
-func (d *DockerCellRuntime) ApplyRetention(ctx context.Context) error {
+// Rotate soft-deletes the cell's deployment down to a count policy, as
+// a deployment's scheduled rotate does.
+func (d *DockerCellRuntime) Rotate(ctx context.Context) error {
+	return d.retentionStep(ctx, d.AgentBinary, "rotate", d.Deployment, "--repo", d.RepoURL,
+		"--policy", "count", "--keep-fulls", strconv.Itoa(retentionKeepFulls),
+		"--apply", "-o", "json")
+}
+
+// GC garbage-collects the repository the fleet shares. A refusal because
+// a backup lease is still live — typically one a fault killed mid-backup,
+// expiring within its TTL — is ErrRetentionDeferred: the product doing
+// exactly what it documents, and the next window retries.
+func (d *DockerCellRuntime) GC(ctx context.Context) error {
+	return d.retentionStep(ctx, d.AgentBinary, "repo", "gc", "--repo", d.RepoURL, "--apply",
+		"--tombstone-grace", "0",
+		"--min-chunk-age", retentionMinChunkAge.String(), "-o", "json")
+}
+
+func (d *DockerCellRuntime) retentionStep(ctx context.Context, argv ...string) error {
 	if !d.containerRunning(ctx) {
 		return ErrCellNotReady
 	}
-	steps := [][]string{
-		{d.AgentBinary, "rotate", d.Deployment, "--repo", d.RepoURL,
-			"--policy", "count", "--keep-fulls", strconv.Itoa(retentionKeepFulls),
-			"--apply", "-o", "json"},
-		{d.AgentBinary, "repo", "gc", "--repo", d.RepoURL, "--apply",
-			"--tombstone-grace", "0",
-			"--min-chunk-age", retentionMinChunkAge.String(), "-o", "json"},
+	stdout, stderr, err := d.dockerExecCapture(ctx, argv...)
+	if err == nil {
+		return nil
 	}
-	for _, argv := range steps {
-		stdout, stderr, err := d.dockerExecCapture(ctx, argv...)
-		if err == nil {
-			continue
-		}
-		if isContainerGoneExecError(stdout, stderr) || d.containerPositivelyStopped(ctx) {
-			return fmt.Errorf("%w: container %s went down during %s: %v",
-				ErrCellNotReady, d.Container, argv[1], err)
-		}
-		combined := append(append([]byte{}, stdout...), stderr...)
-		return fmt.Errorf("retention %s (%s): %w (output: %s)",
-			d.CellName, strings.Join(argv[1:3], " "), err, truncate(combined, 2048))
+	if isContainerGoneExecError(stdout, stderr) || d.containerPositivelyStopped(ctx) {
+		return fmt.Errorf("%w: container %s went down during %s: %v",
+			ErrCellNotReady, d.Container, argv[1], err)
 	}
-	return nil
+	combined := append(append([]byte{}, stdout...), stderr...)
+	if bytes.Contains(combined, []byte(`"code": "repo.gc.live_backup_lease"`)) {
+		return fmt.Errorf("%w: %s: a backup lease is still live", ErrRetentionDeferred, d.CellName)
+	}
+	// The error document follows gc's safety-floor warning; keep the
+	// tail, where the error is, rather than the head.
+	if len(combined) > 2048 {
+		combined = combined[len(combined)-2048:]
+	}
+	return fmt.Errorf("retention %s (%s): %w (output: %s)",
+		d.CellName, strings.Join(argv[1:3], " "), err, combined)
 }
 
 // containerPositivelyStopped reports whether Docker says the container

@@ -16,6 +16,7 @@ package validate
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/testkit/inject"
@@ -138,22 +139,42 @@ type LoopOptions struct {
 	// fault apply and recovery.  Default 30s.
 	HealWindow time.Duration
 
-	// RetentionEvery N iterations, run retention (rotate + gc) on
-	// cells whose runtime implements RetentionApplier. Default 20;
-	// negative disables. Without it the repository only grows: under
-	// enterprise_heavy's sustained writer every backup stores the
-	// pages churned since the last one, ~100 GB/h across 8 cells,
-	// which no host sustains for an 8h soak.
-	RetentionEvery int
+	// RetentionInterval is how often the fleet pauses for retention:
+	// every cell's deployment is rotated, then the shared repository is
+	// garbage-collected once. Default 15m; negative disables. Without it
+	// the repository only grows — under enterprise_heavy's sustained
+	// writer every backup stores the pages churned since the last one,
+	// ~100 GB/h across 8 cells, which no host sustains for 8h.
+	//
+	// Fleet-wide, not per cell, because the cells share one repository
+	// and gc rightly refuses while any backup is in flight (an in-flight
+	// backup may have deduplicated against the chunks it would delete):
+	// with 8 cells backing up every minute that is almost always. So
+	// retention runs in a window: new backups and verifies are held,
+	// in-flight ones drain, and the window gives up (deferred, not
+	// failed) if they do not within RetentionQuiesceTimeout.
+	RetentionInterval time.Duration
+
+	// RetentionQuiesceTimeout bounds how long a retention window waits
+	// for in-flight backups and verifies to drain. Default 5m — one cell
+	// waiting out a long PG recovery must not stall the whole fleet.
+	RetentionQuiesceTimeout time.Duration
 }
 
 // RetentionApplier is implemented by runtimes that can apply retention
-// to their repository the way a deployment does: rotate to a count
-// policy, then garbage-collect what that released. Optional, so the
-// fakes that implement CellRuntime need not.
+// the way a deployment does: rotate the cell's deployment to a count
+// policy, and garbage-collect the repository. Optional, so the fakes
+// that implement CellRuntime need not.
 type RetentionApplier interface {
-	ApplyRetention(ctx context.Context) error
+	Rotate(ctx context.Context) error
+	GC(ctx context.Context) error
 }
+
+// ErrRetentionDeferred means gc refused to sweep for a documented,
+// transient reason — a backup lease is still live (typically one a
+// fault killed mid-backup, which expires within its TTL). The next
+// retention window retries; it is not a failure.
+var ErrRetentionDeferred = errors.New("retention deferred")
 
 // defaults fills LoopOptions with sane production defaults
 // where the operator hasn't set them.
@@ -170,7 +191,10 @@ func (o *LoopOptions) defaults() {
 	if o.VerifyEvery == 0 {
 		o.VerifyEvery = 25
 	}
-	if o.RetentionEvery == 0 {
-		o.RetentionEvery = 20
+	if o.RetentionInterval == 0 {
+		o.RetentionInterval = 15 * time.Minute
+	}
+	if o.RetentionQuiesceTimeout == 0 {
+		o.RetentionQuiesceTimeout = 5 * time.Minute
 	}
 }

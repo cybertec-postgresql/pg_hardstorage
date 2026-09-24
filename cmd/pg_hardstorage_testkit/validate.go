@@ -32,6 +32,7 @@ func newValidateCmd() *cobra.Command {
 		healWindow       time.Duration
 		backupEvery      int
 		verifyEvery      int
+		retentionEvery   time.Duration
 		iterInterval     time.Duration
 		hostPortBase     int
 		dockerBin        string
@@ -162,6 +163,7 @@ fleet.`,
 					IterationInterval: iterInterval,
 					BackupEvery:       backupEvery,
 					VerifyEvery:       verifyEvery,
+					RetentionInterval: retentionEvery,
 					FaultProbability:  faultRate,
 					HealWindow:        healWindow,
 				},
@@ -247,6 +249,8 @@ fleet.`,
 		"take a backup every N iterations")
 	c.Flags().IntVar(&verifyEvery, "verify-every", 25,
 		"restore-verify every N iterations")
+	c.Flags().DurationVar(&retentionEvery, "retention-interval", 0,
+		"pause the fleet for rotate + gc this often (0 = 15m default, negative disables)")
 	c.Flags().DurationVar(&iterInterval, "iter-interval", 10*time.Second,
 		"sleep between iterations")
 	c.Flags().IntVar(&hostPortBase, "host-port-base", 15432,

@@ -119,6 +119,24 @@ func Run(ctx context.Context, opts RunOptions) (*report.Report, error) {
 		setupSem = make(chan struct{}, setupCap)
 	}
 
+	gate := newRetentionGate()
+	var appliers []RetentionApplier
+	for _, c := range opts.Cells {
+		if ra, ok := c.(RetentionApplier); ok {
+			appliers = append(appliers, ra)
+		}
+	}
+	retCtx, retCancel := context.WithCancel(runCtx)
+	retDone := make(chan struct{})
+	if len(appliers) > 0 && opts.Loop.RetentionInterval > 0 {
+		go func() {
+			defer close(retDone)
+			runRetentionWindows(retCtx, opts.Cells, gate, opts.Loop, emitEvent)
+		}()
+	} else {
+		close(retDone)
+	}
+
 	for i, cell := range opts.Cells {
 		wg.Add(1)
 		go func(idx int, cell CellRuntime) {
@@ -126,13 +144,15 @@ func Run(ctx context.Context, opts RunOptions) (*report.Report, error) {
 			cr := report.CellReport{
 				Name: cell.Name(), Pass: true,
 			}
-			runCellLoop(runCtx, cell, &cr, opts, emitEvent, setupSem)
+			runCellLoop(runCtx, cell, &cr, opts, emitEvent, setupSem, gate)
 			mu.Lock()
 			rep.Cells = append(rep.Cells, cr)
 			mu.Unlock()
 		}(i, cell)
 	}
 	wg.Wait()
+	retCancel()
+	<-retDone
 
 	// Aggregate fault stats across cells.  We didn't track
 	// per-prefix counts inside the cell loop (kept it simple);
@@ -218,6 +238,7 @@ func runCellLoop(
 	opts RunOptions,
 	emit func(Event),
 	setupSem chan struct{},
+	gate *retentionGate,
 ) {
 	rng := rand.New(rand.NewSource(opts.Seed ^ hashName(cell.Name())))
 	cr.UpFor = 0
@@ -464,162 +485,144 @@ func runCellLoop(
 			}
 		}
 
-		// 3. Backup every N iterations.
-		if iter%opts.Loop.BackupEvery == 0 {
-			emit(Event{Cell: cr.Name, Op: "backup_started", Iteration: iter})
-			cr.BackupsTaken++
-			id, err := cell.TakeBackup(ctx)
-			switch {
-			case err != nil && ctx.Err() != nil:
-				// Run-wide deadline elapsed mid-backup; the
-				// orchestrator is shutting down and any
-				// SIGKILL'd in-flight backup is a runner
-				// artefact, not a system failure.  Roll back
-				// the optimistic BackupsTaken increment so
-				// the report doesn't double-count an attempt
-				// that never had a fair chance to complete.
-				cr.BackupsTaken--
-				cr.LastIteration = iter - 1
-				emit(Event{Cell: cr.Name, Op: "backup_aborted_at_deadline",
-					Iteration: iter, Err: err.Error()})
-				return
-			case errors.Is(err, ErrCellNotReady):
-				// A fault knocked the cell offline and
-				// recovery hasn't completed; skip this
-				// dispatch rather than counting it as a
-				// failure.  The next iteration retries.
-				cr.BackupsTaken--
-				emit(Event{Cell: cr.Name, Op: "backup_skipped_cell_down",
-					Iteration: iter})
-			case isSourceCorruptionFailure(err):
-				// PostgreSQL refused the backup because the SOURCE
-				// data is damaged — a page that failed its checksum,
-				// a broken index. The soak injects exactly that
-				// (torn_page), and detection is the success signal,
-				// not a failure.
-				//
-				// It only started arriving here on PostgreSQL 18,
-				// which verifies page checksums during BASE_BACKUP;
-				// PG 15-17 copy the torn page and the damage surfaces
-				// later, at restore or verify, where the catalogue
-				// already expects it. So a criterion of "0
-				// backup_failed" was unsatisfiable for any fleet
-				// containing PG 18 + torn_page: every such cell
-				// aborted on the first hit and burned the rest of its
-				// window. All five failing cells in the 2h soak were
-				// exactly this, and the one PG18 cell that passed had
-				// only been lucky — churn happened to rewrite the
-				// corrupted page before the next backup read it.
-				//
-				// Record it as a detection so the cell keeps running
-				// and the rest of its window still measures something.
-				cr.CorruptionDetected++
-				emit(Event{Cell: cr.Name, Op: "backup_refused_source_corruption",
-					Iteration: iter, Err: err.Error()})
-			case err != nil:
-				cr.BackupsFailed++
-				emit(Event{Cell: cr.Name, Op: "backup_failed",
-					Iteration: iter, Err: err.Error()})
-				if reportFailure(report.Failure{
-					At: time.Now().UTC(), Cell: cr.Name, Iteration: iter,
-					Kind: "backup", Message: err.Error(),
-				}) {
-					cr.Pass = false
-					cr.FirstFailureMsg = "backup failed: " + err.Error()
-					return
-				}
-			default:
-				lastBackupID = id
-				emit(Event{Cell: cr.Name, Op: "backup_completed",
-					Iteration: iter, Detail: id})
+		// Backup and verify run inside the retention gate: a retention
+		// window holds them and waits for in-flight ones to drain, so gc
+		// sees a repository with no backup in flight.
+		stop := func() bool {
+			if !gate.enter(ctx) {
+				return false // run ended while a window was open
 			}
-		}
-
-		// 4. Restore-verify every M iterations (only if we
-		// have a backup to verify).
-		if iter%opts.Loop.VerifyEvery == 0 && lastBackupID != "" {
-			emit(Event{Cell: cr.Name, Op: "verify_started",
-				Iteration: iter, Detail: lastBackupID})
-			cr.RestoresAttempted++
-			err := cell.VerifyRestore(ctx, lastBackupID)
-			switch {
-			case err != nil && ctx.Err() != nil:
-				// Run-wide deadline elapsed mid-verify; the
-				// orchestrator is shutting down and any
-				// SIGKILL'd in-flight restore is a runner
-				// artefact, not a system failure.  Mirrors
-				// the backup_aborted_at_deadline path above
-				// — without this, a 10-min soak that fires
-				// verifies near the end racks up bogus
-				// verify_failed entries (signal: killed,
-				// empty output) once the wall-clock timer
-				// cancels the docker exec subprocess.  Roll
-				// back the optimistic RestoresAttempted
-				// increment so the report doesn't count an
-				// attempt that never had a fair chance to
-				// complete.
-				cr.RestoresAttempted--
-				cr.LastIteration = iter - 1
-				emit(Event{Cell: cr.Name, Op: "verify_aborted_at_deadline",
-					Iteration: iter, Err: err.Error()})
-				return
-			case errors.Is(err, ErrCellNotReady):
-				// A fault knocked the cell offline and recovery
-				// hasn't completed; skip this verify rather than
-				// counting it as a failure — mirrors the
-				// backup_skipped_cell_down path above.  The next
-				// verify-eligible iteration retries.
-				cr.RestoresAttempted--
-				emit(Event{Cell: cr.Name, Op: "verify_skipped_cell_down",
-					Iteration: iter})
-			case err != nil:
-				cr.RestoresFailed++
-				emit(Event{Cell: cr.Name, Op: "verify_failed",
-					Iteration: iter, Err: err.Error()})
-				if reportFailure(report.Failure{
-					At: time.Now().UTC(), Cell: cr.Name, Iteration: iter,
-					Kind: "verify", Message: err.Error(),
-				}) {
-					cr.Pass = false
-					cr.FirstFailureMsg = "verify failed: " + err.Error()
-					return
+			defer gate.leave()
+			// 3. Backup every N iterations.
+			if iter%opts.Loop.BackupEvery == 0 {
+				emit(Event{Cell: cr.Name, Op: "backup_started", Iteration: iter})
+				cr.BackupsTaken++
+				id, err := cell.TakeBackup(ctx)
+				switch {
+				case err != nil && ctx.Err() != nil:
+					// Run-wide deadline elapsed mid-backup; the
+					// orchestrator is shutting down and any
+					// SIGKILL'd in-flight backup is a runner
+					// artefact, not a system failure.  Roll back
+					// the optimistic BackupsTaken increment so
+					// the report doesn't double-count an attempt
+					// that never had a fair chance to complete.
+					cr.BackupsTaken--
+					cr.LastIteration = iter - 1
+					emit(Event{Cell: cr.Name, Op: "backup_aborted_at_deadline",
+						Iteration: iter, Err: err.Error()})
+					return true
+				case errors.Is(err, ErrCellNotReady):
+					// A fault knocked the cell offline and
+					// recovery hasn't completed; skip this
+					// dispatch rather than counting it as a
+					// failure.  The next iteration retries.
+					cr.BackupsTaken--
+					emit(Event{Cell: cr.Name, Op: "backup_skipped_cell_down",
+						Iteration: iter})
+				case isSourceCorruptionFailure(err):
+					// PostgreSQL refused the backup because the SOURCE
+					// data is damaged — a page that failed its checksum,
+					// a broken index. The soak injects exactly that
+					// (torn_page), and detection is the success signal,
+					// not a failure.
+					//
+					// It only started arriving here on PostgreSQL 18,
+					// which verifies page checksums during BASE_BACKUP;
+					// PG 15-17 copy the torn page and the damage surfaces
+					// later, at restore or verify, where the catalogue
+					// already expects it. So a criterion of "0
+					// backup_failed" was unsatisfiable for any fleet
+					// containing PG 18 + torn_page: every such cell
+					// aborted on the first hit and burned the rest of its
+					// window. All five failing cells in the 2h soak were
+					// exactly this, and the one PG18 cell that passed had
+					// only been lucky — churn happened to rewrite the
+					// corrupted page before the next backup read it.
+					//
+					// Record it as a detection so the cell keeps running
+					// and the rest of its window still measures something.
+					cr.CorruptionDetected++
+					emit(Event{Cell: cr.Name, Op: "backup_refused_source_corruption",
+						Iteration: iter, Err: err.Error()})
+				case err != nil:
+					cr.BackupsFailed++
+					emit(Event{Cell: cr.Name, Op: "backup_failed",
+						Iteration: iter, Err: err.Error()})
+					if reportFailure(report.Failure{
+						At: time.Now().UTC(), Cell: cr.Name, Iteration: iter,
+						Kind: "backup", Message: err.Error(),
+					}) {
+						cr.Pass = false
+						cr.FirstFailureMsg = "backup failed: " + err.Error()
+						return true
+					}
+				default:
+					lastBackupID = id
+					emit(Event{Cell: cr.Name, Op: "backup_completed",
+						Iteration: iter, Detail: id})
 				}
-			default:
-				emit(Event{Cell: cr.Name, Op: "verify_ok",
+			}
+
+			// 4. Restore-verify every M iterations (only if we
+			// have a backup to verify).
+			if iter%opts.Loop.VerifyEvery == 0 && lastBackupID != "" {
+				emit(Event{Cell: cr.Name, Op: "verify_started",
 					Iteration: iter, Detail: lastBackupID})
-			}
-		}
-
-		// 4b. Retention every R iterations, after verify so the
-		// backup just verified is never the one being pruned. A later
-		// verify_ok is the proof that gc reclaimed nothing still live —
-		// with the WAL streamer committing chunks concurrently.
-		if ra, ok := cell.(RetentionApplier); ok && opts.Loop.RetentionEvery > 0 &&
-			iter%opts.Loop.RetentionEvery == 0 {
-			err := ra.ApplyRetention(ctx)
-			switch {
-			case err != nil && ctx.Err() != nil:
-				emit(Event{Cell: cr.Name, Op: "retention_aborted_at_deadline",
-					Iteration: iter, Err: err.Error()})
-				cr.LastIteration = iter - 1
-				return
-			case errors.Is(err, ErrCellNotReady):
-				emit(Event{Cell: cr.Name, Op: "retention_skipped_cell_down",
-					Iteration: iter})
-			case err != nil:
-				emit(Event{Cell: cr.Name, Op: "retention_failed",
-					Iteration: iter, Err: err.Error()})
-				if reportFailure(report.Failure{
-					At: time.Now().UTC(), Cell: cr.Name, Iteration: iter,
-					Kind: "retention", Message: err.Error(),
-				}) {
-					cr.Pass = false
-					cr.FirstFailureMsg = "retention failed: " + err.Error()
-					return
+				cr.RestoresAttempted++
+				err := cell.VerifyRestore(ctx, lastBackupID)
+				switch {
+				case err != nil && ctx.Err() != nil:
+					// Run-wide deadline elapsed mid-verify; the
+					// orchestrator is shutting down and any
+					// SIGKILL'd in-flight restore is a runner
+					// artefact, not a system failure.  Mirrors
+					// the backup_aborted_at_deadline path above
+					// — without this, a 10-min soak that fires
+					// verifies near the end racks up bogus
+					// verify_failed entries (signal: killed,
+					// empty output) once the wall-clock timer
+					// cancels the docker exec subprocess.  Roll
+					// back the optimistic RestoresAttempted
+					// increment so the report doesn't count an
+					// attempt that never had a fair chance to
+					// complete.
+					cr.RestoresAttempted--
+					cr.LastIteration = iter - 1
+					emit(Event{Cell: cr.Name, Op: "verify_aborted_at_deadline",
+						Iteration: iter, Err: err.Error()})
+					return true
+				case errors.Is(err, ErrCellNotReady):
+					// A fault knocked the cell offline and recovery
+					// hasn't completed; skip this verify rather than
+					// counting it as a failure — mirrors the
+					// backup_skipped_cell_down path above.  The next
+					// verify-eligible iteration retries.
+					cr.RestoresAttempted--
+					emit(Event{Cell: cr.Name, Op: "verify_skipped_cell_down",
+						Iteration: iter})
+				case err != nil:
+					cr.RestoresFailed++
+					emit(Event{Cell: cr.Name, Op: "verify_failed",
+						Iteration: iter, Err: err.Error()})
+					if reportFailure(report.Failure{
+						At: time.Now().UTC(), Cell: cr.Name, Iteration: iter,
+						Kind: "verify", Message: err.Error(),
+					}) {
+						cr.Pass = false
+						cr.FirstFailureMsg = "verify failed: " + err.Error()
+						return true
+					}
+				default:
+					emit(Event{Cell: cr.Name, Op: "verify_ok",
+						Iteration: iter, Detail: lastBackupID})
 				}
-			default:
-				emit(Event{Cell: cr.Name, Op: "retention_ok", Iteration: iter})
 			}
+
+			return false
+		}()
+		if stop {
+			return
 		}
 
 		// 5. Optional sleep between iterations.

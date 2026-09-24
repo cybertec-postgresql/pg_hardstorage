@@ -12,29 +12,65 @@ import (
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/testkit/validate"
 )
 
-// retentionCell is a FakeCellRuntime that also applies retention.
+// retentionCell is a FakeCellRuntime that also applies retention, and
+// whose backups take a moment so a window has something to drain.
 type retentionCell struct {
 	*validate.FakeCellRuntime
-	calls atomic.Int32
-	err   error
+	inflight  *atomic.Int32 // backups in flight across the fleet
+	violation *atomic.Int32 // gc calls that saw a backup in flight
+	rotates   atomic.Int32
+	gcs       atomic.Int32
+	gcErr     error
 }
 
-func (r *retentionCell) ApplyRetention(context.Context) error {
-	r.calls.Add(1)
-	return r.err
+func (r *retentionCell) TakeBackup(ctx context.Context) (string, error) {
+	r.inflight.Add(1)
+	defer r.inflight.Add(-1)
+	time.Sleep(2 * time.Millisecond)
+	return r.FakeCellRuntime.TakeBackup(ctx)
 }
 
-func runRetention(t *testing.T, cell validate.CellRuntime, every int) (*report.Report, []validate.Event) {
+func (r *retentionCell) Rotate(context.Context) error {
+	r.rotates.Add(1)
+	return nil
+}
+
+func (r *retentionCell) GC(context.Context) error {
+	r.gcs.Add(1)
+	if r.inflight.Load() != 0 {
+		r.violation.Add(1)
+	}
+	return r.gcErr
+}
+
+func newRetentionFleet(n int, gcErr error) ([]*retentionCell, *atomic.Int32) {
+	inflight, violation := &atomic.Int32{}, &atomic.Int32{}
+	var cells []*retentionCell
+	for i := range n {
+		cells = append(cells, &retentionCell{
+			FakeCellRuntime: &validate.FakeCellRuntime{NameStr: fmt.Sprintf("c%d", i)},
+			inflight:        inflight, violation: violation, gcErr: gcErr,
+		})
+	}
+	return cells, violation
+}
+
+func runRetention(t *testing.T, cells []*retentionCell, interval time.Duration) (*report.Report, []validate.Event) {
 	t.Helper()
 	validate.ResetForTesting()
 	emit, events, mu := collectEvents(t)
+	var rts []validate.CellRuntime
+	for _, c := range cells {
+		rts = append(rts, c)
+	}
 	rep, err := validate.Run(context.Background(), validate.RunOptions{
 		Seed:     3,
-		Duration: 150 * time.Millisecond,
-		Loop:     validate.LoopOptions{BackupEvery: 1, VerifyEvery: 2, RetentionEvery: every},
-		Faults:   defaultFaults(),
-		Cells:    []validate.CellRuntime{cell},
-		OnEvent:  emit,
+		Duration: 300 * time.Millisecond,
+		Loop: validate.LoopOptions{BackupEvery: 1, VerifyEvery: 2,
+			RetentionInterval: interval, RetentionQuiesceTimeout: time.Second},
+		Faults:  defaultFaults(),
+		Cells:   rts,
+		OnEvent: emit,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -54,46 +90,59 @@ func countOp(evs []validate.Event, op string) int {
 	return n
 }
 
-func TestRun_RetentionRunsOnCadence(t *testing.T) {
-	cell := &retentionCell{FakeCellRuntime: &validate.FakeCellRuntime{NameStr: "c"}}
-	rep, evs := runRetention(t, cell, 3)
+// Every window rotates every cell and gc's the shared repository once,
+// with no backup in flight while gc runs.
+func TestRun_RetentionWindowRotatesEveryCellAndGCsOnceWhileQuiet(t *testing.T) {
+	cells, violation := newRetentionFleet(3, nil)
+	rep, evs := runRetention(t, cells, 40*time.Millisecond)
 	if !rep.OverallPass {
-		t.Fatalf("retention succeeding must not fail the run: %+v", rep.Failures)
+		t.Fatalf("successful retention must not fail the run: %+v", rep.Failures)
 	}
-	if cell.calls.Load() == 0 || int(cell.calls.Load()) != countOp(evs, "retention_ok") {
-		t.Fatalf("calls=%d retention_ok=%d; want equal and > 0", cell.calls.Load(), countOp(evs, "retention_ok"))
+	windows := countOp(evs, "retention_ok")
+	if windows == 0 {
+		t.Fatal("no retention window completed")
 	}
-	if iters := countOp(evs, "iter_start"); int(cell.calls.Load()) > iters/3 {
-		t.Errorf("retention ran %d times in %d iterations; cadence is every 3", cell.calls.Load(), iters)
+	var gcs int32
+	for _, c := range cells {
+		gcs += c.gcs.Load()
+		if int(c.rotates.Load()) < windows {
+			t.Errorf("%s rotated %d times in %d windows", c.Name(), c.rotates.Load(), windows)
+		}
+	}
+	if int(gcs) != windows {
+		t.Errorf("gc ran %d times in %d windows; want once per window", gcs, windows)
+	}
+	if v := violation.Load(); v != 0 {
+		t.Fatalf("gc ran %d time(s) with a backup in flight", v)
+	}
+	if countOp(evs, "backup_completed") == 0 {
+		t.Fatal("no backups ran — the windows starved the fleet")
 	}
 }
 
 func TestRun_RetentionDisabledWhenNegative(t *testing.T) {
-	cell := &retentionCell{FakeCellRuntime: &validate.FakeCellRuntime{NameStr: "c"}}
-	runRetention(t, cell, -1)
-	if n := cell.calls.Load(); n != 0 {
-		t.Fatalf("RetentionEvery<0 must disable retention; ran %d times", n)
+	cells, _ := newRetentionFleet(1, nil)
+	runRetention(t, cells, -1)
+	if n := cells[0].rotates.Load() + cells[0].gcs.Load(); n != 0 {
+		t.Fatalf("RetentionInterval<0 must disable retention; %d calls", n)
 	}
 }
 
-// A cell a fault took down is skipped, not failed — same as backup.
-func TestRun_RetentionCellDownIsSkipped(t *testing.T) {
-	cell := &retentionCell{FakeCellRuntime: &validate.FakeCellRuntime{NameStr: "c"},
-		err: fmt.Errorf("%w: gone", validate.ErrCellNotReady)}
-	rep, evs := runRetention(t, cell, 2)
-	if !rep.OverallPass || countOp(evs, "retention_skipped_cell_down") == 0 {
-		t.Fatalf("cell-down retention must be skipped, not failed: pass=%v failures=%+v", rep.OverallPass, rep.Failures)
+// gc refusing over a live lease is the product working: deferred, not failed.
+func TestRun_RetentionDeferredIsNotAFailure(t *testing.T) {
+	cells, _ := newRetentionFleet(2, fmt.Errorf("%w: lease", validate.ErrRetentionDeferred))
+	rep, evs := runRetention(t, cells, 40*time.Millisecond)
+	if !rep.OverallPass || countOp(evs, "retention_deferred") == 0 {
+		t.Fatalf("a deferred gc must be recorded and must not fail: pass=%v failures=%+v", rep.OverallPass, rep.Failures)
 	}
 }
 
-// A retention that fails is a product failure: rotate and gc are the
-// product, and a gc that errors under load is exactly what to catch.
-func TestRun_RetentionFailureMarksReport(t *testing.T) {
-	cell := &retentionCell{FakeCellRuntime: &validate.FakeCellRuntime{NameStr: "c"},
-		err: errors.New("gc: boom")}
-	rep, evs := runRetention(t, cell, 2)
-	if rep.OverallPass || countOp(evs, "retention_failed") == 0 {
-		t.Fatalf("failed retention must fail the run: pass=%v", rep.OverallPass)
+// Any other gc error is a product failure.
+func TestRun_RetentionGCFailureMarksReport(t *testing.T) {
+	cells, _ := newRetentionFleet(2, errors.New("gc: boom"))
+	rep, evs := runRetention(t, cells, 40*time.Millisecond)
+	if rep.OverallPass || countOp(evs, "retention_gc_failed") == 0 {
+		t.Fatalf("a failed gc must fail the run: pass=%v", rep.OverallPass)
 	}
 	if rep.Failures[0].Kind != "retention" {
 		t.Errorf("failure kind = %q, want retention", rep.Failures[0].Kind)

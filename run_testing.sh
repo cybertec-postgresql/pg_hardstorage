@@ -25,6 +25,9 @@
 #                      enterprise_heavy ship by default)
 #   --fault-rate F     per-iteration fault probability 0..1 (default
 #                      testkit-internal 0.2)
+#   --retention-interval D
+#                      pause the fleet for rotate + gc every D (default
+#                      testkit-internal 15m; negative disables)
 #   --max-containers N soak the whole matrix in sequential batches,
 #                      never exceeding N containers at once (one cell
 #                      = 1 PG + 1 toxiproxy container, so a batch
@@ -105,6 +108,7 @@ PARALLEL=1
 HOST_PORT_BASE=15432
 PROFILE="oltp_smoke"
 FAULT_RATE=""  # empty → testkit's own default (0.2)
+RETENTION_INTERVAL=""  # empty → testkit's own default (15m)
 FLEET_OVERRIDE=""  # --fleet PATH: use this fleet verbatim, skip `fleet random`
 MAX_CONTAINERS=0   # --max-containers N: soak the matrix in batches of ≤N containers
 SKIP_MEM_CHECK=0   # --skip-mem-check: bypass the host-RAM preflight (issue #46)
@@ -125,6 +129,7 @@ while [[ $# -gt 0 ]]; do
         --host-port-base) HOST_PORT_BASE="$2"; shift 2 ;;
         --profile) PROFILE="$2"; shift 2 ;;
         --fault-rate) FAULT_RATE="$2"; shift 2 ;;
+        --retention-interval) RETENTION_INTERVAL="$2"; shift 2 ;;
         --max-containers) MAX_CONTAINERS="$2"; shift 2 ;;
         --fleet) FLEET_OVERRIDE="$2"; shift 2 ;;
         --no-build) NO_BUILD=1; shift ;;
@@ -297,6 +302,7 @@ if [[ "$CELLS_PER_BATCH" -gt 0 ]]; then
         [[ "$KEEP_ON_FAILURE" -eq 1 ]] && forward+=(--keep-on-failure)
         [[ -n "$PROFILE" && "$PROFILE" != "oltp_smoke" ]] && forward+=(--profile "$PROFILE")
         [[ -n "$FAULT_RATE" ]]         && forward+=(--fault-rate "$FAULT_RATE")
+        [[ -n "$RETENTION_INTERVAL" ]] && forward+=(--retention-interval "$RETENTION_INTERVAL")
         note "── batch $bi/${#BATCH_FILES[@]} ($(grep -c 'os:' "$bf" || echo '?') cells) → $bdir ──"
         # `if cmd; then` keeps `set -e` from aborting the run when a
         # batch fails; we want to soak the remaining batches and
@@ -385,6 +391,7 @@ if [[ "$PARALLEL" -gt 1 ]]; then
         [[ "$KEEP_ON_FAILURE" -eq 1 ]]  && forward+=(--keep-on-failure)
         [[ -n "$PROFILE" && "$PROFILE" != "oltp_smoke" ]] && forward+=(--profile "$PROFILE")
         [[ -n "$FAULT_RATE" ]]          && forward+=(--fault-rate "$FAULT_RATE")
+        [[ -n "$RETENTION_INTERVAL" ]]  && forward+=(--retention-interval "$RETENTION_INTERVAL")
         # Stagger slot starts by 2s — concurrent docker compose ups
         # against a single daemon occasionally race on network/volume
         # creation; the small offset eliminates the noise.
@@ -781,9 +788,12 @@ echo
 # ${arr[@]+...} guard yields zero words when the array is empty and
 # the elements — correctly quoted — when it is not; portable from
 # Bash 3.2 through 5.x.  See issue #47.
-FAULT_RATE_FLAG=()
+VALIDATE_OPT_FLAGS=()
 if [[ -n "$FAULT_RATE" ]]; then
-    FAULT_RATE_FLAG=(--fault-rate "$FAULT_RATE")
+    VALIDATE_OPT_FLAGS=(--fault-rate "$FAULT_RATE")
+fi
+if [[ -n "$RETENTION_INTERVAL" ]]; then
+    VALIDATE_OPT_FLAGS+=(--retention-interval "$RETENTION_INTERVAL")
 fi
 "$TESTKIT" validate \
     --fleet "$FLEET_PATH" \
@@ -795,7 +805,7 @@ fi
     --project "$PROJECT" \
     --report-dir "$REPORT_DIR" \
     --host-port-base "$HOST_PORT_BASE" \
-    ${FAULT_RATE_FLAG[@]+"${FAULT_RATE_FLAG[@]}"} \
+    ${VALIDATE_OPT_FLAGS[@]+"${VALIDATE_OPT_FLAGS[@]}"} \
     $EXTRA
 
 green "soak completed; reports in $REPORT_DIR"
