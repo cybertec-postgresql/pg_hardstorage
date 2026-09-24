@@ -195,7 +195,11 @@ Pick `3`:
 ```
 
 The streamer runs in the foreground, prints structured progress
-events, and unwinds cleanly on Ctrl-C.  For unattended setups
+events, and unwinds cleanly on Ctrl-C: the helper forwards a single
+interrupt to `wal stream`, which switches WAL and flushes the final
+segment (allowed up to 30 s before it is killed), then you are back
+at the menu.  Ctrl-C during any flow stops only that flow; the next
+one you pick starts normally.  For unattended setups
 (systemd, k8s, cron) install the full `pg_hardstorage` agent — that
 service runs WAL streaming as a managed daemon and the simple
 helper deliberately doesn't try to replicate that lifecycle.

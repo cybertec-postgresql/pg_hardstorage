@@ -16,8 +16,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"os/signal"
-	"syscall"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/config"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/paths"
@@ -47,11 +45,13 @@ func main() {
 		}
 	}
 
-	// SIGINT during a long-running flow (a backup, a wal stream)
-	// cancels the context so the runner unwinds cleanly instead
-	// of being SIGKILLed mid-write.
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer cancel()
+	// No session-wide signal context: simple.Run gives each flow its
+	// own interrupt-cancellable one, so SIGINT during a backup or wal
+	// stream unwinds that flow cleanly and returns to the menu. A
+	// session-wide NotifyContext stayed cancelled after the first
+	// Ctrl-C, so every later flow started dead. At the menu prompt
+	// itself no handler is installed and Ctrl-C exits as usual.
+	ctx := context.Background()
 
 	p, err := paths.Resolve(paths.DefaultOptions())
 	if err != nil {

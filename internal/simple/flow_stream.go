@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"time"
 )
 
 // flowStream is operation #3 — "Start continuous protection".
@@ -72,11 +73,31 @@ func (f flowStream) Run(ctx context.Context, env *Env) error {
 	)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
+	// Stopping the stream must reach wal stream as ONE catchable
+	// signal. CommandContext's default Cancel is SIGKILL, which skipped
+	// its graceful drain (pg_switch_wal + final segment flush). But the
+	// child treats a SECOND signal as "abort now", so it must not also
+	// get the terminal's own Ctrl-C: it runs in its own process group
+	// (unix) and the only interrupt it sees is the one Cancel forwards.
+	// WaitDelay bounds the drain (self-limited to ~10s) before the
+	// SIGKILL fallback.
+	detachFromTerminalSignals(cmd)
+	cmd.Cancel = func() error {
+		if err := cmd.Process.Signal(os.Interrupt); err != nil {
+			// No interrupt delivery (Windows): the old hard stop.
+			return cmd.Process.Kill()
+		}
+		return nil
+	}
+	cmd.WaitDelay = streamStopGrace
 	env.Prompter.Println("  $ pg_hardstorage wal stream ...")
 	if err := cmd.Run(); err != nil {
-		// Ctrl-C surfaces as exit code 130; treat that as the
-		// "operator stopped me" path and report cleanly.
-		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 130 {
+		// An operator stop: our forwarded interrupt (Run reports the
+		// cancelled ctx when the child then exits 0) or the child's
+		// own Ctrl-C exit code 130. Report it cleanly.
+		var exitErr *exec.ExitError
+		if ctx.Err() != nil && errors.Is(err, ctx.Err()) ||
+			errors.As(err, &exitErr) && exitErr.ExitCode() == 130 {
 			env.Prompter.Println("\n  stopped.")
 			env.State.LastDeployment = dep.Name
 			return nil
@@ -87,6 +108,11 @@ func (f flowStream) Run(ctx context.Context, env *Env) error {
 	env.State.LastDeployment = dep.Name
 	return nil
 }
+
+// streamStopGrace is how long a stopped wal stream may drain before
+// it is killed. Its graceful path bounds itself at ~10s; the rest is
+// headroom for a slow final flush to remote storage.
+const streamStopGrace = 30 * time.Second
 
 // findAgentBinary locates the full pg_hardstorage binary.  Order:
 //
