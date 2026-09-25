@@ -6,6 +6,8 @@ import (
 	stdjson "encoding/json"
 	"errors"
 	"fmt"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup/keystore"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/paths"
 	"io"
 	"strings"
 	"text/tabwriter"
@@ -630,9 +632,21 @@ func (b jitVerifyBody) WriteText(w io.Writer) error {
 // uses; ensures JIT tokens are signed by the same key as
 // manifests + audit bundles.
 func loadSignerForJIT() (*backup.Signer, *backup.Verifier, error) {
-	// Only init and backup create the keypair: a key minted here would
-	// sign tokens that no other verb (or host) recognises.
-	return loadExistingKeypair("jit")
+	// jit and threshold use the keypair as the OPERATOR's identity, so
+	// creating it on first use is the onboarding step (`threshold whoami`
+	// prints the key an approver registers in a roster). Commands that
+	// verify the repository's own manifests (integrity, dsa, restore,
+	// repair, list, …) use loadExistingKeypair instead.
+	p, err := paths.Resolve(paths.DefaultOptions())
+	if err != nil {
+		return nil, nil, output.NewError("internal", err.Error()).Wrap(err)
+	}
+	signer, verifier, err := keystore.LoadOrGenerate(p.Keyring.Value)
+	if err != nil {
+		return nil, nil, output.NewError("internal",
+			fmt.Sprintf("jit: load signer: %v", err)).Wrap(err)
+	}
+	return signer, verifier, nil
 }
 
 // jitSignerAdapter wraps backup.Signer to satisfy jit.Signer

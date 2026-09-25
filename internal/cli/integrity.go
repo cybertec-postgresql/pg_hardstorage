@@ -132,7 +132,7 @@ func runIntegrityRun(cmd *cobra.Command, f integrityRunFlags) error {
 		return err
 	}
 	defer sp.Close()
-	signer, verifier, err := loadSignerForJIT() // shared keystore loader
+	signer, verifier, err := loadExistingKeypair("integrity") // verifies the repository's manifests: never mint a key
 	if err != nil {
 		return err
 	}
@@ -385,7 +385,7 @@ func runIntegrityVerify(cmd *cobra.Command, repoURL, id string) error {
 		return output.NewError("integrity.get_failed",
 			fmt.Sprintf("integrity verify: %v", err)).Wrap(err)
 	}
-	signer, _, err := loadSignerForJIT()
+	signer, _, err := loadExistingKeypair("integrity")
 	if err != nil {
 		return err
 	}

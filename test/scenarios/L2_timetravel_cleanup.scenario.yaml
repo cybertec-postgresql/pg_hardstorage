@@ -23,6 +23,12 @@ topology:
   pg_version: "17"
 
 steps:
+  # 0. A real backup: the repository then has a keyring and a WAL
+  #    window, so create's future-LSN refusal is what is exercised
+  #    (not a missing signing key).
+  - take_backup:
+      type: full
+
   - cli_run:
       args:
         - "timetravel"

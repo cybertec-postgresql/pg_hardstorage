@@ -36,6 +36,9 @@ steps:
         - "scenario-cross-cover-subject"
         - "--tenant"
         - "tenant-b"
+        # The scenario repo holds no backup for this tenant: certify that
+        # deliberately (an unknown --tenant is otherwise refused as a typo).
+        - "--allow-unknown-tenant"
         - "--deployment"
         - "$DEPLOYMENT"
         - "--article"
@@ -56,6 +59,9 @@ steps:
         - "scenario-cross-cover-subject-2"
         - "--tenant"
         - "tenant-c"
+        # The scenario repo holds no backup for this tenant: certify that
+        # deliberately (an unknown --tenant is otherwise refused as a typo).
+        - "--allow-unknown-tenant"
         - "--article"
         - "other"
         - "--skip-sign"

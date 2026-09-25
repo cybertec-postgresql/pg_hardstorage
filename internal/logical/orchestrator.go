@@ -28,6 +28,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -94,7 +95,7 @@ func (m *Manager) Add(opts AddOptions) (*Stream, error) {
 		return nil, errors.New("logical: Deployment is required")
 	}
 	if opts.Slot == "" {
-		opts.Slot = "pg_hardstorage_logical_" + opts.Name
+		opts.Slot = DefaultSlotName(opts.Name)
 	}
 	if opts.Plugin == "" {
 		opts.Plugin = "pgoutput"
@@ -235,4 +236,13 @@ func (m *Manager) saveStateLocked(s *stateFileBody) error {
 	}
 	// fsutil.WriteFileAtomic: tmp+fsync+rename+syncDir.
 	return fsutil.WriteFileAtomic(m.statePath, body, 0o600)
+}
+
+// DefaultSlotName derives a stream's replication slot when none is
+// given: "pg_hardstorage_logical_" + the stream name, lower-cased, with
+// '-' and '.' mapped to '_'. PostgreSQL slot names allow only lower-case
+// letters, digits and '_', so the raw name of a stream like "orders-cdc"
+// produced a slot CREATE_REPLICATION_SLOT always refused.
+func DefaultSlotName(stream string) string {
+	return "pg_hardstorage_logical_" + strings.NewReplacer("-", "_", ".", "_").Replace(strings.ToLower(stream))
 }

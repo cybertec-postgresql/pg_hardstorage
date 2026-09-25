@@ -116,6 +116,9 @@ steps:
         - "$PG_CONN"
         - "--schedule-backup"
         - "off"
+        # Every answer is a flag; --yes makes init non-interactive (the
+        # wizard refuses structured output, the default when piped).
+        - "--yes"
       expect_exit: 0
 
   # 9. logs against a nonexistent systemd unit — must

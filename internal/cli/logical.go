@@ -178,9 +178,9 @@ invalid default slot are refused unless --slot is given.`,
 	return c
 }
 
-// defaultLogicalSlot mirrors logical.Manager.Add's default slot name.
+// defaultLogicalSlot is logical.Manager.Add's default slot name.
 func defaultLogicalSlot(stream string) string {
-	return "pg_hardstorage_logical_" + stream
+	return logical.DefaultSlotName(stream)
 }
 
 // validLogicalSlotName applies PostgreSQL's replication-slot rule

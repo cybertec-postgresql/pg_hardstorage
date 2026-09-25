@@ -101,7 +101,9 @@ steps:
         - "$ARTEFACT_DIR/partial-target"
         - "--pg-connection"
         - "$PG_CONN"
-      expect_exit: 0
+      # A table that is not found fails the run (partial.restore_incomplete),
+      # so a scripted restore cannot proceed as though the data were there.
+      expect_exit: 1
       timeout: 60s
 
 cleanup:

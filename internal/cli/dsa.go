@@ -171,7 +171,7 @@ func runDsaLocate(cmd *cobra.Command, f dsaLocateFlags) error {
 		return err
 	}
 	defer sp.Close()
-	signer, verifier, err := loadSignerForJIT()
+	signer, verifier, err := loadExistingKeypair("dsa")
 	if err != nil {
 		return err
 	}
@@ -398,7 +398,7 @@ func runDsaVerify(cmd *cobra.Command, repoURL, id string) error {
 		return output.NewError("dsa.get_failed",
 			fmt.Sprintf("dsa verify: %v", err)).Wrap(err)
 	}
-	signer, _, err := loadSignerForJIT()
+	signer, _, err := loadExistingKeypair("dsa")
 	if err != nil {
 		return err
 	}
