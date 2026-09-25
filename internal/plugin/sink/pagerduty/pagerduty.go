@@ -45,6 +45,7 @@ import (
 
 func init() {
 	output.DefaultSinkRegistry.Register("pagerduty", NewFromSpec)
+	output.DefaultSinkRegistry.DeclareConfigKeys("pagerduty", "client", "client_url", "routing_key", "source")
 }
 
 // EventsAPIv2URL is the canonical PagerDuty endpoint. Hard-coded

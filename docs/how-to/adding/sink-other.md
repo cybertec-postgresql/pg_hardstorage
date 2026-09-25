@@ -96,7 +96,7 @@ sinks:
       tls: starttls
       auth: plain
       username: pg-hardstorage
-      password: kms-secret://ops/smtp-password
+      password: "<smtp-password>"   # literal value; keep pg_hardstorage.yaml mode 0600
       from: backups@example.com
       to: ["dba@example.com"]
       cc: ["ops@example.com"]
@@ -207,7 +207,6 @@ sinks:
     config:
       endpoint: http://otel-collector:4318
       service_name: pg_hardstorage
-      service_namespace: dba
 ```
 
 ## Severity model recap

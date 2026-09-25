@@ -49,6 +49,7 @@ import (
 
 func init() {
 	output.DefaultSinkRegistry.Register("syslog", NewFromSpec)
+	output.DefaultSinkRegistry.DeclareConfigKeys("syslog", "address", "app_name", "facility", "hostname", "protocol", "timeout", "tls")
 }
 
 // Facility encodes the syslog facility code (0..23).

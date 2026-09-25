@@ -43,6 +43,7 @@ import (
 
 func init() {
 	output.DefaultSinkRegistry.Register("datadog-events", NewFromSpec)
+	output.DefaultSinkRegistry.DeclareConfigKeys("datadog-events", "api_key", "site", "source_type_name", "tags", "timeout")
 }
 
 // Sink emits to Datadog Events API.

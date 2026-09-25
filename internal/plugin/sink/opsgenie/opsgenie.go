@@ -48,6 +48,7 @@ import (
 
 func init() {
 	output.DefaultSinkRegistry.Register("opsgenie", NewFromSpec)
+	output.DefaultSinkRegistry.DeclareConfigKeys("opsgenie", "api_key", "api_url", "source", "tags", "teams")
 }
 
 // DefaultAPIURL is the global Opsgenie endpoint. Operators on the EU

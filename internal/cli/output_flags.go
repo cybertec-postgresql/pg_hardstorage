@@ -384,6 +384,19 @@ func attachLoadedSinks(ctx context.Context, d *output.Dispatcher, loaded *config
 		return
 	}
 
+	for _, spec := range loaded.Config.Sinks {
+		if unknown := output.DefaultSinkRegistry.UnknownConfigKeys(spec); len(unknown) > 0 {
+			known, _ := output.DefaultSinkRegistry.DeclaredConfigKeys(spec.Plugin)
+			_ = d.Event(ctx, output.NewEvent(output.SeverityWarning, "config", "sink.unknown_config_keys").
+				WithBody(map[string]any{
+					"sink":    spec.Name,
+					"plugin":  spec.Plugin,
+					"unknown": unknown,
+					"known":   known,
+					"hint":    "these keys are ignored — check the spelling against the plugin's documented keys",
+				}))
+		}
+	}
 	sinks, errs := output.DefaultSinkRegistry.BuildAll(loaded.Config.Sinks)
 	for _, sink := range sinks {
 		// Open is best-effort (e.g. syslog dial may fail if the

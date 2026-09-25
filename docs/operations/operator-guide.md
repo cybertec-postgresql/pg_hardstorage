@@ -629,7 +629,7 @@ sinks:
     plugin: webhook
     config:
       url: https://alerts.example.com/hooks/pg-hardstorage
-      authorization: "Bearer kms-secret://ops/webhook-token"
+      auth_header: "Bearer <token>"   # sent as the Authorization header; literal value
 
   - name: ops-email
     plugin: email

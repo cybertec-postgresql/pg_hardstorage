@@ -45,6 +45,7 @@ import (
 
 func init() {
 	output.DefaultSinkRegistry.Register("otel-events", NewFromSpec)
+	output.DefaultSinkRegistry.DeclareConfigKeys("otel-events", "endpoint", "headers", "service_name", "timeout")
 }
 
 // Sink emits OTLP/HTTP+JSON logs.

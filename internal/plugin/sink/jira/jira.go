@@ -46,6 +46,7 @@ import (
 
 func init() {
 	output.DefaultSinkRegistry.Register("jira", NewFromSpec)
+	output.DefaultSinkRegistry.DeclareConfigKeys("jira", "api_token", "base_url", "bearer_token", "email", "issue_type", "labels", "project", "ticket_strategy")
 }
 
 // TicketStrategy controls per-event behavior.

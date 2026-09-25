@@ -49,6 +49,7 @@ import (
 
 func init() {
 	output.DefaultSinkRegistry.Register("email", NewFromSpec)
+	output.DefaultSinkRegistry.DeclareConfigKeys("email", "auth", "cc", "from", "password", "smtp_host", "smtp_port", "subject_prefix", "timeout", "tls", "to", "username")
 }
 
 // TLSMode controls how the SMTP connection is wrapped in TLS.

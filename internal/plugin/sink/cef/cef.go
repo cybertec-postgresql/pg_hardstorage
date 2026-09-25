@@ -51,6 +51,7 @@ import (
 
 func init() {
 	output.DefaultSinkRegistry.Register("cef", NewFromSpec)
+	output.DefaultSinkRegistry.DeclareConfigKeys("cef", "destination", "product", "vendor", "version")
 }
 
 // Sink writes CEF lines to a single file.  Survives logrotate:
