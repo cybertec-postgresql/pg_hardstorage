@@ -18,6 +18,10 @@ Generate a signed DSA report for a subject + tenant
 
 .SH OPTIONS
 .PP
+\fB--allow-unknown-tenant\fP[=false]
+	sign a report even when no backup in scope carries --tenant (asserts the tenant holds nothing; default: refuse, since a typo would otherwise yield a signed zero report)
+
+.PP
 \fB--article\fP="art_17_erasure"
 	GDPR article: art_15_access | art_17_erasure | other
 

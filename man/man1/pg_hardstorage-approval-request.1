@@ -19,7 +19,7 @@ Create a new n-of-m approval request
 .SH OPTIONS
 .PP
 \fB--approver-key\fP=[]
-	path to an approver's ed25519 public-key PEM (repeatable; need at least --threshold)
+	path to an approver's ed25519 public-key PEM (repeatable; need at least --threshold; each must be on the trusted roster PG_HARDSTORAGE_APPROVAL_ROSTER)
 
 .PP
 \fB-h\fP, \fB--help\fP[=false]
@@ -39,7 +39,7 @@ Create a new n-of-m approval request
 
 .PP
 \fB--target\fP=""
-	target identifier (e.g. a backup ID)
+	target the destructive op will act on, exactly as that command names it (backup ID, repo URL, keyring dir) (required)
 
 .PP
 \fB--tenant\fP=""
@@ -47,7 +47,7 @@ Create a new n-of-m approval request
 
 .PP
 \fB--threshold\fP=2
-	number of distinct approvals required (≥ 1)
+	number of distinct approvals required (≥ 1, and ≥ the operator minimum PG_HARDSTORAGE_APPROVAL_MIN_THRESHOLD, default 2)
 
 .PP
 \fB--ttl\fP=24h0m0s

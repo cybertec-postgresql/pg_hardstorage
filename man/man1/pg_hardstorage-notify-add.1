@@ -26,7 +26,12 @@ notify add slack    --set webhook_url=https://hooks.slack.com/services/T/B/X
 
 .PP
 --set values are passed verbatim into the sink's config map; the
-plugin's builder validates them.
+plugin's builder validates them.  Commas are part of the value (no
+splitting).  Repeating a key builds a list, e.g. for email recipients:
+
+.PP
+notify add email --set smtp_host=smtp.example.com --set from=pgh@example.com \\
+                   --set to=ops@example.com --set to=dba@example.com
 
 .PP
 Re-adding a sink with the same name replaces the existing entry —
@@ -49,7 +54,7 @@ rejected.
 
 .PP
 \fB--set\fP=[]
-	key=value pairs to merge into the sink's config (repeatable)
+	key=value pair to merge into the sink's config (repeatable; repeat a key to build a list, e.g. --set to=a@x --set to=b@x)
 
 .PP
 \fB--yes\fP[=false]

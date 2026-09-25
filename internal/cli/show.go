@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/restore"
 	"io"
 	"strings"
 	"text/tabwriter"
@@ -52,7 +53,7 @@ func newRealShowCmd() *cobra.Command {
 		includeDeleted bool
 	)
 	c := &cobra.Command{
-		Use:   "show <deployment> <backup-id>",
+		Use:   "show <deployment> <backup-id|latest>",
 		Short: "Show details of a single backup",
 		Long: `show prints the full manifest of a single backup —
 file count, sizes, dedup ratio, signature fingerprint, tablespaces,
@@ -93,6 +94,21 @@ func runShow(cmd *cobra.Command, deployment, backupID, repoURL string, includeDe
 		return err
 	}
 	defer sp.Close()
+
+	// `latest` resolves to the newest live backup, as restore and verify
+	// do — the tutorials (and this command's own usage error) promised it,
+	// but show looked up a backup literally named "latest".
+	if backupID == LatestKeyword {
+		id, _, rerr := restore.ResolveLatestDetailed(cmd.Context(), sp, deployment, verifier)
+		if rerr != nil {
+			return output.NewError("notfound.backup",
+				fmt.Sprintf("show: no backup for deployment %q: %v", deployment, rerr)).
+				WithSuggestion(&output.Suggestion{
+					Human: "list available backups with `pg_hardstorage list " + deployment + "`",
+				}).Wrap(rerr)
+		}
+		backupID = id
+	}
 
 	store := backup.NewManifestStore(sp)
 	var (

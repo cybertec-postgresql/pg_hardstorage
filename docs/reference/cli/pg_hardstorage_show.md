@@ -28,7 +28,7 @@ when triaging undelete candidates discovered via
 `list --only-deleted`.
 
 ```
-pg_hardstorage show <deployment> <backup-id> [flags]
+pg_hardstorage show <deployment> <backup-id|latest> [flags]
 ```
 
 ### Options
