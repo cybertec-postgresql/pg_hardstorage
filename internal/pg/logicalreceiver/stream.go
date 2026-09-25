@@ -164,6 +164,10 @@ func Stream(ctx context.Context, conn *pg.Conn, opts StreamOptions, sink Sink) (
 		}
 	}()
 
+	// lastTraffic is the last time the server sent anything; it feeds the
+	// inactivity deadline below and the reply request in flushAndReport.
+	lastTraffic := time.Now()
+
 	// flushAndReport durably commits the sink's batch then reports the
 	// resulting SyncedLSN to PG. Called on the status-update cadence
 	// (and on reply-requested keepalives) so confirmed_flush_lsn
@@ -174,10 +178,19 @@ func Stream(ctx context.Context, conn *pg.Conn, opts StreamOptions, sink Sink) (
 		}
 		ack.onFlushed()
 		lsn := ack.ack(sink.SyncedLSN())
+		// Ask for a reply once the stream has been quiet for half the
+		// inactivity window. A walsender whose client has confirmed
+		// everything it sent (ackTracker confirms keepalive positions on
+		// an idle publication) has nothing to say and stays silent, so
+		// without a solicited keepalive a healthy idle stream tripped the
+		// watchdog. A live server answers; a dead connection does not —
+		// which is what the watchdog is for.
+		ping := opts.InactivityTimeout > 0 && time.Since(lastTraffic) >= opts.InactivityTimeout/2
 		if err := pglogrepl.SendStandbyStatusUpdate(c, pgc, pglogrepl.StandbyStatusUpdate{
 			WALWritePosition: lsn,
 			WALFlushPosition: lsn,
 			WALApplyPosition: lsn,
+			ReplyRequested:   ping,
 		}); err != nil {
 			return fmt.Errorf("logicalreceiver: status update: %w", err)
 		}
@@ -212,7 +225,6 @@ func Stream(ctx context.Context, conn *pg.Conn, opts StreamOptions, sink Sink) (
 	// (callers then hung until their outer ctx died with a bare
 	// "context deadline exceeded" instead of the classified inactivity
 	// error the contract promises).
-	lastTraffic := time.Now()
 	inactivityDeadline := func() time.Time {
 		if opts.InactivityTimeout <= 0 {
 			return time.Time{} // no deadline; rely on ctx cancellation
@@ -243,6 +255,13 @@ func Stream(ctx context.Context, conn *pg.Conn, opts StreamOptions, sink Sink) (
 		inact := inactivityDeadline()
 		if !inact.IsZero() && inact.Before(waitUntil) {
 			waitUntil = inact
+		}
+		// Also wake at the half-window mark so the reply request goes out
+		// before the inactivity deadline, even with a long status cadence.
+		if !inact.IsZero() {
+			if pingAt := lastTraffic.Add(opts.InactivityTimeout / 2); pingAt.After(time.Now()) && pingAt.Before(waitUntil) {
+				waitUntil = pingAt
+			}
 		}
 		recvCtx, cancel := context.WithDeadline(ctx, waitUntil)
 		msg, err := pgc.ReceiveMessage(recvCtx)
