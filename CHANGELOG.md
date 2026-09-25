@@ -13,6 +13,19 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Added
 
+- **Sink config keys are declared and checked.** Every sink plugin
+  declares the config keys it reads; start-up warns
+  (`sink.unknown_config_keys`) about keys a plugin ignores, instead of
+  silently dropping a misspelt setting. Documentation examples are held
+  to the declared keys by a test.
+- **`repo gc` reaps staging files left by crashed writers**
+  (`.deferred-`/`.excl-`/`.hstmp-`, invisible to List) once they are
+  older than 24h (`staging_reaped` in the result).
+- **Storage: `StagingReapAware`** optional interface (fs, sftp, scp).
+- **`--retention-interval`, `--max-backup-gap`,
+  `--retention-max-deferrals`** for the soak harness (`run_testing.sh`,
+  `pg_hardstorage_testkit validate`), and `--keep-repo`: a passing soak
+  now removes its repository.
 - **A systemd unit for the WAL streamer** (#56, reported by @marsqd).
   `deploy/systemd/pg_hardstorage-wal-stream@.service` runs
   `pg_hardstorage wal stream %i` — templated on the deployment, since
@@ -21,6 +34,115 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **Full-code review (2026-09-24).** A read-only review of the whole Go
+  code base found ~205 defects; all are fixed below, each with a
+  regression test that fails without the fix. The most serious:
+
+  **Restore / PITR / WAL**
+  - compat shims: `wal-g wal-fetch` and `pgbackrest archive-get` exited 1
+    ("segment not in archive") on *any* failure — an S3 outage or a
+    missing env made PostgreSQL end recovery and promote early. They now
+    exit 126 unless the segment is genuinely absent.
+  - compat shims: pgbackrest/barman/wal-g/barman-cloud restores stopped
+    at the backup point (`recovery_target='immediate'`) where the
+    upstream tools replay all archived WAL; they now pass `--to-latest`.
+    `pgbackrest --type=standby` builds a standby; unsupported types are
+    refused; target times without a UTC offset are refused.
+  - `kms rotate` rewraps WAL segment manifests (and soft-deleted
+    backups); it used to leave all pre-rotation WAL undecryptable.
+  - Incremental-chain restore of a cluster with tablespaces misplaced the
+    tablespace data and created no `pg_tblspc` links, yet reported
+    success.
+  - Recovery settings appended to `postgresql.auto.conf` were never
+    removed, so a restored-then-promoted cluster poisoned later restores
+    ("multiple recovery targets"; `--to-latest` stopping at the old
+    consistency point).
+  - `restore --preview --control-plane` ran a real remote restore.
+  - `wal fetch` turned a transient timeline-store read error into "not
+    found", so recovery could silently stay on the pre-failover
+    timeline.
+  - `wal stream` skipped its system-identifier guard and assumed a 16 MiB
+    segment size when PostgreSQL was unreachable at start-up; both are
+    now checked on every reconnect. After a failover it resumes from the
+    new timeline's fork segment, and gap detection is timeline-aware.
+  - The boot test ran before `pg_verifybackup` in the restored target, so
+    `--verify` failed every booted restore; it now runs first and leaves
+    the target untouched.
+  - `restore` / `partial` / recovery drills: chain restore with a trailing
+    slash in `--target`, resume with tablespaces, drills of backups with
+    tablespaces, fake PITR-window holes at the frontier, cloud-KMS
+    deployments reported NOT READY, `estimated_rto_ms` in nanoseconds,
+    exclusive timetravel targets.
+
+  **Repository / GC / storage**
+  - GCS treated any error text containing "412" as "already exists", so a
+    backup could reference a chunk that was never stored.
+  - `repo gc --apply` now excludes concurrent writers: it publishes a run
+    record, settles, and checks writer pins, backup leases and new
+    manifests before every delete batch. Backups, `wal stream`/`wal push`,
+    logical streams, replicate and bundle import fence their commits over
+    deduplicated chunks. `repo gc` is also much faster (one List per
+    prefix, no per-orphan Stat, no per-delete directory fsync: 11.3 s →
+    1.6 s on a 20k-orphan fs repository) and no longer aborts when a
+    manifest is deleted mid-walk.
+  - The CAS no longer trusts an in-memory "seen" entry for a chunk gc may
+    have deleted (long-lived `wal stream`); on WORM repositories adopting
+    an existing chunk extends its retention lock.
+  - S3 without conditional put (custom endpoints) committed WAL/timeline
+    manifests without their WORM lock; SFTP overwrites deleted the
+    destination first; SFTP/SCP never fsynced; SCP had no reconnect;
+    409 ConditionalRequestConflict was not retried.
+  - `repo scrub`/`repair scrub`: encrypted WAL was reported as bit rot;
+    unverifiable manifests and a missing KEK were hidden behind "no
+    integrity failures".
+  - `repo replicate` refreshes manifests rewritten at the source, and its
+    exit code and summary count every failure; `replicate verify` checks
+    WAL chunks.
+  - Azure Key Vault: DEKs wrapped before a key rotation could not be
+    unwrapped. PKCS#11 providers in one process logged each other out.
+    KMS errors are classified (unreachable / access denied / wrong key)
+    instead of all reporting `kek_mismatch`.
+
+  **Backup**
+  - `--stall-timeout` killed healthy backups that streamed longer than
+    the timeout; stream data now counts as progress.
+  - A failed stale-lease break left the lease wedged, silently stopping
+    every later backup.
+  - BASE_BACKUP timed out while `pg_backup_stop` waited for WAL archiving.
+  - The manifest duplicate-key guard could be bypassed with keys that
+    Go's JSON decoder folds (`ſ` → `s`).
+  - `wal stream` preflight refused to restart when the slot table was full
+    only because of its own slot, and refused superusers without
+    REPLICATION.
+
+  **Output, config, CLI**
+  - `-o json` (the default when stdout is not a terminal) printed several
+    JSON documents from many commands; stdout now carries exactly one,
+    events go to stderr (a test walks the whole command tree).
+  - `-c <file>` pointing at a missing file loaded an empty config.
+    Config-editing commands wrote conf.d drop-ins and `PG_HARDSTORAGE_CONFIG`
+    content into the main file.
+  - DSN passwords leaked through `deployment list` (`password = x`),
+    `init`'s JSON result, psql's argv (`redact`, `db install-extension`),
+    `compat translate` and PKCS#11 KEKRef errors.
+  - Read-only verbs (`list`, `doctor`, `restore`, `repair`, …) created a
+    signing keypair when the keyring was empty; only `init`, `backup` and
+    scheduled backups do now (`notfound.signing_key`).
+  - `repo check` names the manifests that fail verification.
+  - Many smaller exit-code, error-code and help-text corrections.
+
+  **LLM helper, sinks, governance, soak harness**
+  - Model-supplied tool arguments could smuggle global flags into the
+    child process (`--cpu-profile=<file>` truncated arbitrary files);
+    arguments are validated and passed after `--`, and `execute_command`
+    checks commands against the real command tree.
+  - Privacy modes now redact the system prompt, JSON-shaped secrets and
+    MCP tool results.
+  - The email sink could hang forever on a stalled relay; the CEF sink
+    kept writing to a rotated file; Jira dedup matched fuzzily.
+  - Soak harness: a permanently dead cell, a no-op fault or a mistyped
+    `--faults` path could all yield a PASS; scenario steps silently
+    dropped unknown keys; doctest checked only a block's last command.
 - **`--cpu-profile`, `--mem-profile` and `--profile-port` were silently
   ignored after a subcommand flag.** They are read before the subcommand
   resolves, by a parse that stopped at the first flag it did not know —
@@ -324,6 +446,32 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Changed
 
+- **Behaviour changes from the full-code review** — check before
+  upgrading:
+  - Approvals require a trusted approver roster
+    (`PG_HARDSTORAGE_APPROVAL_ROSTER`) and at least
+    `PG_HARDSTORAGE_APPROVAL_MIN_THRESHOLD` (default 2) approvals; with no
+    roster every approval is refused. Approvals need an exact `--target`,
+    are single-use and expire after their TTL.
+  - Under `-o json`, events go to stderr (NDJSON); stdout carries only the
+    result. `-o ndjson` still streams everything on stdout.
+  - `restore`, `repair`, `jit` and `audit export-bundle` need the existing
+    keyring (`notfound.signing_key`, exit 6): install it on DR hosts with
+    `keyring install` before restoring.
+  - The wal-g shim derives the deployment name the way the translator
+    does: a dotted `PGHOST` maps to a sanitised name (new lineage), a
+    Unix-socket `PGHOST` to `default`.
+  - `repo gc` refusing over a live backup lease is
+    `conflict.gc_backup_in_flight`, exit 7 (was `repo.gc.live_backup_lease`,
+    exit 1). `repo check` read errors are `repo.check.manifests_unreadable`,
+    exit 1 (were exit 9).
+  - `partial restore` exits non-zero for a table it could not find and
+    refuses incremental backups. `hold add` refuses to weaken an active
+    hold (`--force`, audited). `repo wipe` refuses while legal holds exist.
+  - LLM skills are no longer loaded from `./share/skills` in the working
+    directory (`PG_HARDSTORAGE_SKILL_DIR`).
+  - `audit verify-bundle` requires a trusted signer (local keyring key,
+    `--trusted-key` or `--trusted-fingerprint`).
 - **`repo gc --apply` deletes chunks 16 at a time.** It deleted them one
   by one, and each delete waits for its directory fsync — a journal
   commit, ~1.4 ms on a busy disk — so a sweep of 43,000 chunks took over
@@ -353,6 +501,15 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Security
 
+- **Full-code review security fixes:** LLM tool argument injection and
+  `execute_command` flag smuggling; approval-gate bypass (target-less,
+  reusable, self-approved requests); `repair attestation` re-signing
+  manifests signed by an untrusted key; `restore_roots` bypass through
+  `tablespace_mapping`; `audit verify-bundle` accepting any self-signed
+  bundle; strict air-gap mode not covering s3, gcs, aws-kms, azure-kv,
+  vault-transit, email/syslog sinks and control-plane URLs; credentials
+  in control-plane API responses; unbounded metric cardinality from
+  unauthenticated requests; secrets in error messages, argv and output.
 - **`google.golang.org/grpc` v1.83.1 → v1.83.2** (#57), clearing
   GO-2026-6443 (server panic via missing authority or Host headers),
   which `govulncheck` reported as REACHABLE through
