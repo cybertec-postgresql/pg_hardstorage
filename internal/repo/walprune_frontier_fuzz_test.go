@@ -125,13 +125,15 @@ func FuzzWALPruneNeverDeletesWALBelowKeptBackupFrontier(f *testing.F) {
 				end = lastEnd + 0x1000000
 			}
 			lastEnd = end
-			name := fmt.Sprintf("seg%04d", j)
+			// Canonical segment naming (TLI 1, one 16 MiB segment per j): WALPrune
+			// only considers keys shaped like the ones walsink writes.
+			name := fmt.Sprintf("00000001%016X", j)
 			body, _ := json.Marshal(struct {
 				StartLSN  string    `json:"start_lsn"`
 				EndLSN    string    `json:"end_lsn"`
 				CreatedAt time.Time `json:"created_at"`
 			}{(end - 0x100000).String(), end.String(), base})
-			put("wal/db1/1/"+name+".json", body)
+			put("wal/db1/00000001/"+name+".json", body)
 			segEndByName[name] = end
 		}
 
