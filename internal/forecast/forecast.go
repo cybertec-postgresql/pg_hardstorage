@@ -14,7 +14,7 @@
 // Design discipline:
 //
 //   - Linear regression on observable points (full-backup StoppedAt
-//     + logical bytes, i.e. database size over time) produces a slope
+//     and logical bytes, i.e. database size over time) produces a slope
 //     (bytes/day, manifests/day) +
 //     R² for confidence reporting. We never claim more than the
 //     data supports — sparse-data deployments get "low confidence"
