@@ -65,6 +65,10 @@ keeps reading that version for at least 24 months after a successor lands.
     segment size when PostgreSQL was unreachable at start-up; both are
     now checked on every reconnect. After a failover it resumes from the
     new timeline's fork segment, and gap detection is timeline-aware.
+  - An LSN recovery target past the end of the archived WAL is refused up
+    front (`restore.target_unreachable`); PostgreSQL would have replayed
+    to the archive's end and refused to start. `timetravel create` built
+    such sessions. Found by a scenario once it ran against a real backup.
   - The boot test ran before `pg_verifybackup` in the restored target, so
     `--verify` failed every booted restore; it now runs first and leaves
     the target untouched.

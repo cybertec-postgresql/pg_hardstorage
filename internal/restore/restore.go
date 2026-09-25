@@ -349,6 +349,9 @@ func Restore(ctx context.Context, opts Options) (res *Result, err error) {
 	if err := preflightBackupWALAvailable(ctx, sp, opts.Deployment, m, opts.Recovery, opts.SkipGapCheck); err != nil {
 		return nil, err
 	}
+	if err := preflightTargetBeyondArchive(ctx, sp, opts.Deployment, m, opts.Recovery, opts.SkipGapCheck); err != nil {
+		return nil, err
+	}
 	// Timeline-history reachability: PG probes <N>.history ascending
 	// and stops at the FIRST miss, so a lost history file makes a
 	// --to-latest recovery silently end on an older timeline and
