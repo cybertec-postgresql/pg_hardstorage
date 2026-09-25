@@ -38,7 +38,10 @@ func TestIntegration_ChainRestore_Tablespace(t *testing.T) {
 		t.Skipf("pg_combinebackup unusable: %v %s", err, out)
 	}
 
-	tsSrc := filepath.Join(t.TempDir(), "ts_src")
+	// BASE_BACKUP streams tar, whose symlink targets are limited to 100
+	// bytes: the tablespace must live on a short path, not under the
+	// (long) test TMPDIR — `make test-integration` sets one.
+	tsSrc := filepath.Join(shortTempDir(t), "ts_src")
 	if err := os.MkdirAll(tsSrc, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -147,4 +150,16 @@ func TestIntegration_ChainRestore_Tablespace(t *testing.T) {
 	if got := restored.SQL(t, "SELECT count(*) FROM t_def"); got != "100" {
 		t.Errorf("t_def rows = %s, want 100", got)
 	}
+}
+
+// shortTempDir is a t.TempDir under /tmp, for paths PostgreSQL limits
+// (tar symlink targets: 100 bytes; unix socket paths: ~107 bytes).
+func shortTempDir(t *testing.T) string {
+	t.Helper()
+	d, err := os.MkdirTemp("/tmp", "phs-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(d) })
+	return d
 }

@@ -57,9 +57,16 @@ func startLocalPG(t *testing.T, initdbArgs ...string) string {
 		t.Fatalf("initdb: %v\n%s", err, out)
 	}
 	port := freeTCPPort(t)
+	// Unix socket paths are limited to ~107 bytes; the test TMPDIR
+	// (`make test-integration` uses a repo-local one) is too long for it.
+	sockDir, err := os.MkdirTemp("/tmp", "phs-sock-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(sockDir) })
 	conf := fmt.Sprintf("\nlisten_addresses = '127.0.0.1'\nport = %d\nunix_socket_directories = '%s'\n"+
 		"wal_level = replica\nmax_wal_senders = 10\nmax_replication_slots = 10\nfsync = off\n",
-		port, dir)
+		port, sockDir)
 	f, err := os.OpenFile(filepath.Join(data, "postgresql.conf"), os.O_APPEND|os.O_WRONLY, 0)
 	if err != nil {
 		t.Fatal(err)
