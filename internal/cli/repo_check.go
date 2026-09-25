@@ -103,6 +103,7 @@ func runRepoCheck(cmd *cobra.Command, repoURL string) error {
 	}
 	depReports := make([]repoCheckDeployment, 0, len(deployments))
 	totalSigFailed := 0
+	var sigFailedKeys []string
 	totalManifests := 0
 	totalUnreadable := 0
 	walkErrSample := ""
@@ -118,6 +119,7 @@ func runRepoCheck(cmd *cobra.Command, repoURL string) error {
 		dr.UnreadableManifests = walk.unreadable
 		totalManifests += walk.live
 		totalSigFailed += walk.sigFailed
+		sigFailedKeys = append(sigFailedKeys, walk.sigFailedKeys...)
 		totalUnreadable += walk.unreadable
 		if walkErrSample == "" && walk.firstReadErr != nil {
 			walkErrSample = walk.firstReadErr.Error()
@@ -169,18 +171,19 @@ func runRepoCheck(cmd *cobra.Command, repoURL string) error {
 	}
 
 	body := repoCheckBody{
-		URL:                 repoURL,
-		RepoID:              meta.ID,
-		Schema:              meta.Schema,
-		Deployments:         depReports,
-		LiveManifests:       totalManifests,
-		SignatureFailures:   totalSigFailed,
-		UnreadableManifests: totalUnreadable,
-		ChunkRefs:           refs.Len(),
-		MissingChunks:       len(missing),
-		OrphanedReplicas:    orphanedReplicas,
-		WORM:                meta.WORM,
-		CommitMode:          commitMode,
+		URL:                      repoURL,
+		RepoID:                   meta.ID,
+		Schema:                   meta.Schema,
+		Deployments:              depReports,
+		LiveManifests:            totalManifests,
+		SignatureFailures:        totalSigFailed,
+		SignatureFailedManifests: capList(sigFailedKeys, maxListedSignatureFailures),
+		UnreadableManifests:      totalUnreadable,
+		ChunkRefs:                refs.Len(),
+		MissingChunks:            len(missing),
+		OrphanedReplicas:         orphanedReplicas,
+		WORM:                     meta.WORM,
+		CommitMode:               commitMode,
 	}
 	const maxListedHashes = 64
 	for i, h := range missing {
@@ -204,6 +207,13 @@ func runRepoCheck(cmd *cobra.Command, repoURL string) error {
 	body.Healthy = body.MissingChunks == 0 && body.SignatureFailures == 0 &&
 		len(body.OrphanedReplicas) == 0 && body.UnreadableManifests == 0
 
+	// The verify.* refusals below used to return the error alone, so the
+	// body — which manifests, which chunks — never reached the operator.
+	if body.MissingChunks > 0 || len(body.OrphanedReplicas) > 0 || body.SignatureFailures > 0 {
+		if rerr := d.Result(output.NewResult(cmd.CommandPath()).WithBody(body)); rerr != nil {
+			return rerr
+		}
+	}
 	if body.MissingChunks > 0 {
 		// verify.* is the namespace operators wire ExitVerifyFailed
 		// to (see internal/output/exitcode.go); a missing-chunks
@@ -235,8 +245,8 @@ func runRepoCheck(cmd *cobra.Command, repoURL string) error {
 		// silently-wrong bytes).  Operators must be told via
 		// exit code, not just a field in the JSON body.
 		return output.NewError("verify.signature_failures",
-			fmt.Sprintf("repo check: %d manifest signature(s) failed verification",
-				body.SignatureFailures)).
+			fmt.Sprintf("repo check: %d manifest signature(s) failed verification: %s",
+				body.SignatureFailures, strings.Join(capList(sigFailedKeys, 3), ", "))).
 			WithSuggestion(&output.Suggestion{
 				Human:   "a manifest either failed Ed25519 verification or failed to parse — investigate with `pg_hardstorage repair manifest` and check the audit chain for tampering.",
 				Command: "pg_hardstorage audit verify-chain --repo " + repoURL,
@@ -264,6 +274,9 @@ func runRepoCheck(cmd *cobra.Command, repoURL string) error {
 type manifestCheckWalk struct {
 	live, sigFailed, unreadable int
 	firstReadErr                error
+	// sigFailedKeys names the manifests counted in sigFailed: a count
+	// alone told the operator something was wrong, not where.
+	sigFailedKeys []string
 }
 
 // checkDeploymentManifests walks deployment's primary manifests and
@@ -339,6 +352,7 @@ func checkDeploymentManifests(ctx context.Context, sp storage.StoragePlugin, dep
 		}
 		if _, verr := backup.ParseAndVerify(body, verifier); verr != nil {
 			w.sigFailed++
+			w.sigFailedKeys = append(w.sigFailedKeys, key)
 			continue
 		}
 		w.live++
@@ -383,6 +397,9 @@ type repoCheckBody struct {
 	Deployments       []repoCheckDeployment `json:"deployments"`
 	LiveManifests     int                   `json:"live_manifests"`
 	SignatureFailures int                   `json:"signature_failures"`
+	// SignatureFailedManifests lists the manifests that failed to parse
+	// or verify (capped; SignatureFailures has the full count).
+	SignatureFailedManifests []string `json:"signature_failed_manifests,omitempty"`
 	// UnreadableManifests > 0 means the check is incomplete (exit 1,
 	// repo.check.manifests_unreadable), not that anything was tampered.
 	UnreadableManifests int `json:"unreadable_manifests,omitempty"`
@@ -538,3 +555,6 @@ func findOrphanedReplicas(ctx context.Context, sp storage.StoragePlugin, store *
 	sort.Strings(orphans)
 	return orphans, nil
 }
+
+// maxListedSignatureFailures caps signature_failed_manifests in the body.
+const maxListedSignatureFailures = 64
