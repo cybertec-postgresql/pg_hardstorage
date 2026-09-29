@@ -480,36 +480,8 @@ func (cgroupSqueezeFault) Apply(ctx context.Context, args Args, ts TargetSet) (R
 			if t.Role() != "pg" {
 				continue
 			}
-			if err := restartPGIfDown(ctx, t); err != nil {
-				// A heavy squeeze can OOM-kill not just the
-				// postmaster but the whole container (docker's
-				// OOM watchdog kills PID 1's process tree).
-				// When that happens `docker exec` fails with
-				// "container is not running" and restartPGIfDown
-				// can't even open a shell to bring PG back up.
-				// Detect the typed sentinel, Start the container
-				// first, RE-APPLY the unlimit (docker update --memory
-				// on a stopped container has been observed to not
-				// always persist across Start — the soak's 4th
-				// run got the freshly-Start'd container with the
-				// pre-squeeze limit still in effect and the next
-				// docker exec was OOM-killed mid-script with
-				// exit 137), then retry restartPGIfDown.
-				if errors.Is(err, ErrTargetNotRunning) {
-					if serr := t.Start(ctx); serr != nil {
-						errs = append(errs, fmt.Sprintf("%s: start container: %v", t.Name(), serr))
-						continue
-					}
-					if merr := t.SetMemoryLimit(ctx, -1); merr != nil {
-						errs = append(errs, fmt.Sprintf("%s: re-lift limit after Start: %v", t.Name(), merr))
-						continue
-					}
-					if err2 := restartPGIfDown(ctx, t); err2 != nil {
-						errs = append(errs, fmt.Sprintf("%s: restart PG after container Start: %v", t.Name(), err2))
-					}
-					continue
-				}
-				errs = append(errs, fmt.Sprintf("%s: restart PG: %v", t.Name(), err))
+			if err := recoverSqueezedPG(ctx, t); err != nil {
+				errs = append(errs, err.Error())
 			}
 		}
 		if len(errs) > 0 {
@@ -517,6 +489,66 @@ func (cgroupSqueezeFault) Apply(ctx context.Context, args Args, ts TargetSet) (R
 		}
 		return nil
 	}, nil
+}
+
+// squeezeRecoveryAttempts / squeezeRecoveryBackoff bound the
+// cgroup_squeeze PG recovery.  Variables so tests can run the retry
+// path without sleeping.
+var (
+	squeezeRecoveryAttempts = 4
+	squeezeRecoveryBackoff  = 15 * time.Second
+)
+
+// recoverSqueezedPG brings a squeezed pg target back to the state the
+// fault found it in: container running, no memory limit, PostgreSQL
+// accepting connections.
+//
+// A single restartPGIfDown is not enough.  A heavy squeeze can
+// OOM-kill the whole container, and Docker's restart policy then
+// restarts it on its own schedule — racing the recovery:
+//
+//   - `docker exec` fails with "container is not running"
+//     (ErrTargetNotRunning) or "is restarting, wait until the
+//     container is running";
+//   - an exec already inside the container dies with exit 137 when
+//     the restart tears its process tree down;
+//   - `docker update --memory` on a stopped container has been seen
+//     not to persist across Start, so the restarted container can
+//     come back with the squeeze still in force and OOM-kill the
+//     recovery script itself (exit 137 again).
+//
+// The v1.5.0 campaign soaks lost 14 cells to exactly these, with
+// zero product failures.  Each is transient, so recovery retries:
+// every retry Starts the container (a no-op when running), re-lifts
+// the limit, and re-runs restartPGIfDown.  It fails only when the
+// cell is still not back after squeezeRecoveryAttempts — a genuine
+// wedge the verdict must see.
+func recoverSqueezedPG(ctx context.Context, t Target) error {
+	var last []string
+	for attempt := 0; attempt < squeezeRecoveryAttempts; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return fmt.Errorf("%s: %s; %v", t.Name(), strings.Join(last, "; "), ctx.Err())
+			case <-time.After(squeezeRecoveryBackoff):
+			}
+			last = last[:0]
+			if err := t.Start(ctx); err != nil {
+				last = append(last, fmt.Sprintf("start container: %v", err))
+				continue
+			}
+			if err := t.SetMemoryLimit(ctx, -1); err != nil {
+				last = append(last, fmt.Sprintf("re-lift limit: %v", err))
+				continue
+			}
+		}
+		err := restartPGIfDown(ctx, t)
+		if err == nil {
+			return nil
+		}
+		last = append(last, fmt.Sprintf("restart PG: %v", err))
+	}
+	return fmt.Errorf("%s: after %d attempts: %s", t.Name(), squeezeRecoveryAttempts, strings.Join(last, "; "))
 }
 
 // restartPGIfDown brings PostgreSQL back up inside a cell when it
