@@ -448,6 +448,20 @@ keeps reading that version for at least 24 months after a successor lands.
   implements, and that some unit actually runs `wal stream` — the
   check that would have caught #56 when the docs were written.
 
+- **Soak harness: a kernel refusing an impossible cgroup_squeeze limit was
+  counted as `fault_apply_failed`** (#64). With swap disabled, the kernel
+  cannot reclaim a PostgreSQL cell down to 32 MiB, so it sometimes refuses
+  the write. The injector now reports this as `ErrLimitUnreachable`, and
+  the orchestrator records it as `fault_skipped_limit_unreachable`. A
+  refusal with any other cause still fails the run.
+- **Soak harness: cgroup_squeeze recovery lost the cell when a container
+  restart raced it.** A container restart (Docker restart policy after an
+  OOM) could kill the recovery's `docker exec` (exit 137) or refuse it
+  ("is restarting"). The heavy and default campaign soaks both failed
+  only for this reason. Recovery now retries up to 4 times, each retry
+  starting the container and lifting the limit again, and fails only when
+  the cell does not come back.
+
 ### Changed
 
 - **Behaviour changes from the full-code review** — check before
