@@ -26,6 +26,14 @@ keeps reading that version for at least 24 months after a successor lands.
   `--retention-max-deferrals`** for the soak harness (`run_testing.sh`,
   `pg_hardstorage_testkit validate`), and `--keep-repo`: a passing soak
   now removes its repository.
+- **Scenario `cli_run` steps take `stop_after:`**, which sends SIGTERM
+  after the given duration. Long-running verbs (`logical stream`)
+  normally end when an operator stops them, and this lets a step end them
+  the same way. A step that hits its `timeout:` now fails with "timed out
+  after …" instead of "exit -1". The logical-replication scenarios use
+  this: they had relied on the inactivity watchdog to end a drained
+  stream, and a quiet stream now asks for keepalives, so the watchdog no
+  longer fires.
 - **A systemd unit for the WAL streamer** (#56, reported by @marsqd).
   `deploy/systemd/pg_hardstorage-wal-stream@.service` runs
   `pg_hardstorage wal stream %i` — templated on the deployment, since

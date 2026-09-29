@@ -21,11 +21,13 @@ package runner
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/url"
 	"os/exec"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/testkit/scenario"
@@ -143,6 +145,20 @@ func runCLIRun(ctx context.Context, st scenario.Step, idx int, state *runState, 
 		timeout = d
 	}
 
+	var stopAfter time.Duration
+	if s := strings.TrimSpace(st.StopAfter); s != "" {
+		d, err := time.ParseDuration(s)
+		if err != nil {
+			return StepResult{Index: idx, Kind: st.Kind, Pass: false,
+				Message: fmt.Sprintf("cli_run: parse stop_after %q: %v", s, err)}
+		}
+		if d <= 0 || d >= timeout {
+			return StepResult{Index: idx, Kind: st.Kind, Pass: false,
+				Message: fmt.Sprintf("cli_run: stop_after %s must be > 0 and below timeout %s", d, timeout)}
+		}
+		stopAfter = d
+	}
+
 	expectExit := 0
 	if st.ExpectExit != nil {
 		expectExit = *st.ExpectExit
@@ -206,7 +222,24 @@ func runCLIRun(ctx context.Context, st scenario.Step, idx int, state *runState, 
 		"timeout": timeout.String(),
 	})
 
-	runErr := cmd.Run()
+	runErr := cmd.Start()
+	if runErr == nil {
+		var stop *time.Timer
+		if stopAfter > 0 {
+			stop = time.AfterFunc(stopAfter, func() { _ = cmd.Process.Signal(syscall.SIGTERM) })
+		}
+		runErr = cmd.Wait()
+		if stop != nil {
+			stop.Stop()
+		}
+	}
+	// A command killed at the step deadline reports exit -1, which
+	// reads like a crash; name the timeout instead.
+	if runErr != nil && errors.Is(cctx.Err(), context.DeadlineExceeded) {
+		return StepResult{Index: idx, Kind: st.Kind, Pass: false,
+			Message: fmt.Sprintf("cli_run: timed out after %s (stderr: %s)", timeout,
+				truncate(stderrBuf.Bytes(), cliRunStderrExcerpt))}
+	}
 	// Kept for a later `assert: [cli_output_contains_any: ...]`, which
 	// matches "any of" across stdout and stderr — what the single-
 	// substring expect_*_contains fields cannot express.

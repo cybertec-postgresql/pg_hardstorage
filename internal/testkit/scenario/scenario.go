@@ -333,6 +333,13 @@ type Step struct {
 	ExpectStderrContains string   `yaml:"expect_stderr_contains,omitempty"`
 	Timeout              string   `yaml:"timeout,omitempty"`
 
+	// StopAfter, when set, sends SIGTERM to the command after this
+	// duration (must be below Timeout) — for long-running verbs such
+	// as `logical stream` or `wal stream` whose normal end IS an
+	// operator stop.  The exit code the command then returns is
+	// checked against ExpectExit as usual.
+	StopAfter string `yaml:"stop_after,omitempty"`
+
 	// Env carries extra environment variables to set on the
 	// cli_run child process — primarily for compat-shim
 	// scenarios that need PGPASSWORD (the pgBackRest, WAL-G,
