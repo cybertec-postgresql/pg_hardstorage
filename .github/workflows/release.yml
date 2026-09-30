@@ -110,7 +110,7 @@ jobs:
           if [ "${ALLOW_MISSING_TAP_TOKEN:-}" = "true" ]; then
             echo "::warning title=Cask publishing disabled::repo variable ALLOW_MISSING_TAP_TOKEN=true, so the tap credential is not checked and this release will publish WITHOUT a Homebrew cask."
           elif [ -z "${HOMEBREW_TAP_TOKEN:-}" ]; then
-            echo "::error title=Missing secret::HOMEBREW_TAP_TOKEN is not set, so the Homebrew cask cannot be published. Set it with: gh secret set HOMEBREW_TAP_TOKEN --repo ${{ github.repository }} — it needs contents:write on ${{ github.repository_owner }}/homebrew-tap. To cut a release deliberately without a cask, set the repo variable ALLOW_MISSING_TAP_TOKEN=true."
+            echo "::error title=Missing secret::HOMEBREW_TAP_TOKEN is not set, so the Homebrew cask cannot be published. Set it with: gh secret set HOMEBREW_TAP_TOKEN --repo ${{ github.repository }} — it needs contents:write and pull_requests:write on ${{ github.repository_owner }}/homebrew-tap. To cut a release deliberately without a cask, set the repo variable ALLOW_MISSING_TAP_TOKEN=true."
             exit 1
           else
             # Presence is not enough: the 401 is a VALUE problem, so
@@ -269,6 +269,7 @@ jobs:
             echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
           fi
       - name: Wait for the tap cask to reflect this release
+        id: wait
         env:
           WANT: ${{ steps.v.outputs.version }}
         run: |
@@ -279,13 +280,25 @@ jobs:
             if [ "$got" = "$WANT" ]; then exit 0; fi
             sleep 30
           done
-          echo "::error::tap cask did not reach $WANT within ~10 min — push the cask, then re-run this job"
+          # The cask reaches the tap's main through a reviewed PR (see
+          # homebrew_casks in .goreleaser.yaml), so an unmerged PR is the
+          # expected state here, not a failure: say so, and how to finish.
+          prs=$(curl -fsSL "https://api.github.com/repos/cybertec-postgresql/homebrew-tap/pulls?state=open&head=cybertec-postgresql:pg_hardstorage-$WANT" || echo '[]')
+          pr=$(printf '%s' "$prs" | python3 -c 'import json,sys; p=json.load(sys.stdin); print(p[0]["html_url"] if p else "")')
+          if [ -n "$pr" ]; then
+            echo "pending=true" >> "$GITHUB_OUTPUT"
+            echo "::warning title=Homebrew cask awaiting review::$pr must be approved and merged. Then run this workflow manually with smoke_version=$WANT to smoke-test the cask."
+            exit 0
+          fi
+          echo "::error::tap cask did not reach $WANT within ~10 min and no open tap PR for it was found — publish the cask, then run this workflow with smoke_version=$WANT"
           exit 1
       - name: brew install --cask from the tap
+        if: steps.wait.outputs.pending != 'true'
         run: |
           brew update --quiet || true
           brew install --cask cybertec-postgresql/tap/pg_hardstorage
       - name: Smoke-test the installed binary
+        if: steps.wait.outputs.pending != 'true'
         env:
           WANT: ${{ steps.v.outputs.version }}
         run: |

@@ -9,6 +9,21 @@ on-disk and on-the-wire schema (backup manifests, configuration, output JSON,
 and the on-disk chunk envelope): an agent built against a given schema version
 keeps reading that version for at least 24 months after a successor lands.
 
+## [Unreleased]
+
+### Fixed
+
+- **The Homebrew cask is published through a pull request.** The
+  `homebrew-tap` repository's `main` requires a reviewed PR, so
+  goreleaser's direct push was rejected (409). The v1.5.0 release run
+  failed after every asset had uploaded, and Homebrew stayed on 1.4.2
+  until the cask went in by hand. goreleaser now pushes the cask to a
+  `pg_hardstorage-<version>` branch and opens a PR. The release workflow's
+  Homebrew smoke test reports an open tap PR as a warning, with the
+  command to run once it is merged, instead of failing.
+  `HOMEBREW_TAP_TOKEN` needs `pull_requests:write` in addition to
+  `contents:write`.
+
 ## [1.5.0] — 2026-09-30
 
 ### Added
