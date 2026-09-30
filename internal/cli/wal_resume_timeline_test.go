@@ -38,6 +38,7 @@ package cli
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -46,6 +47,7 @@ import (
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/output"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/pg/replication"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/pg/walsink"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/wal/timeline"
 )
 
 // seg returns the starting LSN of segment n at the default size.
@@ -210,5 +212,61 @@ func TestResolveStartLSN_PrefersTheNearestTimelineBelow(t *testing.T) {
 			"past TLI 2's branch point was written by a primary that was subsequently "+
 			"fenced. Those bytes are a different history, not missing WAL.",
 			lsn, note, want)
+	}
+}
+
+// TestResolveStartLSN_CrossTimelineClampsToTheFork: the old timeline's
+// archived frontier can lie PAST the point where the new timeline forked
+// from it — the old primary kept writing (and the streamer kept
+// archiving) for a while before it was fenced. Those bytes are diverged
+// history; the new timeline's own WAL from the fork onward is different
+// WAL at the same LSNs.
+//
+// TLI 1 is archived through segment 10 (frontier = start of 11); TLI 2
+// forked inside segment 8. Resuming at the frontier asks TLI 2 for
+// segment 11 onward, so TLI 2's segments 8..10 are never archived — and
+// findGaps, comparing segment numbers only, sees 10 -> 11 as contiguous.
+// The resume must start at the segment holding the switchpoint.
+func TestResolveStartLSN_CrossTimelineClampsToTheFork(t *testing.T) {
+	sp, _ := newFsRepo(t)
+	const dep = "db1"
+	for n := uint64(0); n <= 10; n++ {
+		putRealSeg(t, sp, dep, 1, n)
+	}
+	fork := seg(8) + 0x1234
+	hist := fmt.Sprintf("1\t%s\tno recovery target specified\n", fork)
+	if err := timeline.New(sp).Put(context.Background(), dep, 2, []byte(hist)); err != nil {
+		t.Fatal(err)
+	}
+
+	lsn, note, err := resolveStartLSN(context.Background(), sp,
+		walStreamOptions{deployment: dep, pgConn: "x"}, 2, slotAt(4), nil)
+	if err != nil {
+		t.Fatalf("resolveStartLSN: %v", err)
+	}
+	if lsn != seg(8) {
+		t.Fatalf("resume LSN = %s (%s), want %s — the start of the segment holding TLI 2's "+
+			"switchpoint %s. Resuming at TLI 1's frontier %s skips TLI 2's segments 8..10.",
+			lsn, note, seg(8), fork, seg(11))
+	}
+	// And that LSN must be streamed on TLI 2: TLI 1's copy of the fork
+	// segment is a dead end past the switchpoint.
+	if got := resolveStreamTimeline(context.Background(), historyStore(sp), dep, 2, lsn,
+		int64(walsink.SegmentSize), nil); got != 2 {
+		t.Errorf("stream timeline = %d, want 2", got)
+	}
+
+	// A frontier already at or before the fork is left alone.
+	sp2, _ := newFsRepo(t)
+	for n := uint64(0); n <= 5; n++ {
+		putRealSeg(t, sp2, dep, 1, n)
+	}
+	if err := timeline.New(sp2).Put(context.Background(), dep, 2, []byte(hist)); err != nil {
+		t.Fatal(err)
+	}
+	lsn, _, err = resolveStartLSN(context.Background(), sp2,
+		walStreamOptions{deployment: dep, pgConn: "x"}, 2, slotAt(4), nil)
+	if err != nil || lsn != seg(6) {
+		t.Errorf("frontier before the fork: got %s (%v), want %s", lsn, err, seg(6))
 	}
 }

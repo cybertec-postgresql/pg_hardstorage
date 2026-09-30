@@ -3,6 +3,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"sort"
@@ -13,8 +14,8 @@ import (
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/audit"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup"
-	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup/keystore"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup/retention"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/config"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/output"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/paths"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo"
@@ -38,6 +39,16 @@ func newRotateCmd() *cobra.Command {
 		Short: "Apply retention policy to a deployment (or all)",
 		Long: `Classify each backup as kept or to-be-soft-deleted per the chosen
 retention policy, then optionally apply the decision.
+
+Where the policy comes from, per deployment:
+
+  1. any --policy / --keep-* flag  → the flags define the whole policy
+  2. otherwise                     → the deployment's retention: block in
+                                     pg_hardstorage.yaml (the same policy
+                                     the agent's scheduled rotate applies)
+  3. otherwise                     → the built-in GFS defaults below
+
+The plan prints which source it used for each deployment.
 
 Three policies ship today:
 
@@ -105,22 +116,46 @@ type rotateOpts struct {
 func runRotate(cmd *cobra.Command, opts rotateOpts) error {
 	d := DispatcherFrom(cmd)
 
-	policy, err := buildPolicy(opts)
-	if err != nil {
-		return err
+	// Retention comes from flags, else the deployment's config, else the
+	// built-in default — resolved per deployment below (see
+	// rotate_policy_source.go). Validate explicit flags up front so a bad
+	// --policy fails before anything is opened.
+	flagsSet := retentionFlagsChanged(cmd)
+	if flagsSet {
+		if _, err := buildPolicy(opts); err != nil {
+			return err
+		}
+	}
+	var configured map[string]config.DeploymentConfig
+	if pp, perr := paths.Resolve(paths.DefaultOptions()); perr == nil {
+		loaded, lerr := config.Load(pp)
+		switch {
+		case lerr != nil && !flagsSet:
+			// A config that EXISTS but will not load must stop the run.
+			// Load reports a missing file as ReadOK=false, not an error,
+			// so reaching here means pg_hardstorage.yaml is present and
+			// broken. Treating that as "no config" would plan with the
+			// built-in GFS defaults — the exact #66 bug, reached through
+			// a bad edit instead of a missing lookup. With explicit
+			// retention flags the config is not consulted, so proceed.
+			return output.NewError("config.load_failed",
+				fmt.Sprintf("rotate: cannot read the deployments' retention policies: %v", lerr)).
+				WithSuggestion(&output.Suggestion{
+					Human: "fix pg_hardstorage.yaml (`pg_hardstorage lint` shows the error), or pass --policy / --keep-* to rotate with an explicit policy for this run",
+				}).Wrap(lerr)
+		case lerr == nil && loaded != nil:
+			configured = loaded.Config.Deployments
+		}
 	}
 
 	// Resolve verifier the same way restore does — every manifest we
 	// touch must have a valid signature, otherwise the safety story
 	// (the signed-manifest commitment) is broken.
-	p, err := paths.Resolve(paths.DefaultOptions())
+	// Load-only: this verb must never mint a keypair (see
+	// loadExistingKeypair).
+	_, verifier, err := loadExistingKeypair("rotate")
 	if err != nil {
-		return output.NewError("internal", err.Error()).Wrap(err)
-	}
-	_, verifier, err := keystore.LoadOrGenerate(p.Keyring.Value)
-	if err != nil {
-		return output.NewError("internal",
-			fmt.Sprintf("rotate: signing key: %v", err)).Wrap(err)
+		return err
 	}
 
 	repoMeta, sp, err := repo.Open(cmd.Context(), opts.repoURL)
@@ -128,6 +163,13 @@ func runRotate(cmd *cobra.Command, opts rotateOpts) error {
 		return mapRepoOpenErr(opts.repoURL, err)
 	}
 	defer sp.Close()
+	// --apply tombstones backups; a read-only repo refuses that like
+	// every other mutating verb. The dry-run plan stays available.
+	if opts.apply {
+		if err := assertRepoWritable(cmd.Context(), sp, "rotate --apply"); err != nil {
+			return err
+		}
+	}
 	auditStore := audit.NewStoreWithRetention(sp, repoMeta.WORM)
 
 	store := backup.NewManifestStore(sp)
@@ -146,6 +188,10 @@ func runRotate(cmd *cobra.Command, opts rotateOpts) error {
 			return output.NewError("rotate.list_failed",
 				fmt.Sprintf("rotate: list %s: %v", dep, err)).Wrap(err)
 		}
+		policy, source, err := resolveRotatePolicy(dep, flagsSet, opts, configured)
+		if err != nil {
+			return err
+		}
 		decision := policy.Apply(now, manifests)
 
 		// Filter out held backups BEFORE counting "Deleted" so the
@@ -162,6 +208,8 @@ func runRotate(cmd *cobra.Command, opts rotateOpts) error {
 		report := rotationPerDeployment{
 			Deployment:      dep,
 			Policy:          decision.PolicyName,
+			PolicySource:    source,
+			PolicyDetail:    fmt.Sprintf("%+v", policy),
 			Kept:            len(decision.Keep) + len(heldIDs) + len(anchorIDs),
 			Deleted:         len(filteredDelete),
 			Held:            len(heldIDs),
@@ -186,18 +234,14 @@ func runRotate(cmd *cobra.Command, opts rotateOpts) error {
 			}
 			deleted, derr := store.SoftDeleteBatch(cmd.Context(), dep, ids,
 				decision.PolicyName, "policy="+decision.PolicyName)
-			if derr != nil {
-				return output.NewError("rotate.soft_delete_failed",
-					fmt.Sprintf("rotate: soft-delete batch for %s: %v", dep, derr)).Wrap(derr)
-			}
-			report.Applied = len(deleted)
-			report.HeldSkipped = 0
 
 			// Audit one record per backup the policy deleted (observability
 			// audit #4) — a retention run can soft-delete thousands of
 			// backups, and previously left no per-backup trail, unlike
 			// `backup delete`. Per-backup records make "which run deleted
-			// what, when, under which policy" reconstructable.
+			// what, when, under which policy" reconstructable. A failed
+			// batch can still have left tombstones in place (it reports
+			// them in `deleted`), and those need the record most.
 			for _, id := range deleted {
 				auditStore.AppendOrLog(cmd.Context(), &audit.Event{
 					Action: "backup.rotate_delete",
@@ -209,18 +253,82 @@ func runRotate(cmd *cobra.Command, opts rotateOpts) error {
 					Body: map[string]any{"policy": decision.PolicyName},
 				})
 			}
+			if derr != nil {
+				return rotateBatchError(dep, derr, deleted, overall, opts.repoURL)
+			}
+			report.Applied = len(deleted)
+			report.HeldSkipped = 0
 		}
 
 		overall = append(overall, report)
 	}
 
+	policyName := ""
+	for i, r := range overall {
+		if i == 0 {
+			policyName = r.Policy
+		} else if r.Policy != policyName {
+			policyName = "per-deployment"
+			break
+		}
+	}
+	if policyName == "" {
+		// No deployments: report what flags/defaults would have used.
+		if p, perr := buildPolicy(opts); perr == nil {
+			policyName = p.Name()
+		}
+	}
 	body := rotateResultBody{
 		DryRun:      !opts.apply,
-		PolicyName:  policy.Name(),
+		PolicyName:  policyName,
 		Deployments: overall,
 		EvaluatedAt: now,
 	}
 	return d.Result(output.NewResult(cmd.CommandPath()).WithBody(body))
+}
+
+// rotateBatchError maps a refused / failed SoftDeleteBatch the same way
+// `backup delete` maps the single-backup refusals — a hold or a live
+// incremental committed mid-rotation is a conflict (exit 7), not a
+// generic failure — and says how far a multi-deployment run got: the
+// deployments before dep were already rotated and stay rotated, which
+// the operator could not tell from "rotate.soft_delete_failed" alone.
+func rotateBatchError(dep string, derr error, deleted []string, applied []rotationPerDeployment, repoURL string) error {
+	progress := "no deployment had been rotated yet"
+	if len(applied) > 0 {
+		parts := make([]string, 0, len(applied))
+		for _, r := range applied {
+			parts = append(parts, fmt.Sprintf("%s (%d deleted)", r.Deployment, r.Applied))
+		}
+		progress = "already applied: " + strings.Join(parts, ", ")
+	}
+	if len(deleted) > 0 {
+		progress += fmt.Sprintf("; %s: %d tombstone(s) left in place (%s)", dep, len(deleted), strings.Join(deleted, ", "))
+	}
+	rerun := &output.Suggestion{
+		Human:   "rotate is idempotent: re-run it once the conflict is resolved; deployments already rotated are re-evaluated and left alone.",
+		Command: "pg_hardstorage rotate --repo " + repoURL + " --apply",
+	}
+
+	var heldErr *backup.ManifestHeldError
+	if errors.As(derr, &heldErr) {
+		detail := fmt.Sprintf("rotate: %s/%s was placed on legal hold during the rotation", dep, heldErr.BackupID)
+		if heldErr.Holder != "" {
+			detail += " (holder=" + heldErr.Holder + ")"
+		}
+		return output.NewError("conflict.manifest_held", detail+" — "+progress).
+			WithSuggestion(rerun).Wrap(derr)
+	}
+	var chErr *backup.ChainHasLiveDescendantsError
+	if errors.As(derr, &chErr) {
+		return output.NewError("conflict.chain_has_live_descendants",
+			fmt.Sprintf("rotate: %s/%s gained live incremental descendant(s) during the rotation: %s — %s",
+				dep, chErr.BackupID, strings.Join(chErr.Descendants, ", "), progress)).
+			WithSuggestion(rerun).Wrap(derr)
+	}
+	return output.NewError("rotate.soft_delete_failed",
+		fmt.Sprintf("rotate: soft-delete batch for %s: %v — %s", dep, derr, progress)).
+		WithSuggestion(rerun).Wrap(derr)
 }
 
 // buildPolicy constructs a retention.Policy from the flag set. Returns
@@ -355,12 +463,20 @@ type rotateResultBody struct {
 }
 
 type rotationPerDeployment struct {
-	Deployment string   `json:"deployment"`
-	Policy     string   `json:"policy"`
-	Kept       int      `json:"kept"`
-	Deleted    int      `json:"deleted"`
-	Held       int      `json:"held,omitempty"`
-	HeldIDs    []string `json:"held_ids,omitempty"`
+	Deployment string `json:"deployment"`
+	Policy     string `json:"policy"`
+	// PolicySource says where Policy came from: "flags",
+	// "pg_hardstorage.yaml", or "built-in default". Before it existed,
+	// a plan could follow the built-in GFS default while the deployment
+	// declared something else, and nothing on screen said so.
+	PolicySource string `json:"policy_source"`
+	// PolicyDetail is the resolved policy's parameters, e.g.
+	// "{KeepFulls:2}", so the numbers the plan followed are visible.
+	PolicyDetail string   `json:"policy_detail,omitempty"`
+	Kept         int      `json:"kept"`
+	Deleted      int      `json:"deleted"`
+	Held         int      `json:"held,omitempty"`
+	HeldIDs      []string `json:"held_ids,omitempty"`
 	// HeldChainAnchor lists backups kept ONLY because a held
 	// descendant depends on them — deleting them would either break
 	// the held chain or (pre-fix) wedge the whole batch.
@@ -392,6 +508,7 @@ func (b rotateResultBody) WriteText(w io.Writer) error {
 	fmt.Fprintf(bw, "  Policy: %s\n", b.PolicyName)
 	for _, dep := range b.Deployments {
 		fmt.Fprintf(bw, "\n  %s\n", dep.Deployment)
+		fmt.Fprintf(bw, "    policy:  %s %s (from %s)\n", dep.Policy, dep.PolicyDetail, dep.PolicySource)
 		fmt.Fprintf(bw, "    keep:    %d\n", dep.Kept)
 		fmt.Fprintf(bw, "    delete:  %d\n", dep.Deleted)
 		if dep.Held > 0 {

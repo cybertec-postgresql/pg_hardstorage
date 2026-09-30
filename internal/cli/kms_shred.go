@@ -17,6 +17,7 @@ import (
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup/keystore"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/output"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/paths"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/pg/walsink"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
 )
 
@@ -138,13 +139,14 @@ func runKmsShred(cmd *cobra.Command, repoURL, reason, approvalID, confirmKeyring
 			return err
 		}
 		defer sp.Close()
-		affected, scanErr := scanAffectedBackups(cmd.Context(), sp, keystore.KEKRefLocal)
+		scope, scanErr := scanAffectedBackups(cmd.Context(), sp, keystore.KEKRefLocal)
 		body := kmsShredBody{
-			KeyringDir:    keyringDir,
-			Reason:        reason,
-			DryRun:        true,
-			AffectedCount: len(affected),
-			AffectedIDs:   affected,
+			KeyringDir:          keyringDir,
+			Reason:              reason,
+			DryRun:              true,
+			AffectedCount:       len(scope.IDs),
+			AffectedIDs:         scope.IDs,
+			AffectedWALSegments: scope.WALSegments,
 		}
 		if scanErr != nil {
 			body.AffectedScanError = scanErr.Error()
@@ -185,6 +187,12 @@ func runKmsShred(cmd *cobra.Command, repoURL, reason, approvalID, confirmKeyring
 		return err
 	}
 	defer sp.Close()
+	// A read-only repo (repo set-mode read-only) refuses every mutating
+	// verb; shred redeems an approval and appends to the audit chain,
+	// and destroys the key that repo's backups depend on.
+	if err := assertRepoWritable(cmd.Context(), sp, "kms shred"); err != nil {
+		return err
+	}
 	gateReq, gerr := approval.NewStore(sp).Gate(cmd.Context(), approval.GateOptions{
 		RequestID: approvalID,
 		Op:        KMSShredOp,
@@ -207,7 +215,8 @@ func runKmsShred(cmd *cobra.Command, repoURL, reason, approvalID, confirmKeyring
 	// This is best-effort: a List failure on a single deployment
 	// shouldn't block a GDPR-driven shred, but the operator wants
 	// to see the count — and the audit log NEEDS to record it.
-	affected, scanErr := scanAffectedBackups(cmd.Context(), sp, keystore.KEKRefLocal)
+	scope, scanErr := scanAffectedBackups(cmd.Context(), sp, keystore.KEKRefLocal)
+	affected := scope.IDs
 	if scanErr != nil {
 		// Surface but don't block: the operator already passed three
 		// gates; the scan is informational.
@@ -234,14 +243,15 @@ func runKmsShred(cmd *cobra.Command, repoURL, reason, approvalID, confirmKeyring
 	// effort; a failed audit doesn't undo the shred (the bytes
 	// are already gone).
 	body := map[string]any{
-		"keyring_dir":           keyringDir,
-		"approval_id":           gateReq.ID,
-		"approval_op":           string(gateReq.Op),
-		"threshold":             gateReq.Threshold,
-		"approvers":             len(gateReq.Approvals),
-		"reason":                reason,
-		"affected_backup_count": len(affected),
-		"affected_backup_ids":   affected,
+		"keyring_dir":                keyringDir,
+		"approval_id":                gateReq.ID,
+		"approval_op":                string(gateReq.Op),
+		"threshold":                  gateReq.Threshold,
+		"approvers":                  len(gateReq.Approvals),
+		"reason":                     reason,
+		"affected_backup_count":      len(affected),
+		"affected_backup_ids":        affected,
+		"affected_wal_segment_count": scope.WALSegments,
 	}
 	if scanErr != nil {
 		body["affected_scan_error"] = scanErr.Error()
@@ -254,28 +264,48 @@ func runKmsShred(cmd *cobra.Command, repoURL, reason, approvalID, confirmKeyring
 	})
 
 	return d.Result(output.NewResult(cmd.CommandPath()).WithBody(kmsShredBody{
-		KeyringDir:    keyringDir,
-		ApprovalID:    gateReq.ID,
-		Reason:        reason,
-		AffectedCount: len(affected),
-		AffectedIDs:   affected,
+		KeyringDir:          keyringDir,
+		ApprovalID:          gateReq.ID,
+		Reason:              reason,
+		AffectedCount:       len(affected),
+		AffectedIDs:         affected,
+		AffectedWALSegments: scope.WALSegments,
 	}))
 }
 
+// shredScope is what a shred makes unrecoverable: backup IDs (live,
+// soft-deleted, or only a stale replica) and the number of WAL segment
+// manifests whose envelope the key wraps.
+type shredScope struct {
+	IDs         []string
+	WALSegments int
+}
+
 // scanAffectedBackups walks every manifest in every deployment in
-// the repo and returns the backup IDs whose KEKRef matches the
-// shred target.  Best-effort: per-deployment errors are aggregated
-// rather than aborting the scan, because the audit log's
-// affected-scope field is most useful when populated even
-// partially.
+// the repo and returns the backup IDs whose KEKRef resolves to the
+// shred target, plus the WAL segments it protects.  Best-effort:
+// per-deployment errors are aggregated rather than aborting the
+// scan, because the audit log's affected-scope field is most useful
+// when populated even partially.
+//
+// "Resolves to" matters for the local keyring: a local rotation stamps
+// refs like "local:v2" that the keystore maps onto the very same
+// kek.bin, so matching only the literal "local:default" reported 0
+// affected for a fully rotated repo. Tombstoned backups count (undelete
+// can still resurrect them) and so do WAL segments (PITR unwraps each
+// one's own envelope).
 //
 // Cost: one List + one Get per manifest.  Acceptable for a
 // destructive op the operator already passed three gates for.
-func scanAffectedBackups(ctx context.Context, sp storage.StoragePlugin, kekRef string) ([]string, error) {
+func scanAffectedBackups(ctx context.Context, sp storage.StoragePlugin, kekRef string) (shredScope, error) {
+	matches := func(ref string) bool { return ref == kekRef }
+	if keystore.IsLocalRef(kekRef) {
+		matches = keystore.IsLocalRef
+	}
 	ms := backup.NewManifestStore(sp)
 	deployments, err := ms.Deployments(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("list deployments: %w", err)
+		return shredScope{}, fmt.Errorf("list deployments: %w", err)
 	}
 	// Listing for scope, not for trust.  ManifestStore.List rejects
 	// a nil verifier ("manifest: nil verifier"), and provisioning a
@@ -298,13 +328,14 @@ func scanAffectedBackups(ctx context.Context, sp storage.StoragePlugin, kekRef s
 		affected = append(affected, id)
 	}
 	for _, dep := range deployments {
-		for m, mErr := range ms.ListAttestationless(ctx, dep) {
+		for e, mErr := range ms.ListAttestationlessIncludingTombstoned(ctx, dep) {
 			if mErr != nil {
 				if firstErr == nil {
 					firstErr = fmt.Errorf("deployment %q: %w", dep, mErr)
 				}
 				continue
 			}
+			m := e.Manifest
 			if m == nil {
 				continue
 			}
@@ -316,7 +347,7 @@ func scanAffectedBackups(ctx context.Context, sp storage.StoragePlugin, kekRef s
 			if m.Encryption == nil {
 				continue
 			}
-			if m.Encryption.KEKRef == kekRef {
+			if matches(m.Encryption.KEKRef) {
 				add(m.BackupID)
 			}
 		}
@@ -327,15 +358,53 @@ func scanAffectedBackups(ctx context.Context, sp storage.StoragePlugin, kekRef s
 	// shred target is just as unrecoverable once the KEK is gone, so it
 	// MUST be reported here — otherwise shred under-states its blast
 	// radius and an operator strands the replica.
-	if rerr := scanAffectedReplicas(ctx, sp, kekRef, add); rerr != nil && firstErr == nil {
+	if rerr := scanAffectedReplicas(ctx, sp, matches, add); rerr != nil && firstErr == nil {
 		firstErr = rerr
 	}
-	return affected, firstErr
+	walSegs, werr := scanAffectedWALSegments(ctx, sp, matches)
+	if werr != nil && firstErr == nil {
+		firstErr = werr
+	}
+	return shredScope{IDs: affected, WALSegments: walSegs}, firstErr
+}
+
+// scanAffectedWALSegments counts the WAL segment manifests whose own
+// envelope is wrapped under a matching ref.
+func scanAffectedWALSegments(ctx context.Context, sp storage.StoragePlugin, matches func(string) bool) (int, error) {
+	n := 0
+	for info, err := range sp.List(ctx, "wal/") {
+		if err != nil {
+			return n, fmt.Errorf("list WAL segment manifests: %w", err)
+		}
+		if cerr := ctx.Err(); cerr != nil {
+			return n, cerr
+		}
+		if _, ok := backup.WALSegmentManifestDeployment(info.Key); !ok {
+			continue
+		}
+		rc, gerr := sp.Get(ctx, info.Key)
+		if gerr != nil {
+			continue // racing wal prune; not in scope for this scan
+		}
+		raw, rerr := storage.ReadAllLimited(rc, storage.MaxMetadataBytes)
+		_ = rc.Close()
+		if rerr != nil {
+			continue
+		}
+		m, perr := walsink.ParseSegmentManifest(raw)
+		if perr != nil || m.Encryption == nil {
+			continue
+		}
+		if matches(m.Encryption.KEKRef) {
+			n++
+		}
+	}
+	return n, nil
 }
 
 // scanAffectedReplicas walks manifests/_replicas/ and calls add(backupID)
-// for every replica manifest wrapped under kekRef.
-func scanAffectedReplicas(ctx context.Context, sp storage.StoragePlugin, kekRef string, add func(string)) error {
+// for every replica manifest wrapped under a matching ref.
+func scanAffectedReplicas(ctx context.Context, sp storage.StoragePlugin, matches func(string) bool, add func(string)) error {
 	const prefix = "manifests/_replicas/"
 	const suffix = ".manifest.json"
 	for info, err := range sp.List(ctx, prefix) {
@@ -362,7 +431,7 @@ func scanAffectedReplicas(ctx context.Context, sp storage.StoragePlugin, kekRef 
 		if perr != nil || m.Encryption == nil {
 			continue
 		}
-		if m.Encryption.KEKRef == kekRef {
+		if matches(m.Encryption.KEKRef) {
 			add(strings.TrimSuffix(strings.TrimPrefix(key, prefix), suffix))
 		}
 	}
@@ -377,14 +446,17 @@ func scanAffectedReplicas(ctx context.Context, sp storage.StoragePlugin, kekRef 
 // a preview only — the KEK was NOT touched and no audit event was
 // written.
 type kmsShredBody struct {
-	KeyringDir        string   `json:"keyring_dir"`
-	ApprovalID        string   `json:"approval_id,omitempty"`
-	Reason            string   `json:"reason,omitempty"`
-	AlreadyDone       bool     `json:"already_done,omitempty"`
-	DryRun            bool     `json:"dry_run,omitempty"`
-	AffectedCount     int      `json:"affected_backup_count,omitempty"`
-	AffectedIDs       []string `json:"affected_backup_ids,omitempty"`
-	AffectedScanError string   `json:"affected_scan_error,omitempty"`
+	KeyringDir    string   `json:"keyring_dir"`
+	ApprovalID    string   `json:"approval_id,omitempty"`
+	Reason        string   `json:"reason,omitempty"`
+	AlreadyDone   bool     `json:"already_done,omitempty"`
+	DryRun        bool     `json:"dry_run,omitempty"`
+	AffectedCount int      `json:"affected_backup_count,omitempty"`
+	AffectedIDs   []string `json:"affected_backup_ids,omitempty"`
+	// AffectedWALSegments counts WAL segment manifests whose envelope the
+	// key wraps: PITR over them dies with the key too.
+	AffectedWALSegments int    `json:"affected_wal_segment_count,omitempty"`
+	AffectedScanError   string `json:"affected_scan_error,omitempty"`
 }
 
 // WriteText renders the shred outcome — dry-run preview, idempotent no-op,
@@ -445,5 +517,8 @@ func writeAffectedSummary(bw *strings.Builder, b kmsShredBody) {
 			fmt.Fprintf(bw, "    - %s\n", id)
 		}
 		fmt.Fprintf(bw, "    ... +%d more\n", b.AffectedCount-sample)
+	}
+	if b.AffectedWALSegments > 0 {
+		fmt.Fprintf(bw, "  Affected: %d WAL segment(s) %s (PITR through them)\n", b.AffectedWALSegments, verb)
 	}
 }

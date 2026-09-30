@@ -97,6 +97,22 @@ type Options struct {
 	// cluster).
 	Database string
 
+	// User is the PostgreSQL role pg_dump connects as. Empty
+	// defaults to DefaultSandboxUser.
+	//
+	// This is deliberately NOT the host's OS user. The sandbox is a
+	// cluster restored from the operator's backup, so the roles in it
+	// are theirs; whoever happens to be running pg_hardstorage has no
+	// relationship to them. Defaulting to $USER meant `partial dump`
+	// worked only when the operator's login name coincided with a role
+	// in their own backup, and otherwise failed with PostgreSQL's
+	// blunt
+	//
+	//	FATAL: role "<login name>" does not exist
+	//
+	// which reads like a pg_hardstorage bug and is not one.
+	User string
+
 	// Stderr, when non-nil, receives the subprocess stderr streams
 	// for debugging. nil discards.
 	Stderr io.Writer
@@ -157,6 +173,9 @@ func Start(ctx context.Context, opts Options) (*Sandbox, error) {
 	}
 	if opts.Database == "" {
 		opts.Database = "postgres"
+	}
+	if opts.User == "" {
+		opts.User = DefaultSandboxUser
 	}
 
 	// PG-version pre-flight: refuse to spawn pg_ctl against a data
@@ -219,6 +238,12 @@ func Start(ctx context.Context, opts Options) (*Sandbox, error) {
 	if err := os.Chmod(sockDir, 0o700); err != nil {
 		os.RemoveAll(sockDir)
 		return nil, fmt.Errorf("sandbox: chmod socket dir: %w", err)
+	}
+	// The sandbox's own auth rules live beside the socket, inside the
+	// same 0700 directory, and are referenced by hba_file below.
+	if err := os.WriteFile(filepath.Join(sockDir, "pg_hba.conf"), []byte(sandboxHBA), 0o600); err != nil {
+		os.RemoveAll(sockDir)
+		return nil, fmt.Errorf("sandbox: write sandbox pg_hba.conf: %w", err)
 	}
 
 	// Write postgresql.auto.conf for the sandbox.  It must:
@@ -285,13 +310,20 @@ func Start(ctx context.Context, opts Options) (*Sandbox, error) {
 		cmd.Stderr = opts.Stderr
 	}
 	if err := cmd.Run(); err != nil {
-		sb.cleanup()
 		// Best-effort: capture the log so the operator sees what
-		// went wrong.
+		// went wrong. Read it BEFORE cleanup: the log lives in the
+		// socket dir that cleanup removes.
 		var logTail string
 		if body, rerr := os.ReadFile(logFile); rerr == nil {
 			logTail = tailString(string(body), 4096)
 		}
+		// `pg_ctl -w start` failing (e.g. "server did not start in
+		// time") does not mean no postmaster is running: the one it
+		// forked may still be replaying WAL, holding the operator's
+		// data dir and our socket dir. Stop it before tearing down,
+		// or it outlives the command on the restored data.
+		sb.stopPostmaster()
+		sb.cleanup()
 		return nil, fmt.Errorf("sandbox: pg_ctl start: %w (log tail: %s)", err, logTail)
 	}
 
@@ -299,6 +331,7 @@ func Start(ctx context.Context, opts Options) (*Sandbox, error) {
 	// socket file exists.
 	socketPath := filepath.Join(sockDir, ".s.PGSQL.5432")
 	if _, err := os.Stat(socketPath); err != nil {
+		sb.stopPostmaster()
 		sb.cleanup()
 		return nil, fmt.Errorf("sandbox: PG started but socket %s not found: %w", socketPath, err)
 	}
@@ -312,13 +345,57 @@ func Start(ctx context.Context, opts Options) (*Sandbox, error) {
 // by the sandbox's socket/TCP overrides.  PG applies auto.conf
 // last-wins, so the appended overrides take effect without dropping the
 // recovery settings PG needs to replay WAL.
+// DefaultSandboxUser is the role pg_dump connects to the sandbox as
+// when Options.User is empty.
+//
+// "postgres" is what initdb creates unless it was run with -U, which
+// makes it right for the overwhelming majority of clusters and wrong
+// for a knowable minority — those get Options.User (`--pg-user` on the
+// command line), named in the error when the role turns out to be
+// absent.
+const DefaultSandboxUser = "postgres"
+
+// ErrRoleMissing reports that the sandbox came up but the role we
+// connected as does not exist in the restored cluster. It is a
+// configuration answer away (`--pg-user`), so it must not be
+// presented as a dump failure.
+var ErrRoleMissing = errors.New("sandbox: role does not exist in the restored cluster")
+
+// sandboxHBA is the pg_hba.conf the sandbox runs with, replacing
+// whatever the backup carried.
+//
+// The restored cluster's own pg_hba.conf is the operator's production
+// policy: it may demand md5, scram, LDAP, GSSAPI or a client
+// certificate. We have none of those — we are not the application,
+// we are a throwaway reader of their data — so honouring it means
+// `partial dump` fails on any cluster whose local auth is not
+// peer-with-a-matching-name. Even peer only works by coincidence,
+// when the operator's login name happens to be a role.
+//
+// Trust is safe *here* specifically, and the reasons are structural
+// rather than a judgement call: the sandbox listens on no TCP socket
+// (listen_addresses = ”), its unix socket lives in a 0700 directory
+// owned by this process, and the whole cluster is deleted when the
+// command returns. Nothing outside this process can reach it.
+const sandboxHBA = `# pg_hardstorage sandbox — generated, not the operator's policy.
+# The cluster has no TCP listener and its socket dir is 0700, so this
+# file is only reachable by the process that created it.
+local   all   all   trust
+`
+
 func buildSandboxAutoConf(existing []byte, sockDir string) []byte {
+	// hba_file points at the sandbox's own trust-only rules (see
+	// sandboxHBA). Redirecting the GUC rather than rewriting the
+	// data dir's pg_hba.conf means the operator's file is never
+	// touched, so there is nothing to restore on Stop and nothing to
+	// leave behind if we die mid-run.
 	overrides := fmt.Sprintf(
 		"# pg_hardstorage sandbox overrides — restored on Stop\n"+
 			"port = 5432\n"+ // socket-file name suffix
 			"listen_addresses = ''\n"+
-			"unix_socket_directories = '%s'\n",
-		sockDir,
+			"unix_socket_directories = '%s'\n"+
+			"hba_file = '%s'\n",
+		sockDir, filepath.Join(sockDir, "pg_hba.conf"),
 	)
 	if len(existing) == 0 {
 		return []byte(overrides)
@@ -352,6 +429,16 @@ func (s *Sandbox) LogFile() string { return s.logFile }
 //
 // The caller is responsible for the bytes' destination — we don't
 // open files, we just stream pg_dump's stdout into w.
+// ErrNoMatchingTables reports that pg_dump ran, connected, and found
+// nothing matching the requested --table patterns.
+//
+// It is a distinct sentinel because the two outcomes need different
+// exit codes and different advice: a dump that failed is a fault to
+// investigate, while a dump that matched nothing is almost always the
+// operator naming a table that lives in another database (issue #97)
+// and is answered by `--database`.
+var ErrNoMatchingTables = errors.New("sandbox: pg_dump found no matching tables")
+
 func (s *Sandbox) Dump(ctx context.Context, w io.Writer, tables []string, dataOnly bool) error {
 	if s.closed {
 		return errors.New("sandbox: Dump after Stop")
@@ -359,7 +446,7 @@ func (s *Sandbox) Dump(ctx context.Context, w io.Writer, tables []string, dataOn
 	if len(tables) == 0 {
 		return errors.New("sandbox: Dump requires at least one table")
 	}
-	args := buildPGDumpArgs(s.socketDir, currentUser(), s.opts.Database, tables, dataOnly)
+	args := buildPGDumpArgs(s.socketDir, s.opts.User, s.opts.Database, tables, dataOnly)
 
 	// Always capture pg_dump's stderr so a "no matching tables were
 	// found" diagnostic (issue #97: a table that lives in a database
@@ -374,12 +461,57 @@ func (s *Sandbox) Dump(ctx context.Context, w io.Writer, tables []string, dataOn
 		cmd.Stderr = &errBuf
 	}
 	if err := cmd.Run(); err != nil {
-		if msg := strings.TrimSpace(errBuf.String()); msg != "" {
+		msg := strings.TrimSpace(errBuf.String())
+		// pg_dump treats "--table matched nothing" as a hard error and
+		// exits 1. That is a *not found*, not a dump failure, and the
+		// caller has to be able to tell them apart to route the exit
+		// code — so say which one it is here rather than making the
+		// caller re-parse the same stderr.
+		// A role that is not in the restored cluster is answerable
+		// with --pg-user; it must not be filed as a dump failure.
+		if isRoleMissing(msg) {
+			if msg != "" {
+				return fmt.Errorf("%w: %s", ErrRoleMissing, tailString(msg, 2048))
+			}
+			return ErrRoleMissing
+		}
+		if isNoMatchingTables(msg) {
+			if msg != "" {
+				return fmt.Errorf("%w: %s", ErrNoMatchingTables, tailString(msg, 2048))
+			}
+			return ErrNoMatchingTables
+		}
+		if msg != "" {
 			return fmt.Errorf("%w: %s", err, tailString(msg, 2048))
 		}
 		return err
 	}
 	return nil
+}
+
+// isNoMatchingTables recognises pg_dump's refusal to dump a --table
+// pattern that matched nothing:
+//
+//	pg_dump: error: no matching tables were found
+//
+// Matched on the diagnostic rather than on the exit status, because
+// pg_dump exits 1 for every failure it has — a dead connection, a
+// permission denial and an empty pattern are indistinguishable by
+// code alone.
+// isRoleMissing recognises PostgreSQL's refusal when the role we
+// asked to connect as is not defined in the restored cluster:
+//
+//	FATAL:  role "postgres" does not exist
+//
+// Matched on the diagnostic for the same reason as
+// isNoMatchingTables: pg_dump exits 1 for everything.
+func isRoleMissing(stderr string) bool {
+	l := strings.ToLower(stderr)
+	return strings.Contains(l, "does not exist") && strings.Contains(l, "role ")
+}
+
+func isNoMatchingTables(stderr string) bool {
+	return strings.Contains(strings.ToLower(stderr), "no matching tables were found")
 }
 
 // buildPGDumpArgs assembles the pg_dump argv for a sandbox dump.  The
@@ -446,6 +578,26 @@ func (s *Sandbox) Stop(ctx context.Context) error {
 
 	s.cleanup()
 	return stopErr
+}
+
+// stopPostmaster is the Start failure path's best-effort
+// `pg_ctl -m fast stop`. It runs on a fresh context bounded by
+// ShutdownTimeout because the caller's ctx may be the very thing that
+// was cancelled; a stop against an absent postmaster is a harmless
+// no-op whose error is intentionally discarded.
+func (s *Sandbox) stopPostmaster() {
+	timeout := s.opts.ShutdownTimeout
+	if timeout == 0 {
+		timeout = DefaultShutdownTimeout
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	_ = exec.CommandContext(ctx, s.pgCtl, "stop",
+		"-D", s.opts.DataDir,
+		"-m", "fast",
+		"-w",
+		"-t", fmt.Sprintf("%d", int(timeout/time.Second)),
+	).Run()
 }
 
 // cleanup is called from both the Stop happy path and the Start

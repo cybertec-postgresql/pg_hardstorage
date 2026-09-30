@@ -372,12 +372,12 @@ func TestManifestCorruption_DispatchesInContainerFlip(t *testing.T) {
 func TestManifestCorruption_NoManifestSkipsCleanly(t *testing.T) {
 	// Early-soak window: the repo has no committed backups
 	// yet, so manifests/**/manifest.json is empty.  The fault
-	// must skip cleanly (no error, no write) — the soak's first
-	// run found that the previous "no manifest.json" error
-	// counted every transient pre-first-backup tick as a
-	// fault_apply_failed event.  A vacuous skip is the
-	// correct outcome: there is nothing to corrupt, so the
-	// fault is satisfied.
+	// must not write and must not claim to be applied: it returns
+	// ErrNotApplicable, which the soak records as
+	// fault_skipped_not_applicable (not fault_apply_failed — the
+	// soak's first run found a plain error counted every
+	// pre-first-backup tick as one, and not a vacuous "applied",
+	// which scored damage that never happened as survived).
 	repo := &inject.FakeTarget{
 		NameStr: "repo-0",
 		RoleStr: "repo",
@@ -388,8 +388,8 @@ func TestManifestCorruption_NoManifestSkipsCleanly(t *testing.T) {
 	ts := inject.NewStaticTargetSet([]inject.Target{repo}, 42)
 	_, err := inject.DefaultRegistry.Apply(context.Background(),
 		"manifest_targeted_corruption(target=repo)", ts)
-	if err != nil {
-		t.Errorf("expected clean skip when no manifest exists; got %v", err)
+	if !errors.Is(err, inject.ErrNotApplicable) {
+		t.Errorf("expected ErrNotApplicable when no manifest exists (nothing was corrupted); got %v", err)
 	}
 	if w := repo.Written(); len(w) != 0 {
 		t.Errorf("no manifest → no writes; got %v", w)
@@ -533,8 +533,8 @@ func TestTruncatedWALSegment_NoFilesSkipsCleanly(t *testing.T) {
 	ts := inject.NewStaticTargetSet([]inject.Target{repo}, 42)
 	_, err := inject.DefaultRegistry.Apply(context.Background(),
 		"truncated_wal_segment(target=repo)", ts)
-	if err != nil {
-		t.Errorf("expected clean skip when no WAL exists; got %v", err)
+	if !errors.Is(err, inject.ErrNotApplicable) {
+		t.Errorf("expected ErrNotApplicable when no WAL exists (nothing was truncated); got %v", err)
 	}
 	// One exec (the find that returned ""); NO truncate.
 	calls := repo.ExecCalls()

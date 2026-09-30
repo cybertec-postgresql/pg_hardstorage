@@ -117,7 +117,7 @@ For Docker-free runs, pass --skip-verify; the report's RTO actual
 	c.Flags().StringArrayVar(&tablespaceMapping, "tablespace-mapping", nil,
 		"redirect a tablespace: --tablespace-mapping=<old-abs-path>=<new-abs-path> (repeatable). "+
 			"Required when the backup has non-default tablespaces: without it they would be "+
-			"restored to their original absolute paths, overwriting live data on the source host")
+			"restored to their original absolute paths, overwriting live data on the source host. The mapped dirs are drill scratch: mounted into the verify sandbox at the same path and removed (or, if they pre-existed, emptied) at teardown unless --keep")
 	c.Flags().StringVar(&tempBaseDir, "temp-base", "",
 		"parent directory for the temporary target dir (default: $TMPDIR)")
 	c.Flags().BoolVar(&keepTargetDir, "keep", false,

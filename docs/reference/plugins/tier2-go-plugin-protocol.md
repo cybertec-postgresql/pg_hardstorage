@@ -216,14 +216,11 @@ protocol; the v1 contract is the one-shot shape.
 
 ## Per-RPC timeouts
 
-Default RPC timeout is **30 seconds**.  Configurable per-
-plugin via `pg_hardstorage.yaml`:
-
-```yaml
-plugins:
-  - name: my-storage
-    timeout: 5m
-```
+The RPC timeout is a fixed **30 seconds** per call; it is not
+configurable today. `pg_hardstorage.yaml` has no `plugins:` section —
+adding one makes the configuration fail to load. A plugin that needs
+longer for an operation should do the slow work asynchronously or
+split it across calls.
 
 Slow plugins (cloud SDK init, network round-trip) push
 this up.  No upper bound enforced by the host — the

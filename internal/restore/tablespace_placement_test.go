@@ -93,6 +93,7 @@ func TestRestore_NonDefaultTablespace_LandsAtLocation(t *testing.T) {
 		TablespaceMap: "16384 " + tsLocation + "\n",
 	}
 	store := backup.NewManifestStore(sp)
+	plantArchivedWAL(t, sp, m.Deployment, m.Timeline)
 	if err := store.Commit(context.Background(), m, signer, backup.CommitOptions{}); err != nil {
 		t.Fatalf("commit: %v", err)
 	}

@@ -51,11 +51,14 @@ import (
 
 func init() {
 	output.DefaultSinkRegistry.Register("cef", NewFromSpec)
+	output.DefaultSinkRegistry.DeclareConfigKeys("cef", "destination", "product", "vendor", "version")
 }
 
-// Sink writes CEF lines to a single file.  Re-opens on Emit if the
-// file has been rotated out from under us (logrotate copytruncate
-// or move-and-create) — same posture as syslog/email sinks.
+// Sink writes CEF lines to a single file.  Survives logrotate:
+// copytruncate needs nothing (O_APPEND writes follow the truncated
+// end), and move-and-create is detected before every write by
+// comparing the open fd against whatever the path now names, then
+// re-opening.
 type Sink struct {
 	name        string
 	destination string // resolved file path
@@ -65,7 +68,7 @@ type Sink struct {
 	minSeverity output.Severity
 
 	mu     sync.Mutex
-	w      io.WriteCloser
+	w      *os.File
 	closed bool
 }
 
@@ -143,6 +146,13 @@ func (s *Sink) Emit(_ context.Context, ev *output.Event) error {
 	if !ev.Severity.AtLeast(s.minSeverity) {
 		return nil
 	}
+	if s.w != nil && s.rotated() {
+		// The path now names a different file (or none): the fd we
+		// hold points at the renamed file the forwarder no longer
+		// reads. Drop it and open the path afresh.
+		_ = s.w.Close()
+		s.w = nil
+	}
 	if s.w == nil {
 		f, err := os.OpenFile(s.destination, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 		if err != nil {
@@ -159,6 +169,22 @@ func (s *Sink) Emit(_ context.Context, ev *output.Event) error {
 		return fmt.Errorf("cef: write: %w", err)
 	}
 	return nil
+}
+
+// rotated reports whether s.destination no longer names the file s.w
+// has open — logrotate's move-and-create, or a plain move/delete. A
+// stat error on our own fd is treated as rotated too: re-opening is
+// the cheap, safe answer. Caller holds s.mu.
+func (s *Sink) rotated() bool {
+	cur, err := os.Stat(s.destination)
+	if err != nil {
+		return true
+	}
+	open, err := s.w.Stat()
+	if err != nil {
+		return true
+	}
+	return !os.SameFile(cur, open)
 }
 
 // Close implements output.Sink.

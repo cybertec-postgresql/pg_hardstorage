@@ -180,3 +180,34 @@ func Containing(history []Switch, current uint32, lsn pglogrepl.LSN, segSize int
 	}
 	return current
 }
+
+// LeavesAt returns the LSN at which the lineage described by history
+// (the history file of some timeline N) stops sharing WAL with timeline
+// ancestor — the most recent switchpoint of any timeline at or below
+// ancestor. ok=false when history has no such entry (an empty history,
+// or ancestor older than every entry), i.e. nothing is known.
+//
+// Why "at or below" rather than exactly ancestor: ancestor may be a
+// SIBLING branch that is not in N's lineage at all (both forked from a
+// common parent). N shares with such a sibling only what both inherited
+// from the parent, which ends no later than where N's lineage left that
+// parent — the nearest entry below. Everything ancestor holds past the
+// returned LSN is diverged history, not a prefix of N.
+//
+// This is the bound a streamer resuming "from the previous timeline's
+// frontier" must respect. A frontier past it names WAL the new lineage
+// does not contain; resuming there skips the new timeline's WAL between
+// the fork and the frontier, and nothing downstream notices.
+func LeavesAt(history []Switch, ancestor uint32) (pglogrepl.LSN, bool) {
+	var (
+		best  pglogrepl.LSN
+		found bool
+	)
+	for _, e := range history {
+		if e.Timeline > ancestor {
+			break // entries strictly increase (ParseHistory enforces it)
+		}
+		best, found = e.SwitchPoint, true
+	}
+	return best, found
+}

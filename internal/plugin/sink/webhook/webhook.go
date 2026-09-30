@@ -36,6 +36,7 @@ import (
 
 func init() {
 	output.DefaultSinkRegistry.Register("webhook", NewFromSpec)
+	output.DefaultSinkRegistry.DeclareConfigKeys("webhook", "auth_header", "content_type", "method", "timeout", "url")
 }
 
 // Sink POSTs JSON-encoded events to a fixed URL.

@@ -30,13 +30,17 @@ package bundle
 
 import (
 	"archive/tar"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"path"
+	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -366,6 +370,21 @@ func Import(ctx context.Context, r io.Reader, sp storage.StoragePlugin, opts Imp
 	var totalBytes int64
 	var adoptedChunks []string
 
+	// Manifests, replicas, attestations and WAL files are STAGED, not
+	// written as they stream past: they land in the repository only
+	// after every chunk has. Export writes manifests before chunks, so
+	// writing in tar order made an import that aborted part-way (a
+	// truncated transfer, a chunk failing its content check, a full
+	// disk) leave manifests visible in the repository over chunks that
+	// never arrived — backups that list, verify their signature and
+	// fail at restore. Staging goes to a private temp directory rather
+	// than memory: a deployment's manifests can be large.
+	stage, err := newImportStage()
+	if err != nil {
+		return nil, err
+	}
+	defer stage.cleanup()
+
 	for {
 		hdr, err := tr.Next()
 		if errors.Is(err, io.EOF) {
@@ -464,19 +483,17 @@ func Import(ctx context.Context, r io.Reader, sp storage.StoragePlugin, opts Imp
 			// land in the repo when the operator asked us to check.)
 			// Replica/attestation/WAL entries are not ed25519 backup
 			// manifests and stream as-is.
+			body, err := storage.ReadAllLimited(tr, MaxEntryBytes)
+			if err != nil {
+				return nil, fmt.Errorf("bundle: read %s: %w", clean, err)
+			}
 			if opts.Verifier != nil && isSignedBackupManifestKey(clean) {
-				body, err := io.ReadAll(io.LimitReader(tr, MaxEntryBytes+1))
-				if err != nil {
-					return nil, fmt.Errorf("bundle: read %s: %w", clean, err)
-				}
 				if _, verr := backup.ParseAndVerify(body, opts.Verifier); verr != nil {
 					return nil, fmt.Errorf("bundle: reject %s: manifest signature verification failed: %w", clean, verr)
 				}
-				if _, err := putIfNotExists(ctx, sp, clean, strings_NewReader(string(body))); err != nil {
-					return nil, fmt.Errorf("bundle: write %s: %w", clean, err)
-				}
-			} else if _, err := putIfNotExists(ctx, sp, clean, tr); err != nil {
-				return nil, fmt.Errorf("bundle: write %s: %w", clean, err)
+			}
+			if err := stage.add(clean, body); err != nil {
+				return nil, err
 			}
 		default:
 			// Unknown top-level: skip.  Future bundle versions
@@ -486,6 +503,41 @@ func Import(ctx context.Context, r io.Reader, sp storage.StoragePlugin, opts Imp
 	}
 	if bm.Schema == "" {
 		return nil, errors.New("bundle: archive did not contain bundle.json")
+	}
+
+	// Every chunk is in. Fence the adopted chunks against a concurrent
+	// `repo gc --apply` (repo.BeginCommitFence: pins them and waits out
+	// a running sweep's in-flight batch), then — before a single
+	// manifest becomes visible — confirm they are still there; failing
+	// here leaves nothing half-imported behind.
+	var adoptedHashes []repo.Hash
+	for _, k := range adoptedChunks {
+		if h, perr := repo.ParseChunkKey(k); perr == nil {
+			adoptedHashes = append(adoptedHashes, h)
+		}
+	}
+	fence, ferr := repo.BeginCommitFence(ctx, sp, adoptedHashes, repo.FenceOptions{Owner: "bundle import"})
+	if ferr != nil {
+		return nil, fmt.Errorf("bundle: %w", ferr)
+	}
+	if swept, err := sweptAdopted(ctx, sp, adoptedChunks); err != nil {
+		return nil, err
+	} else if len(swept) > 0 {
+		return nil, fmt.Errorf("bundle: %d chunk(s) this import adopted (already present, not rewritten) "+
+			"vanished before its manifests were written — a concurrent `repo gc --apply` swept them: %s; "+
+			"no manifest from this bundle was written; re-run the import: it is idempotent, and the re-run "+
+			"writes the missing chunks for real",
+			len(swept), strings.Join(swept, ", "))
+	}
+
+	// Now the staged manifests / WAL files, primary backup manifests
+	// LAST so that a backup becomes visible only after its replica,
+	// attestation and WAL companions.
+	if err := stage.commit(ctx, sp); err != nil {
+		return nil, err
+	}
+	if err := fence.Confirm(ctx); err != nil {
+		return nil, fmt.Errorf("bundle: %w; re-run the import: it is idempotent, and the re-run writes the missing chunks for real", err)
 	}
 
 	// Import-side half of the dedup-vs-GC gate. An adopted chunk was
@@ -500,14 +552,9 @@ func Import(ctx context.Context, r io.Reader, sp storage.StoragePlugin, opts Imp
 	// FAIL LOUDLY naming it. The remedy is simply re-running the
 	// import: it is idempotent, the manifests are already in place,
 	// and the re-run finds the chunk absent and writes it for real.
-	var swept []string
-	for _, key := range adoptedChunks {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		if _, err := sp.Stat(ctx, key); err != nil && isNotFound(err) {
-			swept = append(swept, key)
-		}
+	swept, err := sweptAdopted(ctx, sp, adoptedChunks)
+	if err != nil {
+		return nil, err
 	}
 	if len(swept) > 0 {
 		return nil, fmt.Errorf("bundle: %d chunk(s) this import adopted (already present, not rewritten) "+
@@ -518,6 +565,78 @@ func Import(ctx context.Context, r io.Reader, sp storage.StoragePlugin, opts Imp
 	}
 	return &bm, nil
 }
+
+// sweptAdopted returns the adopted chunk keys that are no longer present.
+func sweptAdopted(ctx context.Context, sp storage.StoragePlugin, keys []string) ([]string, error) {
+	var swept []string
+	for _, key := range keys {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if _, err := sp.Stat(ctx, key); err != nil && isNotFound(err) {
+			swept = append(swept, key)
+		}
+	}
+	return swept, nil
+}
+
+// importStage holds the non-chunk entries of a bundle on local disk until
+// every chunk has been written. See Import.
+type importStage struct {
+	dir     string
+	entries []stagedEntry
+}
+
+type stagedEntry struct {
+	key  string
+	path string
+}
+
+func newImportStage() (*importStage, error) {
+	dir, err := os.MkdirTemp("", "pg_hardstorage-bundle-import-*")
+	if err != nil {
+		return nil, fmt.Errorf("bundle: create staging directory: %w", err)
+	}
+	return &importStage{dir: dir}, nil
+}
+
+func (s *importStage) add(key string, body []byte) error {
+	path := filepath.Join(s.dir, strconv.Itoa(len(s.entries)))
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		return fmt.Errorf("bundle: stage %s: %w", key, err)
+	}
+	s.entries = append(s.entries, stagedEntry{key: key, path: path})
+	return nil
+}
+
+// commit writes the staged entries, primary backup manifests last.
+func (s *importStage) commit(ctx context.Context, sp storage.StoragePlugin) error {
+	ordered := make([]stagedEntry, 0, len(s.entries))
+	var primaries []stagedEntry
+	for _, e := range s.entries {
+		if isSignedBackupManifestKey(e.key) {
+			primaries = append(primaries, e)
+			continue
+		}
+		ordered = append(ordered, e)
+	}
+	ordered = append(ordered, primaries...)
+	for _, e := range ordered {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		body, err := os.ReadFile(e.path)
+		if err != nil {
+			return fmt.Errorf("bundle: read staged %s: %w", e.key, err)
+		}
+		if _, err := putIfNotExists(ctx, sp, e.key, bytes.NewReader(body)); err != nil {
+			return fmt.Errorf("bundle: write %s: %w", e.key, err)
+		}
+	}
+	return nil
+}
+
+func (s *importStage) cleanup() { _ = os.RemoveAll(s.dir) }
 
 // isSignedBackupManifestKey reports whether key names a primary backup
 // manifest (manifests/<dep>/backups/<id>/manifest.json) — the only

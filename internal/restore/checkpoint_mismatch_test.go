@@ -57,6 +57,7 @@ func TestRestore_ResumeWithDifferentBackupRefused(t *testing.T) {
 		StartedAt:   ts, StoppedAt: ts.Add(30 * time.Second),
 		BackupLabel: "START WAL LOCATION: 0/3000028\n", Files: []backup.FileEntry{},
 	}
+	plantArchivedWAL(t, sp, m.Deployment, m.Timeline)
 	if err := backup.NewManifestStore(sp).Commit(context.Background(), m, signer, backup.CommitOptions{}); err != nil {
 		t.Fatalf("commit B: %v", err)
 	}

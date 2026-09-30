@@ -47,6 +47,7 @@ import (
 
 func init() {
 	output.DefaultSinkRegistry.Register("splunk-hec", NewFromSpec)
+	output.DefaultSinkRegistry.DeclareConfigKeys("splunk-hec", "host", "index", "insecure_skip_verify", "source", "sourcetype", "timeout", "token", "url")
 }
 
 // Sink emits events to a Splunk HEC endpoint.

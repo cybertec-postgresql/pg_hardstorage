@@ -40,6 +40,7 @@ import (
 
 	"github.com/jackc/pglogrepl"
 
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/logical/commitlsn"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/logical/sinks/chunked"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/pg/logicalreceiver"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
@@ -212,7 +213,7 @@ func TestSink_IdenticalRetryIsStillIdempotent(t *testing.T) {
 		}
 		return s
 	}
-	rec := logicalreceiver.Record{WALStart: 0x1000, Data: bytes.Repeat([]byte("a"), 64)}
+	rec := logicalreceiver.Record{WALStart: 0x1000, Data: append(commitlsn.Message(0x1040), bytes.Repeat([]byte("a"), 64)...)}
 
 	s1 := mk()
 	if err := s1.OnRecord(ctx, rec); err != nil {

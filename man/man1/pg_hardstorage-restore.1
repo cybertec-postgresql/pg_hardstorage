@@ -25,7 +25,12 @@ half is what verifies the manifest signature.
 Refuses to write into a non-empty target unless --force is passed.
 Use --preview to inspect what a real restore would do without
 touching disk. Use --verify=auto|skip|require to control the post-
-restore pg_verifybackup gate.
+restore pg_verifybackup gate; it runs on the directory exactly as
+restored, before the --verify-restore boot test. The boot test starts
+PostgreSQL in the target with a private socket, log and trust-only
+pg_hba (the restored pg_hba.conf is not consulted) and puts back
+postgresql.auto.conf afterwards; what remains is what a first start
+leaves (recovery replayed, backup_label renamed to backup_label.old).
 
 .PP
 PITR (replaying WAL up to a target):
@@ -41,7 +46,10 @@ PITR (replaying WAL up to a target):
 When any of --to / --to-lsn / --to-name is set, recovery.signal is
 dropped in the target dir and a recovery\fItarget\fP* block is appended
 to postgresql.auto.conf. The restore_command points back at this
-binary's wal-fetch shim.
+binary's wal-fetch shim. Recovery settings a previous restore left in
+the backed-up postgresql.auto.conf are removed, and every recovery
+target the new block does not set is reset to '', so inherited
+targets never combine with the requested one.
 
 
 .SH OPTIONS
@@ -107,7 +115,7 @@ binary's wal-fetch shim.
 
 .PP
 \fB--skip-gap-check\fP[=false]
-	bypass the+ WAL-gap pre-flight (operator override; the override is audit-logged)
+	bypass the WAL pre-flights: known WAL gaps, missing timeline history, and a backup whose WAL exists nowhere (operator override; the override is audit-logged)
 
 .PP
 \fB--tablespace-mapping\fP=[]

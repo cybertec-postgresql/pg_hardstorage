@@ -36,6 +36,7 @@ import (
 
 func init() {
 	output.DefaultSinkRegistry.Register("teams", NewFromSpec)
+	output.DefaultSinkRegistry.DeclareConfigKeys("teams", "min_severity", "timeout", "webhook_url")
 }
 
 // Sink emits to a Teams Incoming Webhook.

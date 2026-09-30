@@ -62,6 +62,7 @@ import (
 
 func init() {
 	output.DefaultSinkRegistry.Register("servicenow", NewFromSpec)
+	output.DefaultSinkRegistry.DeclareConfigKeys("servicenow", "active_states", "assignment_group", "bearer_token", "caller_id", "category", "instance_url", "password", "ticket_strategy", "username")
 }
 
 // TicketStrategy controls per-event behaviour.

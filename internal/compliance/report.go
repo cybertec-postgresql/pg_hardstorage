@@ -88,12 +88,43 @@ type Report struct {
 	Chain        *ChainSection        `json:"chain,omitempty"`
 	WORM         *WORMSection         `json:"worm,omitempty"`
 
+	// SignatureFailed lists manifests in the scoped deployments that
+	// could not be loaded and signature-verified. They are reported
+	// regardless of window: an unverified manifest's StoppedAt is
+	// itself unauthenticated, so windowing on it would let a forged
+	// timestamp hide the manifest. The encryption and replica
+	// controls fail while any are present — their coverage figures
+	// exclude these manifests and cannot be established.
+	SignatureFailed []SignatureFailure `json:"signature_failed,omitempty"`
+
+	// SectionErrors records sections whose underlying read (manifest
+	// walk, audit-log search, chain verify) failed. The section's
+	// counters are then incomplete, and every control mapped onto it
+	// fails rather than reading zero-because-unreadable as
+	// zero-because-nothing-happened.
+	SectionErrors []SectionError `json:"section_errors,omitempty"`
+
 	// Controls is the framework-mapped assessment derived from the
 	// other sections.  Populated by AssessControls — Generate runs
 	// it as the final pass so the controls reflect every other
 	// section's data.  Renderers project this into a "verdict
 	// table" (Markdown / PDF) or a flat array (JSON / CSV).
 	Controls *ControlSection `json:"controls,omitempty"`
+}
+
+// SignatureFailure is one manifest the report could not verify.
+// The backup ID is not recorded: it lives inside the manifest body,
+// and an unverified body is exactly what must not be trusted.
+type SignatureFailure struct {
+	Deployment string `json:"deployment"`
+	Error      string `json:"error"`
+}
+
+// SectionError is one section whose evidence could not be read.
+// Section uses the same names as Control.Section.
+type SectionError struct {
+	Section string `json:"section"`
+	Error   string `json:"error"`
 }
 
 // RepoSummary is the static metadata captured from HSREPO.
@@ -304,7 +335,9 @@ var destructiveOps = map[string]struct{}{
 // Generate runs one report for sp + meta over the window in opts.
 // Every section is computed independently; failures in one
 // section don't poison the rest — the report's job is to surface
-// as much truth as the underlying data allows.
+// as much truth as the underlying data allows. A section's failure
+// is itself part of that truth: it lands in Report.SectionErrors
+// and fails the controls built on that section.
 func Generate(ctx context.Context, sp storage.StoragePlugin, meta *repo.Metadata, repoURL string, opts Options) (*Report, error) {
 	if sp == nil {
 		return nil, errors.New("compliance: nil StoragePlugin")
@@ -354,34 +387,45 @@ func Generate(ctx context.Context, sp storage.StoragePlugin, meta *repo.Metadata
 	// Backup-derived sections share the same windowed manifest
 	// walk; collect them once.
 	if !opts.SkipBackups || !opts.SkipEncryption || !opts.SkipReplicas {
-		windowed, byKEKRef, schemes, replicaIdx, replicaWindowed := collectWindowedManifests(ctx, sp, opts)
+		ws := collectWindowedManifests(ctx, sp, opts)
+		r.SignatureFailed = ws.failures
 		if !opts.SkipBackups {
-			r.Backups = buildBackupSection(windowed)
+			r.Backups = buildBackupSection(ws.manifests)
+			r.noteSectionError("backups", ws.walkErr)
 		}
 		if !opts.SkipEncryption {
-			r.Encryption = buildEncryptionSection(windowed, byKEKRef, schemes)
+			r.Encryption = buildEncryptionSection(ws.manifests, ws.byKEKRef, ws.schemes)
+			r.noteSectionError("encryption", ws.walkErr)
 		}
 		if !opts.SkipReplicas {
-			r.Replicas = buildReplicaSection(windowed, replicaIdx, replicaWindowed)
+			r.Replicas = buildReplicaSection(ws.manifests, ws.replicaIdx, ws.replicaWindowed)
+			r.noteSectionError("replicas", ws.walkErr)
+			r.noteSectionError("replicas", ws.replicaErr)
 		}
 	}
 
 	store := audit.NewStore(sp)
 
+	var err error
 	if !opts.SkipKEKLifecycle {
-		r.KEKLifecycle = buildKEKLifecycleSection(ctx, store, opts)
+		r.KEKLifecycle, err = buildKEKLifecycleSection(ctx, store, opts)
+		r.noteSectionError("kek_lifecycle", err)
 	}
 	if !opts.SkipApprovals {
-		r.Approvals = buildApprovalSection(ctx, store, opts)
+		r.Approvals, err = buildApprovalSection(ctx, store, opts)
+		r.noteSectionError("approvals", err)
 	}
 	if !opts.SkipVerification {
-		r.Verification = buildVerificationSection(ctx, store, opts)
+		r.Verification, err = buildVerificationSection(ctx, store, opts)
+		r.noteSectionError("verification", err)
 	}
 	if !opts.SkipHolds {
-		r.Holds = buildHoldSection(ctx, store, opts)
+		r.Holds, err = buildHoldSection(ctx, store, opts)
+		r.noteSectionError("holds", err)
 	}
 	if !opts.SkipChain {
-		r.Chain = buildChainSection(ctx, sp, store, opts, now)
+		r.Chain, err = buildChainSection(ctx, sp, store, opts, now)
+		r.noteSectionError("chain", err)
 	}
 	if !opts.SkipWORM {
 		r.WORM = buildWORMSection(meta)
@@ -399,36 +443,50 @@ func Generate(ctx context.Context, sp storage.StoragePlugin, meta *repo.Metadata
 	return r, nil
 }
 
-// windowedManifestSet is the shared collection step: walks all
+// windowedManifestSet is the result of the shared collection step.
+type windowedManifestSet struct {
+	manifests       []*backup.Manifest
+	byKEKRef        map[string]int
+	schemes         map[string]struct{}
+	replicaIdx      map[string]struct{}
+	replicaWindowed int
+
+	// failures are manifests that did not load + verify; see
+	// Report.SignatureFailed for why they are not windowed.
+	failures []SignatureFailure
+	// walkErr is set when the walk itself stopped early (deployment
+	// enumeration failed, context cancelled): every manifest-derived
+	// section is then incomplete.
+	walkErr error
+	// replicaErr is set when the replica index listing failed; only
+	// the replica section depends on it.
+	replicaErr error
+}
+
+// collectWindowedManifests is the shared collection step: walks all
 // deployments (or just one when opts.DeploymentFilter is set),
 // keeps every manifest with StoppedAt in [Since, Until). The
 // returned slices are deterministic by (deployment, backup_id)
 // so test output is stable.
-func collectWindowedManifests(
-	ctx context.Context,
-	sp storage.StoragePlugin,
-	opts Options,
-) (
-	windowed []*backup.Manifest,
-	byKEKRef map[string]int,
-	schemes map[string]struct{},
-	replicaIdx map[string]struct{},
-	replicaWindowed int,
-) {
+func collectWindowedManifests(ctx context.Context, sp storage.StoragePlugin, opts Options) windowedManifestSet {
 	store := backup.NewManifestStore(sp)
-	byKEKRef = map[string]int{}
-	schemes = map[string]struct{}{}
+	ws := windowedManifestSet{
+		byKEKRef: map[string]int{},
+		schemes:  map[string]struct{}{},
+	}
 
 	deployments, err := store.Deployments(ctx)
 	if err != nil {
-		return nil, byKEKRef, schemes, nil, 0
+		ws.walkErr = fmt.Errorf("enumerate deployments: %w", err)
+		return ws
 	}
 	sort.Strings(deployments)
 
 	// Pre-load the replica index once.
-	replicaIdx = map[string]struct{}{}
+	ws.replicaIdx = map[string]struct{}{}
 	for info, lerr := range sp.List(ctx, "manifests/_replicas/") {
 		if lerr != nil {
+			ws.replicaErr = fmt.Errorf("list replica index: %w", lerr)
 			break
 		}
 		if !strings.HasSuffix(info.Key, ".manifest.json") {
@@ -437,7 +495,7 @@ func collectWindowedManifests(
 		base := strings.TrimPrefix(info.Key, "manifests/_replicas/")
 		id := strings.TrimSuffix(base, ".manifest.json")
 		if id != "" {
-			replicaIdx[id] = struct{}{}
+			ws.replicaIdx[id] = struct{}{}
 		}
 	}
 
@@ -446,32 +504,58 @@ func collectWindowedManifests(
 			continue
 		}
 		if err := ctx.Err(); err != nil {
-			return windowed, byKEKRef, schemes, replicaIdx, replicaWindowed
+			ws.walkErr = err
+			return ws
 		}
 		for m, lerr := range store.List(ctx, dep, opts.Verifier) {
 			if lerr != nil {
+				// The Options contract: an unverifiable manifest
+				// shows up as signature_failed, it does not vanish
+				// from the population the coverage numbers describe.
+				ws.failures = append(ws.failures, SignatureFailure{Deployment: dep, Error: lerr.Error()})
 				continue
 			}
 			if m.StoppedAt.Before(opts.Since) || !m.StoppedAt.Before(opts.Until) {
 				continue
 			}
-			windowed = append(windowed, m)
-			if _, ok := replicaIdx[m.BackupID]; ok {
-				replicaWindowed++
+			ws.manifests = append(ws.manifests, m)
+			if _, ok := ws.replicaIdx[m.BackupID]; ok {
+				ws.replicaWindowed++
 			}
 			if m.Encryption != nil {
 				if m.Encryption.KEKRef == "" {
-					byKEKRef["<empty-ref>"]++
+					ws.byKEKRef["<empty-ref>"]++
 				} else {
-					byKEKRef[m.Encryption.KEKRef]++
+					ws.byKEKRef[m.Encryption.KEKRef]++
 				}
 				if m.Encryption.Scheme != "" {
-					schemes[m.Encryption.Scheme] = struct{}{}
+					ws.schemes[m.Encryption.Scheme] = struct{}{}
 				}
 			}
 		}
 	}
-	return windowed, byKEKRef, schemes, replicaIdx, replicaWindowed
+	return ws
+}
+
+// noteSectionError records err against section; nil is a no-op so
+// call sites stay one line per builder.
+func (r *Report) noteSectionError(section string, err error) {
+	if err == nil {
+		return
+	}
+	r.SectionErrors = append(r.SectionErrors, SectionError{Section: section, Error: err.Error()})
+}
+
+// sectionError returns the recorded read errors for section, joined,
+// and whether there were any.
+func (r *Report) sectionError(section string) (string, bool) {
+	var msgs []string
+	for _, se := range r.SectionErrors {
+		if se.Section == section {
+			msgs = append(msgs, se.Error)
+		}
+	}
+	return strings.Join(msgs, "; "), len(msgs) > 0
 }
 
 // buildBackupSection aggregates per-deployment + per-type counts
@@ -565,7 +649,7 @@ func buildReplicaSection(ms []*backup.Manifest, replicaIdx map[string]struct{}, 
 // buildKEKLifecycleSection walks the audit chain for kms.* events
 // in the window. Distills each into a KEKEvent suitable for
 // inclusion in the report (+ a Markdown-friendly tabular view).
-func buildKEKLifecycleSection(ctx context.Context, store *audit.Store, opts Options) *KEKLifecycleSection {
+func buildKEKLifecycleSection(ctx context.Context, store *audit.Store, opts Options) (*KEKLifecycleSection, error) {
 	out := &KEKLifecycleSection{}
 	events, err := store.Search(ctx, audit.ListFilters{
 		ActionPrefix: "kms.",
@@ -573,7 +657,7 @@ func buildKEKLifecycleSection(ctx context.Context, store *audit.Store, opts Opti
 		Until:        opts.Until,
 	})
 	if err != nil {
-		return out
+		return out, fmt.Errorf("audit search kms.*: %w", err)
 	}
 	for _, ev := range events {
 		ke := KEKEvent{
@@ -611,7 +695,7 @@ func buildKEKLifecycleSection(ctx context.Context, store *audit.Store, opts Opti
 	sort.SliceStable(out.Events, func(i, j int) bool {
 		return out.Events[i].Timestamp.After(out.Events[j].Timestamp)
 	})
-	return out
+	return out, nil
 }
 
 // buildApprovalSection walks the approval-event audit chain +
@@ -620,7 +704,11 @@ func buildKEKLifecycleSection(ctx context.Context, store *audit.Store, opts Opti
 // which can be expensive on huge fleets;+ ships the
 // count-and-classify view, with `approval list` as the
 // per-request drill-down.
-func buildApprovalSection(ctx context.Context, store *audit.Store, opts Options) *ApprovalSection {
+//
+// A search error is returned, not swallowed: DestructiveOps == 0 is
+// what the approvals control reads as "nothing to approve" → pass,
+// so an unreadable audit log must not produce that zero silently.
+func buildApprovalSection(ctx context.Context, store *audit.Store, opts Options) (*ApprovalSection, error) {
 	out := &ApprovalSection{
 		ByStatus:        map[string]int{},
 		DestructiveByOp: map[string]int{},
@@ -631,7 +719,10 @@ func buildApprovalSection(ctx context.Context, store *audit.Store, opts Options)
 		Since:        opts.Since,
 		Until:        opts.Until,
 	})
-	if err == nil {
+	var errs []error
+	if err != nil {
+		errs = append(errs, fmt.Errorf("audit search approval.*: %w", err))
+	} else {
 		for _, ev := range apprEvents {
 			switch ev.Action {
 			case "approval.request":
@@ -657,7 +748,9 @@ func buildApprovalSection(ctx context.Context, store *audit.Store, opts Options)
 		Since: opts.Since,
 		Until: opts.Until,
 	})
-	if err == nil {
+	if err != nil {
+		errs = append(errs, fmt.Errorf("audit search destructive ops: %w", err))
+	} else {
 		for _, ev := range allEvents {
 			if _, ok := destructiveOps[ev.Action]; ok {
 				out.DestructiveOps++
@@ -665,14 +758,20 @@ func buildApprovalSection(ctx context.Context, store *audit.Store, opts Options)
 			}
 		}
 	}
-	return out
+	return out, errors.Join(errs...)
 }
 
 // buildVerificationSection rolls up verify.run + verify.* audit
 // events emitted by the verify command. The command's success
 // Result is not persisted, so these audit events are the only
 // verify-run signal the report can see.
-func buildVerificationSection(ctx context.Context, store *audit.Store, opts Options) *VerificationSection {
+//
+// With a DeploymentFilter the totals and outcomes are scoped like the
+// per-deployment rows: the verification controls judge the filtered
+// deployment, so another deployment's runs must not decide them.
+// Events without a deployment are then excluded — they cannot be
+// attributed to the filtered deployment.
+func buildVerificationSection(ctx context.Context, store *audit.Store, opts Options) (*VerificationSection, error) {
 	out := &VerificationSection{
 		ByOutcome: map[string]int{},
 	}
@@ -682,10 +781,14 @@ func buildVerificationSection(ctx context.Context, store *audit.Store, opts Opti
 		Until:        opts.Until,
 	})
 	if err != nil {
-		return out
+		return out, fmt.Errorf("audit search verify.*: %w", err)
 	}
 	per := map[string]*DeploymentVerifySummary{}
 	for _, ev := range events {
+		dep := ev.Subject.Deployment
+		if opts.DeploymentFilter != "" && opts.DeploymentFilter != dep {
+			continue
+		}
 		out.TotalRuns++
 		// Outcome lives in the Body. Best-effort extraction; an
 		// unrecognised event still bumps TotalRuns.
@@ -694,11 +797,7 @@ func buildVerificationSection(ctx context.Context, store *audit.Store, opts Opti
 			outcome = v
 		}
 		out.ByOutcome[outcome]++
-		dep := ev.Subject.Deployment
 		if dep == "" {
-			continue
-		}
-		if opts.DeploymentFilter != "" && opts.DeploymentFilter != dep {
 			continue
 		}
 		row := per[dep]
@@ -720,11 +819,11 @@ func buildVerificationSection(ctx context.Context, store *audit.Store, opts Opti
 	}
 	sort.Slice(rows, func(i, j int) bool { return rows[i].Deployment < rows[j].Deployment })
 	out.ByDeployment = rows
-	return out
+	return out, nil
 }
 
 // buildHoldSection counts hold lifecycle events.
-func buildHoldSection(ctx context.Context, store *audit.Store, opts Options) *HoldSection {
+func buildHoldSection(ctx context.Context, store *audit.Store, opts Options) (*HoldSection, error) {
 	out := &HoldSection{}
 	events, err := store.Search(ctx, audit.ListFilters{
 		ActionPrefix: "hold.",
@@ -732,7 +831,7 @@ func buildHoldSection(ctx context.Context, store *audit.Store, opts Options) *Ho
 		Until:        opts.Until,
 	})
 	if err != nil {
-		return out
+		return out, fmt.Errorf("audit search hold.*: %w", err)
 	}
 	for _, ev := range events {
 		switch ev.Action {
@@ -744,21 +843,24 @@ func buildHoldSection(ctx context.Context, store *audit.Store, opts Options) *Ho
 			out.HoldsExpired++
 		}
 	}
-	return out
+	return out, nil
 }
 
 // buildChainSection builds the audit-chain subsection. Always
 // counts events + anchors in the window; runs VerifyChain unless
 // opts.SkipChainVerify.
-func buildChainSection(ctx context.Context, sp storage.StoragePlugin, store *audit.Store, opts Options, now time.Time) *ChainSection {
+func buildChainSection(ctx context.Context, sp storage.StoragePlugin, store *audit.Store, opts Options, now time.Time) (*ChainSection, error) {
 	out := &ChainSection{}
+	var errs []error
 
 	// Events in window via audit.Search with empty filters.
 	events, err := store.Search(ctx, audit.ListFilters{
 		Since: opts.Since,
 		Until: opts.Until,
 	})
-	if err == nil {
+	if err != nil {
+		errs = append(errs, fmt.Errorf("audit search: %w", err))
+	} else {
 		out.EventsInWindow = len(events)
 	}
 	for info, lerr := range sp.List(ctx, "audit/") {
@@ -794,13 +896,18 @@ func buildChainSection(ctx context.Context, sp storage.StoragePlugin, store *aud
 	}
 
 	if !opts.SkipChainVerify {
-		res, _ := store.VerifyChain(ctx)
+		// A verify that could not run is not a verify that passed;
+		// its error is surfaced so the chain controls say why.
+		res, verr := store.VerifyChain(ctx)
+		if verr != nil {
+			errs = append(errs, fmt.Errorf("verify chain: %w", verr))
+		}
 		out.VerifyOK = res.OK
 		out.VerifyEventsChecked = res.EventsChecked
 		out.VerifyHashMismatches = len(res.HashMismatches)
 		out.VerifyChainBreaks = len(res.ChainBreaks)
 	}
-	return out
+	return out, errors.Join(errs...)
 }
 
 // buildWORMSection captures the WORM mode + retention status.

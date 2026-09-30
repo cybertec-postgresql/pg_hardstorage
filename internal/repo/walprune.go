@@ -544,7 +544,17 @@ func oldestKeptBackupFrontier(ctx context.Context, sp storage.StoragePlugin, dep
 // listWALSegmentKeys enumerates wal/<deployment>/<tli>/<seg>.json
 // keys. Sorted lexicographically (which matches WAL chronological
 // order when timeline + segment numbers monotonically increase, the
-// normal case). Skips .tmp and timeline history files.
+// normal case).
+//
+// Only keys of the segment-manifest SHAPE are admitted — an 8-hex
+// timeline directory holding a hex-named .json — rather than
+// "any .json except a few known siblings". wal/<dep>/ also holds gap
+// records (gaps/*.json) and timeline histories (timelines/), and a
+// deny-list that forgot gaps/ read every gap record as a segment: with
+// no end_lsn it was counted as a permanent prune failure, and a record
+// that ever decoded with one would have been deleted, erasing the
+// evidence restore uses to refuse a PITR into a hole. An allow-list
+// fails safe when a new sibling tree appears.
 func listWALSegmentKeys(ctx context.Context, sp storage.StoragePlugin, deployment string) ([]string, error) {
 	prefix := "wal/" + deployment + "/"
 	var out []string
@@ -552,22 +562,39 @@ func listWALSegmentKeys(ctx context.Context, sp storage.StoragePlugin, deploymen
 		if err != nil {
 			return nil, err
 		}
-		key := info.Key
-		if !strings.HasSuffix(key, ".json") {
+		if !isWALSegmentManifestRel(strings.TrimPrefix(info.Key, prefix)) {
 			continue
 		}
-		if strings.Contains(key, ".json.tmp.") {
-			continue
-		}
-		// Skip timeline history files (wal/<dep>/timelines/<tli>.history)
-		// — they're not segment manifests.
-		if strings.Contains(key, "/timelines/") {
-			continue
-		}
-		out = append(out, key)
+		out = append(out, info.Key)
 	}
 	sort.Strings(out)
 	return out, nil
+}
+
+// isWALSegmentManifestRel reports whether rel (a key relative to
+// wal/<deployment>/) is `<8 hex tli>/<hex segment>.json`. Temp files
+// (`.json.tmp.<n>`) fail the suffix check; `.backup` / `.partial` aux
+// files and the history/, gaps/, timelines/ and unknown/ trees fail the
+// shape. The segment stem is not length-checked: PG names are 24 hex,
+// but a too-strict filter here would silently stop pruning, and hex-only
+// already excludes every non-segment sibling.
+func isWALSegmentManifestRel(rel string) bool {
+	tli, file, ok := strings.Cut(rel, "/")
+	if !ok || len(tli) != 8 || !isHexString(tli) {
+		return false
+	}
+	seg, found := strings.CutSuffix(file, ".json")
+	return found && seg != "" && isHexString(seg)
+}
+
+func isHexString(s string) bool {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !('0' <= c && c <= '9' || 'a' <= c && c <= 'f' || 'A' <= c && c <= 'F') {
+			return false
+		}
+	}
+	return true
 }
 
 // walSegmentDecode is a partial-decode shape for what WALPrune

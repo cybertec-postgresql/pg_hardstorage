@@ -14,6 +14,20 @@ tags:
 
 Re-sign a manifest with the current keypair (audited)
 
+### Synopsis
+
+Re-sign a manifest whose attestation no longer verifies with the
+current keypair — the signing-key rotation case — and record the
+re-sign in the audit chain.
+
+The manifest must be signed by a key this host TRUSTS: the current
+keyring's public key, a retired operator public key installed under
+<keyring>/trusted-keys/*.pem, or one passed with --trusted-key.
+A manifest signed by any other key is refused: its embedded key is
+part of the manifest itself, so a valid self-signature proves only
+that whoever wrote the file also signed it — re-signing it would
+launder attacker-supplied content under the operator's key.
+
 ```
 pg_hardstorage repair attestation <deployment> <backup-id> [flags]
 ```
@@ -21,11 +35,12 @@ pg_hardstorage repair attestation <deployment> <backup-id> [flags]
 ### Options
 
 ```
-      --actor string    operator principal (lands in the audit event for traceability)
-      --force           re-sign even when the current attestation already verifies
-  -h, --help            help for attestation
-      --reason string   why the re-sign is happening (lands in the audit event)
-      --repo string     repository URL — must already exist (required)
+      --actor string              operator principal (lands in the audit event for traceability)
+      --force                     re-sign even when the current attestation already verifies
+  -h, --help                      help for attestation
+      --reason string             why the re-sign is happening (lands in the audit event)
+      --repo string               repository URL — must already exist (required)
+      --trusted-key stringArray   PEM file of a retired operator public key whose signatures may be re-signed (repeatable; also read from <keyring>/trusted-keys/*.pem)
 ```
 
 ### Options inherited from parent commands

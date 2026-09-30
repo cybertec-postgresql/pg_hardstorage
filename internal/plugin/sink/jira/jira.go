@@ -35,6 +35,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -45,6 +46,7 @@ import (
 
 func init() {
 	output.DefaultSinkRegistry.Register("jira", NewFromSpec)
+	output.DefaultSinkRegistry.DeclareConfigKeys("jira", "api_token", "base_url", "bearer_token", "email", "issue_type", "labels", "project", "ticket_strategy")
 }
 
 // TicketStrategy controls per-event behavior.
@@ -76,6 +78,21 @@ type Sink struct {
 	httpClient *http.Client
 	mu         sync.Mutex
 	closed     bool
+
+	// dedupLocks serialises find-or-create per dedup summary. The
+	// dispatcher runs every Emit on its own goroutine, so a burst of
+	// identical events would otherwise all search, all see "no open
+	// issue", and all create one. Entries are refcounted and removed
+	// when the last holder leaves, so the map stays bounded by the
+	// number of in-flight distinct summaries. Guarded by mu.
+	dedupLocks map[string]*dedupLock
+}
+
+// dedupLock is one per-summary mutex plus the count of goroutines
+// holding or waiting on it.
+type dedupLock struct {
+	mu   sync.Mutex
+	refs int
 }
 
 // NewFromSpec is the SinkBuilder.
@@ -221,6 +238,12 @@ func (s *Sink) Emit(ctx context.Context, ev *output.Event) error {
 	}
 
 	if s.strategy == StrategyDedupe {
+		// Hold the per-summary lock across search AND create so a
+		// concurrent identical event sees the issue this one creates.
+		// (Cross-process races, and JIRA's search-index lag right
+		// after a create, are outside what a local lock can close.)
+		unlock := s.lockDedup(s.dedupSummary(ev))
+		defer unlock()
 		key, err := s.findExistingIssue(ctx, ev)
 		if err != nil {
 			return err
@@ -230,6 +253,32 @@ func (s *Sink) Emit(ctx context.Context, ev *output.Event) error {
 		}
 	}
 	return s.createIssue(ctx, ev)
+}
+
+// lockDedup acquires the per-summary lock and returns its release.
+func (s *Sink) lockDedup(summary string) (unlock func()) {
+	s.mu.Lock()
+	if s.dedupLocks == nil {
+		s.dedupLocks = map[string]*dedupLock{}
+	}
+	l := s.dedupLocks[summary]
+	if l == nil {
+		l = &dedupLock{}
+		s.dedupLocks[summary] = l
+	}
+	l.refs++
+	s.mu.Unlock()
+
+	l.mu.Lock()
+	return func() {
+		l.mu.Unlock()
+		s.mu.Lock()
+		l.refs--
+		if l.refs == 0 {
+			delete(s.dedupLocks, summary)
+		}
+		s.mu.Unlock()
+	}
 }
 
 // Close implements output.Sink.
@@ -253,9 +302,13 @@ func (s *Sink) dedupSummary(ev *output.Event) string {
 // findExistingIssue searches JQL for an open issue matching the
 // dedupe summary. Returns the issue key (e.g. "OPS-1234") or "".
 //
-// We use exact-summary matching via JQL `summary ~ "<term>"` rather
-// than label-based dedup because labels can be edited by humans;
-// the summary is stable.
+// We dedup on the summary rather than labels because labels can be
+// edited by humans; the summary is stable. JQL has no equality
+// operator for summary — `summary ~ "<term>"` is a tokenised text
+// match, so "deployment=db1" also hits "deployment=db1-replica", in
+// relevance order. The search is therefore only a candidate filter:
+// we fetch a page of hits and accept one whose summary is exactly
+// ours, never merely the first.
 //
 // JQL string escaping: the project name is operator-set in config
 // (so attacker-controlled only for an attacker who already owns the
@@ -272,7 +325,7 @@ func (s *Sink) findExistingIssue(ctx context.Context, ev *output.Event) (string,
 	q := url.Values{}
 	q.Set("jql", jql)
 	q.Set("fields", "summary")
-	q.Set("maxResults", "1")
+	q.Set("maxResults", strconv.Itoa(dedupSearchPage))
 	endpoint := s.baseURL + "/rest/api/3/search?" + q.Encode()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
@@ -292,17 +345,28 @@ func (s *Sink) findExistingIssue(ctx context.Context, ev *output.Event) (string,
 	}
 	var out struct {
 		Issues []struct {
-			Key string `json:"key"`
+			Key    string `json:"key"`
+			Fields struct {
+				Summary string `json:"summary"`
+			} `json:"fields"`
 		} `json:"issues"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return "", fmt.Errorf("jira: decode search: %w", err)
 	}
-	if len(out.Issues) == 0 {
-		return "", nil
+	for _, is := range out.Issues {
+		if is.Fields.Summary == summary {
+			return is.Key, nil
+		}
 	}
-	return out.Issues[0].Key, nil
+	return "", nil
 }
+
+// dedupSearchPage is how many fuzzy candidates findExistingIssue
+// inspects for an exact summary match. Our summaries are long and
+// specific, so the exact match ranks near the top; a page this size
+// leaves ample room for near-misses above it.
+const dedupSearchPage = 50
 
 // createIssue opens a new ticket. Body is ADF-shaped (Atlassian
 // Document Format) — JIRA Cloud's REST API v3 mandates ADF for the

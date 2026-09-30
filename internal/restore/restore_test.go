@@ -116,6 +116,7 @@ func newFixture(t *testing.T) *fixture {
 		BackupLabel:   "START WAL LOCATION: 0/3000028 (file 000000010000000000000003)\n",
 		TablespaceMap: "",
 	}
+	plantArchivedWAL(t, sp, m.Deployment, m.Timeline)
 	store := backup.NewManifestStore(sp)
 	if err := store.Commit(context.Background(), m, signer, backup.CommitOptions{}); err != nil {
 		t.Fatalf("commit: %v", err)
@@ -691,6 +692,7 @@ func newTDEFixture(t *testing.T) *fixture {
 		Files:       entries,
 		BackupLabel: "START WAL LOCATION: 0/3000028 (file 000000010000000000000003)\n",
 	}
+	plantArchivedWAL(t, sp, m.Deployment, m.Timeline)
 	store := backup.NewManifestStore(sp)
 	if err := store.Commit(context.Background(), m, signer, backup.CommitOptions{}); err != nil {
 		t.Fatalf("commit: %v", err)

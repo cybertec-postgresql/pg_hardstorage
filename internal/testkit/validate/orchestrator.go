@@ -48,6 +48,12 @@ type RunOptions struct {
 	OnEvent func(Event)
 }
 
+// recoveryTimeout bounds one fault revert. Generous — a revert may
+// restart a container and wait for PostgreSQL — but finite, so a wedged
+// revert fails as recovery_failed instead of holding the run past its
+// deadline. A var so tests can shrink it.
+var recoveryTimeout = 10 * time.Minute
+
 // defaultSetupConcurrency is the fallback applied when
 // RunOptions.SetupConcurrency == 0.  Picked to keep a
 // reasonable host responsive during the bring-up storm of
@@ -119,6 +125,24 @@ func Run(ctx context.Context, opts RunOptions) (*report.Report, error) {
 		setupSem = make(chan struct{}, setupCap)
 	}
 
+	gate := newRetentionGate()
+	var appliers []RetentionApplier
+	for _, c := range opts.Cells {
+		if ra, ok := c.(RetentionApplier); ok {
+			appliers = append(appliers, ra)
+		}
+	}
+	retCtx, retCancel := context.WithCancel(runCtx)
+	retDone := make(chan struct{})
+	if len(appliers) > 0 && opts.Loop.RetentionInterval > 0 {
+		go func() {
+			defer close(retDone)
+			runRetentionWindows(retCtx, opts.Cells, gate, opts.Loop, emitEvent)
+		}()
+	} else {
+		close(retDone)
+	}
+
 	for i, cell := range opts.Cells {
 		wg.Add(1)
 		go func(idx int, cell CellRuntime) {
@@ -126,13 +150,15 @@ func Run(ctx context.Context, opts RunOptions) (*report.Report, error) {
 			cr := report.CellReport{
 				Name: cell.Name(), Pass: true,
 			}
-			runCellLoop(runCtx, cell, &cr, opts, emitEvent, setupSem)
+			runCellLoop(runCtx, cell, &cr, opts, emitEvent, setupSem, gate)
 			mu.Lock()
 			rep.Cells = append(rep.Cells, cr)
 			mu.Unlock()
 		}(i, cell)
 	}
 	wg.Wait()
+	retCancel()
+	<-retDone
 
 	// Aggregate fault stats across cells.  We didn't track
 	// per-prefix counts inside the cell loop (kept it simple);
@@ -145,6 +171,7 @@ func Run(ctx context.Context, opts RunOptions) (*report.Report, error) {
 		// reported zero unrevertable faults regardless of how many
 		// recovery_failed events fired.
 		rep.FaultStats.RecoveryFails += c.RecoveryFails
+		rep.FaultStats.ApplyFails += c.FaultApplyFails
 	}
 	// Move any cell-attributed failures into rep.Failures so
 	// AddFailure semantics match — but the loop already
@@ -186,6 +213,16 @@ func ResetForTesting() {
 	pendingMu.Unlock()
 }
 
+// recordFailure is the one way a failure enters the report: it
+// announces it on the event stream as cell_failed (so live consumers —
+// the Pushgateway pass gauge — reach the same verdict the report does)
+// and stores it. Returns reportFailure's "first failure for this cell".
+func recordFailure(emit func(Event), f report.Failure) bool {
+	emit(Event{Cell: f.Cell, Iteration: f.Iteration, Op: "cell_failed",
+		Detail: f.Kind, Err: f.Message})
+	return reportFailure(f)
+}
+
 // reportFailure stores a failure for the orchestrator to splice
 // into the final report.  Returns true if this is the cell's
 // first failure (so the caller knows to abort the iteration).
@@ -218,8 +255,15 @@ func runCellLoop(
 	opts RunOptions,
 	emit func(Event),
 	setupSem chan struct{},
+	gate *retentionGate,
 ) {
 	rng := rand.New(rand.NewSource(opts.Seed ^ hashName(cell.Name())))
+	// Each cell verifies at its own phase of the VerifyEvery cycle. A
+	// restore-verify materialises the whole cluster in a sandbox (12 GB
+	// per enterprise_heavy cell), and cells that start together stay in
+	// step: every cell verifying at the same iteration stacked 4x12 GB of
+	// sandboxes at once and walked the host towards the disk guard.
+	verifyPhase := int(uint64(hashName(cell.Name())) % uint64(opts.Loop.VerifyEvery))
 	cr.UpFor = 0
 	startedAt := time.Now()
 
@@ -239,6 +283,7 @@ func runCellLoop(
 		case <-ctx.Done():
 			cr.Pass = false
 			cr.FirstFailureMsg = "cancelled before setup: " + ctx.Err().Error()
+			emit(Event{Cell: cr.Name, Op: "cell_failed", Detail: "cancelled", Err: cr.FirstFailureMsg})
 			return
 		}
 	}
@@ -259,7 +304,7 @@ func runCellLoop(
 		cr.Pass = false
 		cr.FirstFailureMsg = "setup failed: " + err.Error()
 		emit(Event{Cell: cr.Name, Op: "setup_failed", Err: err.Error()})
-		reportFailure(report.Failure{
+		recordFailure(emit, report.Failure{
 			At: time.Now().UTC(), Cell: cr.Name, Iteration: 0,
 			Kind: "setup", Message: err.Error(),
 		})
@@ -282,7 +327,7 @@ func runCellLoop(
 		cr.Pass = false
 		cr.FirstFailureMsg = "seed failed: " + err.Error()
 		emit(Event{Cell: cr.Name, Op: "seed_failed", Err: err.Error()})
-		reportFailure(report.Failure{
+		recordFailure(emit, report.Failure{
 			At: time.Now().UTC(), Cell: cr.Name, Iteration: 0,
 			Kind: "seed", Message: err.Error(),
 		})
@@ -302,18 +347,37 @@ func runCellLoop(
 		cr.Pass = false
 		cr.FirstFailureMsg = "sustained load failed to start: " + err.Error()
 		emit(Event{Cell: cr.Name, Op: "sustained_load_failed", Err: err.Error()})
-		reportFailure(report.Failure{
+		recordFailure(emit, report.Failure{
 			At: time.Now().UTC(), Cell: cr.Name, Iteration: 0,
 			Kind: "sustained_load", Message: err.Error(),
 		})
 		return
 	}
-	emit(Event{Cell: cr.Name, Op: "sustained_load_started"})
+	// Only claim the writer started if one actually did.
+	//
+	// StartSustainedLoad is a documented no-op when the profile
+	// leaves SustainedClients at 0 — which the default profile
+	// (oltp_smoke) does — and it signals that by returning nil,
+	// indistinguishable here from a writer that really launched.
+	// Emitting "started" either way put 21 sustained_load_started
+	// events in an 8 h run that had no sustained writer at all,
+	// while the report's own Writer column correctly read "—".
+	//
+	// An event stream that overstates what ran is the specific
+	// failure this soak already shipped once: in v1.4 the
+	// WAL-stream sidecar was dead for most of a run and the
+	// report looked healthy. Say "skipped" when it is skipped.
+	if cell.SustainedWriterActive() {
+		emit(Event{Cell: cr.Name, Op: "sustained_load_started"})
+	} else {
+		emit(Event{Cell: cr.Name, Op: "sustained_load_skipped",
+			Detail: "profile sets no sustained_clients"})
+	}
 	if err := cell.StartWALStream(ctx); err != nil {
 		cr.Pass = false
 		cr.FirstFailureMsg = "wal stream failed to start: " + err.Error()
 		emit(Event{Cell: cr.Name, Op: "wal_stream_failed", Err: err.Error()})
-		reportFailure(report.Failure{
+		recordFailure(emit, report.Failure{
 			At: time.Now().UTC(), Cell: cr.Name, Iteration: 0,
 			Kind: "wal_stream", Message: err.Error(),
 		})
@@ -336,6 +400,45 @@ func runCellLoop(
 	}()
 
 	var lastBackupID string
+
+	// Repo-corruption faults (manifest_targeted_corruption,
+	// truncated/missing_wal_segment) damage this cell's own backups —
+	// DockerCellRuntime scopes them to its deployment. A restore of a
+	// backup that existed when such a fault landed may then rightly be
+	// refused: that is the product DETECTING the damage, the success
+	// signal. lastBackupAt / corruptedAt tell those restores from a
+	// genuine failure: only a backup completed BEFORE the latest
+	// corruption can carry it.
+	var lastBackupAt, corruptedAt time.Time
+
+	// Proof of life. A cell a fault killed for good skips every later
+	// backup and verify as *_skipped_cell_down, and skips are rightly not
+	// failures — so without a floor such a cell PASSED having measured
+	// nothing. A backup that completed, or that PostgreSQL refused over
+	// injected source corruption, proves the cell and the product ran;
+	// going MaxBackupGap without one fails the cell (checked on every
+	// skipped backup), and so does a run in which the cell's backups were
+	// dispatched and none ever got that far (checked at the end).
+	lastAlive := time.Now()
+	backupsDispatched, backupsAlive := 0, 0
+	cellDown := func(iter int, msg string) bool {
+		if recordFailure(emit, report.Failure{
+			At: time.Now().UTC(), Cell: cr.Name, Iteration: iter,
+			Kind: "cell_down", Message: msg,
+		}) {
+			cr.Pass = false
+			cr.FirstFailureMsg = msg
+			return true
+		}
+		return false
+	}
+	defer func() {
+		if cr.Pass && backupsDispatched > 0 && backupsAlive == 0 {
+			cellDown(cr.LastIteration, fmt.Sprintf(
+				"none of the cell's %d dispatched backups got to run: the cell was down for the whole run",
+				backupsDispatched))
+		}
+	}()
 	for iter := 1; ; iter++ {
 		// Check ctx.Done before each iteration; the loop
 		// exits cleanly when the soak duration elapses.
@@ -361,205 +464,316 @@ func runCellLoop(
 			// surface it.
 		}
 
-		// 2. Maybe inject a fault.
-		if rng.Float64() < opts.Loop.FaultProbability && opts.Faults != nil &&
-			len(opts.Faults.Faults) > 0 {
-			fault := pickWeighted(opts.Faults.Faults, rng)
-			emit(Event{Cell: cr.Name, Op: "fault_apply",
-				Iteration: iter, Detail: fault.Action})
-			recovery, err := cell.ApplyFault(ctx, fault.Action)
-			switch {
-			case err != nil && errors.Is(err, inject.ErrTargetNotRunning):
-				// A fault that fires on a cell a PRIOR fault already
-				// downed (kill/OOM/SIGTERM) can't be applied — you
-				// can't fill the disk of a stopped container or pause
-				// a dead PG's archiver. That's a benign race, not a
-				// fault-injection failure (signal/cgroup_squeeze
-				// already swallow it internally; disk_full /
-				// pause_archive surface the typed sentinel). Record it
-				// as a skip, mirroring backup_skipped_cell_down /
-				// verify_skipped_cell_down, so it doesn't pollute the
-				// fault_apply_failed signal the soak triages on.
-				emit(Event{Cell: cr.Name, Op: "fault_skipped_cell_down",
-					Iteration: iter, Detail: fault.Action})
-			case err != nil:
-				emit(Event{Cell: cr.Name, Op: "fault_apply_failed",
-					Iteration: iter, Detail: fault.Action, Err: err.Error()})
-				// Continue — the heal window doesn't
-				// fire and the cell may still recover
-				// on its own.
-			default:
-				cr.FaultsApplied++
-				select {
-				case <-ctx.Done():
-				case <-time.After(opts.Loop.HealWindow):
-				}
-				recovered := true
-				if recovery != nil {
-					if rerr := recovery(ctx); rerr != nil {
-						recovered = false
-						if ctx.Err() != nil {
-							// Run-wide deadline elapsed: the
-							// recovery's docker calls were
-							// cancelled by orchestrator shutdown,
-							// not by a genuine fault-cleanup
-							// failure.  Mirrors the
-							// backup_aborted_at_deadline path —
-							// without this distinction every
-							// soak whose 4-min timer happens to
-							// land inside a heal window reports
-							// alarming "recovery_failed" lines
-							// for what is just teardown.
-							emit(Event{Cell: cr.Name,
-								Op:        "recovery_aborted_at_deadline",
-								Iteration: iter, Err: rerr.Error()})
-						} else {
+		// Faults, backups and verifies run inside the retention gate: a
+		// retention window holds them and waits for in-flight ones to
+		// drain, so gc sees a repository with no backup in flight — and
+		// no injected fault lands on the window's own rotate or gc (the
+		// first gated soak lost a rotate to signal(target=agent_random),
+		// which picked the rotate as its random pg_hardstorage process).
+		stop := func() bool {
+			if !gate.enter(ctx) {
+				return false // run ended while a window was open
+			}
+			defer gate.leave()
+			// settleFault scores one fault application and, if it landed,
+			// waits the heal window and reverts it. Returns true to stop
+			// the cell.
+			settleFault := func(fault config.Fault, recovery inject.Recovery, err error) bool {
+				switch {
+				case err != nil && errors.Is(err, inject.ErrTargetNotRunning):
+					// A fault that fires on a cell a PRIOR fault already
+					// downed (kill/OOM/SIGTERM) can't be applied — you
+					// can't fill the disk of a stopped container or pause
+					// a dead PG's archiver. That's a benign race, not a
+					// fault-injection failure (signal/cgroup_squeeze
+					// already swallow it internally; disk_full /
+					// pause_archive surface the typed sentinel). Record it
+					// as a skip, mirroring backup_skipped_cell_down /
+					// verify_skipped_cell_down, so it doesn't pollute the
+					// fault_apply_failed signal the soak triages on.
+					emit(Event{Cell: cr.Name, Op: "fault_skipped_cell_down",
+						Iteration: iter, Detail: fault.Action})
+				case err != nil && errors.Is(err, inject.ErrLimitUnreachable):
+					// cgroup_squeeze asked for a memory.max the kernel
+					// could not honour (unreclaimable RSS already above
+					// the cap, swap disabled). The injector behaved
+					// correctly; counting it as fault_apply_failed makes
+					// every soak with a 0.7% timing race look like a
+					// product failure. Same skip class as cell-down.
+					emit(Event{Cell: cr.Name, Op: "fault_skipped_limit_unreachable",
+						Iteration: iter, Detail: fault.Action})
+				case err != nil && errors.Is(err, inject.ErrNotApplicable):
+					// The fault cannot produce its effect here (disk_full
+					// whose capped spill cannot fill a large filesystem,
+					// pause_archive with no archiver running). Not applied
+					// and not a failure — but never counted as a fault the
+					// product survived, which is what these used to be.
+					emit(Event{Cell: cr.Name, Op: "fault_skipped_not_applicable",
+						Iteration: iter, Detail: fault.Action, Err: err.Error()})
+				case err != nil:
+					cr.FaultApplyFails++
+					emit(Event{Cell: cr.Name, Op: "fault_apply_failed",
+						Iteration: iter, Detail: fault.Action, Err: err.Error()})
+					// Not a failure by itself: some catalogues expect an
+					// injector to refuse honestly (inode_exhaustion on an
+					// inode-rich host). A refused fault that nonetheless
+					// left the cell broken is caught by the backup-gap
+					// floor below, not here.
+				default:
+					cr.FaultsApplied++
+					if inject.DefaultRegistry.CorruptsRepo(fault.Action) {
+						corruptedAt = time.Now()
+					}
+					select {
+					case <-ctx.Done():
+					case <-time.After(opts.Loop.HealWindow):
+					}
+					recovered := true
+					if recovery != nil {
+						// The revert gets a context of its own. At the run
+						// deadline ctx is already cancelled, and reverting
+						// with it failed every docker call at once — the
+						// fault then stayed applied through teardown and
+						// was reported only as "aborted at deadline".
+						// Bounded, so a wedged revert cannot hold the run.
+						rctx, rcancel := context.WithTimeout(context.WithoutCancel(ctx), recoveryTimeout)
+						rerr := recovery(rctx)
+						rcancel()
+						if rerr != nil {
+							recovered = false
 							cr.RecoveryFails++
 							emit(Event{Cell: cr.Name,
 								Op:        "recovery_failed",
-								Iteration: iter, Err: rerr.Error()})
+								Iteration: iter, Detail: fault.Action, Err: rerr.Error()})
+							// A fault that could not be reverted leaves the
+							// cell in the state the fault created for the
+							// rest of the run — nothing measured on it
+							// afterwards means anything, and a cell a fault
+							// killed for good would otherwise skip every
+							// later backup as cell-down and PASS. It fails
+							// the run as a "recovery" failure: the testbed's,
+							// not the product's.
+							msg := fmt.Sprintf("fault %s could not be reverted: %v", fault.Action, rerr)
+							if recordFailure(emit, report.Failure{
+								At: time.Now().UTC(), Cell: cr.Name, Iteration: iter,
+								Kind: "recovery", Message: msg,
+							}) {
+								cr.Pass = false
+								cr.FirstFailureMsg = msg
+								return true
+							}
 						}
 					}
+					// Only claim recovery when the revert actually
+					// succeeded. This emit used to be unconditional, so a
+					// fault that could NOT be undone emitted
+					// recovery_failed and then fault_recovered right
+					// behind it -- and fault_recovered is one of the three
+					// ops the watch TUI paints as healthy (tui.go), so it
+					// being LAST made a poisoned cell read green for the
+					// rest of the run.
+					if recovered {
+						emit(Event{Cell: cr.Name, Op: "fault_recovered",
+							Iteration: iter, Detail: fault.Action})
+					}
 				}
-				// Only claim recovery when the revert actually
-				// succeeded. This emit used to be unconditional, so a
-				// fault that could NOT be undone emitted
-				// recovery_failed and then fault_recovered right
-				// behind it -- and fault_recovered is one of the three
-				// ops the watch TUI paints as healthy (tui.go), so it
-				// being LAST made a poisoned cell read green for the
-				// rest of the run.
-				if recovered {
-					emit(Event{Cell: cr.Name, Op: "fault_recovered",
+				return false
+			}
+
+			// 2. Maybe inject a fault.
+			var midBackup *config.Fault
+			if rng.Float64() < opts.Loop.FaultProbability && opts.Faults != nil &&
+				len(opts.Faults.Faults) > 0 {
+				fault := pickWeighted(opts.Faults.Faults, rng)
+				if isMidBackupFault(fault.Action) {
+					// A *_mid_backup fault exists to race a backup: applied
+					// here, before the backup step, it never overlapped one
+					// (drop_relation_mid_backup was never mid-backup). It is
+					// applied during this iteration's backup instead.
+					midBackup = &fault
+				} else {
+					emit(Event{Cell: cr.Name, Op: "fault_apply",
 						Iteration: iter, Detail: fault.Action})
+					recovery, err := cell.ApplyFault(ctx, fault.Action)
+					if settleFault(fault, recovery, err) {
+						return true
+					}
 				}
 			}
-		}
 
-		// 3. Backup every N iterations.
-		if iter%opts.Loop.BackupEvery == 0 {
-			emit(Event{Cell: cr.Name, Op: "backup_started", Iteration: iter})
-			cr.BackupsTaken++
-			id, err := cell.TakeBackup(ctx)
-			switch {
-			case err != nil && ctx.Err() != nil:
-				// Run-wide deadline elapsed mid-backup; the
-				// orchestrator is shutting down and any
-				// SIGKILL'd in-flight backup is a runner
-				// artefact, not a system failure.  Roll back
-				// the optimistic BackupsTaken increment so
-				// the report doesn't double-count an attempt
-				// that never had a fair chance to complete.
-				cr.BackupsTaken--
-				cr.LastIteration = iter - 1
-				emit(Event{Cell: cr.Name, Op: "backup_aborted_at_deadline",
-					Iteration: iter, Err: err.Error()})
-				return
-			case errors.Is(err, ErrCellNotReady):
-				// A fault knocked the cell offline and
-				// recovery hasn't completed; skip this
-				// dispatch rather than counting it as a
-				// failure.  The next iteration retries.
-				cr.BackupsTaken--
-				emit(Event{Cell: cr.Name, Op: "backup_skipped_cell_down",
-					Iteration: iter})
-			case isSourceCorruptionFailure(err):
-				// PostgreSQL refused the backup because the SOURCE
-				// data is damaged — a page that failed its checksum,
-				// a broken index. The soak injects exactly that
-				// (torn_page), and detection is the success signal,
-				// not a failure.
-				//
-				// It only started arriving here on PostgreSQL 18,
-				// which verifies page checksums during BASE_BACKUP;
-				// PG 15-17 copy the torn page and the damage surfaces
-				// later, at restore or verify, where the catalogue
-				// already expects it. So a criterion of "0
-				// backup_failed" was unsatisfiable for any fleet
-				// containing PG 18 + torn_page: every such cell
-				// aborted on the first hit and burned the rest of its
-				// window. All five failing cells in the 2h soak were
-				// exactly this, and the one PG18 cell that passed had
-				// only been lucky — churn happened to rewrite the
-				// corrupted page before the next backup read it.
-				//
-				// Record it as a detection so the cell keeps running
-				// and the rest of its window still measures something.
-				cr.CorruptionDetected++
-				emit(Event{Cell: cr.Name, Op: "backup_refused_source_corruption",
-					Iteration: iter, Err: err.Error()})
-			case err != nil:
-				cr.BackupsFailed++
-				emit(Event{Cell: cr.Name, Op: "backup_failed",
-					Iteration: iter, Err: err.Error()})
-				if reportFailure(report.Failure{
-					At: time.Now().UTC(), Cell: cr.Name, Iteration: iter,
-					Kind: "backup", Message: err.Error(),
-				}) {
-					cr.Pass = false
-					cr.FirstFailureMsg = "backup failed: " + err.Error()
-					return
+			// 3. Backup every N iterations — and whenever a mid-backup
+			// fault is waiting for one.
+			if iter%opts.Loop.BackupEvery == 0 || midBackup != nil {
+				emit(Event{Cell: cr.Name, Op: "backup_started", Iteration: iter})
+				cr.BackupsTaken++
+				var midRes <-chan midBackupResult
+				backupDone := make(chan struct{})
+				if midBackup != nil {
+					midRes = applyDuringBackup(ctx, cell, *midBackup, backupDone,
+						func() { emit(Event{Cell: cr.Name, Op: "fault_apply", Iteration: iter, Detail: midBackup.Action}) })
 				}
-			default:
-				lastBackupID = id
-				emit(Event{Cell: cr.Name, Op: "backup_completed",
-					Iteration: iter, Detail: id})
+				id, err := cell.TakeBackup(ctx)
+				close(backupDone)
+				if midRes != nil {
+					// Settle the fault before scoring the backup, so every
+					// exit below leaves it reverted.
+					r := <-midRes
+					if r.missed {
+						emit(Event{Cell: cr.Name, Op: "fault_skipped_backup_finished",
+							Iteration: iter, Detail: midBackup.Action})
+					} else if settleFault(*midBackup, r.recovery, r.err) {
+						return true
+					}
+				}
+				switch {
+				case err != nil && ctx.Err() != nil:
+					// Run-wide deadline elapsed mid-backup; the
+					// orchestrator is shutting down and any
+					// SIGKILL'd in-flight backup is a runner
+					// artefact, not a system failure.  Roll back
+					// the optimistic BackupsTaken increment so
+					// the report doesn't double-count an attempt
+					// that never had a fair chance to complete.
+					cr.BackupsTaken--
+					cr.LastIteration = iter - 1
+					emit(Event{Cell: cr.Name, Op: "backup_aborted_at_deadline",
+						Iteration: iter, Err: err.Error()})
+					return true
+				case errors.Is(err, ErrCellNotReady):
+					// A fault knocked the cell offline and
+					// recovery hasn't completed; skip this
+					// dispatch rather than counting it as a
+					// failure.  The next iteration retries —
+					// within MaxBackupGap.
+					cr.BackupsTaken--
+					backupsDispatched++
+					emit(Event{Cell: cr.Name, Op: "backup_skipped_cell_down",
+						Iteration: iter})
+					if gap := time.Since(lastAlive); opts.Loop.MaxBackupGap > 0 && gap > opts.Loop.MaxBackupGap {
+						if cellDown(iter, fmt.Sprintf(
+							"no backup for %s (bound %s): the cell stayed down — last: %v",
+							gap.Round(time.Second), opts.Loop.MaxBackupGap, err)) {
+							return true
+						}
+					}
+				case isSourceCorruptionFailure(err):
+					// PostgreSQL refused the backup because the SOURCE
+					// data is damaged — a page that failed its checksum,
+					// a broken index. The soak injects exactly that
+					// (torn_page), and detection is the success signal,
+					// not a failure.
+					//
+					// It only started arriving here on PostgreSQL 18,
+					// which verifies page checksums during BASE_BACKUP;
+					// PG 15-17 copy the torn page and the damage surfaces
+					// later, at restore or verify, where the catalogue
+					// already expects it. So a criterion of "0
+					// backup_failed" was unsatisfiable for any fleet
+					// containing PG 18 + torn_page: every such cell
+					// aborted on the first hit and burned the rest of its
+					// window. All five failing cells in the 2h soak were
+					// exactly this, and the one PG18 cell that passed had
+					// only been lucky — churn happened to rewrite the
+					// corrupted page before the next backup read it.
+					//
+					// Record it as a detection so the cell keeps running
+					// and the rest of its window still measures something.
+					cr.CorruptionDetected++
+					backupsDispatched++
+					backupsAlive++
+					lastAlive = time.Now()
+					emit(Event{Cell: cr.Name, Op: "backup_refused_source_corruption",
+						Iteration: iter, Err: err.Error()})
+				case err != nil:
+					backupsDispatched++
+					cr.BackupsFailed++
+					emit(Event{Cell: cr.Name, Op: "backup_failed",
+						Iteration: iter, Err: err.Error()})
+					if recordFailure(emit, report.Failure{
+						At: time.Now().UTC(), Cell: cr.Name, Iteration: iter,
+						Kind: "backup", Message: err.Error(),
+					}) {
+						cr.Pass = false
+						cr.FirstFailureMsg = "backup failed: " + err.Error()
+						return true
+					}
+				default:
+					backupsDispatched++
+					backupsAlive++
+					lastAlive = time.Now()
+					lastBackupID = id
+					lastBackupAt = time.Now()
+					emit(Event{Cell: cr.Name, Op: "backup_completed",
+						Iteration: iter, Detail: id})
+				}
 			}
-		}
 
-		// 4. Restore-verify every M iterations (only if we
-		// have a backup to verify).
-		if iter%opts.Loop.VerifyEvery == 0 && lastBackupID != "" {
-			emit(Event{Cell: cr.Name, Op: "verify_started",
-				Iteration: iter, Detail: lastBackupID})
-			cr.RestoresAttempted++
-			err := cell.VerifyRestore(ctx, lastBackupID)
-			switch {
-			case err != nil && ctx.Err() != nil:
-				// Run-wide deadline elapsed mid-verify; the
-				// orchestrator is shutting down and any
-				// SIGKILL'd in-flight restore is a runner
-				// artefact, not a system failure.  Mirrors
-				// the backup_aborted_at_deadline path above
-				// — without this, a 10-min soak that fires
-				// verifies near the end racks up bogus
-				// verify_failed entries (signal: killed,
-				// empty output) once the wall-clock timer
-				// cancels the docker exec subprocess.  Roll
-				// back the optimistic RestoresAttempted
-				// increment so the report doesn't count an
-				// attempt that never had a fair chance to
-				// complete.
-				cr.RestoresAttempted--
-				cr.LastIteration = iter - 1
-				emit(Event{Cell: cr.Name, Op: "verify_aborted_at_deadline",
-					Iteration: iter, Err: err.Error()})
-				return
-			case errors.Is(err, ErrCellNotReady):
-				// A fault knocked the cell offline and recovery
-				// hasn't completed; skip this verify rather than
-				// counting it as a failure — mirrors the
-				// backup_skipped_cell_down path above.  The next
-				// verify-eligible iteration retries.
-				cr.RestoresAttempted--
-				emit(Event{Cell: cr.Name, Op: "verify_skipped_cell_down",
-					Iteration: iter})
-			case err != nil:
-				cr.RestoresFailed++
-				emit(Event{Cell: cr.Name, Op: "verify_failed",
-					Iteration: iter, Err: err.Error()})
-				if reportFailure(report.Failure{
-					At: time.Now().UTC(), Cell: cr.Name, Iteration: iter,
-					Kind: "verify", Message: err.Error(),
-				}) {
-					cr.Pass = false
-					cr.FirstFailureMsg = "verify failed: " + err.Error()
-					return
-				}
-			default:
-				emit(Event{Cell: cr.Name, Op: "verify_ok",
+			// 4. Restore-verify every M iterations (only if we
+			// have a backup to verify).
+			if (iter+verifyPhase)%opts.Loop.VerifyEvery == 0 && lastBackupID != "" {
+				emit(Event{Cell: cr.Name, Op: "verify_started",
 					Iteration: iter, Detail: lastBackupID})
+				cr.RestoresAttempted++
+				err := cell.VerifyRestore(ctx, lastBackupID)
+				switch {
+				case err != nil && ctx.Err() != nil:
+					// Run-wide deadline elapsed mid-verify; the
+					// orchestrator is shutting down and any
+					// SIGKILL'd in-flight restore is a runner
+					// artefact, not a system failure.  Mirrors
+					// the backup_aborted_at_deadline path above
+					// — without this, a 10-min soak that fires
+					// verifies near the end racks up bogus
+					// verify_failed entries (signal: killed,
+					// empty output) once the wall-clock timer
+					// cancels the docker exec subprocess.  Roll
+					// back the optimistic RestoresAttempted
+					// increment so the report doesn't count an
+					// attempt that never had a fair chance to
+					// complete.
+					cr.RestoresAttempted--
+					cr.LastIteration = iter - 1
+					emit(Event{Cell: cr.Name, Op: "verify_aborted_at_deadline",
+						Iteration: iter, Err: err.Error()})
+					return true
+				case errors.Is(err, ErrCellNotReady):
+					// A fault knocked the cell offline and recovery
+					// hasn't completed; skip this verify rather than
+					// counting it as a failure — mirrors the
+					// backup_skipped_cell_down path above.  The next
+					// verify-eligible iteration retries.
+					cr.RestoresAttempted--
+					emit(Event{Cell: cr.Name, Op: "verify_skipped_cell_down",
+						Iteration: iter})
+				case err != nil && !corruptedAt.IsZero() && lastBackupAt.Before(corruptedAt):
+					// The backup predates a corruption fault this cell
+					// injected into its own repository files; refusing
+					// to restore it is detection, not failure.
+					cr.CorruptionDetected++
+					emit(Event{Cell: cr.Name, Op: "verify_refused_injected_corruption",
+						Iteration: iter, Detail: lastBackupID, Err: err.Error()})
+				case err != nil:
+					cr.RestoresFailed++
+					emit(Event{Cell: cr.Name, Op: "verify_failed",
+						Iteration: iter, Err: err.Error()})
+					if recordFailure(emit, report.Failure{
+						At: time.Now().UTC(), Cell: cr.Name, Iteration: iter,
+						Kind: "verify", Message: err.Error(),
+					}) {
+						cr.Pass = false
+						cr.FirstFailureMsg = "verify failed: " + err.Error()
+						return true
+					}
+				default:
+					emit(Event{Cell: cr.Name, Op: "verify_ok",
+						Iteration: iter, Detail: lastBackupID})
+				}
 			}
+
+			return false
+		}()
+		if stop {
+			return
 		}
 
 		// 5. Optional sleep between iterations.
@@ -570,6 +784,49 @@ func runCellLoop(
 			}
 		}
 	}
+}
+
+// midBackupDelay is how long after a backup starts a mid-backup fault is
+// applied: long enough for the backup to be under way, short enough to
+// land well inside a real one. A var so tests can shrink it.
+var midBackupDelay = 2 * time.Second
+
+// isMidBackupFault reports whether action names a fault meant to race a
+// backup (drop_relation_mid_backup, ...).
+func isMidBackupFault(action string) bool {
+	pa, err := inject.ParseAction(action)
+	return err == nil && strings.HasSuffix(pa.Prefix, "_mid_backup")
+}
+
+// midBackupResult is a mid-backup fault's outcome; missed means the
+// backup ended (or the run did) before the fault was applied, so it was
+// not.
+type midBackupResult struct {
+	recovery inject.Recovery
+	err      error
+	missed   bool
+}
+
+// applyDuringBackup applies fault midBackupDelay after the backup
+// starts, unless backupDone closes first. announce runs just before the
+// fault is applied.
+func applyDuringBackup(ctx context.Context, cell CellRuntime, fault config.Fault, backupDone <-chan struct{}, announce func()) <-chan midBackupResult {
+	res := make(chan midBackupResult, 1)
+	go func() {
+		select {
+		case <-time.After(midBackupDelay):
+		case <-backupDone:
+			res <- midBackupResult{missed: true}
+			return
+		case <-ctx.Done():
+			res <- midBackupResult{missed: true}
+			return
+		}
+		announce()
+		recovery, err := cell.ApplyFault(ctx, fault.Action)
+		res <- midBackupResult{recovery: recovery, err: err}
+	}()
+	return res
 }
 
 // pickWeighted picks a fault using the catalogue's Weight as
@@ -613,6 +870,12 @@ func mergeLoadStats(cr *report.CellReport, src *report.LoadStats) {
 	dst := cr.LoadStats
 	if src.TPSAvg != 0 {
 		dst.TPSAvg = src.TPSAvg
+	}
+	if src.SustainedWriterRestarts != 0 {
+		dst.SustainedWriterRestarts = src.SustainedWriterRestarts
+	}
+	if src.SustainedWriterUptimePct != 0 {
+		dst.SustainedWriterUptimePct = src.SustainedWriterUptimePct
 	}
 	if src.LatencyP95Ms != 0 {
 		dst.LatencyP95Ms = src.LatencyP95Ms

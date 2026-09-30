@@ -263,6 +263,56 @@ func TestWalStreamProgressTicker_StopBlocksUntilGoroutineExits(t *testing.T) {
 	}
 }
 
+// A stream that finishes before the first tick (wal stream --once on a
+// busy server) must still report what it streamed.
+func TestWalStreamProgressTicker_StopFlushesUnreportedAdvance(t *testing.T) {
+	src := &fakeSyncedLSNSource{}
+	cap := &captureEmit{}
+	tk := newWalStreamProgressTicker(time.Hour, src, cap.fn(), "db1", 4, 0)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	tk.Start(ctx)
+	src.set(walsink.SegmentSize)
+	tk.Stop()
+	got := cap.snapshot()
+	if len(got) != 1 {
+		t.Fatalf("Stop after an unreported advance emitted %d events; want 1", len(got))
+	}
+	if total := got[0].Body.(map[string]any)["bytes_advanced_total"].(int64); total != int64(walsink.SegmentSize) {
+		t.Errorf("bytes_advanced_total = %d, want %d", total, walsink.SegmentSize)
+	}
+}
+
+// wal stream --once ends by cancelling the ticker's context, not by Stop.
+func TestWalStreamProgressTicker_CtxCancelFlushesUnreportedAdvance(t *testing.T) {
+	src := &fakeSyncedLSNSource{}
+	cap := &captureEmit{}
+	tk := newWalStreamProgressTicker(time.Hour, src, cap.fn(), "db1", 4, 0)
+	ctx, cancel := context.WithCancel(context.Background())
+	tk.Start(ctx)
+	src.set(walsink.SegmentSize)
+	cancel()
+	<-tk.done
+	tk.Stop()
+	if got := cap.snapshot(); len(got) != 1 {
+		t.Fatalf("ctx cancel after an unreported advance emitted %d events; want 1", len(got))
+	}
+}
+
+// An idle stream stays silent on Stop: nothing advanced, nothing to report.
+func TestWalStreamProgressTicker_StopWithoutAdvanceIsSilent(t *testing.T) {
+	src := &fakeSyncedLSNSource{}
+	cap := &captureEmit{}
+	tk := newWalStreamProgressTicker(time.Hour, src, cap.fn(), "db1", 4, 0)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	tk.Start(ctx)
+	tk.Stop()
+	if got := cap.snapshot(); len(got) != 0 {
+		t.Errorf("idle Stop emitted %d events; want 0", len(got))
+	}
+}
+
 func TestWalStreamProgressTicker_StopIsIdempotent(t *testing.T) {
 	src := &fakeSyncedLSNSource{}
 	cap := &captureEmit{}

@@ -56,6 +56,9 @@ func commitCloudEncryptedBackup(t *testing.T, w *readWorld, deployment, kekRef, 
 			WrappedDEK: base64.StdEncoding.EncodeToString(dek[:]), EnvelopeVersion: 2,
 		},
 	}
+	// Real deployments archive WAL; restore refuses a backup whose
+	// WAL exists nowhere (preflight.backup_wal_missing).
+	w.plantArchivedWAL(t, deployment, 1)
 	if err := w.store.Commit(context.Background(), m, w.signer, backup.CommitOptions{}); err != nil {
 		t.Fatalf("commit encrypted: %v", err)
 	}

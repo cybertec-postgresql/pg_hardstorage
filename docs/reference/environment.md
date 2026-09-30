@@ -28,7 +28,10 @@ they are not an operator surface.
 | `PG_HARDSTORAGE_ROOT` | Root directory the path resolver hangs config, state, cache, logs and runtime under. Mainly for a self-contained or relocated install. |
 | `PG_HARDSTORAGE_URL` | Default repository URL when a command takes no `--repo`. |
 | `PG_HARDSTORAGE_BIN` | Path to the `pg_hardstorage` binary to re-invoke for sub-steps. Defaults to the running executable; set it when that path is not re-executable (a wrapper script, a read-only layer). |
+| `PG_HARDSTORAGE_ACTOR` | Identity recorded as the actor of audit events whose command names none (e.g. `kms shred`, `backup delete`, `repo gc`/`wipe`/`set-mode`). Default: the login name (`$USER`, `$LOGNAME`, else the OS account) as `user@host`. Every audit event carries an actor, so insider detection sees destructive ops. |
 | `PG_HARDSTORAGE_AIRGAPPED` | Refuses every outbound network call not aimed at the repository or the database. |
+| `PG_HARDSTORAGE_APPROVAL_ROSTER` | Trusted approver roster for the n-of-m approval gate: a directory of ed25519 public-key PEMs, or one PEM file. Default `<config-dir>/approvers`. Only votes from these keys count; with no roster the gate refuses every approval. See [n-of-m approvals](../how-to/operating/n-of-m-approvals.md). |
+| `PG_HARDSTORAGE_APPROVAL_MIN_THRESHOLD` | Minimum number of distinct trusted approvals any gated op needs (default `2`), regardless of the request's own threshold. |
 
 ## SSH backends (`scp://`, `sftp://`)
 
@@ -53,6 +56,10 @@ the same order.
 | `PG_HARDSTORAGE_LLM_API_KEY` / `PG_HARDSTORAGE_LLM_KEY` | Credential for the provider. |
 | `PG_HARDSTORAGE_LLM_TEMPERATURE` | Sampling temperature, as a float. Overrides the provider default. |
 | `PG_HARDSTORAGE_LLM_DEBUG_PROMPT` | Any non-empty value prints the assembled system prompt to stderr. For debugging what the assistant was actually told. |
+| `PG_HARDSTORAGE_LLM_HOT_HELP_BYTES` | Byte budget for the "detailed help for hot commands" block baked into the system prompt (default `16384`; `0` disables it). That block exists to stop the model inventing flags, and it is not free: the full `--help` of every hot command is ~150 KB, about 38,000 tokens of prefill on *every* question, which on a reasoning endpoint is minutes of silence before the first token. Anything that does not fit the budget is still reachable — the model is told to call the `read_command_help` tool instead of guessing. Raise it if you have a large context window and a fast endpoint; set `0` to rely on the tool entirely. |
+| `PG_HARDSTORAGE_LLM_FIRST_BYTE_TIMEOUT` | How long to wait for the FIRST byte of an LLM response (Go duration, default `45m`). A self-hosted endpoint accepts a request and sends HTTP headers within ~0.1s, then queues it: measured with 8 concurrent questions against one vLLM instance, individual requests waited between 1s and 874s before producing a single token. That wait grows with concurrency and is entirely legitimate, which is why it gets its own generous budget. |
+| `PG_HARDSTORAGE_LLM_STALL_TIMEOUT` | How long the stream may go silent BETWEEN BYTES *after* it has started (Go duration, default `5m`). Past the first byte the server is generating for this request specifically and tokens arrive continuously — in the same measurement, every mid-stream gap was sub-second — so silence here really does mean the far end died without closing the connection. This bounds silence, not total duration: a model that streams steadily for an hour is never cut off. |
+| `PG_HARDSTORAGE_LLM_HEADER_TIMEOUT` | How long the provider may take to send response headers (Go duration, default `10m`). A busy inference server queues a request before it starts generating; this bounds that wait. |
 | `PG_HARDSTORAGE_ON_ERROR_LLM` | Offers an assistant explanation when a command fails. |
 | `PG_HARDSTORAGE_RUNBOOK_DIR` | Directory the assistant searches for runbooks, ahead of `/usr/share/pg_hardstorage/runbooks` and `docs/runbooks`. |
 | `PG_HARDSTORAGE_SKILL_DIR` | Directory of assistant skill definitions. |

@@ -35,6 +35,7 @@ import (
 
 func init() {
 	output.DefaultSinkRegistry.Register("discord", NewFromSpec)
+	output.DefaultSinkRegistry.DeclareConfigKeys("discord", "avatar_url", "timeout", "username", "webhook_url")
 }
 
 // Sink emits to a Discord webhook.

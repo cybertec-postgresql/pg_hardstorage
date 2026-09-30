@@ -53,6 +53,10 @@ witness once the audit chain is gone.
 	help for wipe
 
 .PP
+\fB--override-legal-holds\fP[=false]
+	wipe even though backups are under an active legal hold; only with --require-approval (never with --force), and the held backups are recorded in the pre-wipe audit event
+
+.PP
 \fB--reason\fP=""
 	free-form reason captured in the audit chain pre-wipe
 

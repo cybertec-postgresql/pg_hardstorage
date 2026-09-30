@@ -67,10 +67,8 @@ steps:
 
   # 4. Assert the runbook reference is in the structured error.
   - assert:
-      asserts:
-        - kind: cli_stderr_or_stdout_contains_any
-          substrings:
-            - "repo.format.future"
-            - "repo.unsupported"
-            - "format=v1.1"
-            - "runbooks/"
+      - cli_output_contains_any:
+          - "repo.format.future"
+          - "repo.unsupported"
+          - "format=v1.1"
+          - "runbooks/"

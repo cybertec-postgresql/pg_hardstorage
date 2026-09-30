@@ -134,6 +134,11 @@ func TestStatus_PendingApprovalsCount(t *testing.T) {
 // TestStatus_TextRendererShowsAnchorAndApprovals: the operator-
 // facing text body surfaces the new repo-level footer.
 func TestStatus_TextRendererShowsAnchorAndApprovals(t *testing.T) {
+	// A hermetic HOME with a signing keypair: status verifies manifests
+	// and never mints a key, so without one it exits notfound.signing_key.
+	// (This test used to pass only when an earlier test in the run had
+	// left a keyring behind.)
+	newReadWorld(t)
 	tmp := t.TempDir()
 	repoDir := filepath.Join(tmp, "repo")
 	if err := os.MkdirAll(repoDir, 0o755); err != nil {

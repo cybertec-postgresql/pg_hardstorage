@@ -155,11 +155,12 @@ func newLlmDoctorCmd() *cobra.Command {
   - cheatsheet drift guard passes against the live cobra tree
   - validator catches a planted invalid command
   - hot-command paths all resolve in the catalog
-  - a known-good probe round-trips to the provider
+  - a known-good probe round-trips to the provider (the child probe
+    inherits --provider / --endpoint / --model)
 
-Each check returns pass/fail with a one-line summary.  Exits
-non-zero when any check fails.  Read-only and cheap; safe to
-run in CI.`,
+Each check returns pass/fail with a one-line summary.  Exits 1
+(runtime failure, not 2 = misuse) when any check fails.
+Read-only and cheap; safe to run in CI.`,
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return runLlmDoctor(cmd)
@@ -298,7 +299,7 @@ func runLlmDoctor(cmd *cobra.Command) error {
 	// cost / latency.  We ask the model to echo a literal token
 	// and check the response contains it.
 	checkStart = time.Now()
-	body.Checks = append(body.Checks, roundTripProbe(cmd, time.Since(checkStart)))
+	body.Checks = append(body.Checks, roundTripProbe(cmd, flagProvider, flagEndpoint, flagModel))
 
 	// Aggregate.
 	body.OK = true
@@ -317,14 +318,19 @@ func runLlmDoctor(cmd *cobra.Command) error {
 // ("Exits non-zero when any check fails.").  The full report is
 // still emitted (via the dispatcher) either way, so the operator
 // sees every ✓/✗ row regardless of exit status.
+//
+// The error is deliberately NOT wrapped in output.ErrUsage: a failed
+// check (provider outage, missing key, drift) is a runtime failure,
+// and exit 2 would tell cron/CI to "fix the invocation" when the
+// command line was fine.  llm.* has no exit route, so it lands on
+// ExitError (1).
 func doctorResult(d *output.Dispatcher, cmd *cobra.Command, body llmDoctorBody) error {
 	if renderErr := d.Result(output.NewResult(cmd.CommandPath()).WithBody(body)); renderErr != nil {
 		return renderErr
 	}
 	if !body.OK {
 		return output.NewError("llm.doctor_failed",
-			"llm doctor: one or more checks failed — see the report above").
-			Wrap(output.ErrUsage)
+			"llm doctor: one or more checks failed — see the report above")
 	}
 	return nil
 }
@@ -333,8 +339,11 @@ func doctorResult(d *output.Dispatcher, cmd *cobra.Command, body llmDoctorBody) 
 // confirm the provider responds.  We can't reuse the open
 // provider directly because the chat session does too much
 // (skill loading, tool registry, etc.); a child `llm ask`
-// exercises the full path the operator uses.
-func roundTripProbe(cmd *cobra.Command, _ time.Duration) llmDoctorCheck {
+// exercises the full path the operator uses.  provider / endpoint /
+// model are the operator's --provider / --endpoint / --model; they
+// are forwarded so the child probes the provider doctor just
+// reported on, not whatever env/config would pick without them.
+func roundTripProbe(cmd *cobra.Command, provider, endpoint, model string) llmDoctorCheck {
 	checkStart := time.Now()
 	// Use our own binary path — should always be argv[0]'s
 	// resolved form.  Falls back to PATH lookup if we can't
@@ -356,8 +365,7 @@ func roundTripProbe(cmd *cobra.Command, _ time.Duration) llmDoctorCheck {
 			Latency: time.Since(checkStart).Round(time.Millisecond).String(),
 		}
 	}
-	probe := "Reply with exactly one word: 'pong' (no preamble, no quotes, no markdown)."
-	c := exec.CommandContext(cmd.Context(), bin, "llm", "ask", probe, "-o", "json")
+	c := exec.CommandContext(cmd.Context(), bin, llmDoctorProbeArgs(provider, endpoint, model)...)
 	c.Env = append(append([]string{}, os.Environ()...), "PG_HARDSTORAGE_LLM_TEMPERATURE=0")
 	var stdout bytes.Buffer
 	c.Stdout = &stdout
@@ -389,6 +397,20 @@ func roundTripProbe(cmd *cobra.Command, _ time.Duration) llmDoctorCheck {
 		}(),
 		Latency: time.Since(checkStart).Round(time.Millisecond).String(),
 	}
+}
+
+// llmDoctorProbeArgs builds the argv for the round-trip probe's
+// child `llm ask`.  Empty overrides are omitted so the child
+// resolves env/config the same way the parent did.
+func llmDoctorProbeArgs(provider, endpoint, model string) []string {
+	probe := "Reply with exactly one word: 'pong' (no preamble, no quotes, no markdown)."
+	args := []string{"llm", "ask", probe, "-o", "json"}
+	for _, kv := range [][2]string{{"--provider", provider}, {"--endpoint", endpoint}, {"--model", model}} {
+		if kv[1] != "" {
+			args = append(args, kv[0], kv[1])
+		}
+	}
+	return args
 }
 
 // cheatsheetDriftDetail re-runs the drift-guard logic at runtime
@@ -651,12 +673,30 @@ func runLlmAsk(cmd *cobra.Command, opts llmAskOptions) error {
 // `--provider mock` for tests / demos / plumbing exercises.
 
 // hotCommandPaths is the hand-picked set of subcommands whose
-// FULL --help text gets baked into the system prompt at session
+// --help text gets baked into the system prompt at session
 // bootstrap.  Evidence: each entry corresponds to a flag-invention
 // failure mode observed in the operator-quality pilot (see
-// the L2 *_flag_accuracy
-// scenarios).  Keep this list tight — every entry costs ~200-400
-// tokens in every chat session.
+// the L2 *_flag_accuracy scenarios).
+//
+// COST, measured rather than estimated. This comment used to say
+// "every entry costs ~200-400 tokens". Against the live binary the 38
+// entries below render 150 KB — about 38,000 tokens, ~1,000 each, so
+// the estimate was low by 3x and the list was kept "tight" against a
+// budget that was not real. Every question paid it: asking "is there
+// an RPM?" shipped the full flag inventory of restore, forecast and
+// compliance report.
+//
+// The practical effect is not cost, it is LATENCY. 38k tokens of
+// prefill on a reasoning endpoint is minutes of silence before the
+// first token — long enough to look like a hung client, which is
+// exactly how it was reported.
+//
+// So the block is now BUDGETED (hotCommandHelpBudget): entries are
+// rendered in list order until the budget is spent, and the rest are
+// reachable through the read_command_help tool, which is already
+// registered and already named in the prompt. Order this list by how
+// badly a wrong flag hurts — what does not fit is a tool call away,
+// not lost.
 var hotCommandPaths = [][]string{
 	// Recovery / repair surface — every entry here is a real
 	// pilot or stretch failure mode.
@@ -718,18 +758,73 @@ var hotCommandPaths = [][]string{
 // the --help output for every command in hotCommandPaths.  Missing
 // commands are silently skipped (covers test fixtures and partial
 // command trees).
+// hotCommandHelpBudget caps the "Detailed help for hot commands"
+// block. ~16 KB is roughly 4,000 tokens — enough for the commands
+// where a wrong flag does real damage, small enough that prefill
+// stays in seconds rather than minutes.
+//
+// Operators with a large context window and a fast endpoint can raise
+// it with PG_HARDSTORAGE_LLM_HOT_HELP_BYTES; 0 disables the block
+// entirely and leaves everything to read_command_help.
+const hotCommandHelpBudget = 16 * 1024
+
+// hotCommandHelpBudgetBytes resolves the budget, honouring the
+// environment override.
+func hotCommandHelpBudgetBytes() int {
+	if v := strings.TrimSpace(os.Getenv("PG_HARDSTORAGE_LLM_HOT_HELP_BYTES")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			return n
+		}
+	}
+	return hotCommandHelpBudget
+}
+
+// renderHotCommandHelp renders hot-command help up to the budget.
+//
+// Entries are emitted in hotCommandPaths order and the walk STOPS at
+// the first one that would overflow, rather than skipping it to fit a
+// later, smaller entry — the list is priority-ordered, and silently
+// preferring a cheap low-priority command over an expensive
+// high-priority one would make the block's contents depend on help
+// text length instead of on importance.
+//
+// The trailing note is load-bearing: without it the model cannot tell
+// "this command has no flags" from "this command was not included",
+// and that ambiguity is what produces invented flags.
 func renderHotCommandHelp(tree *cmdtree.Node) string {
 	if tree == nil {
 		return ""
 	}
+	budget := hotCommandHelpBudgetBytes()
+	if budget == 0 {
+		return ""
+	}
 	var b strings.Builder
+	var shown, omitted int
+	full := false
 	for _, path := range hotCommandPaths {
 		help := cmdtree.Help(tree, path)
 		if help == "" {
 			continue
 		}
+		// Once one entry overflows, everything after it is omitted —
+		// even entries small enough to fit. This loop used `continue`
+		// here, contradicting the comment above, so a large
+		// high-priority command could be dropped while a smaller
+		// low-priority one behind it was rendered.
+		if full || b.Len()+len(help)+1 > budget {
+			full = true
+			omitted++
+			continue
+		}
 		b.WriteString(help)
 		b.WriteString("\n")
+		shown++
+	}
+	if omitted > 0 {
+		fmt.Fprintf(&b, "\n(%d more commands are NOT listed above. Their flags are "+
+			"not shown here and must NOT be guessed — call read_command_help "+
+			"with the command name to get its exact flag list.)\n", omitted)
 	}
 	return b.String()
 }
@@ -1011,6 +1106,7 @@ func buildLiveToolRegistry(gateState *toolGateState, cmdRoot *cobra.Command) (*t
 			Preview:         gateState.preview,
 			Anomaly:         gateState.anomaly,
 			Runner:          runner,
+			Tree:            cmdTree,
 			AuditCallback:   gateState.auditCallback,
 			AnomalyCallback: gateState.anomalyCallback,
 		})
@@ -1158,9 +1254,11 @@ func newLlmSkillLintCmd() *cobra.Command {
 
 func loadSkillSet() (*skills.Set, error) {
 	dirs := skills.DefaultDirs(os.Getenv("HOME"))
-	// Prepend an in-development fallback so a `make build` without
-	// install still finds the in-tree skills.
-	dirs = append([]string{"share/skills"}, dirs...)
+	// No CWD-relative search path (there used to be a ./share/skills
+	// fallback): skill YAML controls the system prompt and the tool
+	// allowlist, so running from an attacker-writable directory must
+	// not silently override the builtins.  In-tree development points
+	// PG_HARDSTORAGE_SKILL_DIR=share/skills at the templates explicitly.
 	if extra := os.Getenv("PG_HARDSTORAGE_SKILL_DIR"); extra != "" {
 		dirs = append(dirs, extra)
 	}
@@ -1266,7 +1364,7 @@ type skillListEntry struct {
 // WriteText renders the available skills as a tabular summary to w.
 func (b skillListBody) WriteText(w io.Writer) error {
 	if len(b.Skills) == 0 {
-		_, err := io.WriteString(w, "no skills loaded — install share/skills/ or drop a YAML in /etc/pg_hardstorage/skills/")
+		_, err := io.WriteString(w, "no skills loaded — drop a YAML in /etc/pg_hardstorage/skills/ or point $PG_HARDSTORAGE_SKILL_DIR at a skill directory")
 		return err
 	}
 	bw := &strings.Builder{}

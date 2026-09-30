@@ -56,9 +56,11 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/kms"
 	kmstypes "github.com/aws/aws-sdk-go-v2/service/kms/types"
+	"github.com/aws/smithy-go"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/airgap"
 	stdkms "github.com/cybertec-postgresql/pg_hardstorage/internal/kms"
@@ -154,15 +156,28 @@ func builder(ctx context.Context, kekRef string, cfg map[string]any) (stdkms.Pro
 	}
 	clientOpts := []func(*kms.Options){}
 	if endpoint != "" {
-		// Endpoint air-gap gate.
-		if err := airgap.Default().EndpointAllowed(endpoint); err != nil {
-			return nil, fmt.Errorf("aws-kms: %w", err)
-		}
 		clientOpts = append(clientOpts, func(o *kms.Options) {
 			o.BaseEndpoint = aws.String(endpoint)
 		})
 	}
 	cli := kms.NewFromConfig(awsCfg, clientOpts...)
+
+	// Air-gap gate on the endpoint the client will actually talk to: the
+	// configured one (the resolved BaseEndpoint also picks up
+	// AWS_ENDPOINT_URL(_KMS)), else the regional AWS host — FIPS variant
+	// when enabled. Checking only an explicit endpoint let the default
+	// public KMS host through under `airgapped: strict`.
+	effective := aws.ToString(cli.Options().BaseEndpoint)
+	if effective == "" {
+		host := "kms"
+		if useFIPS {
+			host = "kms-fips"
+		}
+		effective = "https://" + host + "." + awsCfg.Region + ".amazonaws.com"
+	}
+	if err := airgap.Default().EndpointAllowed(effective); err != nil {
+		return nil, fmt.Errorf("aws-kms: %w", err)
+	}
 
 	return &Provider{
 		kekRef:            kekRef,
@@ -251,12 +266,41 @@ func (p *Provider) UnwrapDEK(ctx context.Context, wrapped []byte) ([]byte, error
 		},
 	})
 	if err != nil {
-		// Wrap the SDK error in our typed sentinel so the
-		// crypto-shred audit can distinguish "key disabled"
-		// from "auth/permission" from "transient network."
-		return nil, fmt.Errorf("%w: %v", stdkms.ErrUnwrap, err)
+		// Classify, so the crypto-shred audit and restore can tell
+		// "key disabled / wrong key" from "auth/permission" from
+		// "transient"; the SDK error stays reachable via errors.As.
+		return nil, stdkms.UnwrapFailure(ctx, classifyAWS(err), "aws-kms: Decrypt", err)
 	}
 	return out.Plaintext, nil
+}
+
+// classifyAWS maps an AWS KMS API error onto the kms error classes.
+// Codes not listed (InvalidCiphertext, IncorrectKey, Disabled,
+// KMSInvalidState, NotFound, ...) genuinely concern the key or the
+// wrapped bytes and stay ErrUnwrap.
+func classifyAWS(err error) error {
+	var ae smithy.APIError
+	if errors.As(err, &ae) {
+		switch ae.ErrorCode() {
+		case "ThrottlingException", "KMSInternalException", "DependencyTimeoutException",
+			"KeyUnavailableException", "ServiceUnavailableException", "InternalFailure",
+			"RequestLimitExceeded", "LimitExceededException":
+			return stdkms.ErrUnavailable
+		case "AccessDeniedException", "UnrecognizedClientException", "InvalidSignatureException",
+			"ExpiredTokenException", "InvalidClientTokenId", "IncompleteSignature", "AccessDenied":
+			return stdkms.ErrAccessDenied
+		}
+	}
+	var re *awshttp.ResponseError
+	if errors.As(err, &re) {
+		switch s := re.HTTPStatusCode(); {
+		case s == 429 || s >= 500:
+			return stdkms.ErrUnavailable
+		case s == 401 || s == 403:
+			return stdkms.ErrAccessDenied
+		}
+	}
+	return stdkms.ErrUnwrap
 }
 
 // Shred implements kms.Provider.  Schedules deletion of the
@@ -371,12 +415,12 @@ func (p *Provider) assertOpen() error {
 //	aws-kms://<key-id>
 func parseKEKRef(kekRef string) (string, error) {
 	if !strings.HasPrefix(kekRef, Scheme+"://") {
-		return "", fmt.Errorf("aws-kms: KEKRef %q does not have the %q:// prefix", kekRef, Scheme)
+		return "", fmt.Errorf("aws-kms: KEKRef %q does not have the %q:// prefix", stdkms.RedactKEKRef(kekRef), Scheme)
 	}
 	id := strings.TrimPrefix(kekRef, Scheme+"://")
 	id = strings.TrimSpace(id)
 	if id == "" {
-		return "", fmt.Errorf("aws-kms: empty key id in KEKRef %q", kekRef)
+		return "", fmt.Errorf("aws-kms: empty key id in KEKRef %q", stdkms.RedactKEKRef(kekRef))
 	}
 	return id, nil
 }

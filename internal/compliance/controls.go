@@ -193,7 +193,17 @@ func AssessControls(r *Report) *ControlSection {
 			Description: sp.Description,
 			Section:     sp.Section,
 		}
-		c.Status, c.Evidence, c.Remediation = sp.Assess(r)
+		// A section whose read failed has counters that are zero
+		// because nothing could be read, and every assessor below
+		// reads a zero as "nothing happened" — for approvals that is
+		// a pass. Missing evidence fails the control instead.
+		if msg, bad := r.sectionError(sp.Section); bad {
+			c.Status = StatusFail
+			c.Evidence = "evidence incomplete — reading the " + sp.Section + " data failed: " + msg
+			c.Remediation = "fix the storage / audit-log read error and re-run the report; a control cannot pass on evidence the report could not read"
+		} else {
+			c.Status, c.Evidence, c.Remediation = sp.Assess(r)
+		}
 		out.Controls = append(out.Controls, c)
 		switch c.Status {
 		case StatusPass:
@@ -233,6 +243,9 @@ func assessEncryption(r *Report) (ControlStatus, string, string) {
 	if s == nil {
 		return StatusNotApplicable, "no encryption section in report", ""
 	}
+	if st, ev, rem, bad := signatureFailedVerdict(r); bad {
+		return st, ev, rem
+	}
 	if s.EncryptedCount == 0 && s.UnencryptedCount == 0 {
 		return StatusNotApplicable, "no backups in window", ""
 	}
@@ -252,22 +265,50 @@ func assessEncryption(r *Report) (ControlStatus, string, string) {
 		""
 }
 
-// assessVerification: pass iff at least one verification ran in
-// the window.  Auditors looking for "did you exercise restorability"
-// expect a non-zero number.
+// signatureFailedVerdict fails a coverage control while any manifest
+// in scope could not be signature-verified: the coverage figures are
+// computed over the verified manifests only, so they say nothing
+// about the unverified ones — which may be forged or tampered.
+func signatureFailedVerdict(r *Report) (ControlStatus, string, string, bool) {
+	n := len(r.SignatureFailed)
+	if n == 0 {
+		return "", "", "", false
+	}
+	return StatusFail,
+		fmt.Sprintf("%d manifest(s) failed signature verification; coverage cannot be established for them", n),
+		"run `pg_hardstorage repo check` to list the manifests; investigate tampering, or a signing-key rotation whose public key the report was not given",
+		true
+}
+
+// assessVerification: pass iff at least one verification run in the
+// window succeeded and none failed.  Counting runs alone let a window
+// in which every verify FAILED pass the control — the failure is the
+// finding the control exists to surface.  "skipped" runs are neither:
+// they don't fail the control, but they don't demonstrate
+// restorability either.
 func assessVerification(r *Report) (ControlStatus, string, string) {
 	s := r.Verification
 	if s == nil {
 		return StatusNotApplicable, "no verification section in report", ""
 	}
+	const rerun = "run `pg_hardstorage verify <deployment> latest` and `pg_hardstorage integrity run` periodically; the recovery drill is the recommended deeper check"
 	if s.TotalRuns == 0 {
+		return StatusFail, "zero verification runs recorded in window", rerun
+	}
+	ok, failed := s.ByOutcome["ok"], s.ByOutcome["failed"]
+	if failed > 0 {
 		return StatusFail,
-			"zero verification runs recorded in window",
-			"run `pg_hardstorage verify <deployment> latest` and `pg_hardstorage integrity run` periodically; the recovery drill is the recommended deeper check"
+			fmt.Sprintf("%d of %d verification run(s) in window FAILED", failed, s.TotalRuns),
+			"investigate each failed `verify.run` event (`pg_hardstorage audit search --action verify.run`); repair or re-take the affected backups, then re-verify"
+	}
+	if ok == 0 {
+		return StatusFail,
+			fmt.Sprintf("no successful verification run in window (%d run(s), outcomes %v)", s.TotalRuns, s.ByOutcome),
+			rerun
 	}
 	return StatusPass,
-		fmt.Sprintf("%d verification run(s) recorded across %d deployment(s)",
-			s.TotalRuns, len(s.ByDeployment)),
+		fmt.Sprintf("%d of %d verification run(s) succeeded across %d deployment(s), none failed",
+			ok, s.TotalRuns, len(s.ByDeployment)),
 		""
 }
 
@@ -345,6 +386,9 @@ func assessReplicas(r *Report) (ControlStatus, string, string) {
 	s := r.Replicas
 	if s == nil {
 		return StatusNotApplicable, "no replicas section in report", ""
+	}
+	if st, ev, rem, bad := signatureFailedVerdict(r); bad {
+		return st, ev, rem
 	}
 	if s.WindowedPrimaries == 0 {
 		return StatusNotApplicable, "no backups in window", ""

@@ -33,6 +33,7 @@ func RenderMarkdown(w io.Writer, r *Report) error {
 	}
 	bw := &strings.Builder{}
 	writeHeader(bw, r)
+	writeEvidenceGaps(bw, r)
 	writeBackupSection(bw, r.Backups)
 	writeEncryptionSection(bw, r.Encryption)
 	writeVerificationSection(bw, r.Verification)
@@ -71,6 +72,38 @@ func writeHeader(bw *strings.Builder, r *Report) {
 	fmt.Fprintln(bw)
 	fmt.Fprintln(bw, "_This report is a record of FACTS over the named window. It is not a verdict — auditors map controls to evidence themselves._")
 	fmt.Fprintln(bw)
+}
+
+// writeEvidenceGaps puts unverifiable manifests and unreadable
+// sections at the top of the report, ahead of the numbers they make
+// incomplete — a reader must not take a section's zero at face value
+// without first learning that it could not be read. Nothing is
+// written when there are no gaps.
+func writeEvidenceGaps(bw *strings.Builder, r *Report) {
+	if len(r.SignatureFailed) == 0 && len(r.SectionErrors) == 0 {
+		return
+	}
+	fmt.Fprintln(bw, "## ⚠ Incomplete evidence")
+	fmt.Fprintln(bw)
+	if n := len(r.SignatureFailed); n > 0 {
+		fmt.Fprintf(bw, "**%d manifest(s) failed signature verification** and are excluded from every count below (reported regardless of window: an unverified manifest's timestamp is not trustworthy).\n\n", n)
+		fmt.Fprintln(bw, "| Deployment | Error |")
+		fmt.Fprintln(bw, "| --- | --- |")
+		for _, f := range r.SignatureFailed {
+			fmt.Fprintf(bw, "| `%s` | %s |\n", f.Deployment, strings.ReplaceAll(f.Error, "|", `\|`))
+		}
+		fmt.Fprintln(bw)
+	}
+	if len(r.SectionErrors) > 0 {
+		fmt.Fprintln(bw, "**Sections whose data could not be read** (their counts are incomplete; mapped controls fail):")
+		fmt.Fprintln(bw)
+		fmt.Fprintln(bw, "| Section | Error |")
+		fmt.Fprintln(bw, "| --- | --- |")
+		for _, e := range r.SectionErrors {
+			fmt.Fprintf(bw, "| %s | %s |\n", e.Section, strings.ReplaceAll(e.Error, "|", `\|`))
+		}
+		fmt.Fprintln(bw)
+	}
 }
 
 func writeBackupSection(bw *strings.Builder, b *BackupSection) {

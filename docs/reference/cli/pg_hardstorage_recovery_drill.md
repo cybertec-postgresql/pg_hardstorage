@@ -67,7 +67,7 @@ pg_hardstorage recovery drill <deployment> [flags]
       --repo string                      repository URL (required)
       --rto-seconds int                  RTO target in seconds for actual-vs-target comparison
       --skip-verify                      don't run the sandbox verify at all (Docker-free run)
-      --tablespace-mapping stringArray   redirect a tablespace: --tablespace-mapping=<old-abs-path>=<new-abs-path> (repeatable). Required when the backup has non-default tablespaces: without it they would be restored to their original absolute paths, overwriting live data on the source host
+      --tablespace-mapping stringArray   redirect a tablespace: --tablespace-mapping=<old-abs-path>=<new-abs-path> (repeatable). Required when the backup has non-default tablespaces: without it they would be restored to their original absolute paths, overwriting live data on the source host. The mapped dirs are drill scratch: mounted into the verify sandbox at the same path and removed (or, if they pre-existed, emptied) at teardown unless --keep
       --temp-base string                 parent directory for the temporary target dir (default: $TMPDIR)
 ```
 

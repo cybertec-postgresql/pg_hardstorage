@@ -18,8 +18,10 @@ import (
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/capacity"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/output"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/paths"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/restore"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/wal/inventory"
 )
 
 // newRealBackupCmd is the in-development real backup command.
@@ -99,7 +101,7 @@ The repository must already exist — create it with ` + "`" + `pg_hardstorage r
 	c.Flags().BoolVar(&opts.allowConcurrent, "allow-concurrent", false,
 		"skip the per-deployment backup lease and allow a second backup of the same deployment to run concurrently (doubles load on the source)")
 	DurationDaysVar(c.Flags(), &opts.stallTimeout, "stall-timeout", 0,
-		"abort with backup.io_starved if no progress event for this long (0 = disabled; soak drivers pin 5m)")
+		"abort with backup.io_starved if no progress (stream data or event) for this long (0 = disabled; soak drivers pin 5m)")
 	c.Flags().BoolVarP(&opts.verbose, "verbose", "v", false,
 		"emit one line per regular file as it commits to the CAS — file path, "+
 			"logical size, chunk count, deduped chunks, and bytes the CAS actually "+
@@ -351,8 +353,59 @@ func runBackup(cmd *cobra.Command, opts runOptions) error {
 		UniqueChunkBytes: res.UniqueChunkBytes,
 		PrimaryKey:       res.PrimaryKey,
 		Encrypted:        encConfig != nil,
+		SelfContained:    opts.includeWAL,
+	}
+	if !opts.includeWAL {
+		if archived, known := walArchivedFor(cmd.Context(), opts.repoURL, res.Deployment, uint32(res.Timeline)); known {
+			body.WALArchived = &archived
+			if !archived {
+				body.RestoreNeeds = fmt.Sprintf("WAL through %s (timeline %d) in the repository", res.StopLSN, res.Timeline)
+			}
+			// In JSON mode the command emits exactly one Result
+			// document; the same facts ride in wal_archived /
+			// restore_needs there. Emitting the event as well put a
+			// second JSON document on stdout and broke every consumer
+			// that parses `backup -o json` (the release gate caught it).
+			if !archived && !suppressEvents {
+				_ = d.Event(cmd.Context(), output.NewEvent(output.SeverityWarning, "backup", "not_yet_restorable").
+					WithSubject(output.Subject{Deployment: res.Deployment, BackupID: res.BackupID}).
+					WithBody(map[string]any{
+						"stop_lsn": res.StopLSN,
+						"timeline": res.Timeline,
+						"message": fmt.Sprintf("no WAL has been archived for %s yet, and this backup does not embed its own (--include-wal was not set): "+
+							"it cannot be restored until WAL through %s is in the repository", res.Deployment, res.StopLSN),
+						"hint": "if `pg_hardstorage wal stream` is running this resolves when that segment completes; " +
+							"otherwise start it (pg_hardstorage-wal-stream@" + res.Deployment + ".service), or re-take the backup with --include-wal",
+					}))
+			}
+		}
 	}
 	return d.Result(output.NewResult(cmd.CommandPath()).WithBody(body))
+}
+
+// walArchivedFor reports whether ANY WAL has been archived for the
+// deployment on the backup's timeline. known=false when the repository
+// could not be asked; the caller then says nothing rather than guess.
+//
+// Why a backup needs to know: without --include-wal, a base backup is
+// only restorable once the WAL covering it is archived. A deployment
+// with no WAL archive at all — the first-backup tutorial's exact setup —
+// produced backups that `restore` could never finish (recovery waits
+// forever for the next segment) while `backup` reported success with no
+// hint of it. Nothing archived is the one condition that can be judged
+// with no false alarms: if even one segment exists, archiving is working
+// and the tail will follow.
+func walArchivedFor(ctx context.Context, repoURL, deployment string, timeline uint32) (archived, known bool) {
+	_, sp, err := repo.Open(ctx, repoURL)
+	if err != nil {
+		return false, false
+	}
+	defer sp.Close()
+	_, found, err := inventory.HighestArchivedLSN(ctx, sp, deployment, timeline)
+	if err != nil {
+		return false, false
+	}
+	return found, true
 }
 
 // loadIncrementalConfig reads the named parent backup's manifest
@@ -404,12 +457,7 @@ func loadIncrementalConfig(ctx context.Context, repoURL, deployment, parentID st
 	store := backup.NewManifestStore(sp)
 	parent, err := store.Read(ctx, deployment, parentID, verifier)
 	if err != nil {
-		return nil, output.NewError("notfound.backup",
-			fmt.Sprintf("backup --incremental-from: parent %q not found in repo: %v",
-				parentID, err)).
-			WithSuggestion(&output.Suggestion{
-				Human: "verify the parent backup ID with `pg_hardstorage list <deployment>`",
-			}).Wrap(err)
+		return nil, incrementalParentReadError(parentID, err)
 	}
 	if len(parent.PGBackupManifest) == 0 {
 		return nil, output.NewError("usage.bad_flag",
@@ -421,6 +469,40 @@ func loadIncrementalConfig(ctx context.Context, repoURL, deployment, parentID st
 		ParentBackupID:   parent.BackupID,
 		ParentPGManifest: parent.PGBackupManifest,
 	}, nil
+}
+
+// incrementalParentReadError maps a failed read of the --incremental-from
+// parent per error class. Every failure used to become notfound.backup
+// (exit 6), so a parent whose signature does not verify — possible
+// tampering — or a repository that was merely unreachable told the
+// operator "that backup does not exist" and sent them to `list`.
+func incrementalParentReadError(parentID string, err error) error {
+	switch {
+	case errors.Is(err, storage.ErrNotFound):
+		return output.NewError("notfound.backup",
+			fmt.Sprintf("backup --incremental-from: parent %q not found in repo", parentID)).
+			WithSuggestion(&output.Suggestion{
+				Human: "verify the parent backup ID with `pg_hardstorage list <deployment>`",
+			}).Wrap(err)
+	case errors.Is(err, backup.ErrTombstoned):
+		return output.NewError("notfound.backup_tombstoned",
+			fmt.Sprintf("backup --incremental-from: parent %q is soft-deleted; an incremental on it would be an orphan", parentID)).
+			WithSuggestion(&output.Suggestion{
+				Human: "undelete the parent first (`backup undelete`), or take a full backup",
+			}).Wrap(err)
+	case errors.Is(err, backup.ErrBadSignature), errors.Is(err, backup.ErrPublicKeyMismatch),
+		errors.Is(err, backup.ErrUnsigned), errors.Is(err, backup.ErrAmbiguousManifest):
+		return output.NewError("verify.manifest_signature",
+			fmt.Sprintf("backup --incremental-from: parent %q does not verify against the trusted signing key: %v", parentID, err)).
+			WithSuggestion(&output.Suggestion{
+				Human: "do not chain onto it: run `pg_hardstorage repo check` (a manifest that fails verification is potential tampering), or take a full backup",
+			}).Wrap(err)
+	}
+	return output.NewError("backup.parent_read_failed",
+		fmt.Sprintf("backup --incremental-from: read parent %q: %v", parentID, err)).
+		WithSuggestion(&output.Suggestion{
+			Human: "the repository could not be read (not a missing backup); check storage reachability and retry",
+		}).Wrap(err)
 }
 
 // Sanity import to keep `repo` referenced (loadIncrementalConfig
@@ -518,8 +600,16 @@ func stringMapToAny(in map[string]string) map[string]any {
 // Field order matches what we want users to read top-to-bottom in
 // text mode (id first, then sizes, then storage location).
 type backupResultBody struct {
-	BackupID         string `json:"backup_id"`
-	Deployment       string `json:"deployment"`
+	BackupID   string `json:"backup_id"`
+	Deployment string `json:"deployment"`
+	// SelfContained is true when the backup embeds the WAL it needs
+	// (--include-wal). WALArchived reports whether any WAL was already
+	// archived for the deployment; with SelfContained false and
+	// WALArchived false, the backup is not restorable yet and
+	// RestoreNeeds says what is missing.
+	SelfContained    bool   `json:"self_contained"`
+	WALArchived      *bool  `json:"wal_archived,omitempty"`
+	RestoreNeeds     string `json:"restore_needs,omitempty"`
 	Tenant           string `json:"tenant,omitempty"`
 	PGVersion        int    `json:"pg_version"`
 	SystemIdentifier string `json:"system_identifier"`
@@ -557,6 +647,10 @@ func (b backupResultBody) WriteText(w io.Writer) error {
 	fmt.Fprintf(bw, "  PostgreSQL:       %d\n", b.PGVersion)
 	fmt.Fprintf(bw, "  Cluster ID:       %s\n", b.SystemIdentifier)
 	fmt.Fprintf(bw, "  Stop LSN / TLI:   %s / %d\n", b.StopLSN, b.Timeline)
+	if b.RestoreNeeds != "" {
+		fmt.Fprintf(bw, "  ⚠ Not restorable yet: needs %s — no WAL has been archived for this\n"+
+			"    deployment and the backup does not embed its own. Start `wal stream`, or re-take with --include-wal.\n", b.RestoreNeeds)
+	}
 	fmt.Fprintf(bw, "  Files:            %d in %d tablespace(s)\n", b.FileCount, b.TablespaceCount)
 	fmt.Fprintf(bw, "  Logical bytes:    %s\n", humanBytes(b.LogicalBytes))
 	fmt.Fprintf(bw, "  Unique chunks:    %d (%s after dedup)\n", b.UniqueChunkCount, humanBytes(b.UniqueChunkBytes))

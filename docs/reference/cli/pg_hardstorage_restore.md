@@ -26,7 +26,12 @@ half is what verifies the manifest signature.
 Refuses to write into a non-empty target unless --force is passed.
 Use --preview to inspect what a real restore would do without
 touching disk. Use --verify=auto|skip|require to control the post-
-restore pg_verifybackup gate.
+restore pg_verifybackup gate; it runs on the directory exactly as
+restored, before the --verify-restore boot test. The boot test starts
+PostgreSQL in the target with a private socket, log and trust-only
+pg_hba (the restored pg_hba.conf is not consulted) and puts back
+postgresql.auto.conf afterwards; what remains is what a first start
+leaves (recovery replayed, backup_label renamed to backup_label.old).
 
 PITR (replaying WAL up to a target):
   --to "5 minutes ago"        natural-language relative time
@@ -40,7 +45,10 @@ PITR (replaying WAL up to a target):
 When any of --to / --to-lsn / --to-name is set, recovery.signal is
 dropped in the target dir and a recovery_target_* block is appended
 to postgresql.auto.conf. The restore_command points back at this
-binary's wal-fetch shim.
+binary's wal-fetch shim. Recovery settings a previous restore left in
+the backed-up postgresql.auto.conf are removed, and every recovery
+target the new block does not set is reset to '', so inherited
+targets never combine with the requested one.
 
 ```
 pg_hardstorage restore <deployment> <backup-id|latest> [flags]
@@ -64,7 +72,7 @@ pg_hardstorage restore <deployment> <backup-id|latest> [flags]
       --repo string                                                                                      repository URL (file://, s3://, ...) — must already exist (required)
       --require-threshold-attestation pg_hardstorage threshold attest sign backup_manifest <backup-id>   refuse to restore unless a k-of-n threshold attestation under this roster ID is present and pins this manifest's body hash; pairs with pg_hardstorage threshold attest sign backup_manifest <backup-id>
       --reset-chain-staging                                                                              wipe the chain-staging directory before starting (force a fresh materialise even if a previous attempt's links are present)
-      --skip-gap-check                                                                                   bypass the+ WAL-gap pre-flight (operator override; the override is audit-logged)
+      --skip-gap-check                                                                                   bypass the WAL pre-flights: known WAL gaps, missing timeline history, and a backup whose WAL exists nowhere (operator override; the override is audit-logged)
       --tablespace-mapping stringArray                                                                   redirect a tablespace from OLDDIR to NEWDIR (repeatable; both paths must be absolute). Plain restores rewrite the manifest's tablespace_map; chain restores pass through to pg_combinebackup. Example: --tablespace-mapping=/mnt/ssd/ts_fast=/var/lib/pg/ts_fast
       --target string                                                                                    directory where the data dir will be materialised (required)
       --to string                                                                                        recover up to this time (natural language or RFC3339)

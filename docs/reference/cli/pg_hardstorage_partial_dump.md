@@ -26,9 +26,9 @@ Run a full pipeline:
 The SQL is written to --sql-file (or stdout if --sql-file is empty).
 Operator-friendly redirection: pipe stdout into a file or psql
 directly. (--sql-file avoids shadowing the global -o/--output JSON
-output flag; the SQL stream is logically separate from the
-structured Result envelope which still rides on stderr/stdout per
--o.)
+output flag.) When the SQL goes to stdout, stdout carries nothing
+else: progress events and the Result summary (in the -o format) are
+written to stderr. With --sql-file they go to stdout as usual.
 
 --data-only emits only INSERT/COPY statements (no DDL).
 
@@ -52,6 +52,7 @@ pg_hardstorage partial dump <deployment> [flags]
       --database string             database containing the requested tables; pg_dump connects to exactly one database, so a table in another database needs its name here (issue #97) (default "postgres")
   -h, --help                        help for dump
       --kms-config stringToString   cloud KMS provider config for a cloud-KMS-encrypted backup (e.g. region=eu-central-1,endpoint=...); empty uses ambient credentials (default [])
+      --pg-user string              PostgreSQL role to read the sandbox as. The sandbox is your own cluster restored from the backup, so this must be a role that exists IN THE BACKUP — not a host login. Only needed when the cluster was initdb'd with -U <name> (default "postgres")
       --repo string                 repository URL (required)
       --skip-version-check          bypass the data-dir vs pg_ctl major-version pre-flight (only for operators running heterogeneous fleets where compatibility was validated some other way)
       --sql-file string             write the dumped SQL here; empty streams to stdout (named --sql-file to avoid shadowing the global --output flag)

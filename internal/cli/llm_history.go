@@ -154,7 +154,7 @@ func newLlmHistoryCmd() *cobra.Command {
 }
 
 func newLlmHistoryListCmd() *cobra.Command {
-	var principal string
+	var principal, keyFile string
 	c := &cobra.Command{
 		Use:          "list",
 		Short:        "List recorded sessions for the operator (or all principals with --principal '*')",
@@ -166,7 +166,7 @@ func newLlmHistoryListCmd() *cobra.Command {
 			if wildcard {
 				scoped = ""
 			}
-			store, err := openHistoryStoreForRead(scoped)
+			store, err := openHistoryStoreForRead(scoped, keyFile)
 			if err != nil {
 				return err
 			}
@@ -205,6 +205,8 @@ func newLlmHistoryListCmd() *cobra.Command {
 	}
 	c.Flags().StringVar(&principal, "principal", "",
 		"operator principal to scope to (default: $USER); pass '*' to list every principal on the host")
+	c.Flags().StringVar(&keyFile, "history-key-file", "",
+		"path to the 32-byte hex key file the transcripts were recorded with (as passed to llm chat --history-key-file); default: derive from the local KEK")
 	return c
 }
 
@@ -212,6 +214,7 @@ func newLlmHistoryShowCmd() *cobra.Command {
 	var (
 		principal string
 		sessionID string
+		keyFile   string
 	)
 	c := &cobra.Command{
 		Use:          "show <session-id>",
@@ -222,7 +225,7 @@ func newLlmHistoryShowCmd() *cobra.Command {
 			d := DispatcherFrom(cmd)
 			sessionID = args[0]
 			scoped := resolvePrincipal(principal)
-			store, err := openHistoryStoreForRead(scoped)
+			store, err := openHistoryStoreForRead(scoped, keyFile)
 			if err != nil {
 				return err
 			}
@@ -239,6 +242,8 @@ func newLlmHistoryShowCmd() *cobra.Command {
 	}
 	c.Flags().StringVar(&principal, "principal", "",
 		"operator principal (default: $USER)")
+	c.Flags().StringVar(&keyFile, "history-key-file", "",
+		"path to the 32-byte hex key file the transcripts were recorded with (as passed to llm chat --history-key-file); default: derive from the local KEK")
 	return c
 }
 
@@ -246,6 +251,7 @@ func newLlmHistoryShredCmd() *cobra.Command {
 	var (
 		principal string
 		yes       bool
+		keyFile   string
 	)
 	c := &cobra.Command{
 		Use:          "shred",
@@ -259,7 +265,7 @@ func newLlmHistoryShredCmd() *cobra.Command {
 					Wrap(output.ErrUsage)
 			}
 			scoped := resolvePrincipal(principal)
-			store, err := openHistoryStoreForRead(scoped)
+			store, err := openHistoryStoreForRead(scoped, keyFile)
 			if err != nil {
 				return err
 			}
@@ -278,6 +284,8 @@ func newLlmHistoryShredCmd() *cobra.Command {
 		"operator principal (default: $USER)")
 	c.Flags().BoolVar(&yes, "yes", false,
 		"acknowledge that the deletion is irreversible (no backup of these transcripts is taken anywhere — they live only on the operator's host)")
+	c.Flags().StringVar(&keyFile, "history-key-file", "",
+		"path to the 32-byte hex key file the transcripts were recorded with (as passed to llm chat --history-key-file); default: derive from the local KEK")
 	return c
 }
 
@@ -327,10 +335,13 @@ func historyConversationsRoot() (string, error) {
 }
 
 // openHistoryStoreForRead is the shared open path for the
-// list/show/shred commands.  Resolves the same DEK chain
-// the chat session uses; returns ErrNoDEK / ErrNotFound as
-// structured CLI errors.
-func openHistoryStoreForRead(principal string) (*history.Store, error) {
+// list/show/shred commands.  Resolves the same file > KEK DEK
+// chain the chat session uses (resolveHistoryDEK): a transcript
+// written with `llm chat --history-key-file` is encrypted under
+// that file's key, not the KEK-derived one, so the read side must
+// accept the same flag or those transcripts are unreadable.
+// Returns ErrNoDEK / ErrNotFound as structured CLI errors.
+func openHistoryStoreForRead(principal, keyFile string) (*history.Store, error) {
 	stateRoot, err := paths.Resolve(paths.DefaultOptions())
 	if err != nil {
 		return nil, output.NewError("internal", err.Error()).Wrap(err)
@@ -342,11 +353,23 @@ func openHistoryStoreForRead(principal string) (*history.Store, error) {
 		return nil, output.NewError("history.open_failed",
 			fmt.Sprintf("history: %v", err)).Wrap(err)
 	}
+	if keyFile != "" {
+		dek, err := readHexKeyFile(keyFile)
+		if err != nil {
+			return nil, output.NewError("history.key_file_invalid", err.Error()).
+				Wrap(fmt.Errorf("%w: %w", output.ErrUsage, err))
+		}
+		if err := store.SetDEK(dek); err != nil {
+			return nil, output.NewError("history.set_dek_failed",
+				fmt.Sprintf("history: install DEK: %v", err)).Wrap(err)
+		}
+		return store, nil
+	}
 	if !keystore.KEKExists(stateRoot.Keyring.Value) {
 		return nil, output.NewError("history.no_dek",
 			"history: no local KEK at the keyring (history requires a key for at-rest encryption)").
 			WithSuggestion(&output.Suggestion{
-				Human:   "run `pg_hardstorage init --encrypt` to provision the keyring + KEK; or pass --history-key-file at chat time",
+				Human:   "run `pg_hardstorage init --encrypt` to provision the keyring + KEK; or pass the --history-key-file the transcripts were recorded with",
 				Command: "pg_hardstorage init --encrypt",
 			}).Wrap(history.ErrNoDEK)
 	}

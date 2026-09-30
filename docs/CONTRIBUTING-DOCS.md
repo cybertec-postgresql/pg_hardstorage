@@ -148,7 +148,11 @@ pg_hardstorage init --pg-connection postgres://… --repo file:///tmp/hsr --yes
 The runner asserts:
 
 - Exit code is 0 (or the expected exit code if the comment
-  has `# RUNNABLE expect-exit=N`)
+  has `# RUNNABLE expect-exit=N`). The block's exit code is that
+  of its first failing command, with `pipefail` on — not just its
+  last command's — so a failure early in a block is not masked by
+  a later `echo`. Commands tested by `if`, `&&` or `||` do not
+  count, as with `set -e`.
 - Stdout matches a regex if `# RUNNABLE expect-match="…"` is set
 
 Tutorials are the natural home for runnable blocks; how-to

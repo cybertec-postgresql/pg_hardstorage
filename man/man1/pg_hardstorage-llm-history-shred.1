@@ -22,6 +22,10 @@ Delete every session for the principal (irreversible without backups)
 	help for shred
 
 .PP
+\fB--history-key-file\fP=""
+	path to the 32-byte hex key file the transcripts were recorded with (as passed to llm chat --history-key-file); default: derive from the local KEK
+
+.PP
 \fB--principal\fP=""
 	operator principal (default: $USER)
 

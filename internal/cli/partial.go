@@ -470,8 +470,16 @@ visibility-map, and segment siblings) for the requested tables into
 skipped.
 
 Resolution: pass --pg-connection to query pg_class on a live source
-DB, OR --relfilenode-map <path> to a JSON file (the same shape
-` + "`partial inspect -o json`" + ` emits).
+DB, OR --relfilenode-map <path> to a JSON file: the output of
+` + "`partial inspect -o json`" + ` as saved (or just its table_mappings
+array) is accepted as-is.
+
+Tables in a non-default tablespace land under pg_tblspc/<oid>/...,
+the path pg_relation_filepath() reports. Incremental backups are
+refused (their relation data only exists combined with the chain);
+use a full backup or ` + "`partial dump`" + `. Any requested table that
+yields nothing (not found, or absent from the backup) makes the
+command exit non-zero after the result is printed.
 
 The output is a partial PGDATA layout. Run pg_dump against a
 PG instance pointed at --target (or copy files into a matching
@@ -611,6 +619,12 @@ func runPartialRestore(cmd *cobra.Command, deployment string, f partialRestoreFl
 		},
 	})
 	if err != nil {
+		// A structured refusal (e.g. partial.incremental_unsupported)
+		// keeps its own code and suggestion.
+		var oe *output.Error
+		if errors.As(err, &oe) {
+			return err
+		}
 		return output.NewError("partial.restore_failed",
 			fmt.Sprintf("partial restore: %v", err)).Wrap(err)
 	}
@@ -635,41 +649,41 @@ func runPartialRestore(cmd *cobra.Command, deployment string, f partialRestoreFl
 // extracted nothing for a table the operator named must not report
 // success.
 //
-// Scope: NotInBackup only. NotFound — a table absent from the catalog —
-// deliberately keeps its exit-0 behaviour, which
-// TestPartialRestore_NotFoundTable_PropagatesNotFound pins: a
-// multi-table run that names one typo still extracts the rest and
-// reports the absence in the body. That is an existing, tested
-// decision and not one to change from here.
-//
-// The two are not equivalent from the operator's side. A NotFound
-// table is absent from their own input's premises — they named
-// something that does not exist, and the body says so. A NotInBackup
-// table exists and they had every reason to expect its data; what
-// diverged is the tool's own resolution (live catalog) from the
-// backup's contents. Nothing in their input hints at it, which is
-// exactly why it needs the exit code.
-//
-// If the asymmetry is unwanted, unifying them is a one-line change plus
-// updating that test — a product call, not a bug fix.
+// Both kinds of absence count. A NotFound table — absent from the
+// catalog, or from the --relfilenode-map — used to keep exit 0 on the
+// theory that the operator can read the body; but a map whose entries
+// were silently not understood (see loadRelfilenodeMap) made EVERY
+// table NotFound, extracted nothing, and exited 0. A multi-table run
+// still extracts the tables it can and the body lists both kinds; only
+// the exit code says the result is incomplete.
 //
 // `partial inspect` is unaffected; it is a "would this work?" preview
 // and reporting an absence is its job.
 func partialRestoreIncomplete(res *partial.RestoreResult) error {
-	if res == nil || len(res.NotInBackup) == 0 {
+	if res == nil || (len(res.NotInBackup) == 0 && len(res.NotFound) == 0) {
 		return nil
 	}
+	var parts []string
+	if len(res.NotInBackup) > 0 {
+		parts = append(parts, "table(s) present in the catalog but absent from this backup: "+
+			strings.Join(res.NotInBackup, ", "))
+	}
+	if len(res.NotFound) > 0 {
+		parts = append(parts, "table(s) not found in the catalog or --relfilenode-map: "+
+			strings.Join(res.NotFound, ", "))
+	}
 	return output.NewError("partial.restore_incomplete",
-		fmt.Sprintf("partial restore: nothing was extracted for table(s) present in the "+
-			"catalog but absent from this backup: %s. The files that WERE extracted are in "+
-			"the target dir and the body above lists them; this exit code exists so a "+
-			"scripted run does not proceed as though the data is there",
-			strings.Join(res.NotInBackup, ", "))).
+		fmt.Sprintf("partial restore: nothing was extracted for %s. The files that WERE "+
+			"extracted are in the target dir and the body above lists them; this exit code "+
+			"exists so a scripted run does not proceed as though the data is there",
+			strings.Join(parts, "; "))).
 		WithSuggestion(&output.Suggestion{
 			Human: "a table missing from THIS backup usually means it was rewritten after the " +
 				"backup was taken (VACUUM FULL, CLUSTER, TRUNCATE, a rewriting ALTER TABLE) — " +
 				"the relfilenode is resolved against the live catalog. Restore from an older " +
-				"backup, or pass the historical relfilenode with --relfilenode-map.",
+				"backup, or pass the historical relfilenode with --relfilenode-map. A table " +
+				"not found is a typo, a table absent from the source catalog, or one missing " +
+				"from the --relfilenode-map (which accepts `partial inspect -o json` output as-is).",
 		})
 }
 
@@ -702,10 +716,17 @@ func resolveLatestBackupID(ctx context.Context, store *backup.ManifestStore, dep
 }
 
 // loadRelfilenodeMap reads a JSON file and returns it as the
-// expected map. The on-disk shape mirrors `partial inspect`'s
-// table_mappings array — we accept either:
-//   - A flat object: { "public.users": {schema, table, path, ...} }
-//   - An array of Relfilenode objects (with Qualified set).
+// expected map. The documented source is `partial inspect -o json`,
+// so every shape an operator can get from it is accepted:
+//   - the whole inspect envelope ({"result": {"table_mappings": [...]}}),
+//     or just its result body ({"table_mappings": [...]});
+//   - the bare table_mappings array;
+//   - a flat object keyed by qualified name.
+//
+// Entries may name the heap file "heap_path" (inspect's spelling) or
+// "path" (partial.Relfilenode's). Accepting only "path" made every
+// table in inspect output come back NotFound, so nothing was
+// extracted.
 func loadRelfilenodeMap(path string) (map[string]partial.Relfilenode, error) {
 	body, err := os.ReadFile(path)
 	if err != nil {
@@ -715,33 +736,70 @@ func loadRelfilenodeMap(path string) (map[string]partial.Relfilenode, error) {
 	if len(body) == 0 {
 		return nil, fmt.Errorf("file %s is empty", path)
 	}
+	if body[0] == '{' {
+		// Unwrap the inspect envelope / body to its table_mappings.
+		var probe struct {
+			Result        json.RawMessage `json:"result"`
+			TableMappings json.RawMessage `json:"table_mappings"`
+		}
+		if err := json.Unmarshal(body, &probe); err == nil {
+			if len(probe.Result) > 0 {
+				if err := json.Unmarshal(probe.Result, &probe); err != nil {
+					return nil, fmt.Errorf("decode %s: result: %w", path, err)
+				}
+			}
+			if len(probe.TableMappings) > 0 {
+				body = bytes.TrimSpace(probe.TableMappings)
+			}
+		}
+	}
 	if body[0] == '[' {
-		var arr []partial.Relfilenode
+		var arr []rfnMapEntry
 		if err := json.Unmarshal(body, &arr); err != nil {
 			return nil, fmt.Errorf("decode %s as array: %w", path, err)
 		}
 		out := make(map[string]partial.Relfilenode, len(arr))
-		for _, r := range arr {
-			if r.Qualified == "" {
-				return nil, fmt.Errorf("entry missing 'qualified' field: %+v", r)
+		for _, e := range arr {
+			if e.Qualified == "" {
+				return nil, fmt.Errorf("entry missing 'qualified' field: %+v", e)
 			}
-			out[r.Qualified] = r
+			out[e.Qualified] = e.relfilenode(e.Qualified)
 		}
 		return out, nil
 	}
-	var m map[string]partial.Relfilenode
+	var m map[string]rfnMapEntry
 	if err := json.Unmarshal(body, &m); err != nil {
 		return nil, fmt.Errorf("decode %s as object: %w", path, err)
 	}
-	// Make sure each entry's Qualified matches its key (helps
-	// downstream code that doesn't re-set it).
-	for k, v := range m {
-		if v.Qualified == "" {
-			v.Qualified = k
-			m[k] = v
+	out := make(map[string]partial.Relfilenode, len(m))
+	for k, e := range m {
+		q := e.Qualified
+		if q == "" {
+			q = k
 		}
+		out[k] = e.relfilenode(q)
 	}
-	return m, nil
+	return out, nil
+}
+
+// rfnMapEntry is one --relfilenode-map entry: partial.Relfilenode's
+// fields plus the spellings `partial inspect` uses.
+type rfnMapEntry struct {
+	partial.Relfilenode
+	HeapPath    string `json:"heap_path"`
+	NotInBackup bool   `json:"not_in_backup"`
+}
+
+func (e rfnMapEntry) relfilenode(qualified string) partial.Relfilenode {
+	r := e.Relfilenode
+	r.Qualified = qualified
+	if r.Path == "" {
+		r.Path = e.HeapPath
+	}
+	if r.Schema == "" && r.Table == "" {
+		r.Schema, r.Table, _ = strings.Cut(qualified, ".")
+	}
+	return r
 }
 
 // partialRestoreBody renders the structured result.

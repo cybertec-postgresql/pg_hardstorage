@@ -100,6 +100,10 @@ func TestIncrementalBackupLifecycleEndToEnd_PG17Plus(t *testing.T) {
 
 	// 4. FULL backup.
 	fullRes, err := runner.Take(ctx, runner.TakeOptions{
+		// Restorable backups: this fixture archives no WAL, so the backup
+		// must embed its own, or restore refuses it (preflight.backup_wal_missing)
+		// — such a data directory could never reach consistency.
+		IncludeWAL:   true,
 		PGConnString: srv.DSN, RepoURL: repoURL, Deployment: "db1",
 		Signer: signer, Verifier: verifier, Fast: true,
 	})
@@ -141,6 +145,7 @@ func TestIncrementalBackupLifecycleEndToEnd_PG17Plus(t *testing.T) {
 
 	// 7. INCREMENTAL backup pinned to the full's PG backup_manifest.
 	incRes, err := runner.Take(ctx, runner.TakeOptions{
+		IncludeWAL:   true,
 		PGConnString: srv.DSN, RepoURL: repoURL, Deployment: "db1",
 		Signer: signer, Verifier: verifier, Fast: true,
 		Incremental: &runner.IncrementalConfig{

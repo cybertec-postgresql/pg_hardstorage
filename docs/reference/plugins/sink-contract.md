@@ -57,16 +57,28 @@ type Sink interface {
    Open(ctx, cfg)               ─ called by the dispatcher before first Emit
               │
               ▼
-   Emit(ctx, ev)                ─ called once per event, possibly concurrently
+   Emit(ctx, ev)                ─ called once per event, one at a time, in order
               │
               ▼
    Close()                      ─ called once at process exit
 ```
 
-The dispatcher's `Close()` blocks until every in-flight
-`Emit` returns — a `sync.WaitGroup` tracks them — so a
-slow sink never observes a `Close` mid-`Emit`.  Sinks
-that buffer or batch should flush on `Close`.
+Each sink has one delivery goroutine fed by a bounded queue
+(`output.DefaultSinkQueueSize`, 1024 events): `Emit` calls on
+one sink never overlap and arrive in emission order.  When a
+sink falls that far behind, further events for it are dropped
+rather than blocking the command; the drop count is reported
+at `Close` as an `output.sink.undelivered` warning event.
+
+The dispatcher's `Close()` drains every queue, bounded by
+`DrainTimeout` (default `output.DefaultSinkDrainTimeout`,
+10 s), then closes each sink — a sink never observes `Close`
+mid-`Emit`.  A sink still inside `Emit` when the budget runs
+out is reported (`output.sink.undelivered`, reason
+`drain_timeout`), its context is cancelled, and it is **not**
+closed.  The context passed to `Emit` carries the emitting
+command's values but not its cancellation.  Sinks that buffer
+or batch should flush on `Close`.
 
 ## Per-method contract
 
@@ -259,9 +271,9 @@ plugin name.
 
 | Operation | Concurrent calls allowed? |
 | --- | --- |
-| `Emit` from multiple goroutines | Yes — sinks MUST be goroutine-safe |
+| `Emit` from multiple goroutines | No — the host delivers one event at a time per registered sink (a sink registered twice gets two lanes) |
 | `Open` / `Close` | Serial; host serializes |
-| `Emit` while `Close` is in flight | NO — host's `WaitGroup` blocks `Close` |
+| `Emit` while `Close` is in flight | NO — `Close` drains the queue first; a sink that does not drain in time is abandoned, not closed |
 
 ## Airgap interaction
 
@@ -290,8 +302,8 @@ file-based audit log) bypass this.
    `Emit` is logged but doesn't fail the operation that
    produced the event.
 3. **`Close` flushes.**  Buffered events emit before
-   `Close` returns.  The dispatcher's `WaitGroup` won't
-   block on a sink that lost its events on shutdown.
+   `Close` returns.  The dispatcher waits at most its drain
+   timeout for queued events before closing sinks.
 4. **Severity filtering happens at `Emit`.**  Filtering at
    the dispatcher would force the dispatcher to know about
    per-sink config.

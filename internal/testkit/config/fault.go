@@ -48,15 +48,16 @@ func knownActionPrefixesNow() []string {
 	return inject.DefaultRegistry.Names()
 }
 
-// LoadFaults reads and validates a faults YAML file.
+// LoadFaults reads and validates a faults YAML file. An empty path is
+// the empty catalogue; a path that does not exist is an error — the
+// operator named it, and quietly running with nothing (a typo in
+// --faults used to soak with an empty catalogue and pass) hides the
+// mistake. LoadFaultsOrEmpty is for the editor that creates the file.
 func LoadFaults(path string) (*Faults, error) {
 	if path == "" {
 		return emptyFaults(), nil
 	}
 	body, err := os.ReadFile(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return emptyFaults(), nil
-	}
 	if err != nil {
 		return nil, fmt.Errorf("faults: read %s: %w", path, err)
 	}
@@ -72,6 +73,16 @@ func LoadFaults(path string) (*Faults, error) {
 		f.Version = 1
 	}
 	return &f, nil
+}
+
+// LoadFaultsOrEmpty is LoadFaults, except that a file which does not
+// exist yet is the empty catalogue. Only `fault add` uses it: it is
+// the command that creates the file.
+func LoadFaultsOrEmpty(path string) (*Faults, error) {
+	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+		return emptyFaults(), nil
+	}
+	return LoadFaults(path)
 }
 
 func emptyFaults() *Faults {

@@ -274,10 +274,13 @@ func (b *PGBackend) Claim(ctx context.Context, opts ClaimOptions) (*Job, error) 
 	if opts.AgentID == "" {
 		return nil, errors.New("jobs: AgentID is required for claim")
 	}
-	deployments := opts.Deployments
-	if deployments == nil {
-		deployments = []string{}
+	// Empty deployment set = manages nothing = claims nothing (see
+	// ClaimOptions.Deployments). Short-circuit before the round-trip;
+	// the SQL below also has no "empty = any" arm any more.
+	if len(opts.Deployments) == 0 {
+		return nil, ErrNoJobs
 	}
+	deployments := opts.Deployments
 	kinds := make([]string, len(opts.Kinds))
 	for i, k := range opts.Kinds {
 		kinds[i] = string(k)
@@ -341,7 +344,7 @@ func (b *PGBackend) claimRow(ctx context.Context, q pgQuerier, opts ClaimOptions
          WHERE id = (
              SELECT id FROM phs.jobs
               WHERE state = 'queued'
-                AND ($3::text[] = '{}'::text[] OR deployment = ANY($3))
+                AND deployment = ANY($3)
                 AND ($4::text[] = '{}'::text[] OR kind = ANY($4))
                 AND ($5 <= 0 OR (
                     SELECT count(*) FROM phs.jobs WHERE state = 'running'
@@ -362,6 +365,32 @@ func (b *PGBackend) claimRow(ctx context.Context, q pgQuerier, opts ClaimOptions
 		return nil, fmt.Errorf("pgbackend: claim: %w", err)
 	}
 	return j, nil
+}
+
+// CountByState implements JobBackend: one aggregate row per state, so
+// a /metrics scrape costs an index-sized scan, not every job's args,
+// result and progress arrays.
+func (b *PGBackend) CountByState(ctx context.Context) (map[JobState]int, error) {
+	rows, err := b.pool.Query(ctx, `SELECT state, count(*) FROM phs.jobs GROUP BY state`)
+	if err != nil {
+		return nil, fmt.Errorf("pgbackend: count by state: %w", err)
+	}
+	defer rows.Close()
+	out := map[JobState]int{}
+	for rows.Next() {
+		var (
+			state string
+			n     int64
+		)
+		if err := rows.Scan(&state, &n); err != nil {
+			return nil, fmt.Errorf("pgbackend: count by state: scan: %w", err)
+		}
+		out[JobState(state)] = int(n)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("pgbackend: count by state: %w", err)
+	}
+	return out, nil
 }
 
 // AppendProgress implements JobBackend.
@@ -567,8 +596,12 @@ func (b *PGBackend) SweepAbandoned(ctx context.Context, deadline time.Duration) 
         UPDATE phs.jobs
            SET state = 'failed',
                failure = $1,
-               completed_at = now() AT TIME ZONE 'UTC',
-               updated_at   = now() AT TIME ZONE 'UTC'
+               -- now(), not now() AT TIME ZONE 'UTC': the latter is a
+               -- zone-less wall clock that is re-read in the SESSION
+               -- TimeZone when stored into timestamptz, skewing the
+               -- stamps by the server's UTC offset.
+               completed_at = now(),
+               updated_at   = now()
          WHERE state = 'running'
            AND started_at IS NOT NULL
            AND updated_at < $2

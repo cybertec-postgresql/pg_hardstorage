@@ -223,6 +223,7 @@ func newHoldAddCmd() *cobra.Command {
 		holder  string
 		reason  string
 		until   string
+		force   bool
 	)
 	c := &cobra.Command{
 		Use:   "add <deployment> <backup-id>",
@@ -242,11 +243,17 @@ moment. Useful for time-bounded debugging windows
 --until accepts:
   - duration shorthand: "30d", "2w", "12h", "45m"
   - absolute time:      "2027-01-01T00:00:00Z" (RFC3339) or
-                        "2027-01-01" (date only, midnight UTC)`,
+                        "2027-01-01" (date only, midnight UTC)
+
+Re-adding a hold may extend it (same holder, later or no expiry) but
+never silently weakens an ACTIVE one: an earlier expiry, a finite
+expiry on an indefinite hold, or a different --holder is refused with
+conflict.hold_exists (exit 7). --force replaces it anyway and records
+the replaced hold in a hold.replace audit event.`,
 		Args:         cobra.ExactArgs(2),
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runHoldAdd(cmd, args[0], args[1], repoURL, holder, reason, until)
+			return runHoldAdd(cmd, args[0], args[1], repoURL, holder, reason, until, force)
 		},
 	}
 	c.Flags().StringVar(&repoURL, "repo", "",
@@ -258,10 +265,12 @@ moment. Useful for time-bounded debugging windows
 		"why the hold was placed (free-form; appears in the marker for audit)")
 	c.Flags().StringVar(&until, "until", "",
 		"auto-expire the hold at this time (e.g. '30d', '2w', '2027-01-01'); empty = indefinite")
+	c.Flags().BoolVar(&force, "force", false,
+		"replace an existing active hold even if the new one is weaker (shorter/finite expiry, different holder); audited as hold.replace")
 	return c
 }
 
-func runHoldAdd(cmd *cobra.Command, deployment, backupID, repoURL, holder, reason, until string) error {
+func runHoldAdd(cmd *cobra.Command, deployment, backupID, repoURL, holder, reason, until string, force bool) error {
 	d := DispatcherFrom(cmd)
 
 	// Parse --until BEFORE opening the repo so a typo on the
@@ -292,7 +301,18 @@ func runHoldAdd(cmd *cobra.Command, deployment, backupID, repoURL, holder, reaso
 	defer sp.Close()
 
 	store := backup.NewManifestStore(sp)
-	if err := store.PutHoldUntil(cmd.Context(), deployment, backupID, holder, reason, expiresAt); err != nil {
+	prev, err := store.PutHoldWithOptions(cmd.Context(), deployment, backupID, backup.PutHoldOptions{
+		Holder: holder, Reason: reason, ExpiresAt: expiresAt, Force: force,
+	})
+	if err != nil {
+		var weakErr *backup.HoldWeakenError
+		if errors.As(err, &weakErr) {
+			return output.NewError("conflict.hold_exists",
+				fmt.Sprintf("hold add: %s/%s already has an active hold — %s", deployment, backupID, weakErr.Why)).
+				WithSuggestion(&output.Suggestion{
+					Human: "a hold may be extended but not silently weakened. Check it with `pg_hardstorage hold list`; if replacing it is really intended (and authorised), re-run with --force — the replaced hold is recorded in the audit chain.",
+				}).Wrap(err)
+		}
 		if errors.Is(err, storage.ErrNotFound) {
 			return output.NewError("notfound.backup",
 				fmt.Sprintf("hold add: backup %s/%s not found", deployment, backupID)).
@@ -308,8 +328,14 @@ func runHoldAdd(cmd *cobra.Command, deployment, backupID, repoURL, holder, reaso
 	// Audit the legal-hold placement (observability audit #3): placing a
 	// hold is a compliance-relevant action, so it must leave a chain
 	// record — previously only the automatic purge-expired path did.
+	action := "hold.add"
+	if prev != nil {
+		// Editing an existing marker. Record what it was so a forced
+		// weakening (or any edit) is reconstructable from the chain.
+		action = "hold.replace"
+	}
 	addEv := &audit.Event{
-		Action: "hold.add",
+		Action: action,
 		Actor:  holder,
 		Subject: audit.Subject{
 			Deployment: deployment,
@@ -323,6 +349,16 @@ func runHoldAdd(cmd *cobra.Command, deployment, backupID, repoURL, holder, reaso
 	}
 	if !expiresAt.IsZero() {
 		addEv.Body["expires_at"] = expiresAt.Format(time.RFC3339)
+	}
+	if prev != nil {
+		addEv.Body["forced"] = force
+		addEv.Body["previous_holder"] = prev.Holder
+		addEv.Body["previous_reason"] = prev.Reason
+		if prev.ExpiresAt != nil {
+			addEv.Body["previous_expires_at"] = prev.ExpiresAt.UTC().Format(time.RFC3339)
+		} else {
+			addEv.Body["previous_expires_at"] = "indefinite"
+		}
 	}
 	audit.NewStoreWithRetention(sp, repoMeta.WORM).AppendOrLog(cmd.Context(), addEv)
 
@@ -474,7 +510,10 @@ func runHoldRemove(cmd *cobra.Command, deployment, backupID, repoURL string, yes
 	// emitted no record. Now it does.
 	audit.NewStoreWithRetention(sp, repoMeta.WORM).AppendOrLog(cmd.Context(), &audit.Event{
 		Action: "hold.remove",
-		Actor:  prevHolder,
+		// The actor is whoever RELEASED the hold, not whoever placed it;
+		// recording the original holder made every release look
+		// self-inflicted and hid who actually lifted a legal hold.
+		Actor: initiatorFromEnv(),
 		Subject: audit.Subject{
 			Deployment: deployment,
 			BackupID:   backupID,

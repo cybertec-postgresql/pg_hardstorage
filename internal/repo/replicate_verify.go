@@ -156,9 +156,18 @@ type ReplicateVerifyResult struct {
 	ChunksMissing      int `json:"chunks_missing,omitempty"`
 	ChunksContentDrift int `json:"chunks_content_drift,omitempty"`
 
-	WALManifestsConsidered int `json:"wal_manifests_considered,omitempty"`
-	WALManifestsPresent    int `json:"wal_manifests_present,omitempty"`
-	WALManifestsMissing    int `json:"wal_manifests_missing,omitempty"`
+	WALManifestsConsidered   int `json:"wal_manifests_considered,omitempty"`
+	WALManifestsPresent      int `json:"wal_manifests_present,omitempty"`
+	WALManifestsMissing      int `json:"wal_manifests_missing,omitempty"`
+	WALManifestsContentDrift int `json:"wal_manifests_content_drift,omitempty"`
+
+	// ManifestsUnparseable counts src manifests (backup or WAL) whose
+	// body could not be parsed into a chunk list, so their chunks could
+	// NOT be checked at the replica. They used to be skipped silently
+	// and the run could still say "consistent" about backups whose
+	// chunks nobody looked at. Any non-zero value keeps the verdict off
+	// consistent.
+	ManifestsUnparseable int `json:"manifests_unparseable,omitempty"`
 
 	// WAL auxiliary files (.history/.backup/.partial): direct-byte files
 	// the DR repo needs for cross-failover PITR.
@@ -178,7 +187,7 @@ func (r *ReplicateVerifyResult) AnyMissing() bool {
 
 // AnyDrifted reports whether any present key had drifted content.
 func (r *ReplicateVerifyResult) AnyDrifted() bool {
-	return r.ManifestsContentDrift+r.ChunksContentDrift > 0
+	return r.ManifestsContentDrift+r.ChunksContentDrift+r.WALManifestsContentDrift+r.ManifestsUnparseable > 0
 }
 
 // VerifyReplicate walks src + dst and reports the verification
@@ -247,10 +256,11 @@ func VerifyReplicate(ctx context.Context, src, dst storage.StoragePlugin, opts R
 		if !strings.HasSuffix(info.Key, "/manifest.json.tombstone") {
 			continue
 		}
-		// Layout: manifests/<dep>/backups/<id>/manifest.json.tombstone
-		parts := strings.Split(info.Key, "/")
-		if len(parts) >= 4 {
-			tombstoned[parts[3]] = struct{}{}
+		// Keyed on deployment + id, exactly as Replicate skips them —
+		// an id-only key excused a LIVE same-id backup in another
+		// deployment from verification.
+		if k := tombstoneKey(info.Key); k != "" {
+			tombstoned[k] = struct{}{}
 		}
 	}
 
@@ -278,16 +288,23 @@ func VerifyReplicate(ctx context.Context, src, dst storage.StoragePlugin, opts R
 		}
 		// Skip tombstoned (soft-deleted) backups: Replicate never
 		// copies them, so a healthy replica correctly lacks them.
-		if id := backupIDFromKey(info.Key); id != "" {
-			if _, dead := tombstoned[id]; dead {
+		if k := manifestTombstoneKey(info.Key); k != "" {
+			if _, dead := tombstoned[k]; dead {
 				res.ManifestsTombstoned++
 				continue
 			}
 		}
 		res.ManifestsConsidered++
 
-		// Manifest presence + content check.
-		drift, err := verifyKey(ctx, src, dst, info.Key, info.Size, opts)
+		// Manifest presence + content check. Manifests are compared on
+		// their BYTES even without --deep: they are small, and a manifest
+		// rewritten in place at src (`kms rotate` re-wraps the DEK) keeps
+		// its size to the byte often enough that a size check called a
+		// replica consistent while it held a copy only the retired KEK
+		// could open.
+		mopts := opts
+		mopts.Deep = true
+		drift, err := verifyKey(ctx, src, dst, info.Key, info.Size, mopts)
 		if err != nil {
 			if !errors.Is(err, errReplicaKeyMissing) {
 				// Transient/backend or src-side error — we cannot
@@ -309,7 +326,7 @@ func VerifyReplicate(ctx context.Context, src, dst storage.StoragePlugin, opts R
 			recordReplicateVerifyFailure(res, ReplicateVerifyFailure{
 				Kind:   "content_drift",
 				Key:    info.Key,
-				Reason: "size mismatch between primary and replica",
+				Reason: "content mismatch between primary and replica (re-run replicate to refresh it)",
 			})
 			res.ManifestsContentDrift++
 			emitReplicateVerifyProgress(opts, "manifest", info.Key, "content_drift")
@@ -320,55 +337,9 @@ func VerifyReplicate(ctx context.Context, src, dst storage.StoragePlugin, opts R
 
 		// Walk chunk references.  We need the manifest body to
 		// enumerate chunk hashes; there's no shortcut.
-		chunkKeys, manifestParseErr := chunkKeysFromManifest(ctx, src, info.Key)
-		if manifestParseErr != nil {
-			// A torn manifest at src is a primary-side concern;
-			// surface as a content-drift failure on the manifest
-			// (we already counted it above) and skip the chunk
-			// walk for this manifest.
-			continue
-		}
-		for _, chunkKey := range chunkKeys {
-			if err := ctx.Err(); err != nil {
-				finish()
-				return res, err
-			}
-			if _, seen := chunksSeen[chunkKey]; seen {
-				continue
-			}
-			chunksSeen[chunkKey] = struct{}{}
-			res.ChunksConsidered++
-			drift, err := verifyKey(ctx, src, dst, chunkKey, 0, opts)
-			if err != nil {
-				if !errors.Is(err, errReplicaKeyMissing) {
-					// Transient/backend or src-side error — abort
-					// rather than falsely flagging the chunk missing.
-					finish()
-					return res, fmt.Errorf("repo: VerifyReplicate: verify chunk %q: %w", chunkKey, err)
-				}
-				recordReplicateVerifyFailure(res, ReplicateVerifyFailure{
-					Kind:     "missing_chunk",
-					Key:      chunkKey,
-					BackupID: backupIDFromKey(info.Key),
-					Reason:   err.Error(),
-				})
-				res.ChunksMissing++
-				emitReplicateVerifyProgress(opts, "chunk", chunkKey, "missing")
-				continue
-			}
-			if drift {
-				recordReplicateVerifyFailure(res, ReplicateVerifyFailure{
-					Kind:     "content_drift",
-					Key:      chunkKey,
-					BackupID: backupIDFromKey(info.Key),
-					Reason:   "size mismatch",
-				})
-				res.ChunksContentDrift++
-				emitReplicateVerifyProgress(opts, "chunk", chunkKey, "content_drift")
-			} else {
-				res.ChunksPresent++
-				emitReplicateVerifyProgress(opts, "chunk", chunkKey, "present")
-			}
+		if err := verifyManifestChunks(ctx, src, dst, info.Key, harvestBackup, chunksSeen, opts, res); err != nil {
+			finish()
+			return res, err
 		}
 	}
 
@@ -414,7 +385,9 @@ func VerifyReplicate(ctx context.Context, src, dst storage.StoragePlugin, opts R
 				continue
 			}
 			res.WALManifestsConsidered++
-			drift, err := verifyKey(ctx, src, dst, info.Key, info.Size, opts)
+			wopts := opts
+			wopts.Deep = true // small; compare bytes (see the manifest walk)
+			drift, err := verifyKey(ctx, src, dst, info.Key, info.Size, wopts)
 			if err != nil {
 				if !errors.Is(err, errReplicaKeyMissing) {
 					finish()
@@ -430,20 +403,26 @@ func VerifyReplicate(ctx context.Context, src, dst storage.StoragePlugin, opts R
 				continue
 			}
 			if drift {
-				// WAL drift gets the chunk-style content-drift
-				// classification.  The replica has the segment
-				// manifest but with mismatched bytes — treat
-				// like any other drift.
+				// Counted as WAL-manifest drift, not chunk drift: the
+				// old code bumped ChunksContentDrift, so the report
+				// blamed a chunk for a segment manifest's mismatch.
 				recordReplicateVerifyFailure(res, ReplicateVerifyFailure{
 					Kind:   "content_drift",
 					Key:    info.Key,
-					Reason: "WAL segment manifest size mismatch",
+					Reason: "WAL segment manifest content mismatch",
 				})
-				res.ChunksContentDrift++
+				res.WALManifestsContentDrift++
 				emitReplicateVerifyProgress(opts, "wal_manifest", info.Key, "content_drift")
 			} else {
 				res.WALManifestsPresent++
 				emitReplicateVerifyProgress(opts, "wal_manifest", info.Key, "present")
+			}
+			// The segment's chunks ARE the WAL — a replica holding every
+			// segment manifest but not their chunks cannot replay a
+			// byte, and verify used to call it consistent.
+			if err := verifyManifestChunks(ctx, src, dst, info.Key, harvestWAL, chunksSeen, opts, res); err != nil {
+				finish()
+				return res, err
 			}
 		}
 	}
@@ -549,28 +528,86 @@ func readAll(ctx context.Context, sp storage.StoragePlugin, key string) ([]byte,
 	return storage.ReadAllLimited(rc, MaxChunkEnvelopeBytes)
 }
 
-// chunkKeysFromManifest fetches the manifest at key from src,
-// parses it, and returns the chunk-storage keys for every
-// referenced chunk (deduplicated).  Skips on parse error — the
-// caller treats that as a primary-side concern, not a replica
-// concern.
-//
-// We deliberately re-parse JSON here rather than depending on
-// internal/backup to avoid an import cycle.  The fields we need
-// (`files[].chunks[].hash`) are stable per the v1 contract.
-func chunkKeysFromManifest(ctx context.Context, sp storage.StoragePlugin, key string) ([]string, error) {
+// verifyManifestChunks checks every chunk the src manifest at key
+// references (deduplicated across the run via seen) at dst. A manifest
+// whose body cannot be read-and-parsed is COUNTED as unparseable — its
+// chunks were not verified, and a verdict of consistent must not be
+// built on chunks nobody looked at. The returned error is only for
+// aborts (ctx, transient/backend errors that prove nothing either way).
+func verifyManifestChunks(ctx context.Context, src, dst storage.StoragePlugin, key string, kind harvestKind, seen map[string]struct{}, opts ReplicateVerifyOptions, res *ReplicateVerifyResult) error {
+	chunkKeys, perr := chunkKeysFromManifest(ctx, src, key, kind)
+	if perr != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		res.ManifestsUnparseable++
+		recordReplicateVerifyFailure(res, ReplicateVerifyFailure{
+			Kind:     "unparseable_manifest",
+			Key:      key,
+			BackupID: backupIDFromKey(key),
+			Reason:   "chunks not verified: " + perr.Error(),
+		})
+		return nil
+	}
+	for _, chunkKey := range chunkKeys {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if _, dup := seen[chunkKey]; dup {
+			continue
+		}
+		seen[chunkKey] = struct{}{}
+		res.ChunksConsidered++
+		drift, err := verifyKey(ctx, src, dst, chunkKey, 0, opts)
+		if err != nil {
+			if !errors.Is(err, errReplicaKeyMissing) {
+				// Transient/backend or src-side error — abort
+				// rather than falsely flagging the chunk missing.
+				return fmt.Errorf("repo: VerifyReplicate: verify chunk %q: %w", chunkKey, err)
+			}
+			recordReplicateVerifyFailure(res, ReplicateVerifyFailure{
+				Kind:     "missing_chunk",
+				Key:      chunkKey,
+				BackupID: backupIDFromKey(key),
+				Reason:   err.Error(),
+			})
+			res.ChunksMissing++
+			emitReplicateVerifyProgress(opts, "chunk", chunkKey, "missing")
+			continue
+		}
+		if drift {
+			recordReplicateVerifyFailure(res, ReplicateVerifyFailure{
+				Kind:     "content_drift",
+				Key:      chunkKey,
+				BackupID: backupIDFromKey(key),
+				Reason:   "size mismatch",
+			})
+			res.ChunksContentDrift++
+			emitReplicateVerifyProgress(opts, "chunk", chunkKey, "content_drift")
+		} else {
+			res.ChunksPresent++
+			emitReplicateVerifyProgress(opts, "chunk", chunkKey, "present")
+		}
+	}
+	return nil
+}
+
+// chunkKeysFromManifest fetches the manifest at key from src, parses it
+// with the SAME shapes and fail-closed hash parsing gc and Replicate use
+// (extractChunkHashes), and returns the deduplicated chunk keys.
+func chunkKeysFromManifest(ctx context.Context, sp storage.StoragePlugin, key string, kind harvestKind) ([]string, error) {
 	body, err := readAll(ctx, sp, key)
 	if err != nil {
 		return nil, err
 	}
-	hashes, err := parseChunkHashes(body)
+	hashes, err := extractChunkHashes(body, kind)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("parse manifest: %w", err)
 	}
 	out := make([]string, 0, len(hashes))
 	seen := map[string]struct{}{}
 	for _, h := range hashes {
-		k := chunkKeyFromHexHash(h)
+		k := ChunkKey(h)
 		if _, dup := seen[k]; dup {
 			continue
 		}
@@ -578,41 +615,6 @@ func chunkKeysFromManifest(ctx context.Context, sp storage.StoragePlugin, key st
 		out = append(out, k)
 	}
 	sort.Strings(out)
-	return out, nil
-}
-
-// chunkKeyFromHexHash mirrors ChunkKey() for a string-shaped hash.
-// Same 2/2/60 split that ChunkKey produces.
-func chunkKeyFromHexHash(hex string) string {
-	if len(hex) < 4 {
-		return ""
-	}
-	return "chunks/sha256/" + hex[:2] + "/" + hex[2:4] + "/" + hex + ".chk"
-}
-
-// parseChunkHashes is a manual JSON walk over the manifest body
-// that extracts every `files[].chunks[].hash` field.  We avoid
-// pulling internal/backup here because it would create an import
-// cycle (backup imports repo; this lives in repo).
-func parseChunkHashes(body []byte) ([]string, error) {
-	var manifest struct {
-		Files []struct {
-			Chunks []struct {
-				Hash string `json:"hash"`
-			} `json:"chunks"`
-		} `json:"files"`
-	}
-	if err := jsonStrictUnmarshal(body, &manifest); err != nil {
-		return nil, fmt.Errorf("parse manifest: %w", err)
-	}
-	out := make([]string, 0, 64)
-	for _, f := range manifest.Files {
-		for _, c := range f.Chunks {
-			if c.Hash != "" {
-				out = append(out, c.Hash)
-			}
-		}
-	}
 	return out, nil
 }
 
@@ -694,6 +696,16 @@ func backupIDFromKey(key string) string {
 		return ""
 	}
 	return parts[2]
+}
+
+// manifestTombstoneKey returns "<dep>/<id>" for a
+// manifests/<dep>/backups/<id>/manifest.json key, or "".
+func manifestTombstoneKey(key string) string {
+	parts := strings.Split(key, "/")
+	if len(parts) < 5 || parts[0] != "manifests" || parts[2] != "backups" {
+		return ""
+	}
+	return parts[1] + "/" + parts[3]
 }
 
 // recordReplicateVerifyFailure appends to res.Failures with the

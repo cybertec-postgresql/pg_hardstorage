@@ -161,6 +161,28 @@ func TestCheckEssentialFiles_EmptyDataDir(t *testing.T) {
 	}
 }
 
+// hba_file / config_file may point at another name or a subdirectory
+// INSIDE PGDATA. BASE_BACKUP streams them there; the gate required the
+// hard-coded top-level basenames and refused every such backup. It must
+// look where the GUC points — and still catch the file missing there.
+func TestCheckEssentialFiles_GUCPathInsideDataDirNotTopLevel(t *testing.T) {
+	conf := rhelData + "/conf.d/main.conf"
+	hba := rhelData + "/conf.d/hba.conf"
+	m := manifestWith("PG_VERSION", "postgresql.auto.conf",
+		"conf.d/main.conf", "conf.d/hba.conf", "pg_ident.conf")
+	if err := CheckEssentialFiles(m, rhelData, conf, hba, rhelIdent); err != nil {
+		t.Fatalf("configs present at their GUC paths refused: %v", err)
+	}
+
+	m = manifestWith("PG_VERSION", "postgresql.auto.conf",
+		"conf.d/main.conf", "pg_hba.conf", "pg_ident.conf")
+	err := CheckEssentialFiles(m, rhelData, conf, hba, rhelIdent)
+	var miss *MissingEssentialFilesError
+	if !errors.As(err, &miss) || len(miss.InternalConfigs) != 1 || miss.InternalConfigs[0] != "conf.d/hba.conf" {
+		t.Fatalf("missing hba_file at its GUC path not reported precisely: %v", err)
+	}
+}
+
 // insideDataDir corner cases.  filepath.Clean normalises trailing
 // slashes and "//" runs.
 func TestInsideDataDir(t *testing.T) {

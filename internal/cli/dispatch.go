@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/airgap"
 	"io"
 	"net/http"
 	"os"
@@ -325,6 +326,14 @@ func registerDispatchFlags(c *cobra.Command, f *dispatchAuthFlags) {
 // Caller is expected to have already checked f.controlPlane != ""
 // — this helper is unconditional.
 func newDispatchClient(f *dispatchAuthFlags) (*DispatchClient, error) {
+	// The control plane is an outbound endpoint: under `airgapped: strict`
+	// it must resolve inside the perimeter or be allowlisted, exactly like
+	// the agent's own control-plane URL (agent/controlplane.go). Checked
+	// before the client exists, so a refused URL never sees a request.
+	if err := airgap.Default().EndpointAllowed(f.controlPlane); err != nil {
+		return nil, output.NewError("config.invalid",
+			fmt.Sprintf("dispatch: --control-plane: %v", err)).Wrap(err)
+	}
 	c := &DispatchClient{
 		BaseURL:      strings.TrimRight(f.controlPlane, "/"),
 		CAFile:       f.caFile,

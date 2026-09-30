@@ -110,3 +110,31 @@ func historyStore(sp storage.StoragePlugin) historyReader {
 	}
 	return timeline.New(sp)
 }
+
+// lineageForkSegmentStart returns the start of the WAL segment holding
+// the point where timeline tli's lineage stops sharing WAL with
+// timeline prior (see timeline.LeavesAt), read from tli's captured
+// history file. ok=false when the history is missing, unreadable or
+// says nothing about prior — callers then keep their prior behaviour.
+//
+// Shared by the resume clamp (resolveStartLSN) and timeline-aware gap
+// detection (findLineageGaps), so both agree on where a new timeline's
+// coverage must begin.
+func lineageForkSegmentStart(ctx context.Context, sp storage.StoragePlugin, deployment string, tli, prior uint32, segSize int64) (pglogrepl.LSN, bool) {
+	if sp == nil || tli <= 1 || segSize <= 0 {
+		return 0, false
+	}
+	content, err := timeline.New(sp).Get(ctx, deployment, tli)
+	if err != nil {
+		return 0, false
+	}
+	hist, err := timeline.ParseHistory(content)
+	if err != nil {
+		return 0, false
+	}
+	sw, ok := timeline.LeavesAt(hist, prior)
+	if !ok {
+		return 0, false
+	}
+	return pglogrepl.LSN(uint64(sw) / uint64(segSize) * uint64(segSize)), true
+}

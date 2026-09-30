@@ -78,6 +78,12 @@ func TestWalPush_TDE_RefusesWithoutSysIDOrConn(t *testing.T) {
 		!strings.Contains(oe.Suggestion.Human, "system-identifier") {
 		t.Errorf("suggestion should point at --system-identifier; got %+v", oe.Suggestion)
 	}
+	// The flag only parses unsigned decimal (the form pg_control_system()
+	// prints); telling the operator to paste hex sends them straight into
+	// the flag's own validation error.
+	if oe.Suggestion != nil && !strings.Contains(oe.Suggestion.Human, "--system-identifier <decimal>") {
+		t.Errorf("suggestion must ask for the decimal form the flag accepts; got %q", oe.Suggestion.Human)
+	}
 }
 
 // TestWalPush_TDE_AcceptsExplicitSysID confirms the happy path

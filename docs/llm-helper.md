@@ -36,9 +36,13 @@ For persistent config, add an `llm:` block to
 | `restore` | Walks the operator through a restore.  Uses `recovery readiness` / `recovery windows`. | `pg_hardstorage llm --skill restore` then chat |
 | `incident` | 3am triage.  Pre-loads `doctor`, recent audit events, and the runbook index.  Wired to the `--on-error-llm` trigger. | `pg_hardstorage llm --skill incident` or auto-fire via `pg_hardstorage --on-error-llm <command>` |
 
-Skill files live in `share/skills/` (your editable templates) and
-`internal/llm/skills/builtin/` (compiled-in fallbacks).
-Operator overrides win.  Inspect the active skill at any time:
+Skill files live in `internal/llm/skills/builtin/` (compiled-in
+defaults); `share/skills/` holds editable templates.  Operator
+overrides in `/usr/share/pg_hardstorage/skills/`,
+`/etc/pg_hardstorage/skills/`, `~/.config/pg_hardstorage/skills/`
+and `$PG_HARDSTORAGE_SKILL_DIR` win.  Nothing is loaded relative to
+the current directory — to try the in-tree templates, run with
+`PG_HARDSTORAGE_SKILL_DIR=share/skills`.  Inspect the active skill at any time:
 
 ```bash
 pg_hardstorage llm skill show ask
@@ -147,6 +151,11 @@ Per-session events include:
 - `llm.tool_result` — summary of each tool's result
 - `llm.response` — final answer plus token usage
 - `llm.command_warnings` — validator hits, if any
+- `llm.execute_gate` — advise+execute only: every `execute_command`
+  attempt, allowed or refused, with the gate that refused it
+- `llm.execute_anomaly` — advise+execute only: the anomaly
+  detector's verdict (`normal` / `warn` / `severe`) for each command
+  that passed the gates
 - `llm.session_ended` — final tally
 
 To pull the full transcript for one session:
@@ -155,10 +164,15 @@ To pull the full transcript for one session:
 pg_hardstorage llm history show <session-id>
 ```
 
+If the session was recorded with `llm chat --history-key-file <path>`,
+pass the same `--history-key-file <path>` to `llm history
+list/show/shred` — those transcripts are encrypted under that key,
+not the one derived from the local KEK.
+
 Or export a signed evidence bundle suitable for an auditor:
 
 ```bash
-pg_hardstorage llm export-session <session-id> --out bundle.tar.gz
+pg_hardstorage llm export-session <session-id> --repo <repo-url> --out bundle.tar.gz
 ```
 
 ## Testing your changes
@@ -185,7 +199,7 @@ binary, so scenario behaviour matches operator behaviour exactly.
 
 | lever | location | when to touch |
 |---|---|---|
-| Skill prompt + tool list | `share/skills/<skill>.skill.yaml` | Tighter or broader tool surface; locale variants |
+| Skill prompt + tool list | `share/skills/<skill>.skill.yaml` (load with `PG_HARDSTORAGE_SKILL_DIR=share/skills`) | Tighter or broader tool surface; locale variants |
 | Flag cheatsheet (system prompt) | `internal/llm/chat/session.go` — `flagCheatsheetAddendum` | When you observe the model inventing a new flag pattern; covered by drift-guard test |
 | Pre-loaded `--help` for hot commands | `internal/cli/llm.go` — `hotCommandPaths` | When a subcommand keeps tripping the validator |
 | Validator retry budget | `internal/cli/llm.go` — `MaxValidatorRetries: 1` | Trade latency for accuracy; raise to 2+ if model self-corrects reliably |

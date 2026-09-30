@@ -72,6 +72,9 @@ func commitBackupLSN(t *testing.T, w *readWorld, deployment, id, startLSN, stopL
 	if _, err := repo.NewCAS(w.sp).PutChunk(context.Background(), body); err != nil {
 		t.Fatalf("seed chunk for %s: %v", id, err)
 	}
+	// Real deployments archive WAL; restore refuses a backup whose
+	// WAL exists nowhere (preflight.backup_wal_missing).
+	w.plantArchivedWAL(t, deployment, 1)
 	if err := w.store.Commit(context.Background(), m, w.signer, backup.CommitOptions{}); err != nil {
 		t.Fatalf("commit %s: %v", id, err)
 	}
@@ -311,6 +314,9 @@ func commitChainLink(t *testing.T, w *readWorld, deployment, id, parent, startLS
 	if _, err := repo.NewCAS(w.sp).PutChunk(context.Background(), body); err != nil {
 		t.Fatalf("seed chunk for %s: %v", id, err)
 	}
+	// Real deployments archive WAL; restore refuses a backup whose
+	// WAL exists nowhere (preflight.backup_wal_missing).
+	w.plantArchivedWAL(t, deployment, 1)
 	if err := w.store.Commit(context.Background(), m, w.signer, backup.CommitOptions{}); err != nil {
 		t.Fatalf("commit %s: %v", id, err)
 	}

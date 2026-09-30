@@ -26,8 +26,8 @@ and incident review:
   audit summary --repo  --since 7d --action-prefix backup.
 
 .PP
-# Per-tenant deletion volume
-  audit summary --repo  --since 720h --action backup.delete
+# Deletion volume per action under backup.delete
+  audit summary --repo  --since 720h --action-prefix backup.delete
 
 .PP
 The result is a map of action → count plus a total, rendered as

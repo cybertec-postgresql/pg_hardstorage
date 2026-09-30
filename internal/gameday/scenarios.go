@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
@@ -21,7 +22,7 @@ func init() {
 	})
 	Register(Scenario{
 		Name:        "s3_throttle",
-		Description: "Inject a 503-storm into the storage plugin for duration; assert backup completes.",
+		Description: "Inject a failure storm into the repository's storage plugin; assert writes fail loudly during it and a write after it lands and reads back intact. Needs --repo.",
 		Tier:        "L3",
 		Run:         runS3Throttle,
 	})
@@ -51,32 +52,23 @@ func runS3Throttle(ctx context.Context, opts RunOptions) (*Result, error) {
 		r.Evidence = append(r.Evidence, Event{
 			At:      time.Now().UTC(),
 			Kind:    "plan",
-			Message: fmt.Sprintf("would inject 503 responses for %s on every chunk PUT against the configured storage plugin", dur),
+			Message: fmt.Sprintf("would inject write failures (held up to %s) on a probe key in --repo, assert the write fails during the storm, then that a write after it reads back intact", dur),
 		})
 		r.Pass = true
 		return r, nil
 	}
 
-	// Without a repo URL we fall back to the contract-only path
-	// (matches the v0.1 posture for ad-hoc invocations).
-	if opts.RepoURL == "" {
-		r.Evidence = append(r.Evidence,
-			Event{
-				At:      time.Now().UTC(),
-				Kind:    "invariant",
-				Message: "503-storm of duration N must not abort an in-flight backup whose retry budget covers N",
-				Body: map[string]any{
-					"fault_duration": dur.String(),
-					"retry_budget":   "AWS-style exponential with jitter; per-host circuit breaker",
-				},
-			},
-			Event{
-				At:      time.Now().UTC(),
-				Kind:    "info",
-				Message: "no --repo provided; scenario passes-by-contract. Pass --repo to drive the fault-injection middleware against a real backend.",
-			},
-		)
-		r.Pass = true
+	// No repository is a refusal, not a pass. This path used to
+	// record the invariant, inject nothing and return Pass=true
+	// ("passes-by-contract") — so `gameday run s3_throttle` exited 0
+	// and `gameday report` counted a pass for a drill that never
+	// touched storage. Same posture as agent_kill and
+	// patroni_split_brain.
+	if strings.TrimSpace(opts.RepoURL) == "" {
+		r.Failure = "no repository to drill: pass --repo (the storm is injected into " +
+			"that repository's storage plugin)"
+		r.Misconfigured = true
+		r.Pass = false
 		return r, nil
 	}
 
@@ -137,10 +129,21 @@ func runS3Throttle(ctx context.Context, opts RunOptions) (*Result, error) {
 		r.Pass = false
 		return r, nil
 	}
+	// A Put that returns nil is not yet recovery: read it back through
+	// the same wrapper and require the exact bytes, so a backend that
+	// acknowledges writes it did not keep fails the drill.
+	got, gerr := readProbe(ctx, mw, probeKey)
+	if gerr != nil || !bytes.Equal(got, probeBody) {
+		r.Failure = fmt.Sprintf("post-fault write did not read back intact (err=%v, %d bytes, want %d)",
+			gerr, len(got), len(probeBody))
+		r.Pass = false
+		_ = sp.Delete(ctx, probeKey)
+		return r, nil
+	}
 	r.Evidence = append(r.Evidence, Event{
 		At:      time.Now().UTC(),
 		Kind:    "recovered",
-		Message: "post-fault Put succeeded; recovery confirmed",
+		Message: "post-fault Put succeeded and read back byte-identical; recovery confirmed",
 	})
 
 	// Best-effort cleanup: delete the probe key so we don't leave
@@ -149,6 +152,16 @@ func runS3Throttle(ctx context.Context, opts RunOptions) (*Result, error) {
 
 	r.Pass = true
 	return r, nil
+}
+
+// readProbe reads key in full.
+func readProbe(ctx context.Context, sp storage.StoragePlugin, key string) ([]byte, error) {
+	rc, err := sp.Get(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	defer rc.Close()
+	return storage.ReadAllLimited(rc, storage.MaxMetadataBytes)
 }
 
 // runPatroniFailover documents the failover invariant. A real driver

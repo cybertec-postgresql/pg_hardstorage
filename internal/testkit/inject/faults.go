@@ -43,6 +43,13 @@ func init() {
 	}
 }
 
+// ErrNotApplicable reports that a fault cannot produce its effect on
+// this target — disk_full whose capped spacer cannot reach the requested
+// fill, pause_archive with no archiver running. Reporting such a fault
+// as applied made a third of a soak's fault weight fictional; the
+// orchestrator records it as fault_skipped_not_applicable instead.
+var ErrNotApplicable = errors.New("fault not applicable to this target")
+
 // --- disk_full --------------------------------------------------------
 
 // diskFullFault fills a target's disk by writing a zero-filled
@@ -61,8 +68,13 @@ func init() {
 //	target     — TargetSet selector, required (e.g. "repo", "pg_random")
 //	max_bytes  — absolute cap on the spacer size, default 268435456 (256 MiB).
 //	             Hard upper bound; never exceeded regardless of `fill`.
-//	fill       — percentage of free space to consume up to max_bytes.
-//	             Default "98%".  Pick min(fill% of avail, max_bytes).
+//	fill       — percentage of free space to consume.  Default "98%".
+//	             When fill% of avail exceeds max_bytes the fault is NOT
+//	             applied (ErrNotApplicable): a capped spacer consumes a
+//	             sliver of a large filesystem and never produces ENOSPC,
+//	             and used to be reported as applied anyway.  Raise
+//	             max_bytes, or point path/mount at a small filesystem,
+//	             to run it for real.
 //	path       — file to write the spacer into.  Default
 //	             "/var/lib/pg_hardstorage/repo/.testkit-disk-fill",
 //	             which is the bind-mounted repo dir — the fill
@@ -136,63 +148,103 @@ func (diskFullFault) Apply(ctx context.Context, args Args, ts TargetSet) (Recove
 		maxBytes = mb
 	}
 
-	for _, t := range tgs {
+	// removeSpacer undoes a fill on one target; shared by recovery and
+	// by an apply that has to back out.
+	removeSpacer := func(ctx context.Context, t Target) error {
+		_, err := t.Exec(ctx, "rm", "-f", path)
+		if err == nil {
+			return nil
+		}
+		// Fallback: truncate in place.  An empty `:` builtin +
+		// redirection works in dash / bash / busybox sh and doesn't
+		// allocate a runc temp file (the ENOSPC-during-runc cascade).
+		if _, err2 := t.Exec(ctx, "sh", "-c", fmt.Sprintf(": > %s", path)); err2 != nil {
+			return fmt.Errorf("disk_full recovery: rm on %s: %w (truncate fallback also failed: %v)",
+				t.Name(), err, err2)
+		}
+		return nil
+	}
+	avail := func(t Target) (int, error) {
 		out, err := t.Exec(ctx, "df", "--output=avail", "-B1", mountFor)
 		if err != nil {
-			return nil, fmt.Errorf("disk_full: df %s: %w", t.Name(), err)
+			return 0, fmt.Errorf("disk_full: df %s: %w", t.Name(), err)
 		}
-		avail, err := parseDfAvail(string(out))
+		n, err := parseDfAvail(string(out))
 		if err != nil {
-			return nil, fmt.Errorf("disk_full: parse df: %w", err)
+			return 0, fmt.Errorf("disk_full: parse df: %w", err)
 		}
-		// Spacer = min(avail × pct/100, max_bytes).  The cap
-		// is the load-bearing piece: it prevents one cell
-		// from monopolising the shared host filesystem.
-		spacer := avail * pct / 100
-		if spacer > maxBytes {
-			spacer = maxBytes
+		return n, nil
+	}
+
+	var filled []Target
+	backOut := func() {
+		for _, t := range filled {
+			_ = removeSpacer(context.WithoutCancel(ctx), t)
 		}
-		// dd in 1 MiB blocks; round down to whole blocks so a
-		// sub-MiB spacer (rare, but possible on tight hosts)
-		// becomes 0 rather than failing on a fractional count.
-		blocks := spacer / (1024 * 1024)
+	}
+	for _, t := range tgs {
+		before, err := avail(t)
+		if err != nil {
+			backOut()
+			return nil, err
+		}
+		want := before * pct / 100
+		// The cap is load-bearing — it stops one cell from filling the
+		// shared host filesystem — so it is never exceeded. But a spacer
+		// the cap clamps below the requested fill leaves the filesystem
+		// with plenty of room: no ENOSPC, no fault. Say so instead of
+		// claiming one.
+		if want > maxBytes {
+			backOut()
+			return nil, fmt.Errorf("disk_full on %s: %d%% of %d free bytes is %d, above max_bytes %d; "+
+				"the fill would leave the filesystem far from full: %w",
+				t.Name(), pct, before, want, maxBytes, ErrNotApplicable)
+		}
+		// dd in 1 MiB blocks, rounded down.
+		blocks := want / (1024 * 1024)
 		if blocks <= 0 {
-			// Nothing meaningful to fill; degrade to a no-op
-			// rather than an error so a tightly-quota'd test
-			// host still completes the soak.
-			continue
+			backOut()
+			return nil, fmt.Errorf("disk_full on %s: %d free bytes leave nothing to fill: %w",
+				t.Name(), before, ErrNotApplicable)
 		}
+		// dd is expected to stop at ENOSPC on a filesystem that fills
+		// early, hence `|| true`; whether the fill landed is decided by
+		// measuring below, not by dd's exit status.
 		if _, err := t.Exec(ctx,
 			"sh", "-c",
 			fmt.Sprintf("dd if=/dev/zero of=%s bs=1M count=%d 2>&1 || true",
 				path, blocks)); err != nil {
+			backOut()
 			return nil, fmt.Errorf("disk_full: dd on %s: %w", t.Name(), err)
+		}
+		filled = append(filled, t)
+		after, err := avail(t)
+		if err != nil {
+			backOut()
+			return nil, err
+		}
+		// The fill must really have consumed the space: allow slack for
+		// concurrent writers and filesystem accounting, not for a spacer
+		// that never landed.
+		slack := before / 50
+		if slack < 16*1024*1024 {
+			slack = 16 * 1024 * 1024
+		}
+		if after > before-want+slack {
+			backOut()
+			return nil, fmt.Errorf("disk_full on %s: free space went from %d to %d bytes, not below %d; the fill did not land",
+				t.Name(), before, after, before-want+slack)
 		}
 	}
 
-	// Recovery: remove every spacer.  Best-effort: if the host's
-	// filesystem is so wedged that even `rm` fails (the
-	// classic ENOSPC-during-runc-temp-write cascade), fall
-	// back to truncating the file in place via `:` redirection
-	// — `>FILE` opens for writing with O_TRUNC, releasing the
-	// blocks without needing a runc temp file.  If THAT also
-	// fails, surface the error so the operator sees the wedge.
+	// Recovery: remove every spacer (removeSpacer falls back to
+	// truncation), surfacing any target it could not clean.
 	return func(ctx context.Context) error {
+		var errs []error
 		for _, t := range tgs {
-			if _, err := t.Exec(ctx, "rm", "-f", path); err == nil {
-				continue
-			} else {
-				// Fallback: truncate in place.  An empty `:`
-				// builtin + redirection works in dash / bash /
-				// busybox sh and doesn't allocate runc temp.
-				if _, err2 := t.Exec(ctx,
-					"sh", "-c", fmt.Sprintf(": > %s", path)); err2 != nil {
-					return fmt.Errorf("disk_full recovery: rm on %s: %w (truncate fallback also failed: %v)",
-						t.Name(), err, err2)
-				}
-			}
+			errs = append(errs, removeSpacer(ctx, t))
 		}
-		return nil
+		return errors.Join(errs...)
 	}, nil
 }
 
@@ -406,7 +458,7 @@ func (cgroupSqueezeFault) Apply(ctx context.Context, args Args, ts TargetSet) (R
 		//     tail -F`) — there is NO supervisor — so a killed
 		//     postmaster stays dead for the rest of the cell's
 		//     life.  Every subsequent `pg_hardstorage backup`
-		//     then fails with `storage.unreachable`, which is
+		//     then fails with `pg.unreachable`, which is
 		//     pg_hardstorage behaving CORRECTLY (you cannot back
 		//     up a down database) but is scored as a spurious
 		//     cell-failure.  Lifting the limit alone is not a
@@ -428,36 +480,8 @@ func (cgroupSqueezeFault) Apply(ctx context.Context, args Args, ts TargetSet) (R
 			if t.Role() != "pg" {
 				continue
 			}
-			if err := restartPGIfDown(ctx, t); err != nil {
-				// A heavy squeeze can OOM-kill not just the
-				// postmaster but the whole container (docker's
-				// OOM watchdog kills PID 1's process tree).
-				// When that happens `docker exec` fails with
-				// "container is not running" and restartPGIfDown
-				// can't even open a shell to bring PG back up.
-				// Detect the typed sentinel, Start the container
-				// first, RE-APPLY the unlimit (docker update --memory
-				// on a stopped container has been observed to not
-				// always persist across Start — the soak's 4th
-				// run got the freshly-Start'd container with the
-				// pre-squeeze limit still in effect and the next
-				// docker exec was OOM-killed mid-script with
-				// exit 137), then retry restartPGIfDown.
-				if errors.Is(err, ErrTargetNotRunning) {
-					if serr := t.Start(ctx); serr != nil {
-						errs = append(errs, fmt.Sprintf("%s: start container: %v", t.Name(), serr))
-						continue
-					}
-					if merr := t.SetMemoryLimit(ctx, -1); merr != nil {
-						errs = append(errs, fmt.Sprintf("%s: re-lift limit after Start: %v", t.Name(), merr))
-						continue
-					}
-					if err2 := restartPGIfDown(ctx, t); err2 != nil {
-						errs = append(errs, fmt.Sprintf("%s: restart PG after container Start: %v", t.Name(), err2))
-					}
-					continue
-				}
-				errs = append(errs, fmt.Sprintf("%s: restart PG: %v", t.Name(), err))
+			if err := recoverSqueezedPG(ctx, t); err != nil {
+				errs = append(errs, err.Error())
 			}
 		}
 		if len(errs) > 0 {
@@ -465,6 +489,66 @@ func (cgroupSqueezeFault) Apply(ctx context.Context, args Args, ts TargetSet) (R
 		}
 		return nil
 	}, nil
+}
+
+// squeezeRecoveryAttempts / squeezeRecoveryBackoff bound the
+// cgroup_squeeze PG recovery.  Variables so tests can run the retry
+// path without sleeping.
+var (
+	squeezeRecoveryAttempts = 4
+	squeezeRecoveryBackoff  = 15 * time.Second
+)
+
+// recoverSqueezedPG brings a squeezed pg target back to the state the
+// fault found it in: container running, no memory limit, PostgreSQL
+// accepting connections.
+//
+// A single restartPGIfDown is not enough.  A heavy squeeze can
+// OOM-kill the whole container, and Docker's restart policy then
+// restarts it on its own schedule — racing the recovery:
+//
+//   - `docker exec` fails with "container is not running"
+//     (ErrTargetNotRunning) or "is restarting, wait until the
+//     container is running";
+//   - an exec already inside the container dies with exit 137 when
+//     the restart tears its process tree down;
+//   - `docker update --memory` on a stopped container has been seen
+//     not to persist across Start, so the restarted container can
+//     come back with the squeeze still in force and OOM-kill the
+//     recovery script itself (exit 137 again).
+//
+// The v1.5.0 campaign soaks lost 14 cells to exactly these, with
+// zero product failures.  Each is transient, so recovery retries:
+// every retry Starts the container (a no-op when running), re-lifts
+// the limit, and re-runs restartPGIfDown.  It fails only when the
+// cell is still not back after squeezeRecoveryAttempts — a genuine
+// wedge the verdict must see.
+func recoverSqueezedPG(ctx context.Context, t Target) error {
+	var last []string
+	for attempt := 0; attempt < squeezeRecoveryAttempts; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return fmt.Errorf("%s: %s; %v", t.Name(), strings.Join(last, "; "), ctx.Err())
+			case <-time.After(squeezeRecoveryBackoff):
+			}
+			last = last[:0]
+			if err := t.Start(ctx); err != nil {
+				last = append(last, fmt.Sprintf("start container: %v", err))
+				continue
+			}
+			if err := t.SetMemoryLimit(ctx, -1); err != nil {
+				last = append(last, fmt.Sprintf("re-lift limit: %v", err))
+				continue
+			}
+		}
+		err := restartPGIfDown(ctx, t)
+		if err == nil {
+			return nil
+		}
+		last = append(last, fmt.Sprintf("restart PG: %v", err))
+	}
+	return fmt.Errorf("%s: after %d attempts: %s", t.Name(), squeezeRecoveryAttempts, strings.Join(last, "; "))
 }
 
 // restartPGIfDown brings PostgreSQL back up inside a cell when it
@@ -724,10 +808,13 @@ func (toxiproxyFault) Apply(ctx context.Context, args Args, ts TargetSet) (Recov
 		}
 	}
 	return func(ctx context.Context) error {
+		var errs []error
 		for _, t := range tgs {
-			_, _ = t.Exec(ctx, "toxiproxy-cli", "toxic", "remove", "-n", toxicName, proxy)
+			if _, err := t.Exec(ctx, "toxiproxy-cli", "toxic", "remove", "-n", toxicName, proxy); err != nil {
+				errs = append(errs, fmt.Errorf("toxiproxy: remove %s on %s: %w", toxicName, t.Name(), err))
+			}
 		}
-		return nil
+		return errors.Join(errs...)
 	}, nil
 }
 
@@ -982,10 +1069,13 @@ func (libfaketimeFault) Apply(ctx context.Context, args Args, ts TargetSet) (Rec
 		}
 	}
 	return func(ctx context.Context) error {
+		var errs []error
 		for _, t := range tgs {
-			_, _ = t.Exec(ctx, "rm", "-f", "/etc/faketimerc")
+			if _, err := t.Exec(ctx, "rm", "-f", "/etc/faketimerc"); err != nil {
+				errs = append(errs, fmt.Errorf("libfaketime: remove /etc/faketimerc on %s: %w", t.Name(), err))
+			}
 		}
-		return nil
+		return errors.Join(errs...)
 	}, nil
 }
 
@@ -1028,10 +1118,13 @@ func (networkBlockFault) Apply(ctx context.Context, args Args, ts TargetSet) (Re
 		}
 	}
 	return func(ctx context.Context) error {
+		var errs []error
 		for _, t := range tgs {
-			_, _ = t.Exec(ctx, delArgv...)
+			if _, err := t.Exec(ctx, delArgv...); err != nil {
+				errs = append(errs, fmt.Errorf("network_block: delete rule on %s: %w", t.Name(), err))
+			}
 		}
-		return nil
+		return errors.Join(errs...)
 	}, nil
 }
 
@@ -1104,19 +1197,54 @@ func (flipRandomByteFault) Apply(ctx context.Context, args Args, ts TargetSet) (
 
 // --- pause_archive ----------------------------------------------------
 
-// pauseArchiveFault touches a sentinel file the agent watches.
-// The file's presence pauses WAL archiving until removed;
-// Recovery removes it.  The agent's archive loop honouring
-// the sentinel is the runtime contract — it does not need to
-// be present for this primitive to "succeed" at the inject
-// layer (the touch / rm are the assertions).
+// pauseArchiveFault pauses WAL archiving by stopping (SIGSTOP) the
+// pg_hardstorage `wal stream` / `wal push` processes in the target;
+// Recovery resumes them (SIGCONT) and fails if any is still stopped.
+//
+// It used to touch a sentinel file that nothing in pg_hardstorage reads,
+// so archiving never paused and every application was reported as a
+// fault the product survived. A stopped streamer is what an archiver
+// wedged on I/O looks like from outside: PostgreSQL's walsender times
+// out, WAL piles up in pg_wal, and the streamer has to reconnect and
+// catch up once it is resumed.
+//
+// No archiver running (e.g. the supervisor is between restarts) is
+// ErrNotApplicable, not a silent success.
 type pauseArchiveFault struct{}
 
 // Name returns "pause_archive".
 func (pauseArchiveFault) Name() string { return "pause_archive" }
 
-// Apply touches the agent's archive-pause sentinel on each
-// picked target; Recovery removes it.
+// pauseArchiveStopScript SIGSTOPs every pg_hardstorage `wal stream` /
+// `wal push` process and prints "stopped: <pids>". It scans /proc
+// rather than relying on pkill, which not every testbed image ships.
+// The match strings are assembled at run time so this script's own
+// command line (and its $(...) subshells, which share it) never
+// matches them.
+const pauseArchiveStopScript = `a=pg_hard; a="${a}storage"; s=" wal st"; s="${s}ream "; w=" wal pu"; w="${w}sh "
+found=""
+for d in /proc/[0-9]*; do
+  pid=${d#/proc/}
+  [ "$pid" = "$$" ] && continue
+  cmd=$(tr '\0' ' ' < "$d/cmdline" 2>/dev/null) || continue
+  case "$cmd" in
+    *"$a"*"$s"*|*"$a"*"$w"*) kill -STOP "$pid" 2>/dev/null && found="$found $pid" ;;
+  esac
+done
+echo "stopped:$found"`
+
+// pauseArchiveResumeScript SIGCONTs the given pids and prints
+// "still-stopped: <pid>" for any that is still in state T.
+const pauseArchiveResumeScript = `for p in $PIDS; do kill -CONT "$p" 2>/dev/null; done
+for p in $PIDS; do
+  if [ -r "/proc/$p/stat" ]; then
+    st=$(sed 's/.*) //' "/proc/$p/stat" | cut -d' ' -f1)
+    [ "$st" = T ] && echo "still-stopped: $p"
+  fi
+done
+echo resumed`
+
+// Apply stops the archiving processes on each picked target.
 func (pauseArchiveFault) Apply(ctx context.Context, args Args, ts TargetSet) (Recovery, error) {
 	target := args["target"]
 	if target == "" {
@@ -1126,20 +1254,53 @@ func (pauseArchiveFault) Apply(ctx context.Context, args Args, ts TargetSet) (Re
 	if err != nil {
 		return nil, err
 	}
-	sentinel := args["sentinel"]
-	if sentinel == "" {
-		sentinel = "/var/lib/pg_hardstorage/.archive-paused"
-	}
-	for _, t := range tgs {
-		if _, err := t.Exec(ctx, "touch", sentinel); err != nil {
-			return nil, fmt.Errorf("pause_archive: %s: %w", t.Name(), err)
+	resume := func(ctx context.Context, t Target, pids []string) error {
+		out, err := t.Exec(ctx, "sh", "-c",
+			"PIDS='"+strings.Join(pids, " ")+"'; "+pauseArchiveResumeScript)
+		if errors.Is(err, ErrTargetNotRunning) {
+			// The container went down: the stopped processes went with
+			// it, so nothing is left paused.
+			return nil
 		}
-	}
-	return func(ctx context.Context) error {
-		for _, t := range tgs {
-			_, _ = t.Exec(ctx, "rm", "-f", sentinel)
+		if err != nil {
+			return fmt.Errorf("pause_archive: resume on %s: %w", t.Name(), err)
+		}
+		if strings.Contains(string(out), "still-stopped:") {
+			return fmt.Errorf("pause_archive: resume on %s: %s", t.Name(), strings.TrimSpace(string(out)))
 		}
 		return nil
+	}
+	stopped := map[Target][]string{}
+	var order []Target
+	undo := func() {
+		for _, t := range order {
+			_ = resume(context.WithoutCancel(ctx), t, stopped[t])
+		}
+	}
+	for _, t := range tgs {
+		out, err := t.Exec(ctx, "sh", "-c", pauseArchiveStopScript)
+		if err != nil {
+			undo()
+			return nil, fmt.Errorf("pause_archive: %s: %w", t.Name(), err)
+		}
+		_, list, ok := strings.Cut(string(out), "stopped:")
+		pids := strings.Fields(list)
+		if !ok || len(pids) == 0 {
+			continue
+		}
+		stopped[t] = pids
+		order = append(order, t)
+	}
+	if len(order) == 0 {
+		return nil, fmt.Errorf("pause_archive on %s: no pg_hardstorage wal stream / wal push process to pause: %w",
+			target, ErrNotApplicable)
+	}
+	return func(ctx context.Context) error {
+		var errs []error
+		for _, t := range order {
+			errs = append(errs, resume(ctx, t, stopped[t]))
+		}
+		return errors.Join(errs...)
 	}, nil
 }
 

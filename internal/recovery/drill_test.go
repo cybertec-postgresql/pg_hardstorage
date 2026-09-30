@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"errors"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/testfixture"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -113,6 +114,8 @@ func (w *drillWorld) commitDrillBackupWithTablespaces(t *testing.T, deployment s
 			Chunks: []backup.ChunkRef{{Hash: info.Hash, Offset: 0, Len: int64(len(body))}},
 		}},
 	}
+	// A drill restores the backup; model a deployment that archives WAL.
+	testfixture.PlantArchivedWAL(t, w.sp, deployment, 1)
 	if err := w.store.Commit(context.Background(), m, w.signer, backup.CommitOptions{}); err != nil {
 		t.Fatal(err)
 	}

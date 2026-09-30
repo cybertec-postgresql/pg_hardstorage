@@ -32,9 +32,13 @@ For each manifest, kms verify:
      fleet whose policy is "everything is encrypted", and an
      unencrypted manifest becomes a listed failure with exit 9).
   3. Resolves the KEK by KEKRef. By default the resolver is the
-     local keystore, which knows the "local:default" ref. With
-     --kek-ref + --kek-file the operator points at an explicit
-     KEK file for one ref (post-rotation or per-tenant audits).
+     local keystore, which knows every local:* ref. A cloud-KMS
+     ref (aws-kms://, gcp-kms://, vault-transit://, ...) is
+     verified by asking the provider to unwrap, with settings from
+     the matching kms.providers entry; only a scheme no provider
+     claims is 'kek_unknown'. With --kek-ref + --kek-file the
+     operator points at an explicit KEK file for one ref
+     (post-rotation or per-tenant audits).
   4. Tries to unwrap the wrapped_dek with the resolved KEK. A
      successful unwrap is "ok"; a tag-failure is "unwrap_failed".
 

@@ -12,11 +12,16 @@
 //   - The token is signed with the operator's ed25519 signing
 //     key + persisted at `jit/<id>.json` in the repo.
 //   - The audit chain records the issuance.
-//   - The principal uses the token by passing it to a
-//     destructive command (`kms shred --jit-token <token>`).
-//   - The destructive command verifies the token (signature +
-//     expiration + revocation marker absence + scope match) +
-//     records the use in the audit chain.
+//   - The principal (or a wrapper script) checks the token with
+//     `jit verify --token <token> --operation kms.shred` before
+//     running the destructive command. VerifyAt checks signature +
+//     expiration + revocation marker absence + scope + tenant.
+//   - NOT YET WIRED: destructive commands (kms shred, repo gc,
+//     backup delete, repo wipe) do not take a --jit-token flag or
+//     call VerifyAt themselves; they are gated by approvals
+//     (internal/approval). A JIT token is therefore advisory until
+//     that wiring lands -- do not rely on it as an enforcement
+//     control on its own.
 //   - Revocation is one CLI call: `jit revoke <id>`; writes a
 //     `jit/<id>.json.revoked` marker that destructive commands
 //     check on every use.
@@ -762,9 +767,10 @@ type CheckOptions struct {
 	// point is to authorise specific operations.
 	Operation string
 
-	// Tenant scopes the check.  When non-empty, the token's
-	// Tenant must match (or be empty for tenant-agnostic
-	// tokens).
+	// Tenant is the tenant the operation acts on ("" for an
+	// operation with no tenant).  A tenant-bound token matches
+	// only an equal Tenant; a tenant-agnostic token (empty
+	// Tenant) matches any.
 	Tenant string
 
 	// Now overrides time.Now() for deterministic tests.
@@ -802,7 +808,12 @@ func VerifyAt(ctx context.Context, store *Store, resolver KeyResolver, t *Token,
 	if !t.MatchesScope(opts.Operation) {
 		return ErrScopeNotMatched
 	}
-	if t.Tenant != "" && opts.Tenant != "" && t.Tenant != opts.Tenant {
+	// A tenant-bound token authorises ONLY that tenant's operations.
+	// An operation that names no tenant is not the token's tenant's,
+	// so it is refused too: skipping the check when opts.Tenant was
+	// empty turned a tenant-scoped grant into a fleet-wide one.
+	// Tenant-agnostic tokens (t.Tenant == "") match any operation.
+	if t.Tenant != "" && t.Tenant != opts.Tenant {
 		return ErrTenantMismatch
 	}
 	if store != nil {

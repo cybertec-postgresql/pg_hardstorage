@@ -53,9 +53,12 @@ var exitNamespaceRoutes = map[string]ExitCode{
 // alone. Other restore.* leaves stay generic.
 var exitLeafRoutes = map[string]ExitCode{
 	"storage.unreachable":        ExitUnreachable,
+	"pg.unreachable":             ExitUnreachable,
+	"patroni.unreachable":        ExitUnreachable,
 	"kms.unreachable":            ExitUnreachable,
 	"restore.target_unreachable": ExitConflict,
 	"restore.target_in_wal_gap":  ExitConflict,
+	"partial.dump_no_tables":     ExitNotFound,
 }
 
 // codePrefixToExit maps an error code to an exit code.

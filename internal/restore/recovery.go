@@ -25,10 +25,13 @@ import (
 // `recovery_target_*` GUCs in the cluster's regular config files.
 //
 // We append a managed block to `postgresql.auto.conf` in the target
-// directory:
+// directory, first removing any block an earlier restore left there
+// (the file is part of every base backup):
 //
 //	# --- pg_hardstorage managed block (PITR) ---
 //	restore_command = '...'
+//	recovery_target = ''                    # every target we do NOT set
+//	...                                     # is reset to ''
 //	recovery_target_lsn = '...'             # one of these three
 //	recovery_target_time = '...'
 //	recovery_target_name = '...'
@@ -61,8 +64,10 @@ type Recovery struct {
 	TargetName string
 
 	// Inclusive: when true, recovery stops just after the target.
-	// PG's default is true; we propagate that as the field's default
-	// so the user sees the actual rendered GUC.
+	// PG's default is true, but this field's Go zero value is FALSE
+	// and it is always rendered explicitly — every caller that builds
+	// a Recovery must set it (the CLI and agent default it to true);
+	// leaving it unset silently asks for an exclusive stop.
 	Inclusive bool
 
 	// Action: what PG does when the target is reached.
@@ -186,6 +191,7 @@ func WriteAutoRecovery(target, deployment, repoURL, sysID string) error {
 	autoPath := filepath.Join(target, "postgresql.auto.conf")
 	var b strings.Builder
 	b.WriteString("\n# --- pg_hardstorage managed block (auto-recovery) ---\n")
+	writeTargetResets(&b, "recovery_target")
 	b.WriteString("recovery_target = 'immediate'\n")
 	b.WriteString("recovery_target_action = 'promote'\n")
 	if repoURL != "" && deployment != "" {
@@ -218,6 +224,7 @@ func WriteAutoRecovery(target, deployment, repoURL, sysID string) error {
 		fmt.Fprintf(&b, "restore_command = %s\n",
 			quoteSQL(walfetchcmd.BuildWithIdentity(bin, deployment, repoURL, sysID)))
 	}
+	b.WriteString(managedBlockEnd + "\n")
 	if err := appendAutoConf(autoPath, b.String()); err != nil {
 		return err
 	}
@@ -282,6 +289,7 @@ func buildAutoConfBlock(r Recovery) string {
 	var b strings.Builder
 	b.WriteString("\n# --- pg_hardstorage managed block (PITR) ---\n")
 	fmt.Fprintf(&b, "restore_command = %s\n", quoteSQL(r.RestoreCommand))
+	writeTargetResets(&b, recoveryTargetsSetBy(r))
 
 	if r.TargetLSN != "" {
 		fmt.Fprintf(&b, "recovery_target_lsn = %s\n", quoteSQL(r.TargetLSN))
@@ -310,8 +318,105 @@ func buildAutoConfBlock(r Recovery) string {
 	}
 	fmt.Fprintf(&b, "recovery_target_timeline = %s\n", quoteSQL(timeline))
 
-	b.WriteString("# --- end pg_hardstorage managed block ---\n")
+	b.WriteString(managedBlockEnd + "\n")
 	return b.String()
+}
+
+// Managed-block markers. Every block we write is bracketed by these
+// so the next restore can find and replace it (see stripManagedBlocks).
+const (
+	managedBlockBegin = "# --- pg_hardstorage managed block"
+	managedBlockEnd   = "# --- end pg_hardstorage managed block ---"
+	// postverifyLegacyBegin prefixes the blocks older postverify
+	// versions appended to the restored cluster's auto.conf and never
+	// removed; they reach later backups and must be stripped too.
+	postverifyLegacyBegin = "# pg_hardstorage postverify"
+)
+
+// recoveryTargetGUCs are PostgreSQL's mutually exclusive recovery
+// targets: more than one non-empty value FATALs at startup with
+// "multiple recovery targets specified".
+var recoveryTargetGUCs = []string{
+	"recovery_target",
+	"recovery_target_lsn",
+	"recovery_target_time",
+	"recovery_target_name",
+	"recovery_target_xid",
+}
+
+// recoveryTargetsSetBy names the recovery target GUC r sets, if any.
+func recoveryTargetsSetBy(r Recovery) string {
+	switch {
+	case r.TargetLSN != "":
+		return "recovery_target_lsn"
+	case !r.TargetTime.IsZero():
+		return "recovery_target_time"
+	case r.TargetName != "":
+		return "recovery_target_name"
+	}
+	return ""
+}
+
+// writeTargetResets emits an empty-string assignment for every recovery target
+// except keep.
+//
+// Why: postgresql.auto.conf is part of every base backup. A cluster
+// that was itself restored by pg_hardstorage (and promoted) still
+// carries that restore's recovery settings — and ALTER SYSTEM rewrites
+// the file without our comment markers, so stripping blocks alone
+// cannot find them all. PostgreSQL applies only the LAST occurrence of
+// each name, so resetting every other target inside our block (which
+// is always last) guarantees an inherited recovery_target='immediate'
+// or recovery_target_time can neither combine with ours ("multiple
+// recovery targets") nor silently stop a --to-latest / standby at the
+// old backup's consistency point. The resets must precede our own
+// target: PostgreSQL applies the surviving entries in file order.
+func writeTargetResets(b *strings.Builder, keep string) {
+	for _, g := range recoveryTargetGUCs {
+		if g != keep {
+			fmt.Fprintf(b, "%s = ''\n", g)
+		}
+	}
+}
+
+// isRecoveryGUCLine reports whether ln assigns one of the settings a
+// pg_hardstorage block manages (restore_command, recovery_target*).
+func isRecoveryGUCLine(ln string) bool {
+	key, _, ok := strings.Cut(ln, "=")
+	if !ok {
+		return false
+	}
+	key = strings.TrimSpace(key)
+	return key == "restore_command" || strings.HasPrefix(key, "recovery_target")
+}
+
+// stripManagedBlocks removes every block a previous pg_hardstorage
+// restore (or postverify run) wrote into an auto.conf body, so the
+// block about to be written is the only one. A block is its begin
+// marker, the recovery GUC lines that follow it, and the end marker
+// if present — older auto-recovery and postverify blocks had none.
+// The blank separator line we put before each block goes with it.
+// Operator settings outside our blocks are left untouched.
+func stripManagedBlocks(existing []byte) []byte {
+	lines := strings.SplitAfter(string(existing), "\n")
+	out := make([]string, 0, len(lines))
+	for i := 0; i < len(lines); i++ {
+		t := strings.TrimSpace(lines[i])
+		if !strings.HasPrefix(t, managedBlockBegin) && !strings.HasPrefix(t, postverifyLegacyBegin) {
+			out = append(out, lines[i])
+			continue
+		}
+		if n := len(out); n > 0 && strings.TrimSpace(out[n-1]) == "" {
+			out = out[:n-1]
+		}
+		for i+1 < len(lines) && isRecoveryGUCLine(strings.TrimSpace(lines[i+1])) {
+			i++
+		}
+		if i+1 < len(lines) && strings.TrimSpace(lines[i+1]) == managedBlockEnd {
+			i++
+		}
+	}
+	return []byte(strings.Join(out, ""))
 }
 
 // quoteSQL renders s as a PostgreSQL string literal for embedding in
@@ -351,8 +456,8 @@ func quoteSQL(s string) string {
 }
 
 // appendAutoConf reads the existing postgresql.auto.conf (if any),
-// concatenates block, and atomically rewrites the file via
-// fsutil.WriteFileAtomic.
+// strips previous pg_hardstorage blocks, concatenates block, and
+// atomically rewrites the file via fsutil.WriteFileAtomic.
 //
 // History — audit: the previous implementation opened with
 // O_CREATE|O_APPEND, WriteString'd the block, and fsync'd.  That's
@@ -380,7 +485,10 @@ func appendAutoConf(path, block string) error {
 	if err != nil && !errors.Is(err, stdfs.ErrNotExist) {
 		return fmt.Errorf("recovery: read postgresql.auto.conf: %w", err)
 	}
-	merged := append(existing, []byte(block)...)
+	// Replace, don't stack: a block inherited from an earlier restore
+	// of the source cluster would otherwise stay in force (see
+	// writeTargetResets for the settings that escape the markers).
+	merged := append(stripManagedBlocks(existing), []byte(block)...)
 	if err := fsutil.WriteFileAtomic(path, merged, 0o600); err != nil {
 		return fmt.Errorf("recovery: write postgresql.auto.conf: %w", err)
 	}

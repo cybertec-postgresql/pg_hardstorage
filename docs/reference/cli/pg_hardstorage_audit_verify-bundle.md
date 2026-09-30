@@ -27,6 +27,14 @@ chain, so linkage cannot be asserted from the bundle alone; the result
 reports that explicitly rather than implying a contiguity it did not
 check. Returns the bundle manifest on success.
 
+The key inside the bundle proves only that the bundle is consistent
+under that key -- anyone can re-sign a rewritten bundle with a fresh
+one. The signer must therefore be TRUSTED: by default the public key
+of this host's keyring (the key `audit export-bundle` signs with); pass
+--trusted-key / --trusted-fingerprint to verify a bundle exported
+elsewhere. A validly-signed bundle from an untrusted key fails with
+verify.bundle_untrusted_signer (exit 9).
+
 ```
 pg_hardstorage audit verify-bundle <path> [flags]
 ```
@@ -34,8 +42,10 @@ pg_hardstorage audit verify-bundle <path> [flags]
 ### Options
 
 ```
-      --format string   output format: json | text (default "json")
-  -h, --help            help for verify-bundle
+      --format string                     output format: json | text (default "json")
+  -h, --help                              help for verify-bundle
+      --trusted-fingerprint stringArray   hex SHA-256 fingerprint (full, or the 16-char prefix the manifest prints) of a trusted signing key (repeatable)
+      --trusted-key stringArray           PEM file with an ed25519 public key the bundle may be signed by (repeatable; replaces the default of this host's keyring key)
 ```
 
 ### Options inherited from parent commands

@@ -178,7 +178,7 @@ two methods.  In practice each renderer leans toward one:
 | Renderer | Streaming behaviour | Single-event behaviour |
 | --- | --- | --- |
 | `text` | Paragraph per event, blank-line separated | Pretty multi-line block |
-| `json` | One pretty doc per event (verbose) | One pretty doc total |
+| `json` | Never sees events: it declares `output.SingleDocumentRenderer`, so the dispatcher writes events to stderr as NDJSON lines | One pretty doc total |
 | `ndjson` | One compact line per event (the default for streaming) | One long line |
 | `junit` | Aggregates events into a `<testsuite>` tree, emits at `Close` | One `<testcase>` |
 | `tap` | Per-event `ok` / `not ok` line | Single `1..1` plan + line |
@@ -186,8 +186,25 @@ two methods.  In practice each renderer leans toward one:
 | `pdf`, `html` | Buffered through `Close`; emits one document | One document |
 
 The CLI's TTY auto-detection picks `text` for human
-operators and `ndjson` for pipes.  Operators can override
+operators and `json` for pipes.  Operators can override
 either via `--output <name>` or `PG_HS_OUTPUT=<name>`.
+
+## The SingleDocumentRenderer opt-in
+
+A renderer whose stdout contract is "exactly one document per
+invocation" implements:
+
+```go
+type SingleDocumentRenderer interface {
+    SingleDocument() bool
+}
+```
+
+When it returns true the dispatcher never calls `RenderEvent`
+for stdout: events go to stderr as compact JSON lines instead,
+so the one `Result` is the only document on stdout.  The `json`
+renderer opts in; `yaml` does not (it separates documents with
+`---`, which stays valid multi-document YAML).
 
 ## The TextWriter opt-in
 

@@ -316,18 +316,36 @@ func (b listBody) WriteText(w io.Writer) error {
 
 // loadVerifier resolves the keyring path and returns the Verifier
 // half of the keypair. Used by every read-side CLI command (list,
-// show, status, restore).
+// show, status, doctor). Load-only: see loadExistingKeypair.
 func loadVerifier() (*backup.Verifier, error) {
+	_, verifier, err := loadExistingKeypair("read commands")
+	return verifier, err
+}
+
+// loadExistingKeypair loads the operator's signing keypair WITHOUT ever
+// creating one. Only backup/init may mint a keypair: a read-only or
+// maintenance verb that generated one on an empty or mis-pointed
+// keyring produced a key that verifies none of the repo's manifests,
+// and the next backup then signed under it — the repo silently split
+// across two keys.
+func loadExistingKeypair(op string) (*backup.Signer, *backup.Verifier, error) {
 	p, err := paths.Resolve(paths.DefaultOptions())
 	if err != nil {
-		return nil, output.NewError("internal", err.Error()).Wrap(err)
+		return nil, nil, output.NewError("internal", err.Error()).Wrap(err)
 	}
-	_, verifier, err := keystore.LoadOrGenerate(p.Keyring.Value)
+	signer, verifier, err := keystore.Load(p.Keyring.Value)
 	if err != nil {
-		return nil, output.NewError("internal",
-			fmt.Sprintf("read commands: signing key: %v", err)).Wrap(err)
+		if errors.Is(err, keystore.ErrNoKeypair) {
+			return nil, nil, output.NewError("notfound.signing_key",
+				fmt.Sprintf("%s: no signing keypair in keyring %s", op, p.Keyring.Value)).
+				WithSuggestion(&output.Suggestion{
+					Human: "point PG_HARDSTORAGE_KEYRING_DIR at the keyring that signed this repository's backups (or install it with `keyring install`); only `init` and `backup` create a new keypair",
+				}).Wrap(err)
+		}
+		return nil, nil, output.NewError("internal",
+			fmt.Sprintf("%s: signing key: %v", op, err)).Wrap(err)
 	}
-	return verifier, nil
+	return signer, verifier, nil
 }
 
 // openRepo opens a repository at url, returning its parsed metadata

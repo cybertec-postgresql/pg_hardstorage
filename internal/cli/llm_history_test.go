@@ -31,6 +31,9 @@ func provisionKeyring(t *testing.T) {
 // commands surface a structured error the operator can act on.
 func TestLlmHistory_RequiresKEK(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
+	// TestMain points XDG_CONFIG_HOME at the shared test home, where
+	// another test may have created kek.bin; this test needs none.
+	t.Setenv("XDG_CONFIG_HOME", "")
 	t.Setenv("USER", "alice")
 
 	_, stderr, exit := runCLI(t, "llm", "history", "list", "-o", "json")

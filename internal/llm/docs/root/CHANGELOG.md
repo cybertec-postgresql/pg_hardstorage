@@ -9,6 +9,549 @@ on-disk and on-the-wire schema (backup manifests, configuration, output JSON,
 and the on-disk chunk envelope): an agent built against a given schema version
 keeps reading that version for at least 24 months after a successor lands.
 
+## [1.5.0] — 2026-09-30
+
+### Added
+
+- **Sink config keys are declared and checked.** Every sink plugin
+  declares the config keys it reads; start-up warns
+  (`sink.unknown_config_keys`) about keys a plugin ignores, instead of
+  silently dropping a misspelt setting. Documentation examples are held
+  to the declared keys by a test.
+- **`repo gc` reaps staging files left by crashed writers**
+  (`.deferred-`/`.excl-`/`.hstmp-`, invisible to List) once they are
+  older than 24h (`staging_reaped` in the result).
+- **Storage: `StagingReapAware`** optional interface (fs, sftp, scp).
+- **`--retention-interval`, `--max-backup-gap`,
+  `--retention-max-deferrals`** for the soak harness (`run_testing.sh`,
+  `pg_hardstorage_testkit validate`), and `--keep-repo`: a passing soak
+  now removes its repository.
+- **Scenario `cli_run` steps take `stop_after:`**, which sends SIGTERM
+  after the given duration. Long-running verbs (`logical stream`)
+  normally end when an operator stops them, and this lets a step end them
+  the same way. A step that hits its `timeout:` now fails with "timed out
+  after …" instead of "exit -1". The logical-replication scenarios use
+  this: they had relied on the inactivity watchdog to end a drained
+  stream, and a quiet stream now asks for keepalives, so the watchdog no
+  longer fires.
+- **A systemd unit for the WAL streamer** (#56, reported by @marsqd).
+  `deploy/systemd/pg_hardstorage-wal-stream@.service` runs
+  `pg_hardstorage wal stream %i` — templated on the deployment, since
+  that is a positional argument — and is packaged by all four recipes
+  (goreleaser/nfpm, debian, Arch, RPM).
+
+### Fixed
+
+- **Full-code review (2026-09-24).** A read-only review of the whole Go
+  code base found ~205 defects; all are fixed below, each with a
+  regression test that fails without the fix. The most serious:
+
+  **Restore / PITR / WAL**
+  - compat shims: `wal-g wal-fetch` and `pgbackrest archive-get` exited 1
+    ("segment not in archive") on *any* failure — an S3 outage or a
+    missing env made PostgreSQL end recovery and promote early. They now
+    exit 126 unless the segment is genuinely absent.
+  - compat shims: pgbackrest/barman/wal-g/barman-cloud restores stopped
+    at the backup point (`recovery_target='immediate'`) where the
+    upstream tools replay all archived WAL; they now pass `--to-latest`.
+    `pgbackrest --type=standby` builds a standby; unsupported types are
+    refused; target times without a UTC offset are refused.
+  - `kms rotate` rewraps WAL segment manifests (and soft-deleted
+    backups); it used to leave all pre-rotation WAL undecryptable.
+  - Incremental-chain restore of a cluster with tablespaces misplaced the
+    tablespace data and created no `pg_tblspc` links, yet reported
+    success.
+  - Recovery settings appended to `postgresql.auto.conf` were never
+    removed, so a restored-then-promoted cluster poisoned later restores
+    ("multiple recovery targets"; `--to-latest` stopping at the old
+    consistency point).
+  - `restore --preview --control-plane` ran a real remote restore.
+  - `wal fetch` turned a transient timeline-store read error into "not
+    found", so recovery could silently stay on the pre-failover
+    timeline.
+  - `wal stream` skipped its system-identifier guard and assumed a 16 MiB
+    segment size when PostgreSQL was unreachable at start-up; both are
+    now checked on every reconnect. After a failover it resumes from the
+    new timeline's fork segment, and gap detection is timeline-aware.
+  - An LSN recovery target past the end of the archived WAL is refused up
+    front (`restore.target_unreachable`); PostgreSQL would have replayed
+    to the archive's end and refused to start. `timetravel create` built
+    such sessions. Found by a scenario once it ran against a real backup.
+  - The boot test ran before `pg_verifybackup` in the restored target, so
+    `--verify` failed every booted restore; it now runs first and leaves
+    the target untouched.
+  - `restore` / `partial` / recovery drills: chain restore with a trailing
+    slash in `--target`, resume with tablespaces, drills of backups with
+    tablespaces, fake PITR-window holes at the frontier, cloud-KMS
+    deployments reported NOT READY, `estimated_rto_ms` in nanoseconds,
+    exclusive timetravel targets.
+
+  **Repository / GC / storage**
+  - GCS treated any error text containing "412" as "already exists", so a
+    backup could reference a chunk that was never stored.
+  - `repo gc --apply` now excludes concurrent writers: it publishes a run
+    record, settles, and checks writer pins, backup leases and new
+    manifests before every delete batch. Backups, `wal stream`/`wal push`,
+    logical streams, replicate and bundle import fence their commits over
+    deduplicated chunks. `repo gc` is also much faster (one List per
+    prefix, no per-orphan Stat, no per-delete directory fsync: 11.3 s →
+    1.6 s on a 20k-orphan fs repository) and no longer aborts when a
+    manifest is deleted mid-walk.
+  - The CAS no longer trusts an in-memory "seen" entry for a chunk gc may
+    have deleted (long-lived `wal stream`); on WORM repositories adopting
+    an existing chunk extends its retention lock.
+  - S3 without conditional put (custom endpoints) committed WAL/timeline
+    manifests without their WORM lock; SFTP overwrites deleted the
+    destination first; SFTP/SCP never fsynced; SCP had no reconnect;
+    409 ConditionalRequestConflict was not retried.
+  - `repo scrub`/`repair scrub`: encrypted WAL was reported as bit rot;
+    unverifiable manifests and a missing KEK were hidden behind "no
+    integrity failures".
+  - `repo replicate` refreshes manifests rewritten at the source, and its
+    exit code and summary count every failure; `replicate verify` checks
+    WAL chunks.
+  - Azure Key Vault: DEKs wrapped before a key rotation could not be
+    unwrapped. PKCS#11 providers in one process logged each other out.
+    KMS errors are classified (unreachable / access denied / wrong key)
+    instead of all reporting `kek_mismatch`.
+
+  **Backup**
+  - `--stall-timeout` killed healthy backups that streamed longer than
+    the timeout; stream data now counts as progress.
+  - A failed stale-lease break left the lease wedged, silently stopping
+    every later backup.
+  - BASE_BACKUP timed out while `pg_backup_stop` waited for WAL archiving.
+  - The manifest duplicate-key guard could be bypassed with keys that
+    Go's JSON decoder folds (`ſ` → `s`).
+  - `wal stream` preflight refused to restart when the slot table was full
+    only because of its own slot, and refused superusers without
+    REPLICATION.
+
+  **Output, config, CLI**
+  - `-o json` (the default when stdout is not a terminal) printed several
+    JSON documents from many commands; stdout now carries exactly one,
+    events go to stderr (a test walks the whole command tree).
+  - `-c <file>` pointing at a missing file loaded an empty config.
+    Config-editing commands wrote conf.d drop-ins and `PG_HARDSTORAGE_CONFIG`
+    content into the main file.
+  - DSN passwords leaked through `deployment list` (`password = x`),
+    `init`'s JSON result, psql's argv (`redact`, `db install-extension`),
+    `compat translate` and PKCS#11 KEKRef errors.
+  - Read-only verbs (`list`, `doctor`, `restore`, `repair`, …) created a
+    signing keypair when the keyring was empty; only `init`, `backup` and
+    scheduled backups do now (`notfound.signing_key`).
+  - `repo check` names the manifests that fail verification.
+  - Many smaller exit-code, error-code and help-text corrections.
+
+  **LLM helper, sinks, governance, soak harness**
+  - Model-supplied tool arguments could smuggle global flags into the
+    child process (`--cpu-profile=<file>` truncated arbitrary files);
+    arguments are validated and passed after `--`, and `execute_command`
+    checks commands against the real command tree.
+  - Privacy modes now redact the system prompt, JSON-shaped secrets and
+    MCP tool results.
+  - The email sink could hang forever on a stalled relay; the CEF sink
+    kept writing to a rotated file; Jira dedup matched fuzzily.
+  - Soak harness: a permanently dead cell, a no-op fault or a mistyped
+    `--faults` path could all yield a PASS; scenario steps silently
+    dropped unknown keys; doctest checked only a block's last command.
+- **`--cpu-profile`, `--mem-profile` and `--profile-port` were silently
+  ignored after a subcommand flag.** They are read before the subcommand
+  resolves, by a parse that stopped at the first flag it did not know —
+  so `repo gc --repo X --cpu-profile p.pprof` profiled nothing while
+  `--cpu-profile p.pprof repo gc --repo X` worked. They now work in any
+  position.
+- **`backup --include-wal` failed on a busy database.** `BASE_BACKUP`
+  sends the WAL written during the backup at the end, and nothing pinned
+  it meanwhile, so under sustained writes it was recycled first
+  (`backup.wal_recycled`). With the soak's write load finally kept alive,
+  that was 4 of 16 heavy-profile backups; in an A/B at ~5,000 tps with
+  minimal WAL retention the old binary failed 2/2 and the new one
+  succeeded 2/2, restoring to a consistent, promoted cluster with every
+  row. Each `--include-wal` backup now creates a TEMPORARY physical
+  replication slot with RESERVE_WAL on its own connection — as
+  `pg_basebackup -X stream` does — which the server drops when the
+  session ends. If no slot is available the backup proceeds as before
+  and warns (`backup.wal_slot_unavailable`).
+
+- **Four documented `pg_hardstorage.yaml` sections did not exist, and
+  pasting any of them broke the whole configuration.** The monitoring
+  guide's `observability:` block (tracing), the scaling guide's and
+  `server --help`'s `server:` block, the plugin protocol's `plugins:`
+  block (RPC timeout), and the LLM safety page's `approvals:` block
+  (n-of-m thresholds). The config file is decoded strictly, so each made
+  every command fail with "field … not found". Each page now documents
+  the real mechanism: `--otel-endpoint` / `--otel-stdout`,
+  `server --max-concurrent-jobs`, a fixed 30 s plugin RPC timeout, and
+  `approval request --threshold`. Three documented environment variables
+  were also read by nothing: `PG_HARDSTORAGE_REPO` (a backup "sent to the
+  emergency repo" this way went to the configured one),
+  `PG_HARDSTORAGE_OTLP_ENDPOINT` / `_INSECURE`, and
+  `PG_HARDSTORAGE_KEYRING_PASSPHRASE`. Removed. New tests fail the build
+  on either kind of drift.
+
+- **A backup whose WAL existed nowhere was reported as a success, and
+  restoring it hung forever.** Without `--include-wal`, a base backup is
+  restorable only once the WAL written during it is archived. With no
+  archiving running — exactly the first-backup tutorial's setup —
+  `backup` said `✓ Backup committed`, and `restore` produced a data
+  directory whose recovery waited forever for the next segment (the
+  tutorial's own doctest block was skipped with a note saying so).
+  `backup` now flags such a backup: a `not_yet_restorable` warning, a
+  `⚠ Not restorable yet` line, and `self_contained` / `wal_archived` /
+  `restore_needs` in the JSON result. `restore` refuses it up front with
+  **`preflight.backup_wal_missing` (exit 4)** instead of hanging;
+  `--skip-gap-check` overrides. Both fire only when the backup embeds no
+  WAL **and** the repository holds none on its timeline, so a deployment
+  with working archiving never sees them. The tutorial now uses
+  `--include-wal`, and its restore block runs in CI again.
+
+- **`repo replicate` reported "replication clean" for a DR replica that
+  could not restore.** WAL is replicated only with `--include-wal`; by
+  default a replica of a WAL-archiving source holds backups that cannot
+  become consistent there. The run now warns
+  (`replicate.wal_not_replicated`, `wal_not_replicated: true`, and a
+  `⚠ WAL not replicated` line), and restoring from such a replica is
+  refused rather than hanging.
+
+- **Usage errors ignored `-o json`.** An unknown flag or a wrong number
+  of arguments — the commonest failures there are — printed a plain text
+  line even when JSON output was requested, contradicting the promise
+  that every error is structured. Parsing fails before the output
+  dispatcher is installed, and a code comment claimed JSON consumers
+  were covered anyway. The fallback now honours `-o`/`--output` (even
+  when it appears after the bad flag) and `PG_HARDSTORAGE_OUTPUT`,
+  emitting the normal envelope with its `usage.*` code. Text output is
+  unchanged.
+
+- **A split-brain was never reported with its documented code.** The
+  error-code reference tells automation to route on `splitbrain.*` — the
+  signal that two clusters are archiving into one lineage. `wal push`
+  wrapped every such refusal as `wal.push_failed` and `wal stream`
+  stopped with `wal.stream_permanent`; `splitbrain.content_mismatch`
+  appeared only inside the message text, so no rule keyed on the code
+  could match the most dangerous condition the archive detects. Both
+  now emit the documented `splitbrain.<leaf>` code (exit 1, unchanged),
+  and `wal push` points at runbook R7.
+
+- **The RPM could not be built.** The #56 change placed the new WAL-stream
+  unit's `%files` path inside `%install`, which rpmbuild runs as a shell
+  script, and never listed the installed unit in `%files`. A packaging
+  test that only checked the filename appeared somewhere in the spec
+  passed; it now checks both sections.
+
+- **The LLM helper's command validator rejected valid commands, then
+  talked the model into invalid ones.** Every suggested command is
+  checked against the live CLI and, on a warning, the model is asked to
+  fix it. The validator knew only declared flag names, so it rejected
+  `deployment add --pg-connection` (an accepted spelling of
+  `--connection`); and it demanded `--repo` / `--pg-connection` on
+  `backup db1`, which the CLI fills from the named deployment's config
+  (#12). The retry prompt then told the model a correct command was
+  wrong, and it "fixed" `--pg-connection` into `--conn` or `--pg-conn` —
+  flags that really do not exist. A 64-question eval traced a large
+  share of invented flags to this loop. Operators also saw warnings on
+  the documented form. The validator now applies each command's own
+  flag normalization and treats config-back-filled flags as supplied
+  when the command's first argument is a deployment (as the runtime
+  hook requires — `approval approve <request-id>` still needs
+  `--repo`); a test pins that exemption to exactly the flags the hook
+  fills.
+
+- **A PostgreSQL connection failure was coded `storage.unreachable`.**
+  Exit 8 is correct (transient; retry), but the code is what alert
+  routing keys on, and it named the wrong system: "the database is in
+  crash recovery" reached whoever owns the storage backend. `doctor`
+  already called the same condition `pg.unreachable`, so one outage had
+  two names. It is now `pg.unreachable` everywhere; a Patroni REST
+  endpoint that is down is likewise `patroni.unreachable` rather than
+  `storage.unreachable`. **Upgrade note:** automation matching the
+  string `storage.unreachable` to detect a down database must match
+  `pg.unreachable`; exit codes are unchanged.
+
+- **"Requested WAL segment has already been removed" during a backup
+  was reported as `internal`.** It is the most predictable failure a
+  backup of a busy database has, with a two-line remedy, and it
+  surfaced the first time the soak ran backups under sustained write
+  load. PostgreSQL raises it without an errcode (XX000), so it landed in
+  the "we don't know what this is" bucket. Now `backup.wal_recycled`,
+  saying it is a sizing condition, not damage, that retry is safe, and
+  how to prevent it (raise `wal_keep_size`; a running `wal stream`
+  does not help, since its slot holds only WAL the streamer has not yet
+  consumed).
+
+- **Manual `rotate` ignored the deployment's `retention:` block and
+  applied the built-in GFS defaults** (#66 follow-up, reported by
+  @marsqd). A deployment declaring `policy: count, keep_fulls: 2` got a
+  plan headed `Policy: gfs` that kept 7 of 8 backups. The agent's
+  scheduled rotate always read the block; the manual command never did,
+  though it back-filled `--repo` from the same deployment since #12 and
+  so looked config-aware. One deployment, two retention policies,
+  depending on who ran it.
+
+  This mattered more after the #66 doc fix, which tells operators
+  without the agent to cron `backup && rotate --apply` — a command that
+  would have applied GFS, not the declared policy, and for a deployment
+  configured to keep *more* than GFS, soft-deleted backups its own
+  policy protects.
+
+  Policy now resolves per deployment: any `--policy`/`--keep-*` flag
+  defines the whole policy; otherwise the deployment's block, through
+  the same builder the scheduled task uses; otherwise the GFS defaults.
+  Each plan line says which (`from flags` / `from pg_hardstorage.yaml` /
+  `from built-in default`), and a retention block that does not parse
+  refuses rather than falling back — as does a `pg_hardstorage.yaml`
+  that exists but will not load, unless explicit flags are given.
+  **Behaviour change:** a bare
+  `rotate <deployment>` on a deployment with a `retention:` block now
+  follows that block — dry-run first.
+
+- **A restore reported `postverify_failed` — "your backup did not
+  survive" — when the truth was that the host lacked an extension the
+  source cluster preloaded.** Backups taken from a Patroni/Spilo
+  cluster carry `shared_preload_libraries = bg_mon,...` in their
+  `postgresql.conf`. Restored onto stock PostgreSQL, the boot smoke
+  test dies with
+
+  ```
+  FATAL:  could not access file "bg_mon": No such file or directory
+  ```
+
+  before the postmaster has looked at a single data page. The restored
+  data is sound; only the smoke test could not run. Telling an
+  operator mid-disaster-recovery that their backup is bad, when it is
+  not, is the most expensive wrong answer this tool can give.
+
+  A postmaster that will not start because *this host* is missing a
+  library is now the same category as a host with no `pg_ctl` at all —
+  undetermined, not failed. `Mode=auto` soft-skips with a reason
+  naming the library and three ways to proceed; `Mode=required` still
+  fails, because the operator asked for proof. Every other start
+  failure — invalid checkpoint record, incompatible data files, bad
+  permissions — stays a hard failure, pinned by tests, since catching
+  those is why postverify exists.
+
+- **`partial dump` connected to its sandbox as the host's login name,
+  and honoured the backup's own `pg_hba.conf`.** Both are wrong for
+  what the sandbox is: a throwaway cluster restored from the
+  operator's backup, whose roles and auth policy belong to *their*
+  source cluster.
+
+  The connection role came from `$USER`, so the command worked only
+  where the operator's login happened to match a role inside their own
+  backup — and otherwise failed with PostgreSQL's
+  `FATAL: role "<login>" does not exist`, which reads like a
+  pg_hardstorage bug. Running as `root`, as a service account, or from
+  CI failed by construction.
+
+  The auth policy was the restored cluster's, so a `pg_hba.conf`
+  demanding scram, md5, LDAP, GSSAPI or a client certificate — an
+  ordinary production posture — made `partial dump` unusable, since
+  pg_hardstorage holds no credential for the operator's own database.
+
+  The sandbox now supplies its own trust-only `pg_hba.conf` (via
+  `hba_file`, so the operator's file is never modified) and connects
+  as `postgres` by default, with `--pg-user` for clusters `initdb`'d
+  under another name. Trust is confined to a cluster with no TCP
+  listener whose socket lives in a 0700 directory the process creates
+  and deletes. A role that is not present is now
+  `preflight.pg_role_missing` naming `--pg-user`, not a dump failure.
+
+- **`partial dump` reported a table that does not exist as a tool
+  failure, and its guard against that case was unreachable.** The
+  command carried an empty-dump guard (issue #97) that turned "pg_dump
+  matched nothing" into a structured refusal. It was written against
+  pg_dump builds that exit 0 and emit nothing; every current build
+  treats an unmatched `--table` as a hard error and exits 1, so the
+  generic `partial.dump_pg_dump_failed` branch returned first and the
+  guard could not run on any supported PostgreSQL.
+
+  The operator therefore got `code: "partial.dump_pg_dump_failed"` and
+  exit 1 — the bucket for *the dump broke* — for what is almost always
+  a table living in a different database, the exact mistake `--database`
+  exists to fix. Both discovery paths now raise the same refusal, with
+  the same advice.
+
+  Separately, that refusal routed to exit **1** even when it did fire:
+  `partial.*` has no namespace route and no leaf route existed, so a
+  not-found was indistinguishable from a crash by exit code alone.
+
+  The gate that should have caught this
+  (`L3_partial_dump_database_flag`) skips unless the host carries
+  PostgreSQL **server** binaries, and no CI host did, so it had never
+  run.
+
+- **The documentation promised that retention runs after every backup,
+  and it does not** (#66, reported by @marsqd). Two pages — the
+  operator guide's retention section and the "Set retention" how-to —
+  stated that `rotate` runs automatically on every backup commit.
+  Nothing in the backup path has ever applied retention:
+  `internal/backup/retention` is imported by exactly two non-test
+  callers, the manual `rotate` command and the agent's *scheduled*
+  rotate task.
+
+  An operator who configured `retention` and a `backup` schedule, and
+  took the documentation at its word, therefore accumulated every
+  backup ever taken while believing a policy was in force — and would
+  find out when the repository filled. The reporter's deployment had
+  78 fulls under a `keep_for: 7d` policy.
+
+  Both pages now say plainly that `backup` does not trigger `rotate`,
+  that the two are independent jobs, and what to schedule (or chain in
+  cron) to get retention actually applied. The behaviour is unchanged:
+  this is a documentation fix, not a new implicit delete inside
+  `backup`.
+
+- **The documentation pointed at the agent units to supervise the WAL
+  streamer, and the agent does not stream.** `pg_hardstorage.service`
+  and `pg_hardstorage@.service` both run `pg_hardstorage agent`, which
+  executes the scheduled backup and retention engine and never opens a
+  WAL stream. An operator who followed the getting-started tutorial got
+  periodic base backups and **no continuous archiving**, with nothing
+  to indicate the always-on data plane was absent.
+
+  Corrected in the getting-started tutorial (which now carries an
+  explicit "this is not the agent unit" warning), the R1 runbook —
+  whose `systemctl stop pg_hardstorage` would have left the slot held
+  and PostgreSQL still blocked — and all three migration guides, each
+  of which promised a replication slot and then enabled the agent.
+
+- **Three runbooks referenced `pg_hardstorage-agent`**, a unit no
+  package has ever shipped. Now `pg_hardstorage`.
+
+- **A slow model was treated as a hung connection.** The
+  OpenAI-compatible provider set `http.Client.Timeout` to 5 minutes,
+  described as "a backstop for hung connections". It is not one:
+  `Client.Timeout` bounds the whole exchange including the body, and
+  an SSE client cannot distinguish a dead connection from a healthy
+  stream still delivering tokens. Measured, one ordinary question
+  streams for 265 s on a deepseek-v4 endpoint and 532 s on a qwen3.8
+  one — both well-behaved, both killed at 300 s and reported as a
+  context deadline, which reads as a network fault rather than as our
+  own client hanging up. Every reasoning model was affected.
+
+  Connect, TLS and response-header timeouts are now bounded
+  individually, and the stream is watched for silence rather than
+  elapsed time, with two budgets: up to 45 minutes for the first byte
+  (a busy local endpoint can queue a request that long) and 5 minutes
+  between bytes once the answer is flowing
+  (`PG_HARDSTORAGE_LLM_FIRST_BYTE_TIMEOUT`,
+  `PG_HARDSTORAGE_LLM_STALL_TIMEOUT`). A single two-minute budget was
+  tried first and discarded 192 of 194 answers from a queued endpoint.
+  The watchdog is bound to the request itself, so a connection that
+  goes silent without closing is actually interrupted rather than
+  merely noticed. A stalled stream now says which budget ran out.
+
+- **The command validator's retry narrated itself into the answer.**
+  When a reply named a bad flag, the session asked the model to
+  revise, and nothing told it to keep that internal. Answers came
+  back opening "Now I have the correct flags. Here's the revised
+  answer." The operator never saw the first attempt, so the answer
+  began by referring to a conversation that, from their side, never
+  happened.
+
+- **Nothing connected the unit files to the CLI verbs they invoke.**
+  New tests assert that every unit in `deploy/systemd/` is referenced
+  by every packaging recipe, that each `ExecStart` names a verb the CLI
+  implements, and that some unit actually runs `wal stream` — the
+  check that would have caught #56 when the docs were written.
+
+- **The scenario runner never removed its temp dirs.** Without
+  `--artefact-dir`, each run created `$TMPDIR/pg_hardstorage-testkit-*`
+  and left it behind, pass or fail. One release's scenario campaigns
+  left ~1,800 of them. A passing run now removes its own dir, unless the
+  scenario sets `on_success: keep`. A failing run keeps its dir for
+  triage, and an explicit `--artefact-dir` is never removed.
+- **Soak harness: a kernel refusing an impossible cgroup_squeeze limit was
+  counted as `fault_apply_failed`** (#64). With swap disabled, the kernel
+  cannot reclaim a PostgreSQL cell down to 32 MiB, so it sometimes refuses
+  the write. The injector now reports this as `ErrLimitUnreachable`, and
+  the orchestrator records it as `fault_skipped_limit_unreachable`. A
+  refusal with any other cause still fails the run.
+- **Soak harness: cgroup_squeeze recovery lost the cell when a container
+  restart raced it.** A container restart (Docker restart policy after an
+  OOM) could kill the recovery's `docker exec` (exit 137) or refuse it
+  ("is restarting"). The heavy and default campaign soaks both failed
+  only for this reason. Recovery now retries up to 4 times, each retry
+  starting the container and lifting the limit again, and fails only when
+  the cell does not come back.
+
+### Changed
+
+- **Behaviour changes from the full-code review** — check before
+  upgrading:
+  - Approvals require a trusted approver roster
+    (`PG_HARDSTORAGE_APPROVAL_ROSTER`) and at least
+    `PG_HARDSTORAGE_APPROVAL_MIN_THRESHOLD` (default 2) approvals; with no
+    roster every approval is refused. Approvals need an exact `--target`,
+    are single-use and expire after their TTL.
+  - Under `-o json`, events go to stderr (NDJSON); stdout carries only the
+    result. `-o ndjson` still streams everything on stdout.
+  - `restore`, `repair`, `jit` and `audit export-bundle` need the existing
+    keyring (`notfound.signing_key`, exit 6): install it on DR hosts with
+    `keyring install` before restoring.
+  - The wal-g shim derives the deployment name the way the translator
+    does: a dotted `PGHOST` maps to a sanitised name (new lineage), a
+    Unix-socket `PGHOST` to `default`.
+  - `repo gc` refusing over a live backup lease is
+    `conflict.gc_backup_in_flight`, exit 7 (was `repo.gc.live_backup_lease`,
+    exit 1). `repo check` read errors are `repo.check.manifests_unreadable`,
+    exit 1 (were exit 9).
+  - `partial restore` exits non-zero for a table it could not find and
+    refuses incremental backups. `hold add` refuses to weaken an active
+    hold (`--force`, audited). `repo wipe` refuses while legal holds exist.
+  - LLM skills are no longer loaded from `./share/skills` in the working
+    directory (`PG_HARDSTORAGE_SKILL_DIR`).
+  - `audit verify-bundle` requires a trusted signer (local keyring key,
+    `--trusted-key` or `--trusted-fingerprint`).
+- **`repo gc --apply` deletes chunks 16 at a time.** It deleted them one
+  by one, and each delete waits for its directory fsync — a journal
+  commit, ~1.4 ms on a busy disk — so a sweep of 43,000 chunks took over
+  a minute locally and 4–6 minutes on the heavy soak's loaded host; a
+  remote backend paid a network round trip per chunk. Deletes stay
+  individually durable; concurrent ones share commits and overlap
+  latency (16,562 chunks: 8.7 s). Found by running retention in the
+  soak for the first time.
+- **The LLM helper's system prompt shrank from 150 KB to 64 KB.**
+  `hotCommandPaths` baked the full `--help` of 38 commands into every
+  prompt. Its comment estimated "~200-400 tokens" per entry; measured
+  against the live binary it is ~1,000 — 38,309 tokens in total, so
+  the list had been kept "tight" against a budget understating the
+  cost threefold. Asking "is there an RPM?" shipped the full flag
+  inventory of `restore`, `forecast` and `compliance report`.
+
+  The cost is latency, not money: that much prefill on a reasoning
+  endpoint is minutes of silence before the first token, which is
+  indistinguishable from a hung client. The block is now budgeted
+  (`PG_HARDSTORAGE_LLM_HOT_HELP_BYTES`, default 16 KB, `0` disables),
+  and the overflow is named so the model calls `read_command_help` —
+  a tool already registered and already advertised in that prompt —
+  rather than guessing.
+
+  Measured against a deepseek-v4 endpoint: "How do I take my first
+  backup?" went from 764 s and failing to 316 s and answering.
+
+### Security
+
+- **Full-code review security fixes:** LLM tool argument injection and
+  `execute_command` flag smuggling; approval-gate bypass (target-less,
+  reusable, self-approved requests); `repair attestation` re-signing
+  manifests signed by an untrusted key; `restore_roots` bypass through
+  `tablespace_mapping`; `audit verify-bundle` accepting any self-signed
+  bundle; strict air-gap mode not covering s3, gcs, aws-kms, azure-kv,
+  vault-transit, email/syslog sinks and control-plane URLs; credentials
+  in control-plane API responses; unbounded metric cardinality from
+  unauthenticated requests; secrets in error messages, argv and output.
+- **`google.golang.org/grpc` v1.83.1 → v1.83.2** (#57), clearing
+  GO-2026-6443 (server panic via missing authority or Host headers),
+  which `govulncheck` reported as REACHABLE through
+  `transport.http2Server.HandleStreams`. v1.83.1 had arrived four days
+  earlier in #55 as a fix for an *unreachable* advisory; it introduced
+  a reachable one. The shipped binary scans clean again.
+
+- OpenTelemetry bumps to 1.45.0 (#58, #59, #60): `otel/sdk`,
+  `otlptrace`, `otlptrace/otlptracehttp`.
+
 ## [1.4.2] — 2026-09-08
 
 Container images only, again — v1.4.1 did not actually publish any.

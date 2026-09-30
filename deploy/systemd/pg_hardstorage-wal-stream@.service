@@ -1,0 +1,93 @@
+# pg_hardstorage WAL streamer — templated, one instance per deployment.
+#
+# This is the unit for the always-on data plane: a long-running
+# `pg_hardstorage wal stream <deployment>` holding a physical
+# replication slot and shipping every WAL byte into the repository as
+# PostgreSQL writes it.
+#
+# It is NOT the same thing as pg_hardstorage.service /
+# pg_hardstorage@.service. Those run `pg_hardstorage agent`, which
+# executes the scheduled backup and retention work and never opens a
+# WAL stream. Running only the agent leaves you with periodic base
+# backups and no continuous archiving — the gap that issue #56
+# reported, where the documentation pointed at the agent unit for a
+# job the agent does not do.
+#
+# The two are complements, and a production host runs both:
+#
+#   systemctl enable --now pg_hardstorage.service                  # schedules backups
+#   systemctl enable --now pg_hardstorage-wal-stream@db1.service   # streams WAL
+#
+# %i is the deployment name as it appears under `deployments:` in
+# pg_hardstorage.yaml — it is passed to the CLI as the positional
+# argument, so the instance genuinely selects which deployment streams.
+#
+# Enable with:
+#   systemctl enable --now pg_hardstorage-wal-stream@<deployment>.service
+
+[Unit]
+Description=pg_hardstorage WAL streamer (%i)
+Documentation=https://docs.pghardstorage.org/tutorials/getting-started/
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pgbackup
+Group=pgbackup
+
+Environment=PG_HARDSTORAGE_CONFIG_DIR=/etc/pg_hardstorage
+Environment=PG_HARDSTORAGE_STATE_DIR=/var/lib/pg_hardstorage/%i
+Environment=PG_HARDSTORAGE_LOGS_DIR=/var/log/pg_hardstorage
+Environment=PG_HARDSTORAGE_RUNTIME_DIR=/run/pg_hardstorage
+
+# The deployment name is the positional argument; --pg-connection and
+# --repo are resolved from `deployments.%i` in pg_hardstorage.yaml.
+ExecStart=/usr/bin/pg_hardstorage wal stream %i
+
+WorkingDirectory=/var/lib/pg_hardstorage/%i
+StateDirectory=pg_hardstorage/%i
+ConfigurationDirectory=pg_hardstorage
+RuntimeDirectory=pg_hardstorage
+LogsDirectory=pg_hardstorage
+
+# Always restart. A streamer that stays down is a WAL gap, and the
+# slot holds PostgreSQL's WAL on the primary in the meantime — the
+# failure mode that fills a data disk. The stream is gap-free across
+# restarts: the slot's restart_lsn is where it resumes.
+Restart=always
+RestartSec=5
+
+# Longer than the agent's stop timeout: the streamer flushes the
+# in-flight segment and closes the slot cleanly on SIGTERM, and a
+# half-written segment is what the repo-side gap auditor complains
+# about afterwards.
+TimeoutStopSec=180
+
+SyslogIdentifier=pg_hardstorage-wal-stream@%i
+
+# --- Sandboxing --- (mirror of pg_hardstorage.service)
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+# Writable paths the sandbox must still allow. A file:// repository
+# under /srv or /var/backups needs adding here (or use ReadWritePaths=
+# in a drop-in) — ProtectSystem=strict makes everything else read-only.
+ReadWritePaths=/var/lib/pg_hardstorage /var/log/pg_hardstorage /run/pg_hardstorage
+
+[Install]
+WantedBy=multi-user.target

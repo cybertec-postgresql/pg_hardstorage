@@ -169,8 +169,11 @@ about. See [Add an S3 repository](../adding/repository-s3.md#3-aws-s3-with-worm-
 
 ## Scheduled rotation
 
-Rotation runs automatically after every backup commit and on
-the schedule the deployment declares:
+Rotation runs on the schedule the deployment declares, and
+**only** then. Taking a backup does not apply retention — the
+two are independent jobs, so a deployment that schedules
+`backup` without also scheduling `rotate` accumulates backups
+indefinitely no matter what its `retention` block says:
 
 ```yaml
 deployments:
@@ -182,6 +185,24 @@ deployments:
 
 See [Schedule backups](schedule-backups.md) for the schedule
 expression grammar.
+
+Give `rotate` a time of its own rather than trying to chase the
+backup: a sweep that lands while a backup is still committing
+sees a partial view and refuses. The pairing above — backups
+every 6 h, one rotate at 04:00 — is the shape to copy.
+
+Without the agent, put the sweep in the same cron that takes
+the backup, as a separate command:
+
+```sh
+pg_hardstorage backup db1 && pg_hardstorage rotate db1 --apply
+```
+
+`rotate db1` applies the `retention:` block declared for `db1` in
+`pg_hardstorage.yaml` — the same policy the agent's scheduled rotate
+uses — and prints `(from pg_hardstorage.yaml)` beside it. Passing any
+`--policy` or `--keep-*` flag replaces that policy for the one run.
+Always dry-run first (omit `--apply`) and check the `policy:` line.
 
 ## Troubleshooting
 

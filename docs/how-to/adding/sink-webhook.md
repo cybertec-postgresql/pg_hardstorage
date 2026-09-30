@@ -43,6 +43,11 @@ pg_hardstorage notify add webhook \
 pg_hardstorage notify list
 ```
 
+The `endpoint` shown is redacted so the listing is safe to paste
+into a ticket: the path becomes `/****`, any `user:password@` becomes
+`****@`, and credential-looking query values (`token`, `key`,
+`secret`, `sig`, …) become `****`.
+
 ### 3. Smoke-test
 
 Pipe a verify run, watch the receiver log. The body shape is

@@ -3,6 +3,7 @@ package restore
 
 import (
 	"context"
+	stdjson "encoding/json"
 	"errors"
 	"fmt"
 	stdfs "io/fs"
@@ -70,12 +71,38 @@ type Plan struct {
 	// EstimatedRTO is a crude estimate based on TotalBytes divided by
 	// a fixed throughput baseline. Documented as approximate; the real
 	// number depends on storage backend, network, disk throughput, and
-	// chunk dedup hit-rate from prior restores.
-	EstimatedRTO time.Duration `json:"estimated_rto_ms"`
+	// chunk dedup hit-rate from prior restores. Serialised as whole
+	// milliseconds under estimated_rto_ms by MarshalJSON — a raw
+	// time.Duration would emit nanoseconds under a _ms key.
+	EstimatedRTO time.Duration `json:"-"`
 
 	// AssumedThroughput is the bytes-per-second figure used to compute
 	// EstimatedRTO. Surfaced so the operator can re-estimate manually.
 	AssumedThroughput int64 `json:"assumed_throughput_bytes_per_sec"`
+}
+
+// MarshalJSON emits estimated_rto_ms as whole milliseconds (see
+// EstimatedRTO), mirroring Result/VerifyResult.
+func (p Plan) MarshalJSON() ([]byte, error) {
+	type alias Plan // no methods: avoids recursing into MarshalJSON
+	return stdjson.Marshal(struct {
+		alias
+		EstimatedRTOMS int64 `json:"estimated_rto_ms"`
+	}{alias(p), p.EstimatedRTO.Milliseconds()})
+}
+
+// UnmarshalJSON is the inverse of MarshalJSON (ms → time.Duration).
+func (p *Plan) UnmarshalJSON(b []byte) error {
+	type alias Plan
+	aux := struct {
+		*alias
+		EstimatedRTOMS int64 `json:"estimated_rto_ms"`
+	}{alias: (*alias)(p)}
+	if err := stdjson.Unmarshal(b, &aux); err != nil {
+		return err
+	}
+	p.EstimatedRTO = time.Duration(aux.EstimatedRTOMS) * time.Millisecond
+	return nil
 }
 
 // PlanOptions configures a planning run. Same shape as Options minus

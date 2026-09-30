@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup/keystore"
@@ -240,4 +241,22 @@ func TestResolveEncryption_CloudKMS(t *testing.T) {
 			t.Fatalf("err = %v, want it to wrap kms.ErrUnknownScheme", err)
 		}
 	})
+}
+
+// A KEKRef may carry a secret (pkcs11://…?pin=…). When the provider
+// fails to open, the error — which reaches CLI output, logs and audit
+// bodies — must not repeat it.
+func TestResolveEncryption_OpenErrorRedactsKEKRefSecrets(t *testing.T) {
+	reg, _ := fakeRegistry(t, errors.New("module not found"))
+	_, err := ResolveEncryption(context.Background(), EncryptionRequest{
+		KeyringDir: t.TempDir(),
+		KEKRef:     "fake-kms://acme/db1?pin=123456",
+		Registry:   reg,
+	})
+	if err == nil {
+		t.Fatal("open failure was swallowed")
+	}
+	if strings.Contains(err.Error(), "123456") {
+		t.Fatalf("KMS open error leaks the PIN: %v", err)
+	}
 }

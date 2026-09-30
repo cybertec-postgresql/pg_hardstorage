@@ -2,6 +2,7 @@ package cli_test
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -220,5 +221,50 @@ func TestRepoGC_Apply_NoWarnWithDefaultFloors(t *testing.T) {
 	}
 	if strings.Contains(out+errb, "safety_floor_disabled") {
 		t.Errorf("default floors must not warn:\nstdout=%s\nstderr=%s", out, errb)
+	}
+}
+
+// Deletes run concurrently: every orphan must still go, and the counts
+// must still add up exactly — no lost updates between workers.
+func TestRepoGC_Apply_ConcurrentSweepAccountsEveryChunk(t *testing.T) {
+	repoURL := initRepoForTest(t)
+
+	_, sp, _ := repo.Open(context.Background(), repoURL)
+	cas := casdefault.New(sp)
+	const n = 300
+	var hashes []repo.Hash
+	var total int64
+	for i := range n {
+		info, err := cas.PutChunk(context.Background(), []byte(fmt.Sprintf("orphan-%04d-%s", i, strings.Repeat("x", i))))
+		if err != nil {
+			t.Fatal(err)
+		}
+		hashes = append(hashes, info.Hash)
+		st, err := sp.Stat(context.Background(), repo.ChunkKey(info.Hash))
+		if err != nil {
+			t.Fatal(err)
+		}
+		total += st.Size
+	}
+	sp.Close()
+
+	out, _, exit := runCmd(t, "repo", "gc", repoURL, "--apply", "--min-chunk-age", "0", "--output", "json")
+	if exit != int(output.ExitOK) {
+		t.Fatalf("exit = %d, out:\n%s", exit, out)
+	}
+	for _, want := range []string{
+		fmt.Sprintf(`"applied": %d`, n),
+		fmt.Sprintf(`"bytes_reclaimed": %d`, total),
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %q in:\n%s", want, out)
+		}
+	}
+	_, sp2, _ := repo.Open(context.Background(), repoURL)
+	defer sp2.Close()
+	for _, h := range hashes {
+		if has, _ := casdefault.New(sp2).HasChunk(context.Background(), h); has {
+			t.Fatalf("orphan %s survived the sweep", h)
+		}
 	}
 }

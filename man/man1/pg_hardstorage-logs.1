@@ -23,7 +23,10 @@ multi-instance pattern).
 Options:
 
 .PP
---follow / -f      tail forward (default: print last 100 lines)
+--follow / -f      tail forward (default: print last 100 lines).
+                     Streams with -o text (raw lines) or -o ndjson
+                     (one logs.line event per entry); other formats
+                     are refused with usage.follow_needs_stream.
   --lines N          how many lines to print initially (default 100)
   --since DUR-OR-TS  start from this point ("24h", "yesterday",
                      RFC3339). A bare duration means "that long

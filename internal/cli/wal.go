@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -283,7 +284,7 @@ func runWalPush(cmd *cobra.Command, opts walPushOptions) error {
 		return output.NewError("usage.missing_flag",
 			"wal push --tde: cannot derive system_identifier — segment header is ciphertext under TDE and no --pg-connection / --system-identifier given").
 			WithSuggestion(&output.Suggestion{
-				Human:   "set --system-identifier <hex> (recommended for archive_command; obtain once via `SELECT system_identifier FROM pg_control_system()`) or pass --pg-connection so we can fetch it per push",
+				Human:   "set --system-identifier <decimal> (recommended for archive_command; obtain once via `SELECT system_identifier FROM pg_control_system()`) or pass --pg-connection so we can fetch it per push",
 				DocURL:  "docs/explanation/tde-awareness.md",
 				Command: "pg_hardstorage doctor " + opts.deployment,
 			}).Wrap(output.ErrUsage)
@@ -372,6 +373,19 @@ func mapWalPushError(path string, err error) error {
 			fmt.Sprintf("wal push: %v", err)).
 			WithSuggestion(&output.Suggestion{
 				Human: "this archive_command input is neither a canonical 16 MiB WAL segment nor a recognised companion file (.backup / .history / .partial) — check the %f PG passed",
+			}).Wrap(err)
+	}
+	// Split-brain must surface as its documented code. walsink reports it
+	// as a message prefix ("splitbrain.content_mismatch: ...") and this
+	// function used to wrap everything as wal.push_failed, so the code an
+	// operator's automation was told to route on — docs/reference/
+	// error-codes.md, `splitbrain.*` — never appeared. That is the
+	// signal for two clusters archiving into one lineage; it has to be
+	// matchable without parsing prose.
+	if code := splitBrainCode(err); code != "" {
+		return output.NewError(code, fmt.Sprintf("wal push: %v", err)).
+			WithSuggestion(&output.Suggestion{
+				Human: "another writer has already archived this WAL with different content — two clusters are archiving into one lineage, or the archive was altered. Stop archiving from this node and follow runbook R7 (docs/reference/runbooks/R7-patroni-split-brain.md) before retrying",
 			}).Wrap(err)
 	}
 	return output.NewError("wal.push_failed",
@@ -694,8 +708,18 @@ func fetchAuxBody(ctx context.Context, sp storage.StoragePlugin, key string, kin
 	}
 	if kind == walsink.AuxiliaryHistory {
 		if tli, ok := historyRequestTLI(segmentName); ok {
-			if b, terr := timeline.New(sp).Get(ctx, deployment, tli); terr == nil {
+			b, terr := timeline.New(sp).Get(ctx, deployment, tli)
+			if terr == nil {
 				return b, nil // found in the follower's timeline store
+			}
+			// Only a genuine miss in BOTH places is NotFound. Any other
+			// timeline-store failure must surface: reporting it as "no such
+			// file" lets PG, under recovery_target_timeline='latest',
+			// silently stay on the pre-failover timeline. The caller maps a
+			// non-NotFound error to wal.fetch.read_failed, which aborts
+			// recovery so the operator can retry once storage is healthy.
+			if !errors.Is(terr, storage.ErrNotFound) {
+				return nil, fmt.Errorf("timeline store: %w", terr)
 			}
 		}
 	}
@@ -1359,9 +1383,9 @@ type walStreamOptions struct {
 	kekRef    string
 	kmsConfig map[string]string
 	// segmentSize is the cluster's probed wal_segment_size in bytes,
-	// resolved once at stream start and threaded into the walsink + the
-	// resume/alignment math. 0 means "not yet probed / use the 16 MiB
-	// default" (NormSegmentSize handles the fallback).
+	// re-probed by verifyStreamSource on every attempt and threaded into
+	// the walsink + the resume/alignment math. streamAttempt never
+	// proceeds with it unset.
 	segmentSize int64
 	// allowSysIDChange overrides the system-identifier preflight: by
 	// default `wal stream` refuses to archive into a deployment whose
@@ -1385,59 +1409,38 @@ type walStreamOptions struct {
 	verbose bool
 }
 
-// runWalStream is the main entry-point for `wal stream`. Pulled out
-// of the cobra closure so unit tests can call it with a synthesized
-// command + context without setting up the full CLI binary.
-// probeSegmentSize probes the cluster's wal_segment_size and returns the
-// value the streamer should chop and name segments with. A probe that
-// can't run falls back to the 16 MiB default so a flaky preflight never
-// blocks a valid stream — the connect error, if any, resurfaces in
-// streamAttempt with proper retry/backoff, and a failure to read the
-// setting on a CONNECTED cluster is reported as a warning rather than
-// assumed away in silence.
+// probeSegmentSize reads the cluster's wal_segment_size — the value the
+// streamer must chop and name segments with — and FAILS when it cannot.
 //
-// ("old PG" used to be offered as a reason a probe might not run; it is
-// not one. The query uses pg_size_bytes, available since PG 9.6, far
-// below any version this supports.)
+// It used to fall back to the 16 MiB default on a connect or query
+// failure, on the theory that a flaky probe should not block a valid
+// stream. But it ran once, at startup: a cluster that was unreachable at
+// that moment and reachable a second later streamed its whole life on the
+// assumption, and on a cluster built with `initdb --wal-segsize 64MB`
+// that names every segment wrongly. A FRESH deployment has no archived
+// WAL for guardSegmentSize to contradict, so nothing noticed until a
+// restore failed. The size is never assumed now; verifyStreamSource
+// probes on every attempt, and a failure here is an ordinary retryable
+// setup error — the reconnect loop's backoff, not a guess, covers the
+// flaky case.
+//
 // A probed value that is not a valid WAL segment size (a power of two in
-// [1 MiB, 1 GiB]) is refused: PG cannot produce such a size, so it
-// signals a broken probe or a non-PG endpoint rather than a real
+// [1 MiB, 1 GiB]) is refused permanently: PG cannot produce such a size,
+// so it signals a broken probe or a non-PG endpoint rather than a real
 // cluster, and streaming would mis-name segments.
-func probeSegmentSize(ctx context.Context, d *output.Dispatcher, dsn string) (int64, error) {
+func probeSegmentSize(ctx context.Context, dsn string) (int64, error) {
 	c, err := pg.Connect(ctx, dsn, pg.ModeRegular)
 	if err != nil {
-		// Could not connect at all. No warning: streamAttempt is about to
-		// hit the same failure with proper retry/backoff, so the stream
-		// never quietly proceeds on this assumption.
-		return walsink.DefaultSegmentSize, nil
+		return 0, output.NewError("connect.regular",
+			fmt.Sprintf("wal stream: connect to read wal_segment_size: %v", err)).Wrap(err)
 	}
 	defer c.Close(ctx)
 	got, err := pg.QueryWALSegmentSize(ctx, c)
 	if err != nil {
-		// Connected, but the setting would not read. Fail OPEN -- blocking
-		// WAL archiving on an inconclusive probe is itself a way to lose
-		// WAL, since the primary keeps recycling -- but never silently,
-		// the same posture guardSourceIsPrimary takes below.
-		//
-		// Silence was wrong here specifically because the assumption can
-		// be wrong AND undetectable: on a cluster built with
-		// `initdb --wal-segsize 64MB` this names every segment as though
-		// it were 16 MiB, and on a FRESH deployment guardSegmentSize has
-		// no archived WAL to compare against, so nothing downstream
-		// notices until a restore fails.
-		if d != nil {
-			_ = d.Event(ctx, output.NewEvent(output.SeverityWarning, "wal.stream", "segment_size_probe_failed").
-				WithBody(map[string]any{
-					"error":         err.Error(),
-					"assumed":       walSegSizeHuman(walsink.DefaultSegmentSize),
-					"assumed_bytes": walsink.DefaultSegmentSize,
-					"message": "could not read wal_segment_size from the cluster; assuming the " +
-						"16 MiB default. If this cluster was built with `initdb --wal-segsize`, " +
-						"every segment archived now is named for the wrong size and the archive " +
-						"will not restore. Pass --wal-segment-size explicitly to be sure.",
-				}))
-		}
-		return walsink.DefaultSegmentSize, nil
+		return 0, output.NewError("wal.segment_size_probe_failed",
+			fmt.Sprintf("wal stream: could not read wal_segment_size from the cluster: %v — refusing to "+
+				"stream on an assumed size, which would mis-name every segment of a cluster built with "+
+				"`initdb --wal-segsize`", err)).Wrap(err)
 	}
 	if !walsink.ValidSegmentSize(got) {
 		return 0, output.NewError("preflight.wal_segment_size",
@@ -1446,6 +1449,47 @@ func probeSegmentSize(ctx context.Context, d *output.Dispatcher, dsn string) (in
 				"mis-name segments.", walSegSizeHuman(got), got))
 	}
 	return got, nil
+}
+
+// verifyStreamSource runs the source guards against the cluster an
+// attempt actually reached, and returns the wal_segment_size to stream
+// with. It runs on EVERY attempt, after IDENTIFY_SYSTEM and before
+// anything is written for that cluster.
+//
+// Running these once at startup was not enough. The startup checks were
+// best-effort — an unreachable PostgreSQL skipped the system-identifier
+// guard and made the size probe assume 16 MiB — and the reconnect loop
+// then happily pinned whatever cluster it reached first: a re-initdb'd
+// or pg_upgrade'd cluster's WAL went into the old lineage, a 64 MiB
+// cluster's WAL was chopped at 16 MiB. The reconnect loop exists to
+// survive failovers and VIP repoints, which are exactly the events that
+// can land the DSN somewhere new, so every attempt is checked:
+//
+//   - against the repo's recorded identifier (guardSystemIdentifier),
+//     which catches a foreign cluster even on the very first attempt;
+//   - against the identifier this process first streamed from
+//     (checkSysIDContinuity), which catches a switch on a FRESH
+//     deployment where the repo has nothing recorded yet — and does so
+//     BEFORE streaming, not after an attempt has already archived it;
+//   - and for wal_segment_size, freshly probed and compared with what
+//     the deployment was archived at (guardSegmentSize).
+func verifyStreamSource(ctx context.Context, sp storage.StoragePlugin, opts walStreamOptions, liveSysID string, pinnedSysID *string) (int64, error) {
+	if err := guardSystemIdentifier(ctx, sp, "wal stream", opts.deployment, liveSysID, opts.allowSysIDChange); err != nil {
+		return 0, err
+	}
+	if pinnedSysID != nil && liveSysID != "" {
+		if err := checkSysIDContinuity(pinnedSysID, liveSysID, opts.deployment, opts.allowSysIDChange); err != nil {
+			return 0, err
+		}
+	}
+	segSize, err := probeSegmentSize(ctx, opts.pgConn)
+	if err != nil {
+		return 0, err
+	}
+	if err := guardSegmentSize(ctx, sp, "wal stream", opts.deployment, segSize); err != nil {
+		return 0, err
+	}
+	return segSize, nil
 }
 
 // guardSystemIdentifier refuses to stream when the live cluster's
@@ -1500,10 +1544,11 @@ func deploymentRecordedSysID(ctx context.Context, sp storage.StoragePlugin, depl
 // Unlike that guard there is no --allow override, because unlike a
 // system identifier this value cannot legitimately change: wal_segment_size
 // is fixed by initdb --wal-segsize and is immutable for the life of a
-// cluster. Same cluster therefore ALWAYS means same size, so a mismatch
-// can only mean the size WE resolved is wrong — a --wal-segment-size flag
-// that does not match the cluster, or probeSegmentSize falling back to the
-// 16 MiB default when its query failed against a cluster that is not 16 MiB.
+// cluster. Same cluster therefore ALWAYS means same size. The live size
+// is always freshly probed (verifyStreamSource never assumes one), so a
+// mismatch means the ARCHIVE is wrong: WAL written at an assumed 16 MiB
+// by a build whose probe fell back when it could not connect, or a
+// different cluster admitted under --allow-system-identifier-change.
 // (A genuine re-initdb changes the system identifier, so the guard above
 // catches that case first and offers the right remedy.)
 //
@@ -1523,11 +1568,12 @@ func guardSegmentSize(ctx context.Context, sp storage.StoragePlugin, who, deploy
 			"already-archived WAL was written with %s (%d bytes). Segment size determines segment "+
 			"NAMES as well as their length, so mixing two sizes in one lineage produces names that "+
 			"collide or skip and breaks point-in-time recovery. wal_segment_size is set by initdb and "+
-			"cannot change on a live cluster, so this means the size in use here is wrong. Refusing.",
+			"cannot change on a live cluster, and the live value was just read from the server, so the "+
+			"archive does not belong to this cluster at this size. Refusing.",
 			who, deployment, walSegSizeHuman(liveSize), liveSize,
 			walSegSizeHuman(recorded), recorded)).
 		WithSuggestion(&output.Suggestion{
-			Human: "check the cluster's real value with `SHOW wal_segment_size` and pass it explicitly via --wal-segment-size (in MB). If this is genuinely a different cluster — a re-initdb changes wal_segment_size and the system_identifier together — archive it under a FRESH deployment name so the existing lineage stays intact for PITR.",
+			Human: "confirm the cluster's value with `SHOW wal_segment_size` and compare it with the archived segments (`pg_hardstorage wal list`). If this is a different cluster — a re-initdb changes wal_segment_size and the system_identifier together — archive it under a FRESH deployment name so the existing lineage stays intact for PITR. If the archived segments were written at a wrongly assumed size, they will not restore: start a fresh deployment with a new full backup.",
 		})
 }
 
@@ -1691,19 +1737,6 @@ func runWalStream(cmd *cobra.Command, opts walStreamOptions) error {
 		return err
 	}
 
-	// Probe the cluster's wal_segment_size and stream + name segments
-	// using it. PG packs 4 GiB / size segments per log-id, so the size
-	// shapes both the chop boundary and the segment names. A probe that
-	// can't run (old PG, transient failure) falls back to the 16 MiB
-	// default so a flaky preflight never blocks a valid stream; a probed
-	// value that is not a valid WAL segment size (power of two in
-	// [1 MiB, 1 GiB]) is refused — it cannot be a real PG cluster.
-	segSize, err := probeSegmentSize(repoCtx, d, opts.pgConn)
-	if err != nil {
-		return err
-	}
-	opts.segmentSize = segSize
-
 	// Preflight: refuse to stream into a deployment whose existing WAL
 	// belongs to a DIFFERENT cluster. A changed pg_control system
 	// identifier is the signature of a pg_upgrade, a restore onto fresh
@@ -1711,24 +1744,18 @@ func runWalStream(cmd *cobra.Command, opts walStreamOptions) error {
 	// continuation of the old lineage and interleaving them under one
 	// timeline would corrupt PITR (a recovery could fetch segments from
 	// the wrong cluster). A promotion/failover keeps the SAME sysid, so
-	// this never trips on normal HA events. Probe failures degrade to
-	// "allow" so a flaky preflight never blocks a valid stream.
+	// this never trips on normal HA events.
+	//
+	// This startup check is only an EARLY refusal — it stops a wrong
+	// cluster before encryption setup below touches the deployment's key
+	// material — and it is skipped when PostgreSQL is unreachable. The
+	// authoritative check is verifyStreamSource, which every attempt runs
+	// against the cluster it actually reached, together with the
+	// wal_segment_size probe and guard; neither is ever assumed.
 	if liveID, idErr := identifySystem(repoCtx, opts.pgConn); idErr == nil {
 		if err := guardSystemIdentifier(repoCtx, sp, "wal stream", opts.deployment, liveID.SystemID, opts.allowSysIDChange); err != nil {
 			return err
 		}
-	}
-
-	// Preflight: the size we resolved above must match what this
-	// deployment's WAL was already archived with. probeSegmentSize
-	// deliberately falls back to the 16 MiB default when its query
-	// fails, so that a flaky pre-flight never blocks a valid stream —
-	// but on a cluster built with `initdb --wal-segsize 64MB` that
-	// fallback silently produces exactly the mis-named segments the
-	// invalid-value branch refuses to produce. This is the check that
-	// notices, whatever the wrong size came from.
-	if err := guardSegmentSize(repoCtx, sp, "wal stream", opts.deployment, segSize); err != nil {
-		return err
 	}
 
 	// Encrypt streamed WAL under the deployment's shared DEK when a local KEK
@@ -1847,23 +1874,14 @@ retryLoop:
 		}
 		attempt++
 		attemptWallStart := time.Now()
-		streamErr, syncedAtExit, bufferedAtExit, attemptStart, attemptTLI, attemptInfo, attemptErr := streamAttempt(streamCtx, repoCtx, sp, cas, repoMeta, opts, d, emit, attempt, shutdown, walEncInfo)
-		// System-identifier continuity across reconnects: the startup
-		// guardSystemIdentifier check runs ONCE, but the retry loop
-		// exists to survive failovers — and a failover/VIP repoint can
-		// land the DSN on a DIFFERENT cluster (restored clone, wrongly
-		// re-initialized standby). Without this recheck the next attempt
-		// would archive the foreign cluster's WAL into the same
-		// deployment lineage — exactly the corruption the startup
-		// refusal prevents (concurrency audit). A sysid change is a
-		// permanent, operator-actionable condition: stop, don't retry.
-		if attemptInfo != "" {
-			if perr := checkSysIDContinuity(&streamSysID, attemptInfo, opts.deployment, opts.allowSysIDChange); perr != nil {
-				return perr
-			}
-		}
+		// streamSysID pins the system identifier this process first
+		// streamed from. streamAttempt checks it (with the repo's recorded
+		// identifier and the wal_segment_size) BEFORE streaming, on every
+		// attempt — see verifyStreamSource. It used to be checked here,
+		// after the attempt returned, which let the attempt that reached a
+		// different cluster archive its WAL first and refuse afterwards.
+		streamErr, syncedAtExit, bufferedAtExit, attemptStart, attemptTLI, _, attemptErr := streamAttempt(streamCtx, repoCtx, sp, cas, repoMeta, opts, d, emit, attempt, shutdown, walEncInfo, &streamSysID)
 		if attemptErr == nil {
-			_ = attemptInfo
 			lastStreamErr = streamErr
 			if !firstStartSet {
 				firstStartLSN = attemptStart
@@ -2040,6 +2058,7 @@ func streamAttempt(
 	attempt int,
 	shutdown *walShutdown,
 	encInfo *walsink.EncryptionInfo,
+	pinnedSysID *string,
 ) (streamErr error, synced, buffered pglogrepl.LSN, startLSN pglogrepl.LSN, timeline uint32, identityID string, setupErr error) {
 	// Preflight runs on every attempt by default — the new
 	// leader after a Patroni failover may have different
@@ -2091,6 +2110,17 @@ func streamAttempt(
 	}
 	timeline = uint32(identity.Timeline)
 	identityID = identity.SystemID
+
+	// Which cluster did this attempt reach, and at what segment size?
+	// Checked here, before anything is captured, written or streamed for
+	// it — see verifyStreamSource for why once-at-startup was not enough.
+	// opts is this attempt's copy, so the probed size flows into the
+	// resume math, the gap record and the sink below.
+	segSize, err := verifyStreamSource(repoCtx, sp, opts, identityID, pinnedSysID)
+	if err != nil {
+		return nil, 0, 0, 0, timeline, identityID, err
+	}
+	opts.segmentSize = segSize
 
 	// Refuse to stream from a standby before doing anything else with
 	// this connection. Deliberately NOT part of the preflight: the
@@ -2437,10 +2467,11 @@ func nextStreamBreakBackoff(streamDuration, prevBackoff, initial, max time.Durat
 // path because a Patroni failover legitimately surfaces as those.
 // checkSysIDContinuity pins the stream's system identifier to the first
 // attempt's value and refuses any later attempt that reports a
-// different one (unless the operator passed --allow-sysid-change). See
-// the retry-loop comment: without this, a reconnect after a DSN
-// repoint to a different cluster interleaves foreign WAL into the
-// deployment's lineage.
+// different one (unless the operator passed
+// --allow-system-identifier-change). verifyStreamSource calls it before
+// each attempt streams: without it, a reconnect after a DSN repoint to a
+// different cluster interleaves foreign WAL into the deployment's
+// lineage.
 func checkSysIDContinuity(pinned *string, observed, deployment string, allowChange bool) error {
 	if *pinned == "" {
 		*pinned = observed
@@ -2481,6 +2512,12 @@ func decideStreamStop(streamErr error, noProgress int) (code, msg string, stop b
 	if isWalRemovedError(streamErr) {
 		e := startBeforeRestartError(streamErr)
 		return "wal.start_before_slot_restart_lsn", e.Error(), true
+	}
+	// Split-brain keeps its documented code on the streaming path too;
+	// it was reported as wal.stream_permanent, invisible to automation
+	// routing on `splitbrain.*`.
+	if code := splitBrainCode(streamErr); code != "" {
+		return code, fmt.Sprintf("wal stream stopped: %v", streamErr), true
 	}
 	if isPermanentStreamError(streamErr) {
 		return "wal.stream_permanent",
@@ -2555,7 +2592,16 @@ func isPermanentStreamSetupError(err error) bool {
 		return true
 	}
 	switch oe.Code {
-	case "wal.slot_no_restart_lsn":
+	case "wal.slot_no_restart_lsn",
+		// The source guards (verifyStreamSource) now run inside every
+		// attempt instead of once before the loop, so their refusals
+		// arrive here as setup errors. Each describes WHICH cluster the
+		// DSN reaches, which no reconnect changes back — retrying would
+		// only repeat the refusal forever.
+		"preflight.system_identifier_changed",
+		"wal.system_identifier_changed",
+		"preflight.wal_segment_size",
+		"preflight.wal_segment_size_changed":
 		return true
 	}
 	return false
@@ -2739,6 +2785,37 @@ func resolveStartLSN(ctx context.Context, sp storage.StoragePlugin, opts walStre
 	}
 	if priorFound {
 		note := fmt.Sprintf("resume-across-timeline-%d", priorTLI)
+		// The old frontier is only a shared position up to where this
+		// timeline's lineage FORKED from the old one. The old primary can
+		// keep writing — and the streamer keep archiving — past that point
+		// before it is fenced; those bytes are diverged history, and this
+		// timeline holds different WAL at the same LSNs. Resuming at such a
+		// frontier asked the new timeline for WAL from there onward, so its
+		// own WAL between the fork and the frontier was never archived, and
+		// segment-number gap detection saw the hand-off as contiguous.
+		// Clamp to the start of the segment holding the switchpoint:
+		// resolveStreamTimeline then opens it on the new timeline, whose
+		// copy of that segment is the whole one (PostgreSQL copies the
+		// pre-fork tail under the new name at promotion).
+		//
+		// No readable history → no clamp: that is the prior behaviour, and
+		// resolveStreamTimeline already warns that history is unreadable.
+		if forkSeg, ok := lineageForkSegmentStart(ctx, sp, opts.deployment, timeline, priorTLI, segSize); ok && forkSeg < priorLSN {
+			if emit != nil {
+				emit(output.NewEvent(output.SeverityWarning, "wal.timeline", "frontier_past_fork").
+					WithSubject(output.Subject{Deployment: opts.deployment, Timeline: timeline}).
+					WithBody(map[string]any{
+						"prior_timeline": priorTLI,
+						"prior_frontier": priorLSN.String(),
+						"resume_lsn":     forkSeg.String(),
+						"message": "the previous timeline was archived past the point this timeline " +
+							"forked from it; that WAL is diverged history. Resuming from the fork " +
+							"segment so this timeline's own WAL there is archived.",
+					}))
+			}
+			priorLSN = forkSeg
+			note += "-from-fork"
+		}
 		warnIfStartBehindRestart(priorLSN, restartLSN, note, segSize, emit)
 		return priorLSN, note, nil
 	}
@@ -3288,4 +3365,17 @@ func captureStreamTimelineHistory(ctx context.Context, d *output.Dispatcher, sp 
 			WithSubject(output.Subject{Deployment: opts.deployment, Timeline: tli}).
 			WithBody(map[string]any{"timelines": captured}))
 	}
+}
+
+// splitBrainRe extracts a `splitbrain.<leaf>` code from an error chain's
+// text, where walsink records it.
+var splitBrainRe = regexp.MustCompile(`splitbrain\.[a-z_]+`)
+
+// splitBrainCode returns the documented splitbrain.* code carried by err,
+// or "" when err is not a split-brain refusal.
+func splitBrainCode(err error) string {
+	if err == nil {
+		return ""
+	}
+	return splitBrainRe.FindString(err.Error())
 }

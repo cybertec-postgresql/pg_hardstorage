@@ -10,6 +10,7 @@ import (
 	"math/rand"
 	"os/exec"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -95,12 +96,16 @@ type DockerCellRuntime struct {
 	// kills the process and parses pgbench's final report
 	// from the captured stdout/stderr.
 	sustainedCmd       *exec.Cmd
-	sustainedStdout    *bytes.Buffer
-	sustainedStderr    *bytes.Buffer
+	sustainedStdout    *lockedBuffer
+	sustainedStderr    *lockedBuffer
 	sustainedStartedAt time.Time
 	sustainedCancel    context.CancelFunc
 	sustainedDone      chan struct{}
 	walPreCount        int64 // pg_stat_wal.wal_bytes at writer start; 0 = not sampled
+	walPreLSN          string
+	sustainedPGBin     string
+	sustainedMu        sync.Mutex
+	sustainedRestarts  int
 
 	// WAL-stream sidecar state.  Unlike the sustained writer,
 	// this one is SUPERVISED: `docker exec` dies with the
@@ -110,8 +115,8 @@ type DockerCellRuntime struct {
 	// mutex guards the fields it writes from the reader in
 	// StopWALStream.
 	walStreamMu       sync.Mutex
-	walStreamStdout   *bytes.Buffer
-	walStreamStderr   *bytes.Buffer
+	walStreamStdout   *lockedBuffer
+	walStreamStderr   *lockedBuffer
 	walStreamCancel   context.CancelFunc
 	walStreamDone     chan struct{}
 	walStreamRunning  bool
@@ -394,8 +399,19 @@ func (d *DockerCellRuntime) Seed(ctx context.Context, sizeGB int) error {
 		return fmt.Errorf("seed: %w", err)
 	}
 
-	out, err := d.dockerExec(ctx,
-		"sudo", "-u", d.PGUser,
+	// Run pgbench AS the PG superuser via `docker exec -u`, exactly
+	// as StartSustainedLoad does. This used to be `sudo -u <pguser>`
+	// inside dockerExec — but dockerExec always enters the container as
+	// pgbackup, and pgbackup has no sudo rights on any testbed image,
+	// so every seed died on
+	//
+	//	sudo: a terminal is required to read the password
+	//
+	// which made enterprise_heavy (the only shipped profile with
+	// seed_target_gb) fail on all 21 cells before its first iteration.
+	// The profile that exists to test backup under concurrent write
+	// load had never been able to start.
+	out, err := d.dockerExecAs(ctx, d.PGUser,
 		pgBinDir+"/pgbench", "-i", "-s", fmt.Sprintf("%d", scale),
 		"-d", d.PGDatabase)
 	if err != nil {
@@ -429,24 +445,6 @@ func (d *DockerCellRuntime) locateContainerPGBin(ctx context.Context, binName st
 // test (see runCellLoop).
 var ErrCellNotReady = errors.New("cell not ready: lead container not running")
 
-// cellDownDockerErr reports whether a docker-exec error is the
-// daemon saying the target container is not in a usable state —
-// stopped or removed by a fault.  These phrases originate only
-// from dockerd describing container state, so matching them
-// cannot mask a genuine pg_hardstorage / pg_verifybackup error.
-// Used alongside containerRunning to catch the race where a fault
-// stops the cell *during* an exec (the exec fails, but the
-// container may already be back up by the time we re-inspect).
-func cellDownDockerErr(err error) bool {
-	if err == nil {
-		return false
-	}
-	s := err.Error()
-	return strings.Contains(s, "is not running") ||
-		strings.Contains(s, "No such container") ||
-		strings.Contains(s, "no such container")
-}
-
 // containerRunning returns true iff `docker inspect` reports
 // State.Running == true for the lead container.  Any inspect
 // failure (missing container, daemon error) returns false so the
@@ -462,6 +460,177 @@ func (d *DockerCellRuntime) containerRunning(ctx context.Context) bool {
 		return false
 	}
 	return strings.TrimSpace(string(out)) == "true"
+}
+
+// isContainerGoneExecError reports whether a docker exec failed because
+// Docker could not run anything in the container, rather than for
+// anything the exec'd program did:
+//   - runc's "error executing setns process": the container's namespaces
+//     no longer exist;
+//   - dockerd refusing the exec ("Error response from daemon: ... is
+//     restarting, wait until the container is running", "... is not
+//     running", "No such container").
+//
+// The dockerd phrases count only on a line carrying dockerd's own
+// "Error response from daemon:" prefix — pg_hardstorage's output can
+// say "... is not running" about PostgreSQL, and that is a real result.
+func isContainerGoneExecError(stdout, stderr []byte) bool {
+	for _, out := range [][]byte{stderr, stdout} {
+		if bytes.Contains(out, []byte("error executing setns process")) {
+			return true
+		}
+		for _, line := range bytes.Split(out, []byte("\n")) {
+			if !bytes.Contains(line, []byte("Error response from daemon:")) {
+				continue
+			}
+			for _, phrase := range []string{"is restarting", "is not running", "No such container", "no such container"} {
+				if bytes.Contains(line, []byte(phrase)) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// retentionKeepFulls is how many fulls ApplyRetention keeps: enough
+// that the backup the loop verifies next is never among the pruned.
+const retentionKeepFulls = 3
+
+// retentionMinChunkAge guards chunks a concurrent writer (the WAL
+// streamer, a backup) has stored but not yet referenced from a
+// committed manifest. It is the product's own in-flight defence, and
+// the soak running gc beside a live streamer is what exercises it.
+const retentionMinChunkAge = 10 * time.Minute
+
+// Rotate soft-deletes the cell's deployment down to a count policy, as
+// a deployment's scheduled rotate does.
+func (d *DockerCellRuntime) Rotate(ctx context.Context) error {
+	return d.retentionStep(ctx, d.AgentBinary, "rotate", d.Deployment, "--repo", d.RepoURL,
+		"--policy", "count", "--keep-fulls", strconv.Itoa(retentionKeepFulls),
+		"--apply", "-o", "json")
+}
+
+// GC garbage-collects the repository the fleet shares. A refusal because
+// a backup lease is still live — typically one a fault killed mid-backup,
+// expiring within its TTL — is ErrRetentionDeferred: the product doing
+// exactly what it documents, and the next window retries.
+func (d *DockerCellRuntime) GC(ctx context.Context) error {
+	return d.retentionStep(ctx, d.AgentBinary, "repo", "gc", "--repo", d.RepoURL, "--apply",
+		"--tombstone-grace", "0",
+		"--min-chunk-age", retentionMinChunkAge.String(), "-o", "json")
+}
+
+// RepoKey identifies the cell's repository: its URL plus the storage
+// environment the agent reaches it with, since two sinks may share a
+// URL shape and differ only in endpoint credentials. Over-distinguishing
+// is harmless (a shared repository is gc'd twice); merging two distinct
+// repositories would leave one never collected.
+func (d *DockerCellRuntime) RepoKey() string {
+	keys := make([]string, 0, len(d.sinkAgentEnv))
+	for k := range d.sinkAgentEnv {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var b strings.Builder
+	b.WriteString(d.RepoURL)
+	for _, k := range keys {
+		b.WriteString("\x00" + k + "=" + d.sinkAgentEnv[k])
+	}
+	return b.String()
+}
+
+func (d *DockerCellRuntime) retentionStep(ctx context.Context, argv ...string) error {
+	if !d.containerRunning(ctx) {
+		return ErrCellNotReady
+	}
+	stdout, stderr, err := d.dockerExecCapture(ctx, argv...)
+	if err == nil {
+		return nil
+	}
+	if isContainerGoneExecError(stdout, stderr) || d.containerPositivelyStopped(ctx) {
+		return fmt.Errorf("%w: container %s went down during %s: %v",
+			ErrCellNotReady, d.Container, argv[1], err)
+	}
+	combined := append(append([]byte{}, stdout...), stderr...)
+	// gc's live-lease refusal is conflict.gc_backup_in_flight (exit 7)
+	// since fix/repo; the old repo.gc.live_backup_lease is still matched
+	// so a cell running an older binary defers the same way.
+	if bytes.Contains(combined, []byte(`"code": "conflict.gc_backup_in_flight"`)) ||
+		bytes.Contains(combined, []byte(`"code": "repo.gc.live_backup_lease"`)) {
+		return fmt.Errorf("%w: %s: a backup lease is still live", ErrRetentionDeferred, d.CellName)
+	}
+	// The error document follows gc's safety-floor warning; keep the
+	// tail, where the error is, rather than the head.
+	if len(combined) > 2048 {
+		combined = combined[len(combined)-2048:]
+	}
+	return fmt.Errorf("retention %s (%s): %w (output: %s)",
+		d.CellName, strings.Join(argv[1:3], " "), err, combined)
+}
+
+// containerPositivelyStopped reports whether Docker says the container
+// is not running. Unlike containerRunning, an inspect error is "don't
+// know" (false), not "stopped" — it decides whether a failure is blamed
+// on the testbed, so it must not be a way to hide one.
+func (d *DockerCellRuntime) containerPositivelyStopped(ctx context.Context) bool {
+	if d.Container == "" {
+		return false
+	}
+	out, err := exec.CommandContext(ctx, d.dockerBin(),
+		"inspect", "--format", "{{.State.Running}}",
+		d.Container).Output()
+	return err == nil && strings.TrimSpace(string(out)) == "false"
+}
+
+// cellWentDown classifies a failed agent exec. It returns an error
+// wrapping ErrCellNotReady when there is positive evidence that the
+// container — not pg_hardstorage — ended the exec, and nil when the
+// failure must be scored against the product. bootBefore is the
+// container's StartedAt sampled immediately before THIS exec ("" when
+// unreadable). TakeBackup and VerifyRestore share it so a dying cell is
+// scored the same way whichever operation it interrupted.
+func (d *DockerCellRuntime) cellWentDown(ctx context.Context, op, bootBefore string, stdout, stderr []byte, err error) error {
+	// The container restarted underneath the backup. `docker exec`
+	// children die with the container (exit 137), so the backup was
+	// killed by the testbed, not by pg_hardstorage — the enterprise_
+	// heavy soak lost four backups this way, each within a second of
+	// Docker's unless-stopped policy restarting a cell whose entrypoint
+	// had exited during cgroup_squeeze recovery. Detected precisely:
+	// the container's StartedAt changed across the call. A real
+	// pg_hardstorage crash never restarts its container, so this
+	// cannot hide one; the event stays visible as
+	// backup_skipped_cell_down / verify_skipped_cell_down.
+	if bootBefore != "" {
+		if bootAfter := d.containerStartedAt(ctx); bootAfter != "" && bootAfter != bootBefore {
+			return fmt.Errorf("%w: container %s restarted during the %s (StartedAt %s -> %s): %v",
+				ErrCellNotReady, d.Container, op, bootBefore, bootAfter, err)
+		}
+	}
+	// Or it stopped and has not come back yet: the release soak's first
+	// backup_failed was `docker exec` refusing to enter a container a
+	// SIGKILL fault had just killed (exit 128, "error executing setns
+	// process") — pg_hardstorage never started. Same argument: a
+	// pg_hardstorage failure cannot stop its container. Requires Docker
+	// to say so; an inspect that fails proves nothing.
+	if d.containerPositivelyStopped(ctx) {
+		return fmt.Errorf("%w: container %s stopped during the %s: %v",
+			ErrCellNotReady, d.Container, op, err)
+	}
+	// Docker can lag the truth: on the loaded soak host a SIGKILLed
+	// container stayed "running" for ~30 s after its init died (docker
+	// kill: "did not receive an exit event"), so the check above saw
+	// nothing. The exec error is the evidence then — runc could not
+	// join the container's namespaces because they no longer exist, so
+	// pg_hardstorage never ran. The third attempt then met dockerd
+	// refusing the exec outright ("is restarting"), with Running still
+	// true. Only these messages: other OCI exec failures (a wrong binary
+	// path) are real harness failures.
+	if isContainerGoneExecError(stdout, stderr) {
+		return fmt.Errorf("%w: container %s had died under the %s (exec could not join its namespaces): %v",
+			ErrCellNotReady, d.Container, op, err)
+	}
+	return nil
 }
 
 // TakeBackup invokes `pg_hardstorage backup` inside the
@@ -515,18 +684,36 @@ func (d *DockerCellRuntime) TakeBackup(ctx context.Context) (string, error) {
 	// fails with `storage.unreachable: cannot connect to
 	// PostgreSQL: ... connection refused`, which is a transient
 	// signal — not a real "backup broken" outcome.  The user
-	// wants 100% reliability, so we retry with exponential
-	// backoff (1 s, 2 s, 4 s) before giving up.  Three retries
-	// covers the worst-observed "PG restarted but isn't ready"
-	// window from soak testing (~5 s after a SIGKILL on a busy
-	// cell) with comfortable margin.  Pure transient handler:
-	// any error that isn't "PG unreachable" propagates on the
-	// first try.
+	// wants 100% reliability, so we keep retrying while PG is
+	// recovering. Pure transient handler: any error that isn't
+	// "PG unreachable" propagates on the first try.
+	//
+	// This was three attempts with 1 s / 2 s backoff — about three
+	// seconds of patience, calibrated against "~5 s after a SIGKILL
+	// on a busy cell" under the light oltp_smoke profile. The first
+	// enterprise_heavy soak (10 GB seeded, 16 pgbench writers per
+	// cell) had PG still in crash recovery 29 s after the fault, and
+	// every such backup was scored backup_failed: the soak blamed the
+	// product for declining to back up a database that was not yet
+	// accepting connections. A larger fixed count would just be the
+	// next wrong guess, so this waits on readiness under a deadline —
+	// quick on a quiet cell, patient on a busy one — which is the
+	// same move the scenario runner already made (see ensureUp in
+	// runner/steps.go).
 	var (
 		stdout, stderr []byte
 		err            error
+		bootBefore     string
 	)
-	for attempt, backoff := 0, time.Second; attempt < 3; attempt++ {
+	deadline := time.Now().Add(pgRecoveryBudget)
+	for backoff := time.Second; ; {
+		// StartedAt is sampled per attempt, not once before the loop:
+		// the loop can wait up to pgRecoveryBudget, and a container
+		// restart during that wait (the very recovery it is waiting
+		// out) was otherwise charged to whichever later attempt failed
+		// — turning a genuine pg_hardstorage failure on a healthy,
+		// already-restarted container into backup_skipped_cell_down.
+		bootBefore = d.containerStartedAt(ctx)
 		stdout, stderr, err = d.dockerExecCapture(ctx,
 			d.AgentBinary, "backup", d.Deployment,
 			"--pg-connection", d.containerDSN(),
@@ -537,7 +724,7 @@ func (d *DockerCellRuntime) TakeBackup(ctx context.Context) (string, error) {
 		if err == nil {
 			break
 		}
-		if !isPGUnreachable(stdout, stderr) {
+		if !isPGUnreachable(stdout, stderr) || time.Now().After(deadline) {
 			break
 		}
 		// Wait, then re-poll the container; if the cell isn't
@@ -548,20 +735,30 @@ func (d *DockerCellRuntime) TakeBackup(ctx context.Context) (string, error) {
 			return "", ctx.Err()
 		case <-time.After(backoff):
 		}
-		backoff *= 2
+		if backoff *= 2; backoff > pgRecoveryMaxBackoff {
+			backoff = pgRecoveryMaxBackoff
+		}
 		if !d.containerRunning(ctx) {
 			return "", ErrCellNotReady
 		}
 	}
 	if err != nil {
+		if downErr := d.cellWentDown(ctx, "backup", bootBefore, stdout, stderr, err); downErr != nil {
+			return "", downErr
+		}
 		// Diagnostic display still wants combined output —
 		// stderr is where the operator-relevant context
 		// usually lives on a failure.
 		combined := make([]byte, 0, len(stdout)+len(stderr))
 		combined = append(combined, stdout...)
 		combined = append(combined, stderr...)
+		// 2 KiB, not 256: the agent's JSON error spends ~200 bytes on
+		// schema/command/timestamp before "message", so every
+		// connection failure in the enterprise_heavy soak was recorded
+		// as "failed to connect to `user=postgres d…" — cut off before
+		// pgx said whether it was refused, timed out or in recovery.
 		return "", fmt.Errorf("backup %s: %w (output: %s)",
-			d.CellName, err, truncate(combined, 256))
+			d.CellName, err, truncate(combined, 2048))
 	}
 	// Parse the backup ID from the agent's stdout-only JSON output.
 	// Schema: `{"result": {"backup_id": "..."}}`.  encoding/json
@@ -633,20 +830,25 @@ func (d *DockerCellRuntime) VerifyRestore(ctx context.Context, backupID string) 
 	//
 	// Omitting --to / --to-lsn / --to-name leaves PITR disarmed (the
 	// CLI defaults to "no recovery target" when no --to* is set).
-	out, err := d.dockerExec(ctx,
+	bootBefore := d.containerStartedAt(ctx)
+	stdout, stderr, err := d.dockerExecCapture(ctx,
 		d.AgentBinary, "restore", d.Deployment, backupID,
 		"--repo", d.RepoURL,
 		"--target", target,
 		"--verify", "skip",
 		"--verify-restore", "required")
 	if err != nil {
-		// A fault may have stopped the cell between the gate above
-		// and this exec — re-check (and inspect the error text for
-		// the kill-during-exec race) and soft-skip rather than
-		// reporting a verify failure for a down cell.
-		if !d.containerRunning(ctx) || cellDownDockerErr(err) {
-			return ErrCellNotReady
+		// A fault may have stopped or restarted the cell between the
+		// gate above and this exec. Classified exactly as TakeBackup
+		// does: only positive evidence that the container ended the
+		// exec is a skip. The old check matched dockerd's phrases
+		// against the Go error — which is only "exit status N"; the
+		// daemon's words are in the output — and read an inspect that
+		// FAILED as "stopped", which hid real restore failures.
+		if downErr := d.cellWentDown(ctx, "restore-verify", bootBefore, stdout, stderr, err); downErr != nil {
+			return downErr
 		}
+		out := append(append([]byte{}, stdout...), stderr...)
 		// 4 KiB cap: pg_hardstorage's restore-failure JSON nests the
 		// postverify pg_ctl output + postgresql.log tail; 256 B
 		// truncated the actual reason mid-line.
@@ -662,7 +864,9 @@ func (d *DockerCellRuntime) ApplyFault(ctx context.Context, action string) (inje
 	if d.Targets == nil {
 		return nil, errors.New("ApplyFault: target set not initialised (Setup not called?)")
 	}
-	return inject.DefaultRegistry.Apply(ctx, action, d.Targets)
+	// On behalf of this deployment: repo-corruption faults touch only its
+	// files, not a random file of the repository the fleet shares.
+	return inject.DefaultRegistry.ApplyForDeployment(ctx, action, d.Targets, d.Deployment)
 }
 
 // Teardown closes the pgx connection and brings down the
@@ -719,18 +923,21 @@ func (d *DockerCellRuntime) StartSustainedLoad(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("sustained load: %w", err)
 	}
+	d.sustainedPGBin = pgBin
 
-	// Sample WAL counter so StopSustainedLoad can compute
-	// "WAL bytes written during the writer's lifetime".  Best-
-	// effort: pg_stat_wal exists since PG14; older clusters
-	// just leave the counter at zero and the report shows "—".
-	d.walPreCount = d.samplePGStatWAL(ctx)
+	// WAL written is measured as an LSN distance, read through psql in
+	// the container. The old pg_stat_wal counter was read over d.conn,
+	// which dies with the first fault that restarts PostgreSQL, and the
+	// counter resets on crash recovery anyway; every heavy-soak cell
+	// reported "—". LSNs only move forward.
+	d.walPreLSN = d.currentWALLSN(ctx)
 
 	args := []string{
 		pgBin + "/pgbench",
 		"-c", fmt.Sprintf("%d", d.Profile.SustainedClients),
 		"-j", fmt.Sprintf("%d", d.Profile.SustainedClients),
-		"-T", "100000", // effectively forever; we kill on Stop
+		"-T", "100000", // effectively forever; the supervisor stops it
+		"-P", "10", // a progress sample every 10 s, on stderr
 		"--no-vacuum",
 		"-U", d.PGUser,
 	}
@@ -740,60 +947,137 @@ func (d *DockerCellRuntime) StartSustainedLoad(ctx context.Context) error {
 	args = append(args, d.PGDatabase)
 
 	bgCtx, cancel := context.WithCancel(context.Background())
-	full := append([]string{"exec", "-u", d.PGUser, d.Container}, args...)
-	cmd := exec.CommandContext(bgCtx, d.dockerBin(), full...)
-
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	if err := cmd.Start(); err != nil {
-		cancel()
-		return fmt.Errorf("sustained load: pgbench start: %w", err)
-	}
-
-	d.sustainedCmd = cmd
+	var stdout, stderr lockedBuffer
+	// A placeholder Cmd marks the writer as requested-and-running for
+	// SustainedWriterActive; the supervisor owns the real processes.
+	d.sustainedCmd = exec.CommandContext(bgCtx, d.dockerBin())
 	d.sustainedStdout = &stdout
 	d.sustainedStderr = &stderr
 	d.sustainedStartedAt = time.Now()
 	d.sustainedCancel = cancel
 	d.sustainedDone = make(chan struct{})
-	go func() {
-		_ = cmd.Wait()
-		close(d.sustainedDone)
-	}()
+	go d.superviseSustainedLoad(bgCtx, args, &stdout, &stderr)
 	return nil
 }
 
-// StopSustainedLoad terminates the pgbench writer started by
-// StartSustainedLoad and parses its final report into
-// LoadStats.  Returns nil/nil when no writer was running so
-// the orchestrator can call Stop unconditionally.
+// superviseSustainedLoad keeps pgbench running for the whole soak.
+//
+// A fault that kills PostgreSQL drops all of pgbench's connections and
+// pgbench exits. Unsupervised, that ended the write load for the rest of
+// the cell's run — typically minutes into an 8 h soak — while the report
+// kept showing "Writer ✓". The first enterprise_heavy soak therefore
+// passed without backups having run under sustained writes for most of
+// it. This is the same defect v1.4 found in the WAL-stream sidecar, and
+// the same fix: restart on exit, count the restarts.
+func (d *DockerCellRuntime) superviseSustainedLoad(ctx context.Context, args []string, stdout, stderr *lockedBuffer) {
+	defer close(d.sustainedDone)
+	first := true
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		if !first {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(sustainedRestartDelay):
+			}
+			d.sustainedMu.Lock()
+			d.sustainedRestarts++
+			d.sustainedMu.Unlock()
+		}
+		first = false
+		full := append([]string{"exec", "-u", d.PGUser, d.Container}, args...)
+		cmd := exec.CommandContext(ctx, d.dockerBin(), full...)
+		cmd.Stdout = stdout
+		cmd.Stderr = stderr
+		// Once ctx kills the docker client, stop waiting for an output
+		// pipe something else still holds open, so the supervisor exits.
+		cmd.WaitDelay = sidecarWaitDelay
+		if err := cmd.Start(); err != nil {
+			continue // container likely down mid-fault; retry after the delay
+		}
+		_ = cmd.Wait()
+	}
+}
+
+// sustainedRestartDelay spaces pgbench restarts while PostgreSQL is
+// recovering, so a long recovery does not become a tight loop.
+var sustainedRestartDelay = 5 * time.Second
+
+// sustainedStopTimeout bounds how long StopSustainedLoad waits for the
+// supervisor to exit before it reports anyway, so a wedged docker
+// cannot block teardown. A var so tests can shrink it.
+var sustainedStopTimeout = 10 * time.Second
+
+// sidecarWaitDelay is exec.Cmd.WaitDelay for the supervised sidecars.
+const sidecarWaitDelay = 2 * time.Second
+
+// lockedBuffer is a bytes.Buffer safe for exec's output-copier goroutine
+// to write while another goroutine reads it. The sidecar buffers need
+// it: StopSustainedLoad reads the progress stream after at most
+// sustainedStopTimeout even when the supervisor has not exited, and at
+// that point exec may still be copying into the buffer — a plain
+// bytes.Buffer there was a data race.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// SustainedWriterActive reports whether a writer is actually
+// running. The zero-SustainedClients path leaves sustainedCmd nil,
+// which is the same state as "never asked for one" — and that is
+// precisely the distinction the orchestrator needs before it
+// announces a writer to the event stream.
+func (d *DockerCellRuntime) SustainedWriterActive() bool { return d.sustainedCmd != nil }
+
+// StopSustainedLoad stops the supervised writer and reports what it
+// actually did over its whole window.
 func (d *DockerCellRuntime) StopSustainedLoad(ctx context.Context) (*report.LoadStats, error) {
 	if d.sustainedCmd == nil {
 		return nil, nil
 	}
-	// Cancel triggers SIGKILL on the docker-exec process,
-	// which (because docker exec proxies signals) terminates
-	// pgbench inside the container.  pgbench prints its
-	// summary on TERM as well as on natural exit, so we
-	// expect numbers in stdout regardless.
+	window := time.Since(d.sustainedStartedAt)
 	d.sustainedCancel()
 	select {
 	case <-d.sustainedDone:
-	case <-time.After(5 * time.Second):
-		// pgbench should react within a second; longer means
-		// docker is wedged.  Don't block teardown.
+	case <-time.After(sustainedStopTimeout):
+		// docker wedged; do not block teardown
 	}
 
-	stats := &report.LoadStats{SustainedWriterRan: true}
-	if d.sustainedStdout != nil {
-		tps, p95 := parsePgbenchSummary(d.sustainedStdout.String())
-		stats.TPSAvg = tps
-		stats.LatencyP95Ms = p95
+	d.sustainedMu.Lock()
+	restarts := d.sustainedRestarts
+	progress := ""
+	if d.sustainedStderr != nil {
+		progress = d.sustainedStderr.String()
 	}
-	// WAL bytes written during the writer's lifetime.
-	if post := d.samplePGStatWAL(ctx); post > 0 && d.walPreCount >= 0 {
-		stats.WALBytesWritten = post - d.walPreCount
+	d.sustainedMu.Unlock()
+
+	stats := &report.LoadStats{SustainedWriterRan: true, SustainedWriterRestarts: restarts}
+	tps, p95, samples := parsePgbenchProgress(progress)
+	stats.TPSAvg = tps
+	stats.LatencyP95Ms = p95
+	if window > 0 {
+		up := float64(samples) * 10 / window.Seconds() * 100
+		if up > 100 {
+			up = 100
+		}
+		stats.SustainedWriterUptimePct = up
+	}
+	if post := d.currentWALLSN(ctx); post != "" && d.walPreLSN != "" {
+		stats.WALBytesWritten = d.walLSNDiff(ctx, post, d.walPreLSN)
 	}
 
 	d.sustainedCmd = nil
@@ -802,6 +1086,31 @@ func (d *DockerCellRuntime) StopSustainedLoad(ctx context.Context) (*report.Load
 	d.sustainedCancel = nil
 	d.sustainedDone = nil
 	return stats, nil
+}
+
+// currentWALLSN reads pg_current_wal_lsn() through psql inside the
+// container, independent of the soak's own (fault-prone) connection.
+func (d *DockerCellRuntime) currentWALLSN(ctx context.Context) string {
+	if d.sustainedPGBin == "" {
+		return ""
+	}
+	out, err := d.dockerExecAs(ctx, d.PGUser, d.sustainedPGBin+"/psql", "-U", d.PGUser, "-d", d.PGDatabase,
+		"-Atc", "select pg_current_wal_lsn()")
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// walLSNDiff returns post - pre in bytes, computed by PostgreSQL.
+func (d *DockerCellRuntime) walLSNDiff(ctx context.Context, post, pre string) int64 {
+	out, err := d.dockerExecAs(ctx, d.PGUser, d.sustainedPGBin+"/psql", "-U", d.PGUser, "-d", d.PGDatabase,
+		"-Atc", fmt.Sprintf("select pg_wal_lsn_diff('%s', '%s')::bigint", post, pre))
+	if err != nil {
+		return 0
+	}
+	n, _ := strconv.ParseInt(strings.TrimSpace(string(out)), 10, 64)
+	return n
 }
 
 // StartWALStream runs `pg_hardstorage wal stream` inside the
@@ -830,7 +1139,7 @@ func (d *DockerCellRuntime) StartWALStream(ctx context.Context) error {
 		return errors.New("StartWALStream: already running")
 	}
 	d.walStreamRunning = true
-	var stdout, stderr bytes.Buffer
+	var stdout, stderr lockedBuffer
 	d.walStreamStdout = &stdout
 	d.walStreamStderr = &stderr
 	bgCtx, cancel := context.WithCancel(context.Background())
@@ -870,7 +1179,7 @@ const walStreamRestartDelay = 2 * time.Second
 // Restarts are counted rather than merely retried: a cell whose sidecar
 // had to be re-attached ten times is telling you something about the
 // fault schedule, and StopWALStream reports it.
-func (d *DockerCellRuntime) superviseWALStream(ctx context.Context, done chan struct{}, stdout, stderr *bytes.Buffer) {
+func (d *DockerCellRuntime) superviseWALStream(ctx context.Context, done chan struct{}, stdout, stderr *lockedBuffer) {
 	defer close(done)
 	first := true
 	for {
@@ -901,6 +1210,7 @@ func (d *DockerCellRuntime) superviseWALStream(ctx context.Context, done chan st
 		cmd := exec.CommandContext(ctx, d.dockerBin(), full...)
 		cmd.Stdout = stdout
 		cmd.Stderr = stderr
+		cmd.WaitDelay = sidecarWaitDelay
 		if err := cmd.Start(); err != nil {
 			// The container is probably down mid-fault. Loop and
 			// retry; the delay above bounds the spin.
@@ -1227,7 +1537,11 @@ func (d *DockerCellRuntime) dockerExec(ctx context.Context, argv ...string) ([]b
 // stable across PG / pgx versions.
 func isPGUnreachable(stdout, stderr []byte) bool {
 	combined := append(append([]byte{}, stdout...), stderr...)
-	if !bytesContains(combined, `"code": "storage.unreachable"`) &&
+	// pg.unreachable is the current code for a PG connect failure;
+	// storage.unreachable is what agents before v1.5 emitted for it.
+	if !bytesContains(combined, `"code": "pg.unreachable"`) &&
+		!bytesContains(combined, `"code":"pg.unreachable"`) &&
+		!bytesContains(combined, `"code": "storage.unreachable"`) &&
 		!bytesContains(combined, `"code":"storage.unreachable"`) {
 		return false
 	}
@@ -1279,6 +1593,51 @@ func (d *DockerCellRuntime) dockerExecCapture(ctx context.Context, argv ...strin
 	cmd.Stderr = &stderr
 	err := cmd.Run()
 	return stdout.Bytes(), stderr.Bytes(), err
+}
+
+// dockerExecAs runs argv in the cell container as user, returning
+// combined output. dockerExecCapture always uses pgbackup; the few
+// callers that must act as the PG superuser (seeding pgbench tables it
+// will own) go through here instead of attempting sudo from pgbackup,
+// which has no sudo rights on the testbed images.
+func (d *DockerCellRuntime) dockerExecAs(ctx context.Context, user string, argv ...string) ([]byte, error) {
+	full := append([]string{"exec", "-u", user, d.Container}, argv...)
+	return exec.CommandContext(ctx, d.dockerBin(), full...).CombinedOutput()
+}
+
+// pgRecoveryBudget bounds how long TakeBackup waits for PostgreSQL to
+// start accepting connections again after a fault, and
+// pgRecoveryMaxBackoff caps the gap between attempts. Vars so tests
+// can shrink them.
+//
+// The budget must be no shorter than the testbed's own allowance for PG
+// to start (entrypoint-pg.sh: PG_START_TIMEOUT, default 1800 s). It was
+// 3 minutes, and an enterprise_heavy cell whose crash recovery took
+// 4 min 17 s had its backup abandoned seven seconds before PostgreSQL
+// began accepting connections — while PG was explicitly answering
+// 57P03 "not yet accepting connections", i.e. recovering, not gone.
+// That scored a correct refusal as backup_failed and stopped the cell
+// for the rest of the run. A PG that never returns still fails, just
+// not before the container itself would have given up on it.
+var (
+	pgRecoveryBudget     = 30 * time.Minute
+	pgRecoveryMaxBackoff = 10 * time.Second
+)
+
+// containerStartedAt returns the container's State.StartedAt, or ""
+// when it cannot be read. It changes exactly when the container
+// (re)starts, which is what TakeBackup uses to tell "the testbed
+// restarted the cell under the backup" from a failed backup.
+func (d *DockerCellRuntime) containerStartedAt(ctx context.Context) string {
+	if d.Container == "" {
+		return ""
+	}
+	out, err := exec.CommandContext(ctx, d.dockerBin(), "inspect", "--format",
+		"{{.State.StartedAt}}", d.Container).Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
 }
 
 func (d *DockerCellRuntime) dockerBin() string {
@@ -1423,4 +1782,48 @@ func truncate(b []byte, n int) string {
 		return string(b)
 	}
 	return string(b[:n]) + "…"
+}
+
+// pgbenchProgressRe matches pgbench's -P progress line, e.g.
+//
+//	progress: 10.0 s, 523.4 tps, lat 30.512 ms stddev 12.101, 0 failed
+//
+// PG 15+ appends ", N failed"; older versions omit it. Only the tps and
+// latency fields are read.
+var pgbenchProgressRe = regexp.MustCompile(`progress: [0-9.]+ s, ([0-9.]+) tps, lat ([0-9.]+) ms`)
+
+// parsePgbenchProgress summarises every progress sample across all of
+// the supervised writer's runs: mean tps, the 95th percentile of the
+// 10-second average latencies, and the number of samples (each one is
+// 10 s during which the writer was demonstrably running).
+//
+// The progress stream is used instead of pgbench's end-of-run summary
+// because a supervised writer rarely ends normally: it is killed by a
+// fault or stopped by the soak, and neither prints the summary. Every
+// heavy-soak cell reported 0 tps for exactly that reason.
+func parsePgbenchProgress(s string) (tpsAvg, latP95 float64, samples int) {
+	var tpsSum float64
+	var lats []float64
+	for _, m := range pgbenchProgressRe.FindAllStringSubmatch(s, -1) {
+		tps, err1 := strconv.ParseFloat(m[1], 64)
+		lat, err2 := strconv.ParseFloat(m[2], 64)
+		if err1 != nil || err2 != nil {
+			continue
+		}
+		tpsSum += tps
+		lats = append(lats, lat)
+	}
+	samples = len(lats)
+	if samples == 0 {
+		return 0, 0, 0
+	}
+	sort.Float64s(lats)
+	idx := int(float64(samples)*0.95+0.5) - 1
+	if idx < 0 {
+		idx = 0
+	}
+	if idx >= samples {
+		idx = samples - 1
+	}
+	return tpsSum / float64(samples), lats[idx], samples
 }

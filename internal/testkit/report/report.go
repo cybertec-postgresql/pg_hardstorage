@@ -70,6 +70,10 @@ type CellReport struct {
 	// during BASE_BACKUP. Counted as a failure, it made the
 	// catalogue's own "0 backup_failed" criterion unsatisfiable for
 	// any fleet containing PG 18 and torn_page.
+	//
+	// It also counts restores refused because a repo-corruption fault
+	// this cell injected (into its own deployment's files) damaged the
+	// backup being verified — detection, likewise, not failure.
 	CorruptionDetected int `json:"corruption_detected,omitempty"`
 
 	// RecoveryFails counts faults that were applied but could NOT be
@@ -77,7 +81,13 @@ type CellReport struct {
 	// created for every iteration that follows. Deadline-aborted
 	// recoveries are excluded -- those are orchestrator teardown, not
 	// a cleanup failure.
-	RecoveryFails   int           `json:"recovery_fails"`
+	RecoveryFails int `json:"recovery_fails"`
+
+	// FaultApplyFails counts faults the injector failed to apply for a
+	// reason other than the skip classes (target down, kernel limit
+	// unreachable). Not a failure by itself — some catalogues expect an
+	// injector to refuse — but visible, so a run of them is noticed.
+	FaultApplyFails int           `json:"fault_apply_fails,omitempty"`
 	IterationsRun   int           `json:"iterations_run"`
 	LastIteration   int           `json:"last_iteration"`
 	UpFor           time.Duration `json:"up_for_nanos"`
@@ -157,6 +167,19 @@ type LoadStats struct {
 	// the disambiguator.
 	SustainedWriterRan bool `json:"sustained_writer_ran,omitempty"`
 
+	// SustainedWriterRestarts counts how often the supervisor had to
+	// restart pgbench. A fault that kills PostgreSQL drops every client
+	// connection and pgbench exits; before the writer was supervised,
+	// that ended the write load for the rest of the cell's run while the
+	// report still showed Writer ✓.
+	SustainedWriterRestarts int `json:"sustained_writer_restarts,omitempty"`
+
+	// SustainedWriterUptimePct is the share of the writer's wall-clock
+	// window in which it was actually producing transactions, measured
+	// from pgbench's 10-second progress samples. The number that says
+	// whether "backups ran under sustained write load" is true.
+	SustainedWriterUptimePct float64 `json:"sustained_writer_uptime_pct,omitempty"`
+
 	// WALStreamRan is the same flag for the wal-stream
 	// sidecar.
 	WALStreamRan bool `json:"wal_stream_ran,omitempty"`
@@ -188,6 +211,7 @@ type FaultStats struct {
 	TotalApplied  int            `json:"total_applied"`
 	ByPrefix      map[string]int `json:"by_prefix"`
 	RecoveryFails int            `json:"recovery_fails"`
+	ApplyFails    int            `json:"apply_fails,omitempty"`
 }
 
 // Failure carries one assertion-level failure surfaced during
@@ -303,7 +327,7 @@ func (r *Report) WriteMarkdown(w io.Writer) error {
 			}
 			fmt.Fprintf(w, "| %s | %s | %s | %.0f | %.1f ms | %s | %s | %s | %s |\n",
 				c.Name,
-				boolMark(ls.SustainedWriterRan),
+				writerMark(ls),
 				boolMark(ls.WALStreamRan),
 				ls.TPSAvg, ls.LatencyP95Ms,
 				humanBytes(ls.WALBytesWritten),
@@ -317,6 +341,7 @@ func (r *Report) WriteMarkdown(w io.Writer) error {
 	fmt.Fprintln(w, "## Fault statistics")
 	fmt.Fprintf(w, "- Total faults applied: %d\n", r.FaultStats.TotalApplied)
 	fmt.Fprintf(w, "- Recovery failures: %d\n", r.FaultStats.RecoveryFails)
+	fmt.Fprintf(w, "- Apply failures: %d\n", r.FaultStats.ApplyFails)
 	if len(r.FaultStats.ByPrefix) > 0 {
 		fmt.Fprintln(w, "")
 		fmt.Fprintln(w, "| Fault | Count |")
@@ -420,4 +445,14 @@ func humanBytes(n int64) string {
 	}
 	unit := []string{"KiB", "MiB", "GiB", "TiB", "PiB"}[exp]
 	return fmt.Sprintf("%.2f %s", float64(n)/float64(div), unit)
+}
+
+// writerMark renders the Writer column: whether it ran, and — when it
+// did — how much of the window it was actually writing and how often it
+// had to be restarted. A bare ✓ hid a writer that died minutes in.
+func writerMark(ls *LoadStats) string {
+	if !ls.SustainedWriterRan {
+		return boolMark(false)
+	}
+	return fmt.Sprintf("✓ %.0f%% up, %d restarts", ls.SustainedWriterUptimePct, ls.SustainedWriterRestarts)
 }

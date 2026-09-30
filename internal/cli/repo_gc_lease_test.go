@@ -51,8 +51,13 @@ func TestRepoGC_RefusesWhileBackupLeaseLive(t *testing.T) {
 		t.Fatalf("gc --apply succeeded under a live backup lease:\n%s", stdout)
 	}
 	combined := stdout + stderr
-	if !strings.Contains(combined, "repo.gc.live_backup_lease") || !strings.Contains(combined, "db1") {
-		t.Errorf("want repo.gc.live_backup_lease naming db1; got:\n%s", combined)
+	if !strings.Contains(combined, "conflict.gc_backup_in_flight") || !strings.Contains(combined, "db1") {
+		t.Errorf("want conflict.gc_backup_in_flight naming db1; got:\n%s", combined)
+	}
+	// A lease conflict is exit 7 (retry-safe), as exit-codes.md documents
+	// for lease / in-progress conflicts — it used to be exit 1.
+	if exit != 7 {
+		t.Errorf("exit = %d, want 7 (conflict)", exit)
 	}
 
 	// Dry-run is read-only and must NOT be blocked by the lease.

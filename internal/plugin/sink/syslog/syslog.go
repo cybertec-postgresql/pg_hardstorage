@@ -43,11 +43,13 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/airgap"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/output"
 )
 
 func init() {
 	output.DefaultSinkRegistry.Register("syslog", NewFromSpec)
+	output.DefaultSinkRegistry.DeclareConfigKeys("syslog", "address", "app_name", "facility", "hostname", "protocol", "timeout", "tls")
 }
 
 // Facility encodes the syslog facility code (0..23).
@@ -135,6 +137,17 @@ func NewFromSpec(spec output.SinkSpec) (output.Sink, error) {
 	case "udp", "tcp", "tls":
 	default:
 		return nil, fmt.Errorf("syslog: unsupported protocol %q (allowed: udp, tcp, tls)", protocol)
+	}
+	// airgapped: strict covers every outbound path, not just HTTP.
+	// The scheme only tells the policy to classify by host — it has
+	// no "udp" scheme, and a bare host:port would parse as an unknown
+	// scheme and be refused even for a loopback collector.
+	scheme := "syslog"
+	if protocol == "tls" {
+		scheme = "syslog+tls"
+	}
+	if err := airgap.Default().EndpointAllowed(scheme + "://" + address); err != nil {
+		return nil, fmt.Errorf("syslog: %w", err)
 	}
 
 	facName, err := output.SinkConfigStringDefault(spec.Config, "facility", "local6")

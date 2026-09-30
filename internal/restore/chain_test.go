@@ -128,6 +128,7 @@ func newChainFixtureWithLeafGaps(t *testing.T, leafGaps []backup.WALGap) *chainF
 		WALGaps:          leafGaps,
 	}
 
+	plantArchivedWAL(t, sp, full.Deployment, full.Timeline)
 	store := backup.NewManifestStore(sp)
 	if err := store.Commit(context.Background(), full, signer, backup.CommitOptions{}); err != nil {
 		t.Fatalf("commit full: %v", err)

@@ -405,6 +405,13 @@ func (s *Store) Append(ctx context.Context, ev *Event) error {
 	if ev.ID == "" {
 		ev.ID = newEventID(ev.Timestamp)
 	}
+	// Every event names who did it. Several destructive commands never
+	// set Actor, and insider detection skips actor-less events, so
+	// exactly the ops it exists to watch went unseen. Filling it here,
+	// before hashing, covers every caller at once.
+	if strings.TrimSpace(ev.Actor) == "" {
+		ev.Actor = DefaultActor()
+	}
 
 	shard := shardKeyFor(ev)
 	prev, err := s.head(ctx, shard)

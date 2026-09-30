@@ -36,7 +36,7 @@ properties documented here.
 | `conflict.*` | 7 | Wait for the holder, or pick a fresh name. |
 | `verify.*`, `anomaly.*` | 9 | Investigate; do not retry blindly. |
 | `doctor.*` | 10 | Read the doctor body; address the issue. |
-| `storage.unreachable`, `kms.unreachable` (leaf) | 8 | Transient by nature; retry with backoff. |
+| `storage.unreachable`, `kms.unreachable`, `pg.unreachable`, `patroni.unreachable` (leaf) | 8 | Transient by nature; retry with backoff. The code names which dependency is down — route alerts on it. |
 | every other namespace | 1 | Generic; consult the leaf code and the suggestion. |
 
 `*output.Error.Suggestion` carries the human + command +
@@ -58,14 +58,22 @@ Common leaf shapes:
 | Leaf | Meaning |
 | --- | --- |
 | `usage.bad_flag`, `usage.bad_flags` | Flag value parse failed |
-| `usage.bad_arg`, `usage.bad_set` | Positional argument shape mismatch |
-| `usage.missing_*` | Required input absent (`missing_repo_url`, `missing_deployment`, `missing_signer`, `missing_target_dir`, …) |
+| `usage.flag` | Unknown flag (`unknown flag: --x`) — the commonest usage error |
+| `usage.bad_args`, `usage.bad_arg`, `usage.bad_set` | Wrong number or shape of positional arguments |
+| `usage.missing_*` | Required input absent (`missing_repo_url`, `missing_deployment`, `missing_signer`, `missing_target_dir`, `missing_trusted_key`, …) |
 | `usage.bad_lsn`, `usage.bad_target_lsn`, `usage.unaligned_lsn` | LSN parse / alignment refused |
 | `usage.bad_time`, `usage.bad_until`, `usage.bad_schedule` | Time / cron parse refused |
 | `usage.bad_token`, `usage.bad_key_file`, `usage.bad_approver_key` | Cryptographic input did not parse |
 | `usage.confirmation_required`, `usage.confirmation_mismatch` | Typed-keyring confirmation missing or wrong |
 | `usage.conflicting_flags`, `usage.conflicting_targets` | Mutually-exclusive flags both set |
+| `usage.unsupported_flag` | A flag the chosen mode cannot honour, refused instead of silently dropped — e.g. `restore --control-plane` with `--preview` (there is no remote preview; it would run a real restore), `--require-threshold-attestation`, `--verify-restore`, `--kms-config` or `--chain-staging-root` |
+| `usage.bad_tablespace_mapping` | A `--tablespace-mapping` / API `tablespace_mapping` entry is malformed, not normalised, or (control plane) outside `restore_roots` |
+| `usage.threshold_below_policy` | `approval request --threshold` is below the operator minimum (`PG_HARDSTORAGE_APPROVAL_MIN_THRESHOLD`, default 2) |
 | `usage.unknown_output_format`, `usage.unknown_policy`, `usage.unknown_scheme`, `usage.unknown_shell` | Enum-shaped value out of set |
+| `usage.interactive_needs_text` | Interactive `init` wizard under a structured `--output`; pass `--yes` with the answers as flags, or use `-o text` |
+| `usage.follow_needs_stream` | `logs --follow` with a format that promises one finished document (use `-o ndjson` or `-o text`) |
+| `usage.bad_slot` | `logical add`: the slot name (`--slot`, or the default derived from the stream name) is not a valid replication slot name |
+| `usage.unknown_deployment`, `usage.unknown_tenant` | A `--deployment` / `--tenant` filter names nothing in the repo — refused rather than reporting a vacuous clean result (`dsa locate --allow-unknown-tenant` certifies a tenant that holds no backups) |
 
 **Recovery:** read the suggestion, fix the command line,
 re-run.
@@ -79,6 +87,7 @@ re-run.
 | `auth.denied` | RBAC refused the operation |
 | `auth.key_mismatch` | Operator key does not match the configured roster |
 | `auth.approver_not_allowed` | Approver in an n-of-m flow is not on the roster |
+| `auth.approver_untrusted` | `approval request` named an approver key that is not on the operator's trusted approver roster (`PG_HARDSTORAGE_APPROVAL_ROSTER`) |
 | `auth.approval_op_mismatch`, `auth.approval_target_mismatch` | Approval token bound to a different op or subject |
 
 **Recovery:** rotate credentials, re-run with the right
@@ -101,7 +110,10 @@ is fixed.
 | `preflight.pg_version_mismatch` | Target PG version does not match the backup's |
 | `preflight.pg_combinebackup_missing`, `preflight.pg_tools_missing` | Required PG client tools not on `$PATH` |
 | `preflight.checkpoint_check_failed` | Source PG refused to issue a checkpoint |
+| `preflight.backup_wal_missing` | Restore refused: the backup embeds no WAL and the repository holds none on its timeline, so it could never become consistent (recovery would wait forever). Take a new backup with `--include-wal` or with `wal stream` running; `--skip-gap-check` overrides |
+| `preflight.pg_role_missing` | `partial dump`: the role it connects to the sandbox as (default `postgres`) does not exist in the backed-up cluster; pass `--pg-user`. The temporary sandbox is removed |
 | `preflight.chain_target_not_empty` | Replicate-by-chain target already has content |
+| `preflight.system_identifier_changed`, `preflight.wal_segment_size`, `preflight.wal_segment_size_changed` | `wal stream` / `wal push`: the cluster reached is not the one the deployment's WAL was archived from (different `system_identifier`), reports an impossible `wal_segment_size`, or has a different segment size than the archive. `wal stream` checks on every reconnect attempt, not only at startup, and stops rather than retrying |
 
 **Recovery:** read the body, fix the condition (free disk,
 upgrade PG client tools, clear the target dir, …), retry.
@@ -112,7 +124,7 @@ upgrade PG client tools, clear the target dir, …), retry.
 
 | Leaf | Meaning |
 | --- | --- |
-| `aborted.context_cancelled` | `ctx.Done()` fired (SIGINT, request deadline) |
+| `aborted.context_cancelled` | `ctx.Done()` fired (SIGINT, request deadline). For `backup`/`restore --control-plane`, the dispatched job is cancelled on the control plane first; the message says so, or names the job if the cancel could not be delivered |
 | `aborted.confirmation_required` | Interactive confirmation refused at the prompt |
 | `aborted.backup_cancelled`, `aborted.restore_cancelled`, `aborted.verify_cancelled` | Operator cancelled a long-running op |
 | `aborted.attestation_valid`, `aborted.primary_intact` | Safety belt fired (e.g. `restore` against a still-healthy primary) |
@@ -128,6 +140,7 @@ upgrade PG client tools, clear the target dir, …), retry.
 | `notfound.backup`, `notfound.backup_before_time`, `notfound.backup_tombstoned` | Backup ID / time-pin / liveness mismatch |
 | `notfound.deployment`, `notfound.repo`, `notfound.sink` | Configuration entity missing |
 | `notfound.wal_segment`, `notfound.wal_segment_name` | WAL not present in the repo |
+| `notfound.signing_key` | The keyring holds no signing keypair. Read-only and maintenance verbs (list, show, status, doctor, kms verify/rotate, rotate, backup delete) never create one — point `PG_HARDSTORAGE_KEYRING_DIR` at the keyring that signed the repo; only `init` / `backup` mint a keypair |
 | `notfound.session`, `notfound.token`, `notfound.skill`, `notfound.skill_snapshot` | LLM session / skill state |
 | `notfound.replica_manifest`, `notfound.attestation` | Manifest / attestation absent |
 
@@ -141,9 +154,13 @@ actually there.
 | Leaf | Meaning |
 | --- | --- |
 | `conflict.repo_exists`, `conflict.deployment_exists`, `conflict.sink_exists`, `conflict.standby_exists`, `conflict.timetravel_exists`, `conflict.roster_exists` | Resource with that name is already configured |
-| `conflict.repo_read_only` | Repo is in read-only mode (legal hold, scheduled retire) |
+| `conflict.repo_read_only` | Repo is in read-only mode (legal hold, scheduled retire). Every mutating command refuses, including `repair attestation`, `repair manifest`, `repair chunks --apply`, `repair scrub --heal`, `repo wipe` and `repo bundle import`. |
 | `conflict.manifest_held`, `conflict.chain_has_held_links` | Backup or one of its parents is on legal hold |
-| `conflict.chain_has_live_descendants` | Refused to delete; descendants would orphan |
+| `conflict.chain_has_live_descendants` | Refused to delete; descendants would orphan (also raised by `rotate --apply` when an incremental lands mid-rotation) |
+| `conflict.backup_lease_lost` | A running backup was aborted because another process took over the deployment's backup lease (stall longer than the lease TTL, clock jump, overlapping scheduler) |
+| `conflict.hold_exists` | `hold add` would weaken an active hold (earlier or finite expiry on an indefinite hold, different holder); `--force` replaces it and audits `hold.replace` |
+| `conflict.gc_backup_in_flight` | `repo gc --apply` / `repair chunks --orphans --apply` refused to start — or stopped between delete batches — because a backup holds a live lease (it may have deduplicated against chunks the sweep would delete). Retry-safe once the backup finishes; replaces `repo.gc.live_backup_lease` (which exited 1). |
+| `conflict.legal_hold` | `repo wipe` refused: at least one backup is under an active legal hold (an unreadable hold marker counts as active). Release the holds, or pass `--override-legal-holds` with an approved n-of-m request — never with `--force` — and the held backups are named in the pre-wipe audit event. |
 | `conflict.checkpoint_mismatch`, `conflict.chunks_missing`, `conflict.no_live_manifests` | Repo state would be inconsistent |
 | `conflict.approval_pending`, `conflict.already_signed`, `conflict.already_revoked` | Approval-flow state machine refused |
 | `conflict.too_many_connections` | PG refused another replication / regular connection |
@@ -162,15 +179,22 @@ treat any `verify.*` exit as an alert.
 | --- | --- |
 | `verify.checksum_mismatch`, `verify.chunk_size_mismatch`, `verify.short_assembly`, `verify.scrub_mismatch` | CAS chunk corruption |
 | `verify.missing_chunks` | Manifest references a chunk not present in the repo |
+| `verify.scrub_unverifiable_manifests` | `repo scrub` / `repair scrub`: manifests that would not verify or parse were skipped, so their chunks are unscrubbed (possible tampering, not bit rot). Both commands exit 9 on it, `--heal` included. |
+| `verify.scrub_key_unavailable` | `repo scrub` / `repair scrub`: encrypted manifests (backup or WAL segment) whose DEK this host cannot resolve (keyring/KEK/KMS access) were skipped. A key-access gap, never reported as a mismatch or healed; exit 9. |
 | `verify.manifest_signature`, `verify.replica_signature`, `verify.dsa_signature`, `verify.integrity_signature` | Signature verification failed |
 | `verify.attestation_invalid`, `verify.attestation_quorum`, `verify.attestation_roster`, `verify.attestation_subject` | Attestation refused |
+| `verify.attestation_untrusted_key` | `repair attestation` refused to re-sign: the manifest is signed by a key that is neither the current keyring key nor a trusted retired operator key (`<keyring>/trusted-keys/*.pem`, `--trusted-key`). A manifest's embedded key is part of the manifest, so a valid self-signature proves nothing about who signed it. |
 | `verify.kek_mismatch`, `verify.kek_resolve_failed`, `verify.bad_wrapped_dek` | KEK / DEK decrypt failed |
+| `auth.kms_access_denied` | The cloud KMS refused the credentials in use (restore / verify) — fix the IAM / key / vault policy; the key itself was not found to be wrong (exit 3) |
 | `verify.envelope_break` | Envelope-encryption tag did not validate |
 | `verify.replica_inconsistent`, `verify.replica_identity_mismatch` | Cross-region replica disagrees with primary |
 | `verify.audit_anchor_mismatch`, `verify.audit_chain_broken` | Audit hash chain is broken |
+| `verify.bundle_invalid` | `audit verify-bundle`: signature, layout or chain check failed |
+| `verify.bundle_untrusted_signer` | `audit verify-bundle`: the bundle is internally consistent but signed by a key outside the trust set (this host's keyring key, or `--trusted-key` / `--trusted-fingerprint`) |
 | `verify.residency_violation` | Data-residency policy refused the action |
 | `verify.wal_gap_detected` | A Patroni-failover WAL gap covers the requested PITR window |
 | `verify.heal_incomplete`, `verify.integrity_issues`, `verify.insider_findings` | Resilience checks surfaced findings |
+| `verify.dsa_incomplete` | `dsa locate` could not read or verify some manifests: the report is signed and persisted with its unreadable count, but is not a complete answer to the request |
 
 **Recovery:** never auto-retry.  Treat as a P1 incident;
 follow the relevant
@@ -209,19 +233,24 @@ field is where the recovery hint lives.
 
 | Namespace | Domain |
 | --- | --- |
-| `backup.*` | Backup pipeline (`backup.failed`, `backup.encrypt_no_kek`, `backup.kek_load_failed`, `backup.kms_open_failed`, `backup.compare.*`, `backup.delete.*`, `backup.undelete.*`) |
+| `backup.*` | Backup pipeline (`backup.failed`, `backup.encrypt_no_kek`, `backup.kek_load_failed`, `backup.kms_open_failed`, `backup.compare.*`, `backup.delete.*`, `backup.undelete.*`, `backup.parent_read_failed` — `--incremental-from` parent unreadable for a reason other than not-found / tombstoned / signature, which map to `notfound.backup`, `notfound.backup_tombstoned`, `verify.manifest_signature`) |
 | `keyring.*` | Keyring utilities (`keyring.install_failed`, `keyring.install_empty_source` — the initContainer copy refusing an empty or unreadable Secret mount) |
 | `restore.*` | Restore pipeline (`restore.failed`, `restore.kek_mismatch`, `restore.kek_resolve_failed`, `restore.target_in_wal_gap`, `restore.timeline_history_unreachable`, `restore.unknown_scheme`) |
-| `wal.*` | WAL streaming / fetch (`wal.slot_missing`, `wal.slot_ensure_failed`, `wal.slot_repair_failed`, `wal.fetch.*`, `wal.gap_purge_failed`, `wal.push_failed`, `wal.stream_error`) |
-| `repo.*` | Repo lifecycle, GC, scrub, replicate (`repo.open_failed`, `repo.gc.*`, `repo.scrub.*`, `repo.check.*`, `repo.replicate.*`, `repo.wal_prune.failed`, `repo.wipe.partial`) |
+| `wal.*` | WAL streaming / fetch (`wal.slot_missing`, `wal.slot_ensure_failed`, `wal.slot_repair_failed`, `wal.fetch.*`, `wal.gap_purge_failed`, `wal.push_failed`, `wal.stream_error`, `wal.system_identifier_changed` — the DSN reached a different cluster than this `wal stream` process started on (permanent), `wal.segment_size_probe_failed` — `wal_segment_size` could not be read on a connected cluster; retried, never assumed) |
+| `repo.*` | Repo lifecycle, GC, scrub, replicate (`repo.open_failed`, `repo.gc.*`, `repo.scrub.*`, `repo.check.*`, `repo.replicate.*`, `repo.wal_prune.failed`, `repo.wal_prune.incomplete` — `wal prune` finished but `segments_failed > 0`; the result body lists each failure, re-run once fixed, `repo.wipe.partial`) |
+| `repo.check.manifests_unreadable` | `repo check` could not READ some manifests (storage errors such as an S3 500): the check is incomplete (exit 1, body still emitted, `healthy: false`). Distinct from `verify.signature_failures` (exit 9), which is reserved for manifest bytes that were read and failed Ed25519 verification or parsing. |
 | `repo.replicate.incomplete` | `repo replicate` finished but the destination is NOT a complete replica (some manifests/chunks failed or are missing). Non-zero exit so `replicate && rm source` can't trust a partial DR copy — re-run until it exits 0, then `repo replicate verify`. |
 | `repair.*` | Manifest / attestation / chunk repair |
 | `manifest.*` | Manifest parse / validation at restore-plan time (`manifest.invalid`) |
 | `kms.*` | KMS rotate / shred / verify (`kms.rotate_failed`, `kms.shred_failed`, `kms.verify_failed`); `kms.unreachable` is the only leaf that maps to exit 8 |
+| `backup.archive_lag` | BASE_BACKUP streamed, but `pg_backup_stop` kept waiting for WAL archiving until the stream went silent (PostgreSQL's "still waiting for all required WAL segments to be archived" warnings widen the inactivity window, so this fires only on a real stall). Exit 1. Fix `archive_command` (see `pg_stat_archiver`) and retry. |
+| `backup.io_starved` | `backup --stall-timeout`: no progress (no stream frame and no event) within the timeout — the backup was aborted. Exit 1. Check host disk/network saturation or raise the timeout. |
+| `kms.rotate_incomplete` | `kms rotate --apply` finished but some manifest, replica copy or WAL segment manifest still holds the old KEK (`failed`, `replica_failures` or `wal_failed` > 0). Exit 1. Do NOT retire the old KEK; re-run until it exits 0. |
+| `kms.rotate_plan_failed` | `kms rotate` dry-run whose plan already contains failures (`failed` or `wal_failed` > 0) — `--apply` could not complete. Exit 1. |
 | `chain.*` | Backup-chain integrity (`chain.cycle`, `chain.too_deep`, `chain.no_full_anchor`, `chain.broken_tombstoned`, `chain.degenerate`, `chain.missing_pg_manifest`) |
 | `splitbrain.*` | WAL archive collision: another writer already archived this segment (`splitbrain.content_mismatch` — same cluster, different bytes; `splitbrain.system_identifier_mismatch` — a different cluster, typically a cloned datadir without `pg_resetwal`; `splitbrain.read_failed` — the existing manifest is present but unreadable, refused on doubt). Exit 1. Raised by `wal push` and the streaming sink; see [R7](runbooks/R7-patroni-split-brain.md). |
 | `audit.*` | Audit log (`audit.append_failed`, `audit.anchor_failed`, `audit.verify_failed`, `audit.search_failed`, `audit.export_bundle_failed`, `audit.summary_failed`) |
-| `approval.*` | n-of-m approval flow |
+| `approval.*` | n-of-m approval flow (`approval.gate_failed` — the gate refused for a reason other than pending/expired/revoked/op-or-target mismatch: votes not from the trusted roster or below the configured minimum, no roster configured, or the approval was already redeemed — approvals are single-use) |
 | `threshold.*` | Threshold-signing (FROST) ceremony |
 | `dsa.*` | Detached signing authority |
 | `roster.*` (under `notfound`/`conflict`) | Operator roster |
@@ -233,9 +262,11 @@ field is where the recovery hint lives.
 | `demo.*` | `pg_hardstorage demo` sandbox bring-up (`demo.docker_unavailable`, `demo.pg_not_ready`, `demo.port_failed`, `demo.start_failed`, `demo.step_failed`) |
 | `redact.*` | Logical redaction passes |
 | `partial.*` | Partial / table-level restore |
+| `partial.incremental_unsupported` | `partial restore` of an incremental backup: its relations' main forks are stored as `INCREMENTAL.<relfilenode>` and only exist combined with the chain. Extract from a full backup, or use `partial dump` (which restores the whole chain). Exit 1 |
+| `partial.restore_incomplete` | `partial restore` extracted nothing for at least one requested table: not found (catalog or `--relfilenode-map`), or absent from this backup (no main fork). The result body is printed first and lists both; exit 1 |
 | `combine.*` | `pg_combinebackup` orchestration |
-| `paths.*`, `init.*`, `config.*` | Bootstrap (`config.invalid`, `config.load_failed`, `config.kek_ref_unknown_scheme`) |
-| `compliance.*`, `integrity.*`, `insider.*` | Compliance / integrity scanning |
+| `paths.*`, `init.*`, `config.*` | Bootstrap (`config.invalid`, `config.load_failed` — also an explicit `-c` file that does not exist; `config.kek_ref_unknown_scheme`; `config.defined_elsewhere` — an edit targets a deployment/sink defined in a `conf.d` drop-in or `PG_HARDSTORAGE_CONFIG`; `config.approval_roster_missing` — no trusted approver roster configured; `config.approval_policy_invalid` — unreadable roster or malformed `PG_HARDSTORAGE_APPROVAL_MIN_THRESHOLD`) |
+| `compliance.*`, `integrity.*`, `insider.*` | Compliance / integrity scanning. `integrity.run_incomplete` (exit 1): `integrity run` could not complete — deployments could not be listed, or chunk presence checks failed for a reason other than not-found (throttling, permissions). The run is still signed and stored with `status: error`, so the gap is on record; it is never reported as a clean pass. Real findings stay `verify.integrity_issues` (exit 9). |
 | `llm.*` | LLM provider, skill loading, MCP server |
 | `history.*` | Restore-history slice |
 | `hold.*`, `rotate.*`, `jit.*` | Legal hold, KMS rotation, JIT credentials |
@@ -247,6 +278,7 @@ field is where the recovery hint lives.
 | `standby.*`, `timetravel.*`, `timetable.*` | Standby / timetravel features |
 | `gameday.*` | Disaster drills |
 | `source_corruption.*` | **The database being backed up is damaged** — not pg_hardstorage, and not the repository. Raised when PostgreSQL itself refuses to hand over the data: `source_corruption.data_checksum` (SQLSTATE XX001, a data page failed its checksum during `BASE_BACKUP`) and `source_corruption.index` (XX002). Exit 1. Do NOT retry the backup: treat it as a data-loss incident on the primary, and keep the backups already in the repository (verify one). PostgreSQL 18 verifies page checksums during `BASE_BACKUP`; 15–17 do not, so an older major may have been copying a damaged page silently. |
+| `backup.wal_recycled` | PostgreSQL recycled WAL the backup still needed before `BASE_BACKUP` could send it ("requested WAL segment … has already been removed"). A sizing condition on a busy source — **not** data damage and not a pg_hardstorage fault. Exit 1. The partial backup is not committed; retrying is safe. pg_hardstorage pins the backup's WAL with a temporary replication slot, so this now occurs only when no slot could be created (see the `backup.wal_slot_unavailable` warning: free a slot or raise `max_replication_slots`); otherwise raise `wal_keep_size`. A running `wal stream` does **not** prevent it: its slot holds only WAL the streamer has not consumed. Previously reported as `internal`. |
 | `notimpl.*` | Scaffolded command that is not implemented yet (`notimpl.<command>`, e.g. `notimpl.compact`). Always exit 1; the suggestion points at the design spec. |
 | `internal` | Catch-all for unstructured errors funnelled through `output.ToError` |
 

@@ -13,9 +13,7 @@ import (
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/approval"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/audit"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup"
-	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup/keystore"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/output"
-	"github.com/cybertec-postgresql/pg_hardstorage/internal/paths"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
 )
 
@@ -128,14 +126,11 @@ func runBackupDelete(cmd *cobra.Command, deployment, backupID, repoURL, reason, 
 	// `backup` and `restore`. A signature-broken manifest can still
 	// be deleted, but only via an explicit `repair` workflow; the
 	// happy path requires verification matches the local trust root.
-	p, err := paths.Resolve(paths.DefaultOptions())
+	// Load-only: this verb must never mint a keypair (see
+	// loadExistingKeypair).
+	_, verifier, err := loadExistingKeypair("backup delete")
 	if err != nil {
-		return output.NewError("internal", err.Error()).Wrap(err)
-	}
-	_, verifier, err := keystore.LoadOrGenerate(p.Keyring.Value)
-	if err != nil {
-		return output.NewError("internal",
-			fmt.Sprintf("backup delete: load keyring: %v", err)).Wrap(err)
+		return err
 	}
 	store := backup.NewManifestStore(sp)
 	m, err := store.Read(cmd.Context(), deployment, backupID, verifier)

@@ -94,7 +94,7 @@ pg_hardstorage show <deployment> <backup-id>
 
 # Verify on the spot
 pg_hardstorage verify <deployment> latest --repo <url>
-pg_hardstorage repair scrub <repo-url>
+pg_hardstorage repair scrub --repo <repo-url>
 
 # Audit chain integrity
 pg_hardstorage audit verify-chain --repo <url>

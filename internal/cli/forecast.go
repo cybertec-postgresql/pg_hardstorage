@@ -46,11 +46,15 @@ func newForecastCmd() *cobra.Command {
 		Use:   "forecast <url>",
 		Short: "Capacity-planning + cost-projection report",
 		Long: `forecast walks the repository's manifest history, fits an
-ordinary-least-squares linear regression to the per-day
-cumulative-bytes series for each deployment, and projects forward
-to the configured horizons (defaults: 30d / 90d / 365d).  The
-report includes per-deployment forecasts, a fleet-wide rollup, an
-optional cost projection, and growth-anomaly detection.
+ordinary-least-squares linear regression of each deployment's
+full-backup logical size (its database size) against time, and
+projects forward to the configured horizons (defaults: 30d / 90d /
+365d).  Incremental backups count toward manifests/day but not the
+size fit (their size is a delta).  Projected bytes are the size of
+ONE full backup, not the repository footprint (retained backups x
+size, less dedup + compression).  The report includes
+per-deployment forecasts, a fleet-wide rollup, an optional cost
+projection, and growth-anomaly detection.
 
 Window:
   --baseline-window DURATION  default 90d.  Backups stopped before

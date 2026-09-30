@@ -782,6 +782,13 @@ func mapToSchemaSummary(in map[string]int) []SchemaSummary {
 // the main walk readable.
 type latestTracker struct {
 	best *backup.Manifest
+	// bestHasReplica records whether the newest manifest has a
+	// manifests/_replicas/<id>.manifest.json companion. observe used to
+	// ignore the replica index it was handed, so has_replica_copy was
+	// false for every deployment — telling an operator their newest
+	// backup had no redundant manifest copy when it did (and, worse,
+	// making "false" meaningless when it was true).
+	bestHasReplica bool
 }
 
 func newLatestTracker() *latestTracker { return &latestTracker{} }
@@ -789,6 +796,7 @@ func newLatestTracker() *latestTracker { return &latestTracker{} }
 func (l *latestTracker) observe(m *backup.Manifest, replicaIndex map[string]struct{}) {
 	if l.best == nil || m.StoppedAt.After(l.best.StoppedAt) {
 		l.best = m
+		_, l.bestHasReplica = replicaIndex[m.BackupID]
 	}
 }
 
@@ -797,12 +805,13 @@ func (l *latestTracker) snapshot() *LatestBackupSummary {
 		return nil
 	}
 	out := &LatestBackupSummary{
-		BackupID:    l.best.BackupID,
-		StoppedAt:   l.best.StoppedAt,
-		Type:        string(l.best.Type),
-		PGVersion:   l.best.PGVersion,
-		Timeline:    l.best.Timeline,
-		WALGapCount: len(l.best.WALGaps),
+		BackupID:       l.best.BackupID,
+		StoppedAt:      l.best.StoppedAt,
+		Type:           string(l.best.Type),
+		PGVersion:      l.best.PGVersion,
+		Timeline:       l.best.Timeline,
+		WALGapCount:    len(l.best.WALGaps),
+		HasReplicaCopy: l.bestHasReplica,
 	}
 	if l.best.Encryption != nil {
 		out.Encrypted = true

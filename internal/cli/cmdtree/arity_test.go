@@ -312,9 +312,11 @@ func TestValidate_HelpFlagAlwaysValid(t *testing.T) {
 	if ve, ok := err.(*cmdtree.ValidationError); !ok || ve.Kind != "unknown_command" {
 		t.Errorf("bogus --help should still be unknown_command, got: %v", err)
 	}
-	// Without --help, the missing required flag is still caught.
-	if err := cmdtree.Validate(tree, "pg_hardstorage verify db1", "pg_hardstorage"); err == nil {
-		t.Error("verify db1 (no --help) should still report missing --repo")
+	// Without --help, a command that names no deployment — so nothing
+	// can back-fill --repo — is still caught. (`verify db1` is complete:
+	// --repo comes from db1's config; see DeploymentBackfilledFlags.)
+	if err := cmdtree.Validate(tree, "pg_hardstorage verify", "pg_hardstorage"); err == nil {
+		t.Error("verify with no deployment and no --repo (no --help) should still be rejected")
 	}
 }
 
@@ -404,11 +406,14 @@ func TestValidate_CommandSubstitutionIsOpaque(t *testing.T) {
 			t.Errorf("%q should be valid (substitution is opaque), got: %v", c, err)
 		}
 	}
-	// A genuinely-absent --repo (none after the substitution) is still caught.
-	err := cmdtree.Validate(tree, `pg_hardstorage verify mydb $(pg_hardstorage list mydb -o json | jq -r .id)`, "pg_hardstorage")
-	if ve, ok := err.(*cmdtree.ValidationError); !ok || ve.Kind != "missing_required" {
-		t.Errorf("missing --repo (none outside the substitution) should still be caught, got: %v", err)
+	// Without --repo it is ALSO valid: mydb is a named deployment, so
+	// --repo is back-filled from its config. The point of this case is
+	// that the substitution's own `-o` / `|` do not leak into the outer
+	// parse — which would surface here as unknown_flag or arg_count.
+	if err := cmdtree.Validate(tree, `pg_hardstorage verify mydb $(pg_hardstorage list mydb -o json | jq -r .id)`, "pg_hardstorage"); err != nil {
+		t.Errorf("substitution must stay opaque and --repo is back-filled from mydb, got: %v", err)
 	}
+	var err error
 	// An unknown OUTER command is still caught even with a substitution arg.
 	err = cmdtree.Validate(tree, `pg_hardstorage bogus $(echo x) --repo r`, "pg_hardstorage")
 	if ve, ok := err.(*cmdtree.ValidationError); !ok || ve.Kind != "unknown_command" {
@@ -443,11 +448,13 @@ func TestValidate_UnterminatedQuoteAfterPipe(t *testing.T) {
 			t.Errorf("%q valid pre-pipe should pass (tail discarded), got: %v", c, err)
 		}
 	}
-	// The pre-pipe part's OWN problem (missing --repo) is still reported —
-	// and as that, not a generic "parse" error.
-	err := cmdtree.Validate(tree, `pg_hardstorage status --output json | jq -r '`, "pg_hardstorage")
-	if ve, ok := err.(*cmdtree.ValidationError); !ok || ve.Kind != "missing_required" {
-		t.Errorf("status (missing --repo) before the pipe should be missing_required, got: %v", err)
+	// The pre-pipe part's OWN problem is still reported — and as that,
+	// not a generic "parse" error. (Bare `status` without --repo is no
+	// longer such a problem: the CLI fills --repo from the sole
+	// configured repo, so this uses an invented flag instead.)
+	err := cmdtree.Validate(tree, `pg_hardstorage status --bogus-flag | jq -r '`, "pg_hardstorage")
+	if ve, ok := err.(*cmdtree.ValidationError); !ok || ve.Kind != "unknown_flag" {
+		t.Errorf("an unknown flag before the pipe should be unknown_flag, got: %v", err)
 	}
 }
 

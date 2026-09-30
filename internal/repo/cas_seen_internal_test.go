@@ -37,7 +37,7 @@ func TestCAS_MarkSeenBounded(t *testing.T) {
 
 	const inserts = 10_000
 	for i := 0; i < inserts; i++ {
-		c.markSeen(hashOfInt(i))
+		c.markSeen(hashOfInt(i), seenEntry{})
 	}
 	if n := seenLen(c); n > cap {
 		t.Fatalf("seen cache holds %d entries after %d distinct inserts; must stay <= cap %d (it is cleared on overflow)", n, inserts, cap)
@@ -45,7 +45,7 @@ func TestCAS_MarkSeenBounded(t *testing.T) {
 
 	// unmarkSeen keeps the count in step so the bound keeps working.
 	h := hashOfInt(1_000_000)
-	c.markSeen(h)
+	c.markSeen(h, seenEntry{})
 	before := c.seenCount.Load()
 	c.unmarkSeen(h)
 	if got := c.seenCount.Load(); got != before-1 {
@@ -59,7 +59,7 @@ func TestCAS_MarkSeenUnboundedWhenDisabled(t *testing.T) {
 	c := &CAS{seenCap: 0}
 	const inserts = 5_000
 	for i := 0; i < inserts; i++ {
-		c.markSeen(hashOfInt(i))
+		c.markSeen(hashOfInt(i), seenEntry{})
 	}
 	if n := seenLen(c); n != inserts {
 		t.Fatalf("with the bound disabled the cache should hold all %d entries; got %d", inserts, n)

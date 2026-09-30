@@ -15,6 +15,7 @@ import (
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/kms"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/output"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/encryption"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/encryption/aesgcm"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
@@ -194,6 +195,26 @@ func Restore(ctx context.Context, opts RestoreOptions) (*RestoreResult, error) {
 		return res, fmt.Errorf("partial restore: read manifest: %w", err)
 	}
 
+	// 1b. Incremental backups cannot be extracted table-by-table.
+	// Their changed relations' main forks are stored as
+	// INCREMENTAL.<relfilenode> (only the blocks changed since the
+	// parent, meaningless without pg_combinebackup over the whole
+	// chain), while the _fsm/_vm forks keep their plain names — so the
+	// family walk below would "extract" a table as its two map forks
+	// and nothing else. Refuse up front with the way out.
+	if m.Type == backup.BackupTypeIncremental {
+		finish()
+		return res, output.NewError("partial.incremental_unsupported",
+			fmt.Sprintf("partial restore: backup %s is incremental; its relation data only exists "+
+				"combined with its chain (parent %s), so single tables cannot be extracted from it",
+				m.BackupID, m.ParentBackupID)).
+			WithSuggestion(&output.Suggestion{
+				Human: "extract from the chain's full backup (or another full backup), or use " +
+					"`pg_hardstorage partial dump`, which restores the whole chain through " +
+					"pg_combinebackup into a sandbox and dumps the tables from it.",
+			})
+	}
+
 	// 2. Build the CAS (encryption-aware if needed).
 	cas, err := buildCAS(ctx, sp, m, opts.KEKForRef, opts.UnwrapDEK)
 	if err != nil {
@@ -244,9 +265,10 @@ func Restore(ctx context.Context, opts RestoreOptions) (*RestoreResult, error) {
 		mapping.HeapBytes = heapBytes
 		res.FilesWritten += len(heapWritten)
 		res.BytesWritten += heapBytes
-		if len(heapWritten) == 0 {
-			// Resolved to a relfilenode, but this backup has no file
-			// under it. Say so — see RestoreResult.NotInBackup.
+		if !hasMainFork(heapWritten, rfn.Path) {
+			// Resolved to a relfilenode, but this backup has no main
+			// fork under it (possibly just _fsm/_vm, which hold no
+			// rows). Say so — see RestoreResult.NotInBackup.
 			res.NotInBackup = append(res.NotInBackup, rfn.Qualified)
 		}
 
@@ -263,7 +285,7 @@ func Restore(ctx context.Context, opts RestoreOptions) (*RestoreResult, error) {
 			mapping.ToastBytes = toastBytes
 			res.FilesWritten += len(toastWritten)
 			res.BytesWritten += toastBytes
-			if len(toastWritten) == 0 && len(heapWritten) > 0 {
+			if !hasMainFork(toastWritten, rfn.ToastPath) && hasMainFork(heapWritten, rfn.Path) {
 				// The heap landed but its TOAST relfilenode is absent:
 				// the table restores looking populated with every
 				// out-of-line value missing. Worse than an empty
@@ -304,14 +326,46 @@ func resolveRelfilenodes(ctx context.Context, opts RestoreOptions) ([]Relfilenod
 	return out, nil
 }
 
-// indexFiles builds a path → FileEntry index for fast lookup
+// indexFiles builds a relation-path → FileEntry index for fast lookup
 // during family-walks. Returned map is read-only after construction.
+//
+// Keys are in pg_relation_filepath's namespace, because that is what
+// the lookup side holds: default-tablespace files as-is
+// ("base/16384/2619"), files of a non-default tablespace as
+// "pg_tblspc/<oid>/<path>". The manifest stores the latter relative to
+// the tablespace root plus a TablespaceOID; keyed by bare Path they
+// could never match (and a same-named default-tablespace file could
+// shadow them).
 func indexFiles(files []backup.FileEntry) map[string]*backup.FileEntry {
 	out := make(map[string]*backup.FileEntry, len(files))
 	for i := range files {
-		out[files[i].Path] = &files[i]
+		out[relationPath(&files[i])] = &files[i]
 	}
 	return out
+}
+
+// relationPath is f's path as pg_relation_filepath would spell it.
+func relationPath(f *backup.FileEntry) string {
+	if f.TablespaceOID == 0 {
+		return f.Path
+	}
+	return fmt.Sprintf("pg_tblspc/%d/%s", f.TablespaceOID, f.Path)
+}
+
+// hasMainFork reports whether written contains the relation's main
+// fork: the base file or one of its ".N" segments. _fsm/_vm/_init
+// alone hold no rows, so a table extracted without its main fork has
+// not been extracted.
+func hasMainFork(written []string, basePath string) bool {
+	for _, p := range written {
+		if p == basePath {
+			return true
+		}
+		if rest, ok := strings.CutPrefix(p, basePath+"."); ok && rest != "" && strings.Trim(rest, "0123456789") == "" {
+			return true
+		}
+	}
+	return false
 }
 
 // materialiseRelfilenodeFamily writes every manifest file under a
@@ -330,7 +384,7 @@ func materialiseRelfilenodeFamily(
 ) (written []string, totalBytes int64, err error) {
 	// First, the base file itself.
 	if entry, ok := byPath[basePath]; ok {
-		n, err := materialiseOneFile(ctx, cas, target, entry)
+		n, err := materialiseOneFile(ctx, cas, target, basePath, entry)
 		if err != nil {
 			return written, totalBytes, err
 		}
@@ -358,7 +412,7 @@ func materialiseRelfilenodeFamily(
 	}
 	sort.Strings(siblings)
 	for _, path := range siblings {
-		n, err := materialiseOneFile(ctx, cas, target, byPath[path])
+		n, err := materialiseOneFile(ctx, cas, target, path, byPath[path])
 		if err != nil {
 			return written, totalBytes, err
 		}
@@ -418,8 +472,12 @@ func isFamilyMember(path, basePath string) bool {
 // the defer without them. Post-Sync the data is already durable, so
 // the lie was about fd bookkeeping rather than bytes — but a restore
 // path does not get to report success it did not verify.
-func materialiseOneFile(ctx context.Context, cas *repo.CAS, target string, f *backup.FileEntry) (bytesWritten int64, err error) {
-	full, err := safeJoinTarget(target, f.Path)
+//
+// relPath is where under target the file lands: its relation path
+// (see relationPath), so a tablespace file appears at the
+// pg_tblspc/<oid>/... path the result reports.
+func materialiseOneFile(ctx context.Context, cas *repo.CAS, target, relPath string, f *backup.FileEntry) (bytesWritten int64, err error) {
+	full, err := safeJoinTarget(target, relPath)
 	if err != nil {
 		return 0, err
 	}

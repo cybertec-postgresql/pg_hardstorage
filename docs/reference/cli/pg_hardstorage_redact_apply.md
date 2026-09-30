@@ -24,7 +24,7 @@ pg_hardstorage redact apply [flags]
       --dry-run                validate the plan without applying any SQL
   -h, --help                   help for apply
       --pg-connection string   libpq connection string for the target PostgreSQL cluster
-      --print-sql              print the generated SQL on stdout (no PG connection required)
+      --print-sql              print the generated SQL on stdout (no PG connection required); in structured output modes (-o json, ...) it is returned as result.sql
       --rules string           path to a YAML rules file (required)
       --salt-hex string        override the random salt with a fixed hex string (use to reproduce identical hashes across runs)
 ```

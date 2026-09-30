@@ -4,6 +4,7 @@ package cli
 import (
 	"crypto/ed25519"
 	stdjson "encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -149,14 +150,10 @@ func runAuditExportBundle(cmd *cobra.Command, f auditExportBundleFlags) error {
 			fmt.Sprintf("audit export-bundle: --until: %v", err)).Wrap(output.ErrUsage)
 	}
 
-	p, err := paths.Resolve(paths.DefaultOptions())
+	// A freshly minted key would sign a bundle no verifier trusts.
+	bsigner, _, err := loadExistingKeypair("audit export-bundle")
 	if err != nil {
-		return output.NewError("internal", err.Error()).Wrap(err)
-	}
-	bsigner, _, err := keystore.LoadOrGenerate(p.Keyring.Value)
-	if err != nil {
-		return output.NewError("internal",
-			fmt.Sprintf("audit export-bundle: load signer: %v", err)).Wrap(err)
+		return err
 	}
 
 	_, sp, err := openRepo(cmd.Context(), f.repoURL)
@@ -299,7 +296,11 @@ func (b auditExportBundleBody) WriteText(w io.Writer) error {
 // Operator runs this to assert a previously-exported bundle's
 // signature is valid.  Returns the manifest body on success.
 func newAuditVerifyBundleCmd() *cobra.Command {
-	var format string
+	var (
+		format              string
+		trustedKeys         []string
+		trustedFingerprints []string
+	)
 	c := &cobra.Command{
 		Use:   "verify-bundle <path>",
 		Short: "Verify a signed audit evidence bundle",
@@ -312,19 +313,35 @@ links to the one before it.
 A bundle exported with filters holds a NON-contiguous slice of the
 chain, so linkage cannot be asserted from the bundle alone; the result
 reports that explicitly rather than implying a contiguity it did not
-check. Returns the bundle manifest on success.`,
+check. Returns the bundle manifest on success.
+
+The key inside the bundle proves only that the bundle is consistent
+under that key -- anyone can re-sign a rewritten bundle with a fresh
+one. The signer must therefore be TRUSTED: by default the public key
+of this host's keyring (the key ` + "`audit export-bundle`" + ` signs with); pass
+--trusted-key / --trusted-fingerprint to verify a bundle exported
+elsewhere. A validly-signed bundle from an untrusted key fails with
+verify.bundle_untrusted_signer (exit 9).`,
 		Args:         cobra.ExactArgs(1),
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runAuditVerifyBundle(cmd, args[0], format)
+			return runAuditVerifyBundle(cmd, args[0], format, trustedKeys, trustedFingerprints)
 		},
 	}
 	c.Flags().StringVar(&format, "format", "json", "output format: json | text")
+	c.Flags().StringArrayVar(&trustedKeys, "trusted-key", nil,
+		"PEM file with an ed25519 public key the bundle may be signed by (repeatable; replaces the default of this host's keyring key)")
+	c.Flags().StringArrayVar(&trustedFingerprints, "trusted-fingerprint", nil,
+		"hex SHA-256 fingerprint (full, or the 16-char prefix the manifest prints) of a trusted signing key (repeatable)")
 	return c
 }
 
-func runAuditVerifyBundle(cmd *cobra.Command, path, format string) error {
+func runAuditVerifyBundle(cmd *cobra.Command, path, format string, trustedKeyFiles, trustedFingerprints []string) error {
 	d := DispatcherFrom(cmd)
+	trust, err := bundleTrustSet(trustedKeyFiles, trustedFingerprints)
+	if err != nil {
+		return err
+	}
 	abs, err := filepath.Abs(path)
 	if err != nil {
 		return output.NewError("usage.bad_flag",
@@ -336,7 +353,14 @@ func runAuditVerifyBundle(cmd *cobra.Command, path, format string) error {
 			fmt.Sprintf("audit verify-bundle: %v", err)).Wrap(err)
 	}
 	defer f.Close()
-	manifest, err := audit.VerifyBundle(f)
+	manifest, err := audit.VerifyBundleWithOptions(f, trust)
+	if errors.Is(err, audit.ErrBundleSignerUntrusted) {
+		return output.NewError("verify.bundle_untrusted_signer",
+			fmt.Sprintf("audit verify-bundle: %v", err)).
+			WithSuggestion(&output.Suggestion{
+				Human: "the bundle is internally consistent but was signed by a key you have not trusted -- anyone can produce such a bundle. If it comes from another host, obtain that host's public key out of band and pass it with --trusted-key or --trusted-fingerprint",
+			}).Wrap(err)
+	}
 	if err != nil {
 		return output.NewError("verify.bundle_invalid",
 			fmt.Sprintf("audit verify-bundle: %v", err)).
@@ -408,4 +432,42 @@ func (b auditVerifyBundleBody) WriteText(w io.Writer) error {
 	}
 	_, err := io.WriteString(w, strings.TrimRight(bw.String(), "\n"))
 	return err
+}
+
+// bundleTrustSet builds the signer trust set for verify-bundle. With
+// no explicit keys or fingerprints it defaults to this host's keyring
+// public key -- the key export-bundle signs with -- read WITHOUT
+// generating one (a verifier host with no keyring must not mint a key
+// and then trust it). No key anywhere is a usage error: verifying
+// against the bundle's own key proves nothing.
+func bundleTrustSet(keyFiles, fingerprints []string) (audit.VerifyBundleOptions, error) {
+	var opts audit.VerifyBundleOptions
+	opts.TrustedFingerprints = fingerprints
+	for _, kf := range keyFiles {
+		raw, err := os.ReadFile(kf)
+		if err != nil {
+			return opts, output.NewError("usage.bad_key_file",
+				fmt.Sprintf("audit verify-bundle: --trusted-key: %v", err)).Wrap(output.ErrUsage)
+		}
+		v, err := backup.LoadVerifier(raw)
+		if err != nil {
+			return opts, output.NewError("usage.bad_key_file",
+				fmt.Sprintf("audit verify-bundle: --trusted-key %s: %v", kf, err)).Wrap(output.ErrUsage)
+		}
+		opts.TrustedKeys = append(opts.TrustedKeys, v.PublicKey())
+	}
+	if len(opts.TrustedKeys) > 0 || len(opts.TrustedFingerprints) > 0 {
+		return opts, nil
+	}
+	if p, err := paths.Resolve(paths.DefaultOptions()); err == nil {
+		if raw, rerr := os.ReadFile(filepath.Join(p.Keyring.Value, keystore.PublicKeyFile)); rerr == nil {
+			if v, verr := backup.LoadVerifier(raw); verr == nil {
+				opts.TrustedKeys = append(opts.TrustedKeys, v.PublicKey())
+				return opts, nil
+			}
+		}
+	}
+	return opts, output.NewError("usage.missing_trusted_key",
+		"audit verify-bundle: no trusted signing key: this host has no keyring public key; pass --trusted-key <pem> or --trusted-fingerprint <hex> for the key that exported the bundle").
+		Wrap(output.ErrUsage)
 }

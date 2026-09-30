@@ -610,7 +610,56 @@ const (
 //
 // Returns the decoded BundleManifest on success; error on
 // signature failure or chain-break.
+//
+// VerifyBundle alone proves only "signed by whoever ships in this
+// tarball": the key it checks against travels INSIDE the bundle, so a
+// forger who rewrites the events and re-signs under a fresh key passes.
+// Callers answering "is this evidence genuine?" must use
+// VerifyBundleWithOptions with a trust set.
 func VerifyBundle(r io.Reader) (*BundleManifest, error) {
+	return VerifyBundleWithOptions(r, VerifyBundleOptions{})
+}
+
+// VerifyBundleOptions pins which signers a bundle may come from.
+type VerifyBundleOptions struct {
+	// TrustedKeys and TrustedFingerprints together form the trust set:
+	// the key that validated the signature must equal a TrustedKey or
+	// match a TrustedFingerprint (the full lowercase hex SHA-256 of the
+	// raw key, or its 16-hex prefix as printed in the manifest). Both
+	// empty = no trust check (the VerifyBundle behaviour).
+	TrustedKeys         []ed25519.PublicKey
+	TrustedFingerprints []string
+}
+
+// ErrBundleSignerUntrusted is returned (wrapped) when a bundle's
+// signature and chain verify but its signer is not in the trust set.
+// The manifest is returned alongside so the caller can report what was
+// found; it must not be treated as verified evidence.
+var ErrBundleSignerUntrusted = errors.New("audit: bundle signature is valid but the signing key is not trusted")
+
+// trusts reports whether pub is in the trust set.
+func (o VerifyBundleOptions) trusts(pub ed25519.PublicKey) bool {
+	for _, k := range o.TrustedKeys {
+		if bytes.Equal(k, pub) {
+			return true
+		}
+	}
+	sum := sha256.Sum256(pub)
+	full := hex.EncodeToString(sum[:])
+	for _, fp := range o.TrustedFingerprints {
+		fp = strings.ToLower(strings.TrimSpace(fp))
+		if fp != "" && (fp == full || fp == full[:16]) {
+			return true
+		}
+	}
+	return false
+}
+
+// VerifyBundleWithOptions is VerifyBundle plus signer trust: after the
+// signature and chain checks pass, the signing key must be in the
+// trust set (when one is given), else the manifest is returned with a
+// wrapped ErrBundleSignerUntrusted.
+func VerifyBundleWithOptions(r io.Reader, opts VerifyBundleOptions) (*BundleManifest, error) {
 	gz, err := gzip.NewReader(r)
 	if err != nil {
 		return nil, fmt.Errorf("audit: open gzip: %w", err)
@@ -751,6 +800,13 @@ func VerifyBundle(r io.Reader) (*BundleManifest, error) {
 		return nil, ierr
 	}
 	manifest.Integrity = &integ
+
+	// Signer trust, last: everything above only shows the bundle is
+	// internally consistent under the key it carries.
+	if (len(opts.TrustedKeys) > 0 || len(opts.TrustedFingerprints) > 0) && !opts.trusts(pub) {
+		sum := sha256.Sum256(pub)
+		return &manifest, fmt.Errorf("%w (signer fingerprint %s)", ErrBundleSignerUntrusted, hex.EncodeToString(sum[:]))
+	}
 	return &manifest, nil
 }
 
@@ -824,19 +880,38 @@ func verifyBundleEvents(files map[string][]byte, manifest *BundleManifest) (Bund
 		}
 	}
 
-	// Linkage, only where the slice is genuinely consecutive.
-	integ.LinkageAsserted = true
-	for i := 1; i < len(events); i++ {
-		if events[i].Sequence != events[i-1].Sequence+1 {
-			integ.SequenceGaps++
-			integ.LinkageAsserted = false
-			continue
+	// Linkage, only where the slice is genuinely consecutive — and only
+	// within a shard. The chain is sharded per deployment/tenant, each
+	// shard an independent chain with its own sequence numbers, while
+	// the bundle holds events merged across shards in timestamp order.
+	// Comparing neighbours in that merged order checks db1's event
+	// against db2's and reports a break on every genuine multi-shard
+	// bundle. The shard is derived from the event itself, exactly as
+	// Append derived it, so a verifier needs nothing from the repo.
+	byShard := map[string][]*Event{}
+	var shards []string
+	for _, ev := range events {
+		k := shardKeyFor(ev)
+		if _, seen := byShard[k]; !seen {
+			shards = append(shards, k)
 		}
-		if events[i].PrevHash != events[i-1].Hash {
-			return integ, fmt.Errorf("audit: bundle chain break at sequence %d: event %s "+
-				"records prev_hash %s but the preceding event hashes to %s",
-				events[i].Sequence, events[i].ID,
-				short12(events[i].PrevHash), short12(events[i-1].Hash))
+		byShard[k] = append(byShard[k], ev)
+	}
+	integ.LinkageAsserted = true
+	for _, k := range shards {
+		chain := byShard[k]
+		for i := 1; i < len(chain); i++ {
+			if chain[i].Sequence != chain[i-1].Sequence+1 {
+				integ.SequenceGaps++
+				integ.LinkageAsserted = false
+				continue
+			}
+			if chain[i].PrevHash != chain[i-1].Hash {
+				return integ, fmt.Errorf("audit: bundle chain break at sequence %d (%s): event %s "+
+					"records prev_hash %s but the preceding event hashes to %s",
+					chain[i].Sequence, shardLabel(k), chain[i].ID,
+					short12(chain[i].PrevHash), short12(chain[i-1].Hash))
+			}
 		}
 	}
 

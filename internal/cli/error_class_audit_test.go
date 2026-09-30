@@ -163,6 +163,9 @@ func collectErrorCodes(t *testing.T, roots ...string) map[string]bool {
 				return nil
 			}
 			if d.IsDir() {
+				if n := d.Name(); len(n) > 1 && n[0] == '.' && n != ".." {
+					return filepath.SkipDir // .git, .claude/worktrees, …: not part of the module (go tooling skips them too)
+				}
 				name := d.Name()
 				if name == "vendor" || name == "node_modules" || name == "test-runs" || name == "testdata" {
 					return filepath.SkipDir

@@ -77,6 +77,11 @@ type Runner struct {
 	// rng is nil.
 	rng *rand.Rand
 	mu  sync.Mutex
+
+	// runOnce replaces runStreamOnce in tests so the supervisor's
+	// restart policy can be driven without a live PG. Nil = the real
+	// pipeline.
+	runOnce func(ctx context.Context, s *Stream, conn string) error
 }
 
 // DefaultRescanInterval is the cadence used when RescanInterval is
@@ -307,19 +312,26 @@ func (r *Runner) superviseStream(ctx context.Context, s *Stream) {
 				"deployment": s.Deployment,
 				"slot":       s.Slot,
 			}))
-		err := r.runStreamOnce(ctx, s, conn)
+		runOnce := r.runStreamOnce
+		if r.runOnce != nil {
+			runOnce = r.runOnce
+		}
+		err := runOnce(ctx, s, conn)
 		switch {
 		case err == nil:
-			// Clean exit (the receiver returned nil). Treated as
-			// terminal — receivers shouldn't return nil unless
-			// asked to stop (which means ctx is done). Belt-and-
-			// braces: re-check ctx before exiting the loop.
 			if ctx.Err() != nil {
 				return
 			}
+			// The receiver returned nil with ctx still live: the
+			// server ended COPY cleanly (walsender shutdown, PG
+			// restart, switchover). That is not a stop request, so
+			// reconnect through the same backoff as an error. It used
+			// to return here — and since the watcher only starts names
+			// missing from its active map, which this one never left,
+			// the stream stayed dead until the agent restarted.
+			err = errors.New("replication stream ended by the server (CopyDone)")
 			r.emit(output.NewEvent(output.SeverityWarning, "logical.runner", "stream.ended_unexpectedly").
 				WithBody(map[string]any{"stream": s.Name}))
-			return
 		case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
 			r.emit(output.NewEvent(output.SeverityInfo, "logical.runner", "stream.stopped").
 				WithBody(map[string]any{"stream": s.Name}))

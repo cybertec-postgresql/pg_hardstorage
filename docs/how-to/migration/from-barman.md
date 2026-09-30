@@ -42,7 +42,7 @@ tags:
 | `archive_command`        | WAL streaming via slot (no `archive_command` change) |
 | Streaming-only mode      | Default: agent uses replication slot |
 | `barman check`           | `pg_hardstorage doctor`            |
-| Retention policy         | `retention:` in deployment config  |
+| Retention policy         | `retention:` in deployment config — `RECOVERY WINDOW OF N DAYS` → `policy: simple` + `keep_for`, `REDUNDANCY N` → `policy: count` + `keep_fulls` |
 | `barman switch-wal`      | Inferred — backup commit triggers WAL switch automatically |
 | `barman-cloud-backup`    | Cloud storage backend (`s3://`, `gs://`, `azure://`) |
 
@@ -66,7 +66,8 @@ pg_hardstorage compat translate --from barman \
     --out-file /etc/pg_hardstorage/pg_hardstorage.yaml
 
 # 3. Review the YAML — every unmapped Barman setting
-#    surfaces as a comment + on stderr.  Multi-server
+#    surfaces as a comment + on stderr (secret values
+#    redacted on stderr).  Multi-server
 #    barman.conf with [server] sections produces multiple
 #    deployment entries.
 $EDITOR /etc/pg_hardstorage/pg_hardstorage.yaml
@@ -94,6 +95,13 @@ barman recover db1 db1.full.<id> /var/lib/postgresql/restored
 Verb coverage in v1.1: `backup`, `recover`, `list-backup`,
 `show-backup`, `check`, `delete`, plus the dedicated
 `barman-wal-archive` binary for `archive_command` use.
+`barman-wal-archive` accepts its documented options:
+`-U/--user`, `--port`, `-c/--config` and the compression
+switches (`-z`, `-j`, `--xz`, `--snappy`, `--zstd`, `--lz4`)
+parse and are ignored (no SSH hop; compression is a repository
+setting), and `--test` (`barman-wal-archive --test HOST SERVER
+DUMMY`) checks that SERVER's repository is reachable without
+archiving anything.
 15 less-common verbs (`cron`, `archive-wal`, `switch-wal`,
 `diagnose`, `verify`, `keep`, `receive-wal`, `replication-status`,
 `show-server`, `list-server`, `lock-directory-cleanup`,
@@ -136,7 +144,10 @@ maintains its own replication slot, so they coexist
 without conflict.
 
 ```bash
-sudo systemctl enable --now pg_hardstorage@db1.service
+# The WAL streamer. NOT pg_hardstorage@db1.service — that unit runs
+# `pg_hardstorage agent` (scheduled backups + retention) and never
+# opens a stream or holds a slot.
+sudo systemctl enable --now pg_hardstorage-wal-stream@db1.service
 ```
 
 If your Barman setup uses `archive_command` rather than
@@ -194,6 +205,21 @@ recover onto a remote host directly. Our restore is
 local-target by design (run the restore where the target
 PG will run). For remote restores, run the agent on the
 target host and use `pg_hardstorage restore` from there.
+
+Through the `barman` shim, `recover` keeps Barman's recovery
+semantics:
+
+- **No target** → every archived WAL segment is replayed
+  (native `restore --to-latest`), exactly as Barman copies all
+  archived WAL.  Only `--target-immediate` stops at the
+  backup's consistency point.
+- **`--target-time` needs an explicit UTC offset**
+  (`2026-04-27 09:42:00+02`, `... UTC`).  Barman lets PostgreSQL
+  read an offset-less time in the server's `TimeZone`;
+  pg_hardstorage would read it as UTC and stop at a different
+  instant, so the shim refuses it rather than guess.
+- **`--target-xid`** is refused (no native XID target); use an
+  LSN or a time.
 
 ### `barman-cli` companion package
 

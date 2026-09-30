@@ -22,6 +22,47 @@ func TestDockerMemoryLimitArg_UnlimitedUsesSentinel(t *testing.T) {
 	}
 }
 
+// TestIsCgroupLimitUnreachable pins which docker-update refusals are
+// the injector asking for an impossible cap (skip) versus a host that
+// cannot squeeze at all (fail loudly).
+func TestIsCgroupLimitUnreachable(t *testing.T) {
+	// The 10 h v1.5.0 soak (seed 20260920) logged this runc
+	// refusal once in 152 cgroup_squeeze applications. Typing
+	// it as ErrLimitUnreachable depends on matching that text
+	// and not matching generic docker-update failures.
+	cases := []struct {
+		out  string
+		want bool
+	}{
+		{
+			out: `Error response from daemon: runc did not terminate successfully:
+    failed to write "33554432": write /sys/fs/cgroup/docker/abc/memory.max: invalid argument`,
+			want: true,
+		},
+		{out: "is not running", want: false},
+		{out: "Memory limit should be smaller than already set memoryswap limit", want: false},
+		// No errno, so nothing says whether the kernel refused the cap or
+		// the host cannot write cgroups at all. Unknown stays loud: a false
+		// skip hides a fault for the whole run, a false failure costs one
+		// look.
+		{out: "failed to write foo to /sys/fs/cgroup/memory.max", want: false},
+		{out: "permission denied", want: false},
+		// The realistic spellings of "this host cannot squeeze at all".
+		// The bare string above never contained memory.max, so it could
+		// not catch the path-only matcher classifying these as skips.
+		{out: `runc did not terminate successfully: failed to write "33554432": write /sys/fs/cgroup/docker/abc/memory.max: permission denied`, want: false},
+		{out: `write /sys/fs/cgroup/docker/abc/memory.max: operation not permitted`, want: false},
+		{out: `cannot open /sys/fs/cgroup/docker/abc/memory.max: no such file or directory`, want: false},
+		{out: `failed to write "33554432": write /sys/fs/cgroup/docker/abc/memory.max: device or resource busy`, want: true},
+	}
+	for _, tc := range cases {
+		got := isCgroupLimitUnreachable(tc.out)
+		if got != tc.want {
+			t.Errorf("isCgroupLimitUnreachable(%q) = %v, want %v", tc.out, got, tc.want)
+		}
+	}
+}
+
 // TestDockerMemoryLimitArg_PositiveBytesPassThrough confirms the
 // squeeze path still emits the caller's exact byte count.
 func TestDockerMemoryLimitArg_PositiveBytesPassThrough(t *testing.T) {

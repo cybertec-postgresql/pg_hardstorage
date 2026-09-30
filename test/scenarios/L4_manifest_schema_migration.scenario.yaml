@@ -2,8 +2,8 @@
 #
 # Tier L4 — synthesises a v0.8-shaped manifest into a live repo,
 # then drives the current-version pg_hardstorage binary at it via
-# `audit verify-chain` (the read path that eagerly walks every
-# manifest).  Pass condition: the binary either auto-migrates the
+# `repo check` (the read path that parses and verifies every primary
+# manifest; `audit verify-chain` walks only audit/ and never saw it).  Pass condition: the binary either auto-migrates the
 # old shape silently OR refuses with a structured error code that
 # names the schema mismatch — the failure mode we want to PREVENT
 # is a silent partial-read where some fields are zero-valued and
@@ -49,7 +49,9 @@ steps:
   #    a v0.8 binary would produce.
   - synthesize_manifest:
       manifest_schema_version: v0.8
-      manifest_rel_path: manifests/synthetic-v0_8.json
+      # Where a real backup's manifest lives, so the manifest walk
+      # reaches it (a top-level manifests/*.json is not a backup).
+      manifest_rel_path: manifests/scenario/backups/synthetic-v0_8/manifest.json
 
   # 3. Walk the audit chain with the current binary.  The pass
   #    condition is "exits cleanly OR exits with a structured
@@ -58,32 +60,25 @@ steps:
   #    sniffs below.
   - cli_run:
       args:
-        - audit
-        - verify-chain
+        - repo
+        - check
         - --repo
         - $REPO
         - -o
         - json
       timeout: 30s
-      # We don't pin expect_exit: the binary may legitimately
-      # auto-migrate (exit 0) OR refuse (non-zero with a clear
-      # error code).  Both pass; the failure mode we catch is
-      # a SILENT zero-valued field with exit 0 + no log line.
-      # The stdout sniff below distinguishes "noticed" from
-      # "silently mis-parsed".
+      # The current binary refuses a pre-v1 manifest (it fails
+      # ParseAndVerify): verify.signature_failures, exit 9. If a
+      # future version auto-migrates instead, change this to 0 and
+      # assert the migration line — deliberately, not by accident.
+      expect_exit: 9
 
   # 4. Assert the manifest reader emitted EITHER a successful
   #    migration line OR a structured-error code.  Both paths
   #    name the synthetic manifest by relative path so we know
   #    the walker reached it.
   - assert:
-      asserts:
-        - kind: cli_stderr_or_stdout_contains_any
-          substrings:
-            - "synthetic-v0_8.json"
-        - kind: cli_stderr_or_stdout_contains_any
-          substrings:
-            - "schema_version"
-            - "migrated"
-            - "schema.unsupported"
-            - "manifest.format"
+      - cli_output_contains_any: [ "synthetic-v0_8/manifest.json" ]
+      - cli_output_contains_any:
+          - "verify.signature_failures"
+          - "migrated"

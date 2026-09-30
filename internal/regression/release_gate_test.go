@@ -186,9 +186,18 @@ func TestReleaseGate_BackupVerifyRestore(t *testing.T) {
 	// "latest" alias because that masks a class of bug where
 	// the renderer emits the wrong ID and "latest" resolution
 	// papers over the discrepancy.
+	// --include-wal: the gate restores this backup, so it must be one
+	// that CAN be restored. With no WAL archiving in the fixture, a
+	// backup without embedded WAL could never reach consistency, and
+	// restore now refuses it up front (preflight.backup_wal_missing) —
+	// the gate had been checking PG_VERSION in a data directory that
+	// would never have booted. This also drives the temporary WAL slot
+	// (backup.wal_slot_unavailable if it cannot be created) against a
+	// real PostgreSQL.
 	args = []string{"backup", deployment,
 		"--repo", repoURL,
 		"--pg-connection", dsn,
+		"--include-wal",
 		"--output", "json"}
 	out, err := runBin(t, bin, args...)
 	if err != nil {

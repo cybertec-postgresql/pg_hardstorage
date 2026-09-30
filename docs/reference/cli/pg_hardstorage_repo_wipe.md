@@ -49,6 +49,7 @@ pg_hardstorage repo wipe <url> [flags]
 ```
       --force                     skip the n-of-m approval on an ordinary (non-WORM) repo; still requires --yes
   -h, --help                      help for wipe
+      --override-legal-holds      wipe even though backups are under an active legal hold; only with --require-approval (never with --force), and the held backups are recorded in the pre-wipe audit event
       --reason string             free-form reason captured in the audit chain pre-wipe
       --repo string               repository URL — must already exist (positional <url> is also accepted)
       --require-approval string   approval request ID for the strict n-of-m gate (mandatory for WORM/compliance repos)

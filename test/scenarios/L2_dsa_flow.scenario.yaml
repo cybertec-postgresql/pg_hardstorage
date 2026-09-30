@@ -48,6 +48,9 @@ steps:
         - "scenario-probe-subject-1"
         - "--tenant"
         - "scenario-tenant"
+        # The scenario repo holds no backup for this tenant: certify that
+        # deliberately (an unknown --tenant is otherwise refused as a typo).
+        - "--allow-unknown-tenant"
         - "--article"
         - "art_15_access"
         - "--note"
@@ -67,6 +70,9 @@ steps:
         - "scenario-probe-subject-2"
         - "--tenant"
         - "scenario-tenant"
+        # The scenario repo holds no backup for this tenant: certify that
+        # deliberately (an unknown --tenant is otherwise refused as a typo).
+        - "--allow-unknown-tenant"
         - "--article"
         - "art_17_erasure"
         - "--skip-sign"

@@ -40,6 +40,7 @@ import (
 
 func init() {
 	output.DefaultSinkRegistry.Register("slack", NewFromSpec)
+	output.DefaultSinkRegistry.DeclareConfigKeys("slack", "channel", "username", "webhook_url")
 }
 
 // Sink posts events to a Slack incoming webhook.

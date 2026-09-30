@@ -25,6 +25,10 @@
 #                      enterprise_heavy ship by default)
 #   --fault-rate F     per-iteration fault probability 0..1 (default
 #                      testkit-internal 0.2)
+#   --retention-interval D
+#                      pause the fleet for rotate + gc every D (default
+#                      testkit-internal 15m; a negative duration
+#                      such as -1s disables)
 #   --max-containers N soak the whole matrix in sequential batches,
 #                      never exceeding N containers at once (one cell
 #                      = 1 PG + 1 toxiproxy container, so a batch
@@ -37,6 +41,9 @@
 #   --dry-run          drive the orchestrator against fake cells
 #                      (no PG, no Docker required)
 #   --keep-on-failure  preserve containers + bundle for forensics
+#   --keep-repo        keep the backup repository (report-dir/repo-data)
+#                      after a PASSING run; by default it is removed,
+#                      since only a failed run needs it for forensics
 #   --skip-mem-check   skip the host-RAM preflight (see issue #46)
 #   --help             this message
 #
@@ -101,10 +108,12 @@ NO_BUILD=0
 NO_UP=0
 DRY_RUN=0
 KEEP_ON_FAILURE=0
+KEEP_REPO=0
 PARALLEL=1
 HOST_PORT_BASE=15432
 PROFILE="oltp_smoke"
 FAULT_RATE=""  # empty → testkit's own default (0.2)
+RETENTION_INTERVAL=""  # empty → testkit's own default (15m)
 FLEET_OVERRIDE=""  # --fleet PATH: use this fleet verbatim, skip `fleet random`
 MAX_CONTAINERS=0   # --max-containers N: soak the matrix in batches of ≤N containers
 SKIP_MEM_CHECK=0   # --skip-mem-check: bypass the host-RAM preflight (issue #46)
@@ -125,12 +134,14 @@ while [[ $# -gt 0 ]]; do
         --host-port-base) HOST_PORT_BASE="$2"; shift 2 ;;
         --profile) PROFILE="$2"; shift 2 ;;
         --fault-rate) FAULT_RATE="$2"; shift 2 ;;
+        --retention-interval) RETENTION_INTERVAL="$2"; shift 2 ;;
         --max-containers) MAX_CONTAINERS="$2"; shift 2 ;;
         --fleet) FLEET_OVERRIDE="$2"; shift 2 ;;
         --no-build) NO_BUILD=1; shift ;;
         --no-up) NO_UP=1; shift ;;
         --dry-run) DRY_RUN=1; shift ;;
         --keep-on-failure) KEEP_ON_FAILURE=1; shift ;;
+        --keep-repo) KEEP_REPO=1; shift ;;
         --skip-mem-check) SKIP_MEM_CHECK=1; shift ;;
         --help|-h) usage 0 ;;
         *) echo "unknown option: $1" >&2; usage 2 ;;
@@ -295,8 +306,10 @@ if [[ "$CELLS_PER_BATCH" -gt 0 ]]; then
         [[ "$NO_UP" -eq 1 ]]           && forward+=(--no-up)
         [[ "$DRY_RUN" -eq 1 ]]         && forward+=(--dry-run)
         [[ "$KEEP_ON_FAILURE" -eq 1 ]] && forward+=(--keep-on-failure)
+        [[ "$KEEP_REPO" -eq 1 ]]       && forward+=(--keep-repo)
         [[ -n "$PROFILE" && "$PROFILE" != "oltp_smoke" ]] && forward+=(--profile "$PROFILE")
         [[ -n "$FAULT_RATE" ]]         && forward+=(--fault-rate "$FAULT_RATE")
+        [[ -n "$RETENTION_INTERVAL" ]] && forward+=(--retention-interval "$RETENTION_INTERVAL")
         note "── batch $bi/${#BATCH_FILES[@]} ($(grep -c 'os:' "$bf" || echo '?') cells) → $bdir ──"
         # `if cmd; then` keeps `set -e` from aborting the run when a
         # batch fails; we want to soak the remaining batches and
@@ -383,8 +396,10 @@ if [[ "$PARALLEL" -gt 1 ]]; then
         [[ "$NO_UP" -eq 1 ]]            && forward+=(--no-up)
         [[ "$DRY_RUN" -eq 1 ]]          && forward+=(--dry-run)
         [[ "$KEEP_ON_FAILURE" -eq 1 ]]  && forward+=(--keep-on-failure)
+        [[ "$KEEP_REPO" -eq 1 ]]        && forward+=(--keep-repo)
         [[ -n "$PROFILE" && "$PROFILE" != "oltp_smoke" ]] && forward+=(--profile "$PROFILE")
         [[ -n "$FAULT_RATE" ]]          && forward+=(--fault-rate "$FAULT_RATE")
+        [[ -n "$RETENTION_INTERVAL" ]]  && forward+=(--retention-interval "$RETENTION_INTERVAL")
         # Stagger slot starts by 2s — concurrent docker compose ups
         # against a single daemon occasionally race on network/volume
         # creation; the small offset eliminates the noise.
@@ -735,8 +750,28 @@ cleanup() {
             note "Soak failed; preserving containers (project=$PROJECT) for forensics."
             note "Tear down manually: docker compose -f $COMPOSE_PATH -p $PROJECT down -v"
         else
+            # A passing run's repository is dead weight — tens of GB per
+            # heavy soak, owned by the container uid so the host account
+            # cannot remove it (see HOST-READING-THIS-DIR.txt). Aborted
+            # and passing runs accumulated ~300 GB of it in one day and
+            # starved the next soak of disk. Remove it through one of the
+            # run's own images (as root, no network) unless --keep-repo;
+            # a failed run keeps it for forensics.
+            local img=""
+            if [[ "$rc" -eq 0 && "$KEEP_REPO" -eq 0 ]]; then
+                img=$(docker compose -f "$COMPOSE_PATH" -p "$PROJECT" config --images 2>/dev/null \
+                    | grep -m1 testbed || true)
+            fi
             note "docker compose down -v"
             docker compose -f "$COMPOSE_PATH" -p "$PROJECT" down -v --remove-orphans || true
+            if [[ -n "$img" ]]; then
+                note "soak passed; removing its repository $HOST_REPO_DIR (--keep-repo keeps it)"
+                docker run --rm -u 0 --network none --entrypoint sh \
+                    -v "$HOST_REPO_DIR":/r "$img" -c 'find /r -mindepth 1 -delete' \
+                    || note "could not remove $HOST_REPO_DIR — see HOST-READING-THIS-DIR.txt there"
+            elif [[ "$rc" -eq 0 && "$KEEP_REPO" -eq 0 ]]; then
+                note "soak passed, but no testbed image found to remove $HOST_REPO_DIR as root; left in place"
+            fi
         fi
     fi
     return "$rc"
@@ -781,9 +816,12 @@ echo
 # ${arr[@]+...} guard yields zero words when the array is empty and
 # the elements — correctly quoted — when it is not; portable from
 # Bash 3.2 through 5.x.  See issue #47.
-FAULT_RATE_FLAG=()
+VALIDATE_OPT_FLAGS=()
 if [[ -n "$FAULT_RATE" ]]; then
-    FAULT_RATE_FLAG=(--fault-rate "$FAULT_RATE")
+    VALIDATE_OPT_FLAGS=(--fault-rate "$FAULT_RATE")
+fi
+if [[ -n "$RETENTION_INTERVAL" ]]; then
+    VALIDATE_OPT_FLAGS+=(--retention-interval "$RETENTION_INTERVAL")
 fi
 "$TESTKIT" validate \
     --fleet "$FLEET_PATH" \
@@ -795,7 +833,7 @@ fi
     --project "$PROJECT" \
     --report-dir "$REPORT_DIR" \
     --host-port-base "$HOST_PORT_BASE" \
-    ${FAULT_RATE_FLAG[@]+"${FAULT_RATE_FLAG[@]}"} \
+    ${VALIDATE_OPT_FLAGS[@]+"${VALIDATE_OPT_FLAGS[@]}"} \
     $EXTRA
 
 green "soak completed; reports in $REPORT_DIR"

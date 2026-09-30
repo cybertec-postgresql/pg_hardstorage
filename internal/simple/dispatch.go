@@ -5,6 +5,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"os/signal"
+	"syscall"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/simple/prompt"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/simple/state"
@@ -53,10 +56,23 @@ func Run(ctx context.Context, env *Env) error {
 		}
 		flow := menuChoices[idx].Flow
 		env.Prompter.Printf("\n  → %s\n\n", flow.Name())
-		if err := flow.Run(ctx, env); err != nil {
+		// Each flow gets its own interrupt-cancellable context, so a
+		// Ctrl-C stops the running backup / stream / restore and
+		// returns to the menu. A single session-wide NotifyContext
+		// (what main used to install) stayed cancelled after the first
+		// Ctrl-C, and every later flow started already dead.
+		flowCtx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
+		err = flow.Run(flowCtx, env)
+		interrupted := flowCtx.Err() != nil && ctx.Err() == nil
+		stop()
+		if err != nil {
 			if errors.Is(err, prompt.ErrQuit) {
 				env.Prompter.Println("  bye.\n")
 				return nil
+			}
+			if interrupted {
+				env.Prompter.Printf("  %s interrupted.\n\n", flow.Name())
+				continue
 			}
 			// Flow-level failures print and continue — operators
 			// often want to retry from the menu rather than have

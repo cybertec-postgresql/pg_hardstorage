@@ -81,6 +81,12 @@ steps:
         - "public.nonexistent_in_postgres"
         - "--sql-file"
         - "$ARTEFACT_DIR/partial-no-database.sql"
+        # The sandbox is a cluster restored from THIS backup, so
+        # pg_dump must connect as a role that exists in it. The
+        # testbed's bootstrap superuser is $PG_USER, not the
+        # "postgres" default and certainly not the host login.
+        - "--pg-user"
+        - "$PG_USER"
       expect_exit: 6
       timeout: 60s
 

@@ -47,7 +47,12 @@ half is what verifies the manifest signature.
 Refuses to write into a non-empty target unless --force is passed.
 Use --preview to inspect what a real restore would do without
 touching disk. Use --verify=auto|skip|require to control the post-
-restore pg_verifybackup gate.
+restore pg_verifybackup gate; it runs on the directory exactly as
+restored, before the --verify-restore boot test. The boot test starts
+PostgreSQL in the target with a private socket, log and trust-only
+pg_hba (the restored pg_hba.conf is not consulted) and puts back
+postgresql.auto.conf afterwards; what remains is what a first start
+leaves (recovery replayed, backup_label renamed to backup_label.old).
 
 PITR (replaying WAL up to a target):
   --to "5 minutes ago"        natural-language relative time
@@ -61,7 +66,10 @@ PITR (replaying WAL up to a target):
 When any of --to / --to-lsn / --to-name is set, recovery.signal is
 dropped in the target dir and a recovery_target_* block is appended
 to postgresql.auto.conf. The restore_command points back at this
-binary's wal-fetch shim.`,
+binary's wal-fetch shim. Recovery settings a previous restore left in
+the backed-up postgresql.auto.conf are removed, and every recovery
+target the new block does not set is reset to '', so inherited
+targets never combine with the requested one.`,
 		Args:         cobra.ExactArgs(2),
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -109,7 +117,7 @@ binary's wal-fetch shim.`,
 	c.Flags().BoolVar(&opts.toExclusive, "to-exclusive", false,
 		"stop recovery just BEFORE the target (default: just after)")
 	c.Flags().BoolVar(&opts.skipGapCheck, "skip-gap-check", false,
-		"bypass the+ WAL-gap pre-flight (operator override; "+
+		"bypass the WAL pre-flights: known WAL gaps, missing timeline history, and a backup whose WAL exists nowhere (operator override; "+
 			"the override is audit-logged)")
 	c.Flags().StringVar(&opts.requireAttestation, "require-threshold-attestation", "",
 		"refuse to restore unless a k-of-n threshold attestation under this roster ID is present "+
@@ -244,11 +252,6 @@ func runRestore(cmd *cobra.Command, opts restoreOpts) error {
 	if err != nil {
 		return output.NewError("internal", err.Error()).Wrap(err)
 	}
-	_, verifier, err := keystore.LoadOrGenerate(p.Keyring.Value)
-	if err != nil {
-		return output.NewError("internal",
-			fmt.Sprintf("restore: signing key: %v", err)).Wrap(err)
-	}
 
 	// Resolve `latest` to a concrete backup ID. With
 	// --to <time> set, the right seed isn't necessarily the
@@ -284,9 +287,27 @@ func runRestore(cmd *cobra.Command, opts restoreOpts) error {
 		}
 	}
 
+	// The keyring must already hold the keypair that signed the backups.
+	// Minting one here (on a fresh DR host) cannot verify those manifests
+	// and would sign later backups with a key nothing else trusts; say
+	// what is missing instead (notfound.signing_key → `keyring install`).
+	// Loaded after flag validation: a malformed invocation is a usage
+	// error (exit 2) whatever the state of the keyring.
+	_, verifier, err := loadExistingKeypair("restore")
+	if err != nil {
+		return err
+	}
+
 	backupID := opts.backupID
 	autoResolved := false
 	var resolvedFrom string
+	// JSON mode: stdout carries exactly one document, the Result.
+	// Events (the resolution warnings below, restore progress, the
+	// advisories after it) are suppressed there; what they say that
+	// matters to a machine reader travels in the Result body instead
+	// (skipped_manifests).
+	suppressEvents := d.Renderer().Name() == "json"
+	skippedManifests := 0
 	if backupID == LatestKeyword {
 		// Time-targeted PITR: prefer the time-aware resolver
 		// over the unconstrained latest. The seed must be the
@@ -302,7 +323,8 @@ func runRestore(cmd *cobra.Command, opts restoreOpts) error {
 			// exactly the one that would have won — a closer seed,
 			// meaning less WAL to replay. Say so before the restore
 			// runs; same posture as the `latest` path.
-			if skipped > 0 {
+			skippedManifests = skipped
+			if skipped > 0 && !suppressEvents {
 				_ = d.Event(cmd.Context(), output.NewEvent(output.SeverityWarning, "restore", "time_target_resolved_with_skips").
 					WithSubject(output.Subject{Deployment: opts.deployment}).
 					WithBody(map[string]any{
@@ -327,7 +349,8 @@ func runRestore(cmd *cobra.Command, opts restoreOpts) error {
 			// the operator believes they asked for the newest is a
 			// silently wrong recovery, so say so before the restore
 			// runs and name the way out (an explicit backup ID).
-			if skipped > 0 {
+			skippedManifests = skipped
+			if skipped > 0 && !suppressEvents {
 				_ = d.Event(cmd.Context(), output.NewEvent(output.SeverityWarning, "restore", "latest_resolved_with_skips").
 					WithSubject(output.Subject{Deployment: opts.deployment}).
 					WithBody(map[string]any{
@@ -406,9 +429,8 @@ func runRestore(cmd *cobra.Command, opts restoreOpts) error {
 		}
 	}
 
-	// Wire OnEvent to the dispatcher; suppress in JSON mode so the
-	// final Result is the only document in the stream.
-	suppressEvents := d.Renderer().Name() == "json"
+	// Wire OnEvent to the dispatcher; suppressed in JSON mode (see
+	// suppressEvents above) so the final Result is the only document.
 	kmsProviderFor := deploymentKMSResolver(opts.kmsConfig)
 	res, err := restore.Restore(cmd.Context(), restore.Options{
 		RepoURL:             opts.repoURL,
@@ -423,6 +445,15 @@ func runRestore(cmd *cobra.Command, opts restoreOpts) error {
 		ChainStagingRoot:    opts.chainStagingRoot,
 		ResetChainStaging:   opts.resetChainStaging,
 		VerifyMode:          opts.verifyRestoreMode,
+		// pg_verifybackup runs INSIDE Restore, before the boot test:
+		// booting runs recovery in the target (pg_control rewritten,
+		// backup_label consumed), so running it afterwards — as this
+		// command used to — failed every restore that was booted.
+		PGVerifyBackup: verifyMode,
+		// Independent of `recovery`: a plain restore has no Recovery,
+		// yet its backup-WAL pre-flight names --skip-gap-check as the
+		// override.
+		SkipGapCheck: opts.skipGapCheck,
 		// Always wire the KEK resolver. It's a no-op for unencrypted
 		// backups (Restore only consults it when manifest.Encryption
 		// is non-nil) and the right resolver for encrypted ones.
@@ -447,8 +478,16 @@ func runRestore(cmd *cobra.Command, opts restoreOpts) error {
 			_ = d.Event(cmd.Context(), e)
 		},
 	})
+	// A pg_verifybackup refusal (--verify=require) comes back with a
+	// Result carrying the verification outcome: render it like any
+	// other result so the operator sees what failed, then exit with
+	// the verify error.
+	var verifyErr error
 	if err != nil {
-		return err
+		if res == nil || res.Verify == nil {
+			return err
+		}
+		verifyErr = err
 	}
 
 	// Advise on the restore_command's runtime dependency: PG recovery
@@ -478,10 +517,10 @@ func runRestore(cmd *cobra.Command, opts restoreOpts) error {
 		}
 	}
 
-	// Post-restore verification gate.
-	verify, verifyErr := restore.Verify(cmd.Context(), opts.targetDir, verifyMode)
-	// Even on require-failure we want to attach the VerifyResult to
-	// the output so the user sees what happened. Render then return.
+	// The pg_verifybackup outcome (run by Restore before the boot
+	// test). Even on require-failure it is attached to the output so
+	// the user sees what happened. Render then return.
+	verify := res.Verify
 	body := restoreResultBody{
 		BackupID:          res.BackupID,
 		Deployment:        res.Deployment,
@@ -498,6 +537,7 @@ func runRestore(cmd *cobra.Command, opts restoreOpts) error {
 	if autoResolved {
 		body.AutoResolved = true
 		body.ResolvedFrom = resolvedFrom
+		body.SkippedManifests = skippedManifests
 	}
 	// Surface tablespace remap in the result body for
 	// forensics. Only populated when the operator passed
@@ -803,6 +843,11 @@ type restoreResultBody struct {
 	Recovery          *recoveryArmed        `json:"recovery,omitempty"`
 	AutoResolved      bool                  `json:"auto_resolved,omitempty"`
 	ResolvedFrom      string                `json:"resolved_from,omitempty"` // "time" | "latest"
+	// SkippedManifests counts manifests the latest / --to resolver
+	// could not read and therefore could not rank: one of them may
+	// have been the better seed. Mirrors the *_resolved_with_skips
+	// warning, which JSON mode does not emit (one document only).
+	SkippedManifests int `json:"skipped_manifests,omitempty"`
 	// TablespaceRemap surfaces the operator-supplied path
 	// redirects when --tablespace-mapping was used. Empty /
 	// nil = no remap requested; the field is omitempty so the

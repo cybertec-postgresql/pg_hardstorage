@@ -117,6 +117,12 @@ type runState struct {
 	//     consumes this ref so assert_restored_match knows
 	//     where to start the sandbox cluster.
 	capturedStates map[string]*capturedState
+
+	// lastCLIOutput is the combined stdout+stderr of the most recent
+	// cli_run step; haveCLIOutput says one has run. Feed the
+	// cli_output_contains_any assertion.
+	lastCLIOutput string
+	haveCLIOutput bool
 }
 
 // capturedState is the per-name struct stored in
@@ -352,8 +358,7 @@ func findDockerLeaderContainer(ctx context.Context, dsn string) (string, error) 
 	if port == "" {
 		return "", errors.New("DSN has no explicit port")
 	}
-	cmd := exec.CommandContext(ctx, "docker", "ps", "--format", "{{.Names}}\t{{.Ports}}")
-	stdout, err := cmd.Output()
+	stdout, err := dockerInfo(ctx, "ps", "--format", "{{.Names}}\t{{.Ports}}")
 	if err != nil {
 		return "", fmt.Errorf("docker ps: %w", err)
 	}
@@ -574,11 +579,10 @@ func runAssertRestoredMatch(ctx context.Context, st scenario.Step, idx int, stat
 		// Capture docker logs for forensics — the sandbox name
 		// may already be gone if `docker run` itself bombed,
 		// but `docker logs` is best-effort.
-		logsOut, _ := exec.Command("docker", "logs", "--tail", "200",
-			sandboxName).CombinedOutput()
+		logsOut, _ := dockerDiag("logs", "--tail", "200", sandboxName)
 		_ = os.WriteFile(logFile, logsOut, 0o644)
 		// Best-effort cleanup of a half-spawned container.
-		_ = exec.Command("docker", "rm", "-fv", sandboxName).Run()
+		_, _ = dockerDiag("rm", "-fv", sandboxName)
 		return StepResult{Index: idx, Kind: st.Kind, Pass: false,
 			Message: fmt.Sprintf("assert_restored_match: sandbox start: %v (logs: %s)",
 				startErr, logFile)}
@@ -658,8 +662,7 @@ func runAssertRestoredMatch(ctx context.Context, st scenario.Step, idx int, stat
 		// Drop the sandbox's stderr into logFile so the operator
 		// can see why postmaster never came up (auth?  bad
 		// pg_hba?  WAL replay errors?).
-		logsOut, _ := exec.Command("docker", "logs", "--tail", "200",
-			sandboxName).CombinedOutput()
+		logsOut, _ := dockerDiag("logs", "--tail", "200", sandboxName)
 		_ = os.WriteFile(logFile, logsOut, 0o644)
 		return StepResult{Index: idx, Kind: st.Kind, Pass: false,
 			Message: fmt.Sprintf("assert_restored_match: sandbox did not accept connections within %s (log: %s)", sandboxReadyTimeout, logFile)}
@@ -1524,7 +1527,22 @@ func runRestore(ctx context.Context, st scenario.Step, idx int, state *runState,
 	// skip as a separate event so an operator looking at the
 	// run can see the gap.
 	if vbBin, err := exec.LookPath("pg_verifybackup"); err == nil {
-		vbCmd := exec.CommandContext(ctx, vbBin, target)
+		// -n, for the same reason internal/restore/verify.go passes
+		// it: a restored data directory legitimately has no WAL yet.
+		// pg_hardstorage restores the base backup; the WAL needed to
+		// reach consistency arrives later via the restore_command. So
+		// asking pg_verifybackup to parse pg_wal fails a perfectly
+		// good restore —
+		//
+		//	pg_waldump: could not find a valid record after 0/2000028
+		//	pg_verifybackup: WAL parsing failed for timeline 1
+		//
+		// which is what L4_pg_upgrade_cross_major hit. The product
+		// documented this and got it right; this check did not, and
+		// nothing noticed because LookPath fails on any host without
+		// postgresql-client — so the whole block silently never ran.
+		// Installing the client is what made it visible.
+		vbCmd := exec.CommandContext(ctx, vbBin, "-n", target)
 		var vbOut bytes.Buffer
 		vbCmd.Stdout = &vbOut
 		vbCmd.Stderr = &vbOut
@@ -1651,6 +1669,11 @@ func runInject(ctx context.Context, st scenario.Step, idx int, state *runState, 
 			emit(out, "step.inject.recovery_failed", map[string]any{
 				"index": idx, "error": rerr.Error(),
 			})
+			// The fault is still applied. Passing here let the scenario
+			// carry on against a degraded cell and blame whatever broke
+			// next on the product.
+			return StepResult{Index: idx, Kind: st.Kind, Pass: false,
+				Message: fmt.Sprintf("inject %q: recovery failed, fault still applied: %v", action, rerr)}
 		}
 	}
 	emit(out, "step.inject.completed", map[string]any{
@@ -1692,7 +1715,7 @@ func actionWantsPGReadyPoll(action string) bool {
 // previous fixed-sleep heal_window had to be tuned to the slowest
 // observed case, wasting time on quiet hosts and STILL silently
 // expiring before PG was ready on the slowest ones — surfacing
-// as `storage.unreachable` on the next take_backup.
+// as `pg.unreachable` on the next take_backup.
 //
 // ensureUp is the list of docker containers that should be running
 // for PG to come back.  Each tick calls `docker start` on each —

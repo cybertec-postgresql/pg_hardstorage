@@ -2,8 +2,10 @@
 package cli
 
 import (
+	"context"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"strings"
 
@@ -101,7 +103,7 @@ applying it; --print-sql to write the embedded SQL to stdout
 				return output.NewError("db.psql_not_found",
 					"db install-extension: `psql` not on PATH — install postgresql-client (or use --print-sql to apply manually)").Wrap(err)
 			}
-			pcmd := exec.CommandContext(cmd.Context(), ps, "-v", "ON_ERROR_STOP=1", "-d", pgConn, "-X", "-q", "-1")
+			pcmd := psqlCommand(cmd.Context(), ps, pgConn)
 			pcmd.Stdin = strings.NewReader(sql)
 			pcmd.Stderr = cmd.ErrOrStderr()
 			if err := pcmd.Run(); err != nil {
@@ -167,7 +169,7 @@ the repo — backups themselves are unaffected.`,
 			drop := `DROP SCHEMA IF EXISTS pg_hardstorage CASCADE;
 DROP ROLE IF EXISTS pg_hardstorage_writer;
 `
-			pcmd := exec.CommandContext(cmd.Context(), ps, "-v", "ON_ERROR_STOP=1", "-d", pgConn, "-X", "-q", "-1")
+			pcmd := psqlCommand(cmd.Context(), ps, pgConn)
 			pcmd.Stdin = strings.NewReader(drop)
 			pcmd.Stderr = cmd.ErrOrStderr()
 			if err := pcmd.Run(); err != nil {
@@ -222,4 +224,16 @@ type dbExtUninstallBody struct {
 func (b dbExtUninstallBody) WriteText(w io.Writer) error {
 	_, err := fmt.Fprintf(w, "✓ db uninstall-extension — schema %s dropped (repo backups unaffected)", b.Schema)
 	return err
+}
+
+// psqlCommand runs psql against dsn in a single transaction with the
+// password moved out of argv into PGPASSWORD: a child's argv is readable
+// by every local user (ps, /proc/<pid>/cmdline), its environment is not.
+func psqlCommand(ctx context.Context, psql, dsn string) *exec.Cmd {
+	conn, password, hasPassword := splitDSNPassword(dsn)
+	c := exec.CommandContext(ctx, psql, "-v", "ON_ERROR_STOP=1", "-d", conn, "-X", "-q", "-1")
+	if hasPassword {
+		c.Env = append(os.Environ(), "PGPASSWORD="+password)
+	}
+	return c
 }

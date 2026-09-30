@@ -113,7 +113,7 @@ func ResolveEncryption(ctx context.Context, req EncryptionRequest) (*EncryptionC
 		}
 		provider, err := registry.Open(ctx, req.KEKRef, req.KMSConfig)
 		if err != nil {
-			return nil, fmt.Errorf("%w %q: %w", ErrKMSOpen, req.KEKRef, err)
+			return nil, fmt.Errorf("%w %q: %w", ErrKMSOpen, kms.RedactKEKRef(req.KEKRef), err) // ?pin= and other secrets stay out of errors
 		}
 		return &EncryptionConfig{
 			Provider: provider,

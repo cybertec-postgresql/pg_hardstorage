@@ -30,6 +30,11 @@ func IsUnreachable(err error) bool {
 	if err == nil {
 		return false
 	}
+	// A provider that classified its own failure as transient
+	// (throttled, 5xx) is operationally unreachable too: retry later.
+	if errors.Is(err, ErrUnavailable) {
+		return true
+	}
 
 	// Typed network causes — these unwrap through *url.Error and most SDK
 	// wrappers via errors.As.

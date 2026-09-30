@@ -73,16 +73,21 @@ the exact command to run.
 
 ## 2. Restore
 
-### Interactive
+### Choosing a backup
+
+`restore` always takes the deployment **and** the backup to restore —
+there is no prompt that picks one for you. List the candidates first,
+then name one (or `latest`):
 
 ```sh
-pg_hardstorage restore db1
+pg_hardstorage list db1
+pg_hardstorage restore db1 <backup-id> --target /var/lib/postgresql/restored
 ```
 
-With no positional argument the command lists backups, prompts for
-selection, runs pre-flight checks, and asks for confirmation. The
-answer is `y` to proceed, anything else aborts with exit 5
-(operator-aborted).
+There is no confirmation prompt: the command runs its pre-flight checks
+(see *Refusals* below) and then restores. Use `--preview` to see the plan
+without touching disk. For a guided, menu-driven restore, use
+`pg_hardstorage_simple`.
 
 ### Latest, with one confirmation
 
@@ -117,8 +122,9 @@ pg_hardstorage restore db1 latest \
 
 Prints what would happen — source backup, WAL replay range, RTO
 estimate, target tablespace mapping, verification gate — and exits
-without touching disk. Pair with `--force` to run the same
-operation non-interactively after operator review.
+without touching disk. Re-run the same command without `--preview` to
+perform it. (`--force` is unrelated: it only permits restoring into a
+non-empty target directory.)
 
 ### Refusals (pre-flight, exit 4)
 
@@ -150,8 +156,14 @@ deployments:
       keep_yearly: 5
 ```
 
-`rotate` runs after every backup commit and as a scheduled job. Manual
-invocation is dry-run by default:
+`rotate` is a job in its own right: the agent runs it on the schedule
+the deployment declares, and nothing else triggers it. In particular
+**`backup` does not run it** — a deployment that schedules `backup` but
+not `rotate` keeps every backup it ever takes, whatever `retention`
+says. Retention is a policy the `rotate` job applies, not a property
+the repository enforces on write.
+
+Manual invocation is dry-run by default:
 
 ```sh
 pg_hardstorage rotate db1                # dry-run, prints decisions
@@ -250,7 +262,7 @@ that ran and failed, so a cron gate keyed on 9 catches both.
 The full SHA round-trip across every chunk in the repo:
 
 ```sh
-pg_hardstorage repair scrub <repo-url>
+pg_hardstorage repair scrub --repo <repo-url>
 ```
 
 Mismatches surface as `verify.scrub_mismatch` (exit 9). Schedule this
@@ -291,7 +303,44 @@ pg_hardstorage repo gc file:///srv/backups --apply    # delete orphans
 Walks every manifest (including tombstoned), builds the live chunk
 set, lists everything in `chunks/sha256/` and reports the difference.
 Result body carries `bytes_reclaimable` (dry-run) or `bytes_reclaimed`
-(applied).
+(applied). In `-o json` the output is a single document; warnings
+(for example a disabled safety floor) are in the body's `notices`.
+
+#### gc safety: running `--apply` next to live writers
+
+`repo gc --apply` is safe to run while backups, `wal stream`,
+`wal push`, logical streams, `repo replicate` and bundle imports write to the same
+repository. The hazard is a writer that **deduplicates against** an
+orphan chunk (it adopts the existing object instead of writing it —
+no new mtime, so `--min-chunk-age` does not protect it) and commits a
+manifest referencing it while gc is deleting it. gc and the writers
+share an exclusion protocol (implemented in
+`internal/repo/gcfence.go`):
+
+- gc publishes a **run record** under `gc/runs/` before it starts,
+  heartbeats it, and waits a settle period (60 s, overlapped with the
+  initial walk) before taking the snapshot that decides deletions.
+- gc deletes in batches. Before each batch it publishes a checkpoint,
+  reads writer **pins** (`gc/pins/`), re-scans backup leases (a backup
+  that starts mid-sweep stops the sweep: `conflict.gc_backup_in_flight`,
+  exit 7, retry-safe) and re-scans for manifests committed since the
+  snapshot. Pinned or newly referenced chunks are spared.
+- gc never deletes a chunk younger than the start of its own run, even
+  with `--min-chunk-age 0`.
+- A writer about to commit a manifest over adopted chunks reads the
+  run records first. If a gc run is live it pins those chunks and waits
+  for the run's in-flight batch to finish, then re-checks the chunks
+  exist before committing. If no run was live and the commit took
+  longer than the writer budget (30 s), it re-checks after committing;
+  a chunk swept in that window fails the operation loudly instead of
+  leaving an unrestorable manifest reported as good.
+
+Hosts must agree on the time to well within the run-record TTL
+(2 minutes), as they already must for backup leases. Run records are
+kept 24 h; pins expire after 6 h. Orphan deletions are not
+individually fsynced on the fs backend (a crash can resurrect an
+orphan, which the next run reaps), which is what keeps a sweep of tens
+of thousands of chunks to seconds.
 
 ### usage
 
@@ -580,17 +629,17 @@ sinks:
     plugin: webhook
     config:
       url: https://alerts.example.com/hooks/pg-hardstorage
-      authorization: "Bearer kms-secret://ops/webhook-token"
+      auth_header: "Bearer <token>"   # sent as the Authorization header; literal value
 
   - name: ops-email
     plugin: email
     config:
       smtp_host: smtp.example.com
       smtp_port: 587
-      tls_mode: starttls          # starttls | implicit | none
-      auth_mode: plain            # plain | login | none
+      tls: starttls               # starttls | implicit | none
+      auth: plain                 # plain | login | none
       username: pg-hardstorage
-      password_secret: kms-secret://ops/smtp-password
+      password: "<smtp-password>"   # literal; keep pg_hardstorage.yaml mode 0600
       from: backups@example.com
       to: ["dba@example.com"]
       cc: ["ops@example.com"]

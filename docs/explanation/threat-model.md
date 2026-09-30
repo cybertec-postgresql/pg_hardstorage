@@ -317,7 +317,10 @@ software-architectural controls is a category error.
 - **n-of-m approval for destructive operations.**  A single
   insider cannot `kms shred` or `repo gc --delete` alone.
 - **JIT access.**  Time-bound elevated tokens for break-glass
-  operations; auto-expire; audit-stamped.
+  operations; auto-expire; audit-stamped.  Destructive commands
+  do not yet consume tokens (they are approval-gated), so today a
+  token is checked with `jit verify` in operator tooling and is
+  not an enforcement control on its own.
 - **Insider-threat anomaly detection.**  Unusual download
   patterns, novel IAM principals, off-hours bulk reads → alert.
 

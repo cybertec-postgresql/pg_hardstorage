@@ -103,30 +103,26 @@ func runRepoCheck(cmd *cobra.Command, repoURL string) error {
 	}
 	depReports := make([]repoCheckDeployment, 0, len(deployments))
 	totalSigFailed := 0
+	var sigFailedKeys []string
 	totalManifests := 0
+	totalUnreadable := 0
+	walkErrSample := ""
 	for _, dep := range deployments {
 		dr := repoCheckDeployment{Name: dep}
-		for m, err := range store.List(cmd.Context(), dep, verifier) {
-			if err != nil {
-				// Distinguish a genuine signature/parse failure (the
-				// manifest was fetched but failed Ed25519 verification,
-				// schema/parse, or the embedded key mismatched) from a
-				// transient backend/List error. Counting a List/Get
-				// failure as a signature failure would report
-				// "potential tampering" (exit 9) and present a
-				// truncated walk as complete — a storage hiccup must
-				// not masquerade as corruption.
-				if !isManifestSignatureFailure(err) {
-					return output.NewError("repo.check.manifest_walk_failed",
-						fmt.Sprintf("repo check: list manifests for %s: %v", dep, err)).Wrap(err)
-				}
-				dr.SignatureFailures++
-				totalSigFailed++
-				continue
-			}
-			dr.LiveManifests++
-			totalManifests++
-			_ = m // we only count here; FindMissing does the ref walk
+		walk, werr := checkDeploymentManifests(cmd.Context(), sp, dep, verifier)
+		if werr != nil {
+			return output.NewError("repo.check.manifest_walk_failed",
+				fmt.Sprintf("repo check: list manifests for %s: %v", dep, werr)).Wrap(werr)
+		}
+		dr.LiveManifests = walk.live
+		dr.SignatureFailures = walk.sigFailed
+		dr.UnreadableManifests = walk.unreadable
+		totalManifests += walk.live
+		totalSigFailed += walk.sigFailed
+		sigFailedKeys = append(sigFailedKeys, walk.sigFailedKeys...)
+		totalUnreadable += walk.unreadable
+		if walkErrSample == "" && walk.firstReadErr != nil {
+			walkErrSample = walk.firstReadErr.Error()
 		}
 		// Tombstone count — list once with a hand-rolled walk since
 		// the store filters them out of List by design.
@@ -175,17 +171,19 @@ func runRepoCheck(cmd *cobra.Command, repoURL string) error {
 	}
 
 	body := repoCheckBody{
-		URL:               repoURL,
-		RepoID:            meta.ID,
-		Schema:            meta.Schema,
-		Deployments:       depReports,
-		LiveManifests:     totalManifests,
-		SignatureFailures: totalSigFailed,
-		ChunkRefs:         refs.Len(),
-		MissingChunks:     len(missing),
-		OrphanedReplicas:  orphanedReplicas,
-		WORM:              meta.WORM,
-		CommitMode:        commitMode,
+		URL:                      repoURL,
+		RepoID:                   meta.ID,
+		Schema:                   meta.Schema,
+		Deployments:              depReports,
+		LiveManifests:            totalManifests,
+		SignatureFailures:        totalSigFailed,
+		SignatureFailedManifests: capList(sigFailedKeys, maxListedSignatureFailures),
+		UnreadableManifests:      totalUnreadable,
+		ChunkRefs:                refs.Len(),
+		MissingChunks:            len(missing),
+		OrphanedReplicas:         orphanedReplicas,
+		WORM:                     meta.WORM,
+		CommitMode:               commitMode,
 	}
 	const maxListedHashes = 64
 	for i, h := range missing {
@@ -207,8 +205,15 @@ func runRepoCheck(cmd *cobra.Command, repoURL string) error {
 	// silently miss the corruption.  Surfaced by
 	// L8_repo_check_detects_manifest_corruption.
 	body.Healthy = body.MissingChunks == 0 && body.SignatureFailures == 0 &&
-		len(body.OrphanedReplicas) == 0
+		len(body.OrphanedReplicas) == 0 && body.UnreadableManifests == 0
 
+	// The verify.* refusals below used to return the error alone, so the
+	// body — which manifests, which chunks — never reached the operator.
+	if body.MissingChunks > 0 || len(body.OrphanedReplicas) > 0 || body.SignatureFailures > 0 {
+		if rerr := d.Result(output.NewResult(cmd.CommandPath()).WithBody(body)); rerr != nil {
+			return rerr
+		}
+	}
 	if body.MissingChunks > 0 {
 		// verify.* is the namespace operators wire ExitVerifyFailed
 		// to (see internal/output/exitcode.go); a missing-chunks
@@ -240,45 +245,119 @@ func runRepoCheck(cmd *cobra.Command, repoURL string) error {
 		// silently-wrong bytes).  Operators must be told via
 		// exit code, not just a field in the JSON body.
 		return output.NewError("verify.signature_failures",
-			fmt.Sprintf("repo check: %d manifest signature(s) failed verification",
-				body.SignatureFailures)).
+			fmt.Sprintf("repo check: %d manifest signature(s) failed verification: %s",
+				body.SignatureFailures, strings.Join(capList(sigFailedKeys, 3), ", "))).
 			WithSuggestion(&output.Suggestion{
 				Human:   "a manifest either failed Ed25519 verification or failed to parse — investigate with `pg_hardstorage repair manifest` and check the audit chain for tampering.",
 				Command: "pg_hardstorage audit verify-chain --repo " + repoURL,
 			})
 	}
+	if body.UnreadableManifests > 0 {
+		// Not a finding about the repository — a statement about this
+		// run: N manifests could not be READ (storage errors), so the
+		// check is incomplete. Emit the body, then a non-verify error:
+		// exit 1, not 9, because nothing was found to be tampered with.
+		if rerr := d.Result(output.NewResult(cmd.CommandPath()).WithBody(body)); rerr != nil {
+			return rerr
+		}
+		return output.NewError("repo.check.manifests_unreadable",
+			fmt.Sprintf("repo check: %d manifest(s) could not be read (storage errors), so the check is incomplete: %s",
+				body.UnreadableManifests, walkErrSample)).
+			WithSuggestion(&output.Suggestion{
+				Human: "these are backend read failures, not signature failures; re-run once the storage backend is healthy",
+			})
+	}
 	return d.Result(output.NewResult(cmd.CommandPath()).WithBody(body))
 }
 
-// isManifestSignatureFailure reports whether err from a manifest walk
-// is a genuine signature/verification failure — the manifest bytes
-// were fetched but failed to parse, verify, or matched a different
-// signing key — rather than a transient backend/List error (storage
-// unreachable, listing interrupted, context cancelled). Only the
-// former is "potential tampering" (exit 9); the latter means the walk
-// was TRUNCATED and must be surfaced as a backend error so a storage
-// hiccup doesn't masquerade as corruption or report an incomplete
-// walk as clean.
+// manifestCheckWalk is one deployment's manifest-walk tally.
+type manifestCheckWalk struct {
+	live, sigFailed, unreadable int
+	firstReadErr                error
+	// sigFailedKeys names the manifests counted in sigFailed: a count
+	// alone told the operator something was wrong, not where.
+	sigFailedKeys []string
+}
+
+// checkDeploymentManifests walks deployment's primary manifests and
+// classifies each by WHERE it failed, not by what the error looks like.
 //
-// Classification is by exclusion: a storage-layer sentinel or a
-// cancellation is unambiguously a backend error; everything else that
-// bubbles out of ParseAndVerify (key mismatch, unsigned, bad
-// signature, JSON-parse, schema-mismatch) is a real verification
-// failure over bytes we DID fetch.
-func isManifestSignatureFailure(err error) bool {
-	if err == nil {
-		return false
+// The previous classifier took ManifestStore.List's mixed error stream
+// and called anything that was not one of five storage sentinels a
+// signature failure. A throttled GET (an S3 500, a 503 SlowDown, a reset
+// connection) carries none of those sentinels, so it was reported as
+// "potential tampering" — exit 9 — and, worse, a walk that should have
+// been reported incomplete looked complete.
+//
+// Here the two stages are separate calls. A failure to LIST aborts (the
+// walk cannot know what it missed). A failure to GET or read the body is
+// an unreadable manifest: counted, and the walk continues; the command
+// reports the check incomplete. ErrNotFound on GET is a manifest deleted
+// between List and Get (retention/prune) and is skipped. Only bytes that
+// were fetched and then fail ParseAndVerify are signature failures.
+func checkDeploymentManifests(ctx context.Context, sp storage.StoragePlugin, deployment string, verifier *backup.Verifier) (manifestCheckWalk, error) {
+	var w manifestCheckWalk
+	prefix := "manifests/" + deployment + "/backups/"
+	const manifestSuffix = "/manifest.json"
+	const tombstoneSuffix = "/manifest.json.tombstone"
+	var keys []string
+	tombstoned := map[string]struct{}{}
+	for info, err := range sp.List(ctx, prefix) {
+		if err != nil {
+			return w, err
+		}
+		rel := strings.TrimPrefix(info.Key, prefix)
+		id, _, _ := strings.Cut(rel, "/")
+		switch {
+		case strings.HasSuffix(info.Key, tombstoneSuffix):
+			tombstoned[id] = struct{}{}
+		case strings.HasSuffix(info.Key, manifestSuffix):
+			keys = append(keys, info.Key)
+		}
 	}
-	if errors.Is(err, storage.ErrNotFound) ||
-		errors.Is(err, storage.ErrChecksumMismatch) ||
-		errors.Is(err, storage.ErrUnsupported) ||
-		errors.Is(err, storage.ErrUnknownScheme) ||
-		errors.Is(err, storage.ErrAlreadyExists) ||
-		errors.Is(err, context.Canceled) ||
-		errors.Is(err, context.DeadlineExceeded) {
-		return false
+	sort.Strings(keys)
+	for _, key := range keys {
+		if err := ctx.Err(); err != nil {
+			return w, err
+		}
+		id, _, _ := strings.Cut(strings.TrimPrefix(key, prefix), "/")
+		if _, dead := tombstoned[id]; dead {
+			continue
+		}
+		rc, err := sp.Get(ctx, key)
+		if err != nil {
+			if errors.Is(err, storage.ErrNotFound) {
+				continue // deleted since the List
+			}
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return w, ctxErr
+			}
+			w.unreadable++
+			if w.firstReadErr == nil {
+				w.firstReadErr = fmt.Errorf("%s: %w", key, err)
+			}
+			continue
+		}
+		body, rerr := backup.ReadAllLimited(rc, backup.MaxManifestBytes)
+		_ = rc.Close()
+		if rerr != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return w, ctxErr
+			}
+			w.unreadable++
+			if w.firstReadErr == nil {
+				w.firstReadErr = fmt.Errorf("%s: %w", key, rerr)
+			}
+			continue
+		}
+		if _, verr := backup.ParseAndVerify(body, verifier); verr != nil {
+			w.sigFailed++
+			w.sigFailedKeys = append(w.sigFailedKeys, key)
+			continue
+		}
+		w.live++
 	}
-	return true
+	return w, nil
 }
 
 // countTombstones walks the deployment's manifest tree once and
@@ -303,7 +382,11 @@ type repoCheckDeployment struct {
 	Name              string `json:"name"`
 	LiveManifests     int    `json:"live_manifests"`
 	SignatureFailures int    `json:"signature_failures"`
-	Tombstones        int    `json:"tombstones"`
+	// UnreadableManifests: manifests whose bytes could not be READ
+	// (storage errors) — distinct from signature failures, which are
+	// about bytes that were read. See checkDeploymentManifests.
+	UnreadableManifests int `json:"unreadable_manifests,omitempty"`
+	Tombstones          int `json:"tombstones"`
 }
 
 // repoCheckBody is the v1-stable result body.
@@ -314,8 +397,14 @@ type repoCheckBody struct {
 	Deployments       []repoCheckDeployment `json:"deployments"`
 	LiveManifests     int                   `json:"live_manifests"`
 	SignatureFailures int                   `json:"signature_failures"`
-	ChunkRefs         int                   `json:"chunk_refs"`
-	MissingChunks     int                   `json:"missing_chunks"`
+	// SignatureFailedManifests lists the manifests that failed to parse
+	// or verify (capped; SignatureFailures has the full count).
+	SignatureFailedManifests []string `json:"signature_failed_manifests,omitempty"`
+	// UnreadableManifests > 0 means the check is incomplete (exit 1,
+	// repo.check.manifests_unreadable), not that anything was tampered.
+	UnreadableManifests int `json:"unreadable_manifests,omitempty"`
+	ChunkRefs           int `json:"chunk_refs"`
+	MissingChunks       int `json:"missing_chunks"`
 	// OrphanedReplicas lists backup IDs whose redundancy copy under
 	// manifests/_replicas/ survives but whose primary manifest is gone.
 	// They are invisible to every listing until `repair manifest`
@@ -466,3 +555,6 @@ func findOrphanedReplicas(ctx context.Context, sp storage.StoragePlugin, store *
 	sort.Strings(orphans)
 	return orphans, nil
 }
+
+// maxListedSignatureFailures caps signature_failed_manifests in the body.
+const maxListedSignatureFailures = 64

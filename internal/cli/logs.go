@@ -2,10 +2,10 @@
 package cli
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"io"
-	"os"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -56,7 +56,10 @@ multi-instance pattern).
 
 Options:
 
-  --follow / -f      tail forward (default: print last 100 lines)
+  --follow / -f      tail forward (default: print last 100 lines).
+                     Streams with -o text (raw lines) or -o ndjson
+                     (one logs.line event per entry); other formats
+                     are refused with usage.follow_needs_stream.
   --lines N          how many lines to print initially (default 100)
   --since DUR-OR-TS  start from this point ("24h", "yesterday",
                      RFC3339). A bare duration means "that long
@@ -132,6 +135,20 @@ func journalSince(since string) string {
 func runLogs(cmd *cobra.Command, deployment, overrideUnit, since string, lines int, follow bool) error {
 	d := DispatcherFrom(cmd)
 
+	// An endless tail can only be rendered by a format that streams:
+	// text (journalctl's own lines) or ndjson (one event per entry).
+	// Every other renderer promises a document written once at the end
+	// — json exactly one — which --follow never reaches. It used to exec
+	// journalctl with inherited stdout regardless, putting plain text in
+	// the stream a script was parsing as JSON.
+	if follow && d.Renderer().Name() != "text" && d.Renderer().Name() != "ndjson" {
+		return output.NewError("usage.follow_needs_stream",
+			fmt.Sprintf("logs: --follow cannot be rendered as %s (it never ends, so no single document is ever complete)", d.Renderer().Name())).
+			WithSuggestion(&output.Suggestion{
+				Human: "use -o ndjson for one JSON event per journal entry, -o text for raw lines, or drop --follow for a one-shot document",
+			}).Wrap(output.ErrUsage)
+	}
+
 	// Locate journalctl. Failing here is the most common
 	// non-systemd-host case; surface a structured error so a
 	// monitoring tool can detect "this host doesn't have systemd"
@@ -162,19 +179,22 @@ func runLogs(cmd *cobra.Command, deployment, overrideUnit, since string, lines i
 		args = append(args, "--since", journalSince(since))
 	}
 
-	// Mode A: the operator wants tail-style streaming output. We
+	// Mode A: text — the operator wants tail-style output. We
 	// exec journalctl with stdout/stderr inherited so the log
 	// stream goes straight to their terminal. The dispatcher's
 	// Result/Event mechanism doesn't suit a 24-hour-tail use case.
-	if follow || d.Renderer().Name() == "text" {
+	if follow && d.Renderer().Name() == "ndjson" {
+		return followJournalNDJSON(cmd, d, bin, append(args, "-o", "json"), unit)
+	}
+	if d.Renderer().Name() == "text" {
 		c := exec.CommandContext(cmd.Context(), bin, args...)
-		c.Stdout = os.Stdout
+		c.Stdout = cmd.OutOrStdout()
 		// Tee stderr to the terminal AND capture it, so we can tell a
 		// benign "no entries" (empty stderr) apart from a real failure
 		// (e.g. a bad --since value, whose message journalctl writes to
 		// stderr) without hiding the message from the operator.
 		var stderrBuf strings.Builder
-		c.Stderr = io.MultiWriter(os.Stderr, &stderrBuf)
+		c.Stderr = io.MultiWriter(cmd.ErrOrStderr(), &stderrBuf)
 		if err := c.Run(); err != nil {
 			// Exit code 1 is overloaded: "no entries for this unit"
 			// (empty stderr) vs a genuine failure (non-empty stderr).
@@ -351,6 +371,39 @@ func extractJSONString(s, key string) string {
 }
 
 // Result body shapes — stable per the v1 schema commitment.
+
+// followJournalNDJSON tails journalctl -o json and emits each entry as
+// a logs.line event as it arrives — ndjson's streaming contract.
+func followJournalNDJSON(cmd *cobra.Command, d *output.Dispatcher, bin string, args []string, unit string) error {
+	c := exec.CommandContext(cmd.Context(), bin, args...)
+	var stderrBuf strings.Builder
+	c.Stderr = io.MultiWriter(cmd.ErrOrStderr(), &stderrBuf)
+	stdout, err := c.StdoutPipe()
+	if err != nil {
+		return fmt.Errorf("logs: journalctl: %w", err)
+	}
+	if err := c.Start(); err != nil {
+		return fmt.Errorf("logs: journalctl: %w", err)
+	}
+	sc := bufio.NewScanner(stdout)
+	sc.Buffer(make([]byte, 64*1024), 16*1024*1024) // journal entries can be large
+	for sc.Scan() {
+		for _, jl := range parseJournalJSON(sc.Text()) {
+			_ = d.Event(cmd.Context(), output.NewEvent(output.SeverityInfo, "logs", "line").
+				WithBody(map[string]any{
+					"unit": unit, "timestamp": jl.Timestamp, "priority": jl.Priority,
+					"message": jl.Message, "raw": jl.Raw,
+				}))
+		}
+	}
+	if err := c.Wait(); err != nil && cmd.Context().Err() == nil {
+		if msg := strings.TrimSpace(stderrBuf.String()); msg != "" {
+			return fmt.Errorf("logs: journalctl: %s", msg)
+		}
+		return fmt.Errorf("logs: journalctl: %w", err)
+	}
+	return nil
+}
 
 type journalLine struct {
 	Timestamp string `json:"timestamp,omitempty"`

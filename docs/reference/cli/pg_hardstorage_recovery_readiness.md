@@ -57,8 +57,8 @@ pg_hardstorage recovery readiness <deployment> [flags]
       --no-verification             skip the verification freshness check
       --no-wal                      skip the WAL coverage check
       --repo string                 repository URL (required)
-      --rpo-seconds int             RPO target in seconds (0 = no target check)
-      --rto-seconds int             RTO target in seconds (0 = no target check)
+      --rpo-seconds int             RPO target in seconds (0 = no target check); default: the deployment's slo.rpo_seconds from the config
+      --rto-seconds int             RTO target in seconds (0 = no target check); default: the deployment's slo.rto_seconds from the config
       --staleness string            verification staleness window (e.g. 7d, 24h); default 7d
 ```
 

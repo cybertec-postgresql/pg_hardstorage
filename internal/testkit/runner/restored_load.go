@@ -100,8 +100,8 @@ func runRestoredLoad(ctx context.Context, st scenario.Step, idx int, state *runS
 		// Same forensic dance as assert_restored_match: scrape
 		// docker logs into the artefact dir before tearing down
 		// so a CI run captures why the sandbox refused to come up.
-		logsOut, _ := exec.Command("docker", "logs", "--tail", "200", sandboxName).CombinedOutput()
-		_ = exec.Command("docker", "rm", "-fv", sandboxName).Run()
+		logsOut, _ := dockerDiag("logs", "--tail", "200", sandboxName)
+		_, _ = dockerDiag("rm", "-fv", sandboxName)
 		return StepResult{Index: idx, Kind: st.Kind, Pass: false,
 			Message: fmt.Sprintf("restored_load: sandbox start: %v (logs: %s)", err, truncate(logsOut, 384))}
 	}
@@ -127,7 +127,7 @@ func runRestoredLoad(ctx context.Context, st scenario.Step, idx int, state *runS
 		}
 	}
 	if !ready {
-		logsOut, _ := exec.Command("docker", "logs", "--tail", "200", sandboxName).CombinedOutput()
+		logsOut, _ := dockerDiag("logs", "--tail", "200", sandboxName)
 		return StepResult{Index: idx, Kind: st.Kind, Pass: false,
 			Message: fmt.Sprintf("restored_load: sandbox did not accept connections within 30s (logs: %s)", truncate(logsOut, 512))}
 	}
@@ -143,7 +143,7 @@ func runRestoredLoad(ctx context.Context, st scenario.Step, idx int, state *runS
 	// explicitly and wait for `pg_is_in_recovery() = false`
 	// before running pgbench.
 	if err := promoteRestoredSandbox(ctx, sandboxName, sandboxUser); err != nil {
-		logsOut, _ := exec.Command("docker", "logs", "--tail", "200", sandboxName).CombinedOutput()
+		logsOut, _ := dockerDiag("logs", "--tail", "200", sandboxName)
 		return StepResult{Index: idx, Kind: st.Kind, Pass: false,
 			Message: fmt.Sprintf("restored_load: promote: %v (logs: %s)", err, truncate(logsOut, 384))}
 	}

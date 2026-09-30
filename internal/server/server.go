@@ -94,12 +94,14 @@ type Config struct {
 	// enforces it globally via the shared jobs table).
 	MaxConcurrentJobs int `yaml:"max_concurrent_jobs,omitempty"`
 
-	// RestoreRoots optionally constrains the absolute target_dir an
-	// API client can pass to /v1/deployments/<n>/restores.  When
+	// RestoreRoots optionally constrains every directory an API client
+	// can make a restore write through /v1/deployments/<n>/restores:
+	// target_dir AND each tablespace_mapping destination.  When
 	// empty (the default) the agent's own filesystem permissions are
-	// the only gate.  When non-empty, the request's target_dir must
-	// be under one of the listed roots, post-Clean.  Defence-in-
-	// depth: avoids a misconfigured client asking the agent to
+	// the only gate.  When non-empty, each path must be under one of
+	// the listed roots, post-Clean.  The roots are stamped into the
+	// job (Args.restore_roots) so the agent re-checks them.  Defence-
+	// in-depth: avoids a misconfigured client asking the agent to
 	// restore into /etc, /usr, …
 	RestoreRoots []string `yaml:"restore_roots,omitempty"`
 }

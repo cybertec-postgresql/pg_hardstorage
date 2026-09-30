@@ -21,8 +21,10 @@ tags:
 
 - An understanding of which outbound endpoints your
   deployment actually uses (LLM provider, OTLP collector,
-  Slack/Jira/PagerDuty sinks, control plane, storage
-  backends if HTTP-based).
+  Slack/Jira/PagerDuty sinks, the `email` sink's SMTP relay,
+  the `syslog` sink's collector, control plane, storage
+  backends if HTTP-based). The `cef` sink writes only local
+  files and is not gated.
 - The list of in-perimeter FQDNs that resolve outside
   RFC1918 (split-horizon DNS, private VPC endpoints with
   routable hostnames).
@@ -116,6 +118,17 @@ allowlist only — DNS is **deliberately not consulted**:
 
 If your in-perimeter endpoint resolves to a public IP via
 split-horizon DNS, add the **hostname** to the allowlist.
+
+### Which endpoint each backend checks
+
+| Backend | Endpoint checked at open |
+| --- | --- |
+| `s3` | `?endpoint=` (or `AWS_ENDPOINT_URL[_S3]`); with none, `https://s3.<region>.amazonaws.com`. Allowlist `s3.<region>.amazonaws.com` to use AWS S3 through a VPC endpoint. |
+| `azure-kv` | the vault URL, e.g. `https://<vault>.vault.azure.net/` |
+| `vault-transit` | the Vault address from the KEKRef |
+| `gcs` | `?endpoint=`, else `STORAGE_EMULATOR_HOST`, else `https://storage.googleapis.com` (allowlist it to use GCS through Private Google Access). |
+| `aws-kms` | `endpoint:` (or `AWS_ENDPOINT_URL[_KMS]`); with none, `https://kms.<region>.amazonaws.com` (`kms-fips.` with `use_fips_endpoint`). |
+| control plane | the `--control-plane` URL of `backup`/`restore`/`verify --control-plane`, and the agent's control-plane URL |
 
 ## Troubleshooting
 

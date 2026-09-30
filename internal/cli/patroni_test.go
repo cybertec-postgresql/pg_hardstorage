@@ -119,7 +119,7 @@ func TestPatroniStatus_TextRender(t *testing.T) {
 }
 
 // TestPatroniStatus_Unreachable: a closed server URL maps to
-// storage.unreachable / ExitUnreachable.
+// patroni.unreachable / ExitUnreachable.
 func TestPatroniStatus_Unreachable(t *testing.T) {
 	_, stderr, exit := runCLI(t,
 		"patroni", "status",
@@ -128,8 +128,8 @@ func TestPatroniStatus_Unreachable(t *testing.T) {
 	if exit == int(output.ExitOK) {
 		t.Errorf("unreachable should not exit OK; stderr=%s", stderr)
 	}
-	if !strings.Contains(stderr, "storage.unreachable") {
-		t.Errorf("expected storage.unreachable code; got\n%s", stderr)
+	if !strings.Contains(stderr, "patroni.unreachable") {
+		t.Errorf("expected patroni.unreachable code; got\n%s", stderr)
 	}
 }
 

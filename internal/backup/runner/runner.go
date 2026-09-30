@@ -345,7 +345,19 @@ func (r *Result) UnmarshalJSON(b []byte) error {
 // level: a partial chunk set in the CAS is harmless (orphan chunks GC
 // reaps later, and a retry de-dupes them away). Only a successful Run
 // produces a committed primary manifest.
+//
+// An abort by the stall watchdog or by lease loss surfaces as
+// backup.io_starved / conflict.backup_lease_lost, not as the bare
+// "context canceled" the pipeline observes (see abortCauseError).
 func Take(ctx context.Context, opts TakeOptions) (*Result, error) {
+	abortCtx := ctx
+	res, err := take(ctx, opts, &abortCtx)
+	return res, abortCauseError(abortCtx, err)
+}
+
+// take is Take's body. It stores every context it derives with a cancel
+// cause into *abortCtx so Take can recover why the backup was aborted.
+func take(ctx context.Context, opts TakeOptions, abortCtx *context.Context) (*Result, error) {
 	if err := validateOptions(&opts); err != nil {
 		return nil, err
 	}
@@ -377,47 +389,27 @@ func Take(ctx context.Context, opts TakeOptions) (*Result, error) {
 	// interactive-CLI callers who want to keep their Ctrl-C
 	// privilege).  See TakeOptions.StallTimeout comment for the
 	// reproducer history.
+	//
+	// Events are not the only progress: the BASE_BACKUP stream emits
+	// none between "started" and "stream_complete", so the sink below
+	// is wrapped to touch the watchdog on every frame received.
+	touchProgress := func() {}
 	if opts.StallTimeout > 0 {
 		var (
-			stallCancel    context.CancelCauseFunc
-			lastProgressMu sync.Mutex
-			lastProgress   = time.Now()
+			wd     *stallWatchdog
+			stopWD func()
 		)
-		ctx, stallCancel = context.WithCancelCause(ctx)
-		defer stallCancel(nil)
+		ctx, wd, stopWD = startStallWatchdog(ctx, opts.StallTimeout)
+		*abortCtx = ctx
+		defer stopWD()
+		touchProgress = wd.touch
 
 		// Wrap emit so every event resets the watchdog.
 		inner := emit
 		emit = func(ev *output.Event) {
-			lastProgressMu.Lock()
-			lastProgress = time.Now()
-			lastProgressMu.Unlock()
+			wd.touch()
 			inner(ev)
 		}
-
-		// Watchdog goroutine.  Polls every 30s; the granularity
-		// is fine because StallTimeout is on the order of minutes.
-		go func() {
-			ticker := time.NewTicker(30 * time.Second)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case <-ticker.C:
-					lastProgressMu.Lock()
-					stalled := time.Since(lastProgress)
-					lastProgressMu.Unlock()
-					if stalled > opts.StallTimeout {
-						stallCancel(fmt.Errorf(
-							"backup.io_starved: no progress event for %s (StallTimeout=%s) — "+
-								"likely host disk saturation; check `iostat -x 1` and reduce concurrent backup load",
-							stalled.Round(time.Second), opts.StallTimeout))
-						return
-					}
-				}
-			}
-		}()
 	}
 
 	// Top-level span. Closed at function exit; child spans for the
@@ -481,6 +473,7 @@ func Take(ctx context.Context, opts TakeOptions) (*Result, error) {
 		bctx, cancelBackup := context.WithCancelCause(ctx)
 		defer cancelBackup(nil)
 		ctx = bctx
+		*abortCtx = ctx
 		leaseCtx, leaseStop := context.WithCancel(ctx)
 		defer leaseStop()
 		go lease.Maintain(leaseCtx, leaseLossAborter(opts.Deployment, emit, cancelBackup))
@@ -711,7 +704,18 @@ func Take(ctx context.Context, opts TakeOptions) (*Result, error) {
 			attribute.Bool("fast", opts.Fast),
 			attribute.Bool("incremental", opts.Incremental != nil),
 		))
-	bbRes, err := basebackup.Run(bbCtx, replConn, bbOpts, sink)
+	bbRes, err := basebackup.Run(bbCtx, replConn, bbOpts, progressSink{Sink: sink, touch: touchProgress})
+	if bbRes != nil && bbRes.WALSlotErr != "" {
+		// Without the temporary slot the WAL for this backup is not
+		// pinned; on a busy server it can be recycled before BASE_BACKUP
+		// sends it (backup.wal_recycled). Say why up front.
+		emit(output.NewEvent(output.SeverityWarning, "backup", "wal_slot_unavailable").
+			WithSubject(output.Subject{Deployment: opts.Deployment}).
+			WithBody(map[string]any{
+				"error": bbRes.WALSlotErr,
+				"hint":  "free a replication slot (max_replication_slots) or grant REPLICATION; until then --include-wal backups of a busy database may fail with backup.wal_recycled",
+			}))
+	}
 	if err != nil {
 		bbSpan.SetStatus(codes.Error, err.Error())
 		bbSpan.End()
@@ -724,6 +728,12 @@ func Take(ctx context.Context, opts TakeOptions) (*Result, error) {
 		// in the tool. See sourceerror.go.
 		if typed := classifySourceError(err, opts.Deployment); typed != err {
 			return nil, typed
+		}
+		if errors.Is(err, basebackup.ErrArchiveLag) {
+			return nil, output.NewError("backup.archive_lag", fmt.Sprintf("backup: BASE_BACKUP: %v", err)).
+				WithSuggestion(&output.Suggestion{
+					Human: "the data was streamed but pg_backup_stop could not confirm WAL archiving; fix archive_command (see pg_stat_archiver) and retry",
+				}).Wrap(err)
 		}
 		return nil, fmt.Errorf("backup: BASE_BACKUP: %w", err)
 	}
@@ -893,6 +903,19 @@ func Take(ctx context.Context, opts TakeOptions) (*Result, error) {
 	// one. So the guarantee above holds for every chunk the gate could
 	// actually reach, and the count of the ones it could not is
 	// surfaced rather than folded into a clean pass.
+	//
+	// The re-Stat alone is still a timing guard: a gc could delete an
+	// adopted chunk AFTER the Stat and before the commit is visible. The
+	// commit fence (repo.BeginCommitFence / Confirm, gcfence.go) closes
+	// that for real: it pins the adopted chunks against a running gc and
+	// waits out its in-flight delete batch before the Stat, and checks
+	// afterwards that no gc run could have swept them mid-commit.
+	fence, err := repo.BeginCommitFence(ctx, sp, cas.AdoptedHashes(),
+		repo.FenceOptions{Owner: "backup " + opts.Deployment + "/" + backupID})
+	if err != nil {
+		span.SetStatus(codes.Error, err.Error())
+		return nil, fmt.Errorf("backup: gc fence: %w", err)
+	}
 	unchecked, err := verifyAdoptedChunks(ctx, sp, cas)
 	if err != nil {
 		span.SetStatus(codes.Error, err.Error())
@@ -924,6 +947,13 @@ func Take(ctx context.Context, opts TakeOptions) (*Result, error) {
 		return nil, fmt.Errorf("backup: commit manifest %s: %w", backupID, err)
 	}
 	commitSpan.End()
+	if err := fence.Confirm(ctx); err != nil {
+		// The manifest IS committed but references a chunk a gc run
+		// deleted while the commit was in progress: fail loudly — a
+		// backup reported as good must be restorable.
+		span.SetStatus(codes.Error, err.Error())
+		return nil, fmt.Errorf("backup %s: %w", backupID, err)
+	}
 
 	// 7. Re-read + verify with the user-supplied Verifier — proves the
 	//    just-written manifest is consumable by the rest of the system.

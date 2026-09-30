@@ -29,7 +29,9 @@ package sink
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"os/exec"
 	"runtime"
 	"sort"
 	"strings"
@@ -58,6 +60,78 @@ type dockerManifestEntry struct {
 	} `json:"Descriptor"`
 }
 
+// ErrRegistryUnavailable reports that the registry could not be asked
+// — not that the answer was bad.
+//
+// The two were conflated, and the conflation is worse than a missing
+// check. Docker Hub refuses anonymous manifest queries on a host with
+// no credentials, so `docker manifest inspect` fails with
+//
+//	denied: requested access to the resource is denied
+//	unauthorized: authentication required
+//
+// and the guard reported "a pinned fixture image cannot run on
+// linux/arm64" about an image that was sitting in the local daemon,
+// built for linux/arm64, working perfectly. The diagnosis named an
+// architecture problem that did not exist and sent the reader looking
+// for a replacement pin.
+//
+// "We could not find out" is a third outcome and has to be said out
+// loud, so callers can fall back to the local daemon or decline to
+// judge.
+var ErrRegistryUnavailable = errors.New("sink: registry unavailable")
+
+// registryUnavailable recognises a failure to REACH or AUTHENTICATE
+// with the registry, as opposed to a manifest that genuinely lacks
+// this platform.
+//
+// Matched on the daemon's message because `docker manifest inspect`
+// exits 1 for every failure it has. The list is the refusals a CI or
+// developer host actually produces: an unauthenticated Docker Hub, a
+// rate limit, a proxy, an air-gapped box.
+func registryUnavailable(stderr string) bool {
+	l := strings.ToLower(stderr)
+	for _, sign := range []string{
+		"unauthorized",
+		"authentication required",
+		"requested access to the resource is denied",
+		"toomanyrequests",
+		"rate limit",
+		"no such host",
+		"connection refused",
+		"i/o timeout",
+		"tls handshake timeout",
+		"certificate",
+		"proxyconnect",
+		"temporary failure in name resolution",
+	} {
+		if strings.Contains(l, sign) {
+			return true
+		}
+	}
+	return false
+}
+
+// LocalImagePlatform asks the local daemon what an already-pulled
+// image was built for. It needs no network, so it is what remains
+// when the registry declines to answer.
+//
+// A missing image returns an error: absent is not the same as
+// present-and-wrong, and the caller decides which matters.
+func LocalImagePlatform(ctx context.Context, image string) (ImagePlatform, error) {
+	out, err := execCommand(ctx, "docker", "image", "inspect",
+		"--format", "{{.Os}}/{{.Architecture}}", image).Output()
+	if err != nil {
+		return ImagePlatform{}, fmt.Errorf("sink: image %s not present locally: %w", image, err)
+	}
+	osArch := strings.TrimSpace(string(out))
+	got, arch, ok := strings.Cut(osArch, "/")
+	if !ok || got == "" || arch == "" {
+		return ImagePlatform{}, fmt.Errorf("sink: unparsable local platform %q for %s", osArch, image)
+	}
+	return ImagePlatform{OS: got, Arch: arch}, nil
+}
+
 // ImagePlatforms returns every platform image advertises in its
 // registry manifest.
 //
@@ -72,6 +146,17 @@ type dockerManifestEntry struct {
 func ImagePlatforms(ctx context.Context, image string) ([]ImagePlatform, error) {
 	out, err := execCommand(ctx, "docker", "manifest", "inspect", "--verbose", image).Output()
 	if err != nil {
+		// Separate "the registry would not answer" from "the answer
+		// was bad"; see ErrRegistryUnavailable.
+		var stderr string
+		var ee *exec.ExitError
+		if errors.As(err, &ee) {
+			stderr = string(ee.Stderr)
+		}
+		if registryUnavailable(stderr) {
+			return nil, fmt.Errorf("%w: docker manifest inspect %s: %s",
+				ErrRegistryUnavailable, image, strings.TrimSpace(stderr))
+		}
 		return nil, fmt.Errorf("sink: docker manifest inspect %s: %w", image, err)
 	}
 	// Try the manifest-list shape first, then the single-manifest one.
@@ -143,6 +228,8 @@ func VerifyImageArch(ctx context.Context, kind, goos, goarch string) error {
 // the whole list in one pass, not one image per run.
 func VerifyAllImageArch(ctx context.Context) error {
 	var problems []string
+	var undetermined []string
+	want := ImagePlatform{OS: runtime.GOOS, Arch: runtime.GOARCH}
 	// Dedupe by image: s3-minio and tls-minio share one pin, and a
 	// registry round-trip per kind would query it twice for no gain.
 	checked := map[string]bool{}
@@ -152,13 +239,44 @@ func VerifyAllImageArch(ctx context.Context) error {
 		} else {
 			checked[img] = true
 		}
-		if err := VerifyImageArch(ctx, k, runtime.GOOS, runtime.GOARCH); err != nil {
+		err := VerifyImageArch(ctx, k, runtime.GOOS, runtime.GOARCH)
+		if err == nil {
+			continue
+		}
+		if !errors.Is(err, ErrRegistryUnavailable) {
 			problems = append(problems, "  - "+err.Error())
+			continue
+		}
+		// The registry declined to answer. The local daemon still
+		// can, and an image already pulled for the right platform
+		// settles the question this check exists to ask: will its
+		// container run here?
+		img := SinkImages[k]
+		local, lerr := LocalImagePlatform(ctx, img)
+		switch {
+		case lerr != nil:
+			// Nothing to inspect and nobody to ask. Undetermined is
+			// its own outcome — reporting it as an architecture
+			// failure is how this guard came to accuse an arm64
+			// image, present and working, of being amd64-only.
+			undetermined = append(undetermined,
+				fmt.Sprintf("  - %s (sink %q): %v", img, k, err))
+		case local == want:
+			// Verified against the daemon instead of the registry.
+		default:
+			problems = append(problems, fmt.Sprintf(
+				"  - sink %q: local image %s is %s, not %s — its container "+
+					"will die at startup with \"exec format error\"", k, img, local, want))
 		}
 	}
 	if len(problems) > 0 {
 		return fmt.Errorf("sink images unusable on %s/%s:\n%s",
 			runtime.GOOS, runtime.GOARCH, strings.Join(problems, "\n"))
+	}
+	if len(undetermined) > 0 {
+		return fmt.Errorf("%w: could not determine whether these images run on %s, "+
+			"and they are not present locally to inspect:\n%s",
+			ErrRegistryUnavailable, want, strings.Join(undetermined, "\n"))
 	}
 	return nil
 }

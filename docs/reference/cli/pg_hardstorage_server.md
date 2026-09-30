@@ -39,8 +39,8 @@ Endpoints (all under /v1/):
   GET  /agents [?include_inactive=true]
   POST /agents/heartbeat
 
-The flags below override the config file's server: block. Use
---config to point at a YAML; flag overrides win.
+Configure the server with the flags below. (pg_hardstorage.yaml has
+no server: section; adding one makes the configuration fail to load.)
 
 ```
 pg_hardstorage server [flags]

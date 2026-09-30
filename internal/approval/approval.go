@@ -120,7 +120,7 @@ type Request struct {
 	RevokedBy     string     `json:"revoked_by,omitempty"`
 	RevokedReason string     `json:"revoked_reason,omitempty"`
 	// ExpiredAt is stamped by SweepExpired when a request that passed
-	// its TTL without reaching approval (and was not revoked) has had
+	// its TTL without being redeemed (and was not revoked) has had
 	// its expiry recorded in the audit chain. It is post-creation
 	// metadata — like the revocation fields, it is excluded from the
 	// signed canonical bytes — and exists only to make the expire sweep
@@ -128,6 +128,12 @@ type Request struct {
 	// DERIVED from ExpiresAt by computeStatus; ExpiredAt does not change
 	// the verdict.
 	ExpiredAt *time.Time `json:"expired_at,omitempty"`
+	// ConsumedAt is set by Get from the write-once consumption marker
+	// (approvals/<id>/consumed.json) that Gate lays down when a
+	// destructive op redeems the approval. It is never serialised into
+	// the request body: the marker is the only source of truth, so a
+	// rewritten body cannot un-consume a request.
+	ConsumedAt *time.Time `json:"-"`
 }
 
 // Approval is one signed yes-vote on a Request. Multiple Approvals
@@ -167,9 +173,27 @@ func approverKeyFor(id, fp string) string {
 	return approverPrefixFor(id) + fp + ".json"
 }
 
+// consumedKeyFor returns the key of the write-once marker Gate writes
+// when a destructive op redeems the request. IfNotExists on this key
+// is what makes an approval single-use: of two concurrent redemptions
+// exactly one wins the write.
+func consumedKeyFor(id string) string {
+	return "approvals/" + id + "/consumed.json"
+}
+
+// consumption is the body of the consumption marker.
+type consumption struct {
+	At     time.Time `json:"at"`
+	Op     Op        `json:"op"`
+	Target string    `json:"target,omitempty"`
+}
+
 // Store reads + writes approval requests against any StoragePlugin.
 type Store struct {
 	sp storage.StoragePlugin
+	// policy, when set, is the operator policy Create and Gate enforce.
+	// Nil means Gate loads it with LoadPolicy at call time.
+	policy *Policy
 }
 
 // NewStore wraps sp.
@@ -178,6 +202,14 @@ func NewStore(sp storage.StoragePlugin) *Store {
 		panic("approval: NewStore requires a non-nil StoragePlugin")
 	}
 	return &Store{sp: sp}
+}
+
+// WithPolicy pins the operator policy instead of loading it from the
+// environment at Gate time, and makes Create refuse requests the
+// policy could never honour. Returns s for chaining.
+func (s *Store) WithPolicy(p *Policy) *Store {
+	s.policy = p
+	return s
 }
 
 // CreateOptions tunes Create.
@@ -213,6 +245,11 @@ func (s *Store) Create(ctx context.Context, opts CreateOptions) (*Request, error
 	}
 	if opts.TTL <= 0 {
 		opts.TTL = 24 * time.Hour
+	}
+	if s.policy != nil {
+		if err := s.policy.CheckRequest(opts.Threshold, opts.ApproverKeys); err != nil {
+			return nil, err
+		}
 	}
 
 	// Sanity-check every key parses + canonicalise (decode → re-encode)
@@ -337,6 +374,29 @@ func (s *Store) Get(ctx context.Context, id string) (*Request, error) {
 		merged = append(merged, byFP[fp])
 	}
 	req.Approvals = merged
+
+	// The consumption marker, if present, is authoritative; whatever
+	// the body said about consumption was discarded by `json:"-"`.
+	crc, cerr := s.sp.Get(ctx, consumedKeyFor(id))
+	switch {
+	case cerr == nil:
+		var c consumption
+		cbody, rerr := stdio.ReadAll(crc)
+		_ = crc.Close()
+		if rerr != nil {
+			return nil, fmt.Errorf("approval: read consumption marker: %w", rerr)
+		}
+		// An undecodable marker still means "consumed": the write-once
+		// key exists, and failing open here would re-arm the approval.
+		at := req.CreatedAt
+		if json.Unmarshal(cbody, &c) == nil && !c.At.IsZero() {
+			at = c.At
+		}
+		req.ConsumedAt = &at
+	case errors.Is(cerr, storage.ErrNotFound):
+	default:
+		return nil, fmt.Errorf("approval: get consumption marker: %w", cerr)
+	}
 	return &req, nil
 }
 
@@ -546,7 +606,8 @@ func (s *Store) Revoke(ctx context.Context, id, by, reason string) (*Request, er
 }
 
 // SweepExpired records expiry for every request that has passed its TTL
-// without reaching its approval threshold (and was not revoked) and whose
+// without being redeemed (approved-but-unused requests lapse too) and
+// was not revoked, and whose
 // expiry has not already been recorded. For each such request it stamps
 // ExpiredAt (a read-modify-write, like Revoke) and returns it so the
 // caller can emit one audit event per request — expiry is otherwise a
@@ -565,6 +626,9 @@ func (s *Store) SweepExpired(ctx context.Context, dryRun bool) ([]*Request, erro
 	for _, r := range reqs {
 		if r.ExpiredAt != nil {
 			continue // already recorded
+		}
+		if r.ConsumedAt != nil {
+			continue // redeemed before its TTL; nothing lapsed
 		}
 		if computeStatus(r, now) != StatusExpired {
 			continue
@@ -608,9 +672,16 @@ func (s *Store) StatusOf(ctx context.Context, id string) (Status, error) {
 // adversarial, the signed approvals can't be forged or
 // silently-rewritten without invalidating the signature.
 func VerifyApprovals(req *Request) (int, error) {
+	valid, err := validApprovers(req)
+	return len(valid), err
+}
+
+// validApprovers returns the fingerprints of the distinct allowlisted
+// approvers whose signature over the canonical request verifies.
+func validApprovers(req *Request) (map[string]struct{}, error) {
 	canon, err := canonicalForApproval(req)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 	// Build fingerprint → public-key map from the allowlist.
 	allowed := map[string]ed25519.PublicKey{}
@@ -636,7 +707,7 @@ func VerifyApprovals(req *Request) (int, error) {
 		}
 		seen[a.KeyFingerprint] = struct{}{}
 	}
-	return len(seen), nil
+	return seen, nil
 }
 
 // computeStatus derives the status from the request's persisted
@@ -647,7 +718,9 @@ func VerifyApprovals(req *Request) (int, error) {
 // approval rollup) classify requests with the SAME derivation the store
 // uses for its own filtering and gating, rather than reimplementing the
 // rules and drifting from them. The verdict is derived, never read from
-// a stored field: revoked wins, then quorum, then expiry.
+// a stored field: revoked wins, then expiry, then quorum. Expiry is
+// checked before quorum so an approval that was never redeemed lapses
+// at its TTL instead of staying redeemable forever.
 //
 // A nil request is StatusPending — the zero request has no votes, no
 // revocation and no deadline, which is what "pending" means.
@@ -662,12 +735,18 @@ func computeStatus(r *Request, now time.Time) Status {
 	if r.RevokedAt != nil {
 		return StatusRevoked
 	}
-	count, _ := VerifyApprovals(r)
-	if count >= r.Threshold {
+	// A redeemed request was approved when it mattered; its TTL
+	// lapsing afterwards does not turn it into an unused expiry.
+	// Gate refuses it on ConsumedAt, not on this verdict.
+	if r.ConsumedAt != nil {
 		return StatusApproved
 	}
 	if !r.ExpiresAt.IsZero() && now.After(r.ExpiresAt) {
 		return StatusExpired
+	}
+	count, _ := VerifyApprovals(r)
+	if count >= r.Threshold {
+		return StatusApproved
 	}
 	return StatusPending
 }
@@ -683,6 +762,7 @@ func canonicalForApproval(r *Request) ([]byte, error) {
 	clone.RevokedBy = ""
 	clone.RevokedReason = ""
 	clone.ExpiredAt = nil
+	clone.ConsumedAt = nil
 	// json.Marshal gives stable key order for structs, which is what
 	// we need — no third-party canonicaliser required.
 	return json.Marshal(&clone)
@@ -748,24 +828,31 @@ var (
 	ErrThresholdNotMet    = errors.New("approval: threshold not met")
 	ErrOpMismatch         = errors.New("approval: request op doesn't match the destructive op being attempted")
 	ErrTargetMismatch     = errors.New("approval: request target doesn't match the destructive op's target")
+	ErrConsumed           = errors.New("approval: request already redeemed (approvals are single-use)")
 )
 
 // GateOptions describes what a destructive op expects of an approval
 // request. The destructive op calls Gate to refuse-or-proceed; Gate
 // returns nil only when EVERY check passes:
 //
-//   - request exists
-//   - status is StatusApproved (signature-verified count >= threshold)
+//   - request exists, is not revoked, and is within its TTL
 //   - request.Op matches Op (so an approval for backup.delete cannot
 //     be replayed against kms.shred)
-//   - when Target is non-empty, request.Target matches (so an
-//     approval to delete db1.full.X cannot be redeemed for
-//     db2.full.Y)
+//   - request.Target equals Target exactly — a request filed without
+//     a target authorises nothing that has one (so an approval to
+//     delete db1.full.X cannot be redeemed for db2.full.Y, and a
+//     target-less approval cannot be redeemed for anything)
+//   - enough distinct approvers from the operator's trusted roster
+//     (Policy) signed it: max(request threshold, policy minimum)
+//   - it has not been redeemed before; Gate consumes it
 //
 // Op + Target binding is the trust-foundation property: the
 // approver signed bytes that include op + target, so an attacker
 // who steals an approved request can't redirect it to a different
-// destructive action without re-collecting signatures.
+// destructive action without re-collecting signatures. The roster
+// check is what makes those signatures mean anything: the request
+// body — its key list and threshold included — is written by whoever
+// can write to the repository.
 type GateOptions struct {
 	RequestID string
 	Op        Op
@@ -773,12 +860,26 @@ type GateOptions struct {
 }
 
 // Gate is the destructive-op check. Reads the request, verifies
-// signatures, confirms op + target, and either returns the request
-// (for the caller to log into the audit chain) or one of the
+// signatures against the operator policy, confirms op + target,
+// atomically marks the request consumed, and either returns the
+// request (for the caller to log into the audit chain) or one of the
 // structured errors above for the caller to map to a CLI exit code.
+//
+// Consumption happens at the gate, before the op runs, so an op that
+// fails afterwards has still spent its approval: re-running needs a
+// fresh request. That is the safe direction — the alternative lets a
+// crash between "op done" and "mark consumed" leave a live approval.
 func (s *Store) Gate(ctx context.Context, opts GateOptions) (*Request, error) {
 	if opts.RequestID == "" {
 		return nil, ErrNotFound
+	}
+	pol := s.policy
+	if pol == nil {
+		p, err := LoadPolicy()
+		if err != nil {
+			return nil, err
+		}
+		pol = p
 	}
 	req, err := s.Get(ctx, opts.RequestID)
 	if err != nil {
@@ -793,12 +894,40 @@ func (s *Store) Gate(ctx context.Context, opts GateOptions) (*Request, error) {
 	case StatusPending:
 		return req, ErrThresholdNotMet
 	}
+	if req.ConsumedAt != nil {
+		return req, ErrConsumed
+	}
 	// Op + target binding — the heart of the gate.
 	if opts.Op != "" && req.Op != opts.Op {
 		return req, ErrOpMismatch
 	}
-	if opts.Target != "" && req.Target != "" && req.Target != opts.Target {
+	if req.Target != opts.Target {
 		return req, ErrTargetMismatch
 	}
+	if len(pol.TrustedKeys) == 0 {
+		return req, pol.noRosterErr()
+	}
+	trusted, err := pol.trustedApprovals(req)
+	if err != nil {
+		return req, err
+	}
+	if need := pol.requiredApprovals(req); trusted < need {
+		return req, fmt.Errorf("%w: %d of %d required (request threshold %d, configured minimum %d)",
+			ErrUntrustedApprovals, trusted, need, req.Threshold, pol.MinThreshold)
+	}
+	body, err := json.Marshal(consumption{At: now, Op: opts.Op, Target: opts.Target})
+	if err != nil {
+		return req, err
+	}
+	if _, err := s.sp.Put(ctx, consumedKeyFor(req.ID), bytesReader(body), storage.PutOptions{
+		ContentLength: int64(len(body)),
+		IfNotExists:   true,
+	}); err != nil {
+		if errors.Is(err, storage.ErrAlreadyExists) {
+			return req, ErrConsumed
+		}
+		return req, fmt.Errorf("approval: record consumption: %w", err)
+	}
+	req.ConsumedAt = &now
 	return req, nil
 }

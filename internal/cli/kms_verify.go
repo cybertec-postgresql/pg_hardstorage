@@ -2,6 +2,7 @@
 package cli
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"strings"
@@ -90,9 +91,13 @@ For each manifest, kms verify:
      fleet whose policy is "everything is encrypted", and an
      unencrypted manifest becomes a listed failure with exit 9).
   3. Resolves the KEK by KEKRef. By default the resolver is the
-     local keystore, which knows the "local:default" ref. With
-     --kek-ref + --kek-file the operator points at an explicit
-     KEK file for one ref (post-rotation or per-tenant audits).
+     local keystore, which knows every local:* ref. A cloud-KMS
+     ref (aws-kms://, gcp-kms://, vault-transit://, ...) is
+     verified by asking the provider to unwrap, with settings from
+     the matching kms.providers entry; only a scheme no provider
+     claims is 'kek_unknown'. With --kek-ref + --kek-file the
+     operator points at an explicit KEK file for one ref
+     (post-rotation or per-tenant audits).
   4. Tries to unwrap the wrapped_dek with the resolved KEK. A
      successful unwrap is "ok"; a tag-failure is "unwrap_failed".
 
@@ -153,10 +158,11 @@ func runKmsVerify(cmd *cobra.Command, f kmsVerifyFlags) error {
 	if err != nil {
 		return output.NewError("internal", err.Error()).Wrap(err)
 	}
-	_, verifier, err := keystore.LoadOrGenerate(p.Keyring.Value)
+	// Load-only: this verb must never mint a keypair (see
+	// loadExistingKeypair).
+	_, verifier, err := loadExistingKeypair("kms verify")
 	if err != nil {
-		return output.NewError("internal",
-			fmt.Sprintf("kms verify: signing key: %v", err)).Wrap(err)
+		return err
 	}
 
 	resolver, err := buildKMSVerifyResolver(p.Keyring.Value, f)
@@ -178,8 +184,17 @@ func runKmsVerify(cmd *cobra.Command, f kmsVerifyFlags) error {
 	}
 
 	res, err := backup.VerifyEnvelopes(cmd.Context(), sp, backup.VerifyEnvelopesOptions{
-		Verifier:         verifier,
-		KEKResolver:      resolver,
+		Verifier:    verifier,
+		KEKResolver: resolver,
+		// Cloud-KMS refs are verified by asking the provider to unwrap
+		// (the KEK never leaves the HSM), with provider settings from
+		// the kms.providers entry matching each manifest's own ref.
+		UnwrapDEK: func(ctx context.Context, kekRef string, wrapped []byte) ([]byte, error) {
+			return keystore.UnwrapDEK(ctx, kekRef, wrapped, keystore.UnwrapOpts{
+				KeyringDir:     p.Keyring.Value,
+				ProviderConfig: deploymentKMSResolver(nil)(kekRef),
+			})
+		},
 		DeploymentFilter: f.deployment,
 		KEKRefFilter:     f.kekRef,
 		RequireEncrypted: f.requireEncrypted,

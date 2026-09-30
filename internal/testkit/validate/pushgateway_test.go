@@ -95,7 +95,7 @@ func TestPushgatewayEmitter_PushHasMetrics(t *testing.T) {
 func TestPushgatewayEmitter_FailureMarksPassZero(t *testing.T) {
 	srv := newPushgatewayServer(t)
 	e := validate.NewPushgatewayEmitter(srv.server.URL, "job", "inst")
-	e.OnEvent(validate.Event{Cell: "x", Op: "verify_failed", Iteration: 1})
+	e.OnEvent(validate.Event{Cell: "x", Op: "cell_failed", Iteration: 1, Detail: "verify"})
 	if err := e.Push(context.Background()); err != nil {
 		t.Fatal(err)
 	}

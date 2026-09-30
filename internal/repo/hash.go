@@ -2,9 +2,11 @@
 package repo
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"slices"
 )
 
 // Hash is a SHA-256 digest. It is the canonical content-address used
@@ -82,4 +84,17 @@ func ParseHash(s string) (Hash, error) {
 		return Hash{}, err
 	}
 	return h, nil
+}
+
+// Compare orders hashes by their bytes — the same order as comparing
+// their lowercase-hex String forms, without allocating two strings per
+// comparison (a sort of a gc run's orphan set built hex strings for
+// every comparison: O(n log n) allocations on the hot path).
+func (h Hash) Compare(o Hash) int {
+	return bytes.Compare(h[:], o[:])
+}
+
+// sortHashes sorts hs in place in Compare order.
+func sortHashes(hs []Hash) {
+	slices.SortFunc(hs, Hash.Compare)
 }

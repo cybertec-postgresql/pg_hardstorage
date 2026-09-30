@@ -60,27 +60,49 @@ func recordResurrectedWALGap(ctx context.Context, d *output.Dispatcher, sp stora
 	if perr != nil || stop == 0 {
 		return ""
 	}
+	// A probe that ERRORS is not evidence of intact coverage. Treating
+	// it as such (as this did) recorded nothing, so a --to-latest from
+	// the resurrected backup could later truncate silently at a pruned
+	// hole nobody checked for. Fail closed: record the most
+	// conservative window — from the stop to everything after — and
+	// say why; the operator can re-run the probe (undelete of a live
+	// backup is a no-op, `wal gaps` re-detects) or use --skip-gap-check
+	// with eyes open.
+	var hole, resume pglogrepl.LSN
+	var probeErr error
 	frontier, found, ferr := inventory.HighestArchivedLSN(ctx, sp, deployment, m.Timeline)
-	if ferr != nil || !found || frontier <= stop {
+	switch {
+	case ferr != nil:
+		probeErr = ferr
+		hole, resume = stop, pglogrepl.LSN(^uint64(0))
+	case !found || frontier <= stop:
 		// No archived WAL past the stop: there is nothing to replay
 		// forward INTO, so there is no hole to record — recovery ends
 		// at the archive's true end, which is PG's honest semantics.
 		return ""
-	}
-	// frontier is the END of the highest segment (exclusive); step back
-	// to the last byte the archive holds — the same off-by-one the
-	// contiguity preflight documents.
-	hole, holeFound, herr := inventory.FirstWALHoleInRange(ctx, sp, deployment, m.Timeline, stop, frontier-1)
-	if herr != nil || !holeFound {
-		return "" // coverage intact: the janitors kept this backup's window
-	}
-	resume, resumeFound, rerr := inventory.NextArchivedLSNAtOrAfter(ctx, sp, deployment, m.Timeline, hole)
-	if rerr != nil || !resumeFound {
-		// A hole below the frontier always has archived WAL above it;
-		// failing to find the resume point is a transient read fault.
-		// Fall back to the frontier: over-recording the window is
-		// conservative (refuses more), never lossy.
-		resume = frontier
+	default:
+		// frontier is the END of the highest segment (exclusive); step
+		// back to the last byte the archive holds — the same off-by-one
+		// the contiguity preflight documents.
+		h, holeFound, herr := inventory.FirstWALHoleInRange(ctx, sp, deployment, m.Timeline, stop, frontier-1)
+		if herr != nil {
+			probeErr = herr
+			hole, resume = stop, frontier
+			break
+		}
+		if !holeFound {
+			return "" // coverage intact: the janitors kept this backup's window
+		}
+		hole = h
+		r, resumeFound, rerr := inventory.NextArchivedLSNAtOrAfter(ctx, sp, deployment, m.Timeline, hole)
+		if rerr != nil || !resumeFound {
+			// A hole below the frontier always has archived WAL above
+			// it; failing to find the resume point is a transient read
+			// fault. Fall back to the frontier: over-recording the
+			// window is conservative (refuses more), never lossy.
+			r = frontier
+		}
+		resume = r
 	}
 
 	gs := gapstate.New(sp)
@@ -105,7 +127,7 @@ func recordResurrectedWALGap(ctx context.Context, d *output.Dispatcher, sp stora
 	var persistErr string
 	if _, err := gs.Put(ctx, rec); err != nil {
 		persistErr = err.Error()
-	} else {
+	} else if probeErr == nil {
 		sev = output.SeverityWarning
 	}
 	body := map[string]any{
@@ -119,6 +141,13 @@ func recordResurrectedWALGap(ctx context.Context, d *output.Dispatcher, sp stora
 			"The backup itself restores fine; recovery PAST its own window cannot cross the " +
 			"pruned WAL and is refused via the recorded gap. Restore bounded within the " +
 			"backup's window, or use a backup taken after " + rec.GapEndLSN + ".",
+	}
+	if probeErr != nil {
+		body["probe_error"] = probeErr.Error()
+		body["message"] = "resurrected backup " + backupID + ": the WAL coverage past its stop (" + m.StopLSN +
+			") could NOT be checked (" + probeErr.Error() + "), so a conservative gap " + rec.GapStartLSN + ".." +
+			rec.GapEndLSN + " was recorded: recovery past the backup's own window is refused until the " +
+			"coverage is verified. Re-check with `pg_hardstorage wal gaps`, then remove the record with `wal gap-purge` if the WAL is intact."
 	}
 	if persistErr != "" {
 		body["persist_error"] = persistErr

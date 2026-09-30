@@ -281,9 +281,18 @@ func (p *Plugin) Put(ctx context.Context, key string, r io.Reader, opts storage.
 			// Uploaded but not locked. Delete it so a retry re-uploads and
 			// re-locks rather than leaving an UNLOCKED blob a dedup hit
 			// (IfNotExists) would treat as a committed, protected object.
-			// Best-effort: if the delete fails because the blob IS locked
-			// (a concurrent writer won), it's protected anyway.
-			_ = p.Delete(ctx, key)
+			// Detached context: the retention call may have failed BECAUSE
+			// ctx was cancelled, and a cleanup on that ctx never leaves the
+			// process. A delete refused because the blob IS under an
+			// immutability policy means it is protected anyway; any other
+			// failure leaves an unlocked blob behind and must be said out
+			// loud rather than dropped.
+			cctx, cancel := storage.CleanupContext(ctx)
+			derr := p.Delete(cctx, key)
+			cancel()
+			if derr != nil && !bloberror.HasCode(derr, bloberror.BlobImmutableDueToPolicy) {
+				return storage.PutResult{}, fmt.Errorf("azblob: apply retention to %s: %w; rollback failed, an UNLOCKED blob remains at the key: %w", key, rerr, derr)
+			}
 			return storage.PutResult{}, fmt.Errorf("azblob: apply retention to %s: %w", key, rerr)
 		}
 	}

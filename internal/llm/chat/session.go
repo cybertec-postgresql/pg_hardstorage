@@ -139,6 +139,14 @@ type Session struct {
 	// turn.  Read internally; tests substitute their own.
 	PreviewLedger *safety.PreviewState
 
+	// Anomaly, when non-nil, is execute_command's anomaly
+	// detector.  Ask merges each OPERATOR prompt's topic tokens
+	// into it before the turn runs, so a high-risk verb the
+	// operator asked for is on-topic.  Model replies and tool
+	// output are deliberately not merged: the detector exists to
+	// catch those steering towards a destructive verb.
+	Anomaly *safety.AnomalyDetector
+
 	// HistoryWriter, when non-nil, receives the same events
 	// the AuditEmitter does — but encrypted at rest under the
 	// store's per-principal DEK.  The CLI opens a Writer per
@@ -266,6 +274,12 @@ func (s *Session) emit(action string, body map[string]any) {
 		})
 	}
 }
+
+// Emit fires an event on the session's observers exactly as the
+// session's own events are.  The CLI uses it for events that
+// originate in tools (execute_command gate and anomaly verdicts)
+// so they land on the same audit trail and transcript.
+func (s *Session) Emit(action string, body map[string]any) { s.emit(action, body) }
 
 // mapActionToHistory maps the chat package's emit-action
 // names onto the history.Entry {Role, Op} pair.  The
@@ -422,10 +436,15 @@ func (s *Session) buildSystemPrompt(ctx context.Context) (string, error) {
 	}
 	b.WriteString("\n\n")
 
-	// 2. AdditionalContext (operator-supplied free text).
+	// 2. AdditionalContext (operator-supplied free text).  It is
+	//    operator DATA, not our authored prompt — it goes through the
+	//    privacy redactor like a user prompt would.  The system prompt
+	//    reaches the provider like any other message; only the parts we
+	//    wrote ourselves (skill template, runbook index, catalog, rules)
+	//    are sent verbatim.
 	if s.AdditionalContext != "" {
 		b.WriteString("## Operator context\n\n")
-		b.WriteString(s.AdditionalContext)
+		b.WriteString(privacy.Redact(s.Privacy, s.AdditionalContext))
 		b.WriteString("\n\n")
 	}
 
@@ -450,6 +469,28 @@ func (s *Session) buildSystemPrompt(ctx context.Context) (string, error) {
 	//    this is the human-readable summary for prompt-engineering).
 	if s.Skill != nil && len(s.Skill.Context.AvailableTools) > 0 {
 		b.WriteString("## Available tools\n\n")
+		// State the boundary BEFORE listing them. Several tool
+		// descriptions read "Run `pg_hardstorage doctor` and return
+		// ...", which describes what the tool does for us but leaves
+		// the tool NAME looking like part of the CLI surface — and the
+		// names sit in the same prompt as the real command catalog.
+		//
+		// Models duly conflated the two. Answers came back telling the
+		// operator to run
+		//
+		//	pg_hardstorage read_command_help deployment add
+		//
+		// in a copy-pasteable shell block. That command does not
+		// exist and cannot be made to exist: read_command_help is
+		// ours, not theirs. The operator following it gets "unknown
+		// command" while trying to do the thing the answer was
+		// supposedly explaining.
+		//
+		// Budgeting the hot-command help block made this likelier, not
+		// less: the model is now told more often to reach for
+		// read_command_help, so the name appears more often in its
+		// context. Naming the boundary is what keeps that safe.
+		b.WriteString(systemPromptToolPreamble())
 		for _, name := range s.Skill.Context.AvailableTools {
 			t, err := s.Tools.Get(name)
 			if err != nil {
@@ -542,9 +583,14 @@ func (s *Session) runPreload(ctx context.Context, b *strings.Builder) {
 		if args == nil {
 			args = map[string]any{}
 		}
+		// Preload output is live cluster data (connection strings,
+		// hosts, deployment names, and — in an error — the child's
+		// stderr).  It is redacted under the session's privacy mode
+		// exactly as a mid-turn tool result is; embedding it in the
+		// system prompt does not make it ours.
 		res, err := t.Run(ctx, args)
 		if err != nil {
-			fmt.Fprintf(b, "### preload: %s — error\n\n```\n%s\n```\n\n", p.Name, err)
+			fmt.Fprintf(b, "### preload: %s — error\n\n```\n%s\n```\n\n", p.Name, privacy.Redact(s.Privacy, err.Error()))
 			continue
 		}
 		body, jerr := stdjson.MarshalIndent(map[string]any{
@@ -554,7 +600,7 @@ func (s *Session) runPreload(ctx context.Context, b *strings.Builder) {
 		if jerr != nil {
 			body = []byte(fmt.Sprintf("(could not encode result: %v)", jerr))
 		}
-		bodyStr, truncated := truncateForPrompt(string(body), maxBytes)
+		bodyStr, truncated := truncateForPrompt(privacy.Redact(s.Privacy, string(body)), maxBytes)
 		fmt.Fprintf(b, "### preload: %s\n\n```json\n%s\n```\n", p.Name, bodyStr)
 		if truncated {
 			fmt.Fprintf(b, "_(preload output truncated to %d bytes to stay within the context budget — call `%s` directly for the full, current result.)_\n", maxBytes, p.Name)
@@ -589,6 +635,10 @@ func (s *Session) Ask(ctx context.Context, question string) (*Reply, error) {
 	// protection invariant.
 	if s.PreviewLedger != nil {
 		s.PreviewLedger.Reset()
+	}
+	if s.Anomaly != nil {
+		s.Anomaly.RecentTopicTokens = safety.MergeTopicTokens(
+			s.Anomaly.RecentTopicTokens, safety.ExtractTopicTokens(question))
 	}
 	// Apply privacy redaction to the user prompt BEFORE it
 	// goes into History (so the provider sees the redacted
@@ -704,7 +754,22 @@ func (s *Session) validateAndMaybeRetry(ctx context.Context, reply *Reply) *Repl
 		b.WriteString("\nRevise your answer. Use only flags the validator accepts and the right number of positional arguments; ")
 		b.WriteString("if a command is flagged DESTRUCTIVE-but-labeled-a-dry-run, either drop the `--apply`/`--force`/`--yes` to make it a real dry-run, or relabel it honestly as the step that executes. ")
 		b.WriteString("If you're unsure of a command, call `read_command_help` first. ")
-		b.WriteString("Keep the structure of the previous answer; just fix the flagged commands.")
+		b.WriteString("Keep the structure of the previous answer; just fix the flagged commands.\n\n")
+		// Without this, the model narrates the correction: real
+		// answers came back opening "Now I have the correct flags.
+		// Here's the revised answer." and "Correct — `wal preflight`
+		// takes only --pg-connection. Revised:".
+		//
+		// The operator never saw the first attempt or the validator's
+		// complaint. To them the answer simply begins by referring to
+		// a conversation that, from where they are standing, did not
+		// happen — which reads as the assistant talking to itself and
+		// undermines the answer that follows. The retry is an
+		// internal mechanism and must leave no trace in the output.
+		b.WriteString("Reply with the corrected answer ONLY. Do not mention this correction, " +
+			"do not preface it (\"Here's the revised answer\", \"Now I have the correct flags\", " +
+			"\"Correct —\", \"Revised:\"), and do not explain what changed. " +
+			"The reader is seeing your reply for the first time and has not seen the previous one.")
 		s.History = append(s.History, llmprovider.Message{
 			Role:    "user",
 			Content: b.String(),
@@ -1702,3 +1767,16 @@ point at the safe alternative.
 
 This is an AI assistant.  Every suggested command must be
 verified by the operator before running.`
+
+// systemPromptToolPreamble is the sentence that keeps the assistant's
+// tools and the operator's CLI apart. Its own function so the test
+// can assert the claim survives a reword.
+func systemPromptToolPreamble() string {
+	return "These are YOUR tools. You call them; the operator cannot.\n" +
+		"They are NOT `pg_hardstorage` subcommands and MUST NEVER appear\n" +
+		"in a command you show the operator. `pg_hardstorage read_command_help`,\n" +
+		"`pg_hardstorage read_doctor` and the like are not real commands — if\n" +
+		"you catch yourself writing one, you wanted a tool CALL, and the\n" +
+		"operator-facing equivalent is the plain command (`pg_hardstorage\n" +
+		"doctor`, `pg_hardstorage --help`) or nothing at all.\n\n"
+}

@@ -13,6 +13,10 @@ operator deciding whether to upgrade.
 
 ## Releases
 
+- **[v1.5](v1.5.md)** — continuous archiving gets its own systemd unit,
+  retention follows the policy you declared whoever runs `rotate`, error
+  codes name the system that actually failed, and backup under sustained
+  write load was soak-tested for the first time.
 - **[v1.4](v1.4.md)** — the compat-layer release.  Driving the
   pgBackRest / Barman / WAL-G shims against the real tools found that
   every restore performed through a shim produced an unbootable

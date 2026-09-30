@@ -8,7 +8,10 @@ duration, file count, page churn).
 Pure math: no storage, no manifests, no PG. Callers feed `Sample`s and read
 `Report`s. The algorithm is intentionally boring — compute mean and stddev
 over the most-recent N priors of the same deployment + type, score `(x - mu) /
-sigma`, flag when `|score|` exceeds threshold. Seasonal / ARIMA-style modelling
+sigma`, flag when `|score|` exceeds threshold. When every prior has the same
+value (sigma == 0) there is no z-score: the `Score` carries
+`zero_variance: true` with `z`/`abs_z` of 0, and flags iff the candidate
+differs from the constant baseline. Seasonal / ARIMA-style modelling
 is deliberately out — backup metrics aren't seasonal in a way that pays for
 the cleverness.
 

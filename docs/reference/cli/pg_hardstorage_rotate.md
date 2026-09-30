@@ -19,6 +19,16 @@ Apply retention policy to a deployment (or all)
 Classify each backup as kept or to-be-soft-deleted per the chosen
 retention policy, then optionally apply the decision.
 
+Where the policy comes from, per deployment:
+
+  1. any --policy / --keep-* flag  → the flags define the whole policy
+  2. otherwise                     → the deployment's retention: block in
+                                     pg_hardstorage.yaml (the same policy
+                                     the agent's scheduled rotate applies)
+  3. otherwise                     → the built-in GFS defaults below
+
+The plan prints which source it used for each deployment.
+
 Three policies ship today:
 
   gfs (default): grandfather-father-son.

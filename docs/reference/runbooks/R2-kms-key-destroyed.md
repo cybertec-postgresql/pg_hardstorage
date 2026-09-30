@@ -49,7 +49,7 @@ new backups from being written under a missing key.
 
    ```sh
    grep -n 'kek_ref' /etc/pg_hardstorage/pg_hardstorage.yaml
-   systemctl stop pg_hardstorage-agent
+   systemctl stop pg_hardstorage
    ```
 
 2. **Inventory affected backups.** The `KEKRef` lives in each

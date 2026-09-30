@@ -24,6 +24,45 @@ name in `profiles.yaml`:
 The runtime calls `SchemaSetup` once and `SchemaIteration` each loop. Metrics
 emit to a Prometheus Pushgateway so a long-running soak feeds a dashboard.
 
+## Verdict
+
+A run passes only if no failure was recorded. Every failure goes through
+`recordFailure`, which also emits a `cell_failed` event (the Pushgateway
+`pg_hardstorage_validate_pass` gauge is driven by exactly that event, so it
+agrees with the report). Failure kinds:
+
+| Kind | Raised when |
+| --- | --- |
+| `setup`, `seed`, `sustained_load`, `wal_stream` | the cell could not start |
+| `backup`, `verify` | pg_hardstorage failed a backup / restore-verify on a live cell |
+| `recovery` | a fault was applied and could not be reverted — the testbed's failure, but nothing measured on that cell afterwards can be trusted |
+| `cell_down` | the cell went `--max-backup-gap` (default 1h) without a backup getting through, or none of its dispatched backups ever got through |
+| `retention` | rotate / gc failed, or one repository's gc was deferred `--retention-max-deferrals` (default 4) windows in a row |
+
+Skips are not failures: `backup_skipped_cell_down`, `verify_skipped_cell_down`,
+`fault_skipped_cell_down`, `fault_skipped_limit_unreachable`,
+`fault_skipped_not_applicable` and a single `retention_deferred` are the testbed
+racing its own faults. The `cell_down` floor is what stops a cell that a fault
+killed for good from passing on skips alone. `fault_apply_failed` is counted
+(`fault_apply_fails`) but is not a failure by itself: some catalogues expect an
+injector to refuse (`inode_exhaustion`).
+
+Detection is not failure either: `backup_refused_source_corruption` (PostgreSQL
+refusing a torn page) and `verify_refused_injected_corruption` (a restore
+refusing a backup that predates a repo-corruption fault this cell injected)
+count as `corruption_detected`. Repo-corruption faults (`manifest_targeted_corruption`,
+`truncated_wal_segment`, `missing_wal_segment`) are confined to the injecting
+cell's deployment (`inject.Registry.ApplyForDeployment`), so they cannot damage
+— and blame — another cell sharing the repository.
+
+A fault whose name ends in `_mid_backup` (e.g. `drop_relation_mid_backup`) is
+not applied in the fault step: the iteration takes a backup and the fault is
+applied ~2 s into it, so it really races the backup. If the backup finishes
+first the fault is skipped (`fault_skipped_backup_finished`).
+
+Fault reverts run with their own bounded context, so a fault in flight at the
+run deadline is still reverted before teardown.
+
 ## Key files / subdirs
 
 - `orchestrator.go` — `Run`, `RunOptions`, the per-cell concurrent loop

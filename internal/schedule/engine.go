@@ -57,6 +57,11 @@ type Engine struct {
 	// 6h" task with 30s jitter fires at T+x, T+x+6h, T+x+12h, …).
 	jitter time.Duration
 	rng    *rand.Rand
+
+	// lastRuns, when set, persists each task's last run so a restart
+	// resumes the cadence instead of restarting it. See
+	// WithLastRunStore.
+	lastRuns LastRunStore
 }
 
 type scheduledTask struct {
@@ -119,6 +124,23 @@ func WithJitter(d time.Duration) EngineOption {
 	}
 }
 
+// WithLastRunStore makes the engine remember each task's last run
+// across process restarts. Without it, Add schedules every task from
+// "now": an `every 6h` task on an agent restarted every 5h (crash
+// loop, config-management redeploys, host reboots) would be pushed a
+// full interval out on every start and never fire at all.
+//
+// With a store, Add derives the first firing from the recorded last
+// run: Next(lastRun), or immediately when that slot has already
+// passed while the agent was down. An `every` task with no recorded
+// run is due immediately -- an interval schedule has no wall-clock
+// anchor, so "never run" means overdue. A daily_at / at task with no
+// record keeps its declared slot. runOne records each run's start
+// time after the task returns.
+func WithLastRunStore(s LastRunStore) EngineOption {
+	return func(e *Engine) { e.lastRuns = s }
+}
+
 // New returns an empty Engine.
 func New(opts ...EngineOption) *Engine {
 	e := &Engine{clock: RealClock{}}
@@ -154,7 +176,7 @@ func (e *Engine) Add(t *Task) error {
 		return errors.New("schedule: task has nil Run")
 	}
 	now := e.clock.Now()
-	next := t.Schedule.Next(now)
+	next := e.firstDue(t, now)
 	if next.IsZero() {
 		return ErrEmptySchedule
 	}
@@ -168,6 +190,34 @@ func (e *Engine) Add(t *Task) error {
 	e.tasks = append(e.tasks, &scheduledTask{t: t, nextDue: next})
 	e.mu.Unlock()
 	return nil
+}
+
+// firstDue computes a newly-added task's first firing. Without a
+// LastRunStore it is Next(now), the historical behaviour. With one,
+// see WithLastRunStore.
+func (e *Engine) firstDue(t *Task, now time.Time) time.Time {
+	if e.lastRuns == nil {
+		return t.Schedule.Next(now)
+	}
+	last, ok := e.lastRuns.LastRun(t.Name)
+	if !ok {
+		if _, isEvery := t.Schedule.(Every); isEvery {
+			return now
+		}
+		return t.Schedule.Next(now)
+	}
+	next := t.Schedule.Next(last)
+	if next.IsZero() {
+		// Exhausted (a one-shot that already ran): do not re-run it
+		// just because the process restarted.
+		return time.Time{}
+	}
+	if next.Before(now) {
+		// The slot passed while the agent was down: run once now,
+		// runOne's catch-up then puts it back on the grid.
+		return now
+	}
+	return next
 }
 
 // Tasks returns a snapshot of registered tasks for status output.
@@ -323,6 +373,13 @@ func (e *Engine) runOne(ctx context.Context, st *scheduledTask, dueAt time.Time)
 	st.lastErr = err
 	st.nextDue = next
 	e.mu.Unlock()
+
+	// Record the run whatever its outcome: a failed run is retried at
+	// the next slot in-process, and a restart must not retry it any
+	// sooner than that. The store reports its own write failures.
+	if e.lastRuns != nil {
+		e.lastRuns.RecordRun(st.t.Name, start)
+	}
 }
 
 // runBounded executes the task's Run with a wall-clock ceiling. The

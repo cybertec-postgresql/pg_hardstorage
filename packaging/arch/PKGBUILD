@@ -96,6 +96,10 @@ package() {
         "${pkgdir}/usr/lib/systemd/system/pg_hardstorage.service"
     install -Dm644 deploy/systemd/pg_hardstorage@.service \
         "${pkgdir}/usr/lib/systemd/system/pg_hardstorage@.service"
+    # The WAL streamer is a SEPARATE unit — the two above run
+    # `pg_hardstorage agent`, which never opens a WAL stream (#56).
+    install -Dm644 deploy/systemd/pg_hardstorage-wal-stream@.service \
+        "${pkgdir}/usr/lib/systemd/system/pg_hardstorage-wal-stream@.service"
     install -Dm644 deploy/systemd/pg-hardstorage.sysusers.conf \
         "${pkgdir}/usr/lib/sysusers.d/pg-hardstorage.conf"
     install -Dm644 deploy/systemd/pg-hardstorage.tmpfiles.conf \

@@ -333,6 +333,13 @@ type Step struct {
 	ExpectStderrContains string   `yaml:"expect_stderr_contains,omitempty"`
 	Timeout              string   `yaml:"timeout,omitempty"`
 
+	// StopAfter, when set, sends SIGTERM to the command after this
+	// duration (must be below Timeout) — for long-running verbs such
+	// as `logical stream` or `wal stream` whose normal end IS an
+	// operator stop.  The exit code the command then returns is
+	// checked against ExpectExit as usual.
+	StopAfter string `yaml:"stop_after,omitempty"`
+
 	// Env carries extra environment variables to set on the
 	// cli_run child process — primarily for compat-shim
 	// scenarios that need PGPASSWORD (the pgBackRest, WAL-G,
@@ -435,8 +442,8 @@ func (s *Step) UnmarshalYAML(node *yaml.Node) error {
 			if val.Kind == yaml.MappingNode {
 				type stepPayload Step
 				var p stepPayload
-				if err := val.Decode(&p); err != nil {
-					return err
+				if err := decodeStrict(val, &p); err != nil {
+					return fmt.Errorf("step %s: %w", key, err)
 				}
 				p.Kind = key
 				*s = Step(p)
@@ -447,6 +454,10 @@ func (s *Step) UnmarshalYAML(node *yaml.Node) error {
 		list, err := assert.ParseList(val)
 		if err != nil {
 			return err
+		}
+		if len(list) == 0 {
+			// Checks nothing, and would report "0/0 asserts passed".
+			return fmt.Errorf("step %s (line %d): no assertions", key, val.Line)
 		}
 		s.Asserts = list
 		return nil
@@ -461,11 +472,32 @@ func (s *Step) UnmarshalYAML(node *yaml.Node) error {
 
 	type stepPayload Step
 	var p stepPayload
-	if err := val.Decode(&p); err != nil {
+	if err := decodeStrict(val, &p); err != nil {
 		return fmt.Errorf("step %s: %w", key, err)
 	}
 	p.Kind = key
 	*s = Step(p)
+	return nil
+}
+
+// decodeStrict decodes node into out, rejecting keys out has no field
+// for. yaml.Node.Decode ignores the parent decoder's KnownFields(true),
+// so step payloads — decoded here, inside UnmarshalYAML — silently
+// dropped typoed keys; two shipped scenarios wrote `assert: {asserts:
+// [...]}`, which decoded to an assert step with zero assertions. The
+// node is re-encoded and decoded by a strict decoder instead; errors
+// carry the node's line in the scenario file, since the re-encoded
+// document's own line numbers mean nothing to the author.
+func decodeStrict(node *yaml.Node, out any) error {
+	body, err := yaml.Marshal(node)
+	if err != nil {
+		return fmt.Errorf("line %d: %w", node.Line, err)
+	}
+	dec := yaml.NewDecoder(bytes.NewReader(body))
+	dec.KnownFields(true)
+	if err := dec.Decode(out); err != nil {
+		return fmt.Errorf("line %d: %w", node.Line, err)
+	}
 	return nil
 }
 

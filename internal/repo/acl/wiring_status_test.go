@@ -33,6 +33,9 @@ func TestACL_IsNotWiredIntoAnyProductionPath(t *testing.T) {
 			return nil // unreadable trees are not this test's business
 		}
 		if info.IsDir() {
+			if n := filepath.Base(p); len(n) > 1 && n[0] == '.' && n != ".." {
+				return filepath.SkipDir // .git, .claude/worktrees, …: not part of the module (go tooling skips them too)
+			}
 			base := filepath.Base(p)
 			if base == ".git" || base == "test-runs" || base == "vendor" || base == "bin" {
 				return filepath.SkipDir

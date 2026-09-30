@@ -25,14 +25,15 @@ validator catches a planted invalid command
 .IP \(bu 2
 hot-command paths all resolve in the catalog
 .IP \(bu 2
-a known-good probe round-trips to the provider
+a known-good probe round-trips to the provider (the child probe
+inherits --provider / --endpoint / --model)
 
 .RE
 
 .PP
-Each check returns pass/fail with a one-line summary.  Exits
-non-zero when any check fails.  Read-only and cheap; safe to
-run in CI.
+Each check returns pass/fail with a one-line summary.  Exits 1
+(runtime failure, not 2 = misuse) when any check fails.
+Read-only and cheap; safe to run in CI.
 
 
 .SH OPTIONS

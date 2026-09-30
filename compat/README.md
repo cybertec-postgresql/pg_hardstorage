@@ -69,9 +69,11 @@ the caller cannot recover any other way:
   - **`barman check --nagios`** returns Nagios' own codes —
     0 OK, 1 WARNING, 2 CRITICAL, 3 UNKNOWN — because that is
     the entire point of the flag.
-  - **`barman-cloud-wal-restore`** returns **1** only for a
-    segment that is genuinely absent, and **126** for any other
-    failure.  PostgreSQL reads every plain non-zero exit from a
+  - **Every `restore_command` verb** — `barman-cloud-wal-restore`,
+    `wal-g wal-fetch`, `pgbackrest archive-get` — returns **1**
+    only for a segment that is genuinely absent, and **126** for
+    any other failure (storage outage, missing stanza or
+    `WALG_*` configuration, bad argv, refused flag).  PostgreSQL reads every plain non-zero exit from a
     `restore_command` as "end of archive" and PROMOTES; 126 lands
     on `wait_result_is_any_signal`'s signal-ish branch so
     recovery aborts instead.  Never "fix" a wrapper by

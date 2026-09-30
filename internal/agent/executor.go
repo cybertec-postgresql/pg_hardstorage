@@ -13,6 +13,8 @@ import (
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/config"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/output"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/paths"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/restore"
 )
 
 // BackupExecutor implements JobExecutor for JobBackup. It wraps the
@@ -105,20 +107,18 @@ func (b *BackupExecutor) runBackup(ctx context.Context, job *ControlPlaneJob, pr
 		return nil, errors.New("backup-executor: signer/verifier not loaded; agent's keystore is missing")
 	}
 
-	// Honour Args.fast / Args.label / Args.inactivity_timeout when
-	// the operator's POST /v1/deployments/<n>/backups passed them.
-	fast := false
-	label := ""
-	inactivity := 0 * time.Second
-	if v, ok := job.Args["fast"].(bool); ok {
-		fast = v
+	// Job args from POST /v1/deployments/<n>/backups (what
+	// `backup --control-plane` forwards). Parsed strictly: a value of
+	// the wrong type is a job failure, never a silent default.
+	a, err := parseBackupJobArgs(job.Args)
+	if err != nil {
+		return nil, err
 	}
-	if v, ok := job.Args["label"].(string); ok {
-		label = v
-	}
-	if v, ok := job.Args["inactivity_timeout"].(string); ok {
-		if d, err := time.ParseDuration(v); err == nil {
-			inactivity = d
+	var incr *runner.IncrementalConfig
+	if a.incrementalFrom != "" {
+		incr, err = resolveIncrementalParent(ctx, repoURL, job.Deployment, a.incrementalFrom, b.verifier)
+		if err != nil {
+			return nil, err
 		}
 	}
 
@@ -143,17 +143,21 @@ func (b *BackupExecutor) runBackup(ctx context.Context, job *ControlPlaneJob, pr
 	// on the keyring ⇒ encrypt. Without this, control-plane backups
 	// were silently plaintext even in an --encrypt repo, and
 	// plaintext-hash dedup welds those manifests onto encrypted chunks.
-	var enc *runner.EncryptionConfig
-	if p, perr := paths.Resolve(paths.DefaultOptions()); perr == nil {
-		var eerr error
-		enc, eerr = runner.ResolveEncryption(ctx, runner.EncryptionRequest{
-			KeyringDir: p.Keyring.Value,
-			KEKRef:     dep.KEKRef,
-			KMSConfig:  b.kms.ProviderConfig(dep.KEKRef),
-		})
-		if eerr != nil {
-			return nil, fmt.Errorf("backup-executor: %w", eerr)
-		}
+	//
+	// A paths failure fails the job rather than leaving enc nil: an
+	// unknown keyring location is an unknown encryption posture, and
+	// defaulting to plaintext is the unsafe guess.
+	p, perr := resolveExecutorPaths()
+	if perr != nil {
+		return nil, fmt.Errorf("backup-executor: resolve keyring path (refusing to back up with an unknown encryption posture): %w", perr)
+	}
+	enc, eerr := runner.ResolveEncryption(ctx, runner.EncryptionRequest{
+		KeyringDir: p.Keyring.Value,
+		KEKRef:     dep.KEKRef,
+		KMSConfig:  b.kms.ProviderConfig(dep.KEKRef),
+	})
+	if eerr != nil {
+		return nil, fmt.Errorf("backup-executor: %w", eerr)
 	}
 	// The provider holds SDK connection state; close it once the
 	// backup has wrapped its DEK.
@@ -168,9 +172,12 @@ func (b *BackupExecutor) runBackup(ctx context.Context, job *ControlPlaneJob, pr
 		Tenant:            dep.Tenant,
 		Signer:            b.signer,
 		Verifier:          b.verifier,
-		Label:             label,
-		Fast:              fast,
-		InactivityTimeout: inactivity,
+		Label:             a.label,
+		Fast:              a.fast,
+		IncludeWAL:        a.includeWAL,
+		Incremental:       incr,
+		InactivityTimeout: a.inactivity,
+		StallTimeout:      a.stall,
 		OnEvent:           emit,
 		Encryption:        enc,
 		SkipLease:         dep.AllowUnenforceableLease,
@@ -207,4 +214,122 @@ func (b *BackupExecutor) runBackup(ctx context.Context, job *ControlPlaneJob, pr
 // decide to relax it.
 func repoMatches(a, b string) bool {
 	return strings.TrimRight(a, "/") == strings.TrimRight(b, "/")
+}
+
+// resolveExecutorPaths is paths.Resolve with the default options; a
+// variable so tests can make resolution fail.
+var resolveExecutorPaths = func() (*paths.Paths, error) { return paths.Resolve(paths.DefaultOptions()) }
+
+// backupJobArgs is the decoded Job.Args of a JobBackup.
+type backupJobArgs struct {
+	fast            bool
+	label           string
+	includeWAL      bool
+	incrementalFrom string
+	inactivity      time.Duration // streaming watchdog override
+	stall           time.Duration // `backup --stall-timeout`
+}
+
+// parseBackupJobArgs decodes the backup job args. Every key is
+// optional; a present key of the wrong type (or an unparseable
+// duration) is an error. The previous decoding ignored a malformed
+// inactivity_timeout and fell back to the default, so an operator's
+// watchdog setting could vanish without a trace.
+func parseBackupJobArgs(args map[string]any) (backupJobArgs, error) {
+	var a backupJobArgs
+	var err error
+	if a.fast, err = optBool(args, "fast"); err != nil {
+		return a, err
+	}
+	if a.includeWAL, err = optBool(args, "include_wal"); err != nil {
+		return a, err
+	}
+	if a.label, err = optString(args, "label"); err != nil {
+		return a, err
+	}
+	if a.incrementalFrom, err = optString(args, "incremental_from"); err != nil {
+		return a, err
+	}
+	if a.inactivity, err = optDuration(args, "inactivity_timeout"); err != nil {
+		return a, err
+	}
+	if a.stall, err = optDuration(args, "stall_timeout"); err != nil {
+		return a, err
+	}
+	return a, nil
+}
+
+func optBool(args map[string]any, key string) (bool, error) {
+	raw, ok := args[key]
+	if !ok || raw == nil {
+		return false, nil
+	}
+	v, ok := raw.(bool)
+	if !ok {
+		return false, fmt.Errorf("backup-executor: %s must be a bool, got %T", key, raw)
+	}
+	return v, nil
+}
+
+func optString(args map[string]any, key string) (string, error) {
+	raw, ok := args[key]
+	if !ok || raw == nil {
+		return "", nil
+	}
+	v, ok := raw.(string)
+	if !ok {
+		return "", fmt.Errorf("backup-executor: %s must be a string, got %T", key, raw)
+	}
+	return v, nil
+}
+
+func optDuration(args map[string]any, key string) (time.Duration, error) {
+	s, err := optString(args, key)
+	if err != nil || s == "" {
+		return 0, err
+	}
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		return 0, fmt.Errorf("backup-executor: %s: %w", key, err)
+	}
+	if d < 0 {
+		return 0, fmt.Errorf("backup-executor: %s must not be negative (got %s)", key, s)
+	}
+	return d, nil
+}
+
+// resolveIncrementalParent builds the PG 17+ incremental config for
+// `backup --incremental-from <id|latest>` on the agent, mirroring the
+// CLI's loadIncrementalConfig: "latest" resolves to the newest live
+// backup (refusing when unrankable manifests were skipped -- the
+// parent anchors the whole chain, and nobody is watching an agent
+// warn), and the parent must carry the PG-emitted backup_manifest an
+// incremental needs.
+func resolveIncrementalParent(ctx context.Context, repoURL, deployment, parentID string, verifier *backup.Verifier) (*runner.IncrementalConfig, error) {
+	_, sp, err := repo.Open(ctx, repoURL)
+	if err != nil {
+		return nil, fmt.Errorf("backup-executor: incremental_from: open repo: %w", err)
+	}
+	defer sp.Close()
+	if strings.EqualFold(strings.TrimSpace(parentID), "latest") {
+		id, skipped, rerr := restore.ResolveLatestDetailed(ctx, sp, deployment, verifier)
+		if rerr != nil {
+			return nil, fmt.Errorf("backup-executor: incremental_from=latest: %w", rerr)
+		}
+		if skipped > 0 {
+			return nil, fmt.Errorf("backup-executor: incremental_from=latest: %s", restore.LatestSkippedWarning(deployment, id, skipped))
+		}
+		parentID = id
+	}
+	parent, err := backup.NewManifestStore(sp).Read(ctx, deployment, parentID, verifier)
+	if err != nil {
+		return nil, fmt.Errorf("backup-executor: incremental_from: parent %q: %w", parentID, err)
+	}
+	if len(parent.PGBackupManifest) == 0 {
+		return nil, fmt.Errorf("backup-executor: incremental_from: parent %q has no pg_backup_manifest; take a fresh full backup to anchor the chain", parentID)
+	}
+	return &runner.IncrementalConfig{
+		ParentBackupID:   parent.BackupID,
+		ParentPGManifest: parent.PGBackupManifest,
+	}, nil
 }

@@ -33,24 +33,23 @@ func runnableParentRoot() *cobra.Command {
 }
 
 // TestValidate_RunnableParentPositionalIsNotUnknownSubcommand: `backup db1`
-// must NOT be flagged as an unknown subcommand — db1 is a positional. The
-// validator must instead reach the required-flag check and report the
-// missing --pg-connection (the actually-useful signal that was masked).
+// must NOT be flagged as an unknown subcommand — db1 is a positional.
+//
+// It is also a COMPLETE command: --pg-connection is back-filled from
+// db1's config before cobra checks required flags (issue #12), so
+// demanding it here was a false warning on the documented form — and
+// the validator's retry prompt then pushed the model to invent a DSN
+// flag (`--conn`, `--pg-conn`) to satisfy it. Without a deployment
+// there is nothing to back-fill from, and the flag is still required.
 func TestValidate_RunnableParentPositionalIsNotUnknownSubcommand(t *testing.T) {
 	tree := cmdtree.Walk(runnableParentRoot())
-	err := cmdtree.Validate(tree, "pg_hardstorage backup db1", "pg_hardstorage")
-	if err == nil {
-		t.Fatal("expected missing_required for --pg-connection, got nil")
+	if err := cmdtree.Validate(tree, "pg_hardstorage backup db1", "pg_hardstorage"); err != nil {
+		t.Fatalf("`backup db1` is the documented, complete form; got %v", err)
 	}
+	err := cmdtree.Validate(tree, "pg_hardstorage backup", "pg_hardstorage")
 	ve, ok := err.(*cmdtree.ValidationError)
-	if !ok {
-		t.Fatalf("wrong error type: %T (%v)", err, err)
-	}
-	if ve.Kind != "missing_required" {
-		t.Errorf("Kind = %q, want missing_required (got: %v)", ve.Kind, ve)
-	}
-	if !strings.Contains(ve.Message, "pg-connection") {
-		t.Errorf("missing_required should name --pg-connection, got: %v", ve)
+	if !ok || ve.Kind != "missing_required" || !strings.Contains(ve.Message, "pg-connection") {
+		t.Fatalf("with no deployment named, --pg-connection is still required; got %v", err)
 	}
 }
 
@@ -101,12 +100,20 @@ func TestValidate_UsageDeclaredRequiredFlag(t *testing.T) {
 	rot.Flags().String("repo", "", "repository URL (file://, s3://, ...) — must already exist (required)")
 	rot.Flags().Bool("apply", false, "actually soft-delete (default: dry-run)")
 	root.AddCommand(rot)
+	appr := &cobra.Command{Use: "approve <request-id>", Run: func(_ *cobra.Command, _ []string) {}}
+	appr.Flags().String("repo", "", "repository URL (required)")
+	root.AddCommand(appr)
 	tree := cmdtree.Walk(root)
 
-	err := cmdtree.Validate(tree, "pg_hardstorage rotate db1 --apply", "pg_hardstorage")
+	// A positional that is NOT a deployment → nothing back-fills --repo,
+	// so the usage-declared "(required)" must be enforced.
+	err := cmdtree.Validate(tree, "pg_hardstorage approve req-123", "pg_hardstorage")
 	ve, ok := err.(*cmdtree.ValidationError)
 	if !ok || ve.Kind != "missing_required" || !strings.Contains(ve.Message, "repo") {
 		t.Fatalf("usage-declared required flag not enforced; got: %v", err)
+	}
+	if err := cmdtree.Validate(tree, "pg_hardstorage rotate db1 --apply", "pg_hardstorage"); err != nil {
+		t.Errorf("with a deployment named, --repo is back-filled from its config; got: %v", err)
 	}
 	if err := cmdtree.Validate(tree, "pg_hardstorage rotate db1 --repo file:///r --apply", "pg_hardstorage"); err != nil {
 		t.Errorf("with --repo supplied it should pass, got: %v", err)

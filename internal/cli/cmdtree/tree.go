@@ -36,6 +36,18 @@ import (
 // while another command is mutating its own flag set during
 // PreRun).
 type Node struct {
+	// normalize maps a flag name the operator typed onto the name the
+	// command declares, using the command's own pflag NormalizeFunc.
+	// Several commands accept a second spelling that --help never shows
+	// (deployment add takes --pg-connection for its --connection;
+	// timetravel takes --remove-target and --remove-targets). The
+	// binary accepts those; a validator that only knew declared names
+	// rejected them, and its retry prompt then told the model a
+	// correct flag was invented — so the model "fixed" --pg-connection
+	// into --conn or --pg-conn, which really are invented. nil means
+	// identity (e.g. a tree built without cobra).
+	normalize func(string) string
+
 	Name   string // bare verb, e.g. "add"
 	Path   string // space-separated path, e.g. "pg_hardstorage deployment add"
 	Use    string // raw cobra Use line, e.g. "add <name>"
@@ -266,9 +278,10 @@ func walk(c *cobra.Command, parentPath string) *Node {
 		// subcommands (hardenGroupCommands) is NOT runnable for
 		// validation purposes — `deployment create` must still be
 		// classified as unknown_command, not as positional args.
-		Runnable: c.Runnable() && c.Annotations["pg_hardstorage.group_guard"] != "1",
-		Aliases:  append([]string(nil), c.Aliases...),
-		Flags:    collectFlags(c),
+		Runnable:  c.Runnable() && c.Annotations["pg_hardstorage.group_guard"] != "1",
+		Aliases:   append([]string(nil), c.Aliases...),
+		Flags:     collectFlags(c),
+		normalize: flagNormalizer(c),
 	}
 	n.MinArgs, n.MaxArgs = parseArgSpec(c.Use)
 	for _, child := range c.Commands() {
@@ -376,6 +389,9 @@ func (n *Node) findChild(name string) *Node {
 func (n *Node) FlagByName(name string) *Flag {
 	name = strings.TrimPrefix(name, "--")
 	name = strings.TrimPrefix(name, "-")
+	if n.normalize != nil {
+		name = n.normalize(name)
+	}
 	for i := range n.Flags {
 		if n.Flags[i].Name == name || n.Flags[i].Shorthand == name {
 			return &n.Flags[i]
@@ -396,4 +412,11 @@ func (n *Node) VisibleChildren() []*Node {
 		out = append(out, c)
 	}
 	return out
+}
+
+// flagNormalizer captures c's flag-name normalization, if it has one.
+func flagNormalizer(c *cobra.Command) func(string) string {
+	fs := c.Flags()
+	nf := fs.GetNormalizeFunc()
+	return func(name string) string { return string(nf(fs, name)) }
 }

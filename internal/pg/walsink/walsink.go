@@ -869,7 +869,7 @@ func (s *Sink) flushBatch(batch []chunkedSeg) error {
 		}
 	}
 
-	for _, cs := range batch {
+	for i, cs := range batch {
 		endLSN := cs.startLSN + pglogrepl.LSN(s.segSize)
 		m := &SegmentManifest{
 			Schema:           Schema,
@@ -896,6 +896,7 @@ func (s *Sink) flushBatch(batch []chunkedSeg) error {
 		if err := s.commitManifest(s.procCtx, m); err != nil {
 			return err
 		}
+		s.releaseAdoptedRefs(cs, batch[i+1:])
 
 		// Fault checkpoint: manifest at its canonical key, segment fully
 		// durable; SyncedLSN not yet advanced (PG will resend on resume).
@@ -922,6 +923,46 @@ func (s *Sink) flushBatch(batch []chunkedSeg) error {
 		metrics.WALSegmentArchived(s.opts.Deployment, s.segSize)
 	}
 	return nil
+}
+
+// releaseAdoptedRefs drops a just-committed segment's chunk hashes from
+// the CAS adoption set — except those a later, still-uncommitted segment
+// of the same batch also references.
+//
+// Once a segment manifest is committed, every chunk it references is
+// held by a committed manifest, so gc's orphan sweep can no longer pull
+// one out from under us and the commit-time re-verification has served
+// its purpose for THAT segment. Releasing is required, or a days-long
+// `wal stream` — one CAS for the whole session — retains every
+// deduplicated hash ever seen (memory-leak audit #2).
+//
+// But the adoption set is per-CAS, not per-segment. A batch is chunked
+// in full before any of it commits, so two segments of one batch that
+// share an adopted chunk share ONE entry; releasing it when the first
+// commits blinded the second's verifyAdoptedSegmentRefs, and a gc sweep
+// landing between the two commits went unnoticed — a committed segment
+// over a deleted chunk. Shared hashes are released when the last
+// segment referencing them commits. A failed commit releases nothing:
+// the retry re-verifies the same refs.
+func (s *Sink) releaseAdoptedRefs(committed chunkedSeg, rest []chunkedSeg) {
+	if s.cas == nil {
+		return
+	}
+	var stillNeeded map[repo.Hash]struct{}
+	if len(rest) > 0 {
+		stillNeeded = make(map[repo.Hash]struct{})
+		for _, later := range rest {
+			for _, ref := range later.refs {
+				stillNeeded[ref.Hash] = struct{}{}
+			}
+		}
+	}
+	for _, ref := range committed.refs {
+		if _, keep := stillNeeded[ref.Hash]; keep {
+			continue
+		}
+		s.cas.ForgetAdopted(ref.Hash)
+	}
 }
 
 // procErrStore records the first processing error (first writer wins).
@@ -973,6 +1014,10 @@ func verifyAdoptedSegmentRefs(ctx context.Context, sp storage.StoragePlugin, cas
 		}
 		if _, err := sp.Stat(ctx, repo.ChunkKey(ref.Hash)); err != nil {
 			if errors.Is(err, storage.ErrNotFound) {
+				// Drop every memory of the chunk: without this the retry's
+				// PutChunk hits the in-memory seen cache, "dedups" against
+				// the deleted chunk again and fails the same way forever.
+				cas.ForgetChunk(ref.Hash)
 				return fmt.Errorf("walsink: segment %s references chunk %s which was "+
 					"deduplicated against and has since been deleted (a concurrent "+
 					"`repo gc --apply` swept it as an orphan); refusing to commit a segment "+
@@ -985,6 +1030,26 @@ func verifyAdoptedSegmentRefs(ctx context.Context, sp storage.StoragePlugin, cas
 }
 
 func (s *Sink) commitManifest(ctx context.Context, m *SegmentManifest) error {
+	// gc exclusion (repo/gcfence.go). The re-Stat below is only a timing
+	// guard: a `repo gc --apply` could delete an adopted chunk after the
+	// Stat and before the commit is visible. The fence pins the segment's
+	// adopted chunks against a running gc and waits out its in-flight
+	// delete batch BEFORE the Stat; Confirm then checks no gc run swept
+	// one mid-commit. WAL writers hold no backup lease, so without the
+	// fence a streamer was the one writer gc's exclusion never covered.
+	var adopted []repo.Hash
+	if s.cas != nil {
+		for _, ref := range m.Chunks {
+			if s.cas.WasAdopted(ref.Hash) {
+				adopted = append(adopted, ref.Hash)
+			}
+		}
+	}
+	fence, err := repo.BeginCommitFence(ctx, s.sp, adopted,
+		repo.FenceOptions{Owner: "wal " + m.Deployment + "/" + m.SegmentName})
+	if err != nil {
+		return fmt.Errorf("walsink: gc fence: %w", err)
+	}
 	if err := verifyAdoptedSegmentRefs(ctx, s.sp, s.cas, m); err != nil {
 		return err
 	}
@@ -1024,18 +1089,23 @@ func (s *Sink) commitManifest(ctx context.Context, m *SegmentManifest) error {
 	if commitErr != nil {
 		return commitErr
 	}
-	// The segment manifest is committed (or verified as an
-	// already-committed idempotent re-commit): every chunk it
-	// references is now referenced by a committed manifest, so gc's
-	// orphan sweep can no longer pull one out from under us and the
-	// commit-time re-verification has served its purpose for this
-	// segment.  Release the adopted entries or a days-long
-	// `wal stream` — one CAS for the whole session — would retain
-	// every deduplicated hash ever seen: unbounded growth
-	// (memory-leak audit #2).  A failed commit must NOT release:
-	// the retry re-verifies the same refs.
-	for _, ref := range m.Chunks {
-		s.cas.ForgetAdopted(ref.Hash)
+	if err := fence.Confirm(ctx); err != nil {
+		// Committed over a chunk a gc run deleted mid-commit (only possible
+		// when the commit overran the fence's writer budget). The manifest
+		// must not stay: an idempotent re-commit of the same refs would
+		// accept it as archived. Remove it and forget the chunks, so the
+		// failed attempt leaves SyncedLSN where it was, PostgreSQL resends
+		// the segment, and the retry rewrites it whole.
+		s.cas.ForgetChunk(adopted...)
+		cctx, cancel := storage.CleanupContext(ctx)
+		defer cancel()
+		if derr := s.sp.Delete(cctx, key); derr != nil && !errors.Is(derr, storage.ErrNotFound) {
+			return fmt.Errorf("walsink: segment %s: %w; removing the unrestorable manifest also failed (%v) — delete %s by hand before the stream resumes", m.SegmentName, err, derr, key)
+		}
+		return fmt.Errorf("walsink: segment %s: %w", m.SegmentName, err)
 	}
+	// Releasing this segment's adopted refs is flushBatch's job, not
+	// ours: only it knows which later segments of the same batch —
+	// already chunked, not yet committed — still depend on them.
 	return nil
 }

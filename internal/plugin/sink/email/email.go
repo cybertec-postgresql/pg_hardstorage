@@ -15,6 +15,7 @@
 //	  cc: []                                # optional
 //	  subject_prefix: "[pg_hardstorage]"    # optional
 //	  min_severity: error                   # default: error (email is for waking people)
+//	  timeout: 30s                          # whole SMTP conversation — default: 30s
 //
 // Why a focused TLS / auth model rather than try-everything? Operators
 // typically know which combination their SMTP relay accepts; an
@@ -42,11 +43,13 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/airgap"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/output"
 )
 
 func init() {
 	output.DefaultSinkRegistry.Register("email", NewFromSpec)
+	output.DefaultSinkRegistry.DeclareConfigKeys("email", "auth", "cc", "from", "password", "smtp_host", "smtp_port", "subject_prefix", "timeout", "tls", "to", "username")
 }
 
 // TLSMode controls how the SMTP connection is wrapped in TLS.
@@ -102,12 +105,16 @@ type Sink struct {
 	subjectPfx  string
 	minSeverity output.Severity
 
-	dialTimeout time.Duration
+	// timeout bounds one whole Emit — dial, TLS, SMTP conversation.
+	// The dispatcher hands sinks the caller's ctx, which is often
+	// Background, so without this a relay that accepts TCP and then
+	// stalls would pin Emit (and Dispatcher.Close, which waits for
+	// in-flight Emits) forever.
+	timeout time.Duration
 
-	// dialFn is the connection establisher; tests substitute via the
-	// OverrideDialer hook (test-only file). Production reads
-	// (&net.Dialer{Timeout: dialTimeout}).Dial.
-	dialFn func(network, address string) (net.Conn, error)
+	// dialFn is the connection establisher. Production uses
+	// net.Dialer.DialContext so ctx cancellation reaches the dial too.
+	dialFn func(ctx context.Context, network, address string) (net.Conn, error)
 
 	mu     sync.Mutex
 	closed bool
@@ -150,6 +157,13 @@ func NewFromSpec(spec output.SinkSpec) (output.Sink, error) {
 	}
 	if port <= 0 || port > 65535 {
 		return nil, fmt.Errorf("email: smtp_port %d out of range", port)
+	}
+	// airgapped: strict covers every outbound path, not just HTTP.
+	// "tcp://" gives the policy a scheme it classifies by host; a bare
+	// host:port would parse as an unknown scheme and be refused even
+	// for a loopback relay.
+	if err := airgap.Default().EndpointAllowed("tcp://" + net.JoinHostPort(host, strconv.Itoa(port))); err != nil {
+		return nil, fmt.Errorf("email: %w", err)
 	}
 
 	tlsStr, err := output.SinkConfigStringDefault(spec.Config, "tls", string(TLSStartTLS))
@@ -224,8 +238,19 @@ func NewFromSpec(spec output.SinkSpec) (output.Sink, error) {
 		return nil, fmt.Errorf("email: %w", perr)
 	}
 
-	dialTimeout := 15 * time.Second
-	dialer := &net.Dialer{Timeout: dialTimeout}
+	timeoutStr, err := output.SinkConfigStringDefault(spec.Config, "timeout", "30s")
+	if err != nil {
+		return nil, err
+	}
+	timeout, perr := time.ParseDuration(timeoutStr)
+	if perr != nil {
+		return nil, fmt.Errorf("email: parse timeout %q: %w", timeoutStr, perr)
+	}
+	if timeout <= 0 {
+		return nil, fmt.Errorf("email: timeout %q must be positive", timeoutStr)
+	}
+
+	dialer := &net.Dialer{Timeout: 15 * time.Second}
 	return &Sink{
 		name:        spec.Name,
 		host:        host,
@@ -239,8 +264,8 @@ func NewFromSpec(spec output.SinkSpec) (output.Sink, error) {
 		cc:          cc,
 		subjectPfx:  pfx,
 		minSeverity: minSev,
-		dialTimeout: dialTimeout,
-		dialFn:      dialer.Dial,
+		timeout:     timeout,
+		dialFn:      dialer.DialContext,
 	}, nil
 }
 
@@ -314,11 +339,23 @@ func (s *Sink) Emit(ctx context.Context, ev *output.Event) error {
 	body := formatBody(ev)
 	frame := s.frame(subject, body)
 
+	ctx, cancel := context.WithTimeout(ctx, s.timeout)
+	defer cancel()
+
 	addr := net.JoinHostPort(s.host, strconv.Itoa(s.port))
-	conn, err := s.openConn(addr)
+	conn, err := s.openConn(ctx, addr)
 	if err != nil {
 		return fmt.Errorf("email: dial %s: %w", addr, err)
 	}
+	// net/smtp has no ctx support, so bound it at the conn: the
+	// deadline caps every read/write of the conversation, and closing
+	// the conn on ctx.Done unblocks whatever call is in flight the
+	// moment the caller cancels (a deadline alone would not notice a
+	// cancel that arrives before it).
+	deadline, _ := ctx.Deadline()
+	_ = conn.SetDeadline(deadline)
+	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stop()
 	// net/smtp.NewClient takes the conn; on success the client owns it.
 	c, err := smtp.NewClient(conn, s.host)
 	if err != nil {
@@ -372,23 +409,23 @@ func (s *Sink) Emit(ctx context.Context, ev *output.Event) error {
 // openConn dials the SMTP server, wrapping in implicit TLS when
 // configured. STARTTLS upgrades happen AFTER NewClient, so this
 // function returns a plaintext conn for that mode.
-func (s *Sink) openConn(addr string) (net.Conn, error) {
+func (s *Sink) openConn(ctx context.Context, addr string) (net.Conn, error) {
 	if s.tlsMode == TLSImplicit {
 		// Dial then wrap in TLS. We use net.Dialer (or test
 		// override) for the underlying dial so dial-timeout
 		// semantics match the other modes.
-		raw, err := s.dialFn("tcp", addr)
+		raw, err := s.dialFn(ctx, "tcp", addr)
 		if err != nil {
 			return nil, err
 		}
 		tconn := tls.Client(raw, &tls.Config{ServerName: s.host})
-		if err := tconn.Handshake(); err != nil {
+		if err := tconn.HandshakeContext(ctx); err != nil {
 			_ = raw.Close()
 			return nil, fmt.Errorf("tls handshake: %w", err)
 		}
 		return tconn, nil
 	}
-	return s.dialFn("tcp", addr)
+	return s.dialFn(ctx, "tcp", addr)
 }
 
 // authenticate runs the operator-chosen auth mechanism. AuthNone is a
@@ -499,15 +536,12 @@ func (s *Sink) frame(subject, body string) string {
 	// Body — same vocabulary as the JIRA / syslog shapes so an
 	// operator reading email + Slack about the same incident sees
 	// matching content.
+	//
+	// No dot-stuffing here: RFC 5321 §4.5.2 stuffing is a transport
+	// concern, and smtp.Client.Data's writer (textproto.DotWriter)
+	// already applies it. Stuffing in frame too made every leading-dot
+	// line arrive as "..line".
 	for _, line := range strings.Split(body, "\n") {
-		// SMTP "dot stuffing" — lines beginning with `.` need a
-		// leading dot per RFC 5321 §4.5.2 to avoid being
-		// interpreted as the end-of-data marker. net/textproto's
-		// Data() Writer handles this for us, but applying it here
-		// keeps `frame` self-contained for tests.
-		if strings.HasPrefix(line, ".") {
-			line = "." + line
-		}
 		fmt.Fprintf(bw, "%s\r\n", line)
 	}
 	return bw.String()

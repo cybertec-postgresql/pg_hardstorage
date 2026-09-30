@@ -7,20 +7,28 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
+
+	"github.com/cybertec-postgresql/pg_hardstorage/compat/internal/pitrtime"
 )
 
 // newRestoreCmd implements `pgbackrest --stanza=<n> restore [--target=<t>] [--type=<form>]`.
 //
-// Target form auto-detection:
+// --type follows pgBackRest's recovery types:
+//
+//	default (or unset)  → --to-latest: replay every archived segment
+//	immediate           → stop at consistency (the native default)
+//	time | lsn | name   → --to / --to-lsn / --to-name with --target
+//	standby             → native `standby create` (hot standby)
+//	xid | preserve | none → refused: no native equivalent
+//
+// Without --type, a --target value is auto-detected:
 //
 //	hex with /            → --to-lsn
 //	starts with "name:"   → --to-name
 //	otherwise time-ish    → --to "<value>"
 //
-// Operators can pin the form explicitly with --type=time|lsn|name
-// (mirroring pgBackRest's flag).  --target-action maps 1:1 to the
-// native --to-action; pgBackRest's "promote" / "shutdown" / "pause"
-// names already match.
+// --target-action maps 1:1 to the native --to-action; pgBackRest's
+// "promote" / "shutdown" / "pause" names already match.
 func newRestoreCmd() *cobra.Command {
 	c := &cobra.Command{
 		Use:           "restore",
@@ -36,7 +44,7 @@ func newRestoreCmd() *cobra.Command {
 	c.Flags().StringVar(&globalArgs.targetAction, "target-action", "",
 		"action when target reached: promote | shutdown | pause")
 	c.Flags().StringVar(&globalArgs.targetType, "type", "",
-		"target form override: time | lsn | name | immediate")
+		"recovery type: default | immediate | time | lsn | name | standby")
 
 	// pgBackRest's own explicit forms. Real pgbackrest spells a
 	// recovery target as --target-time / --target-lsn / --target-name;
@@ -52,11 +60,39 @@ func newRestoreCmd() *cobra.Command {
 	return c
 }
 
-// resolveTarget folds pgBackRest's two target spellings into the one
-// (form, value) pair runRestore emits. The explicit --target-* flags
-// win over --target/--type, and setting more than one is a usage
-// error rather than a silent pick.
+// refusedRestoreTypes are pgBackRest recovery types with no native
+// equivalent. Each used to fall through the form switch silently: xid
+// was sniffed as a TIME, preserve / none became an immediate restore
+// that promoted. Refusing names the gap instead.
+var refusedRestoreTypes = map[string]string{
+	"xid": "native recovery has no transaction-ID target; find the commit's LSN " +
+		"(pg_waldump, or pg_current_wal_lsn() logged near the transaction) or its time " +
+		"and pass --type=lsn / --type=time",
+	"preserve": "native restore always writes its own recovery settings; restore with " +
+		"--type=immediate or --type=default, then edit postgresql.auto.conf",
+	"none": "pg_hardstorage backups are taken online and the WAL needed to reach " +
+		"consistency lives in the repository, so a restore without restore_command " +
+		"cannot start; use --type=immediate",
+}
+
+// resolveTarget folds pgBackRest's two target spellings and --type
+// into the one (form, value) pair runRestore emits. form is "" for
+// pgBackRest's default (replay to end of archive), or one of
+// immediate / standby / time / lsn / name. The explicit --target-*
+// flags win over --target/--type, and setting more than one is a
+// usage error rather than a silent pick.
 func resolveTarget(a pgbackrestArgs) (form, value string, err error) {
+	typ := strings.ToLower(a.targetType)
+	switch typ {
+	case "", "default", "immediate", "standby", "time", "lsn", "name":
+	default:
+		if hint, ok := refusedRestoreTypes[typ]; ok {
+			return "", "", refuseFlag("--type="+a.targetType, hint)
+		}
+		return "", "", refuseFlag("--type="+a.targetType,
+			"supported recovery types are default, immediate, time, lsn, name and standby")
+	}
+
 	explicit := 0
 	if a.targetTime != "" {
 		form, value, explicit = "time", a.targetTime, explicit+1
@@ -76,12 +112,29 @@ func resolveTarget(a pgbackrestArgs) (form, value string, err error) {
 			return "", "", fmt.Errorf(
 				"pg-hardstorage-pgbackrest: restore: pass either --target/--type or one of --target-time/--target-lsn/--target-name, not both")
 		}
+		if typ != "" && typ != form {
+			return "", "", fmt.Errorf(
+				"pg-hardstorage-pgbackrest: restore: --type=%s conflicts with --target-%s", typ, form)
+		}
 		return form, value, nil
 	}
 	if a.target == "" {
-		return "", "", nil
+		switch typ {
+		case "", "default":
+			return "", "", nil
+		case "immediate", "standby":
+			return typ, "", nil
+		default:
+			return "", "", fmt.Errorf(
+				"pg-hardstorage-pgbackrest: restore: --type=%s requires --target", typ)
+		}
 	}
-	form, value = classifyTarget(a.target, a.targetType)
+	switch typ {
+	case "default", "immediate", "standby":
+		return "", "", fmt.Errorf(
+			"pg-hardstorage-pgbackrest: restore: --target has no meaning with --type=%s", typ)
+	}
+	form, value = classifyTarget(a.target, typ)
 	return form, value, nil
 }
 
@@ -103,25 +156,56 @@ func runRestore(a pgbackrestArgs) error {
 				"(pgBackRest uses it implicitly; the shim forwards it as --target)")
 	}
 
-	out := []string{native[0], a.stanza, "latest"}
-	out = append(out, native[1:]...)
-	out = append(out, "--target", target)
-
 	form, value, err := resolveTarget(a)
 	if err != nil {
 		return err
 	}
+
+	if form == "standby" {
+		// pgBackRest --type=standby writes standby.signal: the node
+		// stays in recovery following the archive and is never
+		// promoted. A plain native restore arms recovery_target=
+		// 'immediate' + promote, which would turn the would-be replica
+		// into a second, divergent primary — so dispatch the native
+		// hot-standby builder instead.
+		if a.targetAction != "" {
+			return fmt.Errorf(
+				"pg-hardstorage-pgbackrest: restore: --target-action has no meaning with --type=standby (a standby is never promoted automatically)")
+		}
+		out := []string{"standby", "create", a.stanza,
+			"--deployment", a.stanza, "--backup", "latest", "--target", target}
+		out = append(out, native[1:]...)
+		if rc := dispatchNative(out); rc != 0 {
+			return fmt.Errorf("pg-hardstorage-pgbackrest: restore: native CLI exited %d", rc)
+		}
+		return nil
+	}
+
+	out := []string{native[0], a.stanza, "latest"}
+	out = append(out, native[1:]...)
+	out = append(out, "--target", target)
+
 	switch form {
 	case "lsn":
 		out = append(out, "--to-lsn", value)
 	case "name":
 		out = append(out, "--to-name", value)
 	case "time":
+		if err := pitrtime.RequireExplicitZone("pgBackRest",
+			"pg-hardstorage-pgbackrest: restore: target time", value); err != nil {
+			return err
+		}
 		out = append(out, "--to", value)
-	case "immediate", "":
-		// Native maps "immediate" to no PITR target — recovery
-		// stops at the end of the base backup, which is the
-		// default already.
+	case "immediate":
+		// Native's own default: recovery_target='immediate', stop at
+		// the backup's consistency point.
+	case "":
+		// pgBackRest's default type replays every archived segment and
+		// then promotes. The native default stops at the backup's
+		// consistency point instead, which silently discards all WAL
+		// archived after the backup — the most common DR restore would
+		// lose everything since the last backup.
+		out = append(out, "--to-latest")
 	}
 	if a.targetAction != "" {
 		out = append(out, "--to-action", strings.ToLower(a.targetAction))
@@ -146,8 +230,6 @@ func classifyTarget(value, explicit string) (form, normalised string) {
 		return "name", strings.TrimPrefix(value, "name:")
 	case "time":
 		return "time", value
-	case "immediate":
-		return "immediate", ""
 	}
 	// Auto-detect.
 	if strings.HasPrefix(value, "name:") {

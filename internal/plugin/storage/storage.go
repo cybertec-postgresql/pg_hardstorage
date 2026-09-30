@@ -387,3 +387,47 @@ func RegionOf(sp StoragePlugin) string {
 	}
 	return RegionUnknown
 }
+
+// CleanupTimeout bounds a rollback run under CleanupContext.
+const CleanupTimeout = 30 * time.Second
+
+// CleanupContext returns a context for undoing a half-finished write:
+// it keeps ctx's values but not its cancellation, and is bounded by
+// CleanupTimeout.
+//
+// The rollback is needed precisely when something went wrong, and a
+// cancelled or expired caller context is one of the commonest things to
+// go wrong. Reusing that context meant the cleanup request never left
+// the process: a Put whose retention call failed on cancellation left
+// an UNLOCKED object at a chunk key, which the next IfNotExists Put then
+// deduped against as though it were committed and protected.
+func CleanupContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), CleanupTimeout)
+}
+
+// LazyDeleter is an OPTIONAL capability: DeleteLazy removes key like
+// Delete but need not make the removal crash-durable before returning.
+//
+// It exists for deleting GARBAGE. `repo gc --apply` removes tens of
+// thousands of orphan chunks per run; on the fs backend a durable
+// Delete is an unlink plus an open/fsync/close of the parent directory
+// — a journal flush per chunk, which dominated gc on a real shared
+// repository. A crash that resurrects an orphan is harmless (it is
+// unreferenced and content-addressed; the next gc reaps it again), so
+// the per-delete fsync buys nothing there. Never use it for an object
+// whose disappearance other state depends on (manifests, markers).
+//
+// Backends where Delete is already a single durable round trip (object
+// stores) need not implement it; DeleteLazy falls back to Delete.
+type LazyDeleter interface {
+	DeleteLazy(ctx context.Context, key string) error
+}
+
+// DeleteLazy calls sp.DeleteLazy when sp implements LazyDeleter, else
+// sp.Delete. Same not-found semantics as Delete.
+func DeleteLazy(ctx context.Context, sp StoragePlugin, key string) error {
+	if ld, ok := sp.(LazyDeleter); ok {
+		return ld.DeleteLazy(ctx, key)
+	}
+	return sp.Delete(ctx, key)
+}

@@ -90,6 +90,12 @@ type AffectedBackup struct {
 	WrappedDEK string    `json:"wrapped_dek,omitempty"`
 	FileCount  int       `json:"file_count"`
 	ChunkCount int       `json:"chunk_count"`
+	// Tombstoned marks a soft-deleted backup. It is still reported:
+	// until GC reclaims its chunks it is recoverable with `backup
+	// undelete`, so the subject's data is still held. Not part of the
+	// signed digest (the backup ID is), which keeps previously-signed
+	// reports verifiable.
+	Tombstoned bool `json:"tombstoned,omitempty"`
 }
 
 // AffectedDeployment is the per-deployment rollup.
@@ -180,6 +186,9 @@ var (
 	ErrTenantRequired    = errors.New("dsa: tenant is required")
 	ErrArticleRequired   = errors.New("dsa: article is required")
 	ErrInvalidArticle    = errors.New("dsa: invalid article")
+	// ErrUnknownTenant is returned by Locate with RequireKnownTenant
+	// when no manifest in scope carries the tenant at all.
+	ErrUnknownTenant = errors.New("dsa: no backup in scope carries this tenant")
 )
 
 // Signer is the signing surface (backup.Signer satisfies it).
@@ -220,6 +229,15 @@ type LocateOptions struct {
 
 	// Optional deployment scope.  Empty → all deployments.
 	Deployment string
+
+	// RequireKnownTenant makes Locate fail with ErrUnknownTenant when
+	// no readable manifest in scope (live or tombstoned, inside the
+	// window or not) carries Tenant. A mistyped tenant otherwise yields
+	// a clean zero-affected report -- which, signed, reads as "this
+	// subject's data is nowhere". Not applied when manifests were
+	// unreadable: the tenant may be on those, and the report's
+	// ManifestsUnreadable already marks it incomplete.
+	RequireKnownTenant bool
 
 	// Now overrides time.Now (deterministic tests).
 	Now func() time.Time
@@ -290,9 +308,15 @@ func (l *Locator) Locate(ctx context.Context, opts LocateOptions) (*Report, erro
 	}
 
 	deploymentRollup := make(map[string]*AffectedDeployment)
+	tenantSeen := false
 
 	for _, d := range deployments {
-		for m, err := range l.manifests.List(ctx, d, l.verifier) {
+		// ListIncludingTombstoned, not List: a soft-deleted backup's
+		// chunks remain until GC and `backup undelete` restores it, so
+		// the subject's data is still held and must be disclosed (Art.
+		// 15) / erased (Art. 17). List hides tombstones, which made the
+		// report understate the holdings.
+		for entry, err := range l.manifests.ListIncludingTombstoned(ctx, d, l.verifier) {
 			if err != nil {
 				// One bad manifest doesn't kill the whole scan -- but
 				// it is RECORDED, which the previous comment promised
@@ -303,15 +327,18 @@ func (l *Locator) Locate(ctx context.Context, opts LocateOptions) (*Report, erro
 				report.ManifestsUnreadable++
 				continue
 			}
+			m := entry.Manifest
 			report.ManifestsScanned++
 			if m.Tenant != opts.Tenant {
 				continue
 			}
+			tenantSeen = true
 			if !inWindow(m.StoppedAt, opts.WindowStart, opts.WindowEnd) {
 				continue
 			}
 			report.ManifestsAffected++
 			ab := manifestToAffected(m)
+			ab.Tombstoned = entry.Tombstoned
 			report.AffectedBackups = append(report.AffectedBackups, ab)
 
 			rd, ok := deploymentRollup[d]
@@ -322,6 +349,10 @@ func (l *Locator) Locate(ctx context.Context, opts LocateOptions) (*Report, erro
 			rd.BackupCount++
 			rd.BackupIDs = append(rd.BackupIDs, m.BackupID)
 		}
+	}
+
+	if opts.RequireKnownTenant && !tenantSeen && report.ManifestsUnreadable == 0 {
+		return nil, fmt.Errorf("%w: %q", ErrUnknownTenant, opts.Tenant)
 	}
 
 	// Materialise the rollup, sorted by deployment for stable

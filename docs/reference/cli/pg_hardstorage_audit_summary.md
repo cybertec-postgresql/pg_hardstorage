@@ -26,8 +26,8 @@ and incident review:
   # All backup-namespace actions in the last week
   audit summary --repo <url> --since 7d --action-prefix backup.
 
-  # Per-tenant deletion volume
-  audit summary --repo <url> --since 720h --action backup.delete
+  # Deletion volume per action under backup.delete
+  audit summary --repo <url> --since 720h --action-prefix backup.delete
 
 The result is a map of action → count plus a total, rendered as
 a JSON body or a tabular text view.

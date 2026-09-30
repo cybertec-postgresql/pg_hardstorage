@@ -115,7 +115,9 @@ WAL inventory. PITR inside the gap window is then explicitly refused.
 
 **Symptom.** A `wal_gap_detected` notice in `wal stream` logs, or a
 restore returns `restore.target_in_wal_gap` (exit 7) when the requested
-LSN falls inside a known gap.
+LSN falls inside a known gap, or lies beyond one that replay from the
+chosen backup would have to cross (the backup stopped before the gap
+ended).
 
 **What it means.** Some range of WAL LSNs is missing from the repo.
 The gap auditor records the start and end of every gap it knows
@@ -125,7 +127,9 @@ PG would have nothing to replay.
 **What to do.**
 
 - For a recent gap caused by `wal repair`: the gap is real WAL loss.
-  Pick a restore target outside the gap. The gap bounds are reported
+  Pick a restore target below the gap, or restore a backup whose
+  stop LSN is at or after the gap end to reach a target past it (no
+  backup taken before the gap can replay across it). The gap bounds are reported
   in the manifest of any backup taken after the gap, and in
   `pg_hardstorage wal list <deployment>`.
 - For a gap caused by Patroni failover without `permanent_slots`:
@@ -139,6 +143,21 @@ PG would have nothing to replay.
 and span in seconds.
 
 ---
+
+## PostgreSQL unreachable
+
+**Symptom.** `backup`, `wal stream` or `doctor` fails with
+`pg.unreachable` (exit 8).
+
+**What it means.** The *database* did not accept a connection: it is
+down, still in crash recovery, restarting after a failover, or the DSN
+points somewhere wrong. Nothing is wrong with the repository. Before
+v1.5 this was reported as `storage.unreachable`, which named the wrong
+system — alerting that routes on codes sent it to whoever owns storage.
+
+**Fix.** Check `pg_isready` against the deployment's `pg_connection`,
+and the server log. After a crash or failover, recovery on a busy
+cluster can take minutes; retry once it accepts connections.
 
 ## Repository unreachable
 
@@ -190,7 +209,10 @@ be reached raises `kms.unreachable` (exit 8, transient); a keyring
 that cannot resolve the ref at all raises `restore.kek_resolve_failed`
 (exit 1); one that resolves but does not unwrap raises
 `restore.kek_mismatch` (exit 1). Only the `unreachable` leaf routes to
-exit 8 — the others sit in the generic error bucket. The body carries
+exit 8 — the others sit in the generic error bucket. A throttled or
+5xx answer from a cloud KMS counts as unreachable (retry later); an
+AccessDenied / expired-credentials answer is `kek_resolve_failed`, not
+a key mismatch — check the credentials before suspecting the key. The body carries
 the manifest's `KEKRef` so you know which key the read path was
 looking for.
 

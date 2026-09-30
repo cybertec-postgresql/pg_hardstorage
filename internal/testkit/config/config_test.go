@@ -156,7 +156,7 @@ func TestFleet_EffectiveCount_Patroni(t *testing.T) {
 func TestProfiles_RoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "profiles.yaml")
-	p, _ := config.LoadProfiles(path)
+	p, _ := config.LoadProfilesOrEmpty(path)
 	must(t, p.AddProfile(config.Profile{
 		Name: "small_oltp", TargetSizeGB: 10,
 		ChurnMBPerMin: 100, BackupEvery: "5m",
@@ -193,7 +193,7 @@ func TestProfiles_Validate_TargetSize(t *testing.T) {
 func TestFaults_RoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "faults.yaml")
-	f, _ := config.LoadFaults(path)
+	f, _ := config.LoadFaultsOrEmpty(path)
 	must(t, f.AddFault(config.Fault{
 		Name: "disk_full_repo", Weight: 5,
 		Action: "disk_full(target=repo, fill=98%)",

@@ -16,6 +16,7 @@ package validate
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/testkit/inject"
@@ -89,6 +90,13 @@ type CellRuntime interface {
 	// during backup" semantics.
 	StartSustainedLoad(ctx context.Context) error
 
+	// SustainedWriterActive reports whether StartSustainedLoad
+	// actually launched a writer, as opposed to no-opping because
+	// the profile sets no SustainedClients. Both return nil, so
+	// the orchestrator cannot otherwise tell them apart — and it
+	// must, because it announces one of them to the event stream.
+	SustainedWriterActive() bool
+
 	// StopSustainedLoad stops the writer started by
 	// StartSustainedLoad, captures its final TPS / latency
 	// report, and returns it via LoadStats.  Idempotent: a
@@ -130,7 +138,69 @@ type LoopOptions struct {
 	// HealWindow is how long the orchestrator waits between
 	// fault apply and recovery.  Default 30s.
 	HealWindow time.Duration
+
+	// RetentionInterval is how often the fleet pauses for retention:
+	// every cell's deployment is rotated, then the shared repository is
+	// garbage-collected once. Default 15m; negative disables. Without it
+	// the repository only grows — under enterprise_heavy's sustained
+	// writer every backup stores the pages churned since the last one,
+	// ~100 GB/h across 8 cells, which no host sustains for 8h.
+	//
+	// Fleet-wide, not per cell, because the cells share one repository
+	// and gc rightly refuses while any backup is in flight (an in-flight
+	// backup may have deduplicated against the chunks it would delete):
+	// with 8 cells backing up every minute that is almost always. So
+	// retention runs in a window: new backups and verifies are held,
+	// in-flight ones drain, and the window gives up (deferred, not
+	// failed) if they do not within RetentionQuiesceTimeout.
+	RetentionInterval time.Duration
+
+	// RetentionQuiesceTimeout bounds how long a retention window waits
+	// for in-flight backups and verifies to drain. Default 10m: on a
+	// saturated host heavy backups ran 2-7 minutes, so 5m never drained
+	// a fleet of 8; still bounded, so one cell waiting out a long PG
+	// recovery (up to 30m) does not stall the rest.
+	RetentionQuiesceTimeout time.Duration
+
+	// RetentionMaxDeferrals is how many consecutive windows one
+	// repository's gc may be deferred — a live backup lease, a fleet
+	// that did not drain, no cell up to run it — before the run fails.
+	// Default 4 (an hour at the default interval: a killed backup's
+	// lease expires well within that); negative never escalates. One
+	// deferral is benign; one that never clears is a leaked lease or a
+	// stuck backup hiding behind "the next window retries" while the
+	// repository grows for the rest of the run.
+	RetentionMaxDeferrals int
+
+	// MaxBackupGap is how long a cell may go without proof of life — a
+	// backup that completed, or that PostgreSQL refused over injected
+	// source corruption — before it fails as cell_down. Default 1h:
+	// longer than a fault's heal window, a retention window's hold (up
+	// to RetentionQuiesceTimeout) and a slow backup combined, so only a
+	// cell that stays down is caught. Negative disables the bound; a
+	// cell whose dispatched backups ALL skipped still fails at the end
+	// of the run.
+	MaxBackupGap time.Duration
 }
+
+// RetentionApplier is implemented by runtimes that can apply retention
+// the way a deployment does: rotate the cell's deployment to a count
+// policy, and garbage-collect the repository. Optional, so the fakes
+// that implement CellRuntime need not.
+type RetentionApplier interface {
+	Rotate(ctx context.Context) error
+	GC(ctx context.Context) error
+	// RepoKey identifies the repository the cell's deployment lives
+	// in. Cells with equal keys share one repository, which a window
+	// gc's once; cells with a sink of their own have their own.
+	RepoKey() string
+}
+
+// ErrRetentionDeferred means gc refused to sweep for a documented,
+// transient reason — a backup lease is still live (typically one a
+// fault killed mid-backup, which expires within its TTL). The next
+// retention window retries; it is not a failure.
+var ErrRetentionDeferred = errors.New("retention deferred")
 
 // defaults fills LoopOptions with sane production defaults
 // where the operator hasn't set them.
@@ -146,5 +216,17 @@ func (o *LoopOptions) defaults() {
 	}
 	if o.VerifyEvery == 0 {
 		o.VerifyEvery = 25
+	}
+	if o.RetentionInterval == 0 {
+		o.RetentionInterval = 15 * time.Minute
+	}
+	if o.RetentionQuiesceTimeout == 0 {
+		o.RetentionQuiesceTimeout = 10 * time.Minute
+	}
+	if o.RetentionMaxDeferrals == 0 {
+		o.RetentionMaxDeferrals = 4
+	}
+	if o.MaxBackupGap == 0 {
+		o.MaxBackupGap = time.Hour
 	}
 }

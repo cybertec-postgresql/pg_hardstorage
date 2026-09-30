@@ -78,6 +78,29 @@ Three properties this enforces:
 This is what defends against the "the LLM lied to me" failure
 mode: the executed command is byte-equal to the one the user saw.
 
+Before it runs, the command must also pass an argv-hygiene check:
+
+- It must parse against the live command tree — an unknown
+  subcommand, unknown flag, or wrong number of positionals is
+  refused. The skill's `allowed_executes` prefix only bounds the
+  start of the string; the parse bounds the rest.
+- Global flags with side effects outside the command are refused
+  in every spelling: `--cpu-profile`, `--mem-profile`,
+  `--profile-port`, `--otel-endpoint`, `--otel-stdout`,
+  `--config` / `-c`, `--on-error-llm`. The CLI accepts these
+  anywhere on the command line, so `pg_hardstorage doctor
+  --cpu-profile=<path>` would otherwise truncate `<path>`.
+- Shell syntax (quotes, `;`, `|`, `&`, `>`, `$`, backticks) is
+  refused: the command is run directly, never through a shell.
+
+The read-only live-state tools (`read_doctor`, `read_status`,
+`list_backups`, `read_backup`, `read_repo_usage`, `read_audit`)
+apply the same rules to the arguments the model passes them:
+deployment names must match the deployment-name grammar, repository
+URLs must be a URL or an absolute path, no value may start with
+`-`, and positionals are passed after a `--` terminator so the CLI
+can never read one as a flag.
+
 ### Gate 3 — Typed confirmation for destructive operations
 
 For the most dangerous operations — `kms shred`, `repo gc
@@ -120,14 +143,17 @@ Slack message, open a Jira ticket, raise a PagerDuty page.
 Approval comes through the standard binary-side flow; the LLM
 cannot fake it.
 
-n-of-m thresholds are configurable per operation:
+The n-of-m threshold is set on each request, not in configuration:
 
-```yaml
-approvals:
-  kms_shred: { initiator: 1, approvers: 2 }
-  repo_gc_delete: { initiator: 1, approvers: 1 }
-  backup_delete_force: { initiator: 1, approvers: 1 }
+```sh
+pg_hardstorage approval request --op kms.shred --target <kek-ref> \
+    --threshold 2 --approver-key alice.pem --approver-key bob.pem \
+    --reason "decommission tenant" --repo <repo-url>
 ```
+
+`--threshold` is the number of distinct allowlisted approvals the
+operation needs (default 2). There is no `approvals:` section in
+`pg_hardstorage.yaml`; adding one makes the configuration fail to load.
 
 ### Anomaly refusal (cross-cutting)
 
@@ -142,6 +168,13 @@ restores, and verifications are one cluster of operations;
 destructions are another; jumping between clusters without an
 intervening user statement is treated as evidence of a prompt
 injection or a hallucinated escalation.
+
+Concretely, a command carrying a high-risk verb (`delete`,
+`rotate`, `gc`, `force`, `purge`, `shred`, `wipe`) runs only when
+*you* raised that verb earlier in the session ("please run gc",
+"we need a key rotation"). Only your own prompts count: the model's
+replies and tool output cannot put a verb on-topic, since they are
+exactly what the detector is checking. `/clear` resets the topic set.
 
 This is the "the LLM was malicious / compromised" failure mode.
 It's the gate that catches *the model itself* going wrong, not
@@ -245,8 +278,8 @@ cryptographic evidence that none of it was rewritten afterwards.
 Any session can be exported as a signed bundle:
 
 ```console
-$ pg_hardstorage llm export-session <session-id>
-Wrote signed evidence bundle to ./session-20260428T1423-db1-restore.evidence.tar.gz
+$ pg_hardstorage llm export-session <session-id> --repo <repo-url>
+Wrote signed evidence bundle to ./llm-session-<session-id>.tar.gz
   - transcript.ndjson         (every prompt, tool call, response, in order)
   - tool_results/             (raw JSON of each tool call's return)
   - executed_commands.ndjson  (every command actually run, exit code, duration)
@@ -281,7 +314,12 @@ the binary.  Implications:
   increment the version, and `pg_hardstorage llm skill install
   <file>` into the operator overlay (any existing version is
   snapshotted for rollback).  No binary rebuild, no Debian package
-  release.
+  release.  The skill's `name:` must match `^[a-z0-9][a-z0-9_-]*$`
+  (it becomes the overlay filename, so `/` and `..` are refused).
+  Each `llm skill rollback <name>` steps one version further back;
+  the file it replaces is kept as
+  `<name>.skill.yaml.rolledback.<timestamp>` (not a rollback
+  candidate) — `llm skill install` that file to undo a rollback.
 - **Skill isolation.**  A bug in the incident skill cannot
   touch the restore skill.  Each skill loads independently, has
   its own tool allowlist, its own guardrails, its own RBAC scope.
@@ -311,6 +349,16 @@ Four data-flow modes, default-conservative:
 | `standard` (default) | Metadata, doctor JSON, error messages, redacted config.  PII detector strips obvious patterns. |
 | `open` | Everything (with credentials always masked).  Dev / staging only. |
 | `local-only` | Refuses any provider that isn't local (Ollama, llama-cpp).  Auto-selected for `data_classification: confidential` or higher. |
+
+The mode applies to everything that carries operator or cluster
+data: your prompts, tool results, and the data sections of the
+session's system prompt — the skill's pre-loaded tool output
+(`read_doctor`, `list_deployments`, ...) and any operator context.
+Tool results served by `pg_hardstorage llm --mcp-server` are redacted
+the same way; under `local-only` the MCP server refuses tool calls,
+because it cannot see which model its client forwards results to.
+Only text the binary authors itself (skill template, runbook index,
+command catalog, rules) is sent unredacted.
 
 The mode is per-deployment, not per-call.  An operator who runs
 `llm` against a deployment classified `confidential` cannot

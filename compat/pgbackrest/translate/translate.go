@@ -17,6 +17,8 @@ import (
 	"io"
 	"sort"
 	"strings"
+
+	"github.com/cybertec-postgresql/pg_hardstorage/compat/internal/redact"
 )
 
 // Section is one [section] in the INI file.
@@ -130,7 +132,7 @@ func Translate(cfg *Config) (*Result, error) {
 			// Picked up per-deployment.
 		default:
 			out.Unmapped = append(out.Unmapped,
-				fmt.Sprintf("[global] %s = %s", k, globalKV[k]))
+				fmt.Sprintf("[global] %s = %s", k, redact.Value(k, globalKV[k])))
 		}
 	}
 
@@ -269,7 +271,7 @@ func writeDeployment(b *strings.Builder, s *Section, global map[string]string, r
 					s.Name, s.KV[k]))
 		default:
 			r.Unmapped = append(r.Unmapped,
-				fmt.Sprintf("[%s] %s = %s", s.Name, k, s.KV[k]))
+				fmt.Sprintf("[%s] %s = %s", s.Name, k, redact.Value(k, s.KV[k])))
 		}
 	}
 

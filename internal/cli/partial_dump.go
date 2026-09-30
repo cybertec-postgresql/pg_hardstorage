@@ -58,6 +58,7 @@ func newPartialDumpCmd() *cobra.Command {
 		tables           string
 		outFile          string
 		database         string
+		pgUser           string
 		dataOnly         bool
 		stagingDir       string
 		skipVersionCheck bool
@@ -76,9 +77,9 @@ func newPartialDumpCmd() *cobra.Command {
 The SQL is written to --sql-file (or stdout if --sql-file is empty).
 Operator-friendly redirection: pipe stdout into a file or psql
 directly. (--sql-file avoids shadowing the global -o/--output JSON
-output flag; the SQL stream is logically separate from the
-structured Result envelope which still rides on stderr/stdout per
--o.)
+output flag.) When the SQL goes to stdout, stdout carries nothing
+else: progress events and the Result summary (in the -o format) are
+written to stderr. With --sql-file they go to stdout as usual.
 
 --data-only emits only INSERT/COPY statements (no DDL).
 
@@ -99,6 +100,7 @@ who want a PGDATA tree run restore.`,
 				tables:           tables,
 				output:           outFile,
 				database:         database,
+				pgUser:           pgUser,
 				dataOnly:         dataOnly,
 				stagingDir:       stagingDir,
 				skipVersionCheck: skipVersionCheck,
@@ -114,6 +116,8 @@ who want a PGDATA tree run restore.`,
 		"comma-separated qualified tables (required, e.g. public.users,public.events)")
 	c.Flags().StringVar(&database, "database", "postgres",
 		"database containing the requested tables; pg_dump connects to exactly one database, so a table in another database needs its name here (issue #97)")
+	c.Flags().StringVar(&pgUser, "pg-user", sandbox.DefaultSandboxUser,
+		"PostgreSQL role to read the sandbox as. The sandbox is your own cluster restored from the backup, so this must be a role that exists IN THE BACKUP — not a host login. Only needed when the cluster was initdb'd with -U <name>")
 	c.Flags().StringVar(&outFile, "sql-file", "",
 		"write the dumped SQL here; empty streams to stdout (named --sql-file to avoid shadowing the global --output flag)")
 	c.Flags().BoolVar(&dataOnly, "data-only", false,
@@ -134,6 +138,7 @@ type partialDumpFlags struct {
 	tables           string
 	output           string
 	database         string
+	pgUser           string
 	dataOnly         bool
 	stagingDir       string
 	skipVersionCheck bool
@@ -142,6 +147,14 @@ type partialDumpFlags struct {
 
 func runPartialDump(cmd *cobra.Command, f partialDumpFlags) error {
 	d := DispatcherFrom(cmd)
+	// With the SQL on stdout (the default; the help suggests piping it
+	// into psql) stdout IS the SQL stream: restore progress events and
+	// the Result summary rendered there were interleaved with the SQL
+	// and fed to psql. Route them to stderr instead, in the operator's
+	// chosen format.
+	if sqlToStdout(f.output) {
+		d = output.NewDispatcher(d.Renderer(), cmd.ErrOrStderr(), cmd.ErrOrStderr())
+	}
 	tlist := splitCommaTrim(f.tables)
 	if len(tlist) == 0 {
 		return output.NewError("usage.missing_flag",
@@ -245,6 +258,7 @@ func runPartialDump(cmd *cobra.Command, f partialDumpFlags) error {
 		PGCtlPath:        pgCtl,
 		PGDumpPath:       pgDump,
 		Database:         f.database,
+		User:             f.pgUser,
 		SkipVersionCheck: f.skipVersionCheck,
 	})
 	if err != nil {
@@ -279,7 +293,7 @@ func runPartialDump(cmd *cobra.Command, f partialDumpFlags) error {
 	// 3. pg_dump.
 	startedDump := time.Now()
 	var sqlBytes int64
-	dumpDest, dumpClose, err := openDumpOutput(f.output)
+	dumpDest, dumpClose, err := openDumpOutput(f.output, cmd.OutOrStdout())
 	if err != nil {
 		return err
 	}
@@ -290,6 +304,24 @@ func runPartialDump(cmd *cobra.Command, f partialDumpFlags) error {
 	defer dumpClose()
 	counter := &countingWriter{w: dumpDest}
 	if err := sb.Dump(cmd.Context(), counter, tlist, f.dataOnly); err != nil {
+		// "matched no tables" is a not-found, not a failure. Modern
+		// pg_dump reports it by exiting 1, which lands here, so this
+		// branch — not the empty-dump guard below — is what fires on
+		// any current PostgreSQL. Both raise the same refusal.
+		if errors.Is(err, sandbox.ErrNoMatchingTables) {
+			return noTablesMatchedError(f, tlist)
+		}
+		// The cluster came up; we just asked to be someone it has
+		// never heard of. That is a flag away, and saying so beats
+		// making the operator read a FATAL out of a PG log.
+		if errors.Is(err, sandbox.ErrRoleMissing) {
+			return output.NewError("preflight.pg_role_missing",
+				fmt.Sprintf("partial dump: role %q does not exist in the restored cluster: %v", f.pgUser, err)).
+				WithSuggestion(&output.Suggestion{
+					Human: fmt.Sprintf("pass --pg-user <role> naming a role that exists in the backed-up cluster (default %q). The sandbox is your own cluster restored from the backup, so its roles are the ones the source cluster had — a host login name is not one of them unless it also existed there.",
+						sandbox.DefaultSandboxUser),
+				}).Wrap(err)
+		}
 		return output.NewError("partial.dump_pg_dump_failed",
 			fmt.Sprintf("partial dump: pg_dump: %v (sandbox PG log: %s)",
 				err, sb.LogFile())).Wrap(err)
@@ -308,19 +340,7 @@ func runPartialDump(cmd *cobra.Command, f partialDumpFlags) error {
 	// empty SQL file on disk.  Fail loudly and remove the empty file so
 	// the operator isn't left with a silent, misleading artefact.
 	if sqlBytes == 0 {
-		dbName := f.database
-		if dbName == "" {
-			dbName = "postgres"
-		}
-		if f.output != "" && f.output != "-" {
-			_ = os.Remove(f.output)
-		}
-		return output.NewError("partial.dump_no_tables",
-			fmt.Sprintf("partial dump: pg_dump produced no output — table(s) %s not found in database %q",
-				strings.Join(tlist, ", "), dbName)).
-			WithSuggestion(&output.Suggestion{
-				Human: "the requested table lives in a different database; pass --database <name> (partial dump connects to a single database, default \"postgres\")",
-			})
+		return noTablesMatchedError(f, tlist)
 	}
 
 	body := partialDumpBody{
@@ -337,6 +357,9 @@ func runPartialDump(cmd *cobra.Command, f partialDumpFlags) error {
 	return d.Result(output.NewResult(cmd.CommandPath()).WithBody(body))
 }
 
+// sqlToStdout reports whether --sql-file sends the SQL to stdout.
+func sqlToStdout(path string) bool { return path == "" || path == "-" }
+
 // openDumpOutput returns the writer for the SQL stream + closes it
 // when the run ends. Empty path returns os.Stdout (which we don't
 // close). Path = "-" is also stdout (cron-friendly redirection).
@@ -345,10 +368,10 @@ func runPartialDump(cmd *cobra.Command, f partialDumpFlags) error {
 // closer is idempotent — call it from both the happy path (to
 // surface a sync error) and a deferred best-effort path.  For
 // stdout it's a no-op closer.
-func openDumpOutput(path string) (io.Writer, func() error, error) {
+func openDumpOutput(path string, stdout io.Writer) (io.Writer, func() error, error) {
 	noop := func() error { return nil }
-	if path == "" || path == "-" {
-		return os.Stdout, noop, nil
+	if sqlToStdout(path) {
+		return stdout, noop, nil
 	}
 	// MkdirAll on the parent so operators don't have to pre-create
 	// dirs. Then create-or-truncate the file.
@@ -431,4 +454,33 @@ func (b partialDumpBody) WriteText(w io.Writer) error {
 	fmt.Fprintln(bw, "  ✓ sandbox PG cleaned up; staging dir removed")
 	_, err := io.WriteString(w, strings.TrimRight(bw.String(), "\n"))
 	return err
+}
+
+// noTablesMatchedError is the single refusal for "pg_dump matched
+// nothing", raised from the two places that can discover it.
+//
+// pg_dump's behaviour here is version-dependent: current builds treat
+// an unmatched --table as a hard error and exit 1, while older ones
+// exit 0 and simply emit nothing. The first lands in the Dump error
+// path, the second in the empty-dump guard. An operator hitting the
+// same mistake must not get two different codes, two different exit
+// statuses and two different pieces of advice depending on which
+// pg_dump the host happens to carry.
+//
+// The empty file is removed on the way out: leaving a zero-byte .sql
+// behind after a refusal invites someone to restore from it.
+func noTablesMatchedError(f partialDumpFlags, tlist []string) error {
+	dbName := f.database
+	if dbName == "" {
+		dbName = "postgres"
+	}
+	if f.output != "" && f.output != "-" {
+		_ = os.Remove(f.output)
+	}
+	return output.NewError("partial.dump_no_tables",
+		fmt.Sprintf("partial dump: pg_dump produced no output — table(s) %s not found in database %q",
+			strings.Join(tlist, ", "), dbName)).
+		WithSuggestion(&output.Suggestion{
+			Human: "the requested table lives in a different database; pass --database <name> (partial dump connects to a single database, default \"postgres\")",
+		})
 }

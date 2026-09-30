@@ -82,6 +82,10 @@ override_dh_auto_install:
 		debian/pg-hardstorage/lib/systemd/system/pg_hardstorage.service
 	install -D -m 0644 deploy/systemd/pg_hardstorage@.service \
 		debian/pg-hardstorage/lib/systemd/system/pg_hardstorage@.service
+	# The WAL streamer is a SEPARATE unit — the two above run
+	# `pg_hardstorage agent`, which never opens a WAL stream (#56).
+	install -D -m 0644 deploy/systemd/pg_hardstorage-wal-stream@.service \
+		debian/pg-hardstorage/lib/systemd/system/pg_hardstorage-wal-stream@.service
 	install -D -m 0644 deploy/systemd/pg-hardstorage.sysusers.conf \
 		debian/pg-hardstorage/usr/lib/sysusers.d/pg-hardstorage.conf
 	install -D -m 0644 deploy/systemd/pg-hardstorage.tmpfiles.conf \

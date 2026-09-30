@@ -29,6 +29,19 @@ import (
 // main() should be `os.Exit(cli.Execute())`.
 func Execute() int { return Run(NewRoot()) }
 
+// parseRootFlagsEarly fills the root's persistent flags from args before
+// any subcommand has resolved. Everything else in args belongs to a
+// subcommand the root does not know, so unknown flags are skipped rather
+// than fatal: a strict parse stopped at the first one, and every root
+// flag after it was silently ignored — `repo gc --repo X --cpu-profile P`
+// profiled nothing, while `--cpu-profile P repo gc --repo X` worked.
+func parseRootFlagsEarly(root *cobra.Command, args []string) {
+	prev := root.FParseErrWhitelist.UnknownFlags
+	root.FParseErrWhitelist.UnknownFlags = true
+	defer func() { root.FParseErrWhitelist.UnknownFlags = prev }()
+	_ = root.ParseFlags(args)
+}
+
 // Run executes the given root command. Tests construct a root, set its
 // args / writers, and call Run to observe the same behavior production
 // gets from Execute().
@@ -38,10 +51,8 @@ func Run(root *cobra.Command) int {
 	// startProfiling is a no-op when no flag is set.  We
 	// parse args here without executing so the persistent
 	// flags are populated even when ExecuteC bails early
-	// (e.g. unknown subcommand).  ParseFlags returns an
-	// error for unknown flags but accepts unknown
-	// positional args, which is what we want.
-	_ = root.ParseFlags(os.Args[1:])
+	// (e.g. unknown subcommand).
+	parseRootFlagsEarly(root, os.Args[1:])
 	profH, profErr := startProfiling(root)
 	if profErr != nil {
 		fmt.Fprintln(root.ErrOrStderr(), "error:", profErr)
@@ -79,6 +90,16 @@ func Run(root *cobra.Command) int {
 	root.SetContext(ctx)
 
 	cmd, err := root.ExecuteC()
+	// Close the dispatcher on the way out (after any error Result below
+	// is rendered): sink delivery is asynchronous, and without a drain
+	// the process exits with the last events — typically the failure
+	// alert — still queued. Close is bounded, so a stuck sink cannot
+	// hold the exit hostage.
+	if cmd != nil && cmd.Context() != nil {
+		if d, ok := cmd.Context().Value(dispatcherKey{}).(*output.Dispatcher); ok && d != nil {
+			defer func() { _ = d.Close() }()
+		}
+	}
 	if err == nil {
 		return int(output.ExitOK)
 	}
@@ -122,8 +143,25 @@ func Run(root *cobra.Command) int {
 			return int(output.ExitCodeFor(err))
 		}
 	}
-	// Pre-dispatcher failure (very early). Fall back to a
-	// plain stderr line.  When the error is a structured
+	// Pre-dispatcher failure. Flag and argument parsing fail BEFORE the
+	// persistent pre-run installs the dispatcher, so every usage error —
+	// an unknown flag, a missing argument, the commonest failures there
+	// are — used to land here as a plain text line even under `-o json`.
+	// docs/reference/error-codes.md promises that every error a command
+	// can surface is a structured error; scripts parsing the envelope
+	// got nothing to parse. Honour the requested format here too.
+	if format := requestedOutputFormat(cmd, root); format != "" && format != "text" {
+		if r, rerr := resolveRenderer(format, root.OutOrStdout(), true, ""); rerr == nil {
+			path := root.CommandPath()
+			if cmd != nil {
+				path = cmd.CommandPath()
+			}
+			d := output.NewDispatcher(r, root.OutOrStdout(), root.ErrOrStderr())
+			_ = d.Result(output.NewResult(path).WithError(output.ToError(err)))
+			return int(output.ExitCodeFor(err))
+		}
+	}
+	// Text mode: a plain stderr line.  When the error is a structured
 	// *output.Error we print only its Message — the
 	// operator doesn't want to read "usage.bad_args:" in
 	// front of every typo'd command line.  JSON / NDJSON
@@ -491,3 +529,34 @@ func newDemoCmd() *cobra.Command      { return newDemoCmdImpl() }
 func newExplainCmd() *cobra.Command   { return newExplainCmdImpl() }
 func newChangelogCmd() *cobra.Command { return newChangelogCmdImpl() }
 func newGlossaryCmd() *cobra.Command  { return newGlossaryCmdImpl() }
+
+// requestedOutputFormat works out the output format the operator asked
+// for when the command failed before its flags were fully parsed. In
+// order: the --output flag if parsing reached it; otherwise a lenient
+// scan of the raw arguments for -o/--output; otherwise the
+// PG_HARDSTORAGE_OUTPUT environment variable. "" means none requested.
+func requestedOutputFormat(cmd, root *cobra.Command) string {
+	for _, c := range []*cobra.Command{cmd, root} {
+		if c == nil {
+			continue
+		}
+		if f := c.Flags().Lookup("output"); f != nil && f.Changed {
+			return f.Value.String()
+		}
+	}
+	args := os.Args[1:]
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case a == "--":
+			i = len(args)
+		case (a == "-o" || a == "--output") && i+1 < len(args):
+			return args[i+1]
+		case strings.HasPrefix(a, "--output="):
+			return strings.TrimPrefix(a, "--output=")
+		case strings.HasPrefix(a, "-o") && len(a) > 2 && !strings.HasPrefix(a, "--"):
+			return strings.TrimPrefix(strings.TrimPrefix(a, "-o"), "=")
+		}
+	}
+	return strings.TrimSpace(os.Getenv("PG_HARDSTORAGE_OUTPUT"))
+}

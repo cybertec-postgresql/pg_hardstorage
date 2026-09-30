@@ -5,10 +5,11 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -17,7 +18,6 @@ import (
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/audit"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup"
-	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup/keystore"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/output"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/paths"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
@@ -72,20 +72,34 @@ the operator typing --apply (and, for the most destructive paths,
 // is supposed to detect. The operator MUST pass --force to override.
 func newRepairAttestationCmd() *cobra.Command {
 	var (
-		repoURL string
-		actor   string
-		reason  string
-		force   bool
+		repoURL     string
+		actor       string
+		reason      string
+		force       bool
+		trustedKeys []string
 	)
 	c := &cobra.Command{
-		Use:          "attestation <deployment> <backup-id>",
-		Short:        "Re-sign a manifest with the current keypair (audited)",
+		Use:   "attestation <deployment> <backup-id>",
+		Short: "Re-sign a manifest with the current keypair (audited)",
+		Long: `Re-sign a manifest whose attestation no longer verifies with the
+current keypair — the signing-key rotation case — and record the
+re-sign in the audit chain.
+
+The manifest must be signed by a key this host TRUSTS: the current
+keyring's public key, a retired operator public key installed under
+<keyring>/` + trustedKeysDirName + `/*.pem, or one passed with --trusted-key.
+A manifest signed by any other key is refused: its embedded key is
+part of the manifest itself, so a valid self-signature proves only
+that whoever wrote the file also signed it — re-signing it would
+launder attacker-supplied content under the operator's key.`,
 		Args:         cobra.ExactArgs(2),
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runRepairAttestation(cmd, args[0], args[1], repoURL, actor, reason, force)
+			return runRepairAttestation(cmd, args[0], args[1], repoURL, actor, reason, force, trustedKeys)
 		},
 	}
+	c.Flags().StringArrayVar(&trustedKeys, "trusted-key", nil,
+		"PEM file of a retired operator public key whose signatures may be re-signed (repeatable; also read from <keyring>/"+trustedKeysDirName+"/*.pem)")
 	c.Flags().StringVar(&repoURL, "repo", "",
 		"repository URL — must already exist (required)")
 	_ = c.MarkFlagRequired("repo")
@@ -98,7 +112,7 @@ func newRepairAttestationCmd() *cobra.Command {
 	return c
 }
 
-func runRepairAttestation(cmd *cobra.Command, deployment, backupID, repoURL, actor, reason string, force bool) error {
+func runRepairAttestation(cmd *cobra.Command, deployment, backupID, repoURL, actor, reason string, force bool, trustedKeyFiles []string) error {
 	d := DispatcherFrom(cmd)
 	signer, verifier, err := loadSignerAndVerifier()
 	if err != nil {
@@ -109,6 +123,13 @@ func runRepairAttestation(cmd *cobra.Command, deployment, backupID, repoURL, act
 		return err
 	}
 	defer sp.Close()
+	// Read-only is a repository-wide lock the operator set on purpose
+	// (`repo set-mode read-only`); every mutating path refuses under
+	// it, and a repair is no exception — the operator flips the mode
+	// back when they mean to write.
+	if err := assertRepoWritable(cmd.Context(), sp, "repair attestation"); err != nil {
+		return err
+	}
 
 	primaryKey := backup.PrimaryPath(deployment, backupID)
 	body, err := readManifestKey(cmd.Context(), sp, primaryKey)
@@ -171,6 +192,20 @@ func runRepairAttestation(cmd *cobra.Command, deployment, backupID, repoURL, act
 			})
 	}
 
+	// The content is authentic RELATIVE TO ITS OWN KEY — and that key
+	// is part of the file. An attacker with write access to the
+	// repository generates a keypair, signs forged content, embeds the
+	// public half, and VerifyEmbedded is satisfied. Re-signing that with
+	// the operator key would turn a forgery the restore path refuses
+	// into one it trusts. So the embedded key must be one the operator
+	// already trusts: the current keyring key (the --force re-sign
+	// case) or a recorded retired operator key (the rotation case this
+	// command exists for).
+	trustedBy, terr := trustedSignerOf(body, verifier, trustedKeyFiles)
+	if terr != nil {
+		return terr
+	}
+
 	if err := m.Sign(signer); err != nil {
 		return output.NewError("repair.attestation.sign",
 			fmt.Sprintf("repair attestation: sign: %v", err)).Wrap(err)
@@ -230,6 +265,7 @@ func runRepairAttestation(cmd *cobra.Command, deployment, backupID, repoURL, act
 			"forced":               force,
 			"original_fingerprint": origFingerprint,
 			"new_fingerprint":      newFingerprint,
+			"trusted_by":           trustedBy,
 		},
 	}
 	auditWriteErr := auditStore.Append(cmd.Context(), auditEv)
@@ -299,16 +335,9 @@ func wormPolicyFor(repoMeta *repo.Metadata) (time.Time, storage.WORMMode) {
 // loadSignerAndVerifier loads the local keypair (same path
 // loadVerifier uses, but returning both halves).
 func loadSignerAndVerifier() (*backup.Signer, *backup.Verifier, error) {
-	p, err := paths.Resolve(paths.DefaultOptions())
-	if err != nil {
-		return nil, nil, output.NewError("internal", err.Error()).Wrap(err)
-	}
-	signer, verifier, err := keystore.LoadOrGenerate(p.Keyring.Value)
-	if err != nil {
-		return nil, nil, output.NewError("internal",
-			fmt.Sprintf("repair: keystore: %v", err)).Wrap(err)
-	}
-	return signer, verifier, nil
+	// Repair re-signs and verifies with the repository's own key; a key
+	// minted here would re-sign manifests under a key nothing trusts.
+	return loadExistingKeypair("repair")
 }
 
 // currentlyValid reports whether the on-disk manifest verifies
@@ -438,6 +467,11 @@ func runRepairManifest(cmd *cobra.Command, deployment, backupID, repoURL string,
 		return err
 	}
 	defer sp.Close()
+	// Every branch below may write (rebuild the replica or overwrite the
+	// primary), so refuse up front on a read-only repository.
+	if err := assertRepoWritable(cmd.Context(), sp, "repair manifest"); err != nil {
+		return err
+	}
 
 	// Carry the repo's WORM policy so a rebuilt replica / overwritten primary
 	// is locked like the commit-time copy (a compliance repo must not get an
@@ -841,6 +875,15 @@ func runRepairChunks(cmd *cobra.Command, repoURL string, orphans, apply bool, mi
 		return mapRepoOpenErr(repoURL, err)
 	}
 	defer sp.Close()
+	if apply {
+		// Read-only is a repository-wide lock the operator set on purpose
+		// (`repo set-mode read-only`); every mutating path refuses under
+		// it, and a repair is no exception — the operator flips the mode
+		// back when they mean to write.
+		if err := assertRepoWritable(cmd.Context(), sp, "repair chunks --apply"); err != nil {
+			return err
+		}
+	}
 
 	refs, err := repo.CollectReferences(cmd.Context(), sp)
 	if err != nil {
@@ -890,60 +933,38 @@ func runRepairChunks(cmd *cobra.Command, repoURL string, orphans, apply bool, mi
 			body.Chunks = append(body.Chunks, h.String())
 		}
 		if apply {
-			// Same dedup-vs-GC guards as `repo gc --apply` (which see):
-			// the age floor cannot protect chunks an in-flight backup
-			// DEDUPLICATED against — those are old by definition — so
-			// refuse under a live backup lease, and re-collect
-			// references so a backup committed since the snapshot
-			// keeps its chunks.
-			if live, lerr := findLiveBackupLeases(cmd.Context(), sp, time.Now().UTC()); lerr != nil {
-				return output.NewError("repair.lease_scan_failed",
-					fmt.Sprintf("repair chunks: scan backup leases: %v", lerr)).Wrap(lerr)
-			} else if len(live) > 0 {
-				return output.NewError("repair.live_backup_lease",
-					fmt.Sprintf("repair chunks: refusing --apply while backups are in flight for: %s", strings.Join(live, ", "))).
-					WithSuggestion(&output.Suggestion{
-						Human: "an in-flight backup may have deduplicated against chunks this sweep would delete — re-run after the backups finish (a crashed holder's lease expires within its TTL, 15 minutes by default)",
-					})
-			}
-			refsAtDelete, rerr := repo.CollectReferences(cmd.Context(), sp)
-			if rerr != nil {
-				return output.NewError("repair.collect_refs_failed",
-					fmt.Sprintf("repair chunks: re-collect references before delete: %v", rerr)).Wrap(rerr)
-			}
-			// Second lease scan — parity with `repo gc --apply` (its
-			// "part 3"): the scan above ran BEFORE the re-collect, and
-			// the re-collect is a full manifest walk that can take
-			// minutes on a large repository. A backup that starts
-			// during it acquires its lease after the first scan and
-			// can dedup-adopt an orphan this sweep is about to
-			// delete. Scanning again shrinks the unguarded window
-			// from the re-collect's duration to the delete loop
-			// itself; the remaining sliver is closed from the other
-			// side by the writer's commit-time adopted-chunk re-stat.
-			if live, lerr := findLiveBackupLeases(cmd.Context(), sp, time.Now().UTC()); lerr != nil {
-				return output.NewError("repair.lease_scan_failed",
-					fmt.Sprintf("repair chunks: re-scan backup leases: %v", lerr)).Wrap(lerr)
-			} else if len(live) > 0 {
-				return output.NewError("repair.live_backup_lease",
-					fmt.Sprintf("repair chunks: a backup started during the reference re-collect (lease for: %s); refusing to sweep", strings.Join(live, ", "))).
-					WithSuggestion(&output.Suggestion{
-						Human: "the in-flight backup may have deduplicated against chunks this sweep would delete — re-run after it finishes",
-					})
-			}
-			cas := casdefault.New(sp)
-			deleted := 0
-			for _, h := range hashes {
-				if refsAtDelete.Has(h) {
-					continue // referenced by a manifest committed since the snapshot
+			// The same engine and the same safety protocol as `repo gc
+			// --apply` (repo.Sweep; internal/repo/gcfence.go): a run
+			// record writers fence against, a settle before the deciding
+			// snapshot, and per-batch checkpoints that honour writer
+			// pins, re-scan backup leases and re-scan manifests committed
+			// since the snapshot. The previous hand-rolled loop re-
+			// collected once and then deleted for as long as it took,
+			// with a backup free to adopt and commit over any chunk in
+			// between.
+			res, serr := repo.Sweep(cmd.Context(), sp, repo.SweepOptions{
+				MinChunkAge: minAgeForCall,
+				Apply:       true,
+				LiveLeases: func(ctx context.Context) ([]string, error) {
+					return findLiveBackupLeases(ctx, sp, time.Now().UTC())
+				},
+			})
+			if serr != nil {
+				if errors.Is(serr, repo.ErrSweepBackupInFlight) {
+					return output.NewError("conflict.gc_backup_in_flight",
+						fmt.Sprintf("repair chunks: refusing to sweep while backups are in flight: %v", serr)).
+						WithSuggestion(&output.Suggestion{
+							Human: "an in-flight backup may have deduplicated against chunks this sweep would delete — re-run after the backups finish (a crashed holder's lease expires within its TTL, 15 minutes by default)",
+						}).Wrap(serr)
 				}
-				if err := cas.DeleteChunk(cmd.Context(), h); err != nil {
-					return output.NewError("repair.delete_failed",
-						fmt.Sprintf("repair chunks: delete %s: %v", h, err)).Wrap(err)
-				}
-				deleted++
+				return output.NewError("repair.delete_failed",
+					fmt.Sprintf("repair chunks: %v", serr)).Wrap(serr)
 			}
-			body.Applied = deleted
+			if len(res.Failures) > 0 {
+				return output.NewError("repair.delete_failed",
+					fmt.Sprintf("repair chunks: %d deletion(s) failed: %s", len(res.Failures), res.Failures[0]))
+			}
+			body.Applied = res.Deleted
 		}
 		return d.Result(output.NewResult(cmd.CommandPath()).WithBody(body))
 	}
@@ -1026,6 +1047,13 @@ func runRepairScrub(cmd *cobra.Command, repoURL string, limit int, heal bool, re
 		return mapRepoOpenErr(repoURL, err)
 	}
 	defer sp.Close()
+	if heal {
+		// --heal rewrites chunks; refuse before the (possibly long)
+		// scrub rather than after it, on a read-only repository.
+		if err := assertRepoWritable(cmd.Context(), sp, "repair scrub --heal"); err != nil {
+			return err
+		}
+	}
 
 	// Per-manifest scrub: every backup manifest carries its own
 	// encryption block (KEK ref + wrapped DEK), so the CAS that can
@@ -1041,19 +1069,32 @@ func runRepairScrub(cmd *cobra.Command, repoURL string, limit int, heal bool, re
 			fmt.Sprintf("repair scrub: %v", err)).Wrap(err)
 	}
 	body := repairScrubBody{
-		Sampled:         res.Sampled,
-		OK:              res.OK,
-		MismatchCount:   len(res.Mismatches),
-		BytesVerified:   res.Bytes,
-		ReferencedTotal: refsTotal,
+		Sampled:                 res.Sampled,
+		OK:                      res.OK,
+		MismatchCount:           len(res.Mismatches),
+		BytesVerified:           res.Bytes,
+		ReferencedTotal:         refsTotal,
+		UnverifiableManifests:   res.UnverifiableManifests,
+		KeyUnavailableManifests: res.KeyUnavailableManifests,
+		KeyUnavailableChunks:    res.KeyUnavailableChunks,
 	}
 	for _, h := range res.Mismatches {
 		body.Mismatches = append(body.Mismatches, h.String())
 	}
 
-	// No mismatches → done, nothing to heal.
+	// coverage is the verdict for what this run could NOT look at. It
+	// is returned after the body on every path that would otherwise exit
+	// 0: `repair scrub` counted skipped manifests and never reported
+	// them, so a run that skipped every manifest printed "no integrity
+	// failures" and exited 0 (repo scrub already refused that).
+	coverage := scrubCoverageError("repair scrub", repoURL, res, refsTotal)
+
+	// No mismatches → nothing to heal.
 	if len(res.Mismatches) == 0 {
-		return d.Result(output.NewResult(cmd.CommandPath()).WithBody(body))
+		if rerr := d.Result(output.NewResult(cmd.CommandPath()).WithBody(body)); rerr != nil {
+			return rerr
+		}
+		return coverage
 	}
 
 	// Mismatches present. If the operator didn't ask for --heal, this
@@ -1079,19 +1120,7 @@ func runRepairScrub(cmd *cobra.Command, repoURL string, limit int, heal bool, re
 	// Carry the destination repo's WORM policy so healed chunks are re-locked
 	// on a compliance repo (the heal's IfNotExists Put carries no retention).
 	healUntil, healMode := wormPolicyFor(scrubMeta)
-	// Skip the synthetic all-zero repo.Hash{} KEK-missing marker that
-	// scrubManifestAware (~1375) appends for manifests we can't decrypt.
-	// It isn't a real chunk: feeding it to repo.Heal makes Heal Stat a
-	// nonexistent zero-hash chunk and forces a misleading
-	// verify.heal_incomplete. reverifyChunksPlaintext already skips it;
-	// mirror that here.
-	healTargets := make([]repo.Hash, 0, len(res.Mismatches))
-	for _, h := range res.Mismatches {
-		if h == (repo.Hash{}) {
-			continue
-		}
-		healTargets = append(healTargets, h)
-	}
+	healTargets := res.Mismatches
 	healRes, herr := repo.Heal(cmd.Context(), sp, replicaSP, healTargets, repo.HealOptions{
 		RetainUntil:   healUntil,
 		RetentionMode: healMode,
@@ -1151,7 +1180,12 @@ func runRepairScrub(cmd *cobra.Command, repoURL string, limit int, heal bool, re
 				Human: "heal replaced the local chunks with the replica's bytes, but those bytes do not decrypt to the expected content — the replica is corrupt for these chunks too. They must be re-backed-up from a live source; no good copy exists in either repo.",
 			})
 	}
-	return d.Result(output.NewResult(cmd.CommandPath()).WithBody(body))
+	if rerr := d.Result(output.NewResult(cmd.CommandPath()).WithBody(body)); rerr != nil {
+		return rerr
+	}
+	// Every mismatch healed — but "all healed" is not "all clean" when
+	// part of the repository was never looked at.
+	return coverage
 }
 
 // Result body shapes — stable per the v1 schema commitment.
@@ -1233,6 +1267,13 @@ type repairScrubBody struct {
 	// replica was consulted so audits show the source-of-truth.
 	HealResult *repo.HealResult `json:"heal,omitempty"`
 	ReplicaURL string           `json:"replica_url,omitempty"`
+
+	// Coverage gaps — see scrubCoverageError. Non-zero means the run's
+	// verdict covers less of the repository than it appears to, and the
+	// command exits non-zero.
+	UnverifiableManifests   int `json:"unverifiable_manifests,omitempty"`
+	KeyUnavailableManifests int `json:"key_unavailable_manifests,omitempty"`
+	KeyUnavailableChunks    int `json:"key_unavailable_chunks,omitempty"`
 }
 
 // WriteText renders the scrub result — sample size, mismatch list, and any
@@ -1242,8 +1283,20 @@ func (b repairScrubBody) WriteText(w io.Writer) error {
 	fmt.Fprintf(bw, "repair scrub\n")
 	fmt.Fprintf(bw, "  sampled %d / %d referenced chunks (%s verified)\n",
 		b.Sampled, b.ReferencedTotal, humanBytes(b.BytesVerified))
+	if b.UnverifiableManifests > 0 {
+		fmt.Fprintf(bw, "  ! %d manifest(s) could not be verified or read — their chunks were NOT scrubbed\n", b.UnverifiableManifests)
+	}
+	if b.KeyUnavailableManifests > 0 || b.KeyUnavailableChunks > 0 {
+		fmt.Fprintf(bw, "  ! %d encrypted manifest(s) / %d chunk(s) could not be decrypted on this host — NOT scrubbed (key access, not bit rot)\n",
+			b.KeyUnavailableManifests, b.KeyUnavailableChunks)
+	}
+	covered := b.UnverifiableManifests == 0 && b.KeyUnavailableManifests == 0 && b.KeyUnavailableChunks == 0
 	if b.MismatchCount == 0 {
-		fmt.Fprintln(bw, "  ✓ no integrity failures")
+		if covered {
+			fmt.Fprintln(bw, "  ✓ no integrity failures")
+		} else {
+			fmt.Fprintln(bw, "  no integrity failures in what was scrubbed — coverage incomplete (see above)")
+		}
 	} else {
 		fmt.Fprintf(bw, "  ✗ %d chunk(s) failed integrity check:\n", b.MismatchCount)
 		writeHashLines(bw, b.Mismatches)
@@ -1255,7 +1308,11 @@ func (b repairScrubBody) WriteText(w io.Writer) error {
 			fmt.Fprintf(bw, "    Failed:         %d\n", b.HealResult.Failed)
 			fmt.Fprintf(bw, "    Bytes copied:   %s\n", humanBytes(b.HealResult.BytesCopied))
 			if b.HealResult.NotAtReplica == 0 && b.HealResult.Failed == 0 {
-				fmt.Fprintln(bw, "    ✓ all mismatches healed")
+				if covered {
+					fmt.Fprintln(bw, "    ✓ all mismatches healed")
+				} else {
+					fmt.Fprintln(bw, "    all found mismatches healed — but coverage is incomplete (see above)")
+				}
 			}
 		}
 	}
@@ -1283,6 +1340,23 @@ type scrubResultAgg struct {
 	// "sampled 0, 0 mismatches" — a clean bill of health over a repo
 	// it never looked inside.
 	UnverifiableManifests int
+
+	// KeyUnavailableManifests counts ENCRYPTED manifests (backup or WAL
+	// segment) whose DEK could not be resolved on this host, so their
+	// chunks were not scrubbed; KeyUnavailableChunks counts individual
+	// chunks a manifest's CAS had no decryptor for. Both are key-access
+	// gaps, never mismatches: see scrubCoverageError.
+	KeyUnavailableManifests int
+	KeyUnavailableChunks    int
+	KeyUnavailable          []string
+}
+
+// noteKeyUnavailable records one manifest whose DEK could not be resolved.
+func (a *scrubResultAgg) noteKeyUnavailable(what, reason string) {
+	a.KeyUnavailableManifests++
+	if len(a.KeyUnavailable) < maxKeyUnavailableListed {
+		a.KeyUnavailable = append(a.KeyUnavailable, what+": "+reason)
+	}
 }
 
 // hashListForMsg renders a hash slice for an error message, capping the
@@ -1395,10 +1469,40 @@ func reverifyChunksPlaintext(ctx context.Context, sp storage.StoragePlugin, targ
 		}
 	}
 
-	// Anything still pending is a WAL chunk (unencrypted, default CAS)
-	// or a chunk we couldn't locate in a readable manifest. Verify via
-	// the default CAS; if it can't be read/round-tripped, treat it as
-	// still-bad — heal cannot claim a success it can't confirm.
+	// Anything still pending is a WAL chunk or a chunk we couldn't
+	// locate in a readable manifest. WAL chunks are read through their
+	// segment's own (decrypting) CAS — the plain CAS used here before
+	// failed every encrypted WAL chunk and turned a successful heal into
+	// verify.heal_unverified.
+	if len(pending) > 0 {
+		walCAS := newWALScrubCASCache(sp)
+		for info, lerr := range sp.List(ctx, "wal/") {
+			if lerr != nil {
+				return nil, lerr
+			}
+			if len(pending) == 0 {
+				break
+			}
+			if !isWALSegmentKey(info.Key) {
+				continue
+			}
+			seg, serr := readWALSegmentManifest(ctx, sp, info.Key)
+			if serr != nil {
+				continue
+			}
+			segCAS, _ := walCAS.casFor(ctx, seg)
+			if segCAS == nil {
+				continue
+			}
+			for _, ref := range seg.Chunks {
+				verify(segCAS, ref.Hash)
+			}
+		}
+	}
+	// Whatever is STILL pending was not found in any readable manifest
+	// with a usable key: verify via the default CAS; if it can't be
+	// read/round-tripped, treat it as still-bad — heal cannot claim a
+	// success it can't confirm.
 	if len(pending) > 0 {
 		defaultCAS := casdefault.New(sp)
 		for h := range pending {
@@ -1504,6 +1608,10 @@ func scrubManifestAware(ctx context.Context, sp storage.StoragePlugin, limit, wi
 		body, gerr := cas.GetChunkBytes(ctx, h)
 		if gerr != nil {
 			agg.Sampled++
+			if isKeyUnavailableErr(gerr) {
+				agg.KeyUnavailableChunks++
+				return
+			}
 			agg.Mismatches = append(agg.Mismatches, h)
 			return
 		}
@@ -1555,12 +1663,13 @@ func scrubManifestAware(ctx context.Context, sp storage.StoragePlugin, limit, wi
 			}
 			cas, cerr := buildVerifyCAS(ctx, sp, m, nil)
 			if cerr != nil {
-				// Encrypted manifest whose KEK isn't on this host:
-				// can't verify its chunks.  Surface as one synthetic
-				// "mismatch" so the operator knows it's not a clean
-				// scrub; the suggestion in the structured error
-				// points at --kek-file if/when that flag lands.
-				agg.Mismatches = append(agg.Mismatches, repo.Hash{})
+				// Encrypted manifest whose KEK isn't on this host: its
+				// chunks cannot be verified. That is a finding of its
+				// own class, reported by scrubCoverageError — it used to
+				// be a synthetic all-zero "mismatch", which rendered as a
+				// corrupt chunk 000…0 and which --heal skipped and then
+				// declared healed.
+				agg.noteKeyUnavailable("backup "+m.BackupID, cerr.Error())
 				continue
 			}
 			for _, f := range m.Files {
@@ -1583,13 +1692,12 @@ func scrubManifestAware(ctx context.Context, sp storage.StoragePlugin, limit, wi
 		}
 	}
 
-	// Walk WAL segment manifests with the default CAS.  WAL chunks
-	// today are not encrypted at the manifest level (walsink writes
-	// through casdefault.New, not NewEncrypted), so the plain CAS
-	// reads them back correctly.  If a future walsink revision
-	// encrypts WAL chunks the manifest schema will grow an Encryption
-	// block — this loop will need a buildVerifyCAS-style switch then.
-	defaultCAS := casdefault.New(sp)
+	// Walk WAL segment manifests. Since issue #106 a segment manifest
+	// carries its own encryption envelope, so each segment's chunks are
+	// read through the CAS that envelope resolves to (walScrubCASCache)
+	// — the plain CAS this loop used before reported every encrypted WAL
+	// chunk as bit rot.
+	walCAS := newWALScrubCASCache(sp)
 	for info, lerr := range sp.List(ctx, "wal/") {
 		if lerr != nil {
 			// A transient List failure must NOT be swallowed: silently
@@ -1604,17 +1712,30 @@ func scrubManifestAware(ctx context.Context, sp storage.StoragePlugin, limit, wi
 		if limit > 0 && agg.Sampled >= limit {
 			break
 		}
-		hashes, herr := scrubWALManifestHashes(ctx, sp, info.Key)
+		if !isWALSegmentKey(info.Key) {
+			continue // gap-state records and other non-segment .json
+		}
+		seg, herr := readWALSegmentManifest(ctx, sp, info.Key)
 		if herr != nil {
-			// Skip un-readable WAL manifests; verify command will
-			// surface them.  Don't fail the scrub on one bad file.
+			if ctx.Err() != nil {
+				return agg, distinctRefs, ctx.Err()
+			}
+			// One bad file must not stop the walk, but it is COUNTED:
+			// its chunks went unscrubbed (same rule as backup
+			// manifests above).
+			agg.UnverifiableManifests++
 			continue
 		}
-		for _, h := range hashes {
+		segCAS, reason := walCAS.casFor(ctx, seg)
+		if segCAS == nil {
+			agg.noteKeyUnavailable("wal "+info.Key, reason)
+			continue
+		}
+		for _, ref := range seg.Chunks {
 			if err := ctx.Err(); err != nil {
 				return agg, distinctRefs, err
 			}
-			verifyChunk(defaultCAS, h)
+			verifyChunk(segCAS, ref.Hash)
 			if limit > 0 && agg.Sampled >= limit {
 				break
 			}
@@ -1624,42 +1745,46 @@ func scrubManifestAware(ctx context.Context, sp storage.StoragePlugin, limit, wi
 	return agg, distinctRefs, nil
 }
 
-// scrubWALManifestHashes reads a WAL segment manifest at key and
-// returns the list of chunk hashes it references.  Used by
-// scrubManifestAware to verify WAL chunks alongside backup chunks.
-// Errors from the underlying storage are propagated; a malformed
-// manifest returns a parse error.
-func scrubWALManifestHashes(ctx context.Context, sp storage.StoragePlugin, key string) ([]repo.Hash, error) {
-	rc, err := sp.Get(ctx, key)
-	if err != nil {
-		return nil, err
+// trustedKeysDirName is the keyring subdirectory holding retired
+// operator public keys (PEM) whose signatures `repair attestation` may
+// carry forward to the current key.
+const trustedKeysDirName = "trusted-keys"
+
+// trustedSignerOf returns a description of the trusted key that signed
+// body, or a structured refusal when none did. Trusted keys: the
+// current keyring verifier, every <keyring>/trusted-keys/*.pem, and
+// every --trusted-key file. A key file that cannot be read or parsed is
+// an error, not a silent skip — the operator named it on purpose.
+func trustedSignerOf(body []byte, current *backup.Verifier, extraFiles []string) (string, error) {
+	if _, err := backup.ParseAndVerify(body, current); err == nil {
+		return "keyring", nil
 	}
-	defer rc.Close()
-	body, err := io.ReadAll(rc)
-	if err != nil {
-		return nil, err
+	var files []string
+	if p, err := paths.Resolve(paths.DefaultOptions()); err == nil && p.Keyring.Value != "" {
+		matches, _ := filepath.Glob(filepath.Join(p.Keyring.Value, trustedKeysDirName, "*.pem"))
+		sort.Strings(matches)
+		files = append(files, matches...)
 	}
-	// Partial decode — we only need the chunk hashes.  Tracking the
-	// full SegmentManifest type from internal/pg/walsink would
-	// pull an import cycle, so we re-decode locally.  Stable as
-	// long as the manifest's `chunks[].hash` key stays.
-	var m struct {
-		Chunks []struct {
-			Hash string `json:"hash"`
-		} `json:"chunks"`
-	}
-	if err := json.Unmarshal(body, &m); err != nil {
-		return nil, err
-	}
-	out := make([]repo.Hash, 0, len(m.Chunks))
-	for _, c := range m.Chunks {
-		var h repo.Hash
-		raw, derr := hex.DecodeString(c.Hash)
-		if derr != nil || len(raw) != len(h) {
-			continue
+	files = append(files, extraFiles...)
+	for _, f := range files {
+		pem, err := os.ReadFile(f)
+		if err != nil {
+			return "", output.NewError("usage.bad_flag",
+				fmt.Sprintf("repair attestation: read trusted key %s: %v", f, err)).Wrap(output.ErrUsage)
 		}
-		copy(h[:], raw)
-		out = append(out, h)
+		v, err := backup.LoadVerifier(pem)
+		if err != nil {
+			return "", output.NewError("usage.bad_flag",
+				fmt.Sprintf("repair attestation: parse trusted key %s: %v", f, err)).Wrap(output.ErrUsage)
+		}
+		if _, err := backup.ParseAndVerify(body, v); err == nil {
+			return f, nil
+		}
 	}
-	return out, nil
+	return "", output.NewError("verify.attestation_untrusted_key",
+		fmt.Sprintf("repair attestation: refusing to re-sign — the manifest is signed by key %s, which is neither the current keyring key nor a trusted retired operator key",
+			extractAttestationFingerprint(body))).
+		WithSuggestion(&output.Suggestion{
+			Human: "a manifest's embedded public key is part of the manifest, so a valid self-signature proves nothing about WHO signed it. If this really is your previous signing key, install its public half under <keyring>/" + trustedKeysDirName + "/ (or pass --trusted-key <pem>) and re-run; otherwise treat the manifest as forged and recover with `repair manifest` or a fresh backup.",
+		})
 }

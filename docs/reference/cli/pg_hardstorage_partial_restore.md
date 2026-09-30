@@ -22,8 +22,16 @@ visibility-map, and segment siblings) for the requested tables into
 skipped.
 
 Resolution: pass --pg-connection to query pg_class on a live source
-DB, OR --relfilenode-map <path> to a JSON file (the same shape
-`partial inspect -o json` emits).
+DB, OR --relfilenode-map <path> to a JSON file: the output of
+`partial inspect -o json` as saved (or just its table_mappings
+array) is accepted as-is.
+
+Tables in a non-default tablespace land under pg_tblspc/<oid>/...,
+the path pg_relation_filepath() reports. Incremental backups are
+refused (their relation data only exists combined with the chain);
+use a full backup or `partial dump`. Any requested table that
+yields nothing (not found, or absent from the backup) makes the
+command exit non-zero after the result is printed.
 
 The output is a partial PGDATA layout. Run pg_dump against a
 PG instance pointed at --target (or copy files into a matching

@@ -17,6 +17,24 @@ Classify each backup as kept or to-be-soft-deleted per the chosen
 retention policy, then optionally apply the decision.
 
 .PP
+Where the policy comes from, per deployment:
+
+.RS
+.IP "  1." 5
+any --policy / --keep-* flag  → the flags define the whole policy
+.IP "  2." 5
+otherwise                     → the deployment's retention: block in
+                                 pg_hardstorage.yaml (the same policy
+                                 the agent's scheduled rotate applies)
+.IP "  3." 5
+otherwise                     → the built-in GFS defaults below
+
+.RE
+
+.PP
+The plan prints which source it used for each deployment.
+
+.PP
 Three policies ship today:
 
 .PP

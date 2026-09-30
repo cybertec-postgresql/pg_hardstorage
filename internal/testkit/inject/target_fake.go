@@ -31,6 +31,12 @@ type FakeTarget struct {
 	// would make the test assert the script's text twice.
 	ExecDefault []byte
 
+	// ExecFunc, when set, answers every Exec instead of the maps
+	// above — for faults that run the same command twice and must see
+	// different answers (disk_full's df before and after the fill), or
+	// whose recovery must see an Exec fail.
+	ExecFunc func(argv []string) ([]byte, error)
+
 	// SignalErr is returned from every Signal call when set.
 	SignalErr error
 
@@ -72,6 +78,9 @@ func (f *FakeTarget) Exec(_ context.Context, argv ...string) ([]byte, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.execCmds = append(f.execCmds, append([]string{}, argv...))
+	if f.ExecFunc != nil {
+		return f.ExecFunc(argv)
+	}
 	if f.ExecResponses != nil {
 		key := joinArgv(argv)
 		if r, ok := f.ExecResponses[key]; ok {

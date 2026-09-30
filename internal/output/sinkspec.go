@@ -4,6 +4,7 @@ package output
 import (
 	"errors"
 	"fmt"
+	"sort"
 )
 
 // SinkSpec is the declarative form of a sink configuration. It comes
@@ -44,11 +45,13 @@ type SinkBuilder func(spec SinkSpec) (Sink, error)
 // link a plugin doesn't pay for it.
 type SinkRegistry struct {
 	builders map[string]SinkBuilder
+	// keys holds each plugin's declared config keys (DeclareConfigKeys).
+	keys map[string]map[string]struct{}
 }
 
 // NewSinkRegistry returns an empty registry.
 func NewSinkRegistry() *SinkRegistry {
-	return &SinkRegistry{builders: map[string]SinkBuilder{}}
+	return &SinkRegistry{builders: map[string]SinkBuilder{}, keys: map[string]map[string]struct{}{}}
 }
 
 // Register installs builder under plugin. Panics on double-registration:
@@ -125,6 +128,58 @@ func (e SinkBuildError) Error() string {
 
 // Unwrap exposes the inner error for errors.Is / errors.As walks.
 func (e SinkBuildError) Unwrap() error { return e.Err }
+
+// commonSinkKeys are config keys every sink accepts.
+var commonSinkKeys = []string{"min_severity"}
+
+// DeclareConfigKeys records the config keys plugin reads. A sink config
+// is a free-form map, so a misspelt key (`tls_mode` for `tls`) used to
+// be ignored without a word — the operator believed a setting applied
+// that did not. With keys declared, UnknownConfigKeys names such keys
+// and start-up warns (sink.unknown_config_keys). Warn, not refuse: a
+// sink disabled over a harmless stray key would silence alerting.
+func (r *SinkRegistry) DeclareConfigKeys(plugin string, keys ...string) {
+	set := r.keys[plugin]
+	if set == nil {
+		set = map[string]struct{}{}
+		r.keys[plugin] = set
+	}
+	for _, k := range append(keys, commonSinkKeys...) {
+		set[k] = struct{}{}
+	}
+}
+
+// DeclaredConfigKeys returns plugin's declared keys (sorted) and whether
+// it declared any.
+func (r *SinkRegistry) DeclaredConfigKeys(plugin string) ([]string, bool) {
+	set, ok := r.keys[plugin]
+	if !ok {
+		return nil, false
+	}
+	out := make([]string, 0, len(set))
+	for k := range set {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out, true
+}
+
+// UnknownConfigKeys returns spec's config keys its plugin does not read
+// (sorted), or nil when there are none or the plugin declared no keys.
+func (r *SinkRegistry) UnknownConfigKeys(spec SinkSpec) []string {
+	set, ok := r.keys[spec.Plugin]
+	if !ok {
+		return nil
+	}
+	var out []string
+	for k := range spec.Config {
+		if _, known := set[k]; !known {
+			out = append(out, k)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
 
 // ErrUnknownSinkPlugin is returned when SinkSpec.Plugin doesn't map
 // to a registered builder.

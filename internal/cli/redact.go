@@ -66,10 +66,25 @@ func newRedactApplyCmd() *cobra.Command {
 			}
 			tableSQLs := plan.SQL()
 			if printSQL {
+				var sqlText strings.Builder
 				for _, t := range tableSQLs {
-					fmt.Fprintf(cmd.OutOrStdout(), "BEGIN;\n%s;\nCOMMIT;\n", t.Stmt)
+					fmt.Fprintf(&sqlText, "BEGIN;\n%s;\nCOMMIT;\n", t.Stmt)
 				}
-				return nil
+				// Text mode: the raw SQL, pipeable into psql. Any
+				// structured mode (-o json, ...) gets a Result like
+				// every other command, with the SQL in its body —
+				// raw SQL there is not a document a consumer can parse.
+				if d.Renderer().Name() == "text" {
+					_, err := io.WriteString(cmd.OutOrStdout(), sqlText.String())
+					return err
+				}
+				return d.Result(output.NewResult(cmd.CommandPath()).WithBody(redactBody{
+					DryRun:     true,
+					Tables:     tableNames(tableSQLs),
+					Statements: len(tableSQLs),
+					SaltHex:    plan.SaltHex(),
+					SQL:        sqlText.String(),
+				}))
 			}
 			// Flag-gated: --pg-connection only for a live run.
 			if pgConn == "" && !dryRun {
@@ -92,11 +107,19 @@ func newRedactApplyCmd() *cobra.Command {
 			// One psql invocation per table so a per-table
 			// failure surfaces as a distinct error and leaves
 			// preceding tables redacted.
+			//
+			// The password never goes on psql's argv, where every local
+			// user can read it (ps, /proc/<pid>/cmdline): it is split out
+			// of the DSN and handed over in PGPASSWORD.
+			connNoPW, password, _ := splitDSNPassword(pgConn)
 			for _, t := range tableSQLs {
 				body := fmt.Sprintf("BEGIN;\n%s;\nCOMMIT;\n", t.Stmt)
 				pcmd := exec.CommandContext(cmd.Context(), ps,
 					"-v", "ON_ERROR_STOP=1",
-					"-d", pgConn, "-X", "-q", "-1")
+					"-d", connNoPW, "-X", "-q", "-1")
+				if password != "" {
+					pcmd.Env = append(os.Environ(), "PGPASSWORD="+password)
+				}
 				pcmd.Stdin = strings.NewReader(body)
 				pcmd.Stderr = cmd.ErrOrStderr()
 				if err := pcmd.Run(); err != nil {
@@ -124,7 +147,7 @@ func newRedactApplyCmd() *cobra.Command {
 	c.Flags().BoolVar(&dryRun, "dry-run", false,
 		"validate the plan without applying any SQL")
 	c.Flags().BoolVar(&printSQL, "print-sql", false,
-		"print the generated SQL on stdout (no PG connection required)")
+		"print the generated SQL on stdout (no PG connection required); in structured output modes (-o json, ...) it is returned as result.sql")
 	c.Flags().StringVar(&saltHex, "salt-hex", "",
 		"override the random salt with a fixed hex string (use to reproduce identical hashes across runs)")
 	return c
@@ -229,6 +252,9 @@ type redactBody struct {
 	SaltHex    string   `json:"salt_hex"`
 	DryRun     bool     `json:"dry_run,omitempty"`
 	Applied    bool     `json:"applied,omitempty"`
+	// SQL is the generated script, set by --print-sql in structured
+	// output modes.
+	SQL string `json:"sql,omitempty"`
 }
 
 // WriteText renders the redaction outcome — statements run, salt, mode — as

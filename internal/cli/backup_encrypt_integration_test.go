@@ -53,7 +53,7 @@ func TestIntegration_BackupEncrypted_CLIRoundTrip(t *testing.T) {
 
 	// Take a backup. Should auto-encrypt because the KEK is present.
 	out, stderr, exit = runCmd(t,
-		"backup", "db1",
+		"backup", "db1", "--include-wal",
 		"--pg-connection", srv.DSN,
 		"--repo", repoURL,
 		"--fast",
@@ -166,7 +166,7 @@ func TestIntegration_BackupNoEncrypt_OverridesKEK(t *testing.T) {
 
 	// Backup with --no-encrypt should produce an unencrypted manifest.
 	out, _, exit := runCmd(t,
-		"backup", "db1",
+		"backup", "db1", "--include-wal",
 		"--pg-connection", srv.DSN,
 		"--repo", repoURL,
 		"--no-encrypt",
@@ -188,7 +188,7 @@ func TestIntegration_BackupConflictingFlags_ExitMisuse(t *testing.T) {
 	t.Setenv("PG_HARDSTORAGE_KEYRING_DIR", keyringDir)
 
 	_, _, exit := runCmd(t,
-		"backup", "db1",
+		"backup", "db1", "--include-wal",
 		"--pg-connection", "postgres://x",
 		"--repo", "file://"+t.TempDir(),
 		"--encrypt", "--no-encrypt",

@@ -179,9 +179,26 @@ PHYSICAL RESERVE_WAL` if the slot is absent — `RESERVE_WAL` pins
 the slot's `restart_lsn` immediately at create time, so PG
 retains WAL from that moment on.  Then it issues
 `START_REPLICATION SLOT pg_hardstorage_db1 PHYSICAL` against the
-slot.  The stream is gap-free across agent restarts.  Supervise it
-with systemd (the package ships `pg_hardstorage@<deployment>.service`
-for exactly this) or your container scheduler.
+slot.  The stream is gap-free across restarts.  Supervise it with
+systemd — the package ships
+`pg_hardstorage-wal-stream@<deployment>.service` for exactly this:
+
+```sh
+sudo systemctl enable --now pg_hardstorage-wal-stream@db1.service
+```
+
+!!! warning "This is not the agent unit"
+
+    `pg_hardstorage.service` and `pg_hardstorage@.service` run
+    `pg_hardstorage agent`, which executes the **scheduled backup and
+    retention** work. The agent never opens a WAL stream. Running only
+    the agent leaves you with periodic base backups and **no
+    continuous archiving** — and, because the two look
+    interchangeable, with no sign that anything is missing.
+
+    A production host runs both units: the agent for schedules, and
+    `pg_hardstorage-wal-stream@<deployment>` for the always-on data
+    plane.
 
 `--skip-preflight` is the explicit override if you've already
 audited PG; `--no-slot` is the explicit escape hatch for

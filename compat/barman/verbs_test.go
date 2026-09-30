@@ -93,7 +93,7 @@ func TestRecoverVerbBasic(t *testing.T) {
 	if err != nil {
 		t.Fatalf("recover: %v", err)
 	}
-	want := []string{"restore", "db1", "20260427T0942-abc", "--target", "/srv/pg17"}
+	want := []string{"restore", "db1", "20260427T0942-abc", "--target", "/srv/pg17", "--to-latest"}
 	if !equalSlices(got, want) {
 		t.Errorf("argv mismatch:\n got: %v\nwant: %v", got, want)
 	}

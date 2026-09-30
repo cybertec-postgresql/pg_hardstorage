@@ -176,6 +176,34 @@ risk; the manifest writer is single-leader-per-backup so
 the race is bounded.  Filesystems use `linkat(2) | rename(2)`
 for true atomicity.
 
+A copy does not carry the source's retention lock, so
+`storage.CommitExclusive` (the manifest / timeline / WAL
+segment commit helper) stages the temporary *without*
+retention on backends that lack `ConditionalPut` and
+applies `SetRetention` to the final key after the rename.
+If that lock cannot be applied the commit fails and the
+unlocked object is removed again; an unlocked object is
+never reported as committed.
+
+### Optional: `StagingReapAware`
+
+Backends that stage writes under hidden temp names (fs:
+`.hstmp-` / `.deferred-` / `.excl-`; sftp and scp: `.hstmp-`)
+hide them from `List`, so a writer that dies between staging and
+publishing leaks them past every GC pass. Such a backend
+implements
+
+```go
+ReapStaging(ctx context.Context, olderThan time.Duration) (ReapStats, error)
+```
+
+removing only its own staging temps last modified more than
+`olderThan` ago (never a caller's key). Callers go through
+`storage.ReapStagingOf`, which reports `Unsupported` for other
+backends and refuses an age below `storage.MinStagingReapAge`
+(1 h); `storage.DefaultStagingReapAge` (24 h) is the
+recommended cut-off. Middlewares must forward it.
+
 ### `SetRetention(ctx, key, until, mode) error`
 
 Apply a WORM retention deadline + lock posture.  Returns

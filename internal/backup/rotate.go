@@ -28,13 +28,15 @@ const maxRotateKEKFailures = 50
 
 // RotateKEKOptions configures one KEK rotation pass.
 //
-// What rotation does: walks every visible (non-tombstoned) backup
-// manifest in the repo, finds those wrapped with `OldKEKRef`,
+// What rotation does: walks every backup manifest in the repo —
+// tombstoned ones included — finds those wrapped with `OldKEKRef`,
 // decrypts the wrapped DEK using `OldKEK`, re-wraps it under
 // `NewKEK`, mutates the manifest's encryption block to record the
 // new wrapping (`WrappedDEK` + `KEKRef` change; everything else
 // stays bit-identical), re-signs the manifest, and atomically
-// rewrites the body at the same key.
+// rewrites the body at the same key. It then walks every WAL segment
+// manifest (wal/<dep>/<TLI>/<segment>.json) and rewraps the envelope
+// each one carries (issue #106) the same way — see rotateWALSegments.
 //
 // What rotation does NOT do:
 //
@@ -48,8 +50,12 @@ const maxRotateKEKFailures = 50
 //     deliberate: in multi-tenant repos, rotating per-tenant KEKs
 //     individually is the correct posture. The operator passes
 //     `--old-kek-ref X` and only those manifests get rotated.
-//   - Touch tombstoned manifests. They're scheduled for deletion;
-//     re-encrypting their wrapped DEKs would be wasted work.
+//
+// Tombstoned manifests ARE rotated: a soft-delete is reversible
+// (`backup undelete`) until the purge, so a tombstoned backup still
+// needs a DEK the operator can unwrap. Skipping them and then telling
+// the operator the old KEK could be retired made every undelete after
+// the retirement resurrect an undecryptable backup.
 //
 // Resumability: a rotation interrupted partway through can be
 // re-run with the SAME `--old-kek-ref` + `--new-kek-ref`. Manifests
@@ -108,15 +114,25 @@ type RotateKEKOptions struct {
 type RotateKEKProgress struct {
 	Deployment string
 	BackupID   string
+	Key        string // WAL segment manifest key; empty for backup manifests
 	Outcome    string // "rotated" | "would_rotate" | "already_rotated" | "skipped_unencrypted" | "skipped_different_kek" | "failed"
 	Reason     string
 }
 
 // RotateKEKFailure records one manifest that couldn't be rotated.
+// Key is set for WAL segment manifests (BackupID is empty there).
 type RotateKEKFailure struct {
 	Deployment string `json:"deployment"`
 	BackupID   string `json:"backup_id"`
+	Key        string `json:"key,omitempty"`
 	Err        string `json:"err"`
+}
+
+// Complete reports whether every object that held the old KEK now
+// holds the new one — the only state in which retiring the old KEK
+// is safe. On a dry-run it reports whether the PLAN is clean.
+func (r *RotateKEKResult) Complete() bool {
+	return r.Failed == 0 && r.ReplicaFailures == 0 && r.WALFailed == 0
 }
 
 // RotateKEKResult is the structured outcome.
@@ -137,11 +153,28 @@ type RotateKEKResult struct {
 	SkippedDifferentKEK int `json:"skipped_different_kek"`
 	Failed              int `json:"failed"`
 
+	// TombstonedRotated counts soft-deleted manifests (included in
+	// Rotated) that were rewrapped — still recoverable via undelete,
+	// so they must not be stranded on the old KEK.
+	TombstonedRotated int `json:"tombstoned_rotated,omitempty"`
+
+	// WAL segment manifests carry their own envelope and are unwrapped
+	// per segment by `wal fetch`, so they are rotated too. Same
+	// outcome classes as the backup-manifest counters above. A WAL
+	// failure is as blocking as a manifest failure: PITR over the
+	// failed segment needs the old KEK.
+	WALConsidered          int `json:"wal_considered"`
+	WALRotated             int `json:"wal_rotated"`
+	WALAlreadyRotated      int `json:"wal_already_rotated"`
+	WALSkippedUnencrypted  int `json:"wal_skipped_unencrypted"`
+	WALSkippedDifferentKEK int `json:"wal_skipped_different_kek"`
+	WALFailed              int `json:"wal_failed"`
+
 	// SharedDEKMigrated reports whether the authoritative
 	// keys/shared-dek/ object was rewrapped to the new (ref, KEK) as
 	// part of this pass. False on dry-runs, on legacy repos that
 	// never had the object, and when Failed > 0 (migration only runs
-	// after a clean manifest pass).
+	// after a clean manifest AND WAL pass).
 	SharedDEKMigrated bool `json:"shared_dek_migrated,omitempty"`
 
 	// ReplicaFailures counts manifests where the primary rewrite
@@ -200,11 +233,12 @@ func RotateKEK(ctx context.Context, sp storage.StoragePlugin, opts RotateKEKOpti
 			finish()
 			return res, err
 		}
-		for m, lerr := range store.List(ctx, deployment, opts.Verifier) {
+		for entry, lerr := range store.ListIncludingTombstoned(ctx, deployment, opts.Verifier) {
 			if err := ctx.Err(); err != nil {
 				finish()
 				return res, err
 			}
+			m := entry.Manifest
 			res.Considered++
 			if lerr != nil {
 				// Unverified / corrupt manifest. We don't auto-skip —
@@ -222,9 +256,15 @@ func RotateKEK(ctx context.Context, sp storage.StoragePlugin, opts RotateKEKOpti
 			switch outcome {
 			case rotateOutcomeRotated:
 				res.Rotated++
+				if entry.Tombstoned {
+					res.TombstonedRotated++
+				}
 				emitRotateProgress(opts, deployment, m.BackupID, "rotated", "")
 			case rotateOutcomeWouldRotate:
 				res.Rotated++
+				if entry.Tombstoned {
+					res.TombstonedRotated++
+				}
 				emitRotateProgress(opts, deployment, m.BackupID, "would_rotate", "")
 			case rotateOutcomeAlreadyRotated:
 				res.AlreadyRotated++
@@ -239,6 +279,9 @@ func RotateKEK(ctx context.Context, sp storage.StoragePlugin, opts RotateKEKOpti
 						m.Encryption.KEKRef, opts.OldKEKRef))
 			case rotateOutcomeReplicaFailed:
 				res.Rotated++
+				if entry.Tombstoned {
+					res.TombstonedRotated++
+				}
 				res.ReplicaFailures++
 				emitRotateProgress(opts, deployment, m.BackupID, "rotated",
 					"primary OK, replica copy failed (best-effort)")
@@ -255,13 +298,22 @@ func RotateKEK(ctx context.Context, sp storage.StoragePlugin, opts RotateKEKOpti
 		}
 	}
 
+	// WAL segment manifests: each carries its own wrapped DEK, and the
+	// local keystore resolves every local:* ref to the single kek.bin —
+	// so once the operator installs the new KEK, any segment left on the
+	// old wrap is undecryptable and PITR past the base backup is gone.
+	if err := rotateWALSegments(ctx, sp, opts, res); err != nil {
+		finish()
+		return res, fmt.Errorf("backup rotate-kek: %w", err)
+	}
+
 	// Migrate the authoritative shared-DEK object (keys/shared-dek/)
 	// across the rotation. Manifests alone are not enough: the next
 	// backup's ResolveOrMint consults this object FIRST, and a wrap
 	// left under the retired KEK bricks every future backup and
 	// `wal stream` for this ref (they refuse — correctly — to mint a
 	// divergent DEK). Same-DEK invariant: only the wrapping changes.
-	if !opts.DryRun && res.Failed == 0 {
+	if !opts.DryRun && res.Failed == 0 && res.WALFailed == 0 {
 		unwrapOld := func(w []byte) ([]byte, error) {
 			d, err := encryption.Unwrap(opts.OldKEK, w)
 			if err != nil {
@@ -365,6 +417,13 @@ func rotateOneManifest(ctx context.Context, sp storage.StoragePlugin, store *Man
 	}
 	dek, err := encryption.Unwrap(opts.OldKEK, wrappedOld)
 	if err != nil {
+		// A local backup taken after the operator installed the new
+		// kek.bin still carries the fixed local:default ref but is
+		// already wrapped under the new key: done, not failed —
+		// otherwise a resumed rotation can never exit clean.
+		if _, nerr := encryption.Unwrap(opts.NewKEK, wrappedOld); nerr == nil {
+			return rotateOutcomeAlreadyRotated, nil
+		}
 		return rotateOutcomeFailed, fmt.Errorf("unwrap with OldKEK: %w (the supplied OldKEK does not match this manifest's wrapped_dek)", err)
 	}
 

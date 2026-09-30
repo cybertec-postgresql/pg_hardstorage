@@ -95,9 +95,14 @@ func (ms *ManifestStore) PutHold(ctx context.Context, deployment, backupID, hold
 // audit but no longer blocks deletion).
 //
 // Idempotent: a second PutHold/PutHoldUntil for the same
-// (deployment, backupID) updates the holder/reason/expiry fields;
-// HeldAt is preserved from the original so the audit-log duration
-// doesn't reset on every edit.
+// (deployment, backupID) updates the reason and may EXTEND the
+// expiry; HeldAt is preserved from the original so the audit-log
+// duration doesn't reset on every edit. It refuses (HoldWeakenError)
+// to weaken an ACTIVE hold — an earlier expiry, a finite expiry on an
+// indefinite legal hold, or a different holder — since a plain
+// re-add used to silently turn an indefinite regulatory hold into a
+// short one. PutHoldWithOptions{Force: true} is the explicit,
+// audited override.
 //
 // Use cases:
 //   - `hold add` (no --until): regulatory legal hold, indefinite.
@@ -107,22 +112,87 @@ func (ms *ManifestStore) PutHold(ctx context.Context, deployment, backupID, hold
 //   - `hold add --until "2027-01-01"`: bounded preservation
 //     (litigation discovery period, audit window).
 func (ms *ManifestStore) PutHoldUntil(ctx context.Context, deployment, backupID, holder, reason string, expiresAt time.Time) error {
+	_, err := ms.PutHoldWithOptions(ctx, deployment, backupID, PutHoldOptions{
+		Holder: holder, Reason: reason, ExpiresAt: expiresAt,
+	})
+	return err
+}
+
+// PutHoldOptions configures PutHoldWithOptions. Zero ExpiresAt means
+// indefinite.
+type PutHoldOptions struct {
+	Holder    string
+	Reason    string
+	ExpiresAt time.Time
+	// Force replaces an active hold even when the new one is weaker
+	// (earlier/finite expiry, different holder). The caller owns the
+	// audit trail: PutHoldWithOptions returns the replaced hold.
+	Force bool
+}
+
+// ErrHoldWeaken matches HoldWeakenError via errors.Is.
+var ErrHoldWeaken = errors.New("backup: refusing to weaken an existing hold")
+
+// HoldWeakenError is returned when a hold write would weaken an active
+// hold without Force.
+type HoldWeakenError struct {
+	Deployment string
+	BackupID   string
+	Existing   *Hold
+	Why        string
+}
+
+func (e *HoldWeakenError) Error() string {
+	return fmt.Sprintf("backup: %s/%s already has an active hold (holder=%q): %s", e.Deployment, e.BackupID, e.Existing.Holder, e.Why)
+}
+
+// Is makes errors.Is(err, ErrHoldWeaken) match.
+func (e *HoldWeakenError) Is(target error) bool { return target == ErrHoldWeaken }
+
+// holdWeakening reports why replacing existing with (holder, expiresAt)
+// would weaken protection, or "" when it does not. Only an ACTIVE hold
+// can be weakened; an expired marker protects nothing.
+func holdWeakening(existing *Hold, holder string, expiresAt time.Time, now time.Time) string {
+	if existing == nil || !existing.ActiveAt(now) {
+		return ""
+	}
+	if existing.Holder != holder {
+		return fmt.Sprintf("it belongs to holder %q; a different holder (%q) may not replace it", existing.Holder, holder)
+	}
+	if expiresAt.IsZero() {
+		return "" // indefinite never weakens
+	}
+	if existing.ExpiresAt == nil {
+		return fmt.Sprintf("it is indefinite; the new hold would expire at %s", expiresAt.UTC().Format(time.RFC3339))
+	}
+	if expiresAt.Before(*existing.ExpiresAt) {
+		return fmt.Sprintf("it runs until %s; the new hold would expire earlier, at %s",
+			existing.ExpiresAt.UTC().Format(time.RFC3339), expiresAt.UTC().Format(time.RFC3339))
+	}
+	return ""
+}
+
+// PutHoldWithOptions is PutHoldUntil with the weakening override. It
+// returns the hold it replaced (nil when there was none) so the caller
+// can audit exactly what changed.
+func (ms *ManifestStore) PutHoldWithOptions(ctx context.Context, deployment, backupID string, o PutHoldOptions) (*Hold, error) {
+	holder, reason, expiresAt := o.Holder, o.Reason, o.ExpiresAt
 	if deployment == "" || backupID == "" {
-		return errors.New("backup: PutHold requires deployment and backupID")
+		return nil, errors.New("backup: PutHold requires deployment and backupID")
 	}
 	// Validate the storage identifiers up front, mirroring the sibling
 	// tombstone paths (SoftDelete etc. all validateRef before touching
 	// storage). Without this, a hold could be written under a key derived
 	// from an unsafe identifier that the tombstone paths would reject.
 	if err := validateRef(deployment, backupID); err != nil {
-		return err
+		return nil, err
 	}
 	// Refuse to hold a backup that doesn't exist.
 	if _, err := ms.sp.Stat(ctx, PrimaryPath(deployment, backupID)); err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
-			return fmt.Errorf("backup: hold %s/%s: %w", deployment, backupID, storage.ErrNotFound)
+			return nil, fmt.Errorf("backup: hold %s/%s: %w", deployment, backupID, storage.ErrNotFound)
 		}
-		return fmt.Errorf("backup: hold-stat %s/%s: %w", deployment, backupID, err)
+		return nil, fmt.Errorf("backup: hold-stat %s/%s: %w", deployment, backupID, err)
 	}
 
 	// Refuse to hold a tombstoned (soft-deleted) backup. The primary
@@ -133,9 +203,9 @@ func (ms *ManifestStore) PutHoldUntil(ctx context.Context, deployment, backupID,
 	// to SoftDelete's hold check; together they keep a backup from ever
 	// being simultaneously held and tombstoned.
 	if tombstoned, terr := ms.IsTombstoned(ctx, deployment, backupID); terr != nil {
-		return fmt.Errorf("backup: hold tombstone-check %s/%s: %w", deployment, backupID, terr)
+		return nil, fmt.Errorf("backup: hold tombstone-check %s/%s: %w", deployment, backupID, terr)
 	} else if tombstoned {
-		return &ManifestTombstonedError{Deployment: deployment, BackupID: backupID}
+		return nil, &ManifestTombstonedError{Deployment: deployment, BackupID: backupID}
 	}
 
 	heldAt := time.Now().UTC()
@@ -144,9 +214,20 @@ func (ms *ManifestStore) PutHoldUntil(ctx context.Context, deployment, backupID,
 	// hold" is the audit-log artefact; resetting it on every
 	// edit would erase that history.
 	hadExisting := false
-	if existing, err := ms.GetHold(ctx, deployment, backupID); err == nil && existing != nil {
+	var prev *Hold
+	existing, gerr := ms.GetHold(ctx, deployment, backupID)
+	switch {
+	case gerr == nil && existing != nil:
 		heldAt = existing.HeldAt
 		hadExisting = true
+		prev = existing
+	case gerr != nil && !errors.Is(gerr, storage.ErrNotFound) && !o.Force:
+		// Unreadable existing hold: we cannot prove the write would not
+		// weaken it, so refuse rather than overwrite blind (Force may).
+		return nil, fmt.Errorf("backup: read existing hold %s/%s: %w", deployment, backupID, gerr)
+	}
+	if why := holdWeakening(prev, holder, expiresAt, time.Now().UTC()); why != "" && !o.Force {
+		return prev, &HoldWeakenError{Deployment: deployment, BackupID: backupID, Existing: prev, Why: why}
 	}
 
 	var expPtr *time.Time
@@ -165,7 +246,7 @@ func (ms *ManifestStore) PutHoldUntil(ctx context.Context, deployment, backupID,
 	}
 	body, err := encodeJSON(&h)
 	if err != nil {
-		return fmt.Errorf("backup: encode hold: %w", err)
+		return nil, fmt.Errorf("backup: encode hold: %w", err)
 	}
 
 	key := HoldPath(deployment, backupID)
@@ -185,7 +266,7 @@ func (ms *ManifestStore) PutHoldUntil(ctx context.Context, deployment, backupID,
 	if _, err := ms.sp.Put(ctx, key, bytes.NewReader(body), storage.PutOptions{
 		ContentLength: int64(len(body)),
 	}); err != nil {
-		return fmt.Errorf("backup: install hold: %w", err)
+		return nil, fmt.Errorf("backup: install hold: %w", err)
 	}
 
 	// Write-then-verify, symmetric to SoftDelete's post-tombstone hold
@@ -203,17 +284,17 @@ func (ms *ManifestStore) PutHoldUntil(ctx context.Context, deployment, backupID,
 	// — but guarding on hadExisting guarantees we never delete an
 	// operator's standing legal hold.
 	if tombstoned, terr := ms.IsTombstoned(ctx, deployment, backupID); terr != nil {
-		return fmt.Errorf("backup: hold tombstone re-check %s/%s: %w", deployment, backupID, terr)
+		return prev, fmt.Errorf("backup: hold tombstone re-check %s/%s: %w", deployment, backupID, terr)
 	} else if tombstoned {
 		if !hadExisting {
 			if rmErr := ms.RemoveHold(ctx, deployment, backupID); rmErr != nil {
-				return fmt.Errorf("backup: hold on %s raced a concurrent soft-delete and removing the just-written hold failed (the backup may now be held-and-tombstoned; run `backup hold remove %s`): %w",
+				return nil, fmt.Errorf("backup: hold on %s raced a concurrent soft-delete and removing the just-written hold failed (the backup may now be held-and-tombstoned; run `backup hold remove %s`): %w",
 					backupID, backupID, rmErr)
 			}
 		}
-		return &ManifestTombstonedError{Deployment: deployment, BackupID: backupID}
+		return prev, &ManifestTombstonedError{Deployment: deployment, BackupID: backupID}
 	}
-	return nil
+	return prev, nil
 }
 
 // RemoveHold deletes the hold marker for deployment/backupID. Idempotent:

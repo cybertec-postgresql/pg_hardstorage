@@ -236,6 +236,51 @@ func runBackupUndelete(cmd *cobra.Command, deployment string, ids []string, repo
 	outcomeByID := make(map[string]backupUndeleteOutcome, len(ids))
 	restoredIDs := make([]string, 0, len(ids))
 	unverifiedIDs := make([]string, 0, len(ids))
+
+	// Single audit event per call, listing every backup that was
+	// actually resurrected. Already-live IDs are NOT in this list:
+	// the audit chain captures real state changes, not no-ops.
+	// Nothing to emit when no ID was actually restored.
+	//
+	// It is emitted on EVERY exit — a batch that fails on a later ID
+	// has already made the earlier ones live, and returning before the
+	// append (as this used to) left those resurrections with no audit
+	// trace at all.
+	emitAudit := func(failedID string, failure error) {
+		if len(restoredIDs) == 0 {
+			return
+		}
+		body := map[string]any{
+			"deployment":   deployment,
+			"reason":       auditReason,
+			"restored":     restoredIDs,
+			"requested":    ids,
+			"already_live": len(ids) - len(restoredIDs),
+		}
+		// The audit chain must show that some of those resurrections
+		// were never integrity-checked; an entry that looks identical
+		// to a verified one would misrepresent what happened.
+		if len(unverifiedIDs) > 0 {
+			body["chunks_unverified"] = unverifiedIDs
+		}
+		if failure != nil {
+			body["incomplete"] = true
+			body["failed_backup_id"] = failedID
+			body["error"] = failure.Error()
+			delete(body, "already_live") // unknown: the batch stopped early
+		}
+		audit.NewStoreWithRetention(sp, repoMeta.WORM).AppendOrLog(cmd.Context(), &audit.Event{
+			Action: "backup.undelete",
+			Subject: audit.Subject{
+				Deployment: deployment,
+				BackupID:   restoredIDs[0],
+				Repo:       repoURL,
+			},
+			Timestamp: time.Now().UTC(),
+			Body:      body,
+		})
+	}
+
 	for _, id := range ordered {
 		if _, skip := skipDueToMissing[id]; skip {
 			outcomeByID[id] = backupUndeleteOutcome{
@@ -269,6 +314,7 @@ func runBackupUndelete(cmd *cobra.Command, deployment string, ids []string, repo
 			restored = true
 		}
 		if uerr != nil {
+			emitAudit(id, uerr)
 			var cm *backup.UndeleteChunksMissingError
 			if errors.As(uerr, &cm) {
 				return output.NewError("conflict.chunks_missing",
@@ -311,35 +357,7 @@ func runBackupUndelete(cmd *cobra.Command, deployment string, ids []string, repo
 		results = append(results, outcomeByID[id])
 	}
 
-	// Single audit event per call, listing every backup that was
-	// actually resurrected. Already-live IDs are NOT in this list:
-	// the audit chain captures real state changes, not no-ops.
-	// Nothing to emit when no ID was actually restored.
-	if len(restoredIDs) > 0 {
-		body := map[string]any{
-			"deployment":   deployment,
-			"reason":       auditReason,
-			"restored":     restoredIDs,
-			"requested":    ids,
-			"already_live": len(ids) - len(restoredIDs),
-		}
-		// The audit chain must show that some of those resurrections
-		// were never integrity-checked; an entry that looks identical
-		// to a verified one would misrepresent what happened.
-		if len(unverifiedIDs) > 0 {
-			body["chunks_unverified"] = unverifiedIDs
-		}
-		audit.NewStoreWithRetention(sp, repoMeta.WORM).AppendOrLog(cmd.Context(), &audit.Event{
-			Action: "backup.undelete",
-			Subject: audit.Subject{
-				Deployment: deployment,
-				BackupID:   restoredIDs[0],
-				Repo:       repoURL,
-			},
-			Timestamp: time.Now().UTC(),
-			Body:      body,
-		})
-	}
+	emitAudit("", nil)
 
 	body := backupUndeleteBody{
 		Deployment:  deployment,

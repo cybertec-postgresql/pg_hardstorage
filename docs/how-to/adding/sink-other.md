@@ -38,22 +38,30 @@ for the full flag list.
 
 ## CEF (`cef`)
 
-ArcSight Common Event Format over TCP / TLS. For SIEMs that
-prefer CEF over RFC 5424's JSON message body.
+ArcSight Common Event Format, one event per line, appended to a
+local file. For SIEMs that prefer CEF over RFC 5424's JSON
+message body; ship the file with the forwarder you already run
+(rsyslog, filebeat, the ArcSight / Splunk connector). The sink
+has no network transport, so the air-gap policy does not apply.
 
 ```yaml
 sinks:
   - name: prod-cef
     plugin: cef
     config:
-      protocol: tls
-      address: siem.example.com:514
+      destination: file:///var/log/pg_hardstorage/audit.cef
       vendor: pg_hardstorage
       product: pg_hardstorage
       version: "1"
 ```
 
 CEF severity is rendered as 0-10 from the RFC 5424 ladder.
+
+The file is safe to rotate with logrotate in either mode.
+`copytruncate` needs nothing special. With the default
+move-and-create, the sink notices before its next write that the
+path names a different file (or none) and re-opens it, so new
+events land in the fresh file rather than the rotated one.
 
 ## Datadog (`datadog-events`)
 
@@ -88,15 +96,25 @@ sinks:
       tls: starttls
       auth: plain
       username: pg-hardstorage
-      password: kms-secret://ops/smtp-password
+      password: "<smtp-password>"   # literal value; keep pg_hardstorage.yaml mode 0600
       from: backups@example.com
       to: ["dba@example.com"]
       cc: ["ops@example.com"]
       min_severity: error
+      timeout: 30s          # whole SMTP conversation; default 30s
 ```
 
 `min_severity: error` is the right default; nobody wants email
 on every WAL keepalive.
+
+`timeout` bounds one delivery end to end — dial, TLS handshake
+and the SMTP conversation. A relay that accepts the TCP
+connection and then stalls fails that delivery after `timeout`
+instead of holding up shutdown; cancelling the emitting command
+aborts an in-flight delivery immediately. Under
+`airgapped: strict` the `smtp_host` must be loopback, private
+(RFC1918 / RFC4193) or on the air-gap allowlist, or the sink is
+refused at startup.
 
 ## Microsoft Teams (`teams`)
 
@@ -189,7 +207,6 @@ sinks:
     config:
       endpoint: http://otel-collector:4318
       service_name: pg_hardstorage
-      service_namespace: dba
 ```
 
 ## Severity model recap

@@ -21,8 +21,10 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/restore"
 )
 
@@ -87,5 +89,27 @@ func TestReplicate_RestoreFromReplicaMissingChunk_Fails(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("restore succeeded from a replica missing its chunks")
+	}
+}
+
+// TestReplicate_WithoutWAL_ReplicaCannotRestore pins what a default
+// replication means. `repo replicate` copies WAL only with --include-wal;
+// without it, a backup that relies on archived WAL cannot be restored
+// from the replica. That used to surface only at DR time — the restore
+// hung waiting for WAL — while the replication report said "replication
+// clean". Restore now refuses up front (preflight.backup_wal_missing),
+// and the CLI flags the run (ReplicateResult.WALNotReplicated).
+func TestReplicate_WithoutWAL_ReplicaCannotRestore(t *testing.T) {
+	w := setupRVWorld(t)
+	id := w.commitToBoth(t, "db1", 1, []byte("data"), false /* commit only */)
+	if _, err := repo.Replicate(context.Background(), w.srcSP, w.dstSP, repo.ReplicateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	_, err := restore.Restore(context.Background(), restore.Options{
+		RepoURL: w.dstURL, Deployment: "db1", BackupID: id,
+		TargetDir: filepath.Join(t.TempDir(), "r"), Verifier: w.verifier,
+	})
+	if err == nil || !strings.Contains(err.Error(), "preflight.backup_wal_missing") {
+		t.Fatalf("restoring a WAL-dependent backup from a replica without WAL must be refused up front, got: %v", err)
 	}
 }

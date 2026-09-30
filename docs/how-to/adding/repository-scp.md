@@ -201,6 +201,23 @@ already-present chunk is a no-op.  Manifest commits go
 through `RenameIfNotExists` which has the same posture and
 is the actual race winner.
 
+Each staged file is flushed with `sync -- <file>` before it is
+linked or renamed into place, and the parent directory with
+`sync -- <dir>` right after (a remote `sync` that refuses
+arguments falls back to a global `sync`). Directories created by
+`mkdir -p` are not synced in their parents, so the backend does
+not claim inline durability.
+
+## Dead connections
+
+The plugin sends an SSH keepalive every 30 s and tears the
+connection down after two unanswered probes (about 70 s worst
+case), so a silently dropped peer turns into an error instead of
+a hang. The next operation re-dials (at most once every 5 s), so a
+long-running `wal stream` heals after a network blip without a
+restart. Cancelling an operation's context also aborts a remote
+read that is blocked waiting for data.
+
 ## Path safety
 
 Every key flows through a single shell-quoting helper —

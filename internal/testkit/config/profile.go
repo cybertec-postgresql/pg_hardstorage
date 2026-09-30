@@ -56,15 +56,16 @@ type Profile struct {
 	SustainedRateTPS int `yaml:"sustained_rate_tps,omitempty"`
 }
 
-// LoadProfiles reads and validates a profiles YAML file.
+// LoadProfiles reads and validates a profiles YAML file. An empty path is
+// the empty catalogue; a path that does not exist is an error — the
+// operator named it, and quietly running with nothing (a typo in
+// --profiles used to soak with an empty catalogue and pass) hides the
+// mistake. LoadProfilesOrEmpty is for the editor that creates the file.
 func LoadProfiles(path string) (*Profiles, error) {
 	if path == "" {
 		return emptyProfiles(), nil
 	}
 	body, err := os.ReadFile(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return emptyProfiles(), nil
-	}
 	if err != nil {
 		return nil, fmt.Errorf("profiles: read %s: %w", path, err)
 	}
@@ -80,6 +81,16 @@ func LoadProfiles(path string) (*Profiles, error) {
 		p.Version = 1
 	}
 	return &p, nil
+}
+
+// LoadProfilesOrEmpty is LoadProfiles, except that a file which does not
+// exist yet is the empty catalogue. Only `profile add` uses it: it is
+// the command that creates the file.
+func LoadProfilesOrEmpty(path string) (*Profiles, error) {
+	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+		return emptyProfiles(), nil
+	}
+	return LoadProfiles(path)
 }
 
 func emptyProfiles() *Profiles {

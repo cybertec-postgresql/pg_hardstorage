@@ -119,6 +119,7 @@ func Stream(ctx context.Context, conn *pg.Conn, opts StreamOptions, sink Sink) (
 	}
 
 	pgc := conn.PgConn()
+	var ack ackTracker
 	if err := pglogrepl.StartReplication(ctx, pgc, opts.Slot, opts.StartLSN, pglogrepl.StartReplicationOptions{
 		Mode:       pglogrepl.LogicalReplication,
 		PluginArgs: opts.PluginArgs,
@@ -150,9 +151,10 @@ func Stream(ctx context.Context, conn *pg.Conn, opts StreamOptions, sink Sink) (
 			retErr = errors.Join(retErr, ferr)
 			return
 		}
+		ack.onFlushed()
 		sctx, scancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer scancel()
-		lsn := sink.SyncedLSN()
+		lsn := ack.ack(sink.SyncedLSN())
 		if serr := pglogrepl.SendStandbyStatusUpdate(sctx, pgc, pglogrepl.StandbyStatusUpdate{
 			WALWritePosition: lsn,
 			WALFlushPosition: lsn,
@@ -162,6 +164,10 @@ func Stream(ctx context.Context, conn *pg.Conn, opts StreamOptions, sink Sink) (
 		}
 	}()
 
+	// lastTraffic is the last time the server sent anything; it feeds the
+	// inactivity deadline below and the reply request in flushAndReport.
+	lastTraffic := time.Now()
+
 	// flushAndReport durably commits the sink's batch then reports the
 	// resulting SyncedLSN to PG. Called on the status-update cadence
 	// (and on reply-requested keepalives) so confirmed_flush_lsn
@@ -170,11 +176,21 @@ func Stream(ctx context.Context, conn *pg.Conn, opts StreamOptions, sink Sink) (
 		if err := sink.Flush(c); err != nil {
 			return fmt.Errorf("logicalreceiver: flush: %w", err)
 		}
-		lsn := sink.SyncedLSN()
+		ack.onFlushed()
+		lsn := ack.ack(sink.SyncedLSN())
+		// Ask for a reply once the stream has been quiet for half the
+		// inactivity window. A walsender whose client has confirmed
+		// everything it sent (ackTracker confirms keepalive positions on
+		// an idle publication) has nothing to say and stays silent, so
+		// without a solicited keepalive a healthy idle stream tripped the
+		// watchdog. A live server answers; a dead connection does not —
+		// which is what the watchdog is for.
+		ping := opts.InactivityTimeout > 0 && time.Since(lastTraffic) >= opts.InactivityTimeout/2
 		if err := pglogrepl.SendStandbyStatusUpdate(c, pgc, pglogrepl.StandbyStatusUpdate{
 			WALWritePosition: lsn,
 			WALFlushPosition: lsn,
 			WALApplyPosition: lsn,
+			ReplyRequested:   ping,
 		}); err != nil {
 			return fmt.Errorf("logicalreceiver: status update: %w", err)
 		}
@@ -209,7 +225,6 @@ func Stream(ctx context.Context, conn *pg.Conn, opts StreamOptions, sink Sink) (
 	// (callers then hung until their outer ctx died with a bare
 	// "context deadline exceeded" instead of the classified inactivity
 	// error the contract promises).
-	lastTraffic := time.Now()
 	inactivityDeadline := func() time.Time {
 		if opts.InactivityTimeout <= 0 {
 			return time.Time{} // no deadline; rely on ctx cancellation
@@ -240,6 +255,13 @@ func Stream(ctx context.Context, conn *pg.Conn, opts StreamOptions, sink Sink) (
 		inact := inactivityDeadline()
 		if !inact.IsZero() && inact.Before(waitUntil) {
 			waitUntil = inact
+		}
+		// Also wake at the half-window mark so the reply request goes out
+		// before the inactivity deadline, even with a long status cadence.
+		if !inact.IsZero() {
+			if pingAt := lastTraffic.Add(opts.InactivityTimeout / 2); pingAt.After(time.Now()) && pingAt.Before(waitUntil) {
+				waitUntil = pingAt
+			}
 		}
 		recvCtx, cancel := context.WithDeadline(ctx, waitUntil)
 		msg, err := pgc.ReceiveMessage(recvCtx)
@@ -315,11 +337,13 @@ func Stream(ctx context.Context, conn *pg.Conn, opts StreamOptions, sink Sink) (
 			if err := sink.OnRecord(ctx, rec); err != nil {
 				return fmt.Errorf("logicalreceiver: sink: %w", err)
 			}
+			ack.onRecord()
 		case pglogrepl.PrimaryKeepaliveMessageByteID:
 			pk, err := pglogrepl.ParsePrimaryKeepaliveMessage(cd[1:])
 			if err != nil {
 				return fmt.Errorf("logicalreceiver: parse keepalive: %w", err)
 			}
+			ack.onKeepalive(pk.ServerWALEnd)
 			if pk.ReplyRequested {
 				if err := flushAndReport(ctx); err != nil {
 					return err
@@ -332,6 +356,39 @@ func Stream(ctx context.Context, conn *pg.Conn, opts StreamOptions, sink Sink) (
 			// the consumer immediately.
 		}
 	}
+}
+
+// ackTracker decides what LSN to confirm to the walsender.
+//
+// The sink's SyncedLSN only moves when the sink RECEIVES data. On a
+// busy database whose publication is quiet, the walsender decodes and
+// discards everything and sends only keepalives — so SyncedLSN stood
+// still and the slot's confirmed_flush_lsn pinned WAL forever (pg_wal
+// fills). Like pg_recvlogical, when nothing is pending — every record
+// handed to the sink has been flushed — a keepalive's ServerWALEnd is
+// safe to confirm: any transaction committing later is past it and will
+// still be sent.
+type ackTracker struct {
+	pending int           // records handed to the sink since the last successful Flush
+	idle    pglogrepl.LSN // highest keepalive WAL end seen while nothing was pending
+}
+
+func (a *ackTracker) onRecord()  { a.pending++ }
+func (a *ackTracker) onFlushed() { a.pending = 0 }
+
+func (a *ackTracker) onKeepalive(walEnd pglogrepl.LSN) {
+	if a.pending == 0 && walEnd > a.idle {
+		a.idle = walEnd
+	}
+}
+
+// ack is the LSN to report: the sink's durable position, or the idle
+// keepalive position when that is further along.
+func (a *ackTracker) ack(synced pglogrepl.LSN) pglogrepl.LSN {
+	if a.idle > synced {
+		return a.idle
+	}
+	return synced
 }
 
 // finalCommit durably flushes the sink's last buffered batch on Stream's

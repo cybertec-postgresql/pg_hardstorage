@@ -199,25 +199,15 @@ func TestStream_EndToEnd_InsertsFlow(t *testing.T) {
 		t.Fatalf("connect stream: %v", err)
 	}
 	sink := &countingSink{}
-	// InactivityTimeout ends the stream once the backlog is drained
-	// and PG goes quiet — that is the test's normal terminator.
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-	err = logicalreceiver.Stream(ctx, streamConn, logicalreceiver.StreamOptions{
+	got := streamUntilDrained(t, streamConn, logicalreceiver.StreamOptions{
 		Slot:                 slot,
 		StartLSN:             0,
 		PluginArgs:           pubArgs(pub),
 		StatusUpdateInterval: time.Second,
-		InactivityTimeout:    6 * time.Second,
-	}, sink)
-	if err == nil {
-		t.Fatal("Stream should end via inactivity timeout, got nil")
-	}
-	if !errMentions(err, "inactivity timeout") {
-		t.Fatalf("Stream ended with %v, want an inactivity-timeout error", err)
-	}
-
-	got := sink.snapshot()
+		InactivityTimeout:    18 * time.Second,
+	}, sink, 6*time.Second)
 	if got.inserts != rows {
 		t.Errorf("decoded %d Insert messages, want %d (frames=%d begins=%d commits=%d relations=%d)",
 			got.inserts, rows, got.frames, got.begins, got.commits, got.relers)
@@ -393,29 +383,61 @@ func TestCreateLogicalSlot_Idempotent(t *testing.T) {
 // runStreamToIdle streams the slot into a fresh countingSink until the
 // inactivity timeout fires (the test terminator), then returns the
 // sink snapshot.
-func runStreamToIdle(t *testing.T, dsn, slot, pub string, inactivity time.Duration) sinkCounts {
+func runStreamToIdle(t *testing.T, dsn, slot, pub string, idle time.Duration) sinkCounts {
 	t.Helper()
 	streamConn, err := pg.Connect(context.Background(), dsn, pg.ModeReplication)
 	if err != nil {
 		t.Fatalf("connect stream: %v", err)
 	}
 	sink := &countingSink{}
-	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
-	defer cancel()
-	err = logicalreceiver.Stream(ctx, streamConn, logicalreceiver.StreamOptions{
+	got := streamUntilDrained(t, streamConn, logicalreceiver.StreamOptions{
 		Slot:                 slot,
 		PluginArgs:           pubArgs(pub),
 		StatusUpdateInterval: time.Second,
-		InactivityTimeout:    inactivity,
-	}, sink)
-	if err == nil || !errMentions(err, "inactivity timeout") {
-		t.Fatalf("Stream ended with %v, want inactivity-timeout error", err)
-	}
-	got := sink.snapshot()
+		// Stuck-connection watchdog only: a healthy stream answers the
+		// status updates Stream sends, so it never fires here.
+		InactivityTimeout: 3 * idle,
+	}, sink, idle)
 	if got.descLSNs {
 		t.Error("a frame's WALStart went backwards — receive order is not monotonic")
 	}
 	return got
+}
+
+// streamUntilDrained runs Stream until no new frame has reached the sink
+// for idle, lets one more status interval pass so the slot's
+// confirmed_flush_lsn is reported, then cancels and expects a clean
+// cancellation.
+//
+// "Drained" is judged on the DATA the sink received, not on protocol
+// traffic. The tests used to let the inactivity watchdog end the stream
+// — which only worked because a drained walsender used to go silent.
+// The watchdog is a stuck-connection detector: Stream solicits a
+// keepalive on a quiet stream, so a healthy idle stream never trips it
+// (TestStream_InactivityTimeout).
+func streamUntilDrained(t *testing.T, conn *pg.Conn, opts logicalreceiver.StreamOptions, sink *countingSink, idle time.Duration) sinkCounts {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	defer cancel()
+	errCh := make(chan error, 1)
+	go func() { errCh <- logicalreceiver.Stream(ctx, conn, opts, sink) }()
+	last, lastChange := -1, time.Now()
+	for time.Since(lastChange) < idle {
+		select {
+		case err := <-errCh:
+			t.Fatalf("Stream ended before the backlog drained: %v", err)
+		case <-time.After(200 * time.Millisecond):
+		}
+		if f := sink.snapshot().frames; f != last {
+			last, lastChange = f, time.Now()
+		}
+	}
+	time.Sleep(opts.StatusUpdateInterval + 500*time.Millisecond)
+	cancel()
+	if err := <-errCh; err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("Stream ended with %v, want a clean cancellation", err)
+	}
+	return sink.snapshot()
 }
 
 // TestStream_DMLVariety — INSERT / UPDATE / DELETE / TRUNCATE must all

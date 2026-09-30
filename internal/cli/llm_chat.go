@@ -174,6 +174,16 @@ func runLlmChat(cmd *cobra.Command, opts llmChatOptions) error {
 	// 4. Build tool registry.  When advise+execute is active,
 	//    gateState is non-nil and execute_command is registered;
 	//    in read-only mode, execute_command is absent.
+	//
+	//    The gate callbacks are bound before the registry copies
+	//    them into execute_command; they reach the session (built
+	//    below) through this variable.
+	var session *chat.Session
+	bindGateAudit(gateState, func(action string, body map[string]any) {
+		if session != nil {
+			session.Emit(action, body)
+		}
+	})
 	toolReg, runner, _ := buildLiveToolRegistry(gateState, cmd.Root())
 
 	// 4. Resolve privacy mode + endpoint for the session.  The
@@ -205,7 +215,7 @@ func runLlmChat(cmd *cobra.Command, opts llmChatOptions) error {
 	//    is `deployment add <name> --connection ... --repo ...`.
 	chatCmdTree := cmdtree.Walk(cmd.Root())
 	cmdCatalog := cmdtree.Catalog(chatCmdTree, 2)
-	session := &chat.Session{
+	session = &chat.Session{
 		Provider:        prov,
 		Tools:           toolReg,
 		Skill:           skill,
@@ -217,6 +227,10 @@ func runLlmChat(cmd *cobra.Command, opts llmChatOptions) error {
 	}
 	if gateState != nil {
 		session.PreviewLedger = gateState.preview
+		// The session feeds each operator prompt into the
+		// detector's topic set; without it every high-risk verb
+		// was off-topic and refused as severe.
+		session.Anomaly = gateState.anomaly
 	}
 	// 4a. Wire the audit-chain emitter when --audit-repo points
 	//     at a repo with a usable audit chain.  Failures degrade
@@ -359,15 +373,54 @@ func resolveExecMode(modeFlag string, skill *skills.Skill) (safety.ExecMode, *to
 		preview: &safety.PreviewState{},
 		// Fifth gate: anomaly-refusal.  We start with
 		// the default high-risk verb list and an empty topic
-		// set; the chat orchestrator updates RecentTopicTokens
-		// from each user prompt + assistant response so the
-		// detector knows what's on-topic.
+		// set; chat.Session.Ask merges each OPERATOR prompt
+		// into RecentTopicTokens (runLlmChat sets
+		// Session.Anomaly), so a verb is on-topic only once the
+		// operator raised it.
+		//
+		// DeploymentScope stays empty: chat has no single
+		// deployment to scope to, and the detector's
+		// "different deployment" heuristic treats every
+		// identifier-shaped positional (backup ids, "latest",
+		// repo verbs) as a deployment name, so a guessed scope
+		// would refuse ordinary commands.
 		anomaly: &safety.AnomalyDetector{
 			HighRiskVerbs:     safety.DefaultHighRiskVerbs,
 			RecentTopicTokens: map[string]struct{}{},
 		},
 	}
 	return safety.ModeAdviseExecute, state, nil
+}
+
+// bindGateAudit points execute_command's gate and anomaly callbacks
+// at emit, so every allow / refusal / anomaly verdict lands on the
+// session's audit trail and transcript (the safety stack's "audit on
+// every gate" promise).  A nil state (read-only mode) is a no-op.
+func bindGateAudit(state *toolGateState, emit func(action string, body map[string]any)) {
+	if state == nil {
+		return
+	}
+	state.auditCallback = func(d safety.GateDecision, command string) {
+		body := map[string]any{
+			"command": command,
+			"allowed": d.Allowed,
+		}
+		if d.Allowed {
+			body["matched_prefix"] = d.MatchedPrefix
+		} else {
+			body["gate"] = d.Reason
+			body["reason"] = safety.Reason(d)
+		}
+		emit("llm.execute_gate", body)
+	}
+	state.anomalyCallback = func(d safety.AnomalyDecision, command string) {
+		emit("llm.execute_anomaly", map[string]any{
+			"command": command,
+			"score":   d.Score.String(),
+			"reason":  d.Reason,
+			"verb":    d.Verb,
+		})
+	}
 }
 
 // streamChatTurn drives one user turn through the session.  We
@@ -510,6 +563,11 @@ func handleSlash(w io.Writer, session *chat.Session, line string) (bool, error) 
 		// Drop user / assistant history; keep the system message.
 		if len(session.History) > 0 {
 			session.History = session.History[:1]
+		}
+		// The anomaly detector's topics came from the dropped
+		// prompts; a cleared conversation starts off-topic again.
+		if session.Anomaly != nil {
+			session.Anomaly.RecentTopicTokens = map[string]struct{}{}
 		}
 		fmt.Fprintln(w, "  conversation cleared (system prompt preserved)")
 		return false, nil

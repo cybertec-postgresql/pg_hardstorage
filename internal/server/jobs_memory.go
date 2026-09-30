@@ -112,6 +112,11 @@ func (b *MemoryBackend) Claim(_ context.Context, opts ClaimOptions) (*Job, error
 		}
 	}
 
+	// Empty deployment set = manages nothing = claims nothing (see
+	// ClaimOptions.Deployments).
+	if len(opts.Deployments) == 0 {
+		return nil, ErrNoJobs
+	}
 	deploymentSet := map[string]struct{}{}
 	for _, d := range opts.Deployments {
 		deploymentSet[d] = struct{}{}
@@ -130,10 +135,8 @@ func (b *MemoryBackend) Claim(_ context.Context, opts ClaimOptions) (*Job, error
 		if j.State != JobQueued {
 			continue
 		}
-		if len(deploymentSet) > 0 {
-			if _, ok := deploymentSet[j.Deployment]; !ok {
-				continue
-			}
+		if _, ok := deploymentSet[j.Deployment]; !ok {
+			continue
 		}
 		if len(kindSet) > 0 {
 			if _, ok := kindSet[j.Kind]; !ok {
@@ -153,6 +156,17 @@ func (b *MemoryBackend) Claim(_ context.Context, opts ClaimOptions) (*Job, error
 	pick.UpdatedAt = now
 	pick.StartedAt = &now
 	return cloneJob(pick), nil
+}
+
+// CountByState implements JobBackend.
+func (b *MemoryBackend) CountByState(_ context.Context) (map[JobState]int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	out := map[JobState]int{}
+	for _, j := range b.jobs {
+		out[j.State]++
+	}
+	return out, nil
 }
 
 // AppendProgress implements JobBackend.

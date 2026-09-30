@@ -50,6 +50,10 @@ func TestAgentExecutor_ControlPlanePITR_ArmsRecovery(t *testing.T) {
 	verifier, _ := backup.LoadVerifier(pub)
 
 	res, err := runner.Take(ctx, runner.TakeOptions{
+		// Restorable backups: this fixture archives no WAL, so the backup
+		// must embed its own, or restore refuses it (preflight.backup_wal_missing)
+		// — such a data directory could never reach consistency.
+		IncludeWAL:   true,
 		PGConnString: srv.DSN, RepoURL: repoURL, Deployment: "db1",
 		Signer: signer, Verifier: verifier, Fast: true,
 	})
@@ -145,6 +149,7 @@ func TestAgentExecutor_ControlPlaneLatestWithTimeTarget_ResolvesEarlierSeed(t *t
 	take := func() *runner.Result {
 		t.Helper()
 		res, err := runner.Take(ctx, runner.TakeOptions{
+			IncludeWAL:   true,
 			PGConnString: srv.DSN, RepoURL: repoURL, Deployment: "db1",
 			Signer: signer, Verifier: verifier, Fast: true,
 		})

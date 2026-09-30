@@ -56,6 +56,14 @@ we ACK.**  Killing the agent for a long time will bloat
 no-gap guarantee.  See [the slot bloat
 runbook](../reference/runbooks/index.md) for the operator side.
 
+Logical streams ACK at **transaction commit boundaries** only: every
+CDC sink (chunked, webhook, s3events) confirms the end LSN of the
+last pgoutput commit message it has durably stored, never an LSN
+derived from a row's position and payload size. A batch that ends
+mid-transaction does not move the slot, so after a restart PostgreSQL
+re-sends that whole transaction — the already-stored part arrives a
+second time (at-least-once) — rather than skipping it.
+
 ---
 
 ## What flows where
@@ -118,7 +126,26 @@ A few things worth highlighting:
   from `replication.Stream` as a non-`context.Canceled` error.
   The streamer's retry loop sleeps with exponential backoff
   (1s → 30s by default), then re-runs preflight + IDENTIFY_SYSTEM
-  + `EnsureSlot` against the leader-aware DSN — `EnsureSlot`'s
+  + the source guards + `EnsureSlot` against the leader-aware
+  DSN.  The source guards run on **every** attempt, before
+  anything is written for the cluster reached: its
+  `system_identifier` must match both the deployment's archived
+  WAL and the cluster this process first streamed from (else
+  `preflight.system_identifier_changed` /
+  `wal.system_identifier_changed`, permanent), and
+  `wal_segment_size` is re-read from the server — never assumed —
+  and must match the archive (`preflight.wal_segment_size_changed`).
+  A PostgreSQL that is unreachable at startup therefore cannot
+  slip a different cluster, or a wrongly-sized archive, past the
+  checks once it comes up.  After a promotion, when nothing is
+  archived on the new timeline yet, the resume point is the previous
+  timeline's archived frontier — clamped to the start of the segment
+  holding the new timeline's fork point (from its captured
+  `.history`), because old-timeline WAL archived past the fork is
+  diverged history and the new timeline's own WAL there must still be
+  archived.  `wal audit` / `wal list --gaps-only` check the same
+  rule: a new timeline must be covered from its fork segment.
+  `EnsureSlot`'s
   Strategy A path finds a propagated slot, Strategy C recreates
   with `RESERVE_WAL`.  The start-LSN safety check then validates
   the resume position against the (possibly new) `restart_lsn`
@@ -152,9 +179,13 @@ Fatal findings (refuse to start streaming):
 - `wal_level.too_low` — physical replication needs `replica` or
   `logical`.
 - `max_replication_slots.zero` / `.full` — slot table has no room.
+  `.full` is only raised when the streamer must CREATE its slot; a
+  table that is full because the streamer's own slot already exists
+  is fine (it is reused on every restart).
 - `max_wal_senders.zero` / `.saturated` — wal-sender pool is full.
-- `role.no_replication` — the connecting role lacks the
-  `REPLICATION` attribute.
+- `role.no_replication` — the connecting role is neither a
+  superuser nor has the `REPLICATION` attribute (PostgreSQL admits
+  either).
 
 Warning findings (proceed with the warning attached to the
 start event):

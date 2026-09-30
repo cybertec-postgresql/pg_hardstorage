@@ -119,14 +119,31 @@ Every config field has an equivalent flag.  Precedence is
 # Use the config's defaults but override the repo just for one
 # backup (e.g. take an ad-hoc backup to a secondary store):
 pg_hardstorage backup prod --repo s3://emergency-backups/prod
-
-# Same, via env var:
-PG_HARDSTORAGE_REPO=s3://emergency-backups/prod pg_hardstorage backup prod
 ```
 
 `pg_hardstorage --config <path>` lets you point at a fully
 separate config file — useful for CI / migration scenarios where
-the production config shouldn't be touched.
+the production config shouldn't be touched.  The named file is
+read on its own (no `conf.d/` drop-ins) and **must exist**: a
+typo'd path fails with `config.load_failed` (exit 1)
+instead of silently running on an empty config.  Only the
+default location may be absent.  Editing commands
+(`deployment add`, `init`, `notify add`, …) may create the file
+`--config` names.
+
+## How editing commands write the file
+
+`deployment add/edit/remove`, `notify`, `schedule`, `slo`,
+`residency`, `classify set` and `init` edit **one** file: the
+`--config` file if given, otherwise the main
+`pg_hardstorage.yaml`.  They write that file's own content plus
+your change — never the merged view — so deployments and sinks
+from `conf.d/*.yaml` drop-ins or the `PG_HARDSTORAGE_CONFIG`
+environment variable (and any credentials in them) are not
+copied into it.  Changing or removing a deployment or sink that
+a drop-in or the environment variable defines is refused with
+`config.defined_elsewhere` (exit 1), naming the source to edit
+by hand.
 
 ## Where the sample is
 
