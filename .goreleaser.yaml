@@ -105,7 +105,7 @@ archives:
 #
 # Auth: the default GITHUB_TOKEN can only write the current repo, so the
 # push to the separate tap repo uses HOMEBREW_TAP_TOKEN (a fine-grained
-# PAT scoped to contents:write on homebrew-tap), passed through in
+# PAT scoped to contents:write + pull_requests:write on homebrew-tap), passed through in
 # .github/workflows/release.yml.
 homebrew_casks:
   - name: pg_hardstorage
@@ -127,6 +127,19 @@ homebrew_casks:
       owner: cybertec-postgresql
       name: homebrew-tap
       token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+      # The tap's `main` requires a reviewed PR (ruleset "Branch
+      # Protection and Review", added 2026-09-10), so a direct push is
+      # rejected with 409 — which failed v1.5.0's release after every
+      # asset had uploaded. Push the cask to a per-version branch and
+      # open a PR instead; merging it publishes the cask. The token
+      # therefore needs pull_requests:write as well as contents:write.
+      branch: "pg_hardstorage-{{ .Version }}"
+      pull_request:
+        enabled: true
+        base:
+          owner: cybertec-postgresql
+          name: homebrew-tap
+          branch: main
     # Commit author for the cask bump in the tap repo.
     commit_author:
       name: cybertec-postgresql
