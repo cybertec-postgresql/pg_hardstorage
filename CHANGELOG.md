@@ -456,6 +456,12 @@ keeps reading that version for at least 24 months after a successor lands.
   implements, and that some unit actually runs `wal stream` — the
   check that would have caught #56 when the docs were written.
 
+- **The scenario runner never removed its temp dirs.** Without
+  `--artefact-dir`, each run created `$TMPDIR/pg_hardstorage-testkit-*`
+  and left it behind, pass or fail. One release's scenario campaigns
+  left ~1,800 of them. A passing run now removes its own dir, unless the
+  scenario sets `on_success: keep`. A failing run keeps its dir for
+  triage, and an explicit `--artefact-dir` is never removed.
 - **Soak harness: a kernel refusing an impossible cgroup_squeeze limit was
   counted as `fault_apply_failed`** (#64). With swap disabled, the kernel
   cannot reclaim a PostgreSQL cell down to 32 MiB, so it sometimes refuses

@@ -140,6 +140,16 @@ func Run(ctx context.Context, sc *scenario.Scenario, opts RunOptions) (*Result, 
 		StartedAt: time.Now().UTC(),
 	}
 
+	// A temp dir the runner made itself is removed once the scenario
+	// passes (unless it says `on_success: keep`); a failure keeps it
+	// for triage. Nothing removed them before, and ~1,800 accumulated
+	// in $TMPDIR over a release's scenario campaigns. An explicit
+	// --artefact-dir is the caller's and is never removed. Declared
+	// first, so it runs after every topology/sink teardown.
+	if opts.ArtefactDir == "" {
+		defer func() { removeOwnedArtefactDir(artefactDir, res.Pass, sc.Cleanup.OnSuccess, opts.Out) }()
+	}
+
 	emit(opts.Out, "scenario.started", map[string]any{
 		"name":     sc.Name,
 		"tier":     sc.Tier,
@@ -467,6 +477,18 @@ func Run(ctx context.Context, sc *scenario.Scenario, opts RunOptions) (*Result, 
 	res.Pass = true
 	res.finish(opts.Out, artefactDir)
 	return res, nil
+}
+
+// removeOwnedArtefactDir removes a runner-created artefact dir after a
+// passing scenario, unless the scenario's cleanup says `on_success:
+// keep`. A failed scenario's dir is kept for triage.
+func removeOwnedArtefactDir(dir string, pass bool, onSuccess string, out io.Writer) {
+	if !pass || onSuccess == "keep" {
+		return
+	}
+	if err := os.RemoveAll(dir); err != nil {
+		emit(out, "artefacts.remove_failed", map[string]any{"dir": dir, "error": err.Error()})
+	}
 }
 
 func (r *Result) finish(out io.Writer, dir string) {
