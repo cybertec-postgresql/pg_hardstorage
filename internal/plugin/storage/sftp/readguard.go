@@ -131,10 +131,16 @@ func (g *guardedRead) Read(p []byte) (int, error) {
 		n, err := g.f.Read(p)
 		done <- res{n, err}
 	}()
+	// A NewTimer (not time.After) so the healthy path — the overwhelmingly
+	// common one, hit once per 32KB chunk by io.Copy on a WAL stream —
+	// releases the timer instead of leaving a live 60s timer in the
+	// runtime heap until it fires.
+	t := time.NewTimer(g.idle)
+	defer t.Stop()
 	select {
 	case rr := <-done:
 		return rr.n, rr.err
-	case <-time.After(g.idle):
+	case <-t.C:
 		g.once.Do(func() { g.p.idleTeardown(g.gen) })
 		return 0, errSFTPReadStalled
 	}
@@ -177,10 +183,12 @@ func (p *Plugin) idleRoundTrip(gen uint64, do func() error) error {
 	}
 	done := make(chan error, 1)
 	go func() { done <- do() }()
+	t := time.NewTimer(idle)
+	defer t.Stop()
 	select {
 	case err := <-done:
 		return err
-	case <-time.After(idle):
+	case <-t.C:
 		p.idleTeardown(gen)
 		return errSFTPReadStalled
 	}

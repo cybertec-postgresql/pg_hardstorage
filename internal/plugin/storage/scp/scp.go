@@ -809,10 +809,15 @@ func (s *sessionReader) guardedStdoutRead(p []byte) (int, error) {
 		n, err := s.stdout.Read(p)
 		done <- res{n, err}
 	}()
+	// A NewTimer (not time.After) so the healthy path — hit once per
+	// chunk by the Get's stdout drain — releases the timer instead of
+	// leaving a live readIdleTimeout timer in the heap until it fires.
+	t := time.NewTimer(s.idle)
+	defer t.Stop()
 	select {
 	case rr := <-done:
 		return rr.n, rr.err
-	case <-time.After(s.idle):
+	case <-t.C:
 		if s.p != nil {
 			s.stallOnce.Do(func() { s.p.transportTearDown(s.gen) })
 		}
