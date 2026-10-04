@@ -220,6 +220,13 @@ func (p *Plugin) guardedOpen(ctx context.Context, gen uint64, cli *sftp.Client, 
 		f, err := cli.Open(full)
 		done <- res{f, err}
 	}()
+	// A NewTimer (not time.After) so the healthy Open — the common path,
+	// hit once per Get — releases the timer the moment the round-trip wins
+	// instead of leaving a live readIdleTimeout timer in the heap. Same
+	// shape as guardedRead.Read / idleRoundTrip (the 4th guarded site; the
+	// other three were converted together, this one was missed).
+	t := time.NewTimer(idle)
+	defer t.Stop()
 	select {
 	case rr := <-done:
 		if rr.err != nil {
@@ -229,7 +236,7 @@ func (p *Plugin) guardedOpen(ctx context.Context, gen uint64, cli *sftp.Client, 
 			return nil, fmt.Errorf("sftp: open %s: %w", full, rr.err)
 		}
 		return p.guardRead(ctx, rr.f, gen, idle), nil
-	case <-time.After(idle):
+	case <-t.C:
 		p.idleTeardown(gen)
 		return nil, errSFTPReadStalled
 	}
