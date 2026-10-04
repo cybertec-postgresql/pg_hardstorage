@@ -27,6 +27,7 @@ package search
 import (
 	"context"
 	"fmt"
+	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -117,6 +118,9 @@ func newPredicate(key, val string) (Predicate, error) {
 		v, err := strconv.ParseUint(val, 10, 32)
 		if err != nil {
 			return nil, fmt.Errorf("search: timeline: %w", err)
+		}
+		if v > math.MaxInt32 {
+			return nil, fmt.Errorf("search: timeline %d out of range", v)
 		}
 		return eqInt{field: "timeline", want: int(v), get: func(m *backup.Manifest) int { return int(m.Timeline) }}, nil
 	case "since":
