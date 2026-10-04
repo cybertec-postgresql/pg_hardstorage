@@ -288,6 +288,7 @@ func runAgent(cmd *cobra.Command, dryRun bool, metricsListen string) error {
 		schedule.WithLastRunStore(lastRuns),
 		schedule.WithOnStart(func(name string, due time.Time) {
 			_ = d.Event(cmd.Context(), output.NewEvent(output.SeverityInfo, "agent", "task.started").
+				WithSubject(output.Subject{Deployment: taskDeployment(name)}).
 				WithBody(map[string]any{"task": name, "due_at": due.UTC().Format(time.RFC3339)}))
 		}),
 		schedule.WithOnFinish(func(name string, due time.Time, dur time.Duration, runErr error) {
@@ -300,7 +301,8 @@ func runAgent(cmd *cobra.Command, dryRun bool, metricsListen string) error {
 				sev = output.SeverityError
 				body["error"] = runErr.Error()
 			}
-			_ = d.Event(cmd.Context(), output.NewEvent(sev, "agent", "task.finished").WithBody(body))
+			_ = d.Event(cmd.Context(), output.NewEvent(sev, "agent", "task.finished").
+				WithSubject(output.Subject{Deployment: taskDeployment(name)}).WithBody(body))
 		}),
 	)
 
@@ -1452,4 +1454,14 @@ func archiveFrontierForLeader(ctx context.Context, sp storage.StoragePlugin, dep
 		return priorLSN, nil
 	}
 	return 0, nil
+}
+
+// taskDeployment returns the deployment a scheduled task belongs to.
+// Per-deployment tasks are named "<verb>:<deployment>" ("backup:prod");
+// a fleet-wide task has no deployment and gets "".
+func taskDeployment(task string) string {
+	if _, dep, ok := strings.Cut(task, ":"); ok {
+		return dep
+	}
+	return ""
 }

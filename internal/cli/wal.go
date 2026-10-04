@@ -1830,7 +1830,11 @@ func runWalStream(cmd *cobra.Command, opts walStreamOptions) error {
 		if !shouldEmitEvent(suppressEvents, e.Severity) {
 			return
 		}
-		_ = d.Event(streamCtx, e)
+		// Every event this stream emits concerns its deployment. Sinks
+		// render Subject.Deployment, so an alert without it (an email
+		// reading only "wal.stream/reconnecting") left an operator with
+		// several deployments unable to tell which one (issue #70).
+		_ = d.Event(streamCtx, stampDeployment(e, opts.deployment))
 	}
 
 	// 4. Per-attempt resume loop.  Each iteration re-runs
@@ -3378,4 +3382,13 @@ func splitBrainCode(err error) string {
 		return ""
 	}
 	return splitBrainRe.FindString(err.Error())
+}
+
+// stampDeployment sets the event's deployment when the emitter left it
+// empty. An event that already names one keeps it.
+func stampDeployment(e *output.Event, deployment string) *output.Event {
+	if e.Subject.Deployment == "" {
+		e.Subject.Deployment = deployment
+	}
+	return e
 }
