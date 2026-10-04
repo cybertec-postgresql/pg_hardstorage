@@ -9,6 +9,29 @@ on-disk and on-the-wire schema (backup manifests, configuration, output JSON,
 and the on-disk chunk envelope): an agent built against a given schema version
 keeps reading that version for at least 24 months after a successor lands.
 
+## [Unreleased]
+
+### Fixed
+
+- **`wal stream` could hold a Patroni demote indefinitely when the
+  streamer was not on the same host as PostgreSQL** (#69). While a
+  primary shuts down, its walsender trades keepalives with the streamer
+  until the streamer confirms a flush it cannot give (the shutdown
+  checkpoint lands in a partial segment). The issue #34 detector ends
+  the stream on that spin, but it required 200 keepalives within a
+  one-shot 2 s window. The spin runs at one keepalive per network round
+  trip, so across subnets it never reached the threshold, and the window
+  never reset. The streamer answered forever, and the demoting node
+  stayed in "demote in progress" until the streamer was restarted. The
+  window now slides (100 keepalives per 10 s), which detects round trips
+  up to ~100 ms. A healthy primary pings seconds apart and stays far
+  below.
+- **Alerts from `wal stream` and the agent's scheduled tasks named no
+  deployment** (#70). An email reading only `wal.stream/reconnecting`
+  gave no clue which deployment it was about. Every `wal stream` event
+  now carries its deployment, and `agent` `task.started`/`task.finished`
+  carry the task's deployment. Sinks already render it.
+
 ## [1.5.0] — 2026-09-30
 
 ### Added
