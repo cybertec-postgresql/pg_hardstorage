@@ -9,7 +9,12 @@ on-disk and on-the-wire schema (backup manifests, configuration, output JSON,
 and the on-disk chunk envelope): an agent built against a given schema version
 keeps reading that version for at least 24 months after a successor lands.
 
-## [Unreleased]
+## [1.5.1] — 2026-10-05
+
+A patch release. It fixes a streamer holding a Patroni demote over slow
+links (#69), alerts that did not name their deployment (#70), and the
+Homebrew cask publishing that failed for 1.5.0. Nothing on disk or on
+the wire changes; 1.5.0 repositories are used as-is.
 
 ### Fixed
 
@@ -41,6 +46,12 @@ keeps reading that version for at least 24 months after a successor lands.
   command to run once it is merged, instead of failing.
   `HOMEBREW_TAP_TOKEN` needs `pull_requests:write` in addition to
   `contents:write`.
+
+- **Two timeline conversions could wrap on out-of-range input.** A
+  parsed `uint32` timeline was narrowed to a signed 32-bit value without
+  a bound in `fleet search timeline:` and when starting replication.
+  No real cluster has 2^31 timelines; both now refuse such a value
+  instead of wrapping it (flagged by CodeQL).
 
 ## [1.5.0] — 2026-09-30
 
