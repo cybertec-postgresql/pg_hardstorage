@@ -9,6 +9,50 @@ on-disk and on-the-wire schema (backup manifests, configuration, output JSON,
 and the on-disk chunk envelope): an agent built against a given schema version
 keeps reading that version for at least 24 months after a successor lands.
 
+## [1.5.1] — 2026-10-05
+
+A patch release. It fixes a streamer holding a Patroni demote over slow
+links (#69), alerts that did not name their deployment (#70), and the
+Homebrew cask publishing that failed for 1.5.0. Nothing on disk or on
+the wire changes; 1.5.0 repositories are used as-is.
+
+### Fixed
+
+- **`wal stream` could hold a Patroni demote indefinitely when the
+  streamer was not on the same host as PostgreSQL** (#69). While a
+  primary shuts down, its walsender trades keepalives with the streamer
+  until the streamer confirms a flush it cannot give (the shutdown
+  checkpoint lands in a partial segment). The issue #34 detector ends
+  the stream on that spin, but it required 200 keepalives within a
+  one-shot 2 s window. The spin runs at one keepalive per network round
+  trip, so across subnets it never reached the threshold, and the window
+  never reset. The streamer answered forever, and the demoting node
+  stayed in "demote in progress" until the streamer was restarted. The
+  window now slides (100 keepalives per 10 s), which detects round trips
+  up to ~100 ms. A healthy primary pings seconds apart and stays far
+  below.
+- **Alerts from `wal stream` and the agent's scheduled tasks named no
+  deployment** (#70). An email reading only `wal.stream/reconnecting`
+  gave no clue which deployment it was about. Every `wal stream` event
+  now carries its deployment, and `agent` `task.started`/`task.finished`
+  carry the task's deployment. Sinks already render it.
+- **The Homebrew cask is published through a pull request.** The
+  `homebrew-tap` repository's `main` requires a reviewed PR, so
+  goreleaser's direct push was rejected (409). The v1.5.0 release run
+  failed after every asset had uploaded, and Homebrew stayed on 1.4.2
+  until the cask went in by hand. goreleaser now pushes the cask to a
+  `pg_hardstorage-<version>` branch and opens a PR. The release workflow's
+  Homebrew smoke test reports an open tap PR as a warning, with the
+  command to run once it is merged, instead of failing.
+  `HOMEBREW_TAP_TOKEN` needs `pull_requests:write` in addition to
+  `contents:write`.
+
+- **Two timeline conversions could wrap on out-of-range input.** A
+  parsed `uint32` timeline was narrowed to a signed 32-bit value without
+  a bound in `fleet search timeline:` and when starting replication.
+  No real cluster has 2^31 timelines; both now refuse such a value
+  instead of wrapping it (flagged by CodeQL).
+
 ## [1.5.0] — 2026-09-30
 
 ### Added
