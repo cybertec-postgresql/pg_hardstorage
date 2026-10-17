@@ -21,6 +21,10 @@
 //	              OSS, which refuses path-style outright. Set it
 //	              explicitly when the default does not suit the
 //	              backend.
+//	profile       AWS shared-config profile for this URL only
+//	credentials_env  env-var prefix PFX holding PFX_ACCESS_KEY_ID,
+//	              PFX_SECRET_ACCESS_KEY[, PFX_SESSION_TOKEN] for this
+//	              URL only (see Authentication below)
 //	storage_class default StorageClass for Put when none is set per-request.
 //	conditional_put "native" vouches that a custom ?endpoint= enforces
 //	              `If-None-Match: *` atomically (MinIO ≥ RELEASE.2024,
@@ -29,10 +33,16 @@
 //	              degrade loudly instead of trusting an unverified claim.
 //
 // Authentication is delegated to the AWS SDK v2 default credential
-// chain (env vars, IRSA, IAM role, profile, SSO). v0.1 does not
-// support inline credentials in the URL — operators wanting that
-// indirection set AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY in the
-// agent's environment.
+// chain (env vars, IRSA, IAM role, profile, SSO). Inline credentials in
+// the URL are not supported — operators set AWS_ACCESS_KEY_ID /
+// AWS_SECRET_ACCESS_KEY in the agent's environment. When one command
+// talks to two S3 endpoints that need different credentials (repo
+// replicate), name them per URL:
+//
+//	profile=NAME          AWS shared-config profile for this URL
+//	credentials_env=PFX   read PFX_ACCESS_KEY_ID, PFX_SECRET_ACCESS_KEY
+//	                      (and optional PFX_SESSION_TOKEN) from the
+//	                      environment; mutually exclusive with profile
 package s3
 
 import (
@@ -52,6 +62,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws/retry"
 	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
@@ -195,10 +206,37 @@ func (p *Plugin) Open(ctx context.Context, cfg storage.StorageConfig) error {
 	// what self-signed-cert testing surfaced.
 	httpClient := awshttp.NewBuildableClient().WithTimeout(DefaultHTTPTimeout)
 
+	// Per-URL credentials (issue #76): the default chain is process-wide,
+	// so two s3:// URLs in one command (repo replicate --from/--to) could
+	// not authenticate differently. profile= selects a shared-config
+	// profile; credentials_env=PREFIX reads PREFIX_ACCESS_KEY_ID,
+	// PREFIX_SECRET_ACCESS_KEY and PREFIX_SESSION_TOKEN. Names only —
+	// secrets never appear in the URL.
+	profile := q.Get("profile")
+	credsEnv := q.Get("credentials_env")
+	if profile != "" && credsEnv != "" {
+		return errors.New("s3: profile and credentials_env are mutually exclusive")
+	}
+	var envCreds aws.CredentialsProvider
+	if credsEnv != "" {
+		id, secret := os.Getenv(credsEnv+"_ACCESS_KEY_ID"), os.Getenv(credsEnv+"_SECRET_ACCESS_KEY")
+		if id == "" || secret == "" {
+			return fmt.Errorf("s3: credentials_env=%s: %s_ACCESS_KEY_ID and %s_SECRET_ACCESS_KEY must both be set",
+				credsEnv, credsEnv, credsEnv)
+		}
+		envCreds = credentials.NewStaticCredentialsProvider(id, secret, os.Getenv(credsEnv+"_SESSION_TOKEN"))
+	}
+
 	awsCfg, err := awsconfig.LoadDefaultConfig(ctx,
 		func(o *awsconfig.LoadOptions) error {
 			if region != "" {
 				o.Region = region
+			}
+			if profile != "" {
+				o.SharedConfigProfile = profile
+			}
+			if envCreds != nil {
+				o.Credentials = envCreds
 			}
 			o.HTTPClient = httpClient
 			return nil

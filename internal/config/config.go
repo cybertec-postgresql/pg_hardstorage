@@ -233,6 +233,10 @@ type DeploymentConfig struct {
 	// Schedule declares the recurring tasks for this deployment.
 	Schedule DeploymentSchedule `yaml:"schedule,omitempty"`
 
+	// Backup tunes the SCHEDULED backup, mirroring the `backup` flags
+	// an unattended agent has no way to pass (issue #75).
+	Backup BackupConfig `yaml:"backup,omitempty" json:"backup,omitempty"`
+
 	// Drill tunes the SCHEDULED recovery drill. The interactive
 	// `recovery drill` command takes the same settings as flags; this
 	// is how an unattended drill gets them, since nobody is at a
@@ -470,6 +474,20 @@ type DrillConfig struct {
 	// target. Default: the system temp dir. Useful when /tmp is too
 	// small for a real data directory.
 	TempBase string `yaml:"temp_base,omitempty" json:"temp_base,omitempty"`
+}
+
+// BackupConfig sets the options of the agent's scheduled backups — the
+// settings `pg_hardstorage backup` takes as flags.
+type BackupConfig struct {
+	// IncludeWAL is `backup --include-wal`: embed the WAL needed for a
+	// consistent restore in the backup itself. For deployments with no
+	// WAL streaming/archiving, where PITR is not needed.
+	IncludeWAL bool `yaml:"include_wal,omitempty" json:"include_wal,omitempty"`
+	// Fast is `backup --fast`: request an immediate checkpoint.
+	Fast bool `yaml:"fast,omitempty" json:"fast,omitempty"`
+	// Encrypt is `--encrypt` (true) / `--no-encrypt` (false). Unset
+	// keeps the auto-detect posture: encrypt when a KEK is available.
+	Encrypt *bool `yaml:"encrypt,omitempty" json:"encrypt,omitempty"`
 }
 
 // DeploymentSchedule lists per-task schedule specs.
@@ -1040,6 +1058,15 @@ func mergeDeployment(existing, overlay DeploymentConfig) DeploymentConfig {
 	}
 	if overlay.Schedule.Backup.Every != "" || overlay.Schedule.Backup.DailyAt != "" || overlay.Schedule.Backup.At != "" {
 		existing.Schedule.Backup = overlay.Schedule.Backup
+	}
+	if overlay.Backup.IncludeWAL {
+		existing.Backup.IncludeWAL = true
+	}
+	if overlay.Backup.Fast {
+		existing.Backup.Fast = true
+	}
+	if overlay.Backup.Encrypt != nil {
+		existing.Backup.Encrypt = overlay.Backup.Encrypt
 	}
 	if overlay.Schedule.Rotate.Every != "" || overlay.Schedule.Rotate.DailyAt != "" || overlay.Schedule.Rotate.At != "" {
 		existing.Schedule.Rotate = overlay.Schedule.Rotate

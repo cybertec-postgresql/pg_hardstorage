@@ -620,6 +620,8 @@ func buildBackupTask(name string, dep config.DeploymentConfig, kmsCfg config.KMS
 				KeyringDir: p.Keyring.Value,
 				KEKRef:     dep.KEKRef,
 				KMSConfig:  kmsCfg.ProviderConfig(dep.KEKRef),
+				Encrypt:    dep.Backup.Encrypt != nil && *dep.Backup.Encrypt,
+				NoEncrypt:  dep.Backup.Encrypt != nil && !*dep.Backup.Encrypt,
 			})
 			if eerr != nil {
 				return fmt.Errorf("agent backup %s: %w", name, eerr)
@@ -635,6 +637,8 @@ func buildBackupTask(name string, dep config.DeploymentConfig, kmsCfg config.KMS
 				Signer:       signer,
 				Verifier:     verifier,
 				Encryption:   enc,
+				IncludeWAL:   dep.Backup.IncludeWAL,
+				Fast:         dep.Backup.Fast,
 				// Honour allow_unenforceable_lease on the in-process
 				// schedule too, not just the control-plane executor
 				// (internal/agent/executor.go). The sidecar chart runs

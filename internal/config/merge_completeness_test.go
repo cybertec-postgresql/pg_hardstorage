@@ -16,6 +16,7 @@ import (
 // DeploymentConfig without a merge arm fails here instead of
 // silently disappearing in production.
 func TestMergeDeployment_CarriesEveryField(t *testing.T) {
+	encOn := true
 	base := DeploymentConfig{
 		PGConnection:   "postgres://base@h/db",
 		Repo:           "file:///base",
@@ -50,6 +51,7 @@ func TestMergeDeployment_CarriesEveryField(t *testing.T) {
 			Interval: "10s",
 		},
 		AllowUnenforceableLease: true,
+		Backup:                  BackupConfig{IncludeWAL: true, Fast: true, Encrypt: &encOn},
 	}
 
 	got := mergeDeployment(base, overlay)

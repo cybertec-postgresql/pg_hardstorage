@@ -9,6 +9,32 @@ on-disk and on-the-wire schema (backup manifests, configuration, output JSON,
 and the on-disk chunk envelope): an agent built against a given schema version
 keeps reading that version for at least 24 months after a successor lands.
 
+## [Unreleased]
+
+### Fixed
+
+- **`repo bundle export --include-wal` always refused** (#77). No backup
+  records `wal_required`, so the export had nothing to pull. It now
+  derives the segments each backup needs from its start and stop LSN,
+  fails if one is not archived, and carries each segment's chunks (the
+  bundle previously held only the segment manifests).
+- **`repo replicate` could not use different credentials for two `s3://`
+  URLs** (#76). `s3://` URLs accept `profile=NAME` and
+  `credentials_env=PREFIX` to authenticate one URL on its own.
+- **The sftp subsystem handshake had no deadline** (#73). A peer that
+  authenticated but never answered the SFTP version exchange hung the
+  first `Open` and every reconnect. It is now bounded like the other
+  data-plane reads.
+- **sftp/scp data-plane reads had no deadline** (#72). A wedged read on
+  a live connection hung forever; it now fails after 60 s of no progress
+  and the next operation reconnects. This is the likely cause of the
+  stalled `restore_command` in #71.
+
+### Added
+
+- **`backup:` block per deployment** (#75): `include_wal`, `fast` and
+  `encrypt` set the options of the agent's scheduled backups.
+
 ## [1.5.1] — 2026-10-05
 
 A patch release. It fixes a streamer holding a Patroni demote over slow
