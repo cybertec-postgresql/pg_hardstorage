@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -35,6 +36,30 @@ type execServer struct {
 	hostPub ssh.PublicKey
 	mu      sync.Mutex
 	cmds    []string
+
+	// Stress wedge: when wedgeSuffix is set, a `cat` of a path ending in it
+	// serves only the first wedgeChunk bytes, then parks (the data channel
+	// makes no progress) while the SSH control channel / keepalive stay
+	// live. Inert unless a test sets it; the parked write returns when the
+	// client disconnects. wedgeSuffix + wedgeChunk are guarded by mu.
+	wedgeSuffix string
+	wedgeChunk  int
+}
+
+// wedge returns the current wedge suffix + chunk (mu-guarded).
+func (s *execServer) wedge() (string, int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.wedgeSuffix, s.wedgeChunk
+}
+
+// setWedge arms or disarms the stress wedge (mu-guarded). An empty suffix
+// disarms it (normal exec for every command).
+func (s *execServer) setWedge(suffix string, chunk int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.wedgeSuffix = suffix
+	s.wedgeChunk = chunk
 }
 
 func (s *execServer) Commands() []string {
@@ -120,6 +145,9 @@ func (s *execServer) serveSession(ch ssh.Channel, reqs <-chan *ssh.Request) {
 			s.cmds = append(s.cmds, command)
 			s.mu.Unlock()
 			_ = req.Reply(true, nil)
+			if s.wedgeCat(ch, reqs, command) {
+				return
+			}
 			cmd = exec.Command("/bin/sh", "-c", command)
 			cmd.Stdin = ch
 			cmd.Stdout = ch
@@ -159,6 +187,60 @@ func (s *execServer) serveSession(ch ssh.Channel, reqs <-chan *ssh.Request) {
 			}
 		}
 	}
+}
+
+// wedgeCat handles a `cat` of a wedged path: it serves only the first
+// wedgeChunk bytes of the (locally existing) file, then parks — the data
+// channel makes no further progress (no more bytes, no EOF) while the SSH
+// control channel and keepalive stay live. It returns true (handling the
+// request) only when the stress wedge is armed for this command; otherwise
+// false (normal exec). The parked goroutine blocks on ch.Read, which returns
+// when the read guard tears the transport down (ch closes), releasing it.
+func (s *execServer) wedgeCat(ch ssh.Channel, reqs <-chan *ssh.Request, command string) bool {
+	wedge, wedgeChunk := s.wedge()
+	if wedge == "" {
+		return false
+	}
+	fields := strings.Fields(command)
+	if len(fields) != 2 || fields[0] != "cat" {
+		return false
+	}
+	arg := unshellQuote(fields[1])
+	if !strings.HasSuffix(arg, wedge) {
+		return false
+	}
+	data, err := os.ReadFile(arg)
+	if err != nil {
+		// Absent file: report nothing and close (the client's cat would exit
+		// non-zero; the stress scenarios always put the file first).
+		_ = ch.CloseWrite()
+		return true
+	}
+	chunk := wedgeChunk
+	if chunk <= 0 || chunk > len(data) {
+		chunk = len(data)
+	}
+	// Serve the first chunk, then park WITHOUT sending any more bytes or an
+	// EOF: the client's stdout Read then makes no progress. This goroutine is
+	// the per-session goroutine (NOT the mux/reqs loop), so parking here
+	// blocks only the server-side channel; the client's transport teardown
+	// (or process exit) ends it. It outlives the read guard's idle window,
+	// which is exactly what makes the client's read stall.
+	if _, werr := ch.Write(data[:chunk]); werr != nil {
+		return true
+	}
+	select {}
+}
+
+// unshellQuote strips one layer of shellQuote's single quotes ("'...'" with
+// the '\” escape) so the in-proc server can read the real path the plugin
+// passed to `cat`.
+func unshellQuote(s string) string {
+	if len(s) >= 2 && strings.HasPrefix(s, "'") && strings.HasSuffix(s, "'") {
+		s = s[1 : len(s)-1]
+		s = strings.ReplaceAll(s, `'\''`, "'")
+	}
+	return s
 }
 
 // dropProxy forwards until blackhole is set, then reads and discards.

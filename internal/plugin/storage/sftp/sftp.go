@@ -496,7 +496,7 @@ func (p *Plugin) atomicRename(cli *sftp.Client, src, dst string) error {
 
 // Get implements storage.StoragePlugin.
 func (p *Plugin) Get(ctx context.Context, key string) (io.ReadCloser, error) {
-	cli, cerr := p.conn()
+	cli, gen, _, cerr := p.connGen()
 	if cerr != nil {
 		return nil, cerr
 	}
@@ -507,19 +507,16 @@ func (p *Plugin) Get(ctx context.Context, key string) (io.ReadCloser, error) {
 	if err != nil {
 		return nil, err
 	}
-	f, err := cli.Open(full)
+	g, err := p.guardedOpen(ctx, gen, cli, full)
 	if err != nil {
-		if isNotExist(err) {
-			return nil, storage.ErrNotFound
-		}
-		return nil, fmt.Errorf("sftp: open %s: %w", full, err)
+		return nil, err
 	}
-	return f, nil
+	return g, nil
 }
 
 // Stat implements storage.StoragePlugin.
 func (p *Plugin) Stat(ctx context.Context, key string) (storage.ObjectInfo, error) {
-	cli, cerr := p.conn()
+	cli, gen, _, cerr := p.connGen()
 	if cerr != nil {
 		return storage.ObjectInfo{}, cerr
 	}
@@ -530,8 +527,12 @@ func (p *Plugin) Stat(ctx context.Context, key string) (storage.ObjectInfo, erro
 	if err != nil {
 		return storage.ObjectInfo{}, err
 	}
-	fi, err := cli.Stat(full)
-	if err != nil {
+	var fi os.FileInfo
+	if err := p.idleRoundTrip(gen, func() error {
+		var serr error
+		fi, serr = cli.Stat(full)
+		return serr
+	}); err != nil {
 		if isNotExist(err) {
 			return storage.ObjectInfo{}, storage.ErrNotFound
 		}
@@ -547,7 +548,7 @@ func (p *Plugin) Stat(ctx context.Context, key string) (storage.ObjectInfo, erro
 // List implements storage.StoragePlugin.  Walks the prefix
 // recursively (SFTP's Walk uses depth-first traversal).
 func (p *Plugin) List(ctx context.Context, prefix string) iter.Seq2[storage.ObjectInfo, error] {
-	cli, cerr := p.conn()
+	cli, gen, _, cerr := p.connGen()
 	if cerr != nil {
 		return func(yield func(storage.ObjectInfo, error) bool) {
 			yield(storage.ObjectInfo{}, cerr)
@@ -564,7 +565,20 @@ func (p *Plugin) List(ctx context.Context, prefix string) iter.Seq2[storage.Obje
 			return
 		}
 		walker := cli.Walk(full)
-		for walker.Step() {
+		for {
+			// Each Step is one READ round-trip; bound it so a wedged
+			// directory listing cannot hang the walk (the campaign's
+			// sftp-contract-quiet Stat/List stall shape).
+			next := false
+			if err := p.idleRoundTrip(gen, func() error {
+				next = walker.Step()
+				return nil
+			}); err != nil {
+				return
+			}
+			if !next {
+				break
+			}
 			if err := ctx.Err(); err != nil {
 				yield(storage.ObjectInfo{}, err)
 				return

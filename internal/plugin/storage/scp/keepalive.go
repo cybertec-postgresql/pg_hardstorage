@@ -116,6 +116,32 @@ func (p *Plugin) markDead(gen uint64) {
 	}
 }
 
+// transportTearDown closes the SSH transport of generation gen and
+// marks it dead. This is the read-guard's unblock lever: a stdout Read
+// parked in x/crypto/ssh's buffered channel reader is only released by
+// closing the transport (marking it dead alone would not wake it). A
+// stale call (gen no longer current) is a no-op so a late timeout from
+// an old generation never tears down a fresh re-dial.
+func (p *Plugin) transportTearDown(gen uint64) {
+	p.mu.Lock()
+	kaStop := p.kaStop
+	if p.closed || p.gen != gen {
+		p.mu.Unlock()
+		return
+	}
+	p.kaStop = nil
+	if p.ssh != nil {
+		_ = p.ssh.Close()
+		p.ssh = nil
+	}
+	p.dead = true
+	p.mu.Unlock()
+	// Retire the prober off the lock (its own teardown takes p.mu).
+	if kaStop != nil {
+		close(kaStop)
+	}
+}
+
 // conn hands back the live client, re-dialling (rate-limited) after
 // the connection was found dead. It also returns the generation so a
 // caller that finds the transport broken can mark exactly it dead.
