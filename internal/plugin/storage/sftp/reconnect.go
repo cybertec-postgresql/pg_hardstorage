@@ -26,24 +26,33 @@ import (
 	"github.com/pkg/sftp"
 )
 
+// conn is connGen for callers that do not need the generation or the
+// idle window.
 func (p *Plugin) conn() (*sftp.Client, error) {
+	cli, _, _, err := p.connGen()
+	return cli, err
+}
+
+// connGen returns the live client and its generation under the lock,
+// plus the current idle window. The generation is what the read-guard
+// teardown compares against, so it kills only the connection it is
+// reading on, never a fresher re-dial.
+func (p *Plugin) connGen() (*sftp.Client, uint64, time.Duration, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.closed || p.cfgssh == nil {
-		// Closed, or never opened: there is nothing to reconnect TO —
-		// Open is where dial parameters come from.
-		return nil, errClosed
+		return nil, 0, 0, errClosed
 	}
 	if p.client != nil && !p.dead {
-		return p.client, nil
+		return p.client, p.gen, readIdleTimeout, nil
 	}
 	if since := time.Since(p.lastRedial); since < redialMinInterval {
-		return nil, fmt.Errorf("sftp: connection lost %s ago; next reconnect attempt in %s",
+		return nil, 0, 0, fmt.Errorf("sftp: connection lost %s ago; next reconnect attempt in %s",
 			since.Round(time.Second), (redialMinInterval - since).Round(time.Second))
 	}
 	p.lastRedial = time.Now()
 	if err := p.dialLocked(); err != nil {
-		return nil, fmt.Errorf("sftp: reconnect: %w", err)
+		return nil, 0, 0, fmt.Errorf("sftp: reconnect: %w", err)
 	}
-	return p.client, nil
+	return p.client, p.gen, readIdleTimeout, nil
 }

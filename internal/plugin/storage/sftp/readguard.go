@@ -41,30 +41,6 @@ import (
 
 var errSFTPReadStalled = errors.New("sftp: read stalled: no progress for readIdleTimeout; tore down the connection, the next operation reconnects")
 
-// connGen returns the live client and its generation under the lock,
-// plus the current idle window. The generation is what the read-guard
-// teardown compares against, so it kills only the connection it is
-// reading on, never a fresher re-dial.
-func (p *Plugin) connGen() (*sftp.Client, uint64, time.Duration, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.closed || p.cfgssh == nil {
-		return nil, 0, 0, errClosed
-	}
-	if p.client != nil && !p.dead {
-		return p.client, p.gen, readIdleTimeout, nil
-	}
-	if since := time.Since(p.lastRedial); since < redialMinInterval {
-		return nil, 0, 0, fmt.Errorf("sftp: connection lost %s ago; next reconnect attempt in %s",
-			since.Round(time.Second), (redialMinInterval - since).Round(time.Second))
-	}
-	p.lastRedial = time.Now()
-	if err := p.dialLocked(); err != nil {
-		return nil, 0, 0, fmt.Errorf("sftp: reconnect: %w", err)
-	}
-	return p.client, p.gen, readIdleTimeout, nil
-}
-
 // idleTeardown closes the SSH transport of generation gen (the only
 // lever that unblocks a read parked in ssh's buffered reader) and marks
 // that generation dead. A stale call (gen no longer current) is a no-op.
