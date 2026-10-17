@@ -30,6 +30,10 @@ keeps reading that version for at least 24 months after a successor lands.
   and the next operation reconnects. This is the likely cause of the
   stalled `restore_command` in #71.
 
+### Changed
+
+- **Test fixtures:** the sftp and ssh-exec sink containers run with `RLIMIT_NOFILE` capped; an unbounded limit made sshd sessions spin and stalled the SFTP handshake on some Docker hosts.
+
 ### Added
 
 - **`backup:` block per deployment** (#75): `include_wal`, `fast` and
