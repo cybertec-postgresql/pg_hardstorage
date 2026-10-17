@@ -21,15 +21,41 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo/bundle"
 )
 
-func TestExport_IncludeWALRefusesWhenNoManifestDeclaresAny(t *testing.T) {
+// Backups record no wal_required (issue #77), so the export derives the
+// segments from the start..stop LSN range and carries them.
+func TestExport_IncludeWALDerivesSegmentsWhenManifestRecordsNone(t *testing.T) {
 	sp := newRepo(t)
-	// PRODUCTION shape: the backup runner sets WALRequired to nil. The
-	// package's own sampleManifest populates it, which is why this gap
-	// went unnoticed — the bundle tests exercise a manifest shape no
-	// backup this build writes.
+	m := sampleManifest(t, sp, "db1.full.20260501T120000Z")
+	m.WALRequired = nil // production shape; LSNs 0/3000028..0/30001A0 -> segment 3
+	commitManifest(t, sp, m)
+	walKey := "wal/db1/00000001/000000010000000000000003.json"
+	body := `{"schema":"pg_hardstorage.wal_segment.v1"}`
+	if _, err := sp.Put(context.Background(), walKey, strings.NewReader(body),
+		storage.PutOptions{ContentLength: int64(len(body))}); err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	bm, err := bundle.Export(context.Background(), sp, &buf, bundle.ExportOptions{
+		Deployment: "db1",
+		IncludeWAL: true,
+	})
+	if err != nil {
+		t.Fatalf("export --include-wal failed: %v", err)
+	}
+	if len(bm.WAL) != 1 || bm.WAL[0].Filename != "000000010000000000000003" {
+		t.Fatalf("WAL entries = %+v, want segment ...0003", bm.WAL)
+	}
+}
+
+// A segment the backup needs but the repository lacks must fail the
+// export: the bundle would be unrestorable.
+func TestExport_IncludeWALRefusesWhenSegmentNotArchived(t *testing.T) {
+	sp := newRepo(t)
 	m := sampleManifest(t, sp, "db1.full.20260501T120000Z")
 	m.WALRequired = nil
 	commitManifest(t, sp, m)
@@ -40,14 +66,11 @@ func TestExport_IncludeWALRefusesWhenNoManifestDeclaresAny(t *testing.T) {
 		IncludeWAL: true,
 	})
 	if err == nil {
-		t.Fatal("--include-wal produced a bundle with no WAL segments and reported success.\n\n" +
-			"The base backups it carries cannot be brought to a consistent state without " +
-			"the WAL between their start and stop LSN, so the bundle is unrestorable — and " +
-			"the operator finds out from the air-gapped copy.")
+		t.Fatal("--include-wal reported success with the required WAL missing")
 	}
-	for _, want := range []string{"wal_required", "--include-wal"} {
+	for _, want := range []string{"000000010000000000000003", "--include-wal"} {
 		if !strings.Contains(err.Error(), want) {
-			t.Errorf("refusal does not mention %q, so the operator cannot tell why:\n%v", want, err)
+			t.Errorf("refusal does not mention %q:\n%v", want, err)
 		}
 	}
 }
