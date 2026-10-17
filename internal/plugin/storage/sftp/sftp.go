@@ -252,7 +252,7 @@ func (p *Plugin) dialLocked() error {
 		return fmt.Errorf("sftp: dial %s: %w", p.host, err)
 	}
 	conn := ssh.NewClient(sc, chans, reqs)
-	cli, err := sftp.NewClient(conn)
+	cli, err := newClientBounded(conn, readIdleTimeout)
 	if err != nil {
 		_ = conn.Close()
 		return fmt.Errorf("sftp: open client: %w", err)

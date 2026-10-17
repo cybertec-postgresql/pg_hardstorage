@@ -34,6 +34,7 @@ import (
 	"time"
 
 	"github.com/pkg/sftp"
+	"golang.org/x/crypto/ssh"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
 )
@@ -238,6 +239,46 @@ func (p *Plugin) guardedOpen(ctx context.Context, gen uint64, cli *sftp.Client, 
 		return p.guardRead(ctx, rr.f, gen, idle), nil
 	case <-t.C:
 		p.idleTeardown(gen)
+		return nil, errSFTPReadStalled
+	}
+}
+
+// newClientBounded runs the SFTP subsystem handshake (sftp.NewClient →
+// recvVersion) under the same no-progress bound as the data-plane reads.
+// The handshake happens after the SSH transport is up, so the dial
+// timeout does not reach it, and the keepalive is armed only once it
+// succeeds: a peer that authenticates but stalls the subsystem would hang
+// every Open and reconnect forever (issue #73).
+//
+// The handshake runs on a connection not yet installed as a generation,
+// so a stall needs no generation teardown: the caller closes conn, which
+// releases the parked goroutine, and returns the error.
+func newClientBounded(conn *ssh.Client, idle time.Duration) (*sftp.Client, error) {
+	if idle <= 0 {
+		return sftp.NewClient(conn)
+	}
+	type res struct {
+		c   *sftp.Client
+		err error
+	}
+	done := make(chan res, 1)
+	go func() {
+		c, err := sftp.NewClient(conn)
+		done <- res{c, err}
+	}()
+	t := time.NewTimer(idle)
+	defer t.Stop()
+	select {
+	case r := <-done:
+		return r.c, r.err
+	case <-t.C:
+		// The goroutine may still return a client after the caller
+		// closes conn; reap it so it is not leaked.
+		go func() {
+			if r := <-done; r.c != nil {
+				_ = r.c.Close()
+			}
+		}()
 		return nil, errSFTPReadStalled
 	}
 }
