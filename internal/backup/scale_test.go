@@ -7,10 +7,12 @@ import (
 	"os"
 	"runtime"
 	"strconv"
+	"syscall"
 	"testing"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/spill"
 )
 
 // TestScale_SpoolCommitStreamVerify proves the whole large-manifest path
@@ -28,12 +30,28 @@ func TestScale_SpoolCommitStreamVerify(t *testing.T) {
 		n, _ = strconv.Atoi(v)
 	}
 	const chunksPerFile = 16384 // one 1 GiB relation segment
+
+	// Disk guard: this test writes ~3 copies of a manifest of ~235 bytes per
+	// chunk reference (entry spool, canonical copy, the committed primary;
+	// no replica). Refuse to start if that would take more than a fifth of
+	// the free space, so it can never fill the disk.
+	{
+		var st syscall.Statfs_t
+		if err := syscall.Statfs(os.TempDir(), &st); err == nil {
+			free := int64(st.Bavail) * int64(st.Bsize)
+			need := int64(n) * 235 * 3
+			t.Logf("disk: need ~%d GiB, free %d GiB", need>>30, free>>30)
+			if need > free/5 {
+				t.Skipf("would need %d GiB of %d GiB free (> 20%%); lower PGHS_SCALE_CHUNKS", need>>30, free>>30)
+			}
+		}
+	}
 	files := (n + chunksPerFile - 1) / chunksPerFile
 
 	priv, pub, _ := backup.GenerateKeypair(rand.Reader)
 	signer, _ := backup.LoadSigner(priv)
 	verifier, _ := backup.LoadVerifier(pub)
-	store, _ := storeAt(t)
+	store, sp := storeAt(t)
 	ctx := context.Background()
 
 	var peak uint64
@@ -76,7 +94,7 @@ func TestScale_SpoolCommitStreamVerify(t *testing.T) {
 	}
 	h := validManifest()
 	h.Files = nil
-	if err := store.CommitSpooled(ctx, h, spool, signer, backup.CommitOptions{}); err != nil {
+	if err := store.CommitSpooled(ctx, h, spool, signer, backup.CommitOptions{SkipReplica: true}); err != nil {
 		t.Fatalf("CommitSpooled: %v", err)
 	}
 	sample()
@@ -104,8 +122,23 @@ func TestScale_SpoolCommitStreamVerify(t *testing.T) {
 		t.Fatalf("streamed Validate: %v", err)
 	}
 	sample()
+	// GC's mark phase over the same manifest: streamed, spilled, exact.
+	gcRefs, err := repo.CollectReferencesWithOptions(ctx, sp, repo.CollectReferencesOptions{
+		RefSpill: spill.Options{MemEntries: 500_000, Dir: t.TempDir()},
+	})
+	if err != nil {
+		t.Fatalf("CollectReferences: %v", err)
+	}
+	defer gcRefs.Close()
+	if got := gcRefs.Len(); got != n {
+		t.Fatalf("GC reference set has %d distinct chunks, want %d", got, n)
+	}
+	sample()
 	t.Logf("%d chunk refs in %d files: peak heap %d MiB", n, files, peak>>20)
-	if limit := uint64(256 << 20); peak > limit {
+	// Not constant: each live distinct-chunk set keeps a Bloom filter in
+	// memory (~1.25 bytes per chunk) and the test holds two (the spool's and
+	// GC's), plus capped hash buffers. Bound = fixed 128 MiB + 10 B/chunk.
+	if limit := uint64(128<<20) + uint64(n)*10; peak > limit {
 		t.Errorf("peak heap %d MiB over the %d MiB bound", peak>>20, limit>>20)
 	}
 }
