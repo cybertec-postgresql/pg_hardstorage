@@ -39,6 +39,7 @@ pg_hardstorage backup <deployment> [flags]
 ```
       --allow-concurrent                   skip the per-deployment backup lease and allow a second backup of the same deployment to run concurrently (doubles load on the source)
       --capacity-safety-factor float       safety multiplier for the capacity pre-flight (default 1.1 = 110% of projected); ignored under --ignore-capacity (default 1.1)
+      --chunk-size string                  average chunk size (e.g. 256KiB, 1MiB; 16KiB..16MiB, default 64KiB). Larger chunks mean far fewer chunk objects and manifest entries for very large databases, at the cost of coarser dedup; boundaries differ per size, so keep one value per deployment
       --control-plane string               control-plane base URL — when set, the command is dispatched there instead of running locally
       --control-plane-ca string            PEM file pinning the control plane's TLS server certificate
       --control-plane-client-cert string   client certificate for mTLS to the control plane

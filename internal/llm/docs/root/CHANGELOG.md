@@ -9,6 +9,56 @@ on-disk and on-the-wire schema (backup manifests, configuration, output JSON,
 and the on-disk chunk envelope): an agent built against a given schema version
 keeps reading that version for at least 24 months after a successor lands.
 
+## [Unreleased]
+
+### Fixed
+
+- **Backups of very large databases no longer hit the 1 GiB manifest
+  ceiling.** A manifest is ~115 bytes per chunk, so a 200 TB database
+  (about 3.3 billion chunks at the default 64 KiB average) is a ~380 GB
+  document; every reader capped manifests at 1 GiB and loaded them whole,
+  which stopped working near 0.6 TB. No on-disk format change: the same
+  manifests are written and read, and existing repositories are untouched.
+  - Backups spool file entries to disk as the tar stream is chunked and
+    sign a memory-mapped canonical copy (`CommitSpooled`, byte-identical
+    to `Commit`). Restore, `restore --preview`, `verify`, `list`, `show`,
+    `integrity`, `repo check`/`scrub`/`repair`, `partial`, `backup
+    compare`, `backup graph`, `capacity`, `cost`, `forecast`, `anomaly`
+    and `recovery` walk manifests as streams (`ReadAuto`/`ListAuto`); a
+    manifest under 64 MiB still takes the old single-read path.
+  - `repo gc` marks references with a disk-spilling exact set and streams
+    the manifests; `repo replicate` and `replicate verify` stream large
+    manifests and copy them as streams.
+  - Dedup hints are a Bloom filter, the encryption-key reuse probe reads
+    only the manifest head (it used to fail past 1 GiB, silently turning
+    off dedup for encrypted repositories), and the adopted-chunk set that
+    the commit gate and the GC fence walk is no longer a map.
+  - The S3 plugin uploads objects over 64 MiB as multipart (a single PUT
+    is capped at 5 GiB), keeping `If-None-Match` on completion.
+  - Memory is bounded by the spill budgets (`spill.DefaultMemEntries`),
+    not by database size: a 6M-reference (1.4 GB) manifest is committed,
+    verified and walked at a 52 MiB heap peak.
+
+### Added
+
+- **`backup --chunk-size`** sets the average chunk size (16 KiB–16 MiB,
+  default 64 KiB). A 1 MiB average cuts a 200 TB database from ~3.3
+  billion chunks to ~210 million. Boundaries change with the size, so
+  keep one value per deployment.
+- `backup.TakeOptions.SpoolDir`: where the manifest spool lives (needs
+  free space of about the manifest size, twice while signing).
+
+### Known limits
+
+- Signing and verifying need the whole canonical manifest as one buffer
+  (Ed25519 is not streamable); it is memory-mapped, so it costs disk and
+  page cache, not heap — and a platform without `mmap` (Windows) must
+  hold it in RAM.
+- Every verified read of a huge manifest is a full pass over it (hours at
+  200 TB); there is no per-file index.
+- `kms rotate`, `backup bundle` and `repair attestation` still load whole
+  manifests and refuse ones over 1 GiB.
+
 ## [1.5.0] — 2026-09-30
 
 ### Added

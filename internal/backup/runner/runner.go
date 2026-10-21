@@ -26,6 +26,7 @@ import (
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/audit"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup/chunker"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup/tarsink"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/kms"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/obs/metrics"
@@ -38,6 +39,7 @@ import (
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo/casdefault"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/spill"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/wal/gapstate"
 )
 
@@ -169,6 +171,16 @@ type TakeOptions struct {
 	// savings) without waiting for manifest commit.  Callbacks
 	// must NOT block; they back-pressure the basebackup pipe.
 	OnFile func(tarsink.FileStats)
+
+	// ChunkAvgSize, when > 0, sets the content-defined chunker's average
+	// chunk size in bytes (minimum = avg/16, maximum = avg*4; the default
+	// is 64 KiB). Larger chunks mean proportionally fewer chunk objects,
+	// manifest entries and dedup hashes — a 1 MiB average cuts a 200 TB
+	// database from ~3.3 billion chunks to ~210 million — at the cost of
+	// coarser dedup. Chunk boundaries change with the size, so a backup
+	// taken with a different size shares few chunks with earlier ones:
+	// pick one value per deployment and keep it.
+	ChunkAvgSize int
 
 	// SpoolDir is where the backup's file-entry spool and canonical
 	// manifest are written while it runs (empty = os.TempDir()). The
@@ -539,6 +551,10 @@ func take(ctx context.Context, opts TakeOptions, abortCtx *context.Context) (*Re
 		casdefault.WithCompressionLevel(repoMeta.Compression),
 		casdefault.WithChunkDurability(storage.DurabilityDeferred),
 		casdefault.WithDedupHintFilter(hints),
+		// A re-backup of a big database adopts (deduplicates against)
+		// billions of chunks; the set that the commit gate and the GC
+		// fence walk must not be a map of them.
+		casdefault.WithSpilledAdoption(spill.Options{Dir: opts.SpoolDir}),
 	}
 	cas := casdefault.NewWithRetention(sp, repoMeta.WORM, wormNow, casOpts...)
 	var encryptionInfo *backup.EncryptionInfo
@@ -610,6 +626,7 @@ func take(ctx context.Context, opts TakeOptions, abortCtx *context.Context) (*Re
 			EnvelopeVersion: 2,
 		}
 	}
+	defer func() { _ = cas.CloseAdopted() }()
 	manifestStore := backup.NewManifestStore(sp)
 
 	// The manifest's file entries are spooled to disk as the tar stream
@@ -712,6 +729,12 @@ func take(ctx context.Context, opts TakeOptions, abortCtx *context.Context) (*Re
 		sinkOpts = append(sinkOpts, tarsink.WithFileObserver(opts.OnFile))
 	}
 	sinkOpts = append(sinkOpts, tarsink.WithEntryHandler(addEntry))
+	if opts.ChunkAvgSize > 0 {
+		avg := opts.ChunkAvgSize
+		sinkOpts = append(sinkOpts, tarsink.WithChunkerFactory(func() *chunker.Chunker {
+			return chunker.NewWithParams(avg/16, avg, avg*4)
+		}))
+	}
 	sink := tarsink.New(ctx, cas, sinkOpts...)
 	backupTypeLabel = string(backupType)
 	started = true
@@ -945,7 +968,7 @@ func take(ctx context.Context, opts TakeOptions, abortCtx *context.Context) (*Re
 	// that for real: it pins the adopted chunks against a running gc and
 	// waits out its in-flight delete batch before the Stat, and checks
 	// afterwards that no gc run could have swept them mid-commit.
-	fence, err := repo.BeginCommitFence(ctx, sp, cas.AdoptedHashes(),
+	fence, err := repo.BeginCommitFenceSource(ctx, sp, cas.AdoptedSource(),
 		repo.FenceOptions{Owner: "backup " + opts.Deployment + "/" + backupID})
 	if err != nil {
 		span.SetStatus(codes.Error, err.Error())
@@ -961,7 +984,7 @@ func take(ctx context.Context, opts TakeOptions, abortCtx *context.Context) (*Re
 			WithSubject(output.Subject{Deployment: opts.Deployment, BackupID: backupID}).
 			WithBody(map[string]any{
 				"unchecked": unchecked,
-				"adopted":   len(cas.AdoptedHashes()),
+				"adopted":   cas.AdoptedLen(),
 				"reason": "the dedup-vs-GC gate could not confirm every chunk this backup " +
 					"deduplicated against; those Stats failed for a reason other than not-found. " +
 					"The backup committed anyway (refusing would trade a possible gap for a certain " +
@@ -1095,6 +1118,10 @@ func validateOptions(o *TakeOptions) error {
 	if o.Deployment == "" {
 		return output.NewError("usage.missing_deployment",
 			"backup: Deployment is required").Wrap(output.ErrUsage)
+	}
+	if o.ChunkAvgSize != 0 && (o.ChunkAvgSize < 16<<10 || o.ChunkAvgSize > 16<<20) {
+		return output.NewError("usage.invalid_chunk_size",
+			fmt.Sprintf("backup: ChunkAvgSize %d is outside 16 KiB..16 MiB", o.ChunkAvgSize)).Wrap(output.ErrUsage)
 	}
 	// The deployment is interpolated into storage keys
 	// (manifests/<dep>/backups/..., wal/<dep>/...) and the backup ID.
@@ -1364,23 +1391,29 @@ const statVerifyConcurrency = 32
 // operations, not database ones.
 
 func verifyAdoptedChunks(ctx context.Context, sp storage.StoragePlugin, cas *repo.CAS) (int, error) {
-	adopted := cas.AdoptedHashes()
-	if len(adopted) == 0 {
+	if cas.AdoptedLen() == 0 {
 		return 0, nil
+	}
+	if err := cas.AdoptedErr(); err != nil {
+		// A spilled adoption set that lost a write would make this gate
+		// check fewer chunks than were adopted.
+		return 0, fmt.Errorf("backup: adoption set unreliable: %w", err)
 	}
 	var (
 		mu        sync.Mutex
-		missing   []string
+		missing   []string // first few, for the message
+		nMissing  int
 		unchecked int
 	)
 	// The Stats fan out: the gate reads nothing this run wrote, so
 	// the only shared state is the missing-list append. The bounded
 	// errgroup keeps in-flight work at O(statVerifyConcurrency). A
 	// worker fails the group ONLY on ctx cancellation — a Stat error
-	// is never a group error:
+	// is never a group error. The adoption set is walked, not
+	// materialised: it can be billions of hashes.
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(statVerifyConcurrency)
-	for _, h := range adopted {
+	_ = cas.ForEachAdopted(func(h repo.Hash) error {
 		g.Go(func() error {
 			if err := ctx.Err(); err != nil {
 				return err
@@ -1388,7 +1421,10 @@ func verifyAdoptedChunks(ctx context.Context, sp storage.StoragePlugin, cas *rep
 			if _, err := sp.Stat(gctx, repo.ChunkKey(h)); err != nil {
 				if errors.Is(err, storage.ErrNotFound) {
 					mu.Lock()
-					missing = append(missing, h.String())
+					nMissing++
+					if len(missing) < 8 {
+						missing = append(missing, h.String())
+					}
 					mu.Unlock()
 					return nil
 				}
@@ -1409,13 +1445,14 @@ func verifyAdoptedChunks(ctx context.Context, sp storage.StoragePlugin, cas *rep
 			}
 			return nil
 		})
-	}
+		return ctx.Err()
+	})
 	if err := g.Wait(); err != nil {
 		return unchecked, err
 	}
-	if len(missing) > 0 {
-		if len(missing) > 8 {
-			missing = append(missing[:8], fmt.Sprintf("… and %d more", len(missing)-8))
+	if nMissing > 0 {
+		if nMissing > 8 {
+			missing = append(missing, fmt.Sprintf("… and %d more", nMissing-8))
 		}
 		return unchecked, fmt.Errorf("backup: %d chunk(s) this backup deduplicated against were deleted "+
 			"before the manifest could commit (a concurrent `repo gc --apply` swept them as "+
@@ -1423,7 +1460,7 @@ func verifyAdoptedChunks(ctx context.Context, sp storage.StoragePlugin, cas *rep
 			"Re-run the backup: the retry writes these chunks fresh, and the new mtime puts "+
 			"them under gc's --min-chunk-age protection. Schedule gc away from backup "+
 			"windows, or rely on its live-lease refusal by not disabling leases",
-			len(missing), strings.Join(missing, ", "))
+			nMissing, strings.Join(missing, ", "))
 	}
 	return unchecked, nil
 }

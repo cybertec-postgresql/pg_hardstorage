@@ -200,6 +200,7 @@ nav:
           - "Verify: fast vs full": how-to/operating/verify-fast-vs-full.md
           - Scrub and heal: how-to/operating/scrub-and-heal.md
           - Replication-slot disk safety: how-to/operating/slot-disk-safety.md
+          - Very large databases: how-to/operating/very-large-databases.md
           - Rotate KEK: how-to/operating/rotate-kek.md
           - Crypto-shred: how-to/operating/crypto-shred.md
           - Legal hold: how-to/operating/legal-hold.md

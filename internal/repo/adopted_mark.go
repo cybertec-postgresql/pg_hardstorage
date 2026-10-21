@@ -8,5 +8,10 @@ package repo
 // these before publishing a manifest). Own file so the mutation
 // harness can swap in the pre-c31688b no-op.
 func (c *CAS) markAdopted(h Hash) {
+	if c.adoptedSpill != nil {
+		c.adoptedGone.Delete(h)
+		c.adoptedSpill.Add(h)
+		return
+	}
 	c.adopted.Store(h, struct{}{})
 }

@@ -37,7 +37,9 @@ func replicateManifestStreamed(ctx context.Context, src, dst storage.StoragePlug
 	seen := spill.NewHashSet(spill.Options{})
 	defer seen.Close()
 	chunksOK := true
-	var adopted []Hash
+	adoptedSet := spill.NewHashSet(spill.Options{})
+	defer adoptedSet.Close()
+	adopted := spillSource{adoptedSet}
 	err = streamBackupChunkRefs(rc, func(hex string) error {
 		h, perr := parseHexHash(hex)
 		if perr != nil {
@@ -53,7 +55,7 @@ func replicateManifestStreamed(ctx context.Context, src, dst storage.StoragePlug
 		case chunkFailed:
 			chunksOK = false
 		case chunkAdopted:
-			adopted = append(adopted, h)
+			adoptedSet.Add(h)
 		}
 		return nil
 	})
@@ -63,6 +65,11 @@ func replicateManifestStreamed(ctx context.Context, src, dst storage.StoragePlug
 	}
 	if err != nil {
 		recordReplicateFailure(res, key, fmt.Errorf("decode manifest: %w", err))
+		res.ManifestsFailed++
+		return
+	}
+	if err := adoptedSet.Err(); err != nil {
+		recordReplicateFailure(res, key, fmt.Errorf("adopted-chunk set: %w", err))
 		res.ManifestsFailed++
 		return
 	}
@@ -193,4 +200,12 @@ func objectsEqual(ctx context.Context, a, b storage.StoragePlugin, key string) (
 			return endA && endB, nil
 		}
 	}
+}
+
+// spillSource adapts a spill.HashSet to HashSource.
+type spillSource struct{ s *spill.HashSet }
+
+func (a spillSource) Len() int { return a.s.Len() }
+func (a spillSource) ForEachHash(fn func(Hash) error) error {
+	return a.s.ForEach(func(k spill.Key) error { return fn(Hash(k)) })
 }

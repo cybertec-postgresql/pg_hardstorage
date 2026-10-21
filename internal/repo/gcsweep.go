@@ -355,6 +355,7 @@ func Sweep(ctx context.Context, sp storage.StoragePlugin, opts SweepOptions) (*S
 		conc = 16
 	}
 	pins := newGCPinSet()
+	defer pins.close()
 	var mu sync.Mutex
 	for b, lo := 0, 0; lo < len(orphans); b, lo = b+1, lo+batchSize {
 		hi := min(lo+batchSize, len(orphans))
@@ -367,6 +368,9 @@ func Sweep(ctx context.Context, sp storage.StoragePlugin, opts SweepOptions) (*S
 		}
 		if err := pins.refresh(ctx, sp, clock()); err != nil {
 			return res, fmt.Errorf("repo: gc: read writer pins: %w", err)
+		}
+		if err := pins.err(); err != nil {
+			return res, fmt.Errorf("repo: gc: writer pin set unreliable: %w", err)
 		}
 		if opts.LiveLeases != nil {
 			live, err := opts.LiveLeases(ctx)
