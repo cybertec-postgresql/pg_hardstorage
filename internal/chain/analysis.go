@@ -2,7 +2,10 @@
 package chain
 
 import (
-	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo"
+	"context"
+
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/spill"
 )
 
 // ChainMetrics records the per-node chunk-overlap analysis. It
@@ -99,41 +102,69 @@ type ChainSummary struct {
 // AND fills the per-chain summaries. Walks each chain top-down,
 // extending an "ancestor chunks" set at every step.
 //
-// Memory: O(total distinct chunks across each chain). For chains
-// with millions of chunks this can dominate; the BuildGraph caller
-// can opt out via Options.SkipAnalysis.
+// Memory: bounded. A node's distinct chunks go into a spill.HashSet (heap
+// capped, the rest on disk) that lives only while its subtree is being
+// analysed, so at any moment the sets held are those of the current
+// root-to-node path — not one per backup, and not a Go map of billions of
+// hashes.
 //
 // We do NOT walk orphans; their parent set is unknown so the
 // metrics would be misleading.
-func AnalyzeChain(g *Graph) {
+func AnalyzeChain(g *Graph) { _ = AnalyzeChainContext(context.Background(), g) }
+
+// AnalyzeChainContext is AnalyzeChain with cancellation and the error a
+// manifest walk can hit. Metrics of nodes analysed before a failure stay
+// populated.
+func AnalyzeChainContext(ctx context.Context, g *Graph) error {
 	for _, root := range g.Roots {
-		analyzeNode(root, map[repo.Hash]int64{})
+		if err := analyzeNode(ctx, root, nil, 0); err != nil {
+			return err
+		}
 	}
+	return nil
 }
 
-// analyzeNode is the per-node analyzer. ancestors is the
-// (chunk-hash → length) map of every chunk seen in any strict
-// ancestor of n. n's own chunks are added to the next-level
-// ancestor map before recursing into children.
-//
-// We pass the ancestors map by value (i.e., we copy it before
-// extending) so siblings see the same starting set rather than
-// each other's chunks. Without this, a depth-2 fan-out would
-// alias the parent's pointer and double-count.
-func analyzeNode(n *Node, ancestors map[repo.Hash]int64) {
-	own := n.chunks
-	m := &ChainMetrics{
-		TotalChunks:        len(own),
-		AncestorChunkCount: len(ancestors),
-	}
-	for h, l := range own {
-		m.TotalChunkBytes += l
-		if _, inAncestor := ancestors[h]; inAncestor {
-			m.SharedWithAncestors++
-			m.SharedWithAncestorsBytes += l
-		} else {
-			m.UniqueChunks++
-			m.UniqueChunkBytes += l
+// analyzeNode is the per-node analyzer. ancestors holds the distinct-chunk
+// set of every strict ancestor of n (root first). n's own set is built
+// here, used for its metrics, appended for its children, and closed when
+// its subtree is done. Siblings share the same ancestors slice contents
+// but never each other's chunks (the append below is a fresh slice).
+func analyzeNode(ctx context.Context, n *Node, ancestors []*spill.HashSet, ancestorDistinct int) error {
+	own := spill.NewHashSet(spill.Options{})
+	defer own.Close()
+	// ancestorDistinct is the size of the UNION of the ancestors' sets,
+	// carried down: a child adds exactly the chunks not already in them.
+	m := &ChainMetrics{AncestorChunkCount: ancestorDistinct}
+	if n.src != nil {
+		err := n.src.EachFile(ctx, func(f *backup.FileEntry) error {
+			for _, c := range f.Chunks {
+				if !own.Add(c.Hash) {
+					continue // first sight of a chunk within this manifest only
+				}
+				m.TotalChunks++
+				m.TotalChunkBytes += c.Len
+				shared := false
+				for _, a := range ancestors {
+					if a.Has(c.Hash) {
+						shared = true
+						break
+					}
+				}
+				if shared {
+					m.SharedWithAncestors++
+					m.SharedWithAncestorsBytes += c.Len
+				} else {
+					m.UniqueChunks++
+					m.UniqueChunkBytes += c.Len
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+		if err := own.Err(); err != nil {
+			return err
 		}
 	}
 	if m.UniqueChunks > 0 {
@@ -141,20 +172,17 @@ func analyzeNode(n *Node, ancestors map[repo.Hash]int64) {
 	}
 	n.Metrics = m
 
-	// Build the ancestor set for the children. Copy first; do
-	// NOT mutate the caller's map.
 	if len(n.Children) > 0 {
-		next := make(map[repo.Hash]int64, len(ancestors)+len(own))
-		for h, l := range ancestors {
-			next[h] = l
-		}
-		for h, l := range own {
-			next[h] = l
-		}
+		next := make([]*spill.HashSet, len(ancestors)+1)
+		copy(next, ancestors)
+		next[len(ancestors)] = own
 		for _, c := range n.Children {
-			analyzeNode(c, next)
+			if err := analyzeNode(ctx, c, next, ancestorDistinct+m.UniqueChunks); err != nil {
+				return err
+			}
 		}
 	}
+	return nil
 }
 
 // SummarizeChain rolls up per-node ChainMetrics for one root +

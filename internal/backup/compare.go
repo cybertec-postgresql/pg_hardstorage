@@ -2,10 +2,13 @@
 package backup
 
 import (
+	"context"
+	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"sort"
 
-	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/spill"
 )
 
 // ComparisonResult is the structured output of Compare. It
@@ -128,12 +131,20 @@ const DefaultCompareTopN = 20
 // FileEntry slice on either side is treated as "no files",
 // not an error.
 //
-// CPU + memory: O(F_a + F_b + C_a + C_b) where F is file count
-// and C is chunk count per side. Two-pass: build per-side
-// indices, then walk the union of paths and the union of
-// chunk hashes. Determinism: TopFileDeltas sort is
-// (|delta| desc, path asc) so ties are stable across runs.
+// Memory: O(F_a + F_b) for the per-file index (path, size, a digest of
+// the chunk list) plus a bounded-memory set per side for the chunk-level
+// diff. File counts are small even for enormous databases (a relation
+// segment is 1 GiB, so ~200K files per 200 TB), whereas chunk counts are
+// billions — which is why only the chunk side spills to disk. Each side
+// is walked once through EachFile, so streamed manifests work.
+// Determinism: TopFileDeltas sort is (|delta| desc, path asc) so ties
+// are stable across runs.
 func Compare(a, b *Manifest, opts CompareOptions) (*ComparisonResult, error) {
+	return CompareContext(context.Background(), a, b, opts)
+}
+
+// CompareContext is Compare with a context for the manifest walks.
+func CompareContext(ctx context.Context, a, b *Manifest, opts CompareOptions) (*ComparisonResult, error) {
 	if a == nil || b == nil {
 		return nil, errors.New("backup: Compare requires both manifests to be non-nil")
 	}
@@ -141,20 +152,38 @@ func Compare(a, b *Manifest, opts CompareOptions) (*ComparisonResult, error) {
 		opts.TopN = DefaultCompareTopN
 	}
 
-	res := &ComparisonResult{
-		A: summarizeManifestForCompare(a),
-		B: summarizeManifestForCompare(b),
+	setA := spill.NewHashSet(spill.Options{})
+	defer setA.Close()
+	setB := spill.NewHashSet(spill.Options{})
+	defer setB.Close()
+
+	aIdx, aSide, err := scanSide(ctx, a, setA, nil)
+	if err != nil {
+		return nil, err
 	}
+	res := &ComparisonResult{A: aSide.ComparisonSide}
+	bIdx, bSide, err := scanSide(ctx, b, setB, setA)
+	if err != nil {
+		return nil, err
+	}
+	res.B = bSide.ComparisonSide
+
+	// Chunk-level diff. B's scan counted the chunks shared with A; the
+	// rest of each side is exclusive to it.
+	res.ChunkCounts.Shared = bSide.shared
+	res.ChunkCounts.SharedBytes = bSide.sharedBytes
+	res.ChunkCounts.BOnly = res.B.UniqueChunkCount - bSide.shared
+	res.ChunkCounts.BOnlyBytes = res.B.UniqueChunkBytes - bSide.sharedBytes
+	res.ChunkCounts.AOnly = res.A.UniqueChunkCount - bSide.shared
+	res.ChunkCounts.AOnlyBytes = res.A.UniqueChunkBytes - bSide.sharedBytes
 
 	// File-level diff.
-	aByPath := indexFilesByPath(a.Files)
-	bByPath := indexFilesByPath(b.Files)
-	allPaths := make([]string, 0, len(aByPath)+len(bByPath))
-	for p := range aByPath {
+	allPaths := make([]string, 0, len(aIdx)+len(bIdx))
+	for p := range aIdx {
 		allPaths = append(allPaths, p)
 	}
-	for p := range bByPath {
-		if _, ok := aByPath[p]; !ok {
+	for p := range bIdx {
+		if _, ok := aIdx[p]; !ok {
 			allPaths = append(allPaths, p)
 		}
 	}
@@ -163,33 +192,33 @@ func Compare(a, b *Manifest, opts CompareOptions) (*ComparisonResult, error) {
 	deltas := make([]FileDelta, 0, len(allPaths))
 	var sharedLogical int64
 	for _, p := range allPaths {
-		af, aOK := aByPath[p]
-		bf, bOK := bByPath[p]
+		af, aOK := aIdx[p]
+		bf, bOK := bIdx[p]
 		switch {
 		case aOK && !bOK:
 			res.FileCounts.OnlyInA++
 			deltas = append(deltas, FileDelta{
-				Path: p, ASize: af.Size, BSize: 0,
-				Delta: -af.Size, Class: "removed",
+				Path: p, ASize: af.size, BSize: 0,
+				Delta: -af.size, Class: "removed",
 			})
 		case !aOK && bOK:
 			res.FileCounts.OnlyInB++
 			deltas = append(deltas, FileDelta{
-				Path: p, ASize: 0, BSize: bf.Size,
-				Delta: bf.Size, Class: "added",
+				Path: p, ASize: 0, BSize: bf.size,
+				Delta: bf.size, Class: "added",
 			})
 		default:
 			res.FileCounts.InBoth++
-			if !filesEqual(af, bf) {
+			if af != bf {
 				res.FileCounts.Changed++
 				deltas = append(deltas, FileDelta{
-					Path: p, ASize: af.Size, BSize: bf.Size,
-					Delta: bf.Size - af.Size, Class: "changed",
+					Path: p, ASize: af.size, BSize: bf.size,
+					Delta: bf.size - af.size, Class: "changed",
 				})
 			} else {
-				// Same chunk set + same size = same bytes.
+				// Same chunk list + same size = same bytes.
 				// Count toward shared-logical-bytes.
-				sharedLogical += af.Size
+				sharedLogical += af.size
 			}
 		}
 	}
@@ -206,28 +235,6 @@ func Compare(a, b *Manifest, opts CompareOptions) (*ComparisonResult, error) {
 	}
 	res.TopFileDeltas = deltas
 
-	// Chunk-level diff using the per-side hash→size maps.
-	aChunks := uniqueChunkSizes(a.Files)
-	bChunks := uniqueChunkSizes(b.Files)
-	for h, sz := range aChunks {
-		if bSz, ok := bChunks[h]; ok {
-			res.ChunkCounts.Shared++
-			// Shared bytes use the A-side size; for the
-			// CAS-deduped case the sizes match.
-			res.ChunkCounts.SharedBytes += sz
-			_ = bSz
-		} else {
-			res.ChunkCounts.AOnly++
-			res.ChunkCounts.AOnlyBytes += sz
-		}
-	}
-	for h, sz := range bChunks {
-		if _, ok := aChunks[h]; !ok {
-			res.ChunkCounts.BOnly++
-			res.ChunkCounts.BOnlyBytes += sz
-		}
-	}
-
 	// Logical bytes.
 	res.LogicalBytes = LogicalBytesBreakdown{
 		A:      res.A.LogicalBytes,
@@ -239,84 +246,63 @@ func Compare(a, b *Manifest, opts CompareOptions) (*ComparisonResult, error) {
 	return res, nil
 }
 
-// summarizeManifestForCompare builds the per-side rollup
-// embedded in ComparisonResult. Mirrors the
-// per-row summary the list / show commands compute.
-func summarizeManifestForCompare(m *Manifest) ComparisonSide {
-	uniq := uniqueChunkSizes(m.Files)
-	var uniqBytes int64
-	for _, sz := range uniq {
-		uniqBytes += sz
-	}
-	var logical int64
-	for _, f := range m.Files {
-		logical += f.Size
-	}
-	stoppedAt := ""
+// fileSig identifies a file's bytes: its size and a digest of the
+// ordered chunk list (hash, length, offset). Equal sigs mean the same
+// bytes; Mode and ModTime are deliberately not part of it (touching a
+// file's mtime does not change its bytes).
+type fileSig struct {
+	size   int64
+	digest [32]byte
+}
+
+type sideScan struct {
+	ComparisonSide
+	shared      int
+	sharedBytes int64
+}
+
+// scanSide walks one manifest once: builds its per-file index and its
+// rollup, adds its chunks to set, and — when other is the other side's
+// completed set — counts the chunks the two share.
+func scanSide(ctx context.Context, m *Manifest, set, other *spill.HashSet) (map[string]fileSig, sideScan, error) {
+	idx := make(map[string]fileSig)
+	sc := sideScan{ComparisonSide: ComparisonSide{
+		BackupID:  m.BackupID,
+		Type:      string(m.Type),
+		FileCount: m.NumFiles(),
+	}}
 	if !m.StoppedAt.IsZero() {
-		stoppedAt = m.StoppedAt.UTC().Format("2006-01-02T15:04:05Z07:00")
+		sc.StoppedAt = m.StoppedAt.UTC().Format("2006-01-02T15:04:05Z07:00")
 	}
-	return ComparisonSide{
-		BackupID:         m.BackupID,
-		Type:             string(m.Type),
-		StoppedAt:        stoppedAt,
-		FileCount:        len(m.Files),
-		UniqueChunkCount: len(uniq),
-		UniqueChunkBytes: uniqBytes,
-		LogicalBytes:     logical,
-	}
-}
-
-// indexFilesByPath builds a path→entry index over a manifest's
-// Files slice. A FileEntry's Path is unique within a manifest;
-// duplicates are silently last-wins (the manifest store would
-// have refused duplicate keys at commit time).
-func indexFilesByPath(files []FileEntry) map[string]FileEntry {
-	out := make(map[string]FileEntry, len(files))
-	for _, f := range files {
-		out[f.Path] = f
-	}
-	return out
-}
-
-// uniqueChunkSizes builds a hash→len map across every
-// FileEntry's Chunks slice. CAS dedup means the same hash
-// always has the same Len; pick whichever wins on insertion
-// (lengths are identical so it's idempotent).
-func uniqueChunkSizes(files []FileEntry) map[repo.Hash]int64 {
-	out := make(map[repo.Hash]int64)
-	for _, f := range files {
+	var buf [8]byte
+	err := m.EachFile(ctx, func(f *FileEntry) error {
+		sc.LogicalBytes += f.Size
+		h := sha256.New()
 		for _, c := range f.Chunks {
-			out[c.Hash] = c.Len
+			h.Write(c.Hash[:])
+			binary.BigEndian.PutUint64(buf[:], uint64(c.Len))
+			h.Write(buf[:])
+			binary.BigEndian.PutUint64(buf[:], uint64(c.Offset))
+			h.Write(buf[:])
+			if set.Add(c.Hash) {
+				sc.UniqueChunkCount++
+				sc.UniqueChunkBytes += c.Len
+				if other != nil && other.Has(c.Hash) {
+					sc.shared++
+					sc.sharedBytes += c.Len
+				}
+			}
 		}
+		var sig fileSig
+		sig.size = f.Size
+		copy(sig.digest[:], h.Sum(nil))
+		idx[f.Path] = sig
+		return nil
+	})
+	if err == nil {
+		err = set.Err()
 	}
-	return out
-}
-
-// filesEqual reports whether two FileEntry values represent
-// the same bytes. Same Size + same chunk-hash list (in
-// order). Doesn't compare Mode or ModTime — those can change
-// without the bytes changing (touch a file's mtime; PG-side
-// processes do this).
-func filesEqual(a, b FileEntry) bool {
-	if a.Size != b.Size {
-		return false
-	}
-	if len(a.Chunks) != len(b.Chunks) {
-		return false
-	}
-	for i := range a.Chunks {
-		if a.Chunks[i].Hash != b.Chunks[i].Hash {
-			return false
-		}
-		if a.Chunks[i].Len != b.Chunks[i].Len {
-			return false
-		}
-		if a.Chunks[i].Offset != b.Chunks[i].Offset {
-			return false
-		}
-	}
-	return true
+	return idx, sc, err
 }
 
 // abs returns |x| for int64 without overflow concerns at the

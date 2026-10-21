@@ -308,7 +308,7 @@ func Drill(ctx context.Context, repoURL string, deployment string, opts DrillOpt
 	}
 	pickPhase.OK = true
 	pickPhase.Note = fmt.Sprintf("picked %s (%s, %d files)",
-		manifest.BackupID, manifest.Type, len(manifest.Files))
+		manifest.BackupID, manifest.Type, manifest.NumFiles())
 	report.Phases = append(report.Phases, pickPhase)
 	report.BackupID = manifest.BackupID
 
@@ -566,7 +566,7 @@ func pickDrillManifest(ctx context.Context, sp storage.StoragePlugin, deployment
 	if target == "" || target == "latest" {
 		var newest *backup.Manifest
 		skipped := 0
-		for m, lerr := range store.List(ctx, deployment, opts.Verifier) {
+		for m, lerr := range store.ListAuto(ctx, deployment, opts.Verifier) {
 			if lerr != nil {
 				// Counted. A drill exists to answer "could we restore
 				// this deployment right now?"; silently drilling an

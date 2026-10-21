@@ -48,6 +48,7 @@ import (
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/compression"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/spill"
 )
 
 // SchemaBundle is the on-disk schema string carried in
@@ -181,7 +182,8 @@ func Export(ctx context.Context, sp storage.StoragePlugin, w io.Writer, opts Exp
 		SourceRepo:  opts.SourceRepoURL,
 	}
 
-	chunkSeen := map[repo.Hash]struct{}{}
+	chunkSeen := spill.NewHashSet(spill.Options{})
+	defer chunkSeen.Close()
 	for _, m := range manifests {
 		bundleManifest.Backups = append(bundleManifest.Backups, BackupEntry{
 			Deployment: m.Deployment,
@@ -214,10 +216,9 @@ func Export(ctx context.Context, sp storage.StoragePlugin, w io.Writer, opts Exp
 		// Step 3 — every chunk this manifest references.
 		for _, fe := range m.Files {
 			for _, ref := range fe.Chunks {
-				if _, dup := chunkSeen[ref.Hash]; dup {
+				if !chunkSeen.Add(ref.Hash) {
 					continue
 				}
-				chunkSeen[ref.Hash] = struct{}{}
 				key := repo.ChunkKey(ref.Hash)
 				size, err := copyChunk(ctx, sp, tw, key)
 				if err != nil {

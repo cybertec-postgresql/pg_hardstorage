@@ -56,7 +56,7 @@ func (f flowVerify) Run(ctx context.Context, env *Env) error {
 	// Build the manifest picker.
 	var manifests []*backup.Manifest
 	skipped := 0
-	for m, mErr := range store.List(ctx, dep.Name, verifier) {
+	for m, mErr := range store.ListAuto(ctx, dep.Name, verifier) {
 		if mErr != nil {
 			skipped++
 			continue
@@ -85,7 +85,7 @@ func (f flowVerify) Run(ctx context.Context, env *Env) error {
 	for i, m := range manifests {
 		choices[i] = prompt.Choice{
 			Label:  m.BackupID,
-			Detail: fmt.Sprintf("%s · %d files", humanWhen(m.StartedAt), len(m.Files)),
+			Detail: fmt.Sprintf("%s · %d files", humanWhen(m.StartedAt), m.NumFiles()),
 		}
 	}
 	idx, err := env.Prompter.PromptChoice("Which backup?", choices, 0)
@@ -107,7 +107,7 @@ func (f flowVerify) Run(ctx context.Context, env *Env) error {
 	var ok int
 	var total int
 	var firstFail string
-	for _, file := range m.Files {
+	if err := m.EachFile(ctx, func(file *backup.FileEntry) error {
 		for _, ref := range file.Chunks {
 			total++
 			if _, err := cas.GetChunkBytes(ctx, ref.Hash); err != nil {
@@ -118,6 +118,9 @@ func (f flowVerify) Run(ctx context.Context, env *Env) error {
 				ok++
 			}
 		}
+		return nil
+	}); err != nil {
+		return err
 	}
 	if ok == total {
 		env.Prompter.Printf("\n  ✓ %d / %d chunks ok\n\n", ok, total)

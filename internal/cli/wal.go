@@ -927,7 +927,7 @@ func parseSegmentNameForFetch(name string) (uint32, uint64, bool) {
 // failure is consistent and the error already names the unreadable chunk.
 func buildWALDecryptingCAS(ctx context.Context, sp storage.StoragePlugin, deployment string) (*repo.CAS, bool) {
 	var info *backup.EncryptionInfo
-	for m, lerr := range backup.NewManifestStore(sp).ListAttestationless(ctx, deployment) {
+	for m, lerr := range backup.NewManifestStore(sp).ListAttestationlessAuto(ctx, deployment) {
 		if lerr != nil || m == nil || m.Encryption == nil {
 			continue
 		}
@@ -1012,7 +1012,7 @@ func decryptingCASFromEnvelope(ctx context.Context, sp storage.StoragePlugin, sc
 // posture as buildWALDecryptingCAS — the KEKRef only steers posture, the
 // unwrap step is the real gate).
 func deploymentBackupKEKRef(ctx context.Context, sp storage.StoragePlugin, deployment string) (string, bool) {
-	for m, lerr := range backup.NewManifestStore(sp).ListAttestationless(ctx, deployment) {
+	for m, lerr := range backup.NewManifestStore(sp).ListAttestationlessAuto(ctx, deployment) {
 		if lerr != nil || m == nil || m.Encryption == nil {
 			continue
 		}

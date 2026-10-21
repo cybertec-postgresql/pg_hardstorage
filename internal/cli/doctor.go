@@ -453,7 +453,7 @@ func appendPGVersionChecks(ctx context.Context, cfg *config.LoadResult, issues [
 			// are silently skipped, same posture as
 			// pickLatestBackup in the verify command.
 			var latest *backup.Manifest
-			for m, mErr := range store.List(ctx, p.name, verifier) {
+			for m, mErr := range store.ListAuto(ctx, p.name, verifier) {
 				if mErr != nil {
 					continue
 				}
@@ -542,7 +542,7 @@ func appendManifestSignatureChecks(ctx context.Context, cfg *config.LoadResult, 
 			store := backup.NewManifestStore(sp)
 			var checked, mismatched, failed int
 			sampled := false
-			for _, mErr := range store.List(ctx, p.name, verifier) {
+			for _, mErr := range store.ListAuto(ctx, p.name, verifier) {
 				if checked >= doctorMaxManifestsVerified {
 					sampled = true
 					break

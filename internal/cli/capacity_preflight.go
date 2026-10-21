@@ -212,7 +212,7 @@ func projectedBytesFromDeployment(ctx context.Context, sp storage.StoragePlugin,
 	store := backup.NewManifestStore(sp)
 	var latestAny, latestKind *backup.Manifest
 	var lastListErr error
-	for m, err := range store.List(ctx, deployment, verifier) {
+	for m, err := range store.ListAuto(ctx, deployment, verifier) {
 		if err != nil {
 			lastListErr = err
 			continue
@@ -248,11 +248,7 @@ func projectedBytesFromDeployment(ctx context.Context, sp storage.StoragePlugin,
 				Command: "pg_hardstorage capacity preflight --repo <url> --projected-bytes <N>",
 			})
 	}
-	var total int64
-	for _, f := range pick.Files {
-		total += f.Size
-	}
-	return total, nil
+	return pick.TotalFileBytes(), nil
 }
 
 // capacityPreflightBody is the v1-stable result for `capacity

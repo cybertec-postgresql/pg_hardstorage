@@ -226,8 +226,7 @@ func (ms *ManifestStore) CommitSpooled(ctx context.Context, m *Manifest, sp *Man
 	body := manifestBody{
 		size: head + int64(len(tail)),
 		open: func() (stdio.ReadCloser, error) {
-			return stdio.NopCloser(stdio.MultiReader(
-				stdio.NewSectionReader(canon, 0, head), strings.NewReader(tail))), nil
+			return &spoolBody{head: stdio.NewSectionReader(canon, 0, head), headLen: head, tail: strings.NewReader(tail)}, nil
 		},
 	}
 	return ms.commitBody(ctx, m, body, opts)
@@ -242,4 +241,73 @@ func (s *ManifestSpool) dir() string {
 		return ""
 	}
 	return s.path[:i]
+}
+
+// spoolBody is the on-disk canonical bytes followed by the attestation
+// tail, readable and seekable as one stream (object-store clients rewind
+// the body to sign it).
+type spoolBody struct {
+	head    *stdio.SectionReader
+	headLen int64
+	tail    *strings.Reader
+	pos     int64
+}
+
+func (b *spoolBody) Read(p []byte) (int, error) {
+	if b.pos < b.headLen {
+		n, err := b.head.Read(p)
+		b.pos += int64(n)
+		if err == stdio.EOF && b.pos >= b.headLen {
+			err = nil
+		}
+		return n, err
+	}
+	n, err := b.tail.Read(p)
+	b.pos += int64(n)
+	return n, err
+}
+
+func (b *spoolBody) Seek(off int64, whence int) (int64, error) {
+	total := b.headLen + b.tail.Size()
+	var abs int64
+	switch whence {
+	case stdio.SeekStart:
+		abs = off
+	case stdio.SeekCurrent:
+		abs = b.pos + off
+	case stdio.SeekEnd:
+		abs = total + off
+	default:
+		return 0, errors.New("spoolBody: bad whence")
+	}
+	if abs < 0 {
+		return 0, errors.New("spoolBody: negative position")
+	}
+	if abs > total {
+		abs = total
+	}
+	if _, err := b.head.Seek(minInt64(abs, b.headLen), stdio.SeekStart); err != nil {
+		return 0, err
+	}
+	if _, err := b.tail.Seek(maxInt64(abs-b.headLen, 0), stdio.SeekStart); err != nil {
+		return 0, err
+	}
+	b.pos = abs
+	return abs, nil
+}
+
+func (b *spoolBody) Close() error { return nil }
+
+func minInt64(a, b int64) int64 {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func maxInt64(a, b int64) int64 {
+	if a > b {
+		return a
+	}
+	return b
 }

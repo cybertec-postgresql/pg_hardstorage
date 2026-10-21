@@ -291,7 +291,7 @@ func Readiness(ctx context.Context, sp storage.StoragePlugin, deployment string,
 		oldest time.Time
 		count  int
 	)
-	for m, lerr := range store.List(ctx, deployment, opts.Verifier) {
+	for m, lerr := range store.ListAuto(ctx, deployment, opts.Verifier) {
 		if err := ctx.Err(); err != nil {
 			finish()
 			return r, err
@@ -628,11 +628,7 @@ func replicaPresent(sp storage.StoragePlugin, backupID string) bool {
 // manifestLogicalBytes sums the FileEntry sizes — same definition
 // as the forecast package uses. Logical bytes = on-source size.
 func manifestLogicalBytes(m *backup.Manifest) int64 {
-	var total int64
-	for _, f := range m.Files {
-		total += f.Size
-	}
-	return total
+	return m.TotalFileBytes()
 }
 
 // humanThroughput renders bytes-per-second as a compact label for

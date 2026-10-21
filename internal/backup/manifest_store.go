@@ -252,9 +252,16 @@ type manifestBody struct {
 
 func bytesBody(b []byte) manifestBody {
 	return manifestBody{size: int64(len(b)), open: func() (stdio.ReadCloser, error) {
-		return stdio.NopCloser(bytes.NewReader(b)), nil
+		return seekCloser{bytes.NewReader(b)}, nil
 	}}
 }
+
+// seekCloser keeps a reader seekable through the ReadCloser interface:
+// object-store clients (S3) rewind the body to sign it, and a plain
+// NopCloser would hide the Seek.
+type seekCloser struct{ *bytes.Reader }
+
+func (seekCloser) Close() error { return nil }
 
 // commitBody publishes an already-validated, already-signed manifest
 // document: the primary exclusively, the chain-safety re-check for

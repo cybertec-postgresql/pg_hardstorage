@@ -25,6 +25,7 @@ package cli
 // empty. That distinction is what this test pins.
 
 import (
+	"context"
 	"testing"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup"
@@ -42,7 +43,7 @@ func TestMatchManifestPaths_RewrittenTableIsFlaggedNotInBackup(t *testing.T) {
 		backup.FileEntry{Path: "base/16384/2619", Size: 8192},
 		backup.FileEntry{Path: "base/16384/2619.1", Size: 4096},
 	)
-	got := matchManifestPaths(m, []partial.Relfilenode{{
+	got := mustMatch(t, m, []partial.Relfilenode{{
 		Qualified: "public.users", Path: "base/16384/99999", Relfilenode: 99999,
 	}})
 	if len(got) != 1 {
@@ -73,7 +74,7 @@ func TestMatchManifestPaths_PresentTablesAreNotFlagged(t *testing.T) {
 	}
 	for name, f := range cases {
 		t.Run(name, func(t *testing.T) {
-			got := matchManifestPaths(inspectManifest(f), []partial.Relfilenode{{
+			got := mustMatch(t, inspectManifest(f), []partial.Relfilenode{{
 				Qualified: "public.users", Path: "base/16384/2619",
 			}})
 			if got[0].NotInBackup {
@@ -88,7 +89,7 @@ func TestMatchManifestPaths_PresentTablesAreNotFlagged(t *testing.T) {
 // pick up the new one — nothing was looked up, so nothing can be said
 // about the backup.
 func TestMatchManifestPaths_NotFoundTableIsNotAlsoNotInBackup(t *testing.T) {
-	got := matchManifestPaths(inspectManifest(), []partial.Relfilenode{{
+	got := mustMatch(t, inspectManifest(), []partial.Relfilenode{{
 		Qualified: "public.typo", NotFound: true,
 	}})
 	if !got[0].NotFound {
@@ -108,7 +109,7 @@ func TestMatchManifestPaths_SegmentedRelationCounts(t *testing.T) {
 		backup.FileEntry{Path: "base/16384/2619.1", Size: 1 << 30},
 		backup.FileEntry{Path: "base/16384/2619.2", Size: 512},
 	)
-	got := matchManifestPaths(m, []partial.Relfilenode{{
+	got := mustMatch(t, m, []partial.Relfilenode{{
 		Qualified: "public.big", Path: "base/16384/2619",
 	}})
 	if got[0].NotInBackup {
@@ -117,4 +118,13 @@ func TestMatchManifestPaths_SegmentedRelationCounts(t *testing.T) {
 	if got[0].HeapSegments != 3 {
 		t.Errorf("HeapSegments = %d, want 3", got[0].HeapSegments)
 	}
+}
+
+func mustMatch(t *testing.T, m *backup.Manifest, rfns []partial.Relfilenode) []partialTableMapping {
+	t.Helper()
+	got, err := matchManifestPaths(context.Background(), m, rfns)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return got
 }

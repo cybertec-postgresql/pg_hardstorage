@@ -94,16 +94,16 @@ func runBackupCompare(cmd *cobra.Command, deployment, idA, idB, repoURL string, 
 	defer sp.Close()
 
 	store := backup.NewManifestStore(sp)
-	manifestA, err := store.Read(cmd.Context(), deployment, idA, verifier)
+	manifestA, err := store.ReadAuto(cmd.Context(), deployment, idA, verifier)
 	if err != nil {
 		return mapCompareReadError("a", deployment, idA, err)
 	}
-	manifestB, err := store.Read(cmd.Context(), deployment, idB, verifier)
+	manifestB, err := store.ReadAuto(cmd.Context(), deployment, idB, verifier)
 	if err != nil {
 		return mapCompareReadError("b", deployment, idB, err)
 	}
 
-	res, err := backup.Compare(manifestA, manifestB, backup.CompareOptions{TopN: topN})
+	res, err := backup.CompareContext(cmd.Context(), manifestA, manifestB, backup.CompareOptions{TopN: topN})
 	if err != nil {
 		return output.NewError("backup.compare.failed",
 			fmt.Sprintf("backup compare: %v", err)).Wrap(err)

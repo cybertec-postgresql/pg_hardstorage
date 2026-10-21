@@ -6,8 +6,8 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
-	"iter"
 	"io"
+	"iter"
 	"os"
 	"strings"
 	"time"
@@ -24,8 +24,8 @@ import (
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/encryption/aesgcm"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo"
-	"github.com/cybertec-postgresql/pg_hardstorage/internal/spill"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo/casdefault"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/spill"
 )
 
 // newVerifyCmd implements `pg_hardstorage verify <deployment>

@@ -17,6 +17,7 @@ import (
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/output"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/spill"
 )
 
 // newAnomalyCmd implements `pg_hardstorage anomaly check <deployment>`.
@@ -129,12 +130,17 @@ func runAnomalyCheck(cmd *cobra.Command, deployment, repoURL string, threshold f
 	store := backup.NewManifestStore(sp)
 	var samples []anomaly.Sample
 	var skipped int
-	for m, lerr := range store.List(cmd.Context(), deployment, verifier) {
+	for m, lerr := range store.ListAuto(cmd.Context(), deployment, verifier) {
 		if lerr != nil {
 			skipped++
 			continue
 		}
-		samples = append(samples, manifestToSample(m))
+		sample, serr := manifestToSample(cmd.Context(), m)
+		if serr != nil {
+			skipped++
+			continue
+		}
+		samples = append(samples, sample)
 	}
 	if len(samples) == 0 {
 		// No backups at all is not a failure — empty deployments are
@@ -244,23 +250,28 @@ func runAnomalyCheck(cmd *cobra.Command, deployment, repoURL string, threshold f
 // CLI's summary type and the detector's Sample have different
 // long-term ownership (the summary is a CLI rendering shape, the
 // Sample is a numerical input).
-func manifestToSample(m *backup.Manifest) anomaly.Sample {
+func manifestToSample(ctx context.Context, m *backup.Manifest) (anomaly.Sample, error) {
 	s := anomaly.Sample{
 		BackupID:        m.BackupID,
 		Type:            string(m.Type),
 		StoppedAt:       m.StoppedAt,
 		DurationSeconds: m.StoppedAt.Sub(m.StartedAt).Seconds(),
-		FileCount:       int64(len(m.Files)),
+		FileCount:       int64(m.NumFiles()),
 	}
-	uniqueChunks := map[string]struct{}{}
-	for _, f := range m.Files {
+	seen := spill.NewHashSet(spill.Options{})
+	defer seen.Close()
+	if err := m.EachFile(ctx, func(f *backup.FileEntry) error {
 		s.LogicalBytes += f.Size
 		for _, c := range f.Chunks {
-			uniqueChunks[c.Hash.String()] = struct{}{}
+			if seen.Add(c.Hash) {
+				s.UniqueChunkCount++
+			}
 		}
+		return nil
+	}); err != nil {
+		return s, err
 	}
-	s.UniqueChunkCount = int64(len(uniqueChunks))
-	return s
+	return s, seen.Err()
 }
 
 // emitAnomalyAudits appends one audit-chain entry per flagged

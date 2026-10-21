@@ -189,7 +189,7 @@ func Restore(ctx context.Context, opts RestoreOptions) (*RestoreResult, error) {
 	}
 	defer sp.Close()
 	store := backup.NewManifestStore(sp)
-	m, err := store.Read(ctx, opts.Deployment, opts.BackupID, opts.Verifier)
+	m, err := store.ReadAuto(ctx, opts.Deployment, opts.BackupID, opts.Verifier)
 	if err != nil {
 		finish()
 		return res, fmt.Errorf("partial restore: read manifest: %w", err)
@@ -241,7 +241,14 @@ func Restore(ctx context.Context, opts RestoreOptions) (*RestoreResult, error) {
 
 	// 5. For each resolved table, find matching FileEntries +
 	//    materialise. NotFound tables get appended to res.NotFound.
-	byPath := indexFiles(m.Files)
+	// Only the files belonging to the requested relations are indexed
+	// (one pass over the manifest): a streamed manifest has no file list
+	// to index whole, and the whole index was never needed.
+	byPath, ierr := indexFamilyFiles(ctx, m, rfns)
+	if ierr != nil {
+		finish()
+		return res, fmt.Errorf("partial restore: read manifest files: %w", ierr)
+	}
 	for _, rfn := range rfns {
 		if rfn.NotFound || rfn.Path == "" {
 			res.NotFound = append(res.NotFound, rfn.Qualified)
@@ -326,23 +333,13 @@ func resolveRelfilenodes(ctx context.Context, opts RestoreOptions) ([]Relfilenod
 	return out, nil
 }
 
-// indexFiles builds a relation-path → FileEntry index for fast lookup
-// during family-walks. Returned map is read-only after construction.
-//
-// Keys are in pg_relation_filepath's namespace, because that is what
-// the lookup side holds: default-tablespace files as-is
-// ("base/16384/2619"), files of a non-default tablespace as
-// "pg_tblspc/<oid>/<path>". The manifest stores the latter relative to
-// the tablespace root plus a TablespaceOID; keyed by bare Path they
-// could never match (and a same-named default-tablespace file could
-// shadow them).
-func indexFiles(files []backup.FileEntry) map[string]*backup.FileEntry {
-	out := make(map[string]*backup.FileEntry, len(files))
-	for i := range files {
-		out[relationPath(&files[i])] = &files[i]
-	}
-	return out
-}
+// Keys of the family index are in pg_relation_filepath's namespace
+// (see relationPath), because that is what the lookup side holds:
+// default-tablespace files as-is ("base/16384/2619"), files of a
+// non-default tablespace as "pg_tblspc/<oid>/<path>". The manifest stores
+// the latter relative to the tablespace root plus a TablespaceOID; keyed
+// by bare Path they could never match (and a same-named
+// default-tablespace file could shadow them).
 
 // relationPath is f's path as pg_relation_filepath would spell it.
 func relationPath(f *backup.FileEntry) string {
@@ -680,4 +677,33 @@ func safeJoinTarget(target, rel string) (string, error) {
 		return "", fmt.Errorf("partial: refusing path %q that escapes target %q", rel, target)
 	}
 	return cleanFull, nil
+}
+
+// indexFamilyFiles returns the manifest entries (copied) that are a
+// requested relation's file or one of its family members.
+func indexFamilyFiles(ctx context.Context, m *backup.Manifest, rfns []Relfilenode) (map[string]*backup.FileEntry, error) {
+	var bases []string
+	for _, r := range rfns {
+		if r.NotFound || r.Path == "" {
+			continue
+		}
+		bases = append(bases, r.Path)
+		if r.ToastPath != "" {
+			bases = append(bases, r.ToastPath)
+		}
+	}
+	out := map[string]*backup.FileEntry{}
+	err := m.EachFile(ctx, func(f *backup.FileEntry) error {
+		rp := relationPath(f)
+		for _, b := range bases {
+			if rp == b || isFamilyMember(rp, b) {
+				cp := *f
+				cp.Chunks = append([]backup.ChunkRef(nil), f.Chunks...)
+				out[rp] = &cp
+				break
+			}
+		}
+		return nil
+	})
+	return out, err
 }

@@ -385,11 +385,9 @@ func manifestToAffected(m *backup.Manifest) AffectedBackup {
 		Tenant:     m.Tenant,
 		StartedAt:  m.StartedAt,
 		StoppedAt:  m.StoppedAt,
-		FileCount:  len(m.Files),
+		FileCount:  m.NumFiles(),
 	}
-	for _, f := range m.Files {
-		ab.ChunkCount += len(f.Chunks)
-	}
+	ab.ChunkCount = int(m.NumChunkRefs())
 	if m.Encryption != nil {
 		ab.Encrypted = true
 		ab.KEKRef = m.Encryption.KEKRef

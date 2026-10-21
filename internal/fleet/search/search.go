@@ -272,7 +272,7 @@ func Search(ctx context.Context, sp storage.StoragePlugin, q And, opts SearchOpt
 		if err := ctx.Err(); err != nil {
 			return Result{}, err
 		}
-		for m, lerr := range ms.List(ctx, dep, opts.Verifier) {
+		for m, lerr := range ms.ListAuto(ctx, dep, opts.Verifier) {
 			if lerr != nil {
 				// Keep walking, but record it -- see doc comment.
 				res.Unreadable++
@@ -307,7 +307,7 @@ func manifestToHit(m *backup.Manifest) Hit {
 		StopLSN:    m.StopLSN,
 		StartedAt:  m.StartedAt,
 		StoppedAt:  m.StoppedAt,
-		Files:      len(m.Files),
+		Files:      m.NumFiles(),
 	}
 }
 

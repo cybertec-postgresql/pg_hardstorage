@@ -146,7 +146,7 @@ func runPartialInspect(cmd *cobra.Command, opts partialInspectOptions) error {
 		id = latestID
 	}
 
-	m, err := ms.ReadAttestationless(cmd.Context(), opts.deployment, id)
+	m, err := ms.ReadAttestationlessAuto(cmd.Context(), opts.deployment, id)
 	if err != nil {
 		if errors.Is(err, backup.ErrTombstoned) {
 			return output.NewError("notfound.backup_tombstoned",
@@ -161,13 +161,11 @@ func runPartialInspect(cmd *cobra.Command, opts partialInspectOptions) error {
 		BackupID:   m.BackupID,
 		PGVersion:  m.PGVersion,
 		Timeline:   m.Timeline,
-		FileCount:  len(m.Files),
+		FileCount:  m.NumFiles(),
 		Tables:     opts.tables,
 	}
-	for _, f := range m.Files {
-		body.ChunkCount += len(f.Chunks)
-		body.LogicalBytes += f.Size
-	}
+	body.ChunkCount = int(m.NumChunkRefs())
+	body.LogicalBytes = m.TotalFileBytes()
 
 	// Per-table mapping when --tables is set. With --pg-connection,
 	// we resolve each table's relfilenode against pg_class and
@@ -182,7 +180,11 @@ func runPartialInspect(cmd *cobra.Command, opts partialInspectOptions) error {
 		if lerr != nil {
 			body.LookupError = lerr.Error()
 		} else {
-			body.TableMappings = matchManifestPaths(m, rfns)
+			mappings, merr := matchManifestPaths(cmd.Context(), m, rfns)
+			if merr != nil {
+				body.LookupError = merr.Error()
+			}
+			body.TableMappings = mappings
 		}
 	} else if len(opts.tables) > 0 {
 		body.Note = "pass --pg-connection <url> to map each table to its manifest heap file via pg_class"
@@ -200,45 +202,55 @@ func runPartialInspect(cmd *cobra.Command, opts partialInspectOptions) error {
 // "base/<dbnode>/<relfilenode>" with optional ".N" segment suffixes
 // for relations larger than 1 GiB; we collect every segment whose
 // path starts with the relfilenode prefix.
-func matchManifestPaths(m *backup.Manifest, rfns []partial.Relfilenode) []partialTableMapping {
+func matchManifestPaths(ctx context.Context, m *backup.Manifest, rfns []partial.Relfilenode) ([]partialTableMapping, error) {
 	out := make([]partialTableMapping, 0, len(rfns))
 	for _, rfn := range rfns {
-		entry := partialTableMapping{
+		out = append(out, partialTableMapping{
 			Qualified:   rfn.Qualified,
 			OID:         rfn.OID,
 			Relfilenode: rfn.Relfilenode,
 			HeapPath:    rfn.Path,
 			ToastPath:   rfn.ToastPath,
 			NotFound:    rfn.NotFound,
-		}
-		if !rfn.NotFound {
-			matchPaths(&entry.HeapBytes, &entry.HeapChunks, &entry.HeapSegments, m, rfn.Path)
-			if rfn.ToastPath != "" {
-				matchPaths(&entry.ToastBytes, &entry.ToastChunks, &entry.ToastSegments, m, rfn.ToastPath)
+		})
+	}
+	// One pass over the manifest for every requested table: a very large
+	// manifest is streamed, so it must not be walked once per table.
+	err := m.EachFile(ctx, func(f *backup.FileEntry) error {
+		for i, rfn := range rfns {
+			if rfn.NotFound {
+				continue
 			}
+			e := &out[i]
+			if matchesRel(f.Path, rfn.Path) {
+				e.HeapBytes += f.Size
+				e.HeapChunks += len(f.Chunks)
+				e.HeapSegments++
+			}
+			if rfn.ToastPath != "" && matchesRel(f.Path, rfn.ToastPath) {
+				e.ToastBytes += f.Size
+				e.ToastChunks += len(f.Chunks)
+				e.ToastSegments++
+			}
+		}
+		return nil
+	})
+	for i, rfn := range rfns {
+		if !rfn.NotFound {
 			// Zero SEGMENTS, not zero bytes: an empty table still has a
 			// heap file in the manifest (a FileEntry of size 0), so a
 			// segment count of zero means the path is genuinely absent
 			// from this backup rather than the relation being empty.
-			entry.NotInBackup = entry.HeapSegments == 0
+			out[i].NotInBackup = out[i].HeapSegments == 0
 		}
-		out = append(out, entry)
 	}
-	return out
+	return out, err
 }
 
-// matchPaths walks every FileEntry whose path starts with prefix
-// (so segments base/16384/24576, base/16384/24576.1, ... all match),
-// and accumulates totals into the supplied counters.
-func matchPaths(bytes *int64, chunks, segments *int, m *backup.Manifest, prefix string) {
-	for _, f := range m.Files {
-		if f.Path != prefix && !strings.HasPrefix(f.Path, prefix+".") {
-			continue
-		}
-		*bytes += f.Size
-		*chunks += len(f.Chunks)
-		*segments++
-	}
+// matchesRel reports whether a manifest path is the relation file at
+// prefix or one of its ".N" segments.
+func matchesRel(path, prefix string) bool {
+	return path == prefix || strings.HasPrefix(path, prefix+".")
 }
 
 // latestBackupID returns the lex-greatest non-tombstoned manifest ID
@@ -261,7 +273,7 @@ func latestBackupID(cmd *cobra.Command, ms *backup.ManifestStore, deployment str
 	var latest string
 	var latestAt time.Time
 	skipped := 0
-	for m, err := range ms.ListAttestationless(cmd.Context(), deployment) {
+	for m, err := range ms.ListAttestationlessAuto(cmd.Context(), deployment) {
 		if err != nil {
 			// Counted. This walk deliberately skips signature
 			// verification (`partial inspect` is a read-only preview),
@@ -693,7 +705,7 @@ func resolveLatestBackupID(ctx context.Context, store *backup.ManifestStore, dep
 	var latestID string
 	var latestTS time.Time
 	skipped := 0
-	for m, err := range store.List(ctx, deployment, verifier) {
+	for m, err := range store.ListAuto(ctx, deployment, verifier) {
 		if err != nil {
 			skipped++
 			continue

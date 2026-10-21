@@ -23,6 +23,7 @@ import (
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo/casdefault"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/spill"
 )
 
 // newRepairCmd implements the `repair` command tree. v0.1 ships:
@@ -1445,7 +1446,7 @@ func reverifyChunksPlaintext(ctx context.Context, sp storage.StoragePlugin, targ
 		return nil, err
 	}
 	for _, dep := range deployments {
-		for m, merr := range ms.List(ctx, dep, verifier) {
+		for m, merr := range ms.ListAuto(ctx, dep, verifier) {
 			if merr != nil {
 				continue
 			}
@@ -1453,13 +1454,21 @@ func reverifyChunksPlaintext(ctx context.Context, sp storage.StoragePlugin, targ
 			if cerr != nil {
 				continue
 			}
-			for _, f := range m.Files {
+			if err := m.EachFile(ctx, func(f *backup.FileEntry) error {
 				for _, c := range f.Chunks {
 					if err := ctx.Err(); err != nil {
-						return nil, err
+						return err
 					}
 					verify(cas, c.Hash)
 				}
+				return nil
+			}); err != nil {
+				if ctx.Err() != nil {
+					return nil, ctx.Err()
+				}
+				// Unreadable entries: this manifest cannot vouch for
+				// anything; the chunks stay pending and are reported.
+				continue
 			}
 			if len(pending) == 0 {
 				break
@@ -1575,7 +1584,8 @@ func scrubWindowStart(total, limit, windowIndex int) (start, windows int) {
 
 func scrubManifestAware(ctx context.Context, sp storage.StoragePlugin, limit, windowIndex int) (scrubResultAgg, int, error) {
 	var agg scrubResultAgg
-	seen := make(map[repo.Hash]struct{})
+	seen := spill.NewHashSet(spill.Options{})
+	defer seen.Close()
 
 	// distinctRefs counts how many unique hashes the repo would have
 	// scrubbed at limit=0 — surfaces as ReferencedTotal in the body.
@@ -1595,10 +1605,9 @@ func scrubManifestAware(ctx context.Context, sp storage.StoragePlugin, limit, wi
 	// later runs reach later chunks.
 	ordinal := 0
 	verifyChunk := func(cas *repo.CAS, h repo.Hash) {
-		if _, dup := seen[h]; dup {
+		if !seen.Add(h) {
 			return
 		}
-		seen[h] = struct{}{}
 		idx := ordinal
 		ordinal++
 		if idx < start {
@@ -1646,7 +1655,7 @@ func scrubManifestAware(ctx context.Context, sp storage.StoragePlugin, limit, wi
 		return agg, distinctRefs, err
 	}
 	for _, dep := range deployments {
-		for m, merr := range ms.List(ctx, dep, verifier) {
+		for m, merr := range ms.ListAuto(ctx, dep, verifier) {
 			if merr != nil {
 				// Skip un-readable manifests: one bad manifest must not
 				// stop the rest of the repo being scrubbed. But COUNT
@@ -1674,19 +1683,23 @@ func scrubManifestAware(ctx context.Context, sp storage.StoragePlugin, limit, wi
 				agg.noteKeyUnavailable("backup "+m.BackupID, cerr.Error())
 				continue
 			}
-			for _, f := range m.Files {
+			errLimit := errors.New("scrub sample limit reached")
+			if err := m.EachFile(ctx, func(f *backup.FileEntry) error {
 				for _, c := range f.Chunks {
 					if err := ctx.Err(); err != nil {
-						return agg, distinctRefs, err
+						return err
 					}
 					verifyChunk(cas, c.Hash)
 					if limit > 0 && agg.Sampled >= limit {
-						break
+						return errLimit
 					}
 				}
-				if limit > 0 && agg.Sampled >= limit {
-					break
+				return nil
+			}); err != nil && !errors.Is(err, errLimit) {
+				if ctx.Err() != nil {
+					return agg, distinctRefs, ctx.Err()
 				}
+				agg.UnverifiableManifests++
 			}
 		}
 		if limit > 0 && agg.Sampled >= limit {

@@ -36,6 +36,7 @@
 package s3
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -401,6 +402,26 @@ func (p *Plugin) Put(ctx context.Context, key string, r io.Reader, opts storage.
 		}
 	}
 
+	// Large bodies go up in parts: a single PutObject is capped at 5 GiB
+	// and needs a seekable body (see multipart.go).
+	if bodySize > multipartThreshold {
+		return p.putMultipart(ctx, key, r, bodySize, opts, in)
+	}
+	// A small body that cannot seek (a stream) is buffered: the SDK needs
+	// to rewind it to sign the payload.
+	if _, seekable := r.(io.Seeker); !seekable {
+		buf, rerr := io.ReadAll(io.LimitReader(r, multipartThreshold+1))
+		if rerr != nil {
+			return storage.PutResult{}, fmt.Errorf("s3: put %q: read body: %w", key, rerr)
+		}
+		if int64(len(buf)) > multipartThreshold {
+			return storage.PutResult{}, fmt.Errorf("s3: put %q: unseekable body over %d bytes needs PutOptions.ContentLength (multipart upload must know the size)", key, multipartThreshold)
+		}
+		in.Body = bytes.NewReader(buf)
+		if bodySize == 0 {
+			bodySize = int64(len(buf))
+		}
+	}
 	var callOpts []func(*s3.Options)
 	if opts.IfNotExists {
 		callOpts = append(callOpts, retryConditionalConflict)

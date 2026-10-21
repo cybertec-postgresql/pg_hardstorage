@@ -32,7 +32,6 @@ import (
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
-	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo"
 )
 
 // GraphSchema is the on-disk version tag for Graph bodies.
@@ -141,10 +140,11 @@ type Node struct {
 	// AnalyzeChain; nil before analysis.
 	Metrics *ChainMetrics `json:"metrics,omitempty"`
 
-	// chunks is the per-node distinct chunk set (hash → length),
-	// stashed at build time from the manifest. Private — analysis
-	// reads it directly; renderers don't need it. Not serialized.
-	chunks map[repo.Hash]int64 `json:"-"`
+	// src is the manifest this node was built from. Analysis walks its
+	// chunks on demand (EachFile), holding a chunk set only for the nodes
+	// on the current root-to-node path rather than one per backup.
+	// Private; not serialized.
+	src *backup.Manifest `json:"-"`
 }
 
 // IsRoot reports whether this node sits at the top of a chain.
@@ -227,7 +227,7 @@ func BuildGraph(ctx context.Context, sp storage.StoragePlugin, deployment string
 	// Graph.UnreadableCount.
 	unreadable := 0
 	if opts.IncludeTombstoned {
-		for entry, lerr := range store.ListIncludingTombstoned(ctx, deployment, opts.Verifier) {
+		for entry, lerr := range store.ListIncludingTombstonedAuto(ctx, deployment, opts.Verifier) {
 			if err := ctx.Err(); err != nil {
 				finish()
 				return g, err
@@ -241,7 +241,7 @@ func BuildGraph(ctx context.Context, sp storage.StoragePlugin, deployment string
 			byID[n.BackupID] = n
 		}
 	} else {
-		for m, lerr := range store.List(ctx, deployment, opts.Verifier) {
+		for m, lerr := range store.ListAuto(ctx, deployment, opts.Verifier) {
 			if err := ctx.Err(); err != nil {
 				finish()
 				return g, err
@@ -273,7 +273,10 @@ func BuildGraph(ctx context.Context, sp storage.StoragePlugin, deployment string
 	linkNodes(g, byID)
 
 	if !opts.SkipAnalysis {
-		AnalyzeChain(g)
+		if err := AnalyzeChainContext(ctx, g); err != nil {
+			finish()
+			return g, err
+		}
 	}
 
 	finish()
@@ -420,24 +423,14 @@ func manifestToNode(m *backup.Manifest, _ bool) *Node {
 		StopLSN:        m.StopLSN,
 		Timeline:       m.Timeline,
 		PGVersion:      m.PGVersion,
-		LogicalBytes:   sumFileSizes(m),
+		LogicalBytes:   m.TotalFileBytes(),
+		src:            m,
 	}
 	if m.Encryption != nil {
 		n.Encrypted = true
 		n.KEKRef = m.Encryption.KEKRef
 	}
-	n.chunks = uniqueChunkSet(m)
 	return n
-}
-
-// sumFileSizes returns the manifest's logical bytes — same definition
-// as forecast / repoaudit.
-func sumFileSizes(m *backup.Manifest) int64 {
-	var total int64
-	for _, f := range m.Files {
-		total += f.Size
-	}
-	return total
 }
 
 // assignDepth fills Depth for n and its children via DFS.
@@ -516,21 +509,4 @@ func detectCycles(nodes map[string]*Node) map[string]struct{} {
 		}
 	}
 	return cycles
-}
-
-// uniqueChunkSet returns the set of distinct chunk hashes in a
-// manifest. A chunk referenced by multiple files counts once.
-func uniqueChunkSet(m *backup.Manifest) map[repo.Hash]int64 {
-	out := map[repo.Hash]int64{}
-	for _, f := range m.Files {
-		for _, c := range f.Chunks {
-			// Multiple references to the same chunk inside a
-			// single manifest happen for tablespace shared
-			// chunks. We keep the first observed length.
-			if _, ok := out[c.Hash]; !ok {
-				out[c.Hash] = c.Len
-			}
-		}
-	}
-	return out
 }
