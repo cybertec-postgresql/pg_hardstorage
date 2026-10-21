@@ -170,6 +170,14 @@ type TakeOptions struct {
 	// must NOT block; they back-pressure the basebackup pipe.
 	OnFile func(tarsink.FileStats)
 
+	// SpoolDir is where the backup's file-entry spool and canonical
+	// manifest are written while it runs (empty = os.TempDir()). The
+	// manifest of a very large database is hundreds of GB; it is spooled
+	// to disk as the tar stream is chunked, never held in memory, so this
+	// needs free space on the order of the manifest size (about 115
+	// bytes per chunk, two copies while signing).
+	SpoolDir string
+
 	// Actor identifies who initiated the backup, for the hash-chained
 	// audit log. Free-form (operator email, agent ID, "scheduler",
 	// etc.). Empty when the runner is invoked from a path that
@@ -496,15 +504,15 @@ func take(ctx context.Context, opts TakeOptions, abortCtx *context.Context) (*Re
 	// means no hints (a normal, un-accelerated backup), never a
 	// backup failure. A first backup finds no prior manifest and gets
 	// an empty set, which is a no-op.
-	hints, hintErr := loadDedupHints(ctx, sp, opts.Deployment)
+	hints, hintCount, hintErr := loadDedupHints(ctx, sp, opts.Deployment)
 	if hintErr != nil {
 		emit(output.NewEvent(output.SeverityWarning, "backup", "dedup_hints_unavailable").
 			WithSubject(output.Subject{Deployment: opts.Deployment}).
 			WithBody(map[string]any{"error": hintErr.Error()}))
-	} else if len(hints) > 0 {
+	} else if hintCount > 0 {
 		emit(output.NewEvent(output.SeverityInfo, "backup", "dedup_hints_loaded").
 			WithSubject(output.Subject{Deployment: opts.Deployment}).
-			WithBody(map[string]any{"hint_chunks": len(hints)}))
+			WithBody(map[string]any{"hint_chunks": hintCount}))
 	}
 
 	// Chunks are written DurabilityDeferred — no per-chunk fsync —
@@ -530,7 +538,7 @@ func take(ctx context.Context, opts TakeOptions, abortCtx *context.Context) (*Re
 	casOpts := []casdefault.Option{
 		casdefault.WithCompressionLevel(repoMeta.Compression),
 		casdefault.WithChunkDurability(storage.DurabilityDeferred),
-		casdefault.WithDedupHints(hints),
+		casdefault.WithDedupHintFilter(hints),
 	}
 	cas := casdefault.NewWithRetention(sp, repoMeta.WORM, wormNow, casOpts...)
 	var encryptionInfo *backup.EncryptionInfo
@@ -603,6 +611,28 @@ func take(ctx context.Context, opts TakeOptions, abortCtx *context.Context) (*Re
 		}
 	}
 	manifestStore := backup.NewManifestStore(sp)
+
+	// The manifest's file entries are spooled to disk as the tar stream
+	// is chunked, not accumulated in memory: a 200 TB database has about
+	// 3.3 billion chunk references, ~380 GB of manifest.
+	spool, err := backup.NewManifestSpool(opts.SpoolDir, 0)
+	if err != nil {
+		return nil, fmt.Errorf("backup: %w", err)
+	}
+	defer spool.Close()
+	// An invalid entry (bad path, chunk-sum mismatch, duplicate) must not
+	// fail the tar parse with an opaque error: remember the first one and
+	// let the manifest gate below report it the way it always has.
+	var spoolErr error
+	addEntry := func(fe *backup.FileEntry) error {
+		if spoolErr != nil {
+			return nil
+		}
+		if err := spool.Add(fe); err != nil {
+			spoolErr = err
+		}
+		return nil
+	}
 
 	// 2. Probe the PG version on a regular-mode connection. Replication
 	//    mode can't run SHOW, and we want the version recorded on the
@@ -681,6 +711,7 @@ func take(ctx context.Context, opts TakeOptions, abortCtx *context.Context) (*Re
 	if opts.OnFile != nil {
 		sinkOpts = append(sinkOpts, tarsink.WithFileObserver(opts.OnFile))
 	}
+	sinkOpts = append(sinkOpts, tarsink.WithEntryHandler(addEntry))
 	sink := tarsink.New(ctx, cas, sinkOpts...)
 	backupTypeLabel = string(backupType)
 	started = true
@@ -774,7 +805,11 @@ func take(ctx context.Context, opts TakeOptions, abortCtx *context.Context) (*Re
 	// commit moves that failure to backup time where the operator
 	// has full context — and ensures every committed manifest in
 	// the repo IS restorable.
-	if err := m.Validate(); err != nil {
+	validateErr := spoolErr
+	if validateErr == nil {
+		validateErr = spool.ValidateManifest(m)
+	}
+	if err := validateErr; err != nil {
 		span.SetStatus(codes.Error, err.Error())
 		return nil, output.NewError("backup.manifest_invalid",
 			fmt.Sprintf("backup: refusing to commit %s: manifest fails its own invariant check: %v",
@@ -833,7 +868,7 @@ func take(ctx context.Context, opts TakeOptions, abortCtx *context.Context) (*Re
 				"error": lerr.Error(),
 				"hint":  "could not query data_directory / config_file from source PG; skipping the pre-commit essential-files check",
 			}))
-	} else if eerr := backup.CheckEssentialFiles(m, locs.DataDirectory, locs.ConfigFile, locs.HbaFile, locs.IdentFile); eerr != nil {
+	} else if eerr := backup.CheckEssentialFilesIn(func(rel string) bool { return spool.HasFile(0, rel) }, locs.DataDirectory, locs.ConfigFile, locs.HbaFile, locs.IdentFile); eerr != nil {
 		span.SetStatus(codes.Error, eerr.Error())
 		return nil, output.NewError("backup.missing_essential_files",
 			fmt.Sprintf("backup: refusing to commit %s: %v", backupID, eerr)).
@@ -938,9 +973,9 @@ func take(ctx context.Context, opts TakeOptions, abortCtx *context.Context) (*Re
 	commitCtx, commitSpan := tracing.Tracer().Start(ctx, "manifest.commit",
 		trace.WithAttributes(
 			attribute.String("backup_id", backupID),
-			attribute.Int("file_count", len(m.Files)),
+			attribute.Int64("file_count", spool.NumFiles()),
 		))
-	if err := manifestStore.Commit(commitCtx, m, opts.Signer, commitOpts); err != nil {
+	if err := manifestStore.CommitSpooled(commitCtx, m, spool, opts.Signer, commitOpts); err != nil {
 		commitSpan.SetStatus(codes.Error, err.Error())
 		commitSpan.End()
 		span.SetStatus(codes.Error, err.Error())
@@ -957,12 +992,12 @@ func take(ctx context.Context, opts TakeOptions, abortCtx *context.Context) (*Re
 
 	// 7. Re-read + verify with the user-supplied Verifier — proves the
 	//    just-written manifest is consumable by the rest of the system.
-	if _, err := manifestStore.Read(ctx, opts.Deployment, backupID, opts.Verifier); err != nil {
+	if _, err := manifestStore.ReadStreaming(ctx, opts.Deployment, backupID, opts.Verifier); err != nil {
 		return nil, fmt.Errorf("backup: post-commit verify: %w", err)
 	}
 
 	stoppedAt := time.Now().UTC()
-	res := summarize(opts, m, sink, identity, pgVersion.Major, startedAt, stoppedAt)
+	res := summarize(opts, m, spool, identity, pgVersion.Major, startedAt, stoppedAt)
 	res.PrimaryKey = backup.PrimaryPath(opts.Deployment, backupID)
 	// Dedup outcomes measured at PutChunk time (the CAS counts them as
 	// it runs); safe to snapshot now that BASE_BACKUP + Barrier are
@@ -1276,8 +1311,8 @@ func buildManifest(opts TakeOptions, bb *basebackup.Result, sink *tarsink.Sink, 
 // summarize derives a Result from the assembled manifest. Counters are
 // computed by walking the FileEntries; chunk uniqueness is a hash-map
 // dedupe so two refs to the same chunk count as one unique chunk.
-func summarize(opts TakeOptions, m *backup.Manifest, _ *tarsink.Sink, identity pg.SystemIdentity, pgVersion int, startedAt, stoppedAt time.Time) *Result {
-	res := &Result{
+func summarize(opts TakeOptions, m *backup.Manifest, spool *backup.ManifestSpool, identity pg.SystemIdentity, pgVersion int, startedAt, stoppedAt time.Time) *Result {
+	return &Result{
 		BackupID:         m.BackupID,
 		Deployment:       opts.Deployment,
 		Tenant:           opts.Tenant,
@@ -1290,22 +1325,12 @@ func summarize(opts TakeOptions, m *backup.Manifest, _ *tarsink.Sink, identity p
 		StoppedAt:        stoppedAt,
 		Duration:         stoppedAt.Sub(startedAt),
 		TablespaceCount:  len(m.Tablespaces),
-		FileCount:        len(m.Files),
+		FileCount:        int(spool.NumFiles()),
+		LogicalBytes:     spool.TotalFileBytes(),
+		TotalChunkRefs:   int(spool.NumChunkRefs()),
+		UniqueChunkCount: int(spool.UniqueChunks()),
+		UniqueChunkBytes: spool.UniqueChunkBytes(),
 	}
-
-	uniqueBytes := map[repo.Hash]int64{}
-	for _, f := range m.Files {
-		res.LogicalBytes += f.Size
-		res.TotalChunkRefs += len(f.Chunks)
-		for _, c := range f.Chunks {
-			uniqueBytes[c.Hash] = c.Len
-		}
-	}
-	res.UniqueChunkCount = len(uniqueBytes)
-	for _, sz := range uniqueBytes {
-		res.UniqueChunkBytes += sz
-	}
-	return res
 }
 
 // readGapsForManifest snapshots the deployment's persisted

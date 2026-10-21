@@ -130,6 +130,10 @@ type Sink struct {
 	pipeWriter *io.PipeWriter
 	parserDone chan parserResult
 
+	// entryHandler, when set, receives every file entry as it is produced
+	// instead of the sink accumulating it in files. See WithEntryHandler.
+	entryHandler func(*backup.FileEntry) error
+
 	// manifestBuf accumulates raw bytes when currentIdx == ManifestSinkIndex.
 	manifestBuf bytes.Buffer
 
@@ -180,6 +184,18 @@ func defaultChunkConcurrency() int {
 		n = 1
 	}
 	return n
+}
+
+// WithEntryHandler hands every finished FileEntry to fn, in the order
+// the tar stream produced them, instead of accumulating them in memory.
+// With it set, Files and AllFiles return nothing: the caller owns the
+// entries. This is what lets a backup of a database with billions of
+// chunks keep its manifest off the heap — the runner spools each entry
+// to disk as it arrives. fn runs on the tar-parsing goroutine, one
+// tablespace at a time; it must not block for long (it back-pressures
+// the basebackup pipe). The entry is only valid during the call.
+func WithEntryHandler(fn func(*backup.FileEntry) error) Option {
+	return func(s *Sink) { s.entryHandler = fn }
 }
 
 // FileStats summarises a single regular file's pass through the
@@ -600,6 +616,12 @@ func (s *Sink) parseTar(ctx context.Context, r io.Reader, idx int, tsOID uint32)
 		// non-default-tablespace file under its real location rather
 		// than flattening it under PGDATA root.
 		entry.TablespaceOID = tsOID
+		if s.entryHandler != nil {
+			if err := s.entryHandler(&entry); err != nil {
+				return files, dirs, fmt.Errorf("record %s: %w", hdr.Name, err)
+			}
+			continue
+		}
 		files = append(files, entry)
 	}
 }

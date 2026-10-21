@@ -327,7 +327,7 @@ func Restore(ctx context.Context, opts Options) (res *Result, err error) {
 	// GB and must not be held in memory. Verification (signature and
 	// every invariant) happens in this call; the entries are walked on
 	// demand by m.EachFile.
-	m, err := store.ReadStreaming(ctx, opts.Deployment, opts.BackupID, opts.Verifier)
+	m, err := store.ReadAuto(ctx, opts.Deployment, opts.BackupID, opts.Verifier)
 	if err != nil {
 		return nil, mapManifestReadErr("restore", opts.Deployment, opts.BackupID, err)
 	}

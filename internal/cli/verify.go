@@ -6,9 +6,9 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"iter"
 	"io"
 	"os"
-	"sort"
 	"strings"
 	"time"
 
@@ -24,6 +24,7 @@ import (
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/encryption/aesgcm"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/spill"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo/casdefault"
 )
 
@@ -164,7 +165,7 @@ func runVerify(cmd *cobra.Command, deployment, backupID, repoURL string, sample 
 		backupID = latest
 	}
 
-	m, err := store.Read(cmd.Context(), deployment, backupID, verifier)
+	m, err := store.ReadAuto(cmd.Context(), deployment, backupID, verifier)
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			return output.NewError("notfound.backup",
@@ -294,7 +295,7 @@ func pickLatestBackup(ctx context.Context, store *backup.ManifestStore, deployme
 	var latestID string
 	var latestStop time.Time
 	skipped := 0
-	for m, err := range store.List(ctx, deployment, verifier) {
+	for m, err := range store.ListAuto(ctx, deployment, verifier) {
 		if err != nil {
 			// Counted, not merely skipped. A manifest that fails
 			// verification yields no stopped_at and cannot be ranked,
@@ -449,28 +450,20 @@ type verifyStats struct {
 // abort.
 func verifyChunks(ctx context.Context, cas *repo.CAS, m *backup.Manifest, sample int) (verifyStats, error) {
 	stats := verifyStats{}
-	unique := map[repo.Hash]struct{}{}
-	for _, f := range m.Files {
-		for _, c := range f.Chunks {
-			stats.ChunksReferenced++
-			unique[c.Hash] = struct{}{}
-		}
+	unique, referenced, err := uniqueChunkSet(ctx, m)
+	if err != nil {
+		return stats, err
 	}
-	stats.ChunksUnique = len(unique)
+	defer unique.Close()
+	stats.ChunksReferenced = referenced
+	stats.ChunksUnique = unique.Len()
+	hashes, err := firstHashes(unique, sample)
+	if err != nil {
+		return stats, err
+	}
+	stats.ChunksSampled = hashes.n
 
-	hashes := make([]repo.Hash, 0, len(unique))
-	for h := range unique {
-		hashes = append(hashes, h)
-	}
-	sort.Slice(hashes, func(i, j int) bool {
-		return hashes[i].String() < hashes[j].String()
-	})
-	if sample > 0 && sample < len(hashes) {
-		hashes = hashes[:sample]
-	}
-	stats.ChunksSampled = len(hashes)
-
-	for _, h := range hashes {
+	for h := range hashes.each() {
 		// Cooperative cancellation point. We check BEFORE each
 		// GetChunkBytes — checking after would still let one
 		// ctx-cancelled call leak into stats.Mismatches.
@@ -546,28 +539,20 @@ func summarizeHashes(h []repo.Hash, max int) string {
 // inflating Mismatches.
 func verifyChunkExistence(ctx context.Context, sp storage.StoragePlugin, m *backup.Manifest, sample int) (verifyStats, error) {
 	stats := verifyStats{}
-	unique := map[repo.Hash]struct{}{}
-	for _, f := range m.Files {
-		for _, c := range f.Chunks {
-			stats.ChunksReferenced++
-			unique[c.Hash] = struct{}{}
-		}
+	unique, referenced, err := uniqueChunkSet(ctx, m)
+	if err != nil {
+		return stats, err
 	}
-	stats.ChunksUnique = len(unique)
+	defer unique.Close()
+	stats.ChunksReferenced = referenced
+	stats.ChunksUnique = unique.Len()
+	hashes, err := firstHashes(unique, sample)
+	if err != nil {
+		return stats, err
+	}
+	stats.ChunksSampled = hashes.n
 
-	hashes := make([]repo.Hash, 0, len(unique))
-	for h := range unique {
-		hashes = append(hashes, h)
-	}
-	sort.Slice(hashes, func(i, j int) bool {
-		return hashes[i].String() < hashes[j].String()
-	})
-	if sample > 0 && sample < len(hashes) {
-		hashes = hashes[:sample]
-	}
-	stats.ChunksSampled = len(hashes)
-
-	for _, h := range hashes {
+	for h := range hashes.each() {
 		if err := ctx.Err(); err != nil {
 			return stats, err
 		}
@@ -656,4 +641,57 @@ func emitVerifyLatestSkipWarning(_ context.Context, deployment, chosen string, s
 			"could not be verified or read; %q is the newest of the ones that COULD be read, and a "+
 			"skipped manifest may have been newer.\n",
 		deployment, skipped, chosen)
+}
+
+// uniqueChunkSet collects the distinct chunk hashes a manifest references
+// into a bounded-memory set (billions of chunks do not fit a map) and
+// counts the total references. The caller closes the set.
+func uniqueChunkSet(ctx context.Context, m *backup.Manifest) (*spill.HashSet, int, error) {
+	set := spill.NewHashSet(spill.Options{})
+	referenced := 0
+	if err := m.EachFile(ctx, func(f *backup.FileEntry) error {
+		for _, c := range f.Chunks {
+			referenced++
+			set.Add(c.Hash)
+		}
+		return nil
+	}); err != nil {
+		set.Close()
+		return nil, 0, err
+	}
+	if err := set.Err(); err != nil {
+		set.Close()
+		return nil, 0, err
+	}
+	return set, referenced, nil
+}
+
+// firstHashes selects the first n hashes (all when n <= 0 or n exceeds the
+// set) in ascending hash order — the order verify has always walked in.
+type hashWindow struct {
+	set *spill.HashSet
+	n   int
+}
+
+func firstHashes(set *spill.HashSet, sample int) (hashWindow, error) {
+	n := set.Len()
+	if sample > 0 && sample < n {
+		n = sample
+	}
+	return hashWindow{set: set, n: n}, set.Err()
+}
+
+// each yields the window's hashes in ascending order.
+func (w hashWindow) each() iter.Seq[repo.Hash] {
+	return func(yield func(repo.Hash) bool) {
+		i := 0
+		stop := errors.New("stop")
+		_ = w.set.ForEach(func(k spill.Key) error {
+			if i >= w.n || !yield(repo.Hash(k)) {
+				return stop
+			}
+			i++
+			return nil
+		})
+	}
 }

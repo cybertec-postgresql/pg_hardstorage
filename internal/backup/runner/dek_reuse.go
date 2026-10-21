@@ -3,7 +3,6 @@ package runner
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -122,10 +121,16 @@ func looksLikePrimaryManifest(key string) bool {
 	return true
 }
 
-// readManifestNoVerify pulls the manifest bytes off sp at key and
-// unmarshals without checking the ed25519 signature.  Only the
-// Encryption block is consumed downstream; the wrap-unwrap step
-// authenticates the DEK.
+// readManifestNoVerify reads the Encryption block off the manifest at
+// key without checking the ed25519 signature. Only that block is
+// consumed downstream; the wrap-unwrap step authenticates the DEK.
+//
+// It reads the HEAD of the document only: Commit writes the encryption
+// block before the files array, so the probe costs a few KB however large
+// the manifest is. (The probe used to read the whole manifest under a
+// 1 GiB cap, which for a database past ~0.6 TB failed every time — and a
+// failed probe is a soft miss, so every backup of it silently got a fresh
+// DEK and stopped deduplicating against the last one.)
 func readManifestNoVerify(ctx context.Context, sp storage.StoragePlugin, key string) (*backup.Manifest, bool, error) {
 	rc, err := sp.Get(ctx, key)
 	if err != nil {
@@ -135,19 +140,11 @@ func readManifestNoVerify(ctx context.Context, sp storage.StoragePlugin, key str
 		return nil, false, err
 	}
 	defer rc.Close()
-	// Bounded read like every other manifest consumer (perf audit #5a):
-	// this is a DEK-reuse probe that may touch a manifest that declares
-	// a huge files/chunks array or is corrupt/oversized; an unbounded
-	// ReadAll would OOM the runner before the JSON can be rejected.
-	body, err := backup.ReadAllLimited(rc, backup.MaxManifestBytes)
+	m, err := backup.ScanManifestFields(rc, "encryption")
 	if err != nil {
 		return nil, false, err
 	}
-	var m backup.Manifest
-	if err := json.Unmarshal(body, &m); err != nil {
-		return nil, false, err
-	}
-	return &m, true, nil
+	return m, true, nil
 }
 
 // unwrapDEKForReuse decrypts an existing manifest's WrappedDEK with

@@ -39,6 +39,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/hex"
 	stdjson "encoding/json"
 	"errors"
 	"fmt"
@@ -53,6 +54,7 @@ import (
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/spill"
 )
 
 // Schema strings (24-month backward-compat).
@@ -278,12 +280,17 @@ func (e *Engine) Execute(ctx context.Context, deployment string, strategy Strate
 		deployments = ds
 	}
 
-	// 2. Walk manifests, collect chunk references.
-	chunkRefs := make(map[repo.Hash][]string) // hash → list of backup IDs
+	// 2. Walk manifests, collect the DISTINCT chunk references. The set is
+	// bounded-memory (it spills to disk): a 200 TB database references
+	// billions of chunks, far more than a map holds, and its manifests are
+	// walked as streams, never held.
+	refs := spill.NewHashSet(spill.Options{})
+	defer refs.Close()
 	for _, d := range deployments {
-		// List yields verified manifests; failures (signature break /
-		// unreadable / decode failure) come through the error channel.
-		for m, err := range e.manifests.List(ctx, d, e.verifier) {
+		// ListStreaming yields verified manifests; failures (signature
+		// break / unreadable / decode failure) come through the error
+		// channel.
+		for m, err := range e.manifests.ListAuto(ctx, d, e.verifier) {
 			run.Manifests.Total++
 			if err != nil {
 				run.Manifests.SignaturesFail++
@@ -297,14 +304,28 @@ func (e *Engine) Execute(ctx context.Context, deployment string, strategy Strate
 			if strategy.Mode == "manifests-only" {
 				continue
 			}
-			for _, file := range m.Files {
+			if err := m.EachFile(ctx, func(file *backup.FileEntry) error {
 				for _, c := range file.Chunks {
-					// One entry per (chunk, backup), not one
-					// per chunk occurrence — see appendRef.
-					chunkRefs[c.Hash] = appendRef(chunkRefs[c.Hash], m.BackupID)
+					refs.Add(c.Hash)
 				}
+				return nil
+			}); err != nil {
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					return nil, fmt.Errorf("integrity: run aborted: %w", ctxErr)
+				}
+				// The manifest verified but its entries could not be
+				// walked: its chunks were not checked, which is a
+				// failure to verify, not a pass.
+				run.Manifests.SignaturesFail++
+				run.Manifests.Failures = append(run.Manifests.Failures, ManifestFailure{
+					Deployment: d,
+					Reason:     "read file entries: " + err.Error(),
+				})
 			}
 		}
+	}
+	if err := refs.Err(); err != nil {
+		return nil, fmt.Errorf("integrity: chunk reference set: %w", err)
 	}
 
 	if strategy.Mode == "manifests-only" {
@@ -312,63 +333,69 @@ func (e *Engine) Execute(ctx context.Context, deployment string, strategy Strate
 		return run, nil
 	}
 
-	// 3. Order chunks deterministically so sampling is reproducible.
-	hashes := make([]repo.Hash, 0, len(chunkRefs))
-	for h := range chunkRefs {
-		hashes = append(hashes, h)
-	}
-	sort.Slice(hashes, func(i, j int) bool {
-		return hashes[i].String() < hashes[j].String()
-	})
-	run.Chunks.DistinctReferenced = len(hashes)
+	// 3. Chunks are visited in ascending hash order (the set's native
+	// order), so sampling is reproducible and the report is stable.
+	total := refs.Len()
+	run.Chunks.DistinctReferenced = total
 
-	// 4. Pick the sample for content-verification.
-	sample := pickSample(hashes, strategy, e.rng)
+	// 4. Pick the sample for content-verification, as the set of ranks
+	// (positions in that ascending order) to content-check.
+	sample := pickSampleRanks(total, strategy, e.rng)
 
 	// 5. Walk every referenced hash for presence.  For each hash in
-	// the sample, additionally fetch + verify content.
-	sampleSet := make(map[repo.Hash]struct{}, len(sample))
-	for _, h := range sample {
-		sampleSet[h] = struct{}{}
+	// the sample, additionally fetch + verify content. Failing hashes are
+	// remembered (up to a cap) so a second, narrow pass can name the
+	// backups that reference them without a hash -> backups map for the
+	// whole repository.
+	const maxReferrerLookups = 100_000
+	failing := map[repo.Hash]struct{}{}
+	noteFail := func(h repo.Hash) {
+		if len(failing) < maxReferrerLookups {
+			failing[h] = struct{}{}
+		}
 	}
-	for _, h := range hashes {
+	var rank int64
+	walkErr := refs.ForEach(func(k spill.Key) error {
+		h := repo.Hash(k)
+		inSample := sample.has(rank)
+		rank++
 		if err := ctx.Err(); err != nil {
 			// Cancelled: abort rather than record every remaining
 			// chunk as missing and sign that as an attestation.
-			return nil, fmt.Errorf("integrity: run aborted: %w", err)
+			return fmt.Errorf("integrity: run aborted: %w", err)
 		}
 		run.Chunks.PresenceChecked++
 		_, err := e.sp.Stat(ctx, repo.ChunkKey(h))
 		if err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
-				return nil, fmt.Errorf("integrity: run aborted: %w", ctxErr)
+				return fmt.Errorf("integrity: run aborted: %w", ctxErr)
 			}
 			if !errors.Is(err, storage.ErrNotFound) {
 				run.Chunks.PresenceUnchecked++
 				run.Chunks.Failures = append(run.Chunks.Failures, ChunkFailure{
-					ChunkHash:    h.String(),
-					Reason:       "stat_failed",
-					Detail:       err.Error(),
-					ReferencedBy: dedupeIDs(chunkRefs[h]),
+					ChunkHash: h.String(),
+					Reason:    "stat_failed",
+					Detail:    err.Error(),
 				})
-				continue
+				noteFail(h)
+				return nil
 			}
 			run.Chunks.Missing++
 			run.Chunks.Failures = append(run.Chunks.Failures, ChunkFailure{
-				ChunkHash:    h.String(),
-				Reason:       "missing",
-				Detail:       err.Error(),
-				ReferencedBy: dedupeIDs(chunkRefs[h]),
+				ChunkHash: h.String(),
+				Reason:    "missing",
+				Detail:    err.Error(),
 			})
-			continue
+			noteFail(h)
+			return nil
 		}
-		if _, ok := sampleSet[h]; !ok {
-			continue
+		if !inSample {
+			return nil
 		}
 		run.Chunks.Sampled++
 		if e.cas == nil {
 			run.Chunks.Skipped++
-			continue
+			return nil
 		}
 		// GetChunkBytes does decompress + plaintext-SHA-256 check.
 		// On encrypted chunks without a registered decryptor, it
@@ -378,7 +405,7 @@ func (e *Engine) Execute(ctx context.Context, deployment string, strategy Strate
 		if _, err := e.cas.GetChunkBytes(ctx, h); err != nil {
 			if isMissingDecryptorErr(err) {
 				run.Chunks.Skipped++
-				continue
+				return nil
 			}
 			// Distinguish a corrupted-content failure from a "could
 			// not even fetch the bytes" failure for the report.
@@ -388,14 +415,32 @@ func (e *Engine) Execute(ctx context.Context, deployment string, strategy Strate
 				run.Chunks.Mismatched++
 			}
 			run.Chunks.Failures = append(run.Chunks.Failures, ChunkFailure{
-				ChunkHash:    h.String(),
-				Reason:       reason,
-				Detail:       err.Error(),
-				ReferencedBy: dedupeIDs(chunkRefs[h]),
+				ChunkHash: h.String(),
+				Reason:    reason,
+				Detail:    err.Error(),
 			})
-			continue
+			noteFail(h)
+			return nil
 		}
 		run.Chunks.Verified++
+		return nil
+	})
+	if walkErr != nil {
+		return nil, walkErr
+	}
+	if err := refs.Err(); err != nil {
+		return nil, fmt.Errorf("integrity: chunk reference set: %w", err)
+	}
+
+	// 6. Name the referrers of failing chunks (ReferencedBy).
+	if len(failing) > 0 {
+		referrers := e.findReferrers(ctx, deployments, failing)
+		for i := range run.Chunks.Failures {
+			f := &run.Chunks.Failures[i]
+			if h, err := parseChunkHash(f.ChunkHash); err == nil {
+				f.ReferencedBy = dedupeIDs(referrers[h])
+			}
+		}
 	}
 
 	finishRun(run, e.now())
@@ -513,54 +558,108 @@ func isHashMismatchErr(err error) bool {
 		strings.Contains(msg, "checksum mismatch")
 }
 
-// pickSample resolves the strategy + chunk set into the list of
-// chunks to content-verify.
-func pickSample(hashes []repo.Hash, s Strategy, rng func(int64) *rand.Rand) []repo.Hash {
-	if len(hashes) == 0 {
-		return nil
+// sampleRanks is the set of positions, in ascending hash order, chosen
+// for content verification. all means every position.
+type sampleRanks struct {
+	all    bool
+	chosen map[int64]struct{}
+}
+
+func (r sampleRanks) has(rank int64) bool {
+	if r.all {
+		return true
+	}
+	_, ok := r.chosen[rank]
+	return ok
+}
+
+// pickSampleRanks resolves the strategy into which of the n distinct
+// chunks (ranked by ascending hash) to content-verify. It never
+// materialises the chunks: a partial Fisher-Yates over a SPARSE array
+// draws exactly the picks the old dense shuffle drew (same rng calls,
+// same swaps), but costs O(count) rather than O(n), and n can be
+// billions.
+func pickSampleRanks(n int, s Strategy, rng func(int64) *rand.Rand) sampleRanks {
+	if n == 0 {
+		return sampleRanks{}
 	}
 	switch s.Mode {
 	case "manifests-only", "presence":
-		return nil
+		return sampleRanks{}
 	case "content-full":
-		return hashes
+		return sampleRanks{all: true}
 	case "content-sample":
 		count := s.Count
 		if count == 0 && s.Percent > 0 {
-			count = (s.Percent * len(hashes)) / 100
+			count = int((int64(s.Percent) * int64(n)) / 100)
 			if count < 1 {
 				count = 1
 			}
 		}
 		if count == 0 {
-			return nil
+			return sampleRanks{}
 		}
-		if count >= len(hashes) {
-			return hashes
+		if count >= n {
+			return sampleRanks{all: true}
 		}
 		seed := s.Seed
 		if seed == 0 {
-			seed = int64(len(hashes))
+			seed = int64(n)
 		}
 		r := rng(seed)
-		// Fisher-Yates partial shuffle.
-		idx := make([]int, len(hashes))
-		for i := range idx {
-			idx[i] = i
+		// idx[i] defaults to i; only swapped slots are stored.
+		idx := make(map[int]int, 2*count)
+		at := func(i int) int {
+			if v, ok := idx[i]; ok {
+				return v
+			}
+			return i
 		}
+		chosen := make(map[int64]struct{}, count)
 		for i := 0; i < count; i++ {
-			j := i + r.Intn(len(idx)-i)
-			idx[i], idx[j] = idx[j], idx[i]
+			j := i + r.Intn(n-i)
+			vi, vj := at(i), at(j)
+			idx[i], idx[j] = vj, vi
+			chosen[int64(idx[i])] = struct{}{}
 		}
-		out := make([]repo.Hash, count)
-		for i := 0; i < count; i++ {
-			out[i] = hashes[idx[i]]
-		}
-		// Sort for stable output.
-		sort.Slice(out, func(i, j int) bool { return out[i].String() < out[j].String() })
-		return out
+		return sampleRanks{chosen: chosen}
 	}
-	return nil
+	return sampleRanks{}
+}
+
+// findReferrers re-walks the manifests once to map each hash in want to
+// the backups that reference it. Used only for the (normally few)
+// chunks a run found failing, so the whole-repository hash -> backups
+// map the old implementation built is never needed.
+func (e *Engine) findReferrers(ctx context.Context, deployments []string, want map[repo.Hash]struct{}) map[repo.Hash][]string {
+	out := make(map[repo.Hash][]string, len(want))
+	for _, d := range deployments {
+		for m, err := range e.manifests.ListAuto(ctx, d, e.verifier) {
+			if err != nil || m == nil {
+				continue
+			}
+			id := m.BackupID
+			_ = m.EachFile(ctx, func(file *backup.FileEntry) error {
+				for _, c := range file.Chunks {
+					if _, ok := want[c.Hash]; ok {
+						out[c.Hash] = appendRef(out[c.Hash], id)
+					}
+				}
+				return nil
+			})
+		}
+	}
+	return out
+}
+
+func parseChunkHash(s string) (repo.Hash, error) {
+	var h repo.Hash
+	b, err := hex.DecodeString(s)
+	if err != nil || len(b) != len(h) {
+		return h, fmt.Errorf("bad chunk hash %q", s)
+	}
+	copy(h[:], b)
+	return h, nil
 }
 
 func validateStrategy(s Strategy) error {

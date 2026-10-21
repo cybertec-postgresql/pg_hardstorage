@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"reflect"
 	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup"
@@ -262,5 +263,22 @@ func TestStreamManifest_ConstantMemory(t *testing.T) {
 	t.Logf("document %d MB, heap growth while streaming+verifying+validating: %d MB", len(raw)>>20, grew>>20)
 	if grew > int64(len(raw))/2 {
 		t.Errorf("heap grew %d MB streaming a %d MB document: not constant-memory", grew>>20, len(raw)>>20)
+	}
+}
+
+func TestScanTopLevelStrings_SkipsFilesAndFoldsKeys(t *testing.T) {
+	doc := `{"schema":"x","files":[{"path":"a","chunks":[{"hash":"h"}]},{"path":"b"}],"Backup_ID":"id1","parent_backup_id":null,"nested":{"backup_id":"WRONG"},"parent_backup_id":"p1"}`
+	got, err := backup.ScanTopLevelStringsForTest(strings.NewReader(doc), "backup_id", "parent_backup_id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got["backup_id"] != "id1" || got["parent_backup_id"] != "p1" {
+		t.Errorf("got %v", got)
+	}
+	if _, err := backup.ScanTopLevelStringsForTest(strings.NewReader(`{"backup_id":`), "backup_id"); err == nil {
+		t.Error("truncated document accepted")
+	}
+	if _, err := backup.ScanTopLevelStringsForTest(strings.NewReader(`{"backup_id":3}`), "backup_id"); err == nil {
+		t.Error("non-string value accepted")
 	}
 }

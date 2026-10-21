@@ -108,11 +108,6 @@ func CheckEssentialFiles(m *Manifest, dataDir, configFile, hbaFile, identFile st
 	if m == nil {
 		return errors.New("CheckEssentialFiles: nil manifest")
 	}
-	if dataDir == "" {
-		return errors.New("CheckEssentialFiles: empty data_directory; cannot reason about external configs")
-	}
-	dataDir = filepath.Clean(dataDir)
-
 	// Index the manifest's file list by path relative to the data
 	// directory (PG's backup_manifest paths are). The always-required
 	// files are top-level; the config files are looked up at the path
@@ -122,10 +117,22 @@ func CheckEssentialFiles(m *Manifest, dataDir, configFile, hbaFile, identFile st
 	for i := range m.Files {
 		present[strings.TrimPrefix(filepath.ToSlash(m.Files[i].Path), "./")] = true
 	}
+	return CheckEssentialFilesIn(func(rel string) bool { return present[rel] }, dataDir, configFile, hbaFile, identFile)
+}
+
+// CheckEssentialFilesIn is CheckEssentialFiles over any membership test
+// on paths relative to the data directory, for callers (the backup
+// runner, with its spooled manifest) that do not hold the file list.
+func CheckEssentialFilesIn(has func(rel string) bool, dataDir, configFile, hbaFile, identFile string) error {
+	present := mapLike(has)
+	if dataDir == "" {
+		return errors.New("CheckEssentialFiles: empty data_directory; cannot reason about external configs")
+	}
+	dataDir = filepath.Clean(dataDir)
 
 	miss := &MissingEssentialFilesError{}
 	for _, base := range alwaysRequiredFiles {
-		if !present[base] {
+		if !present.has(base) {
 			miss.AlwaysRequired = append(miss.AlwaysRequired, base)
 		}
 	}
@@ -155,7 +162,7 @@ func CheckEssentialFiles(m *Manifest, dataDir, configFile, hbaFile, identFile st
 			rel = oc.BaseName
 		}
 		rel = filepath.ToSlash(rel)
-		if !present[rel] {
+		if !present.has(rel) {
 			miss.InternalConfigs = append(miss.InternalConfigs, rel)
 		}
 	}
@@ -187,3 +194,8 @@ func insideDataDir(path, dataDir string) bool {
 	prefix := d + string(filepath.Separator)
 	return strings.HasPrefix(p, prefix)
 }
+
+// mapLike adapts a membership func to the lookup shape the checks use.
+type mapLike func(string) bool
+
+func (f mapLike) has(rel string) bool { return f(rel) }

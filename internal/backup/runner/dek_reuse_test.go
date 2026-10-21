@@ -185,49 +185,57 @@ func TestSelectDEK_UnwrappableExistingFailsNotFresh(t *testing.T) {
 	}
 }
 
-// infiniteReader yields 'x' forever — a manifest body far larger than
-// MaxManifestBytes without ever allocating it.
-type infiniteReader struct{}
-
-func (infiniteReader) Read(p []byte) (int, error) {
-	for i := range p {
-		p[i] = 'x'
+// TestReadManifestNoVerify_ReadsOnlyTheHead pins that the DEK-reuse probe
+// does not read a manifest past its header: an endless files array after
+// the encryption block must not be consumed. (It used to be read whole
+// under the 1 GiB manifest cap, so a database whose manifest passed that
+// size silently lost DEK reuse — and with it cross-backup dedup.)
+func TestReadManifestNoVerify_ReadsOnlyTheHead(t *testing.T) {
+	sp := newRunnerSP(t)
+	const key = "manifests/db1/backups/db1.full.A/manifest.json"
+	head := `{"schema":"pg_hardstorage.manifest.v1","backup_id":"db1.full.A",` +
+		`"encryption":{"scheme":"aes-256-gcm","kek_ref":"k1","wrapped_dek":"AAAA","envelope_version":2},"files":[`
+	endless := io.MultiReader(strings.NewReader(head), infiniteFilesReader{})
+	wrapped := &headSP{StoragePlugin: sp, key: key, body: endless}
+	m, found, err := readManifestNoVerify(context.Background(), wrapped, key)
+	if err != nil || !found {
+		t.Fatalf("found=%v err=%v", found, err)
 	}
-	return len(p), nil
+	if m.Encryption == nil || m.Encryption.KEKRef != "k1" {
+		t.Fatalf("encryption block not read: %+v", m.Encryption)
+	}
+	// No encryption block before the files array: absent, promptly.
+	plain := io.MultiReader(strings.NewReader(`{"schema":"pg_hardstorage.manifest.v1","files":[`), infiniteFilesReader{})
+	m2, found2, err := readManifestNoVerify(context.Background(), &headSP{StoragePlugin: sp, key: key, body: plain}, key)
+	if err != nil || !found2 || m2.Encryption != nil {
+		t.Fatalf("plain manifest: found=%v err=%v enc=%+v", found2, err, m2)
+	}
 }
 
-// oversizedManifestSP returns an effectively unbounded body for one
-// key, simulating a corrupt/oversized manifest object. Every other key
-// passes through to the wrapped plugin.
-type oversizedManifestSP struct {
+type headSP struct {
 	storage.StoragePlugin
-	manifestKey string
+	key  string
+	body io.Reader
 }
 
-func (s *oversizedManifestSP) Get(ctx context.Context, key string) (io.ReadCloser, error) {
-	if key == s.manifestKey {
-		return io.NopCloser(io.LimitReader(infiniteReader{}, int64(backup.MaxManifestBytes)+1024)), nil
+func (s *headSP) Get(ctx context.Context, key string) (io.ReadCloser, error) {
+	if key == s.key {
+		return io.NopCloser(s.body), nil
 	}
 	return s.StoragePlugin.Get(ctx, key)
 }
 
-// TestReadManifestNoVerify_ReadIsCapped pins perf audit #5a: the DEK-reuse
-// probe reads the manifest with the same ReadAllLimited/MaxManifestBytes
-// cap as every other manifest consumer, so a corrupt/oversized manifest
-// object errors out instead of being slurped unboundedly into memory by
-// an unbounded ReadAll before the JSON can be rejected.
-func TestReadManifestNoVerify_ReadIsCapped(t *testing.T) {
-	sp := newRunnerSP(t)
-	const key = "manifests/db1/backups/db1.full.A/manifest.json"
-	wrapped := &oversizedManifestSP{StoragePlugin: sp, manifestKey: key}
-	_, found, err := readManifestNoVerify(context.Background(), wrapped, key)
-	if err == nil {
-		t.Fatal("readManifestNoVerify on an oversized manifest body must error (read cap), not slurp it unboundedly")
+// infiniteFilesReader yields a never-ending files array body.
+type infiniteFilesReader struct{}
+
+func (infiniteFilesReader) Read(p []byte) (int, error) {
+	const entry = `{"path":"x","size":0,"chunks":null},`
+	n := 0
+	for n+len(entry) <= len(p) {
+		n += copy(p[n:], entry)
 	}
-	if found {
-		t.Error("found = true on an error read; want false")
+	if n == 0 {
+		return 0, io.ErrShortBuffer
 	}
-	if !strings.Contains(err.Error(), "exceeds") {
-		t.Errorf("error should mention the byte limit; got %v", err)
-	}
+	return n, nil
 }

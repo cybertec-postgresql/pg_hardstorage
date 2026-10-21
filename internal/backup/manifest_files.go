@@ -4,6 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"iter"
+	"sort"
+	"strings"
 )
 
 // ErrStreamedManifest is returned when a manifest read with ReadStreaming
@@ -133,4 +136,243 @@ func (fs *fileStream) validate() error {
 		return fmt.Errorf("backup: manifest %s changed after it was verified", fs.key)
 	}
 	return nil
+}
+
+// ListStreaming is List for deployments whose manifests must not be held
+// in memory: each yielded manifest is signature-verified (one pass over
+// its object) and carries Files == nil, with its entries walked by
+// EachFile. Order, tombstone filtering and primary-only reads are List's.
+//
+// Each manifest costs one full read of its object even if the caller
+// only wants the header: the signature covers the whole document.
+func (ms *ManifestStore) ListStreaming(ctx context.Context, deployment string, verifier *Verifier) iter.Seq2[*Manifest, error] {
+	return ms.listStreaming(ctx, deployment, StreamOptions{Verifier: verifier}, verifier != nil)
+}
+
+// ListAttestationlessStreaming is ListStreaming without signature
+// verification (ListAttestationless' trust posture: inspection only).
+func (ms *ManifestStore) ListAttestationlessStreaming(ctx context.Context, deployment string) iter.Seq2[*Manifest, error] {
+	return ms.listStreaming(ctx, deployment, StreamOptions{}, true)
+}
+
+func (ms *ManifestStore) listStreaming(ctx context.Context, deployment string, opts StreamOptions, ok bool) iter.Seq2[*Manifest, error] {
+	return func(yield func(*Manifest, error) bool) {
+		for e, err := range ms.listStreamingEntries(ctx, deployment, opts, ok, false, false) {
+			if !yield(e.Manifest, err) {
+				return
+			}
+		}
+	}
+}
+
+// ListIncludingTombstonedStreaming is ListStreaming that also yields
+// soft-deleted manifests, flagged — ListIncludingTombstoned's streaming
+// counterpart.
+func (ms *ManifestStore) ListIncludingTombstonedStreaming(ctx context.Context, deployment string, verifier *Verifier) iter.Seq2[ManifestEntry, error] {
+	return ms.listStreamingEntries(ctx, deployment, StreamOptions{Verifier: verifier}, verifier != nil, true, false)
+}
+
+func (ms *ManifestStore) listStreamingEntries(ctx context.Context, deployment string, opts StreamOptions, ok bool, includeTombstoned bool, auto bool) iter.Seq2[ManifestEntry, error] {
+	return func(yield func(ManifestEntry, error) bool) {
+		if !ok {
+			yield(ManifestEntry{}, errors.New("backup: ListStreaming requires a verifier (use ListAttestationlessStreaming to read without one)"))
+			return
+		}
+		if err := validateStorageID("deployment", deployment); err != nil {
+			yield(ManifestEntry{}, err)
+			return
+		}
+		prefix := "manifests/" + deployment + "/backups/"
+		const manifestSuffix = "/manifest.json"
+		const tombstoneSuffix = "/manifest.json.tombstone"
+		var keys []string
+		sizes := map[string]int64{}
+		tombstoned := map[string]struct{}{}
+		for info, err := range ms.sp.List(ctx, prefix) {
+			if err != nil {
+				yield(ManifestEntry{}, err)
+				return
+			}
+			switch {
+			case strings.HasSuffix(info.Key, tombstoneSuffix):
+				rel := strings.TrimPrefix(info.Key, prefix)
+				if slash := strings.IndexByte(rel, '/'); slash > 0 {
+					tombstoned[rel[:slash]] = struct{}{}
+				}
+			case strings.HasSuffix(info.Key, manifestSuffix):
+				keys = append(keys, info.Key)
+				sizes[info.Key] = info.Size
+			}
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
+			rel := strings.TrimPrefix(key, prefix)
+			dead := false
+			if slash := strings.IndexByte(rel, '/'); slash > 0 {
+				_, dead = tombstoned[rel[:slash]]
+			}
+			if dead && !includeTombstoned {
+				continue
+			}
+			var (
+				m   *Manifest
+				err error
+			)
+			if auto && sizes[key] <= AutoStreamThreshold {
+				m, err = ms.readHeld(ctx, key, opts)
+			} else {
+				m, err = ms.streamHeader(ctx, key, opts)
+			}
+			if err != nil {
+				if !yield(ManifestEntry{}, err) {
+					return
+				}
+				continue
+			}
+			if !yield(ManifestEntry{Manifest: m, Tombstoned: dead}, nil) {
+				return
+			}
+		}
+	}
+}
+
+// streamHeader reads one object into a streamed Manifest.
+func (ms *ManifestStore) streamHeader(ctx context.Context, key string, opts StreamOptions) (*Manifest, error) {
+	rc, err := ms.sp.Get(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	defer rc.Close()
+	info, err := StreamManifest(rc, opts, nil)
+	if err != nil {
+		return nil, err
+	}
+	m := info.Manifest
+	m.stream = &fileStream{
+		ms: ms, key: key, sha: info.RawSHA256,
+		files: info.Files, bytes: info.Bytes, chunkRefs: info.ChunkRefs,
+	}
+	return m, nil
+}
+
+// ReadStreamingAttestationless is ReadStreaming without signature
+// verification, for read-only inspection (ReadAttestationless' posture).
+func (ms *ManifestStore) ReadStreamingAttestationless(ctx context.Context, deployment, backupID string) (*Manifest, error) {
+	info, err := ms.StreamFilesAttestationless(ctx, deployment, backupID, nil)
+	if err != nil {
+		return nil, err
+	}
+	m := info.Manifest
+	m.stream = &fileStream{
+		ms: ms, key: info.Key, sha: info.RawSHA256,
+		files: info.Files, bytes: info.Bytes, chunkRefs: info.ChunkRefs,
+	}
+	return m, nil
+}
+
+// AutoStreamThreshold is the stored-manifest size above which the *Auto
+// readers hand back a streamed manifest (Files == nil, entries via
+// EachFile) instead of a held one. Below it they behave exactly like
+// Read/List: one read, Files populated. 64 MiB is ~550K chunk
+// references, ~35 GB of database at the default chunk size — far under
+// the 1 GiB cap those readers enforce, so nothing that fits today
+// changes behaviour.
+var AutoStreamThreshold int64 = 64 << 20
+
+// ReadAuto is Read for callers that handle both shapes: it returns a held
+// manifest when the primary object is at most AutoStreamThreshold and a
+// streamed one otherwise. Callers must reach the files only through
+// EachFile/NumFiles/TotalFileBytes/NumChunkRefs (which work on both).
+func (ms *ManifestStore) ReadAuto(ctx context.Context, deployment, backupID string, verifier *Verifier) (*Manifest, error) {
+	if ms.bigPrimary(ctx, deployment, backupID) {
+		return ms.ReadStreaming(ctx, deployment, backupID, verifier)
+	}
+	return ms.Read(ctx, deployment, backupID, verifier)
+}
+
+// ReadAttestationlessAuto is ReadAuto for ReadAttestationless'
+// trust posture.
+func (ms *ManifestStore) ReadAttestationlessAuto(ctx context.Context, deployment, backupID string) (*Manifest, error) {
+	if ms.bigPrimary(ctx, deployment, backupID) {
+		return ms.ReadStreamingAttestationless(ctx, deployment, backupID)
+	}
+	return ms.ReadAttestationless(ctx, deployment, backupID)
+}
+
+// ReadIncludingTombstonedAuto is ReadAuto for ReadIncludingTombstoned.
+func (ms *ManifestStore) ReadIncludingTombstonedAuto(ctx context.Context, deployment, backupID string, verifier *Verifier) (*Manifest, bool, error) {
+	if !ms.bigPrimary(ctx, deployment, backupID) {
+		return ms.ReadIncludingTombstoned(ctx, deployment, backupID, verifier)
+	}
+	if verifier == nil {
+		return nil, false, errors.New("backup: ReadIncludingTombstonedAuto requires a verifier")
+	}
+	dead, err := ms.IsTombstoned(ctx, deployment, backupID)
+	if err != nil {
+		return nil, false, fmt.Errorf("backup: tombstone check %s: %w", backupID, err)
+	}
+	info, err := ms.streamFilesT(ctx, deployment, backupID, StreamOptions{Verifier: verifier}, true, nil, true)
+	if err != nil {
+		return nil, false, err
+	}
+	m := info.Manifest
+	m.stream = &fileStream{
+		ms: ms, key: info.Key, sha: info.RawSHA256,
+		files: info.Files, bytes: info.Bytes, chunkRefs: info.ChunkRefs,
+	}
+	return m, dead, nil
+}
+
+// bigPrimary reports whether the primary manifest object is over the
+// threshold. Any Stat failure answers false: the held reader then
+// produces the real error (or its replica fallback).
+func (ms *ManifestStore) bigPrimary(ctx context.Context, deployment, backupID string) bool {
+	st, err := ms.sp.Stat(ctx, PrimaryPath(deployment, backupID))
+	return err == nil && st.Size > AutoStreamThreshold
+}
+
+// ListAuto is List with per-manifest shape selection (see ReadAuto).
+func (ms *ManifestStore) ListAuto(ctx context.Context, deployment string, verifier *Verifier) iter.Seq2[*Manifest, error] {
+	return func(yield func(*Manifest, error) bool) {
+		for e, err := range ms.listStreamingEntries(ctx, deployment, StreamOptions{Verifier: verifier}, verifier != nil, false, true) {
+			if !yield(e.Manifest, err) {
+				return
+			}
+		}
+	}
+}
+
+// ListAttestationlessAuto is ListAuto without signature verification.
+func (ms *ManifestStore) ListAttestationlessAuto(ctx context.Context, deployment string) iter.Seq2[*Manifest, error] {
+	return func(yield func(*Manifest, error) bool) {
+		for e, err := range ms.listStreamingEntries(ctx, deployment, StreamOptions{}, true, false, true) {
+			if !yield(e.Manifest, err) {
+				return
+			}
+		}
+	}
+}
+
+// ListIncludingTombstonedAuto is ListAuto that also yields soft-deleted
+// manifests, flagged.
+func (ms *ManifestStore) ListIncludingTombstonedAuto(ctx context.Context, deployment string, verifier *Verifier) iter.Seq2[ManifestEntry, error] {
+	return ms.listStreamingEntries(ctx, deployment, StreamOptions{Verifier: verifier}, verifier != nil, true, true)
+}
+
+// readHeld reads one small object into a held manifest, verifying per
+// opts (the same parse List/ListAttestationless use).
+func (ms *ManifestStore) readHeld(ctx context.Context, key string, opts StreamOptions) (*Manifest, error) {
+	if opts.Verifier != nil {
+		return ms.readVerified(ctx, key, opts.Verifier)
+	}
+	rc, err := ms.sp.Get(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	defer rc.Close()
+	body, err := ReadAllLimited(rc, MaxManifestBytes)
+	if err != nil {
+		return nil, err
+	}
+	return ParseAttestationless(body)
 }

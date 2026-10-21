@@ -41,13 +41,21 @@ func (ms *ManifestStore) StreamFilesAttestationless(ctx context.Context, deploym
 }
 
 func (ms *ManifestStore) streamFiles(ctx context.Context, deployment, backupID string, opts StreamOptions, gate bool, fn func(*FileEntry) error) (*StreamInfo, error) {
+	return ms.streamFilesT(ctx, deployment, backupID, opts, gate, fn, false)
+}
+
+// streamFilesT is streamFiles with the tombstone gate optional, for
+// callers (show --include-deleted) that inspect soft-deleted manifests.
+func (ms *ManifestStore) streamFilesT(ctx context.Context, deployment, backupID string, opts StreamOptions, gate bool, fn func(*FileEntry) error, allowTombstoned bool) (*StreamInfo, error) {
 	if err := validateRef(deployment, backupID); err != nil {
 		return nil, err
 	}
-	if dead, err := ms.IsTombstoned(ctx, deployment, backupID); err != nil {
-		return nil, fmt.Errorf("backup: tombstone check %s: %w", backupID, err)
-	} else if dead {
-		return nil, ErrTombstoned
+	if !allowTombstoned {
+		if dead, err := ms.IsTombstoned(ctx, deployment, backupID); err != nil {
+			return nil, fmt.Errorf("backup: tombstone check %s: %w", backupID, err)
+		} else if dead {
+			return nil, ErrTombstoned
+		}
 	}
 	primaryKey := PrimaryPath(deployment, backupID)
 	info, key, primaryErr := ms.streamOne(ctx, primaryKey, opts, gate, fn)

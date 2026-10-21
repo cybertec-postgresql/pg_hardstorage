@@ -160,7 +160,7 @@ func Preview(ctx context.Context, opts PlanOptions) (*Plan, error) {
 	defer sp.Close()
 
 	store := backup.NewManifestStore(sp)
-	m, err := store.ReadStreaming(ctx, opts.Deployment, opts.BackupID, opts.Verifier)
+	m, err := store.ReadAuto(ctx, opts.Deployment, opts.BackupID, opts.Verifier)
 	if err != nil {
 		return nil, mapManifestReadErr("plan", opts.Deployment, opts.BackupID, err)
 	}

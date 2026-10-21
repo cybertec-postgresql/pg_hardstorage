@@ -17,6 +17,7 @@ import (
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/compression/none"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/encryption"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/spill"
 )
 
 // asArray converts repo.Hash back to [32]byte for the storage plugin's
@@ -135,6 +136,12 @@ type CAS struct {
 	// nil disables the probe — zero overhead, the right default for a
 	// first backup.
 	hints map[Hash]struct{}
+
+	// hintFilter is the memory-bounded form of hints: a Bloom filter over
+	// the same kind of set (see WithDedupHintFilter). A false positive
+	// costs one Stat probe that falls through to the normal write path,
+	// so it needs no exactness and no per-hash heap.
+	hintFilter *spill.Bloom
 
 	// dedup counters — atomics because PutChunk runs concurrently
 	// (the base-backup chunk worker pool). Read via DedupStats.
@@ -579,6 +586,17 @@ func WithSeenCacheLimit(n int) CASOption {
 	}
 }
 
+// WithDedupHintFilter is WithDedupHints for a hint set too large to hold
+// as a map: a Bloom filter over the hashes the caller believes are
+// already in the repo. A database with billions of chunks has a hint set
+// of hundreds of GB as a map; the filter is about 1.25 bytes per hash.
+// A false positive only causes one extra Stat probe — the probe's result,
+// not the filter, decides — so the filter being approximate is safe.
+// nil is a no-op. The filter must not be modified after this call.
+func WithDedupHintFilter(f *spill.Bloom) CASOption {
+	return func(cas *CAS) { cas.hintFilter = f }
+}
+
 // WithDedupHints supplies a set of plaintext chunk hashes the caller
 // believes are ALREADY present in the repo — typically every chunk
 // referenced by the deployment's most recent prior backup manifest.
@@ -736,8 +754,15 @@ func (c *CAS) PutChunk(ctx context.Context, body []byte) (ChunkInfo, error) {
 	// since the hint set was built, or a transient Stat error) just
 	// falls through to the normal write path below; the IfNotExists
 	// Put is the correctness backstop either way.
-	if c.hints != nil {
-		if _, hinted := c.hints[hash]; hinted {
+	if c.hints != nil || c.hintFilter != nil {
+		hinted := false
+		if c.hints != nil {
+			_, hinted = c.hints[hash]
+		}
+		if !hinted && c.hintFilter != nil {
+			hinted = c.hintFilter.Test(hash)
+		}
+		if hinted {
 			if _, statErr := c.sp.Stat(ctx, ChunkKey(hash)); statErr == nil {
 				if err := c.ensureAdoptable(ctx, hash); err != nil {
 					return ChunkInfo{}, err
