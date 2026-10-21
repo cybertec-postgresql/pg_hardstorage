@@ -890,6 +890,7 @@ func runRepairChunks(cmd *cobra.Command, repoURL string, orphans, apply bool, mi
 		return output.NewError("repair.collect_refs_failed",
 			fmt.Sprintf("repair chunks: collect references: %v", err)).Wrap(err)
 	}
+	defer refs.Close()
 
 	if orphans {
 		// Chunk-age floor (default DefaultOrphanMinAge): never reap a
@@ -1582,6 +1583,7 @@ func scrubManifestAware(ctx context.Context, sp storage.StoragePlugin, limit, wi
 	if err != nil {
 		return agg, 0, err
 	}
+	defer refs.Close()
 	distinctRefs := refs.Len()
 
 	start, windows := scrubWindowStart(distinctRefs, limit, windowIndex)

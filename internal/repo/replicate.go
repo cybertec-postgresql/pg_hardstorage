@@ -394,6 +394,12 @@ func Replicate(ctx context.Context, src, dst storage.StoragePlugin, opts Replica
 // recorded in res but do NOT abort the replicate run — operators
 // running this from cron want the full report, not a fail-on-first.
 func replicateManifest(ctx context.Context, src, dst storage.StoragePlugin, key, backupID string, kind harvestKind, opts ReplicateOptions, res *ReplicateResult) {
+	if kind == harvestBackup {
+		if st, serr := src.Stat(ctx, key); serr == nil && st.Size > replicateStreamThreshold {
+			replicateManifestStreamed(ctx, src, dst, key, backupID, st.Size, opts, res)
+			return
+		}
+	}
 	body, err := readKey(ctx, src, key)
 	if err != nil {
 		recordReplicateFailure(res, key, err)

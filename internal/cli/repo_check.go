@@ -164,6 +164,7 @@ func runRepoCheck(cmd *cobra.Command, repoURL string) error {
 		return output.NewError("repo.check.collect_refs_failed",
 			fmt.Sprintf("repo check: collect references: %v", err)).Wrap(err)
 	}
+	defer refs.Close()
 	missing, err := repo.FindMissing(cmd.Context(), sp, refs)
 	if err != nil {
 		return output.NewError("repo.check.find_missing_failed",

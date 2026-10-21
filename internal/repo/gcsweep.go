@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/spill"
 )
 
 // SweepOptions configures Sweep.
@@ -40,6 +41,11 @@ type SweepOptions struct {
 
 	// Now is the clock (default time.Now).
 	Now func() time.Time
+
+	// RefSpill tunes the reference set's heap budget and spill
+	// directory. The zero value keeps up to spill.DefaultMemEntries
+	// hashes on the heap and spills the rest to the system temp dir.
+	RefSpill spill.Options
 
 	// OnWarning, when set, receives non-fatal findings (a pin or run
 	// record that could not be cleaned up, ...).
@@ -277,14 +283,20 @@ func Sweep(ctx context.Context, sp storage.StoragePlugin, opts SweepOptions) (*S
 	fo := FindOrphansOptions{MinAge: opts.MinChunkAge, Now: start}
 	minAge := fo.effectiveMinAge()
 	snap := &manifestSnapshot{
-		refs:      NewRefSet(),
+		refs:      NewRefSetWithOptions(opts.RefSpill),
 		harvested: map[string]storage.ObjectInfo{},
 		opts:      CollectReferencesOptions{TombstoneGrace: opts.TombstoneGrace, Now: start},
 		minAge:    minAge,
 		ageCutoff: start.Add(-minAge),
 	}
+	defer snap.refs.Close()
 	if err := snap.scan(ctx, sp, true); err != nil {
 		return nil, fmt.Errorf("repo: gc: collect references: %w", err)
+	}
+	// A spill I/O failure means a negative Has may be wrong; deleting on
+	// that basis would destroy live chunks, so refuse to continue.
+	if err := snap.refs.Err(); err != nil {
+		return nil, fmt.Errorf("repo: gc: reference set unreliable: %w", err)
 	}
 
 	// One chunks/ listing: orphan set with sizes.
@@ -369,6 +381,9 @@ func Sweep(ctx context.Context, sp storage.StoragePlugin, opts SweepOptions) (*S
 		}
 		if err := snap.scan(ctx, sp, false); err != nil {
 			return res, fmt.Errorf("repo: gc: rescan references before delete: %w", err)
+		}
+		if err := snap.refs.Err(); err != nil {
+			return res, fmt.Errorf("repo: gc: reference set unreliable: %w", err)
 		}
 		if opts.beforeDelete != nil {
 			opts.beforeDelete(b)

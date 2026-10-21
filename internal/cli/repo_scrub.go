@@ -105,6 +105,7 @@ func runRepoScrub(cmd *cobra.Command, urlArg string, samplePercent int, fullScan
 		return output.NewError("repo.scrub.collect_refs_failed",
 			fmt.Sprintf("repo scrub: collect references: %v", err)).Wrap(err)
 	}
+	defer refs.Close()
 
 	// Convert sample-percent to a chunk-count limit. limit=0 means
 	// "everything" — what --full requests.

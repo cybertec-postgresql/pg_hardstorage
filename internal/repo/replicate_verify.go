@@ -9,11 +9,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"sort"
 	"strings"
 	"time"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/spill"
 )
 
 // jsonUnmarshalImpl is the canonical unmarshal entry point for
@@ -268,7 +268,8 @@ func VerifyReplicate(ctx context.Context, src, dst storage.StoragePlugin, opts R
 	//   - confirm the same key exists at dst (Stat-only by default)
 	//   - parse the manifest body to enumerate chunk hashes
 	//   - confirm each chunk exists at dst
-	chunksSeen := map[string]struct{}{}
+	chunksSeen := spill.NewHashSet(spill.Options{})
+	defer chunksSeen.Close()
 
 	for info, lerr := range src.List(ctx, prefix) {
 		if err := ctx.Err(); err != nil {
@@ -534,36 +535,25 @@ func readAll(ctx context.Context, sp storage.StoragePlugin, key string) ([]byte,
 // chunks were not verified, and a verdict of consistent must not be
 // built on chunks nobody looked at. The returned error is only for
 // aborts (ctx, transient/backend errors that prove nothing either way).
-func verifyManifestChunks(ctx context.Context, src, dst storage.StoragePlugin, key string, kind harvestKind, seen map[string]struct{}, opts ReplicateVerifyOptions, res *ReplicateVerifyResult) error {
-	chunkKeys, perr := chunkKeysFromManifest(ctx, src, key, kind)
-	if perr != nil {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		res.ManifestsUnparseable++
-		recordReplicateVerifyFailure(res, ReplicateVerifyFailure{
-			Kind:     "unparseable_manifest",
-			Key:      key,
-			BackupID: backupIDFromKey(key),
-			Reason:   "chunks not verified: " + perr.Error(),
-		})
-		return nil
-	}
-	for _, chunkKey := range chunkKeys {
+func verifyManifestChunks(ctx context.Context, src, dst storage.StoragePlugin, key string, kind harvestKind, seen *spill.HashSet, opts ReplicateVerifyOptions, res *ReplicateVerifyResult) error {
+	var abort error // an abort (ctx / backend error) as opposed to a parse failure
+	perr := forEachManifestChunk(ctx, src, key, kind, func(h Hash) error {
 		if err := ctx.Err(); err != nil {
+			abort = err
 			return err
 		}
-		if _, dup := seen[chunkKey]; dup {
-			continue
+		if !seen.Add(h) {
+			return nil
 		}
-		seen[chunkKey] = struct{}{}
+		chunkKey := ChunkKey(h)
 		res.ChunksConsidered++
 		drift, err := verifyKey(ctx, src, dst, chunkKey, 0, opts)
 		if err != nil {
 			if !errors.Is(err, errReplicaKeyMissing) {
 				// Transient/backend or src-side error — abort
 				// rather than falsely flagging the chunk missing.
-				return fmt.Errorf("repo: VerifyReplicate: verify chunk %q: %w", chunkKey, err)
+				abort = fmt.Errorf("repo: VerifyReplicate: verify chunk %q: %w", chunkKey, err)
+				return abort
 			}
 			recordReplicateVerifyFailure(res, ReplicateVerifyFailure{
 				Kind:     "missing_chunk",
@@ -573,7 +563,7 @@ func verifyManifestChunks(ctx context.Context, src, dst storage.StoragePlugin, k
 			})
 			res.ChunksMissing++
 			emitReplicateVerifyProgress(opts, "chunk", chunkKey, "missing")
-			continue
+			return nil
 		}
 		if drift {
 			recordReplicateVerifyFailure(res, ReplicateVerifyFailure{
@@ -588,34 +578,60 @@ func verifyManifestChunks(ctx context.Context, src, dst storage.StoragePlugin, k
 			res.ChunksPresent++
 			emitReplicateVerifyProgress(opts, "chunk", chunkKey, "present")
 		}
+		return nil
+	})
+	if abort != nil {
+		return abort
+	}
+	if perr != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		res.ManifestsUnparseable++
+		recordReplicateVerifyFailure(res, ReplicateVerifyFailure{
+			Kind:     "unparseable_manifest",
+			Key:      key,
+			BackupID: backupIDFromKey(key),
+			Reason:   "chunks not verified: " + perr.Error(),
+		})
 	}
 	return nil
 }
 
-// chunkKeysFromManifest fetches the manifest at key from src, parses it
-// with the SAME shapes and fail-closed hash parsing gc and Replicate use
-// (extractChunkHashes), and returns the deduplicated chunk keys.
-func chunkKeysFromManifest(ctx context.Context, sp storage.StoragePlugin, key string, kind harvestKind) ([]string, error) {
+// forEachManifestChunk calls fn with every chunk hash the manifest at
+// key references, using the same fail-closed hash parsing as gc and
+// Replicate. Backup manifests are streamed (they can be hundreds of GB);
+// WAL segment manifests are a handful of chunks and are read whole.
+// Duplicates are passed through; the caller de-duplicates.
+func forEachManifestChunk(ctx context.Context, sp storage.StoragePlugin, key string, kind harvestKind, fn func(Hash) error) error {
+	if kind == harvestBackup {
+		rc, err := sp.Get(ctx, key)
+		if err != nil {
+			return err
+		}
+		defer rc.Close()
+		return streamBackupChunkRefs(rc, func(hex string) error {
+			h, perr := parseHexHash(hex)
+			if perr != nil {
+				return unparseableReplicaRef(hex, perr)
+			}
+			return fn(h)
+		})
+	}
 	body, err := readAll(ctx, sp, key)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	hashes, err := extractChunkHashes(body, kind)
 	if err != nil {
-		return nil, fmt.Errorf("parse manifest: %w", err)
+		return fmt.Errorf("parse manifest: %w", err)
 	}
-	out := make([]string, 0, len(hashes))
-	seen := map[string]struct{}{}
 	for _, h := range hashes {
-		k := ChunkKey(h)
-		if _, dup := seen[k]; dup {
-			continue
+		if err := fn(h); err != nil {
+			return err
 		}
-		seen[k] = struct{}{}
-		out = append(out, k)
 	}
-	sort.Strings(out)
-	return out, nil
+	return nil
 }
 
 // jsonStrictUnmarshal forwards to encoding/json.Unmarshal.
