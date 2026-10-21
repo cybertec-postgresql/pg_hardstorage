@@ -10,6 +10,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo"
@@ -280,5 +281,33 @@ func TestScanTopLevelStrings_SkipsFilesAndFoldsKeys(t *testing.T) {
 	}
 	if _, err := backup.ScanTopLevelStringsForTest(strings.NewReader(`{"backup_id":3}`), "backup_id"); err == nil {
 		t.Error("non-string value accepted")
+	}
+}
+
+// Regression: a malformed manifest used to hang rejectDuplicateKeys
+// forever (an array walk that swallowed a decoder error kept calling
+// dec.More(), which stays true once the decoder has failed). Found by
+// fuzzing; ParseAttestationless/ParseAndVerify — so verify, list and
+// restore — hung on such a file.
+func TestMalformedManifestDoesNotHangEitherReader(t *testing.T) {
+	inputs := []string{
+		"{\"schema\":\"pg_hardstorage.manifest.v1\",\"files\":[{\"path\":\"a\",\"ch\x00\x80ks\":null}]}",
+		`{"files":[`,
+		`{"files":[{"a":[1,2,`,
+		`{"files":[[[[[[`,
+		`[`,
+	}
+	for _, in := range inputs {
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			_, _ = backup.ParseAttestationless([]byte(in))
+			_, _ = backup.StreamManifest(strings.NewReader(in), backup.StreamOptions{}, nil)
+		}()
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			t.Fatalf("reader hung on %q", in)
+		}
 	}
 }

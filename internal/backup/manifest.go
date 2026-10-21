@@ -436,11 +436,18 @@ var ErrAmbiguousManifest = errors.New("manifest: ambiguous document")
 func rejectDuplicateKeys(raw []byte) error {
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.UseNumber()
-	if err := checkNoDupKeys(dec, "$"); err != nil {
+	if err := checkNoDupKeys(dec, "$"); err != nil && !errors.Is(err, errMalformedJSON) {
 		return err
 	}
 	return nil
 }
+
+// errMalformedJSON stops the duplicate-key walk at malformed input. The
+// caller's Unmarshal reports the parse error; the walk must merely STOP:
+// once json.Decoder is in an error state dec.More() stays true, so a walk
+// that swallowed the error and carried on looped forever (a fuzzer found a
+// two-line input that hung ParseAndVerify, i.e. verify/list/restore).
+var errMalformedJSON = errors.New("manifest: malformed JSON")
 
 // checkNoDupKeys consumes exactly one JSON value from dec, recursing
 // through objects and arrays. path is used only to name the offender.
@@ -448,8 +455,8 @@ func checkNoDupKeys(dec *json.Decoder, path string) error {
 	tok, err := dec.Token()
 	if err != nil {
 		// Malformed JSON is the caller's Unmarshal error to report, not
-		// ours; treat it as "nothing to say about duplicates".
-		return nil //nolint:nilerr // parse errors are reported by Unmarshal
+		// ours; stop the walk (see errMalformedJSON).
+		return errMalformedJSON
 	}
 	delim, ok := tok.(json.Delim)
 	if !ok {
@@ -461,11 +468,11 @@ func checkNoDupKeys(dec *json.Decoder, path string) error {
 		for dec.More() {
 			kt, err := dec.Token()
 			if err != nil {
-				return nil //nolint:nilerr // see above
+				return errMalformedJSON
 			}
 			key, ok := kt.(string)
 			if !ok {
-				return nil
+				return errMalformedJSON
 			}
 			if !isSchemaKey(key) {
 				return fmt.Errorf("%w: object %s has key %q, which is not lowercase-ASCII "+

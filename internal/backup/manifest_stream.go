@@ -190,6 +190,15 @@ func StreamManifest(r io.Reader, opts StreamOptions, fn func(*FileEntry) error) 
 	if _, err := dec.Token(); err != nil { // '}'
 		return nil, fmt.Errorf("manifest: parse: %w", err)
 	}
+	// Nothing but whitespace may follow the document: bytes after the
+	// closing brace are covered by no signature, and the held parser
+	// (json.Unmarshal) rejects them too.
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+		if err == nil {
+			err = errors.New("invalid data after top-level value")
+		}
+		return nil, fmt.Errorf("manifest: parse: %w", err)
+	}
 
 	m, err := buildHeader(fields)
 	if err != nil {
