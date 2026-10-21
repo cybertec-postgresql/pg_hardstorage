@@ -2,6 +2,7 @@ package restore
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path"
 	"strings"
@@ -37,7 +38,7 @@ func preflightBackupWALAvailable(ctx context.Context, sp storage.StoragePlugin, 
 	if m == nil || skipGapCheck || (recovery != nil && recovery.SkipGapCheck) {
 		return nil
 	}
-	if embedsWAL(m) {
+	if embedsWAL(ctx, m) {
 		return nil
 	}
 	_, found, err := inventory.HighestArchivedLSN(ctx, sp, deployment, m.Timeline)
@@ -58,11 +59,19 @@ func preflightBackupWALAvailable(ctx context.Context, sp storage.StoragePlugin, 
 
 // embedsWAL reports whether the backup carries at least one WAL
 // segment of its own under pg_wal/.
-func embedsWAL(m *backup.Manifest) bool {
-	for _, f := range m.Files {
+func embedsWAL(ctx context.Context, m *backup.Manifest) bool {
+	errFound := errors.New("found")
+	err := m.EachFile(ctx, func(f *backup.FileEntry) error {
 		if strings.HasPrefix(f.Path, "pg_wal/") && len(path.Base(f.Path)) == 24 {
-			return true
+			return errFound
 		}
+		return nil
+	})
+	if errors.Is(err, errFound) {
+		return true
 	}
-	return false
+	// A manifest that cannot be walked is not evidence the WAL is absent:
+	// do not turn a read failure into a refusal. The restore itself will
+	// fail on the same read.
+	return err != nil
 }

@@ -15,6 +15,7 @@ import (
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/output"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/spill"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/wal/inventory"
 )
 
@@ -159,7 +160,7 @@ func Preview(ctx context.Context, opts PlanOptions) (*Plan, error) {
 	defer sp.Close()
 
 	store := backup.NewManifestStore(sp)
-	m, err := store.Read(ctx, opts.Deployment, opts.BackupID, opts.Verifier)
+	m, err := store.ReadStreaming(ctx, opts.Deployment, opts.BackupID, opts.Verifier)
 	if err != nil {
 		return nil, mapManifestReadErr("plan", opts.Deployment, opts.BackupID, err)
 	}
@@ -174,24 +175,32 @@ func Preview(ctx context.Context, opts PlanOptions) (*Plan, error) {
 		StartLSN:          m.StartLSN,
 		StopLSN:           m.StopLSN,
 		Timeline:          m.Timeline,
-		FileCount:         len(m.Files),
+		FileCount:         m.NumFiles(),
 		Tablespaces:       m.Tablespaces,
 		BackupLabelSize:   len(m.BackupLabel),
 		TablespaceMapSize: len(m.TablespaceMap),
 		AssumedThroughput: EstimateThroughput,
 	}
 
-	uniqueBytes := map[repo.Hash]int64{}
-	for _, f := range m.Files {
+	// Unique-chunk accounting through a bounded-memory set: a 200 TB
+	// backup has billions of distinct chunks, far more than a map holds.
+	seen := spill.NewHashSet(spill.Options{})
+	defer seen.Close()
+	if err := m.EachFile(ctx, func(f *backup.FileEntry) error {
 		p.TotalBytes += f.Size
 		p.ChunkRefCount += len(f.Chunks)
 		for _, c := range f.Chunks {
-			uniqueBytes[c.Hash] = c.Len
+			if seen.Add(c.Hash) {
+				p.UniqueChunkCount++
+				p.UniqueChunkBytes += c.Len
+			}
 		}
+		return nil
+	}); err != nil {
+		return nil, mapManifestReadErr("plan", opts.Deployment, opts.BackupID, err)
 	}
-	p.UniqueChunkCount = len(uniqueBytes)
-	for _, sz := range uniqueBytes {
-		p.UniqueChunkBytes += sz
+	if err := seen.Err(); err != nil {
+		return nil, fmt.Errorf("plan: unique-chunk set: %w", err)
 	}
 
 	// Plumb the operator's PITR target into the plan body so

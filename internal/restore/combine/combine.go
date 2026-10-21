@@ -88,7 +88,7 @@ func Build(ctx context.Context, sp storage.StoragePlugin, deployment, leafID str
 		}
 		seen[cur] = struct{}{}
 
-		m, err := store.Read(ctx, deployment, cur, verifier)
+		m, err := store.ReadStreaming(ctx, deployment, cur, verifier)
 		if err != nil {
 			if errors.Is(err, backup.ErrTombstoned) {
 				return nil, output.NewError("chain.broken_tombstoned",
