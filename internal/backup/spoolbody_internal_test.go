@@ -1,6 +1,7 @@
 package backup
 
 import (
+	"errors"
 	"io"
 	"os"
 	"strings"
@@ -36,5 +37,43 @@ func TestSpoolBody_ReadSeekMatchesConcatenation(t *testing.T) {
 	b.Seek(-5, io.SeekCurrent)
 	if rest, _ := io.ReadAll(b); string(rest) != whole[len(whole)-5:] {
 		t.Fatalf("SeekCurrent: %q", rest)
+	}
+}
+
+func TestDeliveryError_WrapsAndReports(t *testing.T) {
+	inner := io.ErrUnexpectedEOF
+	var err error = &deliveryError{err: inner}
+	if err.Error() != inner.Error() {
+		t.Fatalf("Error() = %q", err.Error())
+	}
+	if u, ok := err.(interface{ Unwrap() error }); !ok || u.Unwrap() != inner {
+		t.Fatal("Unwrap does not return the wrapped error")
+	}
+}
+
+func TestWALOutcomeName_AllOutcomesNamed(t *testing.T) {
+	for o, want := range map[rotateOutcome]string{
+		rotateOutcomeRotated:             "rotated",
+		rotateOutcomeWouldRotate:         "would_rotate",
+		rotateOutcomeAlreadyRotated:      "already_rotated",
+		rotateOutcomeSkippedUnencrypted:  "skipped_unencrypted",
+		rotateOutcomeSkippedDifferentKEK: "skipped_different_kek",
+		rotateOutcomeFailed:              "failed",
+	} {
+		if got := walOutcomeName(o); got != want {
+			t.Errorf("walOutcomeName(%v) = %q, want %q", o, got, want)
+		}
+	}
+}
+
+func TestHoldWeakenError_MessageNamesTheHolder(t *testing.T) {
+	err := error(&HoldWeakenError{Deployment: "db1", BackupID: "b1", Existing: &Hold{Holder: "legal"}, Why: "shorter expiry"})
+	if !errors.Is(err, ErrHoldWeaken) {
+		t.Fatal("errors.Is(ErrHoldWeaken) must match")
+	}
+	for _, want := range []string{"db1/b1", "legal", "shorter expiry"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("message %q lacks %q", err.Error(), want)
+		}
 	}
 }

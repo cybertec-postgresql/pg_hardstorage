@@ -38,6 +38,22 @@ keeps reading that version for at least 24 months after a successor lands.
   - Memory is bounded by the spill budgets (`spill.DefaultMemEntries`),
     not by database size: a 6M-reference (1.4 GB) manifest is committed,
     verified and walked at a 52 MiB heap peak.
+- **Spill-set hardening found by the pre-release review.**
+  - A spill file truncated or unreadable behind the set's back used to
+    answer "absent" for the members it held; `Has` now answers "present"
+    and records the error, so a GC keeps the chunk (fail closed).
+  - After a failed flush (spill volume full) every `Add` re-sorted the
+    whole heap buffer and retried, so a backup crawled instead of
+    failing. Flushes now back off as the buffer doubles, and adopting a
+    chunk into a broken spilled adoption set fails that chunk — and the
+    backup — immediately.
+  - The manifest spool reports a spill I/O error as such (not as a
+    "duplicate file path") and refuses to commit when its path set or
+    unique-chunk counters lost data; the adoption gate refuses to pass
+    when its walk stopped early; `repo gc`'s reference set closes
+    explicitly.
+  - `show` reports a corrupt manifest as `verify.manifest_signature`
+    instead of `internal`.
 
 ### Added
 

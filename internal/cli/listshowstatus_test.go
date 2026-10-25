@@ -4,7 +4,10 @@ import (
 	"bytes"
 	"context"
 	stdjson "encoding/json"
+	"io"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -343,5 +346,94 @@ func TestStatus_AllDeployments(t *testing.T) {
 	}
 	if counts["db1"] != 1 || counts["db2"] != 2 || counts["analytics"] != 1 {
 		t.Errorf("counts wrong: %v", counts)
+	}
+}
+
+// A manifest that exists but cannot be parsed is damage, reported in the
+// same namespace as `verify`; it used to surface as code "internal".
+func TestShow_CorruptManifestIsNotAnInternalError(t *testing.T) {
+	w := newReadWorld(t)
+	w.commitManifest(t, "db1", 0)
+	var path string
+	_ = filepath.Walk(strings.TrimPrefix(w.repoURL, "file://"), func(p string, fi os.FileInfo, err error) error {
+		if err == nil && !fi.IsDir() && strings.HasSuffix(p, "/manifest.json") {
+			path = p
+		}
+		return nil
+	})
+	if path == "" {
+		t.Fatal("fixture: primary manifest not found")
+	}
+	fi, _ := os.Stat(path)
+	if err := os.Truncate(path, fi.Size()/2); err != nil {
+		t.Fatal(err)
+	}
+	// Drop the replica so there is nothing to fall back to.
+	_ = os.RemoveAll(filepath.Join(strings.TrimPrefix(w.repoURL, "file://"), "manifests", "_replicas"))
+
+	id := filepath.Base(filepath.Dir(path))
+	_, errb, exit := runCLI(t, "show", "db1", id, "--repo", w.repoURL, "-o", "json")
+	if strings.Contains(errb, `"internal"`) {
+		t.Errorf("corrupt manifest reported as an internal error: %s", errb)
+	}
+	if !strings.Contains(errb, "verify.manifest_signature") {
+		t.Errorf("error should carry verify.manifest_signature: %s", errb)
+	}
+	if exit != int(output.ExitVerifyFailed) {
+		t.Errorf("exit = %d, want ExitVerifyFailed(%d)", exit, output.ExitVerifyFailed)
+	}
+}
+
+// `partial inspect` reads manifests without verifying them; with no
+// database connection it still maps the requested tables to nothing and
+// must say so rather than fail.
+func TestPartialInspect_ReadsTheNewestBackup(t *testing.T) {
+	w := newReadWorld(t)
+	w.commitManifest(t, "db1", 0)
+	stdout, errb, exit := runCLI(t, "partial", "inspect", "db1", "--repo", w.repoURL,
+		"--tables", "public.t1", "-o", "json")
+	if exit != int(output.ExitOK) {
+		t.Fatalf("exit = %d\nstdout: %s\nstderr: %s", exit, stdout, errb)
+	}
+	var view struct {
+		BackupID string `json:"backup_id"`
+	}
+	bodyOf(t, stdout, &view)
+	if !strings.HasPrefix(view.BackupID, "db1.full.") {
+		t.Fatalf("inspected backup %q, want the committed db1 backup", view.BackupID)
+	}
+}
+
+// `verify latest` must say so when it passed over a manifest it could not
+// read: silently verifying an older backup would hide that the newest one
+// is damaged.
+func TestVerifyLatest_WarnsWhenItSkippedAnUnreadableManifest(t *testing.T) {
+	w := newReadWorld(t)
+	w.commitManifest(t, "db1", 0)
+	w.commitManifest(t, "db1", 1)
+	var newest string
+	_ = filepath.Walk(strings.TrimPrefix(w.repoURL, "file://"), func(p string, fi os.FileInfo, err error) error {
+		if err == nil && !fi.IsDir() && strings.HasSuffix(p, "/manifest.json") && p > newest {
+			newest = p
+		}
+		return nil
+	})
+	if err := os.WriteFile(newest, []byte("{not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.RemoveAll(filepath.Join(strings.TrimPrefix(w.repoURL, "file://"), "manifests", "_replicas"))
+	// The note goes to the process's stderr, not the command's writer.
+	r, wr, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	saved := os.Stderr
+	os.Stderr = wr
+	_, _, _ = runCLI(t, "verify", "db1", "latest", "--repo", w.repoURL, "-o", "json")
+	os.Stderr = saved
+	_ = wr.Close()
+	captured, _ := io.ReadAll(r)
+	if !strings.Contains(string(captured), "skipped 1 manifest") {
+		t.Fatalf("no skip warning on stderr:\n%s", captured)
 	}
 }

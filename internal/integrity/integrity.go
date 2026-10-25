@@ -287,7 +287,7 @@ func (e *Engine) Execute(ctx context.Context, deployment string, strategy Strate
 	refs := spill.NewHashSet(spill.Options{})
 	defer refs.Close()
 	for _, d := range deployments {
-		// ListStreaming yields verified manifests; failures (signature
+		// The streaming list yields verified manifests; failures (signature
 		// break / unreadable / decode failure) come through the error
 		// channel.
 		for m, err := range e.manifests.ListAuto(ctx, d, e.verifier) {

@@ -2,12 +2,15 @@ package spill
 
 import (
 	"bytes"
+	"container/heap"
 	"crypto/sha256"
 	"encoding/binary"
 	"os"
+	"path/filepath"
 	"sort"
 	"sync"
 	"testing"
+	"time"
 )
 
 func key(i int) Key {
@@ -146,5 +149,102 @@ func TestBloom_NoFalseNegatives(t *testing.T) {
 	}
 	if fp > 600 { // ~1% expected of 20000 = 200; allow 3%
 		t.Fatalf("false positives %d/20000 too high", fp)
+	}
+}
+
+// A run file truncated behind the set's back is damage, not absence: Has
+// must answer "present" (a GC then keeps the chunk) and Err must say why.
+func TestHashSet_TruncatedRunFailsClosed(t *testing.T) {
+	s := NewHashSet(Options{Dir: t.TempDir(), MemEntries: 1000})
+	defer s.Close()
+	const n = 5000
+	for i := 0; i < n; i++ {
+		s.Add(key(i))
+	}
+	s.mu.Lock()
+	paths := make([]string, 0, len(s.runs))
+	for _, r := range s.runs {
+		paths = append(paths, r.path)
+	}
+	s.mu.Unlock()
+	if len(paths) == 0 {
+		t.Fatal("fixture: nothing spilled")
+	}
+	for _, p := range paths {
+		fi, err := os.Stat(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Truncate(p, fi.Size()/2); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := 0; i < n; i++ {
+		if !s.Has(key(i)) {
+			t.Fatalf("member %d reported absent after its run file was truncated", i)
+		}
+	}
+	if s.Err() == nil {
+		t.Fatal("Err() is nil although a run file could not be read")
+	}
+}
+
+// A failed flush (disk full) must not make every later Add re-sort the
+// whole heap buffer: the set keeps accepting members, reports the error,
+// and retries only as the buffer doubles.
+func TestHashSet_FailedFlushDoesNotRetryEveryAdd(t *testing.T) {
+	s := NewHashSet(Options{Dir: t.TempDir(), MemEntries: 1000})
+	defer s.Close()
+	for i := 0; i < 1000; i++ { // first flush succeeds and creates the spill dir
+		s.Add(key(i))
+	}
+	s.mu.Lock()
+	dir := s.dir
+	s.mu.Unlock()
+	if dir == "" {
+		t.Fatal("fixture: nothing spilled")
+	}
+	// A read-only spill dir makes every later run creation fail, after the
+	// heap buffer has been sorted: the cost the retry-every-Add paid.
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chmod(dir, 0o700)
+	if f, err := os.OpenFile(filepath.Join(dir, "probe"), os.O_CREATE|os.O_WRONLY, 0o600); err == nil {
+		f.Close()
+		t.Skip("directory permissions are not enforced (running as root?)")
+	}
+	start := time.Now()
+	const n = 200_000
+	for i := 1000; i < n; i++ {
+		if !s.Add(key(i)) {
+			t.Fatalf("Add(%d) reported a duplicate", i)
+		}
+	}
+	if s.Err() == nil {
+		t.Fatal("Err() is nil after failed flushes")
+	}
+	// Retrying on every Add sorts up to 200k keys 199k times (minutes).
+	if d := time.Since(start); d > 20*time.Second {
+		t.Fatalf("%d Adds after a failed flush took %v", n, d)
+	}
+}
+
+// mergeHeap must satisfy container/heap's full contract.
+func TestMergeHeap_PushPop(t *testing.T) {
+	var h mergeHeap
+	heap.Push(&h, &mergeSrc{cur: key(2)})
+	heap.Push(&h, &mergeSrc{cur: key(1)})
+	heap.Push(&h, &mergeSrc{cur: key(3)})
+	if h.Len() != 3 {
+		t.Fatalf("Len = %d", h.Len())
+	}
+	prev := heap.Pop(&h).(*mergeSrc).cur
+	for h.Len() > 0 {
+		cur := heap.Pop(&h).(*mergeSrc).cur
+		if bytes.Compare(prev[:], cur[:]) > 0 {
+			t.Fatal("heap popped out of order")
+		}
+		prev = cur
 	}
 }

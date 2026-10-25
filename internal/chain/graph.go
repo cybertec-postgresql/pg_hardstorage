@@ -137,7 +137,7 @@ type Node struct {
 	Children []*Node `json:"children,omitempty"`
 
 	// Metrics carries chunk-overlap analysis. Populated by
-	// AnalyzeChain; nil before analysis.
+	// AnalyzeChainContext; nil before analysis.
 	Metrics *ChainMetrics `json:"metrics,omitempty"`
 
 	// src is the manifest this node was built from. Analysis walks its

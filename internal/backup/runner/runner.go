@@ -1252,11 +1252,6 @@ func base64Encode(b []byte) string {
 	return base64.StdEncoding.EncodeToString(b)
 }
 
-// base64Decode is the symmetric reader (used by restore).
-func base64Decode(s string) ([]byte, error) {
-	return base64.StdEncoding.DecodeString(s)
-}
-
 // buildManifest assembles a Manifest from the sink output and protocol
 // metadata. It does NOT compute Attestation here; ManifestStore.Commit
 // signs as part of the commit flow.
@@ -1413,7 +1408,7 @@ func verifyAdoptedChunks(ctx context.Context, sp storage.StoragePlugin, cas *rep
 	// materialised: it can be billions of hashes.
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(statVerifyConcurrency)
-	_ = cas.ForEachAdopted(func(h repo.Hash) error {
+	walkErr := cas.ForEachAdopted(func(h repo.Hash) error {
 		g.Go(func() error {
 			if err := ctx.Err(); err != nil {
 				return err
@@ -1449,6 +1444,11 @@ func verifyAdoptedChunks(ctx context.Context, sp storage.StoragePlugin, cas *rep
 	})
 	if err := g.Wait(); err != nil {
 		return unchecked, err
+	}
+	// A walk that stopped early (an unreadable spill run) has checked only
+	// a prefix of the adoption set; passing the gate on that is unsafe.
+	if walkErr != nil {
+		return unchecked, fmt.Errorf("backup: adoption set walk: %w", walkErr)
 	}
 	if nMissing > 0 {
 		if nMissing > 8 {

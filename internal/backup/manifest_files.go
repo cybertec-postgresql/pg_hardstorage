@@ -138,44 +138,10 @@ func (fs *fileStream) validate() error {
 	return nil
 }
 
-// ListStreaming is List for deployments whose manifests must not be held
-// in memory: each yielded manifest is signature-verified (one pass over
-// its object) and carries Files == nil, with its entries walked by
-// EachFile. Order, tombstone filtering and primary-only reads are List's.
-//
-// Each manifest costs one full read of its object even if the caller
-// only wants the header: the signature covers the whole document.
-func (ms *ManifestStore) ListStreaming(ctx context.Context, deployment string, verifier *Verifier) iter.Seq2[*Manifest, error] {
-	return ms.listStreaming(ctx, deployment, StreamOptions{Verifier: verifier}, verifier != nil)
-}
-
-// ListAttestationlessStreaming is ListStreaming without signature
-// verification (ListAttestationless' trust posture: inspection only).
-func (ms *ManifestStore) ListAttestationlessStreaming(ctx context.Context, deployment string) iter.Seq2[*Manifest, error] {
-	return ms.listStreaming(ctx, deployment, StreamOptions{}, true)
-}
-
-func (ms *ManifestStore) listStreaming(ctx context.Context, deployment string, opts StreamOptions, ok bool) iter.Seq2[*Manifest, error] {
-	return func(yield func(*Manifest, error) bool) {
-		for e, err := range ms.listStreamingEntries(ctx, deployment, opts, ok, false, false) {
-			if !yield(e.Manifest, err) {
-				return
-			}
-		}
-	}
-}
-
-// ListIncludingTombstonedStreaming is ListStreaming that also yields
-// soft-deleted manifests, flagged — ListIncludingTombstoned's streaming
-// counterpart.
-func (ms *ManifestStore) ListIncludingTombstonedStreaming(ctx context.Context, deployment string, verifier *Verifier) iter.Seq2[ManifestEntry, error] {
-	return ms.listStreamingEntries(ctx, deployment, StreamOptions{Verifier: verifier}, verifier != nil, true, false)
-}
-
 func (ms *ManifestStore) listStreamingEntries(ctx context.Context, deployment string, opts StreamOptions, ok bool, includeTombstoned bool, auto bool) iter.Seq2[ManifestEntry, error] {
 	return func(yield func(ManifestEntry, error) bool) {
 		if !ok {
-			yield(ManifestEntry{}, errors.New("backup: ListStreaming requires a verifier (use ListAttestationlessStreaming to read without one)"))
+			yield(ManifestEntry{}, errors.New("backup: streaming list requires a verifier"))
 			return
 		}
 		if err := validateStorageID("deployment", deployment); err != nil {

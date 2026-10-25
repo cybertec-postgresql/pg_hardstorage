@@ -65,7 +65,27 @@ type HashSet struct {
 	dir    string // lazily created
 	seq    int
 	closed bool
-	err    error // sticky spill error, surfaced by Err/Close
+
+	// retryAt is the heap size at which a flush that failed is tried
+	// again. Without it every Add after a failed flush (disk full) would
+	// re-sort the whole heap buffer and retry, so a full spill volume
+	// would crawl instead of failing; doubling keeps the retries
+	// amortised while the buffer, which cannot be shed, keeps growing.
+	retryAt int
+
+	// errMu guards err on its own: lookups run under the read lock and
+	// must still be able to record a damaged run file.
+	errMu sync.Mutex
+	err   error // sticky spill error, surfaced by Err/Close
+}
+
+// setErr records the first spill error.
+func (s *HashSet) setErr(err error) {
+	s.errMu.Lock()
+	if s.err == nil {
+		s.err = err
+	}
+	s.errMu.Unlock()
 }
 
 // NewHashSet returns an empty set.
@@ -87,9 +107,12 @@ func (s *HashSet) Add(k Key) bool {
 		return false
 	}
 	s.mem[k] = struct{}{}
-	if len(s.mem) >= s.opts.MemEntries {
-		if err := s.flushLocked(); err != nil && s.err == nil {
-			s.err = err
+	if len(s.mem) >= s.opts.MemEntries && len(s.mem) >= s.retryAt {
+		if err := s.flushLocked(); err != nil {
+			s.setErr(err)
+			s.retryAt = 2 * len(s.mem)
+		} else {
+			s.retryAt = 0
 		}
 	}
 	return true
@@ -109,8 +132,8 @@ func (s *HashSet) Has(k Key) bool {
 // missing members, so a caller using it for a safety decision (GC)
 // MUST check Err before trusting a negative Has.
 func (s *HashSet) Err() error {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.errMu.Lock()
+	defer s.errMu.Unlock()
 	return s.err
 }
 
@@ -124,15 +147,11 @@ func (s *HashSet) Len() int {
 		return len(s.mem)
 	}
 	if err := s.flushLocked(); err != nil {
-		if s.err == nil {
-			s.err = err
-		}
+		s.setErr(err)
 		return len(s.mem)
 	}
 	if err := s.compactAllLocked(); err != nil {
-		if s.err == nil {
-			s.err = err
-		}
+		s.setErr(err)
 	}
 	var n int64
 	for _, r := range s.runs {
@@ -181,7 +200,7 @@ func (s *HashSet) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
-		return s.err
+		return s.Err()
 	}
 	s.closed = true
 	for _, r := range s.runs {
@@ -192,12 +211,20 @@ func (s *HashSet) Close() error {
 	if s.dir != "" {
 		_ = os.RemoveAll(s.dir)
 	}
-	return s.err
+	return s.Err()
 }
 
 func (s *HashSet) inRunsLocked(k Key) bool {
 	for i := len(s.runs) - 1; i >= 0; i-- {
-		if s.runs[i].has(k) {
+		found, err := s.runs[i].has(k)
+		if err != nil {
+			// A run that cannot be read cannot vouch for absence. Answer
+			// "present" so a GC never deletes a chunk because of it, and
+			// record the failure for callers that check Err.
+			s.setErr(err)
+			return true
+		}
+		if found {
 			return true
 		}
 	}
@@ -343,14 +370,14 @@ func (r *run) close() {
 	}
 }
 
-func (r *run) has(k Key) bool {
+func (r *run) has(k Key) (bool, error) {
 	if r.n == 0 || !r.bloom.test(k) {
-		return false
+		return false, nil
 	}
 	// Last fence entry <= k names the block that could hold k.
 	b := sort.Search(len(r.fence), func(i int) bool { return bytes.Compare(r.fence[i][:], k[:]) > 0 }) - 1
 	if b < 0 {
-		return false
+		return false, nil
 	}
 	first := int64(b) * fenceEvery
 	cnt := r.n - first
@@ -358,15 +385,16 @@ func (r *run) has(k Key) bool {
 		cnt = fenceEvery
 	}
 	buf := make([]byte, cnt*keyLen)
-	if _, err := r.f.ReadAt(buf, first*keyLen); err != nil && !errors.Is(err, io.EOF) {
-		// Unreadable spill file: fail closed for membership ("present")
-		// so a GC never deletes a chunk because of a read error. The
-		// caller sees the error through HashSet.Err via the flush path;
-		// here, claiming presence is the safe answer.
-		return true
+	if n, err := r.f.ReadAt(buf, first*keyLen); err != nil {
+		// io.EOF with fewer bytes than the run's own key count means the
+		// file was truncated behind our back: that is damage, not absence.
+		if errors.Is(err, io.EOF) {
+			err = fmt.Errorf("short read (%d of %d bytes): %w", n, len(buf), io.ErrUnexpectedEOF)
+		}
+		return false, fmt.Errorf("spill: read run %s: %w", r.path, err)
 	}
 	i := sort.Search(int(cnt), func(i int) bool { return bytes.Compare(buf[i*keyLen:(i+1)*keyLen], k[:]) >= 0 })
-	return i < int(cnt) && bytes.Equal(buf[i*keyLen:(i+1)*keyLen], k[:])
+	return i < int(cnt) && bytes.Equal(buf[i*keyLen:(i+1)*keyLen], k[:]), nil
 }
 
 // ---- k-way merge ----

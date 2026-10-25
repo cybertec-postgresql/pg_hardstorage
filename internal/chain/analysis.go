@@ -98,7 +98,7 @@ type ChainSummary struct {
 	LeafCount int `json:"leaf_count"`
 }
 
-// AnalyzeChain populates Node.Metrics for every node in the graph
+// AnalyzeChainContext populates Node.Metrics for every node in the graph
 // AND fills the per-chain summaries. Walks each chain top-down,
 // extending an "ancestor chunks" set at every step.
 //
@@ -110,10 +110,8 @@ type ChainSummary struct {
 //
 // We do NOT walk orphans; their parent set is unknown so the
 // metrics would be misleading.
-func AnalyzeChain(g *Graph) { _ = AnalyzeChainContext(context.Background(), g) }
-
-// AnalyzeChainContext is AnalyzeChain with cancellation and the error a
-// manifest walk can hit. Metrics of nodes analysed before a failure stay
+// AnalyzeChainContext annotates the graph with chain metrics, honouring
+// cancellation and returning the error a manifest walk can hit. Metrics of nodes analysed before a failure stay
 // populated.
 func AnalyzeChainContext(ctx context.Context, g *Graph) error {
 	for _, root := range g.Roots {

@@ -3,6 +3,8 @@ package repo
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -91,5 +93,41 @@ func TestFence_PinWrittenInPartsAndReadBackByGC(t *testing.T) {
 	}
 	if len(f.Adopted()) != 450 {
 		t.Fatalf("Adopted() = %d", len(f.Adopted()))
+	}
+}
+
+// A spilled adoption set that can no longer write must fail the chunk that
+// was being adopted, so a backup on a full spill volume stops at once
+// instead of after the rest of the data has been read.
+func TestCAS_MarkAdoptedFailsFastWhenSpillBreaks(t *testing.T) {
+	sp, _ := fenceWorld(t)
+	dir := t.TempDir()
+	c := NewCAS(sp, WithSpilledAdoption(spill.Options{MemEntries: 4, Dir: dir}))
+	defer c.CloseAdopted()
+	for i := 0; i < 4; i++ { // fills the heap budget: first run written, spill dir exists
+		if err := c.markAdopted(HashOf([]byte(fmt.Sprintf("ok%d", i)))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ents, _ := os.ReadDir(dir)
+	for _, e := range ents {
+		if e.IsDir() {
+			p := filepath.Join(dir, e.Name())
+			if err := os.Chmod(p, 0o500); err != nil {
+				t.Fatal(err)
+			}
+			defer os.Chmod(p, 0o700)
+			if f, err := os.Create(filepath.Join(p, "probe")); err == nil {
+				f.Close()
+				t.Skip("directory permissions are not enforced (running as root?)")
+			}
+		}
+	}
+	var failed error
+	for i := 0; i < 20 && failed == nil; i++ {
+		failed = c.markAdopted(HashOf([]byte(fmt.Sprintf("late%d", i))))
+	}
+	if failed == nil {
+		t.Fatal("markAdopted kept succeeding although the spill set cannot write")
 	}
 }

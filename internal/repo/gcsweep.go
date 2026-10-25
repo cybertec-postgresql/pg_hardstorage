@@ -289,7 +289,7 @@ func Sweep(ctx context.Context, sp storage.StoragePlugin, opts SweepOptions) (*S
 		minAge:    minAge,
 		ageCutoff: start.Add(-minAge),
 	}
-	defer snap.refs.Close()
+	defer func() { _ = snap.refs.Close() }()
 	if err := snap.scan(ctx, sp, true); err != nil {
 		return nil, fmt.Errorf("repo: gc: collect references: %w", err)
 	}

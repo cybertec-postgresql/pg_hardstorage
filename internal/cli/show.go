@@ -145,6 +145,17 @@ func runShow(cmd *cobra.Command, deployment, backupID, repoURL string, includeDe
 					Command: "pg_hardstorage backup undelete " + deployment + " " + backupID + " --repo " + repoURL,
 				}).Wrap(readErr)
 		}
+		// A manifest that exists but cannot be parsed or verified is
+		// damage the operator must act on, not an internal error: report
+		// it in the same namespace `verify` uses for the same failure.
+		if isManifestDamage(readErr) {
+			return output.NewError("verify.manifest_signature",
+				fmt.Sprintf("show: manifest of %s is unreadable or fails verification: %v", backupID, readErr)).
+				WithSuggestion(&output.Suggestion{
+					Human:   "check the damage with `pg_hardstorage verify`, then `pg_hardstorage repair manifest` can restore a damaged copy from its replica",
+					Command: "pg_hardstorage verify " + deployment + " " + backupID + " --repo " + repoURL,
+				}).Wrap(readErr)
+		}
 		return fmt.Errorf("show: read manifest: %w", readErr)
 	}
 
@@ -312,4 +323,15 @@ func (b showBody) WriteText(w io.Writer) error {
 	}
 	_, err := io.WriteString(w, bw.String())
 	return err
+}
+
+// isManifestDamage reports whether err says a manifest was found but is
+// corrupt, unsigned or fails verification (as opposed to being absent or
+// the store being unreachable).
+func isManifestDamage(err error) bool {
+	if errors.Is(err, backup.ErrUnsigned) || errors.Is(err, backup.ErrPublicKeyMismatch) ||
+		errors.Is(err, backup.ErrAmbiguousManifest) {
+		return true
+	}
+	return strings.Contains(err.Error(), "manifest: ")
 }

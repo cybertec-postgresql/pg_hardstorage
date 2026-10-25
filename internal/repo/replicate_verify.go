@@ -6,7 +6,6 @@ package repo
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -15,13 +14,6 @@ import (
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/spill"
 )
-
-// jsonUnmarshalImpl is the canonical unmarshal entry point for
-// this file.  Wrapped so a future migration to a non-JSON
-// manifest format doesn't ripple through every caller.
-func jsonUnmarshalImpl(body []byte, into any) error {
-	return json.Unmarshal(body, into)
-}
 
 // ReplicateVerifySchema is the on-disk version tag for
 // ReplicateVerifyResult bodies.  Stable per the v1 commitment.
@@ -632,14 +624,6 @@ func forEachManifestChunk(ctx context.Context, sp storage.StoragePlugin, key str
 		}
 	}
 	return nil
-}
-
-// jsonStrictUnmarshal forwards to encoding/json.Unmarshal.
-// Wrapped so we can swap in a non-JSON parser later (CBOR /
-// MessagePack manifest formats appear in the SPEC's deferred
-// list) without touching every caller.
-func jsonStrictUnmarshal(body []byte, into any) error {
-	return jsonUnmarshalImpl(body, into)
 }
 
 // isManifestKey filters List() yields to the canonical

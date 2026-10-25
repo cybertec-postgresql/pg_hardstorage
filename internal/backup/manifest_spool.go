@@ -57,6 +57,11 @@ func (s *ManifestSpool) Add(fe *FileEntry) error {
 		return err
 	}
 	if !s.fileSet.Add(sha256.Sum256([]byte(fileIdentity(fe)))) {
+		// A damaged spill file answers "present" (fail closed); that is an
+		// I/O failure, not a duplicate path, and must be reported as one.
+		if err := s.fileSet.Err(); err != nil {
+			return fmt.Errorf("manifest spool: path set: %w", err)
+		}
 		return fmt.Errorf("manifest: duplicate file path %q in tablespace %d", fe.Path, fe.TablespaceOID)
 	}
 	s.enc.Reset()
@@ -158,6 +163,9 @@ func (ms *ManifestStore) CommitSpooled(ctx context.Context, m *Manifest, sp *Man
 	if err := sp.fileSet.Err(); err != nil {
 		return fmt.Errorf("backup: manifest path set: %w", err)
 	}
+	if err := sp.chunkSet.Err(); err != nil {
+		return fmt.Errorf("backup: manifest unique-chunk counters: %w", err)
+	}
 	if err := m.validateHeader(); err != nil {
 		return fmt.Errorf("backup: Commit refuses invalid manifest %s: %w", m.BackupID, err)
 	}
@@ -174,21 +182,22 @@ func (ms *ManifestStore) CommitSpooled(ctx context.Context, m *Manifest, sp *Man
 		return fmt.Errorf("backup: canonical spool: %w", err)
 	}
 	defer func() { _ = canon.Close(); _ = os.Remove(canon.Name()) }()
+	// bufio.Writer errors are sticky: the Flush below reports any of them.
 	w := bufio.NewWriterSize(canon, 1<<20)
-	w.Write(prefix)
+	_, _ = w.Write(prefix)
 	if sp.files == 0 {
-		w.WriteString("[]")
+		_, _ = w.WriteString("[]")
 	} else {
-		w.WriteByte('[')
+		_ = w.WriteByte('[')
 		if _, err := sp.f.Seek(0, stdio.SeekStart); err != nil {
 			return err
 		}
 		if _, err := stdio.Copy(w, sp.f); err != nil {
 			return fmt.Errorf("backup: assemble canonical manifest: %w", err)
 		}
-		w.WriteByte(']')
+		_ = w.WriteByte(']')
 	}
-	w.Write(suffix)
+	_, _ = w.Write(suffix)
 	if err := w.Flush(); err != nil {
 		return fmt.Errorf("backup: assemble canonical manifest: %w", err)
 	}

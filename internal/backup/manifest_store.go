@@ -1904,16 +1904,6 @@ func (ms *ManifestStore) readManifestUnverified(ctx context.Context, deployment,
 	return ms.streamHeader(ctx, ReplicaPath(backupID), StreamOptions{})
 }
 
-// readKeyBytes returns the raw body at key (Get + ReadAll).
-func (ms *ManifestStore) readKeyBytes(ctx context.Context, key string) ([]byte, error) {
-	rc, err := ms.sp.Get(ctx, key)
-	if err != nil {
-		return nil, err
-	}
-	defer rc.Close()
-	return ReadAllLimited(rc, MaxManifestBytes)
-}
-
 // EnsureReplica guarantees the redundant replica copy of a committed
 // manifest exists and verifies. If the replica is missing or
 // unverifiable, it is rebuilt from the (signature-verified) primary;

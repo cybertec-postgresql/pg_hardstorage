@@ -10,6 +10,7 @@ package repo
 // TestVerifyAdoptedChunks_SweptAdoptionRefusesCommit,
 // TestAdoptedHashes_LostPutRaceIsAdopted (backup/runner) and
 // TestSink_AdoptedChunkSweptMidStream_RefusesCommit (pg/walsink).
-func (c *CAS) markAdopted(h Hash) {
+func (c *CAS) markAdopted(h Hash) error {
 	_ = h
+	return nil
 }

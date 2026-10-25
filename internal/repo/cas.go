@@ -20,11 +20,6 @@ import (
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/spill"
 )
 
-// asArray converts repo.Hash back to [32]byte for the storage plugin's
-// PutOptions.ContentSHA256. Hash and [32]byte share an underlying type;
-// this is just a typed conversion at the API boundary.
-func (h Hash) asArray() [32]byte { return [32]byte(h) }
-
 // CASRetention configures per-Put retention propagation. When
 // active, every PutChunk includes a RetainUntil deadline in
 // PutOptions, which storage backends with WORM support
@@ -815,7 +810,9 @@ func (c *CAS) PutChunk(ctx context.Context, body []byte) (ChunkInfo, error) {
 	if v, ok := c.seen.Load(hash); ok {
 		e, _ := v.(seenEntry)
 		if e.writtenAt.IsZero() || c.clock().Sub(e.writtenAt) >= seenWriteTrust {
-			c.markAdopted(hash)
+			if err := c.markAdopted(hash); err != nil {
+				return ChunkInfo{}, err
+			}
 		}
 		if until, err := c.ensureRetention(ctx, hash, e.retainedUntil); err != nil {
 			return ChunkInfo{}, err
@@ -853,7 +850,9 @@ func (c *CAS) PutChunk(ctx context.Context, body []byte) (ChunkInfo, error) {
 					return ChunkInfo{}, err
 				}
 				c.markSeen(hash, seenEntry{retainedUntil: until})
-				c.markAdopted(hash)
+				if err := c.markAdopted(hash); err != nil {
+					return ChunkInfo{}, err
+				}
 				c.dedupStorage.Add(1)
 				info.Deduped = true
 				return info, nil
@@ -929,7 +928,9 @@ func (c *CAS) PutChunk(ctx context.Context, body []byte) (ChunkInfo, error) {
 			return ChunkInfo{}, rerr
 		}
 		c.markSeen(hash, seenEntry{retainedUntil: until})
-		c.markAdopted(hash)
+		if err := c.markAdopted(hash); err != nil {
+			return ChunkInfo{}, err
+		}
 		c.dedupStorage.Add(1)
 		info.Deduped = true
 		return info, nil
