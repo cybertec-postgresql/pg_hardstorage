@@ -60,7 +60,12 @@ import (
 
 // writeCloseExempt maps a repo-relative path to why a deferred-only
 // Close is acceptable there.
-var writeCloseExempt = map[string]string{}
+var writeCloseExempt = map[string]string{
+	"internal/spill/hashset.go": "writeRunLocked keeps the run file open on success and reads it back " +
+		"through the same descriptor; the deferred Close only runs on the failure path, " +
+		"where the partial run is removed and the write error is already returned",
+	"internal/testkit/leakcheck/leakcheck.go": "test helper; a heap profile dump is best-effort diagnostics",
+}
 
 func TestWritableFilesHaveTheirCloseChecked(t *testing.T) {
 	root := repoRoot(t)
