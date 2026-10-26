@@ -1056,7 +1056,9 @@ func preflightAttestationGate(
 	}
 	defer sp.Close()
 	store := backup.NewManifestStore(sp)
-	m, err := store.Read(ctx, deployment, backupID, verifier)
+	// ReadAuto: a huge manifest comes back streamed and attestgate hashes
+	// its canonical form from a disk spool in bounded memory.
+	m, err := store.ReadAuto(ctx, deployment, backupID, verifier)
 	if err != nil {
 		return err
 	}

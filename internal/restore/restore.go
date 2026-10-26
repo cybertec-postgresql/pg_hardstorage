@@ -450,11 +450,14 @@ func Restore(ctx context.Context, opts Options) (res *Result, err error) {
 	// the data dir. We refuse loudly when that mismatch shows up;
 	// "wrong target dir" is what the operator wants to see, not a
 	// silent half-from-X half-from-Y mix.
-	cp, err := LoadCheckpoint(opts.TargetDir)
+	cp, done, err := LoadCompleted(opts.TargetDir, 0)
 	if err != nil {
 		return nil, output.NewError("restore.checkpoint_load_failed",
 			fmt.Sprintf("restore: load checkpoint: %v", err)).Wrap(err)
 	}
+	// done is the bounded (spilling) set of already-materialised files;
+	// nil when this is a fresh restore. See CompletedKeys.
+	defer done.Close()
 	resumed := cp != nil
 	if resumed && cp.BackupID != "" && cp.BackupID != m.BackupID {
 		return nil, output.NewError("conflict.checkpoint_mismatch",
@@ -471,18 +474,16 @@ func Restore(ctx context.Context, opts Options) (res *Result, err error) {
 					m.Deployment, cp.BackupID, opts.TargetDir),
 			})
 	}
-	completed := map[string]struct{}{}
 	var resumedBytes int64
 	var resumedChunks int
 	if resumed {
-		completed = cp.CompletedSet()
 		resumedBytes = cp.BytesWritten
 		resumedChunks = cp.ChunksFetched
 		emit(output.NewEvent(output.SeverityNotice, "restore", "resumed").
 			WithSubject(output.Subject{Deployment: opts.Deployment, BackupID: opts.BackupID}).
 			WithBody(map[string]any{
 				"target":          opts.TargetDir,
-				"completed_files": len(cp.CompletedFiles),
+				"completed_files": done.Len(),
 				"resumed_bytes":   resumedBytes,
 				"resumed_chunks":  resumedChunks,
 				"started_at":      cp.StartedAt.Format(time.RFC3339),
@@ -504,16 +505,28 @@ func Restore(ctx context.Context, opts Options) (res *Result, err error) {
 		}
 	}
 
-	cw := NewCheckpointWriter(opts.TargetDir, Checkpoint{
-		Schema:         SchemaCheckpoint,
-		BackupID:       m.BackupID,
-		Deployment:     m.Deployment,
-		TargetDir:      opts.TargetDir,
-		StartedAt:      orResumeTime(resumed, cp, startedAt),
-		CompletedFiles: completedSlice(cp),
-		BytesWritten:   resumedBytes,
-		ChunksFetched:  resumedChunks,
-	}, 0)
+	cpInit := Checkpoint{
+		Schema:        SchemaCheckpoint,
+		BackupID:      m.BackupID,
+		Deployment:    m.Deployment,
+		TargetDir:     opts.TargetDir,
+		StartedAt:     orResumeTime(resumed, cp, startedAt),
+		BytesWritten:  resumedBytes,
+		ChunksFetched: resumedChunks,
+	}
+	var cw *CheckpointWriter
+	if resumed {
+		// Extend the existing completed-files log (migrating a legacy
+		// inline list) rather than re-seeding it from memory.
+		cpInit.CompletedLogBytes, cpInit.CompletedCount = cp.CompletedLogBytes, cp.CompletedCount
+		cpInit.legacyInline = cp.legacyInline
+		if cw, err = ResumeCheckpointWriter(opts.TargetDir, cpInit, 0); err != nil {
+			return nil, output.NewError("restore.checkpoint_load_failed",
+				fmt.Sprintf("restore: resume checkpoint: %v", err)).Wrap(err)
+		}
+	} else {
+		cw = NewCheckpointWriter(opts.TargetDir, cpInit, 0)
+	}
 
 	emit(output.NewEvent(output.SeverityInfo, "restore", "started").
 		WithSubject(output.Subject{Deployment: opts.Deployment, BackupID: opts.BackupID}).
@@ -523,7 +536,7 @@ func Restore(ctx context.Context, opts Options) (res *Result, err error) {
 	matCtx, matSpan := tracing.Tracer().Start(ctx, "restore.materialise",
 		trace.WithAttributes(
 			attribute.Int("file_count_total", m.NumFiles()),
-			attribute.Int("file_count_already_done", len(completed)),
+			attribute.Int("file_count_already_done", done.Len()),
 		))
 	var bytesWritten int64 = resumedBytes
 	var chunksFetched int = resumedChunks
@@ -540,7 +553,10 @@ func Restore(ctx context.Context, opts Options) (res *Result, err error) {
 		if err != nil {
 			return err
 		}
-		if _, alreadyDone := completed[fkey]; alreadyDone {
+		if done.Has(fkey) {
+			if err := done.Err(); err != nil {
+				return fmt.Errorf("restore: resume set: %w", err)
+			}
 			// Cheap on-disk revalidation before trusting the
 			// checkpoint. After an OS crash / power loss the journal
 			// can persist the checkpoint's rename while dropping the
@@ -556,8 +572,8 @@ func Restore(ctx context.Context, opts Options) (res *Result, err error) {
 			if st, serr := os.Stat(filepath.Join(destRoot, filepath.FromSlash(f.Path))); serr == nil && st.Size() == f.Size {
 				return nil
 			}
-			// Missing or wrong size: drop the claim and re-materialise.
-			delete(completed, fkey)
+			// Missing or wrong size: re-materialise (each file is visited
+			// once, so the stale claim needs no removal from the set).
 		}
 		n, k, err := materializeFile(matCtx, cas, destRoot, f)
 		if err != nil {
@@ -579,6 +595,7 @@ func Restore(ctx context.Context, opts Options) (res *Result, err error) {
 		}
 		return nil
 	})
+	_ = done.Close() // release the resume set's heap and spill files
 	if walkErr != nil {
 		matSpan.SetStatus(codes.Error, walkErr.Error())
 		matSpan.End()
@@ -1296,7 +1313,9 @@ func hasFile(entries []os.DirEntry, name string) bool {
 // for backupID, i.e. this run resumes an interrupted restore of the
 // same backup. An unreadable checkpoint is not a resume.
 func resumesBackup(target, backupID string) bool {
-	cp, err := LoadCheckpoint(target)
+	// Header only: the completed-files list is not needed (and at millions
+	// of files not wanted) just to learn which backup the checkpoint is for.
+	cp, err := scanState(filepath.Join(target, CheckpointFilename), func(string, bool) error { return nil })
 	return err == nil && cp != nil && cp.BackupID == backupID
 }
 
