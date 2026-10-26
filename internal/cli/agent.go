@@ -329,6 +329,16 @@ func runAgent(cmd *cobra.Command, dryRun bool, metricsListen string) error {
 	ctx, cancel := context.WithCancel(cmd.Context())
 	defer cancel()
 
+	// Record which schedules this process loaded, so `schedule` can tell an
+	// operator that an edited config is not what the agent runs yet. Best
+	// effort: the record is advisory.
+	if werr := writeAgentLoaded(p.State.Value, newAgentLoadedRecord(loaded.Config.Deployments, addErrs, time.Now())); werr != nil {
+		_ = d.Event(cmd.Context(), output.NewEvent(output.SeverityWarning, "agent", "schedule.loaded_record_failed").
+			WithBody(map[string]any{"error": werr.Error()}))
+	} else {
+		defer removeAgentLoaded(p.State.Value)
+	}
+
 	// Optional Prometheus surface for this agent process (no-op when the
 	// flag is empty).  Started before the engine so a scrape during the
 	// first backup already sees data.
@@ -540,6 +550,10 @@ func buildDrillTask(name string, dep config.DeploymentConfig, kmsCfg config.KMSC
 		// namespace that does not exist.
 		return nil, fmt.Errorf("invalid drill.tablespace_mapping for deployment %q: %w", name, tsErr)
 	}
+	tsMapAll, tsAllErr := restore.CleanTablespaceMapAll(dep.Drill.TablespaceMappingAll)
+	if tsAllErr != nil {
+		return nil, fmt.Errorf("invalid drill.tablespace_mapping_all for deployment %q: %w", name, tsAllErr)
+	}
 	return &schedule.Task{
 		Name:     "drill:" + name,
 		Schedule: sched,
@@ -547,6 +561,7 @@ func buildDrillTask(name string, dep config.DeploymentConfig, kmsCfg config.KMSC
 			opts := recovery.DrillOptions{
 				Verifier:           verifier,
 				TablespaceRemap:    tsRemap,
+				TablespaceMapAll:   tsMapAll,
 				SkipVerifyEntirely: dep.Drill.SkipVerify,
 				TempBaseDir:        dep.Drill.TempBase,
 			}
@@ -588,9 +603,16 @@ func buildBackupTask(name string, dep config.DeploymentConfig, kmsCfg config.KMS
 	if err != nil {
 		return nil, err
 	}
+	// Parsed at build time like the drill mapping: a typo must stop the
+	// task registering, not surface as a failed 02:00 backup.
+	chunkAvg, runTimeout, err := parseAgentBackupSettings(dep.Backup)
+	if err != nil {
+		return nil, fmt.Errorf("deployment %q: %w", name, err)
+	}
 	return &schedule.Task{
 		Name:     "backup:" + name,
 		Schedule: sched,
+		Timeout:  runTimeout,
 		Run: func(ctx context.Context) error {
 			// Resolve encryption exactly like the interactive CLI: the
 			// deployment's kek_ref when it declares one, else a KEK on
@@ -633,6 +655,7 @@ func buildBackupTask(name string, dep config.DeploymentConfig, kmsCfg config.KMS
 				Signer:       signer,
 				Verifier:     verifier,
 				Encryption:   enc,
+				ChunkAvgSize: chunkAvg,
 				// Honour allow_unenforceable_lease on the in-process
 				// schedule too, not just the control-plane executor
 				// (internal/agent/executor.go). The sidecar chart runs
@@ -646,6 +669,27 @@ func buildBackupTask(name string, dep config.DeploymentConfig, kmsCfg config.KMS
 			return err
 		},
 	}, nil
+}
+
+// parseAgentBackupSettings validates a deployment's `backup:` block: the
+// average chunk size (0 = chunker default) and the per-run ceiling (0 =
+// derived from the schedule).
+func parseAgentBackupSettings(b config.BackupConfig) (chunkAvg int, timeout time.Duration, err error) {
+	if b.ChunkSize != "" {
+		n, perr := parseThroughput(b.ChunkSize)
+		if perr != nil || n < 16<<10 || n > 16<<20 {
+			return 0, 0, fmt.Errorf("backup.chunk_size %q: want a size between 16KiB and 16MiB (e.g. 1MiB)", b.ChunkSize)
+		}
+		chunkAvg = int(n)
+	}
+	if b.Timeout != "" {
+		d, perr := ParseDurationDays(b.Timeout)
+		if perr != nil || d <= 0 {
+			return 0, 0, fmt.Errorf("backup.timeout %q: want a positive duration such as 36h or 3d", b.Timeout)
+		}
+		timeout = d
+	}
+	return chunkAvg, timeout, nil
 }
 
 // buildAnchorTask produces a schedule.Task that publishes the audit
