@@ -721,6 +721,8 @@ func take(ctx context.Context, opts TakeOptions, abortCtx *context.Context) (*Re
 		sinkOpts = append(sinkOpts, tarsink.WithFileObserver(opts.OnFile))
 	}
 	sinkOpts = append(sinkOpts, tarsink.WithEntryStream(entryStream))
+	// PG's backup_manifest is held once, in the base-backup result.
+	sinkOpts = append(sinkOpts, tarsink.WithoutPGManifestCopy())
 	if opts.ChunkAvgSize > 0 {
 		avg := opts.ChunkAvgSize
 		sinkOpts = append(sinkOpts, tarsink.WithChunkerFactory(func() *chunker.Chunker {

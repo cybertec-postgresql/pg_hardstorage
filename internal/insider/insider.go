@@ -37,6 +37,7 @@ import (
 	stdjson "encoding/json"
 	"errors"
 	"fmt"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/topn"
 	"hash/fnv"
 	"path"
 	"sort"
@@ -757,12 +758,14 @@ type ListFilter struct {
 	MinSeverity     Severity
 	Tenant          string
 	HasFindingsOnly bool
+	// Limit keeps only the newest Limit scans (0 = all).
+	Limit int
 }
 
 // List returns scans newest-first matching the filter.
 func (s *ScanStore) List(ctx context.Context, f ListFilter) ([]*Scan, error) {
 	const prefix = "insider/scans/"
-	var out []*Scan
+	out := topn.New(f.Limit, func(a, b *Scan) bool { return a.StartedAt.After(b.StartedAt) })
 	for obj, err := range s.sp.List(ctx, prefix) {
 		if err != nil {
 			return nil, fmt.Errorf("insider: list: %w", err)
@@ -788,12 +791,9 @@ func (s *ScanStore) List(ctx context.Context, f ListFilter) ([]*Scan, error) {
 		if f.MinSeverity != "" && !severityAtLeast(scan.HighestSeverity(), f.MinSeverity) {
 			continue
 		}
-		out = append(out, scan)
+		out.Add(scan)
 	}
-	sort.Slice(out, func(i, j int) bool {
-		return out[i].StartedAt.After(out[j].StartedAt)
-	})
-	return out, nil
+	return out.Result(), nil
 }
 
 func severityAtLeast(have, want Severity) bool {

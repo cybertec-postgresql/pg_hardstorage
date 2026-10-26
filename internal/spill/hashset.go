@@ -48,9 +48,13 @@ type Key = [32]byte
 const (
 	keyLen = 32
 
-	// DefaultMemEntries is the heap budget before a flush: 4M hashes,
-	// roughly 300 MiB as a Go map.
-	DefaultMemEntries = 4 << 20
+	// DefaultMemEntries is the heap budget before a flush: 1M hashes,
+	// roughly 75 MiB as a Go map (plus the same again, transiently, for
+	// the sorted copy written to a run file). It used to be 4M (~300 MiB
+	// per set); commands that hold two or three sets at once (compare,
+	// graph, list's per-backup accounting) then sat at ~0.5-1 GiB however
+	// small the host, for the sake of a few fewer run files.
+	DefaultMemEntries = 1 << 20
 
 	// fenceEvery is the sparse-index stride: one in-memory key per
 	// fenceEvery on-disk keys, so a lookup reads one 32 KiB block.
@@ -422,6 +426,15 @@ func (s *HashSet) writeRunLocked(level int, upper int64, next func() (Key, bool,
 		return nil, fmt.Errorf("spill: create run: %w", err)
 	}
 	r := &run{f: f, path: path, level: level, bloom: newBloom(upper, s.opts.maxBloomBytes())}
+	// A failed write must not strand a partial run file (a full spill
+	// volume retried repeatedly would otherwise accumulate one per try).
+	ok := false
+	defer func() {
+		if !ok {
+			_ = f.Close()
+			_ = os.Remove(path)
+		}
+	}()
 	w := bufio.NewWriterSize(f, 1<<20)
 	var prev Key
 	for {
@@ -451,6 +464,7 @@ func (s *HashSet) writeRunLocked(level int, upper int64, next func() (Key, bool,
 		_ = f.Close()
 		return nil, fmt.Errorf("spill: flush run: %w", err)
 	}
+	ok = true
 	return r, nil
 }
 

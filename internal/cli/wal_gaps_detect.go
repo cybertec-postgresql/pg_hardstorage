@@ -28,10 +28,18 @@ package cli
 // as a gap would send an operator hunting for segments that should not
 // be replayed.
 func findGaps(segs []walSegment) []walGap {
-	if len(segs) < 2 {
-		return nil
-	}
 	var gaps []walGap
+	eachGap(segs, func(g walGap) { gaps = append(gaps, g) })
+	return gaps
+}
+
+// eachGap is findGaps as a visitor: it reports every gap without collecting
+// them, so callers over a very large archive (every other segment missing
+// is tens of millions of gaps) can count and keep only a bounded sample.
+func eachGap(segs []walSegment, emit func(walGap)) {
+	if len(segs) < 2 {
+		return
+	}
 	for i := 1; i < len(segs); i++ {
 		prev, curr := segs[i-1], segs[i]
 		if curr.SegmentNumber > prev.SegmentNumber+1 {
@@ -44,8 +52,7 @@ func findGaps(segs []walSegment) []walGap {
 			if curr.Timeline != prev.Timeline {
 				g.EndTimeline = curr.Timeline
 			}
-			gaps = append(gaps, g)
+			emit(g)
 		}
 	}
-	return gaps
 }

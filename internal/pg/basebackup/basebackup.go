@@ -393,15 +393,19 @@ func readLSNResult(ctx context.Context, reader *streaming.Reader, label string) 
 }
 
 // MaxManifestBytes bounds res.ManifestBytes in drainMultiplexed. A
-// real PG `pg_verifybackup` manifest is sized by the number of
-// files in PGDATA — for a 100 TB cluster this is on the order of
-// hundreds of thousands of files × ~100 bytes per entry, so a
-// few hundred MiB at the extreme. 256 MiB is comfortably above the
-// realistic ceiling and well below an OOM-risk threshold for the
-// tiny supervisor process. A misbehaving / hostile server that
-// streams CopyData past this bound is refused with a clean error
-// rather than dragging the agent down.
-const MaxManifestBytes = 256 << 20
+// real PG `pg_verifybackup` manifest is sized by the number of files in
+// PGDATA at roughly 150-250 bytes per entry, so a cluster of tens of
+// millions of small files (many tables, many partitions, TOAST) needs
+// gigabytes; the former 256 MiB ceiling (about 1.3M files) refused such a
+// backup outright. 1 GiB covers ~5M files and stays well below the
+// MaxManifestBytes the repository applies to a whole manifest object. A
+// misbehaving / hostile server that streams CopyData past this bound is
+// refused with a clean error rather than dragging the agent down.
+//
+// It is a variable so tests (and an operator who knows their file count)
+// can move it. The bytes are held once, in Result.ManifestBytes; the tar
+// sink is told not to keep a second copy (tarsink.WithoutPGManifestCopy).
+var MaxManifestBytes int64 = 1 << 30
 
 // Multiplex type bytes — first byte of every CopyData payload in PG
 // 15+ BASE_BACKUP.  Values from src/backend/backup/basebackup_copy.c.

@@ -43,6 +43,7 @@ import (
 	stdjson "encoding/json"
 	"errors"
 	"fmt"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/topn"
 	"hash/fnv"
 	"math/rand"
 	"path"
@@ -934,12 +935,15 @@ type ListFilter struct {
 	Since      *time.Time
 	Status     Status
 	Deployment string
+	// Limit keeps only the newest Limit runs (0 = all). Memory is O(Limit)
+	// rather than O(runs ever recorded).
+	Limit int
 }
 
 // List returns every run, newest-first, matching the filter.
 func (s *RunStore) List(ctx context.Context, f ListFilter) ([]*Run, error) {
 	const prefix = "integrity/runs/"
-	var out []*Run
+	out := topn.New(f.Limit, func(a, b *Run) bool { return a.StartedAt.After(b.StartedAt) })
 	for obj, err := range s.sp.List(ctx, prefix) {
 		if err != nil {
 			return nil, fmt.Errorf("integrity: list runs: %w", err)
@@ -962,10 +966,7 @@ func (s *RunStore) List(ctx context.Context, f ListFilter) ([]*Run, error) {
 		if f.Deployment != "" && r.Deployment != f.Deployment {
 			continue
 		}
-		out = append(out, r)
+		out.Add(r)
 	}
-	sort.Slice(out, func(i, j int) bool {
-		return out[i].StartedAt.After(out[j].StartedAt)
-	})
-	return out, nil
+	return out.Result(), nil
 }

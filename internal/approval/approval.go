@@ -50,6 +50,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/topn"
 	"sort"
 	"strings"
 	"time"
@@ -405,6 +406,8 @@ type ListFilters struct {
 	Op     Op
 	Status Status
 	Tenant string
+	// Limit keeps only the newest Limit requests (0 = all).
+	Limit int
 }
 
 // List returns matching requests in newest-first order.
@@ -417,10 +420,19 @@ type ListFilters struct {
 //	approvals/<id>.json                          → request body (2 segments)
 //	approvals/<id>/approvers/<fp>.json           → per-approver vote (4 segments)
 func (s *Store) List(ctx context.Context, f ListFilters) ([]*Request, error) {
-	var keys []string
-	for info, err := range s.sp.List(ctx, "approvals/") {
-		if err != nil {
-			return nil, err
+	// Streamed: request keys are not collected (a repository that has
+	// recorded years of approvals would hold every key), and only the
+	// newest Limit matching requests are retained when a Limit is set.
+	now := time.Now().UTC()
+	out := topn.New(f.Limit, func(a, b *Request) bool {
+		if !a.CreatedAt.Equal(b.CreatedAt) {
+			return a.CreatedAt.After(b.CreatedAt)
+		}
+		return a.ID > b.ID
+	})
+	for info, lerr := range s.sp.List(ctx, "approvals/") {
+		if lerr != nil {
+			return out.Result(), lerr
 		}
 		if !strings.HasSuffix(info.Key, ".json") {
 			continue
@@ -432,13 +444,7 @@ func (s *Store) List(ctx context.Context, f ListFilters) ([]*Request, error) {
 		if strings.Count(info.Key, "/") > 1 {
 			continue
 		}
-		keys = append(keys, info.Key)
-	}
-	// Newest-first; IDs embed sortable timestamps.
-	sort.Sort(sort.Reverse(sort.StringSlice(keys)))
-	now := time.Now().UTC()
-	var out []*Request
-	for _, k := range keys {
+		k := info.Key
 		id := strings.TrimSuffix(strings.TrimPrefix(k, "approvals/"), ".json")
 		r, err := s.Get(ctx, id)
 		if err != nil {
@@ -463,7 +469,7 @@ func (s *Store) List(ctx context.Context, f ListFilters) ([]*Request, error) {
 			if errors.Is(err, ErrNotFound) {
 				continue
 			}
-			return out, fmt.Errorf("approval: list: request %s: %w", id, err)
+			return out.Result(), fmt.Errorf("approval: list: request %s: %w", id, err)
 		}
 		if f.Op != "" && r.Op != f.Op {
 			continue
@@ -475,9 +481,9 @@ func (s *Store) List(ctx context.Context, f ListFilters) ([]*Request, error) {
 		if f.Status != "" && st != f.Status {
 			continue
 		}
-		out = append(out, r)
+		out.Add(r)
 	}
-	return out, nil
+	return out.Result(), nil
 }
 
 // Approve adds an approval to the named request. The approver supplies

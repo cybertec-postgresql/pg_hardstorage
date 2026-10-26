@@ -140,6 +140,8 @@ type Sink struct {
 
 	// manifestBuf accumulates raw bytes when currentIdx == ManifestSinkIndex.
 	manifestBuf bytes.Buffer
+	// skipPGManifest drops the manifest CopyOut instead of buffering it.
+	skipPGManifest bool
 
 	mu sync.Mutex // protects files / *bytes / per-tablespace state across the goroutines
 }
@@ -153,6 +155,13 @@ type parserResult struct {
 }
 
 // Option tunes a Sink at construction time.
+// WithoutPGManifestCopy stops the sink from buffering PG's own
+// backup_manifest. The base-backup driver already holds those bytes in
+// basebackup.Result.ManifestBytes; a second copy in the sink doubles the
+// footprint of a manifest that can be gigabytes on a cluster with tens of
+// millions of files. ManifestBytes() then returns nil.
+func WithoutPGManifestCopy() Option { return func(s *Sink) { s.skipPGManifest = true } }
+
 type Option func(*Sink)
 
 // WithChunkerFactory replaces the default chunker.New with f. Each
@@ -427,7 +436,9 @@ func (s *Sink) OnTablespaceData(idx int, data []byte) error {
 		return fmt.Errorf("tarsink: OnTablespaceData(%d) but currentIdx=%d", idx, s.currentIdx)
 	}
 	if idx == basebackup.ManifestSinkIndex {
-		s.manifestBuf.Write(data)
+		if !s.skipPGManifest {
+			s.manifestBuf.Write(data)
+		}
 		s.mu.Unlock()
 		return nil
 	}

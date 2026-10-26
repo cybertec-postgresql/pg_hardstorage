@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/topn"
 	"sort"
 	"strings"
 	"time"
@@ -275,34 +276,75 @@ type HistoryFilter struct {
 // matching the filter.  O(history-length) per call; fleets with
 // huge drill volumes can paginate via Since/Until + Limit.
 func (s *HistoryStore) List(ctx context.Context, f HistoryFilter) ([]*DrillHistoryEntry, error) {
-	keys, err := s.allKeys(ctx)
-	if err != nil {
-		return nil, err
-	}
-	sort.Strings(keys)
+	// Streamed over the listing: keys are not collected and sorted. IDs
+	// embed a sortable timestamp, so "oldest N" / "newest N" is a bounded
+	// top-N by ID, and the heap holds O(Limit) entries however long the
+	// drill history is. Unlimited (Limit 0) keeps every match, as before.
+	less := func(a, b string) bool { return a < b }
 	if f.Reverse {
-		for i, j := 0, len(keys)-1; i < j; i, j = i+1, j-1 {
-			keys[i], keys[j] = keys[j], keys[i]
+		less = func(a, b string) bool { return a > b }
+	}
+	type keyed struct {
+		key   string
+		entry *DrillHistoryEntry
+	}
+	// Select the Limit best KEYS first (cheap strings, no body reads), then
+	// read only those bodies; entries that fail the filter or decode are
+	// then skipped, which matches the old walk except that a Limit now
+	// counts candidates rather than matches only when filters drop some.
+	// To keep the exact old semantics (Limit counts MATCHES) with filters
+	// set, fall back to reading bodies as we go.
+	if f.Limit <= 0 || f.Deployment != "" || f.Verdict != "" || !f.Since.IsZero() || !f.Until.IsZero() {
+		c := topn.New(f.Limit, func(a, b keyed) bool { return less(a.key, b.key) })
+		for info, err := range s.sp.List(ctx, HistoryPrefix) {
+			if err != nil {
+				return nil, fmt.Errorf("recovery: list history: %w", err)
+			}
+			if !strings.HasSuffix(info.Key, ".json") {
+				continue
+			}
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			entry, err := s.get(ctx, info.Key)
+			if err != nil {
+				// A torn / partial write would surface here as a
+				// JSON-decode error.  Skip + continue rather than
+				// failing the whole walk; one corrupt history file
+				// shouldn't lock out the operator.
+				continue
+			}
+			if !matchesHistoryFilter(entry, f) {
+				continue
+			}
+			c.Add(keyed{info.Key, entry})
+		}
+		var out []*DrillHistoryEntry
+		for _, k := range c.Result() {
+			out = append(out, k.entry)
+		}
+		return out, nil
+	}
+	kc := topn.New(f.Limit+16, less)
+	for info, err := range s.sp.List(ctx, HistoryPrefix) {
+		if err != nil {
+			return nil, fmt.Errorf("recovery: list history: %w", err)
+		}
+		if strings.HasSuffix(info.Key, ".json") {
+			kc.Add(info.Key)
 		}
 	}
 	var out []*DrillHistoryEntry
-	for _, k := range keys {
+	for _, k := range kc.Result() {
 		if err := ctx.Err(); err != nil {
 			return out, err
 		}
 		entry, err := s.get(ctx, k)
 		if err != nil {
-			// A torn / partial write would surface here as a
-			// JSON-decode error.  Skip + continue rather than
-			// failing the whole walk; one corrupt history file
-			// shouldn't lock out the operator.
-			continue
-		}
-		if !matchesHistoryFilter(entry, f) {
 			continue
 		}
 		out = append(out, entry)
-		if f.Limit > 0 && len(out) >= f.Limit {
+		if len(out) >= f.Limit {
 			break
 		}
 	}

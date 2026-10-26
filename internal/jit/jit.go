@@ -46,7 +46,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"sort"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/topn"
 	"strings"
 	"time"
 
@@ -672,6 +672,8 @@ type ListFilter struct {
 	Status    Status // empty = all
 	Tenant    string
 	Now       time.Time
+	// Limit keeps only the newest Limit tokens (0 = all).
+	Limit int
 }
 
 // List returns matching tokens in newest-first order (lex of
@@ -681,7 +683,7 @@ func (s *Store) List(ctx context.Context, f ListFilter) ([]*ListEntry, error) {
 	if now.IsZero() {
 		now = time.Now().UTC()
 	}
-	var keys []string
+	out := topn.New(f.Limit, func(a, b *ListEntry) bool { return a.Token.IssuedAt.After(b.Token.IssuedAt) })
 	for info, err := range s.sp.List(ctx, "jit/") {
 		if err != nil {
 			return nil, fmt.Errorf("jit: list: %w", err)
@@ -691,12 +693,7 @@ func (s *Store) List(ctx context.Context, f ListFilter) ([]*ListEntry, error) {
 		if !strings.HasSuffix(info.Key, ".json") || strings.HasSuffix(info.Key, ".revoked") {
 			continue
 		}
-		keys = append(keys, info.Key)
-	}
-	sort.Strings(keys)
-	var out []*ListEntry
-	for _, k := range keys {
-		id := strings.TrimSuffix(strings.TrimPrefix(k, "jit/"), ".json")
+		id := strings.TrimSuffix(strings.TrimPrefix(info.Key, "jit/"), ".json")
 		t, err := s.Get(ctx, id)
 		if err != nil {
 			continue
@@ -716,13 +713,10 @@ func (s *Store) List(ctx context.Context, f ListFilter) ([]*ListEntry, error) {
 		if f.Status != "" && entry.EffectiveStatus != f.Status {
 			continue
 		}
-		out = append(out, entry)
+		out.Add(entry)
 	}
 	// Newest-first by IssuedAt.
-	sort.Slice(out, func(i, j int) bool {
-		return out[i].Token.IssuedAt.After(out[j].Token.IssuedAt)
-	})
-	return out, nil
+	return out.Result(), nil
 }
 
 // ListEntry pairs a Token with its computed lifecycle state.

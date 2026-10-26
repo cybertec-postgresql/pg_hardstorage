@@ -32,6 +32,7 @@ package audit
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -45,6 +46,7 @@ import (
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/spill"
 )
 
 // defaultAuditLoggerMu guards the package-level fallback loggers
@@ -742,20 +744,36 @@ func (s *Store) head(ctx context.Context, shard string) (*Event, error) {
 // all of them; a named shard's directory contains only its own events
 // plus its _head.json.
 func (s *Store) listShardEventKeys(ctx context.Context, shard string) ([]string, error) {
+	var out []string
+	if err := s.eachShardEventKey(ctx, shard, func(k string) error {
+		out = append(out, k)
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+// eachShardEventKey streams one shard's event keys (in the backend's list
+// order) without collecting them: a chain of millions of events must not
+// cost a heap slice of every key. Use listShardEventKeys only where a
+// sorted slice is genuinely required (tests).
+func (s *Store) eachShardEventKey(ctx context.Context, shard string, fn func(key string) error) error {
 	dir := shardEventDir(shard)
 	headKey := headKeyForShard(shard)
-	var out []string
 	for info, err := range s.sp.List(ctx, dir) {
 		if err != nil {
-			return nil, err
+			return err
 		}
 		if !s.isShardEventKey(shard, info.Key, headKey) {
 			continue
 		}
-		out = append(out, info.Key)
+		if err := fn(info.Key); err != nil {
+			return err
+		}
 	}
-	sort.Strings(out)
-	return out, nil
+	return nil
 }
 
 // isShardEventKey reports whether key is an event object of shard's
@@ -871,37 +889,25 @@ func trimAuditMatches(out []*Event, limit int, reverse bool) []*Event {
 // Reverse=true + Limit=10 returns the 10 most-recent events
 // matching filters — the natural "what happened recently?" query.
 func (s *Store) Search(ctx context.Context, f ListFilters) ([]*Event, error) {
-	shards, err := s.listShards(ctx)
-	if err != nil {
-		return nil, err
-	}
 	// Collect matches across every shard, then order globally. Per-shard
 	// Sequence isn't comparable across shards, so the global order is by
 	// Timestamp (ID breaks ties deterministically) — the multi-shard
 	// equivalent of the single-chain commit order. Limit/Reverse apply
 	// AFTER the global sort so they mean "the newest/oldest N overall".
 	var out []*Event
-	for _, shard := range shards {
-		keys, err := s.listShardEventKeys(ctx, shard)
-		if err != nil {
-			return out, err
+	err := s.scan(ctx, f, func(ev *Event) error {
+		out = append(out, ev)
+		// Bounded retention: with a Limit only the oldest (or,
+		// Reverse, newest) Limit matches can be returned, so
+		// compact periodically instead of holding every match
+		// of a multi-million-event chain.
+		if f.Limit > 0 && len(out) >= 2*f.Limit+1024 {
+			out = trimAuditMatches(out, f.Limit, f.Reverse)
 		}
-		for _, k := range keys {
-			ev, err := s.getByKey(ctx, k)
-			if err != nil {
-				return out, err
-			}
-			if matches(ev, f) {
-				out = append(out, ev)
-				// Bounded retention: with a Limit only the oldest (or,
-				// Reverse, newest) Limit matches can be returned, so
-				// compact periodically instead of holding every match
-				// of a multi-million-event chain.
-				if f.Limit > 0 && len(out) >= 2*f.Limit+1024 {
-					out = trimAuditMatches(out, f.Limit, f.Reverse)
-				}
-			}
-		}
+		return nil
+	})
+	if err != nil {
+		return out, err
 	}
 	sortAuditEvents(out)
 	if f.Reverse {
@@ -913,6 +919,30 @@ func (s *Store) Search(ctx context.Context, f ListFilters) ([]*Event, error) {
 		out = out[:f.Limit]
 	}
 	return out, nil
+}
+
+// scan streams every event matching f (ignoring Limit and Reverse) to fn,
+// one event at a time and without collecting the chain's key list.
+func (s *Store) scan(ctx context.Context, f ListFilters, fn func(*Event) error) error {
+	shards, err := s.listShards(ctx)
+	if err != nil {
+		return err
+	}
+	for _, shard := range shards {
+		if err := s.eachShardEventKey(ctx, shard, func(k string) error {
+			ev, err := s.getByKey(ctx, k)
+			if err != nil {
+				return err
+			}
+			if matches(ev, f) {
+				return fn(ev)
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func matches(ev *Event, f ListFilters) bool {
@@ -961,18 +991,16 @@ func (s *Store) SummaryByAction(ctx context.Context, f ListFilters) (map[string]
 	// would be confusing ("limit before grouping" vs "limit
 	// groups"); the summary is meant to count EVERYTHING that
 	// matches.
-	loop := f
-	loop.Limit = 0
-	loop.Reverse = false
-	events, err := s.Search(ctx, loop)
-	if err != nil {
+	counts := make(map[string]int, 8)
+	total := 0
+	if err := s.scan(ctx, f, func(ev *Event) error {
+		counts[ev.Action]++
+		total++
+		return nil
+	}); err != nil {
 		return nil, 0, err
 	}
-	counts := make(map[string]int, 8)
-	for _, ev := range events {
-		counts[ev.Action]++
-	}
-	return counts, len(events), nil
+	return counts, total, nil
 }
 
 // VerifyResult records the outcome of VerifyChain.
@@ -1003,6 +1031,10 @@ type VerifyResult struct {
 	// verification that could not run must not report as one that
 	// passed.
 	HeadPointerMissing []string `json:"head_pointer_missing,omitempty"`
+
+	// FindingsTruncated is set when a finding list above hit its cap
+	// (maxVerifyFindings); the verdict is unaffected.
+	FindingsTruncated bool `json:"findings_truncated,omitempty"`
 
 	OK bool `json:"ok"`
 }
@@ -1036,37 +1068,38 @@ func (s *Store) VerifyChain(ctx context.Context) (VerifyResult, error) {
 	return res, nil
 }
 
+// verifySortMemBytes is the in-memory buffer of verifyShard's linkage sorter
+// (0 = the sorter's default); a variable so tests can force the spill path.
+var verifySortMemBytes int
+
 // verifyShard checks one shard's chain and folds its findings into res.
 func (s *Store) verifyShard(ctx context.Context, shard string, res *VerifyResult) error {
-	keys, err := s.listShardEventKeys(ctx, shard)
-	if err != nil {
-		return err
-	}
 	// The storage keys sort date-first (.../YYYY/MM/DD/<seq>-<id>), so a
 	// backward wall-clock step across a day boundary can place a
 	// higher-Sequence event under an earlier date and reorder the walk
 	// — which would flag a perfectly valid chain as broken. The
 	// authoritative append order is the monotonic Sequence; do the hash
-	// self-check while streaming (cheap, per-event), but collect a small
-	// (seq, hash, prev_hash, id) tuple per event and run the PrevHash
-	// linkage check in Sequence order.
-	type link struct {
-		seq            int64
-		hash, prev, id string
-	}
-	var links []link
-	for _, k := range keys {
+	// self-check while streaming (cheap, per-event), but feed a small
+	// (seq, hash, prev_hash, id) tuple per event to an external sorter and
+	// run the PrevHash linkage check in Sequence order. The tuples spill
+	// to disk, so a chain of millions of events costs a bounded buffer
+	// rather than a heap slice of every key and tuple.
+	linkSort := spill.NewSorter(spill.SorterOptions{MemBytes: verifySortMemBytes})
+	defer linkSort.Close()
+	var nEvents int64
+	if err := s.eachShardEventKey(ctx, shard, func(k string) error {
 		ev, err := s.getByKey(ctx, k)
 		if err != nil {
 			return err
 		}
 		res.EventsChecked++
+		nEvents++
 		recomputed, err := ComputeHash(ev)
 		if err != nil {
 			return err
 		}
 		if recomputed != ev.Hash {
-			res.HashMismatches = append(res.HashMismatches, ev.ID)
+			res.addFinding(&res.HashMismatches, ev.ID)
 		}
 		// Belongs-in-shard: an event whose scope implies a different
 		// shard has been relocated into this chain — a tamper signal
@@ -1074,19 +1107,42 @@ func (s *Store) verifyShard(ctx context.Context, shard string, res *VerifyResult
 		// internally-valid sub-chain moved wholesale into another
 		// shard's directory, which the linkage check alone would miss).
 		if shardKeyFor(ev) != shard {
-			res.Misfiled = append(res.Misfiled, ev.ID)
+			res.addFinding(&res.Misfiled, ev.ID)
 		}
-		links = append(links, link{seq: ev.Sequence, hash: ev.Hash, prev: ev.PrevHash, id: ev.ID})
+		var key [8]byte
+		// Flip the sign bit so negative sequences (corrupt data) still
+		// sort below positive ones in unsigned byte order.
+		binary.BigEndian.PutUint64(key[:], uint64(ev.Sequence)^(1<<63))
+		return linkSort.Add(key[:], encodeLink(ev.Hash, ev.PrevHash, ev.ID))
+	}); err != nil {
+		return err
 	}
-	sort.Slice(links, func(i, j int) bool { return links[i].seq < links[j].seq })
-	for i, l := range links {
-		expectedPrev := GenesisHash
-		if i > 0 {
-			expectedPrev = links[i-1].hash
+	var (
+		head struct {
+			seq  int64
+			hash string
 		}
-		if l.prev != expectedPrev {
-			res.ChainBreaks = append(res.ChainBreaks, l.id)
+		prevHash = GenesisHash
+	)
+	it, err := linkSort.Iter()
+	if err != nil {
+		return err
+	}
+	defer it.Close()
+	for {
+		k, v, ok, err := it.Next()
+		if err != nil {
+			return err
 		}
+		if !ok {
+			break
+		}
+		hash, prev, id := decodeLink(v)
+		if prev != prevHash {
+			res.addFinding(&res.ChainBreaks, id)
+		}
+		prevHash = hash
+		head.seq, head.hash = int64(binary.BigEndian.Uint64(k)^(1<<63)), hash
 	}
 
 	// Tail check. Everything above is internal to the events that are
@@ -1098,10 +1154,9 @@ func (s *Store) verifyShard(ctx context.Context, shard string, res *VerifyResult
 	// prunes the OLDEST events while sequence numbers keep climbing, so
 	// a count-based check would fire on every pruned chain (see
 	// HeadKeyForShard's note). A pruned chain still has its true head.
-	if len(links) == 0 {
+	if nEvents == 0 {
 		return nil // empty shard: nothing to truncate
 	}
-	head := links[len(links)-1]
 	hp, hperr := s.readHeadPointer(ctx, shard)
 	if hperr != nil {
 		return hperr
@@ -1123,6 +1178,37 @@ func (s *Store) verifyShard(ctx context.Context, shard string, res *VerifyResult
 			shardLabel(shard), head.seq, short12(head.hash), short12(hp.Hash)))
 	}
 	return nil
+}
+
+// maxVerifyFindings caps each finding list in a VerifyResult so a wholesale
+// corrupted chain of millions of events cannot turn the report itself into
+// a linear-memory (and unreadable) object. The first findings are kept;
+// FindingsTruncated says there were more, and OK is already false.
+const maxVerifyFindings = 10000
+
+func (r *VerifyResult) addFinding(list *[]string, id string) {
+	if len(*list) >= maxVerifyFindings {
+		r.FindingsTruncated = true
+		return
+	}
+	*list = append(*list, id)
+}
+
+func encodeLink(hash, prev, id string) []byte {
+	b := make([]byte, 0, len(hash)+len(prev)+len(id)+2)
+	b = append(b, hash...)
+	b = append(b, 0)
+	b = append(b, prev...)
+	b = append(b, 0)
+	return append(b, id...)
+}
+
+func decodeLink(b []byte) (hash, prev, id string) {
+	parts := bytes.SplitN(b, []byte{0}, 3)
+	for len(parts) < 3 {
+		parts = append(parts, nil)
+	}
+	return string(parts[0]), string(parts[1]), string(parts[2])
 }
 
 // shardLabel renders a shard name for operator-facing findings; the
@@ -1260,10 +1346,6 @@ func (s *Store) VerifyAnchor(ctx context.Context, log TransparencyLog, logID str
 	// sequence. a.Shard is "" for both the global chain and pre-sharding
 	// anchors, so legacy anchors verify against the global chain exactly
 	// as before.
-	keys, err := s.listShardEventKeys(ctx, a.Shard)
-	if err != nil {
-		return res, err
-	}
 	// Resolve the anchored event BY SEQUENCE, never by list index.
 	// Index==sequence silently breaks in two documented realities:
 	// mixed key layouts (legacy date-bucketed keys sort lexically
@@ -1273,10 +1355,10 @@ func (s *Store) VerifyAnchor(ctx context.Context, log TransparencyLog, logID str
 	// tool whose job is telling "verified" from "tampered".
 	var anchoredKey string
 	var maxSeq int64 = -1
-	for _, k := range keys {
+	if err := s.eachShardEventKey(ctx, a.Shard, func(k string) error {
 		seq, ok := seqFromEventKey(k)
 		if !ok {
-			continue
+			return nil
 		}
 		if seq > maxSeq {
 			maxSeq = seq
@@ -1284,6 +1366,9 @@ func (s *Store) VerifyAnchor(ctx context.Context, log TransparencyLog, logID str
 		if seq == a.HeadSequence {
 			anchoredKey = k
 		}
+		return nil
+	}); err != nil {
+		return res, err
 	}
 	if anchoredKey == "" {
 		if maxSeq < a.HeadSequence {

@@ -67,7 +67,12 @@ const SinkSchema = "pg_hardstorage.logical.s3events.v1"
 // Defaults: same shape as the webhook sink so operators picking
 // between them don't have to re-tune.
 const (
-	DefaultBatchSize     = 100
+	DefaultBatchSize = 100
+	// DefaultBatchBytes caps the payload bytes buffered per batch. A count
+	// alone is not a memory bound: 100 records of a wide row (a row can be
+	// up to 1 GiB) would hold gigabytes. The batch flushes when either the
+	// record count or the byte total is reached.
+	DefaultBatchBytes    = 16 << 20
 	DefaultBatchInterval = 5 * time.Second
 )
 
@@ -97,6 +102,10 @@ type Options struct {
 	// DefaultBatchSize / DefaultBatchInterval.
 	BatchSize     int
 	BatchInterval time.Duration
+
+	// BatchBytes flushes the batch once the buffered record payloads reach
+	// this many bytes (default DefaultBatchBytes).
+	BatchBytes int
 
 	// DeadLetter, when non-nil, captures batches that hit a
 	// persistent Put failure.  Without it, the sink stalls on
@@ -166,6 +175,7 @@ type Sink struct {
 	slot       string
 
 	batchSize     int
+	batchBytes    int
 	batchInterval time.Duration
 
 	deadLetter DeadLetterSink
@@ -174,6 +184,7 @@ type Sink struct {
 
 	mu          sync.Mutex
 	buffered    []logicalreceiver.Record
+	bufBytes    int // payload bytes in buffered
 	bufferStart pglogrepl.LSN
 	bufferEnd   pglogrepl.LSN
 	bufferSince time.Time
@@ -219,6 +230,10 @@ func New(opts Options) (*Sink, error) {
 	if bs <= 0 {
 		bs = DefaultBatchSize
 	}
+	bb := opts.BatchBytes
+	if bb <= 0 {
+		bb = DefaultBatchBytes
+	}
 	bi := opts.BatchInterval
 	if bi <= 0 {
 		bi = DefaultBatchInterval
@@ -230,6 +245,7 @@ func New(opts Options) (*Sink, error) {
 		stream:        opts.Stream,
 		slot:          opts.Slot,
 		batchSize:     bs,
+		batchBytes:    bb,
 		batchInterval: bi,
 		deadLetter:    opts.DeadLetter,
 		now:           now,
@@ -249,6 +265,7 @@ func (s *Sink) OnRecord(ctx context.Context, rec logicalreceiver.Record) error {
 		s.bufferSince = s.now()
 	}
 	s.buffered = append(s.buffered, rec)
+	s.bufBytes += len(rec.Data)
 	// bufferEnd is the batch's recorded LSN range end only. It is NOT
 	// what gets confirmed: neither rec.ServerWALEnd (the server's global
 	// end-of-WAL) nor WALStart+len(Data) (synthetic, can overshoot a
@@ -257,7 +274,7 @@ func (s *Sink) OnRecord(ctx context.Context, rec logicalreceiver.Record) error {
 	if end := rec.WALStart + pglogrepl.LSN(len(rec.Data)); end > s.bufferEnd {
 		s.bufferEnd = end
 	}
-	if len(s.buffered) >= s.batchSize {
+	if len(s.buffered) >= s.batchSize || s.bufBytes >= s.batchBytes {
 		return s.flushLocked(ctx)
 	}
 	s.mu.Unlock()
@@ -331,6 +348,7 @@ func (s *Sink) flushLocked(ctx context.Context) error {
 	startLSN := s.bufferStart
 	endLSN := s.bufferEnd
 	s.buffered = nil
+	s.bufBytes = 0
 	s.bufferStart = 0
 	s.bufferEnd = 0
 	s.bufferSince = time.Time{}
@@ -366,6 +384,7 @@ func (s *Sink) flushLocked(ctx context.Context) error {
 		s.mu.Lock()
 		if !s.closed {
 			s.buffered = append(batch, s.buffered...)
+			s.bufBytes += recordBytes(batch)
 			s.bufferStart = startLSN
 			if s.bufferEnd < endLSN {
 				s.bufferEnd = endLSN
@@ -394,6 +413,7 @@ func (s *Sink) flushLocked(ctx context.Context) error {
 		s.mu.Lock()
 		if !s.closed {
 			s.buffered = append(batch, s.buffered...)
+			s.bufBytes += recordBytes(batch)
 			s.bufferStart = startLSN
 			if s.bufferEnd < endLSN {
 				s.bufferEnd = endLSN
@@ -495,4 +515,13 @@ func (d *StorageDeadLetter) WriteDeadLetter(ctx context.Context, env DeadLetterE
 		ContentLength: int64(len(body)),
 	})
 	return err
+}
+
+// recordBytes is the total payload size of recs.
+func recordBytes(recs []logicalreceiver.Record) int {
+	n := 0
+	for i := range recs {
+		n += len(recs[i].Data)
+	}
+	return n
 }

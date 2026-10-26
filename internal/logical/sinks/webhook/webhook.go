@@ -56,6 +56,10 @@ const SinkSchema = "pg_hardstorage.logical.webhook.v1"
 // 1-record requests.
 const DefaultBatchSize = 100
 
+// DefaultBatchBytes caps the payload bytes buffered per POST: a record
+// count alone is not a memory bound when rows are wide.
+const DefaultBatchBytes = 16 << 20
+
 // DefaultBatchInterval is the wallclock-based flush deadline.
 // Records buffered for longer than this without filling a batch
 // get POSTed anyway.
@@ -102,6 +106,10 @@ type Options struct {
 	// BatchSize is the records-per-POST cap.  Default
 	// DefaultBatchSize.
 	BatchSize int
+
+	// BatchBytes flushes the batch once the buffered record payloads reach
+	// this many bytes.  Default DefaultBatchBytes.
+	BatchBytes int
 
 	// BatchInterval is the wallclock-based flush deadline.
 	// Default DefaultBatchInterval.
@@ -220,6 +228,7 @@ type Sink struct {
 
 	mu       sync.Mutex
 	buf      []logicalreceiver.Record
+	bufBytes int // payload bytes in buf
 	startLSN pglogrepl.LSN
 	endLSN   pglogrepl.LSN
 
@@ -245,6 +254,9 @@ func New(opts Options) (*Sink, error) {
 	}
 	if opts.BatchSize <= 0 {
 		opts.BatchSize = DefaultBatchSize
+	}
+	if opts.BatchBytes <= 0 {
+		opts.BatchBytes = DefaultBatchBytes
 	}
 	if opts.BatchInterval <= 0 {
 		opts.BatchInterval = DefaultBatchInterval
@@ -287,7 +299,8 @@ func (s *Sink) OnRecord(ctx context.Context, rec logicalreceiver.Record) error {
 	}
 	s.endLSN = rec.WALStart + pglogrepl.LSN(len(rec.Data))
 	s.buf = append(s.buf, rec)
-	if len(s.buf) >= s.opts.BatchSize {
+	s.bufBytes += len(rec.Data)
+	if len(s.buf) >= s.opts.BatchSize || s.bufBytes >= s.opts.BatchBytes {
 		return s.flushLocked(ctx)
 	}
 	return nil
@@ -354,6 +367,7 @@ func (s *Sink) flushLocked(ctx context.Context) error {
 	startLSN := s.startLSN
 	endLSN := s.endLSN
 	s.buf = nil
+	s.bufBytes = 0
 	s.startLSN = 0
 	s.endLSN = 0
 	s.lastFlush.Store(s.opts.Now().UnixNano())
@@ -390,6 +404,7 @@ func (s *Sink) flushLocked(ctx context.Context) error {
 		// advance but keep the records in memory; on agent
 		// restart they're re-streamed by PG).
 		s.buf = batch
+		s.bufBytes = recordBytes(batch)
 		s.startLSN = startLSN
 		s.endLSN = endLSN
 		return fmt.Errorf("webhook: batch %s exhausted retry budget; slot will stall: %w",
@@ -415,6 +430,7 @@ func (s *Sink) flushLocked(ctx context.Context) error {
 		// AND stall the slot (don't advance + leave records
 		// in buffer).
 		s.buf = batch
+		s.bufBytes = recordBytes(batch)
 		s.startLSN = startLSN
 		s.endLSN = endLSN
 		return fmt.Errorf("webhook: batch %s POST failed AND dead-letter persist failed: post=%v; dl=%w",
@@ -593,4 +609,13 @@ func computeBatchID(records []logicalreceiver.Record, start, end pglogrepl.LSN) 
 	}
 	fmt.Fprintf(h, "%s|%s", start, end)
 	return hex.EncodeToString(h.Sum(nil)[:16])
+}
+
+// recordBytes is the total payload size of recs.
+func recordBytes(recs []logicalreceiver.Record) int {
+	n := 0
+	for i := range recs {
+		n += len(recs[i].Data)
+	}
+	return n
 }

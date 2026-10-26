@@ -30,9 +30,47 @@ type timelineForkLookup func(newTLI, prevTLI uint32) (forkSeg uint64, ok bool)
 // must be covered from the fork segment. When the fork is unknown (no
 // history captured, unreadable) this is exactly findGaps.
 func findLineageGaps(segs []walSegment, forks timelineForkLookup) []walGap {
-	gaps := findGaps(segs)
+	var gaps []walGap
+	eachLineageGap(segs, forks, func(g walGap) { gaps = append(gaps, g) })
+	return gaps
+}
+
+// maxReportedGaps caps how many individual gaps a report carries. The
+// count and the missing-segment total always cover every gap; only the
+// per-gap rows are cut. A damaged archive (every other segment missing)
+// has tens of millions of gaps, and the report must not hold them all.
+const maxReportedGaps = 100000
+
+// gapReport is a lineage-gap scan reduced to bounded memory: the exact
+// totals plus the first maxReportedGaps individual gaps.
+type gapReport struct {
+	Gaps      []walGap
+	Count     int
+	Missing   uint64
+	Truncated bool
+}
+
+// scanLineageGaps is findLineageGaps with bounded memory.
+func scanLineageGaps(segs []walSegment, forks timelineForkLookup) gapReport {
+	var r gapReport
+	eachLineageGap(segs, forks, func(g walGap) {
+		r.Count++
+		r.Missing += g.MissingCount
+		if len(r.Gaps) < maxReportedGaps {
+			r.Gaps = append(r.Gaps, g)
+		} else {
+			r.Truncated = true
+		}
+	})
+	return r
+}
+
+// eachLineageGap visits every gap findLineageGaps would return, in the
+// same order, without collecting them.
+func eachLineageGap(segs []walSegment, forks timelineForkLookup, emit func(walGap)) {
+	eachGap(segs, emit)
 	if forks == nil {
-		return gaps
+		return
 	}
 	for i := 1; i < len(segs); i++ {
 		prev, curr := segs[i-1], segs[i]
@@ -49,14 +87,13 @@ func findLineageGaps(segs []walSegment, forks timelineForkLookup) []walGap {
 		if forkSeg > prev.SegmentNumber || curr.SegmentNumber <= forkSeg {
 			continue
 		}
-		gaps = append(gaps, walGap{
+		emit(walGap{
 			Timeline:     curr.Timeline,
 			StartSegment: forkSeg,
 			EndSegment:   curr.SegmentNumber - 1,
 			MissingCount: curr.SegmentNumber - forkSeg,
 		})
 	}
-	return gaps
 }
 
 // repoTimelineForks builds a timelineForkLookup from the history files

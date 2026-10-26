@@ -682,3 +682,33 @@ var errSentinel = &dlError{}
 type dlError struct{}
 
 func (dlError) Error() string { return "dl persist failed" }
+
+// TestSink_BatchBytes_FlushesBeforeCountCap: a batch of wide rows flushes on
+// payload bytes long before BatchSize records, so the buffer is bounded in
+// bytes and not just in record count.
+func TestSink_BatchBytes_FlushesBeforeCountCap(t *testing.T) {
+	rec := newRecorder()
+	srv := httptest.NewServer(rec.handler())
+	defer srv.Close()
+	s, err := webhook.New(webhook.Options{
+		URL: srv.URL, BatchSize: 1000, BatchBytes: 1 << 10,
+		Deployment: "db1", StreamName: "events", Slot: "test_slot",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	wide := make([]byte, 600)
+	if err := s.OnRecord(ctx, mkRecord(0x1000, wide)); err != nil {
+		t.Fatal(err)
+	}
+	if rec.calls.Load() != 0 {
+		t.Fatalf("flushed below the byte cap")
+	}
+	if err := s.OnRecord(ctx, mkRecord(0x1001, wide)); err != nil {
+		t.Fatal(err)
+	}
+	if rec.calls.Load() != 1 {
+		t.Errorf("%d posts after crossing BatchBytes with 2 of 1000 records, want 1", rec.calls.Load())
+	}
+}

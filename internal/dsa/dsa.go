@@ -46,6 +46,7 @@ import (
 	stdjson "encoding/json"
 	"errors"
 	"fmt"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/topn"
 	"hash/fnv"
 	"path"
 	"sort"
@@ -680,12 +681,14 @@ type ListFilter struct {
 	Tenant        string
 	Article       Article
 	SubjectIDHash string
+	// Limit keeps only the newest Limit reports (0 = all).
+	Limit int
 }
 
 // List returns every report newest-first matching the filter.
 func (s *ReportStore) List(ctx context.Context, f ListFilter) ([]*Report, error) {
 	const prefix = "dsa/reports/"
-	var out []*Report
+	out := topn.New(f.Limit, func(a, b *Report) bool { return a.GeneratedAt.After(b.GeneratedAt) })
 	for obj, err := range s.sp.List(ctx, prefix) {
 		if err != nil {
 			return nil, fmt.Errorf("dsa: list: %w", err)
@@ -711,12 +714,9 @@ func (s *ReportStore) List(ctx context.Context, f ListFilter) ([]*Report, error)
 		if f.SubjectIDHash != "" && r.SubjectIDHash != f.SubjectIDHash {
 			continue
 		}
-		out = append(out, r)
+		out.Add(r)
 	}
-	sort.Slice(out, func(i, j int) bool {
-		return out[i].GeneratedAt.After(out[j].GeneratedAt)
-	})
-	return out, nil
+	return out.Result(), nil
 }
 
 // ----- helpers -----

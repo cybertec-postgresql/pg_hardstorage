@@ -57,3 +57,24 @@ func TestWalListBody_TruncationNotice(t *testing.T) {
 		t.Fatalf("missing truncation notice:\n%s", sb.String())
 	}
 }
+
+// A damaged archive with every other segment missing has one gap per
+// present segment. The report keeps the exact count and missing total but
+// holds only maxReportedGaps rows.
+func TestScanLineageGaps_CapsRowsKeepsExactTotals(t *testing.T) {
+	n := maxReportedGaps*2 + 10
+	segs := make([]walSegment, n)
+	for i := range segs {
+		segs[i] = walSegment{Timeline: 1, SegmentNumber: uint64(2 * i)}
+	}
+	r := scanLineageGaps(segs, nil)
+	if r.Count != n-1 || r.Missing != uint64(n-1) {
+		t.Fatalf("count=%d missing=%d, want %d each", r.Count, r.Missing, n-1)
+	}
+	if len(r.Gaps) != maxReportedGaps || !r.Truncated {
+		t.Fatalf("kept %d rows truncated=%v, want %d rows and truncated", len(r.Gaps), r.Truncated, maxReportedGaps)
+	}
+	if got := findLineageGaps(segs[:5], nil); len(got) != 4 {
+		t.Fatalf("findLineageGaps unchanged: got %d gaps, want 4", len(got))
+	}
+}

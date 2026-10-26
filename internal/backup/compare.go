@@ -126,16 +126,21 @@ type CompareOptions struct {
 // DefaultCompareTopN is the default cap on TopFileDeltas.
 const DefaultCompareTopN = 20
 
+// compareSortMemBytes is the in-memory buffer of each side's per-file
+// signature sorter (0 = the sorter's default). A variable so tests can force
+// the spill path with a handful of files.
+var compareSortMemBytes int
+
 // Compare diffs two manifests and returns a structured
 // ComparisonResult. Both manifests must be non-nil; an empty
 // FileEntry slice on either side is treated as "no files",
 // not an error.
 //
-// Memory: O(F_a + F_b) for the per-file index (path, size, a digest of
-// the chunk list) plus a bounded-memory set per side for the chunk-level
-// diff. File counts are small even for enormous databases (a relation
-// segment is 1 GiB, so ~200K files per 200 TB), whereas chunk counts are
-// billions — which is why only the chunk side spills to disk. Each side
+// Memory: bounded, independent of both file and chunk counts. Chunks go
+// through a bounded-memory spill set per side; the per-file signatures
+// (path, size, a digest of the chunk list) go through an external sorter
+// per side and are merge-joined in path order, so a manifest with 100M
+// files costs a few tens of MiB of heap rather than tens of GiB. Each side
 // is walked once through EachFile, so streamed manifests work.
 // Determinism: TopFileDeltas sort is (|delta| desc, path asc) so ties
 // are stable across runs.
@@ -157,12 +162,20 @@ func CompareContext(ctx context.Context, a, b *Manifest, opts CompareOptions) (*
 	setB := spill.NewHashSet(spill.Options{})
 	defer setB.Close()
 
-	aIdx, aSide, err := scanSide(ctx, a, setA, nil)
+	// Per-file signatures go to external sorters keyed by path rather than
+	// into a map: a manifest with 100M files would otherwise cost tens of
+	// GiB of heap per side. The two sorted streams are merge-joined below.
+	aIdx := spill.NewSorter(spill.SorterOptions{MemBytes: compareSortMemBytes})
+	defer aIdx.Close()
+	bIdx := spill.NewSorter(spill.SorterOptions{MemBytes: compareSortMemBytes})
+	defer bIdx.Close()
+
+	aSide, err := scanSide(ctx, a, setA, nil, aIdx)
 	if err != nil {
 		return nil, err
 	}
 	res := &ComparisonResult{A: aSide.ComparisonSide}
-	bIdx, bSide, err := scanSide(ctx, b, setB, setA)
+	bSide, err := scanSide(ctx, b, setB, setA, bIdx)
 	if err != nil {
 		return nil, err
 	}
@@ -202,30 +215,66 @@ func CompareContext(ctx context.Context, a, b *Manifest, opts CompareOptions) (*
 		copy(top[i+1:], top[i:])
 		top[i] = d
 	}
-	for p, af := range aIdx {
-		bf, bOK := bIdx[p]
+	ai, err := aIdx.Iter()
+	if err != nil {
+		return nil, err
+	}
+	defer ai.Close()
+	bi, err := bIdx.Iter()
+	if err != nil {
+		return nil, err
+	}
+	defer bi.Close()
+	// pull copies the record out of the iterator's reusable buffers.
+	type rec struct {
+		ok   bool
+		path string
+		sig  fileSig
+	}
+	pull := func(it *spill.Iter) (rec, error) {
+		k, v, ok, err := it.Next()
+		if err != nil || !ok {
+			return rec{}, err
+		}
+		r := rec{ok: true, path: string(k)}
+		r.sig.size = int64(binary.BigEndian.Uint64(v[:8]))
+		copy(r.sig.digest[:], v[8:])
+		return r, nil
+	}
+	ar, err := pull(ai)
+	if err != nil {
+		return nil, err
+	}
+	br, err := pull(bi)
+	if err != nil {
+		return nil, err
+	}
+	for ar.ok || br.ok {
 		switch {
-		case !bOK:
+		case !br.ok || (ar.ok && ar.path < br.path):
 			res.FileCounts.OnlyInA++
-			offer(FileDelta{Path: p, ASize: af.size, BSize: 0, Delta: -af.size, Class: "removed"})
+			offer(FileDelta{Path: ar.path, ASize: ar.sig.size, BSize: 0, Delta: -ar.sig.size, Class: "removed"})
+			ar, err = pull(ai)
+		case !ar.ok || br.path < ar.path:
+			res.FileCounts.OnlyInB++
+			offer(FileDelta{Path: br.path, ASize: 0, BSize: br.sig.size, Delta: br.sig.size, Class: "added"})
+			br, err = pull(bi)
 		default:
 			res.FileCounts.InBoth++
-			if af != bf {
+			if ar.sig != br.sig {
 				res.FileCounts.Changed++
-				offer(FileDelta{Path: p, ASize: af.size, BSize: bf.size, Delta: bf.size - af.size, Class: "changed"})
+				offer(FileDelta{Path: ar.path, ASize: ar.sig.size, BSize: br.sig.size, Delta: br.sig.size - ar.sig.size, Class: "changed"})
 			} else {
 				// Same chunk list + same size = same bytes.
-				// Count toward shared-logical-bytes.
-				sharedLogical += af.size
+				sharedLogical += ar.sig.size
+			}
+			if ar, err = pull(ai); err == nil {
+				br, err = pull(bi)
 			}
 		}
-	}
-	for p, bf := range bIdx {
-		if _, ok := aIdx[p]; ok {
-			continue
+		if err != nil {
+			return nil, err
 		}
-		res.FileCounts.OnlyInB++
-		offer(FileDelta{Path: p, ASize: 0, BSize: bf.size, Delta: bf.size, Class: "added"})
 	}
 	res.TopFileDeltas = top
 
@@ -258,8 +307,7 @@ type sideScan struct {
 // scanSide walks one manifest once: builds its per-file index and its
 // rollup, adds its chunks to set, and — when other is the other side's
 // completed set — counts the chunks the two share.
-func scanSide(ctx context.Context, m *Manifest, set, other *spill.HashSet) (map[string]fileSig, sideScan, error) {
-	idx := make(map[string]fileSig)
+func scanSide(ctx context.Context, m *Manifest, set, other *spill.HashSet, idx *spill.Sorter) (sideScan, error) {
 	sc := sideScan{ComparisonSide: ComparisonSide{
 		BackupID:  m.BackupID,
 		Type:      string(m.Type),
@@ -290,13 +338,15 @@ func scanSide(ctx context.Context, m *Manifest, set, other *spill.HashSet) (map[
 		var sig fileSig
 		sig.size = f.Size
 		copy(sig.digest[:], h.Sum(nil))
-		idx[f.Path] = sig
-		return nil
+		var val [8 + 32]byte
+		binary.BigEndian.PutUint64(val[:8], uint64(sig.size))
+		copy(val[8:], sig.digest[:])
+		return idx.Add([]byte(f.Path), val[:])
 	})
 	if err == nil {
 		err = set.Err()
 	}
-	return idx, sc, err
+	return sc, err
 }
 
 // abs returns |x| for int64 without overflow concerns at the

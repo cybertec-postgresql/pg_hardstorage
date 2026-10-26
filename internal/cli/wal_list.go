@@ -77,11 +77,12 @@ func runWalList(cmd *cobra.Command, deployment, repoURL string, tliFilter uint32
 	}
 	// Timeline-aware: a new timeline must be covered from its fork, which
 	// segment numbers alone cannot tell (see findLineageGaps).
-	gaps := findLineageGaps(segs, repoTimelineForks(cmd.Context(), sp, deployment, segs, segSize))
+	gr := scanLineageGaps(segs, repoTimelineForks(cmd.Context(), sp, deployment, segs, segSize))
 	body := walListBody{
-		Deployment: deployment,
-		Timelines:  summariseTimelines(segs),
-		GapCount:   len(gaps),
+		Deployment:    deployment,
+		Timelines:     summariseTimelines(segs),
+		GapCount:      gr.Count,
+		GapsTruncated: gr.Truncated,
 	}
 	if !gapsOnly {
 		n := len(segs)
@@ -92,7 +93,7 @@ func runWalList(cmd *cobra.Command, deployment, repoURL string, tliFilter uint32
 		}
 		body.Segments = walSegmentRows(segs[:n], segSize)
 	}
-	body.Gaps = gaps
+	body.Gaps = gr.Gaps
 	return d.Result(output.NewResult(cmd.CommandPath()).WithBody(body))
 }
 
@@ -363,7 +364,10 @@ type walListBody struct {
 	Timelines  []walTimelineSummary `json:"timelines"`
 	GapCount   int                  `json:"gap_count"`
 	Gaps       []walGap             `json:"gaps,omitempty"`
-	Segments   []walSegmentRow      `json:"segments,omitempty"`
+	// GapsTruncated is set when Gaps was cut at maxReportedGaps; GapCount
+	// is still the true total.
+	GapsTruncated bool            `json:"gaps_truncated,omitempty"`
+	Segments      []walSegmentRow `json:"segments,omitempty"`
 	// SegmentCount and SegmentsTruncated are set only when Segments was
 	// cut at --limit; SegmentCount is then the true total.
 	SegmentCount      int  `json:"segment_count,omitempty"`
@@ -391,6 +395,9 @@ func (b walListBody) WriteText(w io.Writer) error {
 		for _, g := range b.Gaps {
 			fmt.Fprintf(bw, "      TLI %d: segments #%d..#%d (%d missing)\n",
 				g.Timeline, g.StartSegment, g.EndSegment, g.MissingCount)
+		}
+		if b.GapsTruncated {
+			fmt.Fprintf(bw, "      ... %d more gap(s) not listed\n", b.GapCount-len(b.Gaps))
 		}
 	}
 	if len(b.Segments) > 0 {
