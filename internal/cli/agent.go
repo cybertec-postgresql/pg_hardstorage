@@ -288,6 +288,7 @@ func runAgent(cmd *cobra.Command, dryRun bool, metricsListen string) error {
 		schedule.WithLastRunStore(lastRuns),
 		schedule.WithOnStart(func(name string, due time.Time) {
 			_ = d.Event(cmd.Context(), output.NewEvent(output.SeverityInfo, "agent", "task.started").
+				WithSubject(output.Subject{Deployment: taskDeployment(name)}).
 				WithBody(map[string]any{"task": name, "due_at": due.UTC().Format(time.RFC3339)}))
 		}),
 		schedule.WithOnFinish(func(name string, due time.Time, dur time.Duration, runErr error) {
@@ -300,7 +301,8 @@ func runAgent(cmd *cobra.Command, dryRun bool, metricsListen string) error {
 				sev = output.SeverityError
 				body["error"] = runErr.Error()
 			}
-			_ = d.Event(cmd.Context(), output.NewEvent(sev, "agent", "task.finished").WithBody(body))
+			_ = d.Event(cmd.Context(), output.NewEvent(sev, "agent", "task.finished").
+				WithSubject(output.Subject{Deployment: taskDeployment(name)}).WithBody(body))
 		}),
 	)
 
@@ -640,6 +642,8 @@ func buildBackupTask(name string, dep config.DeploymentConfig, kmsCfg config.KMS
 				KeyringDir: p.Keyring.Value,
 				KEKRef:     dep.KEKRef,
 				KMSConfig:  kmsCfg.ProviderConfig(dep.KEKRef),
+				Encrypt:    dep.Backup.Encrypt != nil && *dep.Backup.Encrypt,
+				NoEncrypt:  dep.Backup.Encrypt != nil && !*dep.Backup.Encrypt,
 			})
 			if eerr != nil {
 				return fmt.Errorf("agent backup %s: %w", name, eerr)
@@ -656,6 +660,8 @@ func buildBackupTask(name string, dep config.DeploymentConfig, kmsCfg config.KMS
 				Verifier:     verifier,
 				Encryption:   enc,
 				ChunkAvgSize: chunkAvg,
+				IncludeWAL:   dep.Backup.IncludeWAL,
+				Fast:         dep.Backup.Fast,
 				// Honour allow_unenforceable_lease on the in-process
 				// schedule too, not just the control-plane executor
 				// (internal/agent/executor.go). The sidecar chart runs
@@ -1498,4 +1504,14 @@ func archiveFrontierForLeader(ctx context.Context, sp storage.StoragePlugin, dep
 		return priorLSN, nil
 	}
 	return 0, nil
+}
+
+// taskDeployment returns the deployment a scheduled task belongs to.
+// Per-deployment tasks are named "<verb>:<deployment>" ("backup:prod");
+// a fleet-wide task has no deployment and gets "".
+func taskDeployment(task string) string {
+	if _, dep, ok := strings.Cut(task, ":"); ok {
+		return dep
+	}
+	return ""
 }

@@ -25,6 +25,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"strings"
@@ -55,9 +56,22 @@ func TestRepro34_ContinuousStreamerSwitchover(t *testing.T) {
 	defer p.Down(context.Background())
 
 	// Multi-host, primary-routed DSN — exactly the issue's service.
+	// PGHS_REPRO34_DELAY (e.g. 10ms) routes the streamer through a
+	// per-node proxy adding that delay in each direction. The shutdown
+	// spin is a keepalive ping-pong, so its rate is one per round trip:
+	// on localhost the #34 detector always fired, while a streamer on
+	// another subnet held the demote for 20 minutes (issue #69).
 	var hosts []string
+	delay, _ := time.ParseDuration(os.Getenv("PGHS_REPRO34_DELAY"))
 	for _, n := range p.nodes {
-		hosts = append(hosts, fmt.Sprintf("127.0.0.1:%d", n.pgPort))
+		addr := fmt.Sprintf("127.0.0.1:%d", n.pgPort)
+		if delay > 0 {
+			addr = startDelayProxy(t, addr, delay)
+		}
+		hosts = append(hosts, addr)
+	}
+	if delay > 0 {
+		t.Logf("streamer routed through %s-per-direction delay proxies: %v", delay, hosts)
 	}
 	dsn := fmt.Sprintf("postgres://postgres:%s@%s/postgres?target_session_attrs=primary&sslmode=disable",
 		patroniSuperPassword, strings.Join(hosts, ","))
@@ -187,4 +201,49 @@ func dockerLogsTail(container string, n int) string {
 	}
 	out, _ := exec.Command("docker", "logs", "--tail", fmt.Sprintf("%d", n), container).CombinedOutput()
 	return string(out)
+}
+
+// startDelayProxy forwards TCP connections to target, sleeping delay
+// before passing on each chunk in either direction, and returns its
+// listen address. Closed with the test.
+func startDelayProxy(t *testing.T, target string, delay time.Duration) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("delay proxy: %v", err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	pipe := func(dst, src net.Conn) {
+		defer dst.Close()
+		defer src.Close()
+		buf := make([]byte, 64<<10)
+		for {
+			n, err := src.Read(buf)
+			if n > 0 {
+				time.Sleep(delay)
+				if _, werr := dst.Write(buf[:n]); werr != nil {
+					return
+				}
+			}
+			if err != nil {
+				return
+			}
+		}
+	}
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			u, err := net.Dial("tcp", target)
+			if err != nil {
+				c.Close()
+				continue
+			}
+			go pipe(u, c)
+			go pipe(c, u)
+		}
+	}()
+	return ln.Addr().String()
 }

@@ -31,6 +31,16 @@ Tombstoned backups are not replicated. The replica is for surviving
 loss of the primary, not for resurrecting deleted backups.
 
 .PP
+Credentials: --from and --to authenticate independently. When both are
+s3:// URLs that need different credentials, name them per URL:
+  --from 's3://local/repo?endpoint=http://minio:9000&credentials_env=SRC_S3'
+  --to   's3://offsite/repo?profile=aws-dr'
+credentials_env=PFX reads PFX_ACCESS_KEY_ID / PFX_SECRET_ACCESS_KEY (and
+optionally PFX_SESSION_TOKEN) from the environment; profile=NAME selects
+an AWS shared-config profile. Without either, the default AWS credential
+chain applies to that URL.
+
+.PP
 By default WAL segment manifests (and their chunks) are NOT copied.
 Pass --include-wal for full WAL redundancy in the replica region.
 

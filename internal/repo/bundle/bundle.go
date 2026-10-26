@@ -44,10 +44,12 @@ import (
 	"time"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/pg/walsink"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/compression"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/spill"
+	"github.com/jackc/pglogrepl"
 )
 
 // SchemaBundle is the on-disk schema string carried in
@@ -104,17 +106,11 @@ type ExportOptions struct {
 	// included.
 	BackupID string
 
-	// IncludeWAL pulls every WAL segment listed in each manifest's
-	// WALRequired field.
-	//
-	// NOTE: nothing populates Manifest.WALRequired today — the backup
-	// runner sets it to nil — so on a repository written by this build
-	// there is nothing for this option to pull, and Build REFUSES rather
-	// than emit a bundle whose base backups have no WAL to replay. The
-	// timeline-history files this comment used to promise ("plus every
-	// timeline-history file under wal/<deployment>/timelines/") were
-	// never copied either, and BundleManifest.Timelines is never
-	// populated by anything.
+	// IncludeWAL pulls every WAL segment each backup needs: those in its
+	// manifest's WALRequired when recorded, otherwise every segment from
+	// its start LSN to its stop LSN on its timeline (backups do not yet
+	// record WALRequired — issue #77). A needed segment missing from the
+	// repository fails the export rather than yield an unrestorable bundle.
 	IncludeWAL bool
 
 	// SourceRepoURL is recorded in the bundle's manifest so
@@ -228,10 +224,39 @@ func Export(ctx context.Context, sp storage.StoragePlugin, w io.Writer, opts Exp
 		// bytes for readability but the bundle keeps the same
 		// path so an Import doesn't need to reshape.
 		if opts.IncludeWAL {
-			for _, seg := range m.WALRequired {
+			segs, err := requiredWAL(ctx, sp, m)
+			if err != nil {
+				return nil, fmt.Errorf("bundle: resolve WAL for %s/%s: %w", m.Deployment, m.BackupID, err)
+			}
+			for _, seg := range segs {
 				key := walSegmentKey(m.Deployment, m.Timeline, seg)
-				if err := copyKey(ctx, sp, tw, key, false); err != nil {
+				body, err := readKey(ctx, sp, key)
+				if err != nil {
+					if isNotFound(err) {
+						return nil, fmt.Errorf("bundle: --include-wal: backup %s/%s needs WAL segment %s to reach consistency, "+
+							"but it is not archived at %s (is `wal stream` or archive_command running for this deployment?). "+
+							"Export without --include-wal if the base backups alone are what you want", m.Deployment, m.BackupID, seg, key)
+					}
 					return nil, fmt.Errorf("bundle: copy WAL %s: %w", key, err)
+				}
+				if err := writeTarEntry(tw, key, body); err != nil {
+					return nil, err
+				}
+				// The segment manifest only references its bytes: carry
+				// the chunks too, or the imported WAL is unreadable.
+				if sm, perr := walsink.ParseSegmentManifest(body); perr == nil {
+					for _, ref := range sm.Chunks {
+						h := ref.Hash
+						if !chunkSeen.Add(h) {
+							continue
+						}
+						size, err := copyChunk(ctx, sp, tw, repo.ChunkKey(h))
+						if err != nil {
+							return nil, fmt.Errorf("bundle: copy WAL chunk %s: %w", repo.ChunkKey(h), err)
+						}
+						bundleManifest.ChunkCount++
+						bundleManifest.ChunkBytes += size
+					}
 				}
 				bundleManifest.WAL = append(bundleManifest.WAL, WALSegment{
 					Deployment: m.Deployment,
@@ -243,34 +268,10 @@ func Export(ctx context.Context, sp storage.StoragePlugin, w io.Writer, opts Exp
 	}
 
 	// --include-wal must not silently produce a bundle with no WAL.
-	//
-	// The loop above draws its segment list from each manifest's
-	// WALRequired, and nothing populates that field: the backup runner
-	// sets `WALRequired: nil` with the note "empty in v0.1: WAL
-	// streaming lands in Slice 8". WAL streaming has since landed; the
-	// field did not follow. So the loop body never ran, and
-	// bundleManifest.Timelines — declared as "one timeline-history file
-	// the bundle carries" — is never populated by anything either.
-	//
-	// The result was an air-gap export that reported success, carried
-	// the base backups, and contained not one WAL segment. A base backup
-	// cannot reach a consistent state without the WAL between its start
-	// and stop LSN, so every such bundle was unrestorable — discovered
-	// at restore time, from the air-gapped copy, which is the worst
-	// possible moment to find out.
-	//
-	// Refusing is the fail-closed reading of an unmet completeness
-	// claim. If a repository's manifests DO carry wal_required (written
-	// by a build that populates it), the loop collects them and this
-	// never fires.
+	// requiredWAL always yields at least the segment holding the start
+	// LSN, so an empty result means a logic error; fail closed.
 	if opts.IncludeWAL && len(bundleManifest.WAL) == 0 {
-		return nil, fmt.Errorf("bundle: --include-wal was requested but no manifest in this " +
-			"selection declares any required WAL (the manifest field wal_required is not " +
-			"populated at backup time), so the bundle would carry base backups with none of " +
-			"the WAL needed to bring them to a consistent state. Refusing to write an " +
-			"unrestorable bundle: export without --include-wal if the base backups alone are " +
-			"what you want, or copy the repository with `repo replicate` to a local " +
-			"destination and archive that instead")
+		return nil, fmt.Errorf("bundle: --include-wal was requested but no WAL segment was resolved for the selection")
 	}
 
 	// Step 5 — bundle.json at the tar root.  Sort embedded slices
@@ -750,6 +751,59 @@ func writeTarEntry(tw *tar.Writer, name string, body []byte) error {
 // it as a tar entry under the same name.  When skipMissing is
 // true, an absent source key is a no-op; otherwise it's an
 // error.
+func readKey(ctx context.Context, sp storage.StoragePlugin, key string) ([]byte, error) {
+	rc, err := sp.Get(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	defer rc.Close()
+	return storage.ReadAllLimited(rc, storage.MaxMetadataBytes)
+}
+
+// requiredWAL names the WAL segments a backup needs to reach consistency:
+// the manifest's wal_required when a build recorded one, otherwise every
+// segment from the backup's start LSN to its stop LSN on its timeline.
+// Backups written so far never record wal_required (issue #77), so the
+// range is derived; the cluster's segment size is read from the archived
+// segment manifests (16 MiB when none can be read).
+func requiredWAL(ctx context.Context, sp storage.StoragePlugin, m *backup.Manifest) ([]string, error) {
+	if len(m.WALRequired) > 0 {
+		return m.WALRequired, nil
+	}
+	start, err := pglogrepl.ParseLSN(m.StartLSN)
+	if err != nil {
+		return nil, fmt.Errorf("start_lsn %q: %w", m.StartLSN, err)
+	}
+	stop, err := pglogrepl.ParseLSN(m.StopLSN)
+	if err != nil {
+		return nil, fmt.Errorf("stop_lsn %q: %w", m.StopLSN, err)
+	}
+	prefix := fmt.Sprintf("wal/%s/%08X/", m.Deployment, m.Timeline)
+	var segSize int64
+	for info, lerr := range sp.List(ctx, prefix) {
+		if lerr != nil {
+			return nil, lerr
+		}
+		if !strings.HasSuffix(info.Key, ".json") {
+			continue
+		}
+		body, gerr := readKey(ctx, sp, info.Key)
+		if gerr != nil {
+			continue
+		}
+		if sm, perr := walsink.ParseSegmentManifest(body); perr == nil && walsink.ValidSegmentSize(sm.SegmentSize) {
+			segSize = sm.SegmentSize
+			break
+		}
+	}
+	segSize = walsink.NormSegmentSize(segSize)
+	var out []string
+	for n := uint64(start) / uint64(segSize); n <= uint64(stop)/uint64(segSize); n++ {
+		out = append(out, walsink.SegmentFileName(m.Timeline, n, segSize))
+	}
+	return out, nil
+}
+
 func copyKey(ctx context.Context, sp storage.StoragePlugin, tw *tar.Writer, key string, skipMissing bool) error {
 	rc, err := sp.Get(ctx, key)
 	if err != nil {

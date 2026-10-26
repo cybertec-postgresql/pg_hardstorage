@@ -10,14 +10,24 @@ package sftp
 // restarts the process.
 
 import (
+	"time"
+
 	"github.com/pkg/sftp"
 )
 
 func (p *Plugin) conn() (*sftp.Client, error) {
+	cli, _, _, err := p.connGen()
+	return cli, err
+}
+
+// connGen is mutated too: the read-guarded paths (Get/Stat/List) take
+// their client from it, and a mutation that left them reconnecting
+// would no longer be caught by the reconnect test.
+func (p *Plugin) connGen() (*sftp.Client, uint64, time.Duration, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.closed {
-		return nil, errClosed
+		return nil, 0, 0, errClosed
 	}
-	return p.client, nil
+	return p.client, p.gen, readIdleTimeout, nil
 }

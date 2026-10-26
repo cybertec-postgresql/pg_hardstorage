@@ -11,16 +11,17 @@ import (
 
 func TestParse_RejectsEmptyAndBadTokens(t *testing.T) {
 	cases := map[string]string{
-		"":                "empty",
-		"   ":             "empty",
-		"deployment":      "no colon",
-		"deployment:":     "trailing colon",
-		":db1":            "leading colon",
-		"unknown:foo":     "unknown key",
-		"pg_version:foo":  "non-int pg_version",
-		"timeline:-1":     "negative timeline",
-		"since:nonsense":  "bad duration",
-		"before:also-bad": "bad before",
+		"":                    "empty",
+		"   ":                 "empty",
+		"deployment":          "no colon",
+		"deployment:":         "trailing colon",
+		":db1":                "leading colon",
+		"unknown:foo":         "unknown key",
+		"pg_version:foo":      "non-int pg_version",
+		"timeline:-1":         "negative timeline",
+		"timeline:2147483648": "timeline above int32",
+		"since:nonsense":      "bad duration",
+		"before:also-bad":     "bad before",
 	}
 	for q, why := range cases {
 		if _, err := search.Parse(q); err == nil {

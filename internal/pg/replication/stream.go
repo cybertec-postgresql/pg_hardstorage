@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"sync/atomic"
 	"time"
 
@@ -71,14 +72,22 @@ var ErrPrimaryDraining = errors.New("replication: primary draining (shutdown kee
 
 var (
 	// drainSpinKeepalives / drainSpinWindow define the shutdown-spin
-	// signature: this many reply-requested keepalives while fully caught
-	// up (nothing new to receive), within this window, with NO
-	// intervening XLogData. A healthy primary sends keepalives on a
-	// wal_sender_timeout/2 cadence (tens of seconds apart) and
-	// interleaves XLogData, so it can never hit this; the shutdown spin
-	// produces thousands per second (measured: ~1.26M in ~2.5 min).
-	drainSpinKeepalives = 200
-	drainSpinWindow     = 2 * time.Second
+	// signature: this many caught-up keepalives (nothing new to receive)
+	// within one window, with NO intervening XLogData. The spin is a
+	// ping-pong — keepalive, our reply, keepalive — so it runs at one
+	// keepalive per network round trip: thousands per second on
+	// localhost (measured: ~1.26M in ~2.5 min), but only 100/s over a
+	// 10 ms link. 100 in 10 s detects round trips up to ~100 ms. A
+	// healthy primary pings once per wal_sender_timeout/2 — seconds
+	// apart even for an aggressive timeout — so it stays far below.
+	//
+	// The window SLIDES: one that expires below the threshold starts a
+	// new one. It used to be one-shot (200 in 2 s), so a spin slower than
+	// that never reset and was never detected — across subnets the
+	// streamer answered keepalives forever and held a Patroni demote
+	// until it was restarted (issue #69).
+	drainSpinKeepalives = 100
+	drainSpinWindow     = 10 * time.Second
 )
 
 // XLogRecord is one chunk of WAL bytes delivered by Stream.
@@ -156,6 +165,11 @@ func Stream(ctx context.Context, c *pg.Conn, opts StreamOptions, sink WALSink) e
 	// Issue START_REPLICATION on the underlying pgconn before we
 	// hijack — pglogrepl handles the protocol shim. After this call
 	// the connection is in CopyBoth and ready for streaming.
+	// The protocol's TIMELINE is a uint32, pglogrepl's an int32. No
+	// real cluster reaches 2^31 timelines; refuse rather than wrap.
+	if opts.Timeline > math.MaxInt32 {
+		return fmt.Errorf("replication: timeline %d out of range", opts.Timeline)
+	}
 	startOpts := pglogrepl.StartReplicationOptions{
 		Timeline: int32(opts.Timeline),
 		Mode:     pglogrepl.PhysicalReplication,
@@ -307,11 +321,12 @@ func runReceiveLoop(ctx context.Context, reader *streaming.Reader, sink WALSink,
 			// Bail so its walsender can exit — reconnect resumes from our
 			// real flush position on the new primary.
 			if uint64(pk.ServerWALEnd) <= written.Load() {
-				if drainKeepalives == 0 {
+				if drainKeepalives == 0 || time.Since(drainWindowStart) > drainSpinWindow {
 					drainWindowStart = time.Now()
+					drainKeepalives = 0
 				}
 				drainKeepalives++
-				if drainKeepalives >= drainSpinKeepalives && time.Since(drainWindowStart) <= drainSpinWindow {
+				if drainKeepalives >= drainSpinKeepalives {
 					return ErrPrimaryDraining
 				}
 			} else {

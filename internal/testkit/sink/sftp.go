@@ -57,6 +57,9 @@ const (
 
 var sftpCounter atomic.Uint64
 
+// sinkNofile is the container RLIMIT_NOFILE for the sshd-based fixtures.
+const sinkNofile = "nofile=1024:1048576"
+
 func newSFTP() *sftpRuntime { return &sftpRuntime{} }
 
 // Name returns "sftp".
@@ -82,10 +85,17 @@ func (s *sftpRuntime) Up(ctx context.Context) error {
 	s.container = fmt.Sprintf("pg-hs-sftp-%d-%d",
 		time.Now().UnixMilli(), sftpCounter.Add(1))
 
+	// Cap RLIMIT_NOFILE. Docker hosts whose daemon runs with
+	// LimitNOFILE=infinity hand the container ~1e9 open files, and
+	// OpenSSH's per-session closefrom() loop then spins for minutes at
+	// 100% CPU: the session authenticates but never answers the SFTP
+	// version exchange. That looked like a flaky fixture (issues #72,
+	// #73); it is the limit.
 	args := []string{
 		"run", "-d",
 		"--name", s.container,
 		"-p", fmt.Sprintf("127.0.0.1:%d:22", s.port),
+		"--ulimit", sinkNofile,
 	}
 	// PGHS_SINK_SCRATCH relocates the server's upload directory onto a
 	// host path via bind mount. Without it the data lives in the

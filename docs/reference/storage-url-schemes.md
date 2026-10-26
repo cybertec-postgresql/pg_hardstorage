@@ -77,11 +77,13 @@ s3://acme-pg-backups?region=eu-west-1&storage_class=STANDARD_IA
 | `endpoint` | S3-compatible endpoint URL (MinIO, Cloudflare R2, B2). When set, `path_style` is forced on |
 | `path_style` | `true` to force path-style addressing (bucket in path, not host) |
 | `storage_class` | default `StorageClass` for `Put` when not set per-request (`STANDARD`, `STANDARD_IA`, `GLACIER`, …) |
+| `profile` | AWS shared-config profile used for this URL only. Lets one command talk to two S3 endpoints with different credentials, e.g. `repo replicate --from 's3://local/r?endpoint=http://minio:9000&profile=minio' --to 's3://dr/r?profile=aws'` |
+| `credentials_env` | environment-variable prefix `PFX`: credentials for this URL only are read from `PFX_ACCESS_KEY_ID`, `PFX_SECRET_ACCESS_KEY` and optional `PFX_SESSION_TOKEN`. Only the variable *prefix* appears in the URL, never the secret. Mutually exclusive with `profile` |
 | `checksum` | SDK checksum posture. `when_required` (default) — only attach checksums to operations that explicitly need them. Required for Ceph-RGW services (Hetzner Object Storage, some MinIO configurations, Backblaze B2 strict mode) that reject the v1.36+ default CRC32 header with `400 InvalidRequest`. `when_supported` opts back into the SDK default for real AWS where the duplicate integrity check is harmless. The CAS layer already content-addresses every chunk by SHA-256, so the SDK-level CRC32 is duplicative regardless of the setting. |
 
 | Field | Value |
 | --- | --- |
-| **Auth** | AWS SDK v2 default credential chain (env vars → IRSA → IAM role → profile → SSO). Inline URL credentials are not accepted |
+| **Auth** | AWS SDK v2 default credential chain (env vars → IRSA → IAM role → profile → SSO). Inline URL credentials are not accepted; use `profile` or `credentials_env` to give one URL its own credentials |
 | **Atomicity** | `If-None-Match: *` for `IfNotExists`; rename emulated via copy+delete |
 | **WORM** | S3 Object Lock — `SetRetention` maps `WORMCompliance` / `WORMGovernance` onto Object Lock modes |
 | **HTTP timeout** | per-request timeout = 5 min (`DefaultHTTPTimeout`); operators wanting tighter limits pass a `ctx` deadline |

@@ -84,6 +84,23 @@ keeps reading that version for at least 24 months after a successor lands.
   - `show` reports a corrupt manifest as `verify.manifest_signature`
     instead of `internal`.
 
+- **`repo bundle export --include-wal` always refused** (#77). No backup
+  records `wal_required`, so the export had nothing to pull. It now
+  derives the segments each backup needs from its start and stop LSN,
+  fails if one is not archived, and carries each segment's chunks (the
+  bundle previously held only the segment manifests).
+- **`repo replicate` could not use different credentials for two `s3://`
+  URLs** (#76). `s3://` URLs accept `profile=NAME` and
+  `credentials_env=PREFIX` to authenticate one URL on its own.
+- **The sftp subsystem handshake had no deadline** (#73). A peer that
+  authenticated but never answered the SFTP version exchange hung the
+  first `Open` and every reconnect. It is now bounded like the other
+  data-plane reads.
+- **sftp/scp data-plane reads had no deadline** (#72). A wedged read on
+  a live connection hung forever; it now fails after 60 s of no progress
+  and the next operation reconnects. This is the likely cause of the
+  stalled `restore_command` in #71.
+
 ### Added
 
 - **`restore --tablespace-mapping-all <dir>`, `recovery drill
@@ -106,6 +123,13 @@ keeps reading that version for at least 24 months after a successor lands.
 - `backup.TakeOptions.SpoolDir`: where the manifest spool lives (needs
   free space of about the manifest size, twice while signing).
 
+- **`backup:` block per deployment** (#75): `include_wal`, `fast` and
+  `encrypt` set the options of the agent's scheduled backups.
+
+### Changed
+
+- **Test fixtures:** the sftp and ssh-exec sink containers run with `RLIMIT_NOFILE` capped; an unbounded limit made sshd sessions spin and stalled the SFTP handshake on some Docker hosts.
+
 ### Known limits
 
 - Signing and verifying need the whole canonical manifest as one buffer
@@ -114,6 +138,50 @@ keeps reading that version for at least 24 months after a successor lands.
   hold it in RAM.
 - Every verified read of a huge manifest is a full pass over it (hours at
   200 TB); there is no per-file index.
+
+## [1.5.1] — 2026-10-05
+
+A patch release. It fixes a streamer holding a Patroni demote over slow
+links (#69), alerts that did not name their deployment (#70), and the
+Homebrew cask publishing that failed for 1.5.0. Nothing on disk or on
+the wire changes; 1.5.0 repositories are used as-is.
+
+### Fixed
+
+- **`wal stream` could hold a Patroni demote indefinitely when the
+  streamer was not on the same host as PostgreSQL** (#69). While a
+  primary shuts down, its walsender trades keepalives with the streamer
+  until the streamer confirms a flush it cannot give (the shutdown
+  checkpoint lands in a partial segment). The issue #34 detector ends
+  the stream on that spin, but it required 200 keepalives within a
+  one-shot 2 s window. The spin runs at one keepalive per network round
+  trip, so across subnets it never reached the threshold, and the window
+  never reset. The streamer answered forever, and the demoting node
+  stayed in "demote in progress" until the streamer was restarted. The
+  window now slides (100 keepalives per 10 s), which detects round trips
+  up to ~100 ms. A healthy primary pings seconds apart and stays far
+  below.
+- **Alerts from `wal stream` and the agent's scheduled tasks named no
+  deployment** (#70). An email reading only `wal.stream/reconnecting`
+  gave no clue which deployment it was about. Every `wal stream` event
+  now carries its deployment, and `agent` `task.started`/`task.finished`
+  carry the task's deployment. Sinks already render it.
+- **The Homebrew cask is published through a pull request.** The
+  `homebrew-tap` repository's `main` requires a reviewed PR, so
+  goreleaser's direct push was rejected (409). The v1.5.0 release run
+  failed after every asset had uploaded, and Homebrew stayed on 1.4.2
+  until the cask went in by hand. goreleaser now pushes the cask to a
+  `pg_hardstorage-<version>` branch and opens a PR. The release workflow's
+  Homebrew smoke test reports an open tap PR as a warning, with the
+  command to run once it is merged, instead of failing.
+  `HOMEBREW_TAP_TOKEN` needs `pull_requests:write` in addition to
+  `contents:write`.
+
+- **Two timeline conversions could wrap on out-of-range input.** A
+  parsed `uint32` timeline was narrowed to a signed 32-bit value without
+  a bound in `fleet search timeline:` and when starting replication.
+  No real cluster has 2^31 timelines; both now refuse such a value
+  instead of wrapping it (flagged by CodeQL).
 
 ## [1.5.0] — 2026-09-30
 

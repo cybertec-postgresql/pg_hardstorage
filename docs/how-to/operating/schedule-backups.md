@@ -234,6 +234,25 @@ systemctl status pg_hardstorage
 `daily_at` times, or raise `agent.max_concurrent_backups`
 when the box can handle the parallelism.
 
+## Backup options for scheduled backups
+
+The agent has no command line, so the flags of `pg_hardstorage backup`
+are set per deployment under `backup:`:
+
+```yaml
+deployments:
+  db1:
+    schedule:
+      backup: { daily_at: "02:00" }
+    backup:
+      include_wal: true   # --include-wal: embed the WAL needed to restore
+      fast: true          # --fast: immediate checkpoint
+      encrypt: false      # --no-encrypt (true = --encrypt; unset = auto-detect)
+```
+
+`include_wal: true` suits deployments that do not stream or archive WAL
+and do not need point-in-time recovery.
+
 ## Next steps
 
 - [Set retention](set-retention.md) — pair with the rotate
