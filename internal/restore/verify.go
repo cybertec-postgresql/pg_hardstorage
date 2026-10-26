@@ -2,6 +2,7 @@
 package restore
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -136,9 +137,9 @@ func Verify(ctx context.Context, target string, mode VerifyMode) (*VerifyResult,
 	// pg_verifybackup fails every normal restore with "could not find
 	// any WAL file", defeating the gate.
 	cmd := exec.CommandContext(ctx, path, "-n", target)
-	var stdout, stderr strings.Builder
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	stdout, stderr := &cappedBuffer{max: maxToolOutputBytes}, &cappedBuffer{max: maxToolOutputBytes}
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
 	runErr := cmd.Run()
 	res.Duration = time.Since(start)
 	res.Stdout = stdout.String()
@@ -183,3 +184,28 @@ func summarize(body string) string {
 	}
 	return body
 }
+
+// maxToolOutputBytes bounds how much of a child tool's stdout/stderr is
+// kept. pg_verifybackup prints one line per bad file, so a wholly wrong
+// datadir of 100k+ files would otherwise be held in full.
+const maxToolOutputBytes = 1 << 20
+
+// cappedBuffer keeps the first max bytes written and discards the rest
+// (still reporting them written so the child never sees a short write).
+type cappedBuffer struct {
+	buf bytes.Buffer
+	max int
+}
+
+func (c *cappedBuffer) Write(p []byte) (int, error) {
+	if room := c.max - c.buf.Len(); room > 0 {
+		if len(p) < room {
+			room = len(p)
+		}
+		c.buf.Write(p[:room])
+	}
+	return len(p), nil
+}
+
+func (c *cappedBuffer) String() string { return c.buf.String() }
+func (c *cappedBuffer) Len() int       { return c.buf.Len() }

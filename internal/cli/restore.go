@@ -800,7 +800,7 @@ func validateExplicitBackupForTime(ctx context.Context, repoURL, deployment, bac
 	}
 	defer sp.Close()
 	store := backup.NewManifestStore(sp)
-	m, rerr := store.Read(ctx, deployment, backupID, verifier)
+	m, rerr := store.ReadAuto(ctx, deployment, backupID, verifier)
 	if rerr != nil {
 		// If we can't read the manifest, the actual restore
 		// will surface that error. Don't fabricate a different

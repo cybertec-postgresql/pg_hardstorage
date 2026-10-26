@@ -21,7 +21,6 @@
 package restore
 
 import (
-	"bytes"
 	"context"
 	"encoding/binary"
 	stdjson "encoding/json"
@@ -2062,7 +2061,7 @@ func restoreIncrementalChain(ctx context.Context, opts Options, sp storage.Stora
 	// atomic; a failed/crashed merge leaves TargetDir absent.
 	combineOut := opts.TargetDir + ".pgcombine-staging"
 	_ = os.RemoveAll(combineOut) // clear any leftover from a prior crash
-	var stderr bytes.Buffer
+	stderr := &cappedBuffer{max: maxToolOutputBytes}
 	combineCtx, combineSpan := tracing.Tracer().Start(chainCtx, "pg_combinebackup",
 		trace.WithAttributes(
 			attribute.Int("input_dirs", len(inputDirs)),
@@ -2085,7 +2084,7 @@ func restoreIncrementalChain(ctx context.Context, opts Options, sp storage.Stora
 		// the operator's OLD=NEW (original locations) cannot be
 		// passed through verbatim.
 		ExtraArgs: chainTablespaceCombineArgs(leaf, inputDirs[len(inputDirs)-1], opts.TablespaceRemap),
-		Stderr:    &stderr,
+		Stderr:    stderr,
 	}); err != nil {
 		combineSpan.SetStatus(codes.Error, err.Error())
 		combineSpan.End()
