@@ -316,7 +316,7 @@ func (l *Locator) Locate(ctx context.Context, opts LocateOptions) (*Report, erro
 		// the subject's data is still held and must be disclosed (Art.
 		// 15) / erased (Art. 17). List hides tombstones, which made the
 		// report understate the holdings.
-		for entry, err := range l.manifests.ListIncludingTombstoned(ctx, d, l.verifier) {
+		for entry, err := range l.manifests.ListIncludingTombstonedHeaders(ctx, d, l.verifier) {
 			if err != nil {
 				// One bad manifest doesn't kill the whole scan -- but
 				// it is RECORDED, which the previous comment promised

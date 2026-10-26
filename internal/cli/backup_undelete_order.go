@@ -31,7 +31,7 @@ func orderAncestorsFirst(ctx context.Context, store *backup.ManifestStore, deplo
 	}
 	parent := make(map[string]string, len(ids))
 	for _, id := range ids {
-		m, _, err := store.ReadIncludingTombstoned(ctx, deployment, id, verifier)
+		m, _, err := store.ReadIncludingTombstonedAuto(ctx, deployment, id, verifier)
 		if err != nil || m == nil {
 			continue
 		}

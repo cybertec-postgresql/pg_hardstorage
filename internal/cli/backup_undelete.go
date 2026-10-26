@@ -168,7 +168,7 @@ func runBackupUndelete(cmd *cobra.Command, deployment string, ids []string, repo
 	// --check-chunks pre-pass is moot under --force.
 	if checkChunks && !force {
 		for _, id := range ids {
-			m, _, rerr := store.ReadIncludingTombstoned(cmd.Context(), deployment, id, verifier)
+			m, _, rerr := store.ReadIncludingTombstonedAuto(cmd.Context(), deployment, id, verifier)
 			if rerr != nil {
 				return output.NewError("backup.undelete.read_failed",
 					fmt.Sprintf("backup undelete --check-chunks: read manifest %s/%s: %v", deployment, id, rerr)).Wrap(rerr)
@@ -343,7 +343,7 @@ func runBackupUndelete(cmd *cobra.Command, deployment string, ids []string, repo
 			// standby / time-target recovery that would silently
 			// truncate at the pruned hole, instead of a Warning buried
 			// at restore time.
-			if m, _, rerr := store.ReadIncludingTombstoned(cmd.Context(), deployment, id, verifier); rerr == nil {
+			if m, _, rerr := store.ReadIncludingTombstonedAuto(cmd.Context(), deployment, id, verifier); rerr == nil {
 				oc.WALGapRecorded = recordResurrectedWALGap(cmd.Context(), d, sp, deployment, id, m)
 			}
 		}

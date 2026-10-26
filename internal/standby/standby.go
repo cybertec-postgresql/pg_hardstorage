@@ -249,7 +249,7 @@ func (m *Manager) resolveBackup(ctx context.Context, repoURL, deployment, backup
 		backupID = id // read below for the PGVersion the caller needs
 	}
 
-	mm, err := rs.store.Read(ctx, deployment, backupID, verifier)
+	mm, err := rs.store.ReadAuto(ctx, deployment, backupID, verifier)
 	if err != nil {
 		return "", 0, fmt.Errorf("standby: read manifest: %w", err)
 	}

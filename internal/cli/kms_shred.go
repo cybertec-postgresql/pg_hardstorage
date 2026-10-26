@@ -328,7 +328,7 @@ func scanAffectedBackups(ctx context.Context, sp storage.StoragePlugin, kekRef s
 		affected = append(affected, id)
 	}
 	for _, dep := range deployments {
-		for e, mErr := range ms.ListAttestationlessIncludingTombstoned(ctx, dep) {
+		for e, mErr := range ms.ListAttestationlessIncludingTombstonedHeaders(ctx, dep) {
 			if mErr != nil {
 				if firstErr == nil {
 					firstErr = fmt.Errorf("deployment %q: %w", dep, mErr)

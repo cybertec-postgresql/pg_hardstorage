@@ -566,7 +566,7 @@ func pickDrillManifest(ctx context.Context, sp storage.StoragePlugin, deployment
 	if target == "" || target == "latest" {
 		var newest *backup.Manifest
 		skipped := 0
-		for m, lerr := range store.ListAuto(ctx, deployment, opts.Verifier) {
+		for m, lerr := range store.ListHeaders(ctx, deployment, opts.Verifier) {
 			if lerr != nil {
 				// Counted. A drill exists to answer "could we restore
 				// this deployment right now?"; silently drilling an
@@ -589,7 +589,7 @@ func pickDrillManifest(ctx context.Context, sp storage.StoragePlugin, deployment
 		}
 		return newest, nil
 	}
-	m, err := store.Read(ctx, deployment, target, opts.Verifier)
+	m, err := store.ReadAuto(ctx, deployment, target, opts.Verifier)
 	if err != nil {
 		return nil, fmt.Errorf("recovery: drill: read manifest %s/%s: %w",
 			deployment, target, err)
