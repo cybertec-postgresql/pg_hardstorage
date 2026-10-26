@@ -425,12 +425,16 @@ func suggest(key string, names []string) string {
 	if best != "" {
 		return best
 	}
+	// Substring match: the LONGEST matching name is the most specific
+	// ("backup_schedule" contains both `backup` and `schedule`; the
+	// longer one is the better hint than whichever sorts first).
+	longest := ""
 	for _, n := range names {
-		if len(n) >= 4 && (strings.Contains(key, n) || strings.Contains(n, key)) {
-			return n
+		if len(n) >= 4 && (strings.Contains(key, n) || strings.Contains(n, key)) && len(n) > len(longest) {
+			longest = n
 		}
 	}
-	return ""
+	return longest
 }
 
 func join(path, seg string) string {

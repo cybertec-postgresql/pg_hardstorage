@@ -168,6 +168,14 @@ type Options struct {
 	// used verbatim (the previous+ behaviour).
 	TablespaceRemap TablespaceRemap
 
+	// TablespaceMapAll, when non-empty, redirects every non-default
+	// tablespace of the backup that TablespaceRemap does not name to
+	// <TablespaceMapAll>/<tablespace-oid> (pgBackRest's
+	// --tablespace-map-all). Tablespaces added after the option was
+	// configured are covered, because the expansion happens against the
+	// backup's own tablespace list.
+	TablespaceMapAll string
+
 	// ChainStagingRoot lets the operator pin the directory chain
 	// restores use to materialise each link before merging via
 	// pg_combinebackup.  Default: a path derived from os.TempDir
@@ -329,6 +337,13 @@ func Restore(ctx context.Context, opts Options) (res *Result, err error) {
 	m, err := store.ReadAuto(ctx, opts.Deployment, opts.BackupID, opts.Verifier)
 	if err != nil {
 		return nil, mapManifestReadErr("restore", opts.Deployment, opts.BackupID, err)
+	}
+	if opts.TablespaceMapAll != "" {
+		parent, perr := CleanTablespaceMapAll(opts.TablespaceMapAll)
+		if perr != nil {
+			return nil, output.NewError("usage.bad_flag", perr.Error()).Wrap(output.ErrUsage)
+		}
+		opts.TablespaceRemap = opts.TablespaceRemap.WithMapAll(parent, m.Tablespaces)
 	}
 
 	// 2pre. WAL-gap pre-flight. Refuse if the operator's PITR
@@ -2158,8 +2173,10 @@ func restoreIncrementalChain(ctx context.Context, opts Options, sp storage.Stora
 				"reason": "source PG had TDE enabled at backup time; merged bytes are ciphertext and PG's plaintext checksums cannot match in-process. Boot the restored datadir under a TDE-capable PG with key access to run a meaningful pg_verifybackup.",
 				"engine": leaf.SourceTDE.Engine,
 			}))
-	} else if mergedManifest, rerr := os.ReadFile(filepath.Join(opts.TargetDir, "backup_manifest")); rerr == nil {
-		if vbRes, vberr := verifybackup.Verify(chainCtx, mergedManifest, opts.TargetDir); vberr != nil {
+	} else if mergedManifest, rerr := os.Open(filepath.Join(opts.TargetDir, "backup_manifest")); rerr == nil {
+		// Streamed: the merged manifest of a 100 TB cluster is tens of GB.
+		defer mergedManifest.Close()
+		if vbRes, vberr := verifybackup.VerifyReader(chainCtx, mergedManifest, opts.TargetDir); vberr != nil {
 			if errors.Is(vberr, verifybackup.ErrNoManifest) {
 				emit(output.NewEvent(output.SeverityNotice, "restore", "verifybackup_skipped_no_manifest").
 					WithSubject(output.Subject{Deployment: leaf.Deployment, BackupID: leaf.BackupID}).

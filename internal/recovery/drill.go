@@ -139,6 +139,13 @@ type DrillOptions struct {
 	// back to the recorded locations.
 	TablespaceRemap restore.TablespaceRemap
 
+	// TablespaceMapAll, when non-empty, additionally moves EVERY
+	// non-default tablespace the explicit TablespaceRemap does not name to
+	// <TablespaceMapAll>/<oid> (see restore.TablespaceRemap.WithMapAll). It
+	// is expanded against the drilled backup's own tablespace list, so
+	// tablespaces added later are covered. Must be absolute.
+	TablespaceMapAll string
+
 	// KeepTargetDir, when true, leaves the temporary target dir
 	// in place after the drill.  The DrillReport carries the
 	// path so the operator can inspect.  Default: tear down.
@@ -372,12 +379,20 @@ func Drill(ctx context.Context, repoURL string, deployment string, opts DrillOpt
 	// clobber: an operator who wants the drill can supply a mapping,
 	// and one who forgets gets an error instead of a destroyed
 	// tablespace.
+	if opts.TablespaceMapAll != "" {
+		parent, perr := restore.CleanTablespaceMapAll(opts.TablespaceMapAll)
+		if perr != nil {
+			return nil, fmt.Errorf("recovery drill: %w", perr)
+		}
+		opts.TablespaceRemap = opts.TablespaceRemap.WithMapAll(parent, manifest.Tablespaces)
+	}
 	if outside := restore.NonDefaultTablespaces(manifest); len(outside) > 0 && opts.TablespaceRemap.Empty() {
 		return nil, fmt.Errorf(
 			"recovery drill: backup %s has %d non-default tablespace(s) (%s) that would be "+
 				"restored to their ORIGINAL absolute paths, overwriting whatever is there — "+
 				"on the source host that is the live tablespace. Pass --tablespace-mapping "+
-				"to redirect each one into scratch space (same syntax as `restore`), or drill "+
+				"(or --tablespace-mapping-all <dir>) to redirect each one into scratch space "+
+				"(same syntax as `restore`), or drill "+
 				"this backup on a host that does not hold those paths",
 			manifest.BackupID, len(outside), strings.Join(outside, ", "))
 	}
