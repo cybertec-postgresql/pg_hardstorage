@@ -370,6 +370,13 @@ func (r *run) close() {
 	}
 }
 
+// blockPool recycles the fence-block read buffer: has runs once per Bloom
+// positive, and a fresh 32 KiB allocation each time dominated GC churn.
+var blockPool = sync.Pool{New: func() any {
+	b := make([]byte, fenceEvery*keyLen)
+	return &b
+}}
+
 func (r *run) has(k Key) (bool, error) {
 	if r.n == 0 || !r.bloom.test(k) {
 		return false, nil
@@ -384,7 +391,9 @@ func (r *run) has(k Key) (bool, error) {
 	if cnt > fenceEvery {
 		cnt = fenceEvery
 	}
-	buf := make([]byte, cnt*keyLen)
+	bp := blockPool.Get().(*[]byte)
+	defer blockPool.Put(bp)
+	buf := (*bp)[:cnt*keyLen]
 	if n, err := r.f.ReadAt(buf, first*keyLen); err != nil {
 		// io.EOF with fewer bytes than the run's own key count means the
 		// file was truncated behind our back: that is damage, not absence.
