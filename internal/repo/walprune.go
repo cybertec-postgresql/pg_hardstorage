@@ -391,6 +391,77 @@ type backupManifestDecode struct {
 	StartLSN string `json:"start_lsn"`
 }
 
+// readManifestFrontier extracts backup_id and start_lsn from a manifest
+// by walking its top-level members as a token stream, so a manifest of any
+// size costs O(1) memory (the old whole-body read hit the 256 MiB cap and
+// blocked WAL retention). Both fields sit in the header ahead of "files",
+// so the walk normally stops after a few hundred bytes; a manifest that
+// orders them differently is skipped through, still without buffering it.
+// Malformed JSON before both fields are found is an error (fail closed).
+func readManifestFrontier(ctx context.Context, sp storage.StoragePlugin, key string) (backupManifestDecode, error) {
+	var m backupManifestDecode
+	rc, err := sp.Get(ctx, key)
+	if err != nil {
+		return m, err
+	}
+	defer rc.Close()
+	dec := json.NewDecoder(rc)
+	if t, err := dec.Token(); err != nil {
+		return m, err
+	} else if d, ok := t.(json.Delim); !ok || d != '{' {
+		return m, errors.New("manifest is not a JSON object")
+	}
+	var gotID, gotLSN bool
+	for dec.More() && !(gotID && gotLSN) {
+		if err := ctx.Err(); err != nil {
+			return m, err
+		}
+		t, err := dec.Token()
+		if err != nil {
+			return m, err
+		}
+		name, _ := t.(string)
+		switch name {
+		case "backup_id":
+			if err := dec.Decode(&m.BackupID); err != nil {
+				return m, err
+			}
+			gotID = true
+		case "start_lsn":
+			if err := dec.Decode(&m.StartLSN); err != nil {
+				return m, err
+			}
+			gotLSN = true
+		default:
+			if err := skipJSONValue(dec); err != nil {
+				return m, err
+			}
+		}
+	}
+	return m, nil
+}
+
+// skipJSONValue consumes one JSON value from dec without retaining it.
+func skipJSONValue(dec *json.Decoder) error {
+	depth := 0
+	for {
+		t, err := dec.Token()
+		if err != nil {
+			return err
+		}
+		if d, ok := t.(json.Delim); ok {
+			if d == '{' || d == '[' {
+				depth++
+			} else {
+				depth--
+			}
+		}
+		if depth == 0 {
+			return nil
+		}
+	}
+}
+
 // walPruneGrace / walPruneNow resolve the tombstone-grace knobs, mirroring
 // gc.CollectReferencesOptions: zero grace → the shared default, negative →
 // none; zero Now → wallclock.
@@ -500,7 +571,7 @@ func oldestKeptBackupFrontier(ctx context.Context, sp storage.StoragePlugin, dep
 		if _, dead := tombstoned[backupID]; dead {
 			continue
 		}
-		body, err := readKey(ctx, sp, key)
+		m, err := readManifestFrontier(ctx, sp, key)
 		if err != nil {
 			// Fail closed. This is a LIVE (non-tombstoned) backup
 			// whose manifest we cannot read, so we cannot learn its
@@ -512,13 +583,6 @@ func oldestKeptBackupFrontier(ctx context.Context, sp storage.StoragePlugin, dep
 			// Refuse to prune until the operator heals the manifest
 			// (surfaced by `doctor`).
 			return 0, "", fmt.Errorf("read manifest %s for WAL frontier: %w", key, err)
-		}
-		var m backupManifestDecode
-		if err := json.Unmarshal(body, &m); err != nil {
-			// Same rationale as the unreadable case: a corrupt
-			// manifest envelope hides start_lsn, so fail closed
-			// rather than risk pruning WAL the backup depends on.
-			return 0, "", fmt.Errorf("decode manifest %s for WAL frontier: %w", key, err)
 		}
 		// Parse every backup's start_lsn so we can take the true
 		// minimum. A malformed start_lsn is fail-closed (abort the
