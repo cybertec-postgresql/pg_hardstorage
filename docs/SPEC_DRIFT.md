@@ -19,7 +19,7 @@ cross-references rather than reshaping the implementation.
 Empty stub directories (`internal/crypto/envelope/`,
 `internal/crypto/fips/`, `internal/plugin/source/`) removed
 on the same pass.  Item #11 (verify-full of encrypted backups) was
-closed afterwards, so 5 items remain — all real engineering
+closed afterwards, so 4 items remain — all real engineering
 work, deferred to v29.
 
 ## Open (v29 candidates)
@@ -28,7 +28,6 @@ work, deferred to v29.
 | --- | --- | --- |
 | 2 | Crypto cipher | SPEC says **AES-256-GCM-SIV** is the default cipher; `internal/plugin/encryption/aesgcm/` only implements plain AES-256-GCM.  Either implement RFC 8452 or tighten SPEC. |
 | 5 | Source plugin | SPEC promises a `SourcePlugin` interface; no Go code exists (the empty `internal/plugin/source/` directory has been removed; the SPEC promise stands).  Forward-looking shape documented in `docs/reference/plugins/source-contract.md`. |
-| 10 | KMS rotate | `kms rotate` walks deferred to v0.5 per code comments; SPEC describes it as v0.1+ default. |
 | 12 | K8s integrations | **Partially closed in v1.1.**  pgBackRest, Barman, and WAL-G shims now ship as standalone binaries (`pg-hardstorage-{pgbackrest,barman,walg}`) — architecture changed from the SPEC's `agent --*-shim` flag form to segregated drop-in binaries (deliberate; see [compat/README.md](https://github.com/cybertec-postgresql/pg_hardstorage/tree/main/compat)).  CNPG-I provider remains genuinely deferred — still v0.5 work. |
 | 4 (revised) | Crypto package layout | SPEC describes detailed envelope behaviour but the implementation lives in `internal/plugin/encryption/`.  The empty `internal/crypto/envelope/` and `internal/crypto/fips/` stub directories have been removed; no code change needed but the **product call** remains: do we want a top-level `internal/crypto/` namespace eventually, or is `internal/plugin/encryption/` the right home permanently? |
 
@@ -50,19 +49,20 @@ work, deferred to v29.
 
 | # | Area | Resolution |
 | --- | --- | --- |
+| 10 | KMS rotate | **Fixed.**  `kms rotate` is a real implementation (`internal/cli/kms_rotate.go`): it rewraps the DEK of every backup and WAL segment manifest, including soft-deleted backups.  The v0.1.1 deferred stub is gone. |
 | 11 | Verify-full encrypted | **Fixed.**  `verify --full` (and `standby create` / `timetravel`) now resolve the KEK and unwrap the DEK through the same keystore and KMS resolvers the backup and restore paths use (`resolveKEKForVerify`, `deploymentKMSResolver` in `internal/cli/verify_full.go`), so an encrypted backup is decrypted rather than refused; pinned by `TestResolveKEKForVerify_*`. |
 
 ## Recommended resolution
 
-The 5 remaining items split as:
+The 4 remaining items split as:
 
 - **Implement** — match the code to the SPEC (2 items: #2,
   #5)
-- **Decide and document** — needs a product call (3 items:
-  #4-revised, #10, #12)
+- **Decide and document** — needs a product call (2 items:
+  #4-revised, #12)
 
 Total estimated effort to close the v29 backlog: ~1 week of
-focused engineering plus 3 product decisions.
+focused engineering plus 2 product decisions.
 
 The doc project is **not blocked** by these items.  The docs
 currently describe what's actually shipped, with

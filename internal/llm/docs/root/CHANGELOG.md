@@ -13,6 +13,54 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **Memory on the 100 TB paths is bounded by spill budgets, not database
+  size.** A pass over every command that held a per-chunk, per-file or
+  per-segment list in memory (backup, restore, PITR, retention, verify,
+  `repo gc`, `repair chunks --orphans`, `repo wipe`, `repo replicate`,
+  `repo check`, `integrity`, `wal prune`, `partial`) replaced the lists
+  with streams, 1-bit-per-segment bitmaps, counters with bounded samples,
+  or disk-spilling sets (see [Very large
+  databases](docs/how-to/operating/very-large-databases.md)). Commands
+  that only need a manifest's header (`list`, `status`, `capacity`,
+  `cost`, `forecast`, `slo`, `doctor`, `fleet search`, `recovery`
+  windows, `timetravel`, `restore --to`, retention, ...) no longer parse
+  its file entries. User-visible consequences:
+  - Failure and mismatch lists in `verify`, `integrity`, `repo check`,
+    `repo scrub` and `repair scrub` are capped (scrub: the first 1000
+    hashes, `mismatches_truncated`); the counts stay exact.
+  - `integrity` samples chunks with an O(1)-memory streaming selection,
+    so the same `--seed` now picks different chunks than before.
+  - `wal list` and `wal audit` keep 16 bytes per segment and gain
+    `--limit` (default 100000) with `segment_count` and
+    `segments_truncated` in the result; the audit-log head fallback and
+    `audit search` are bounded.
+  - Spill sets check free space before flushing or merging and fail with
+    "not enough free space ... set TMPDIR" instead of ENOSPC mid-run, and
+    warn once when the spill directory is on tmpfs/ramfs.
+  - Repository objects read whole by design (approvals, JIT grants,
+    SCIM/ACL/threshold/insider records, drill history, integrity run
+    records, Patroni and ticketing responses, the doctor head pointer)
+    are capped at `storage.MaxRecordBytes` (64 MiB); a PostgreSQL server
+    message body is capped at 256 MiB; `scp` and docker verify output is
+    capped.
+- **`restore` resume no longer holds the completed-file list in memory.**
+  Completed files are appended to `.pg_hardstorage_restore_done.log` in
+  the target directory (next to `.pg_hardstorage_restore_state.json`,
+  which now records only the committed log length) and consulted through
+  a spill set. A checkpoint written by an earlier version, with an inline
+  `completed_files` list, is still read and migrated. Re-running the same
+  command resumes; a torn log tail from a crash is ignored.
+  `partial` restore materialises matching files in one streaming pass.
+- **`repo gc --apply` re-lists manifests once per sweep window, not once
+  per 4096 deletions.** One fence checkpoint (run-record bump, pin read,
+  lease check, rescan of newly committed manifests) now covers
+  consecutive delete slices for up to a fifth of `GCFenceMaxWait`
+  (adaptive), so a repository with hundreds of millions of orphans is no
+  longer dominated by rescans. The exclusion invariants are unchanged:
+  writers still wait for the in-flight checkpoint. Sidecar replica
+  manifests of huge manifests are streamed, and a failed one is counted
+  instead of silently skipped. The orphan list in the result is a sample.
+
 - **Backups of very large databases no longer hit the 1 GiB manifest
   ceiling.** A manifest is ~115 bytes per chunk, so a 200 TB database
   (about 3.3 billion chunks at the default 64 KiB average) is a ~380 GB
@@ -101,6 +149,35 @@ keeps reading that version for at least 24 months after a successor lands.
   and the next operation reconnects. This is the likely cause of the
   stalled `restore_command` in #71.
 
+- **Security hardening pass (v1.6 validation).** A manifest copied over
+  another backup's key (rollback/replay) is refused: its deployment and
+  backup id must match the key. Credentials in repo URLs (`user:pw@`,
+  `?sig=`, `?token=`, `?secret_key=`) are scrubbed from errors, suggestions
+  and events. The restore boot test and the partial-restore sandbox start
+  with `archive_mode=off`, so a verified restore can no longer push a
+  timeline-2 history file and WAL into the production archive. Keyword-form
+  DSN passwords are masked; `kms rotate`/`kms verify` key files and the
+  approver private key must be owner-only regular files (KEKs 32 bytes,
+  non-zero); `wal fetch` checks the segment manifest's timeline, name and
+  deployment; restore masks setuid/setgid/sticky bits.
+- **`repo gc` leaves a clean repo:** the fs backend prunes the empty
+  `chunks/` and `manifests/` directories gc leaves behind; the pin set
+  honours the configured spill directory; spill and orphan-log leftovers of
+  a killed gc older than 7 days are reaped on `--apply`.
+- **Leaks:** a backup cancelled during the lease settle window no longer
+  holds its lease for the full TTL (it blocked every later backup with
+  `conflict.backup_in_progress`); the scheduler no longer relaunches a
+  task whose abandoned run is still alive (a wedged task now stays
+  skipped until it returns); the zstd compressor caps encoder state at 8
+  (it grew with core count); a failed spill flush removes its run file.
+- **Memory on huge manifests:** `backup compare` and `audit
+  verify-chain`/`summary`/`search` stream through disk-backed sorted runs
+  instead of in-memory maps; `spill.DefaultMemEntries` is 1M (was 4M);
+  `wal list`/`wal audit` cap gap rows at 100,000 (`gaps_truncated`, counts
+  stay exact); the PostgreSQL `backup_manifest` ceiling is 1 GiB (was
+  256 MiB) and is held once; the s3events and webhook logical sinks also
+  flush at `BatchBytes` (default 16 MiB).
+
 ### Added
 
 - **`restore --tablespace-mapping-all <dir>`, `recovery drill
@@ -138,6 +215,15 @@ keeps reading that version for at least 24 months after a successor lands.
   hold it in RAM.
 - Every verified read of a huge manifest is a full pass over it (hours at
   200 TB); there is no per-file index.
+- WAL segment manifests are unsigned: an attacker with write access to
+  the repo can forge a hash-valid WAL chain that PITR would replay.
+  Signing the chain needs a format change (planned for v1.7).
+- A PITR-restored cluster keeps `archive_mode` as configured; decide
+  whether it may archive into the production repo before starting it.
+- The PostgreSQL `backup_manifest` is embedded in the backup manifest
+  header, so a gigabyte-scale one costs gigabytes of memory; `audit
+  export-bundle` holds its window in memory.
+- sftp and scp repos keep empty directories after gc.
 
 ## [1.5.1] — 2026-10-05
 

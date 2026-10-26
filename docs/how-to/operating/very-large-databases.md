@@ -42,6 +42,83 @@ memory. The on-disk format is unchanged.
   mid-run. A warning is printed once when the directory is on tmpfs/ramfs,
   because spilled hashes would then live in RAM.
 
+## Memory sizing
+
+Heap does not grow with the database, but three terms do grow slowly with
+the number of distinct chunks `N` in a set. Per hash set (a command can hold
+two or three at once, for example GC's reference set plus its orphan scan):
+
+| Term | Size | Bounded by |
+|---|---|---|
+| Unflushed buffer | up to `spill.DefaultMemEntries` = 4 Mi hashes, about 300 MiB as a Go map | constant |
+| Bloom filter, one per on-disk run | about 1.25 bytes per key (10 bits) | each run's filter is capped at 128 MiB (`DefaultMaxBloomBytes`, full precision up to about 107 M keys per run); past the cap the filter is leakier and a few more blocks are read |
+| Sparse index | one 32-byte key per 1024 on-disk keys, about 0.03 bytes per key | grows with `N` |
+
+For a 100 TB database at the default 64 KiB average chunk, `N` is about 1.6
+billion: plan on the 300 MiB buffer plus roughly 2 GB of Bloom filters and
+about 50 MB of sparse index per set, on top of the process baseline. With
+`--chunk-size 1MiB` (see below) the same database has about 100 million
+chunks and the Bloom and index terms are 16 times smaller. These are
+derived from the structures above, not a measured guarantee; run a
+`verify` or a dry-run `repo gc` against your own repository and watch RSS
+before relying on a number.
+
+Disk grows with `N` as well (see the next section), so size `$TMPDIR` first.
+
+## Garbage collection at scale
+
+`repo gc` (dry-run or `--apply`) marks every referenced chunk into a
+disk-spilling set, streaming the manifests, so it needs `$TMPDIR` space of
+about 32 bytes per distinct referenced chunk (plus the same again
+transiently while runs merge) and no heap proportional to the repository.
+
+`repo gc --apply` is fenced against concurrent writers (see
+[gc safety](../../operations/operator-guide.md#gc-safety-running-apply-next-to-live-writers)).
+Each delete batch ends in a fence checkpoint: a run-record bump, a pin
+read, a backup-lease check and a rescan of manifests committed since the
+snapshot. Writers that deduplicate against chunks wait for the run's
+in-flight checkpoint, for at most 5 minutes (`GCFenceMaxWait`), so a
+checkpoint must not take longer than that. By default one checkpoint covers
+as many delete slices as fit in about a fifth of that wait (the adaptive
+window), so a repository with hundreds of millions of orphans pays for the
+rescan once per window rather than once per 4096 chunks. A live backup lease
+stops an `--apply` run (`conflict.gc_backup_in_flight`, exit 7); the run is
+safe to repeat. Before it may delete anything an `--apply` run waits a
+60-second settle period after publishing its run record (overlapped with
+the initial walk, so on a large repository it costs nothing extra).
+
+## Restoring a large database: resume
+
+A restore that is interrupted (killed, network loss, full disk) can be
+continued by running the **same command again** against the same `--target`.
+No flag is needed; do not remove the target and do not add `--force`.
+
+While a restore runs it keeps two bookkeeping files in the target
+directory:
+
+- `.pg_hardstorage_restore_state.json`, the checkpoint: backup ID,
+  deployment, byte and chunk totals. It is rewritten (atomically) about
+  every 1 GiB written and at the end.
+- `.pg_hardstorage_restore_done.log`, an append-only log with one completed
+  file per line. It holds the completed set instead of the checkpoint, so
+  neither the writer nor a resuming restore holds or re-sorts a list that
+  grows with the file count (millions of files on a 100 TB cluster). The
+  checkpoint records how many log bytes are committed; a torn tail left by
+  a crash is ignored and overwritten. Checkpoints written by older versions
+  with an inline `completed_files` list are still read and migrated.
+
+On resume the completed files are skipped and only files that were not
+fully written are fetched again (granularity is the whole file, so a
+partly written 1 GiB relation segment starts over). The restore emits a
+`restore/resumed` event with `resumed_bytes` and `resumed_chunks`. Both
+files are removed when the data directory is fully materialised.
+
+If the target holds a checkpoint for a **different** backup the restore
+refuses with `conflict.checkpoint_mismatch`; the message names the backup ID
+to re-run with. A chain (incremental) restore keeps its link staging under
+`--chain-staging-root` and preserves it across retries; `--reset-chain-staging`
+discards it.
+
 ## Fewer, larger chunks
 
 `pg_hardstorage backup --chunk-size 1MiB` makes the average chunk 1 MiB

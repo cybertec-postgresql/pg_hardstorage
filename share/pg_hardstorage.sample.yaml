@@ -139,11 +139,38 @@ deployments:
     schedule:
       backup: { every: 6h }
       rotate: { daily_at: "02:30" }
+      # drill: { every: 168h }          # periodic restore-and-verify
     retention:
       policy: gfs                       # gfs|simple|count
       keep_daily: 14
       keep_weekly: 8
       keep_monthly: 24
+
+    # Options of the agent's SCHEDULED backups (the flags of
+    # `pg_hardstorage backup`).  All optional.
+    # backup:
+    #   include_wal: false              # --include-wal
+    #   fast: false                     # --fast (immediate checkpoint)
+    #   encrypt: true                   # --encrypt / --no-encrypt; unset = encrypt when a KEK exists
+    #   chunk_size: 1MiB                # --chunk-size, 16KiB..16MiB, default 64KiB.
+    #                                   # Pick ONE value per deployment before its
+    #                                   # first backup (see very-large-databases.md)
+    #   timeout: 36h                    # per-run ceiling; default 2x the schedule
+    #                                   # interval clamped to 1h..48h
+
+    # Settings of the scheduled recovery drill (schedule.drill).
+    # drill:
+    #   tablespace_mapping:             # "<old-abs-path>=<new-abs-path>"
+    #     - /srv/ts1=/var/tmp/drill/ts1
+    #   tablespace_mapping_all: /var/tmp/drill/ts   # every other tablespace -> <dir>/<oid>
+    #   skip_verify: false              # skip pg_verifybackup -> "partial" verdict
+    #   temp_base: /var/tmp             # parent of the drill's temporary target
+
+    # slo: { rpo_seconds: 3600, rto_seconds: 7200 }
+
+    # Best-effort scheduled-backup lease on backends without atomic
+    # conditional writes (Ceph S3, some MinIO).  Only with ONE agent replica.
+    # allow_unenforceable_lease: true
 
   staging-db:
     pg_connection: postgres://pgrole@db.staging.example.com:5432/postgres

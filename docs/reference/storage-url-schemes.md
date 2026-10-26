@@ -187,6 +187,7 @@ misconfiguration in audited environments.
 | --- | --- |
 | **Auth** | SSH public key (default) or password |
 | **Atomicity** | `IfNotExists` is stat-then-write-then-rename (TOCTOU window inherent to SFTP).  Rename uses `posix-rename@openssh.com` when the server advertises it; falls back to plain `Rename` otherwise |
+| **Timeouts** | keepalives every 30 s detect a dead peer (about 70 s); a data-plane read or the SFTP subsystem handshake that makes no progress for 60 s fails and the next operation reconnects, so a wedged read cannot hang `restore_command` or `wal fetch` forever |
 | **WORM** | not supported; `SetRetention` returns `ErrUnsupported` |
 | **Capabilities** | `ConditionalPut` (emulated) |
 
@@ -248,6 +249,7 @@ but the quoting defends against future schema changes.
 | --- | --- |
 | **Auth** | SSH public key (default) or password |
 | **Atomicity** | `IfNotExists` is stat-then-write-then-`mv -T` (atomic via `rename(2)` on the same fs).  TOCTOU window same as the SFTP backend; CAS dedup absorbs duplicate writes. |
+| **Timeouts** | keepalives every 30 s detect a dead peer (about 70 s); a data-plane read that makes no progress for 60 s fails and the next operation reconnects, so a wedged read cannot hang `restore_command` or `wal fetch` forever |
 | **WORM** | not supported; `SetRetention` returns `ErrUnsupported` |
 | **Capabilities** | `ConditionalPut` (emulated) |
 
