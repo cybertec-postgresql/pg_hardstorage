@@ -153,3 +153,100 @@ func TestManifestSpool_RejectsBadEntriesAndRefusesPresigned(t *testing.T) {
 		t.Error("dir/file collision accepted")
 	}
 }
+
+// A streamed file (BeginFile/AddChunk/EndFile) must publish byte-for-byte
+// what the whole-entry Add publishes, including zero-chunk files, and a
+// malformed stream must fail and poison the spool.
+func TestManifestSpool_StreamedFileIdenticalToAdd(t *testing.T) {
+	priv, _, _ := backup.GenerateKeypair(rand.Reader)
+	signer, _ := backup.LoadSigner(priv)
+	ctx := context.Background()
+
+	files := manyFiles(5)
+	files = append(files, backup.FileEntry{Path: "empty", Size: 0, TablespaceOID: 7})
+	base := validManifest()
+	commit := func(feed func(*backup.ManifestSpool)) []byte {
+		h := validManifest()
+		h.Files = nil
+		h.StartedAt, h.StoppedAt = base.StartedAt, base.StoppedAt
+		sp, err := backup.NewManifestSpool(t.TempDir(), 2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer sp.Close()
+		feed(sp)
+		st, raw := storeAt(t)
+		if err := st.CommitSpooled(ctx, h, sp, signer, backup.CommitOptions{}); err != nil {
+			t.Fatalf("CommitSpooled: %v", err)
+		}
+		if sp.NumChunkRefs() != 10 || sp.UniqueChunks() != 1 {
+			t.Errorf("refs=%d unique=%d", sp.NumChunkRefs(), sp.UniqueChunks())
+		}
+		return getRaw(t, raw, backup.PrimaryPath(h.Deployment, h.BackupID))
+	}
+	a := commit(func(sp *backup.ManifestSpool) {
+		for i := range files {
+			if err := sp.Add(&files[i]); err != nil {
+				t.Fatal(err)
+			}
+		}
+	})
+	b := commit(func(sp *backup.ManifestSpool) {
+		for _, f := range files {
+			chunks := f.Chunks
+			f.Chunks = nil
+			if err := sp.BeginFile(&f); err != nil {
+				t.Fatal(err)
+			}
+			for _, c := range chunks {
+				if err := sp.AddChunk(c); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := sp.EndFile(); err != nil {
+				t.Fatal(err)
+			}
+		}
+	})
+	if !bytes.Equal(a, b) {
+		t.Fatalf("streamed manifest differs from Add (len %d vs %d)", len(a), len(b))
+	}
+}
+
+func TestManifestSpool_StreamedFileRejectsBadStreams(t *testing.T) {
+	h := repo.Hash{1}
+	cases := map[string]func(sp *backup.ManifestSpool) error{
+		"gap": func(sp *backup.ManifestSpool) error {
+			_ = sp.BeginFile(&backup.FileEntry{Path: "f", Size: 20})
+			return sp.AddChunk(backup.ChunkRef{Hash: h, Offset: 5, Len: 20})
+		},
+		"short": func(sp *backup.ManifestSpool) error {
+			_ = sp.BeginFile(&backup.FileEntry{Path: "f", Size: 20})
+			_ = sp.AddChunk(backup.ChunkRef{Hash: h, Len: 10})
+			return sp.EndFile()
+		},
+		"escape": func(sp *backup.ManifestSpool) error {
+			return sp.BeginFile(&backup.FileEntry{Path: "../x"})
+		},
+		"dup": func(sp *backup.ManifestSpool) error {
+			_ = sp.BeginFile(&backup.FileEntry{Path: "f"})
+			_ = sp.EndFile()
+			return sp.BeginFile(&backup.FileEntry{Path: "f"})
+		},
+	}
+	for name, fn := range cases {
+		t.Run(name, func(t *testing.T) {
+			sp, err := backup.NewManifestSpool(t.TempDir(), 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer sp.Close()
+			if err := fn(sp); err == nil {
+				t.Fatal("bad stream accepted")
+			}
+			if err := sp.BeginFile(&backup.FileEntry{Path: "after"}); err == nil {
+				t.Error("spool usable after a failed stream")
+			}
+		})
+	}
+}

@@ -2,12 +2,12 @@
 package backup
 
 import (
-	"bytes"
 	"context"
 	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"sort"
 	"time"
 
@@ -233,7 +233,7 @@ func RotateKEK(ctx context.Context, sp storage.StoragePlugin, opts RotateKEKOpti
 			finish()
 			return res, err
 		}
-		for entry, lerr := range store.ListIncludingTombstoned(ctx, deployment, opts.Verifier) {
+		for entry, lerr := range store.ListIncludingTombstonedAuto(ctx, deployment, opts.Verifier) {
 			if err := ctx.Err(); err != nil {
 				finish()
 				return res, err
@@ -437,6 +437,11 @@ func rotateOneManifest(ctx context.Context, sp storage.StoragePlugin, store *Man
 		return rotateOutcomeWouldRotate, nil
 	}
 
+	if m.Streaming() {
+		// Too large to hold: rewrite via the on-disk manifest spool.
+		return rotateStreamedManifest(ctx, sp, m, base64.StdEncoding.EncodeToString(wrappedNew), opts)
+	}
+
 	// Mutate the manifest's encryption block. We reset Attestation
 	// so the canonical-bytes computation in Sign produces the
 	// canonical form (Sign sets Attestation back at the end).
@@ -470,6 +475,58 @@ func rotateOneManifest(ctx context.Context, sp storage.StoragePlugin, store *Man
 	return rotateOutcomeRotated, nil
 }
 
+// rotateStreamedManifest is the rotation rewrite for a manifest that was
+// read streamed (Files == nil). The entries are copied through a
+// ManifestSpool, the document is re-assembled and re-signed from disk
+// (assembleAndSign maps it read-only) and then uploaded as a stream, so
+// memory stays independent of the file count. m's header is not
+// modified; the stored object is already signature-verified by the
+// streamed read and EachFile re-checks it did not change.
+func rotateStreamedManifest(ctx context.Context, sp storage.StoragePlugin, m *Manifest, wrappedNew string, opts RotateKEKOptions) (rotateOutcome, error) {
+	spool, err := NewManifestSpool("", 0)
+	if err != nil {
+		return rotateOutcomeFailed, err
+	}
+	defer spool.Close()
+	if err := m.EachFile(ctx, spool.Add); err != nil {
+		return rotateOutcomeFailed, fmt.Errorf("copy entries of streamed manifest: %w", err)
+	}
+	hdr := *m
+	hdr.stream, hdr.Files, hdr.Attestation = nil, nil, nil
+	enc := *m.Encryption
+	enc.WrappedDEK, enc.KEKRef = wrappedNew, opts.NewKEKRef
+	hdr.Encryption = &enc
+	if err := spool.ValidateManifest(&hdr); err != nil {
+		return rotateOutcomeFailed, fmt.Errorf("rewritten manifest invalid: %w", err)
+	}
+	if err := spool.w.Flush(); err != nil {
+		return rotateOutcomeFailed, err
+	}
+	if err := spool.fileSet.Err(); err != nil {
+		return rotateOutcomeFailed, err
+	}
+	canon, size, err := spool.assembleAndSign(&hdr, opts.Signer)
+	if err != nil {
+		return rotateOutcomeFailed, fmt.Errorf("re-sign manifest: %w", err)
+	}
+	defer func() { _ = canon.Close(); _ = os.Remove(canon.Name()) }()
+	body, err := spooledManifestBody(canon, size, hdr.Attestation)
+	if err != nil {
+		return rotateOutcomeFailed, err
+	}
+	primaryKey := PrimaryPath(m.Deployment, m.BackupID)
+	if err := overwriteManifestBody(ctx, sp, primaryKey, body, opts.RetainUntil, opts.RetentionMode); err != nil {
+		return rotateOutcomeFailed, fmt.Errorf("rewrite primary %s: %w", primaryKey, err)
+	}
+	replicaKey := ReplicaPath(m.BackupID)
+	if _, statErr := sp.Stat(ctx, replicaKey); statErr == nil {
+		if err := overwriteManifestBody(ctx, sp, replicaKey, body, opts.RetainUntil, opts.RetentionMode); err != nil {
+			return rotateOutcomeReplicaFailed, fmt.Errorf("rewrite replica %s: %w", replicaKey, err)
+		}
+	}
+	return rotateOutcomeRotated, nil
+}
+
 // healStaleReplica brings the replica copy of an ALREADY-rotated primary
 // up to date — the resume-path counterpart to the inline replica write in
 // the fresh-rotation path. m is the verified primary (KEKRef ==
@@ -491,13 +548,12 @@ func healStaleReplica(ctx context.Context, sp storage.StoragePlugin, m *Manifest
 		}
 		return rotateOutcomeReplicaFailed, fmt.Errorf("read replica %s: %w", replicaKey, err)
 	}
-	rb, rerr := io.ReadAll(io.LimitReader(rc, MaxManifestBytes+1))
+	// Stream the replica (bounded memory, no size cap): only its header
+	// is needed to tell whether it is already on the new KEK.
+	rinfo, perr := StreamManifest(rc, StreamOptions{}, nil)
 	_ = rc.Close()
-	if rerr != nil {
-		return rotateOutcomeReplicaFailed, fmt.Errorf("read replica %s: %w", replicaKey, rerr)
-	}
-	if rm, perr := ParseAttestationless(rb); perr == nil && rm.Encryption != nil &&
-		rm.Encryption.KEKRef == opts.NewKEKRef {
+	if perr == nil && rinfo.Manifest.Encryption != nil &&
+		rinfo.Manifest.Encryption.KEKRef == opts.NewKEKRef {
 		return rotateOutcomeAlreadyRotated, nil // replica already in sync
 	}
 	// Replica is stale (old KEKRef), corrupt, or unparseable → re-sync it
@@ -505,11 +561,23 @@ func healStaleReplica(ctx context.Context, sp storage.StoragePlugin, m *Manifest
 	if opts.DryRun {
 		return rotateOutcomeWouldRotate, nil
 	}
-	body, err := m.MarshalToBytes()
-	if err != nil {
-		return rotateOutcomeReplicaFailed, fmt.Errorf("marshal primary for replica re-sync: %w", err)
+	var body manifestBody
+	if m.Streaming() {
+		// The primary is too large to hold: copy its stored bytes.
+		primaryKey := PrimaryPath(m.Deployment, m.BackupID)
+		st, err := sp.Stat(ctx, primaryKey)
+		if err != nil {
+			return rotateOutcomeReplicaFailed, fmt.Errorf("stat primary %s for replica re-sync: %w", primaryKey, err)
+		}
+		body = manifestBody{size: st.Size, open: func() (io.ReadCloser, error) { return sp.Get(ctx, primaryKey) }}
+	} else {
+		b, err := m.MarshalToBytes()
+		if err != nil {
+			return rotateOutcomeReplicaFailed, fmt.Errorf("marshal primary for replica re-sync: %w", err)
+		}
+		body = bytesBody(b)
 	}
-	if err := overwriteManifest(ctx, sp, replicaKey, body, opts.RetainUntil, opts.RetentionMode); err != nil {
+	if err := overwriteManifestBody(ctx, sp, replicaKey, body, opts.RetainUntil, opts.RetentionMode); err != nil {
 		return rotateOutcomeReplicaFailed, fmt.Errorf("re-sync replica %s: %w", replicaKey, err)
 	}
 	return rotateOutcomeRotated, nil
@@ -522,6 +590,11 @@ func healStaleReplica(ctx context.Context, sp storage.StoragePlugin, m *Manifest
 // maintenance window; the rotation primitive's contract surfaces
 // this in the package docs.
 func overwriteManifest(ctx context.Context, sp storage.StoragePlugin, key string, body []byte, retainUntil time.Time, mode storage.WORMMode) error {
+	return overwriteManifestBody(ctx, sp, key, bytesBody(body), retainUntil, mode)
+}
+
+// overwriteManifestBody is overwriteManifest for a streamed body.
+func overwriteManifestBody(ctx context.Context, sp storage.StoragePlugin, key string, body manifestBody, retainUntil time.Time, mode storage.WORMMode) error {
 	// Direct overwriting Put. Every backend's Put replaces the key
 	// atomically (fs/sftp: tmp + POSIX rename; object stores: PUT is
 	// last-writer-wins on the whole object), so there is never a
@@ -538,9 +611,13 @@ func overwriteManifest(ctx context.Context, sp storage.StoragePlugin, key string
 	// during routine key rotation. A crash between the delete and the
 	// rename stranded the manifest under a name nothing reads, with
 	// the same GC outcome.
-	if _, err := sp.Put(ctx, key, bytes.NewReader(body), storage.PutOptions{
-		ContentLength: int64(len(body)),
-	}); err != nil {
+	rc, err := body.open()
+	if err != nil {
+		return fmt.Errorf("overwrite manifest: %w", err)
+	}
+	_, err = sp.Put(ctx, key, rc, storage.PutOptions{ContentLength: body.size})
+	_ = rc.Close()
+	if err != nil {
 		return fmt.Errorf("overwrite manifest: %w", err)
 	}
 	// Re-apply the repo's WORM lock to the rewritten manifest so a rotation

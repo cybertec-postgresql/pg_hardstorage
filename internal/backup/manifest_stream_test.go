@@ -3,6 +3,7 @@ package backup_test
 import (
 	"bytes"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -309,5 +310,39 @@ func TestMalformedManifestDoesNotHangEitherReader(t *testing.T) {
 		case <-time.After(10 * time.Second):
 			t.Fatalf("reader hung on %q", in)
 		}
+	}
+}
+
+// CanonicalSHA256 from a stream equals sha256(Canonicalize()) of the held
+// parse, in canonical and non-canonical field order, with and without a
+// signature check.
+func TestStreamManifest_CanonicalHashMatchesCanonicalize(t *testing.T) {
+	signer, ver := streamKeys(t)
+	for name, mut := range map[string]func(*backup.Manifest){
+		"normal":       func(m *backup.Manifest) {},
+		"null files":   func(m *backup.Manifest) { m.Files = nil },
+		"empty files":  func(m *backup.Manifest) { m.Files = []backup.FileEntry{} },
+		"after-fields": func(m *backup.Manifest) { m.WALRequired = []string{"000000010000000000000003"} },
+	} {
+		t.Run(name, func(t *testing.T) {
+			m := validManifest()
+			mut(m)
+			raw := signedBytes(t, m, signer)
+			held, err := backup.ParseAndVerify(raw, ver)
+			if err != nil {
+				t.Fatal(err)
+			}
+			canon, _ := held.Canonicalize()
+			want := sha256.Sum256(canon)
+			for _, opts := range []backup.StreamOptions{{CanonicalHash: true}, {Verifier: ver}} {
+				_, info, err := collect(t, raw, opts)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if info.CanonicalSHA256 != want {
+					t.Errorf("%+v: canonical hash differs", opts)
+				}
+			}
+		})
 	}
 }

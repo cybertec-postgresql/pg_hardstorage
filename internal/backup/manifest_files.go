@@ -2,6 +2,7 @@ package backup
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"iter"
@@ -56,6 +57,36 @@ func (m *Manifest) NumChunkRefs() int64 {
 		n += int64(len(m.Files[i].Chunks))
 	}
 	return n
+}
+
+// CanonicalSHA256 is the SHA-256 of the manifest's canonical signing
+// bytes (sha256 of Canonicalize()) whether m is held or streamed. A
+// streamed manifest is hashed in one pass over the stored object with
+// the canonical form spooled to disk, so memory stays independent of
+// the file count; the pass fails if the object no longer hashes to what
+// ReadStreaming verified.
+func (m *Manifest) CanonicalSHA256(ctx context.Context) ([32]byte, error) {
+	if m.stream == nil {
+		b, err := m.Canonicalize()
+		if err != nil {
+			return [32]byte{}, err
+		}
+		return sha256.Sum256(b), nil
+	}
+	fs := m.stream
+	rc, err := fs.ms.sp.Get(ctx, fs.key)
+	if err != nil {
+		return [32]byte{}, err
+	}
+	defer rc.Close()
+	info, err := StreamManifest(rc, StreamOptions{CanonicalHash: true}, nil)
+	if err != nil {
+		return [32]byte{}, err
+	}
+	if info.RawSHA256 != fs.sha {
+		return [32]byte{}, fmt.Errorf("backup: manifest %s changed after it was verified", fs.key)
+	}
+	return info.CanonicalSHA256, nil
 }
 
 // EachFile calls fn for every file entry in document order, from memory
@@ -329,6 +360,25 @@ func (ms *ManifestStore) ListHeaders(ctx context.Context, deployment string, ver
 // janitor) that must see the tombstoned set too.
 func (ms *ManifestStore) ListIncludingTombstonedHeaders(ctx context.Context, deployment string, verifier *Verifier) iter.Seq2[ManifestEntry, error] {
 	return ms.listStreamingEntries(ctx, deployment, StreamOptions{Verifier: verifier}, verifier != nil, true, false)
+}
+
+// ListAttestationlessHeaders is ListHeaders without signature
+// verification, for read-only inspection that needs header fields only.
+func (ms *ManifestStore) ListAttestationlessHeaders(ctx context.Context, deployment string) iter.Seq2[*Manifest, error] {
+	return func(yield func(*Manifest, error) bool) {
+		for e, err := range ms.listStreamingEntries(ctx, deployment, StreamOptions{}, true, false, false) {
+			if !yield(e.Manifest, err) {
+				return
+			}
+		}
+	}
+}
+
+// ListAttestationlessIncludingTombstonedHeaders is
+// ListAttestationlessHeaders that also yields soft-deleted manifests,
+// flagged.
+func (ms *ManifestStore) ListAttestationlessIncludingTombstonedHeaders(ctx context.Context, deployment string) iter.Seq2[ManifestEntry, error] {
+	return ms.listStreamingEntries(ctx, deployment, StreamOptions{}, true, true, false)
 }
 
 // ListAttestationlessAuto is ListAuto without signature verification.

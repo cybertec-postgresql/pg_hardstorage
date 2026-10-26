@@ -641,15 +641,7 @@ func take(ctx context.Context, opts TakeOptions, abortCtx *context.Context) (*Re
 	// fail the tar parse with an opaque error: remember the first one and
 	// let the manifest gate below report it the way it always has.
 	var spoolErr error
-	addEntry := func(fe *backup.FileEntry) error {
-		if spoolErr != nil {
-			return nil
-		}
-		if err := spool.Add(fe); err != nil {
-			spoolErr = err
-		}
-		return nil
-	}
+	entryStream := &spoolStream{sp: spool, err: &spoolErr}
 
 	// 2. Probe the PG version on a regular-mode connection. Replication
 	//    mode can't run SHOW, and we want the version recorded on the
@@ -728,7 +720,7 @@ func take(ctx context.Context, opts TakeOptions, abortCtx *context.Context) (*Re
 	if opts.OnFile != nil {
 		sinkOpts = append(sinkOpts, tarsink.WithFileObserver(opts.OnFile))
 	}
-	sinkOpts = append(sinkOpts, tarsink.WithEntryHandler(addEntry))
+	sinkOpts = append(sinkOpts, tarsink.WithEntryStream(entryStream))
 	if opts.ChunkAvgSize > 0 {
 		avg := opts.ChunkAvgSize
 		sinkOpts = append(sinkOpts, tarsink.WithChunkerFactory(func() *chunker.Chunker {
@@ -1486,4 +1478,42 @@ func readGapsForManifest(ctx context.Context, sp storage.StoragePlugin, deployme
 		})
 	}
 	return out, nil
+}
+
+// spoolStream feeds the tar sink's streamed file entries into the manifest
+// spool. Like the whole-entry path it replaces, it never fails the tar parse:
+// the first spool error (bad path, chunk-sum mismatch, duplicate) is
+// remembered in *err for the manifest gate to report, and everything after
+// it is ignored.
+type spoolStream struct {
+	sp  *backup.ManifestSpool
+	err *error
+}
+
+func (s *spoolStream) note(err error) error {
+	if err != nil && *s.err == nil {
+		*s.err = err
+	}
+	return nil
+}
+
+func (s *spoolStream) BeginFile(fe *backup.FileEntry) error {
+	if *s.err != nil {
+		return nil
+	}
+	return s.note(s.sp.BeginFile(fe))
+}
+
+func (s *spoolStream) AddChunk(c backup.ChunkRef) error {
+	if *s.err != nil {
+		return nil
+	}
+	return s.note(s.sp.AddChunk(c))
+}
+
+func (s *spoolStream) EndFile() error {
+	if *s.err != nil {
+		return nil
+	}
+	return s.note(s.sp.EndFile())
 }

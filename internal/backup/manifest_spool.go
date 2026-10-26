@@ -13,6 +13,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/spill"
 )
 
@@ -34,6 +35,13 @@ type ManifestSpool struct {
 	// need no second pass (and no map the size of the backup).
 	chunkSet                  *spill.HashSet
 	uniqueChunks, uniqueBytes int64
+
+	// Streaming-file state (BeginFile/AddChunk/EndFile). cur is the
+	// header of the file being streamed; nil when none is open.
+	cur       *FileEntry
+	curNext   int64 // expected offset of the next chunk
+	curChunks int
+	broken    error // sticky: a failed stream leaves a torn entry in the spool
 }
 
 // NewManifestSpool creates a spool whose temp files live in dir
@@ -88,6 +96,140 @@ func (s *ManifestSpool) Add(fe *FileEntry) error {
 		}
 	}
 	return nil
+}
+
+// BeginFile starts a streamed entry: fe carries every field except Chunks
+// (which must be empty). AddChunk appends chunk refs in file order and
+// EndFile closes the entry. The bytes written are identical to Add of the
+// same complete entry, but only O(1) of the chunk list is ever in memory,
+// which is what a single file of hundreds of GB needs. An error from any of
+// the three leaves a torn entry behind, so the spool is unusable afterwards
+// and every later call (and CommitSpooled) reports that error.
+func (s *ManifestSpool) BeginFile(fe *FileEntry) error {
+	if s.broken != nil {
+		return s.broken
+	}
+	if s.cur != nil {
+		return s.fail(errors.New("manifest spool: BeginFile while a streamed file is open"))
+	}
+	if len(fe.Chunks) != 0 {
+		return s.fail(fmt.Errorf("manifest spool: BeginFile %q: Chunks must be empty", fe.Path))
+	}
+	// Path/size checks of the per-entry validator, minus the chunk-sum
+	// check that EndFile performs.
+	hdr := *fe
+	hdr.Size = 0
+	if err := validateFileEntry(int(s.files), &hdr); err != nil {
+		return s.fail(err)
+	}
+	if fe.Size < 0 {
+		return s.fail(fmt.Errorf("manifest: files[%d] %q size=%d (must be ≥0)", s.files, fe.Path, fe.Size))
+	}
+	if !s.fileSet.Add(sha256.Sum256([]byte(fileIdentity(fe)))) {
+		if err := s.fileSet.Err(); err != nil {
+			return s.fail(fmt.Errorf("manifest spool: path set: %w", err))
+		}
+		return s.fail(fmt.Errorf("manifest: duplicate file path %q in tablespace %d", fe.Path, fe.TablespaceOID))
+	}
+	// Encode the header with "chunks":null and cut the null: the chunk
+	// array is appended piecewise, byte-identical to a whole-entry encode.
+	s.enc.Reset()
+	e := json.NewEncoder(&s.enc)
+	e.SetEscapeHTML(false)
+	hdr = *fe
+	hdr.Chunks = nil
+	if err := e.Encode(&hdr); err != nil {
+		return s.fail(fmt.Errorf("manifest spool: encode %q: %w", fe.Path, err))
+	}
+	head := bytes.TrimSuffix(s.enc.Bytes(), []byte("null}\n"))
+	if len(head) == s.enc.Len() {
+		return s.fail(fmt.Errorf("manifest spool: unexpected encoding of %q", fe.Path))
+	}
+	if s.files > 0 {
+		if err := s.w.WriteByte(','); err != nil {
+			return s.fail(err)
+		}
+	}
+	if _, err := s.w.Write(head); err != nil {
+		return s.fail(err)
+	}
+	cp := *fe
+	s.cur, s.curNext, s.curChunks = &cp, 0, 0
+	return nil
+}
+
+// AddChunk appends the next chunk ref of the file opened by BeginFile.
+func (s *ManifestSpool) AddChunk(c ChunkRef) error {
+	if s.broken != nil {
+		return s.broken
+	}
+	if s.cur == nil {
+		return s.fail(errors.New("manifest spool: AddChunk without BeginFile"))
+	}
+	j, path := s.curChunks, s.cur.Path
+	switch {
+	case c.Hash == (repo.Hash{}):
+		return s.fail(fmt.Errorf("manifest: files[%d] %q chunk[%d] zero hash", s.files, path, j))
+	case c.Len <= 0:
+		return s.fail(fmt.Errorf("manifest: files[%d] %q chunk[%d] len=%d", s.files, path, j, c.Len))
+	case c.Offset != s.curNext:
+		return s.fail(fmt.Errorf("manifest: files[%d] %q chunk[%d] offset=%d, want %d (chunks must be contiguous)",
+			s.files, path, j, c.Offset, s.curNext))
+	}
+	s.enc.Reset()
+	e := json.NewEncoder(&s.enc)
+	e.SetEscapeHTML(false)
+	if err := e.Encode(&c); err != nil {
+		return s.fail(fmt.Errorf("manifest spool: encode chunk of %q: %w", path, err))
+	}
+	open := byte(',')
+	if j == 0 {
+		open = '['
+	}
+	if err := s.w.WriteByte(open); err != nil {
+		return s.fail(err)
+	}
+	if _, err := s.w.Write(bytes.TrimSuffix(s.enc.Bytes(), []byte("\n"))); err != nil {
+		return s.fail(err)
+	}
+	s.curNext += c.Len
+	s.curChunks++
+	if s.chunkSet.Add(c.Hash) {
+		s.uniqueChunks++
+		s.uniqueBytes += c.Len
+	}
+	return nil
+}
+
+// EndFile closes the streamed entry, checking the chunks add up to Size.
+func (s *ManifestSpool) EndFile() error {
+	if s.broken != nil {
+		return s.broken
+	}
+	if s.cur == nil {
+		return s.fail(errors.New("manifest spool: EndFile without BeginFile"))
+	}
+	fe := s.cur
+	if s.curNext != fe.Size {
+		return s.fail(fmt.Errorf("manifest: files[%d] %q chunks total %d != size %d", s.files, fe.Path, s.curNext, fe.Size))
+	}
+	tail := "]}"
+	if s.curChunks == 0 {
+		tail = "null}"
+	}
+	if _, err := s.w.WriteString(tail); err != nil {
+		return s.fail(err)
+	}
+	s.files++
+	s.bytes += fe.Size
+	s.chunkRefs += int64(s.curChunks)
+	s.cur = nil
+	return nil
+}
+
+func (s *ManifestSpool) fail(err error) error {
+	s.broken = err
+	return err
 }
 
 // UniqueChunks and UniqueChunkBytes count each distinct chunk once.
@@ -157,6 +299,9 @@ func (ms *ManifestStore) CommitSpooled(ctx context.Context, m *Manifest, sp *Man
 	if err := validateRef(m.Deployment, m.BackupID); err != nil {
 		return err
 	}
+	if sp.broken != nil || sp.cur != nil {
+		return fmt.Errorf("backup: manifest spool holds a torn streamed entry: %v", sp.broken)
+	}
 	if err := sp.w.Flush(); err != nil {
 		return fmt.Errorf("backup: flush manifest spool: %w", err)
 	}
@@ -173,46 +318,69 @@ func (ms *ManifestStore) CommitSpooled(ctx context.Context, m *Manifest, sp *Man
 		return fmt.Errorf("backup: Commit refuses invalid manifest %s: %w", m.BackupID, err)
 	}
 
-	prefix, suffix, err := canonicalSplit(m)
+	canon, size, err := sp.assembleAndSign(m, signer)
 	if err != nil {
 		return err
 	}
-	canon, err := os.CreateTemp(sp.dir(), "pghs-manifest-*.canon")
-	if err != nil {
-		return fmt.Errorf("backup: canonical spool: %w", err)
-	}
 	defer func() { _ = canon.Close(); _ = os.Remove(canon.Name()) }()
+	body, err := spooledManifestBody(canon, size, m.Attestation)
+	if err != nil {
+		return err
+	}
+	return ms.commitBody(ctx, m, body, opts)
+}
+
+// assembleAndSign writes the canonical document for header m plus this
+// spool's entries to a temp file, signs it (memory-mapped, so no RAM
+// proportional to the manifest) and sets m.Attestation. The caller owns
+// the returned file (close + remove it) and its size.
+func (s *ManifestSpool) assembleAndSign(m *Manifest, signer *Signer) (*os.File, int64, error) {
+	prefix, suffix, err := canonicalSplit(m)
+	if err != nil {
+		return nil, 0, err
+	}
+	canon, err := os.CreateTemp(s.dir(), "pghs-manifest-*.canon")
+	if err != nil {
+		return nil, 0, fmt.Errorf("backup: canonical spool: %w", err)
+	}
+	ok := false
+	defer func() {
+		if !ok {
+			_ = canon.Close()
+			_ = os.Remove(canon.Name())
+		}
+	}()
 	// bufio.Writer errors are sticky: the Flush below reports any of them.
 	w := bufio.NewWriterSize(canon, 1<<20)
 	_, _ = w.Write(prefix)
-	if sp.files == 0 {
+	if s.files == 0 {
 		_, _ = w.WriteString("[]")
 	} else {
 		_ = w.WriteByte('[')
-		if _, err := sp.f.Seek(0, stdio.SeekStart); err != nil {
-			return err
+		if _, err := s.f.Seek(0, stdio.SeekStart); err != nil {
+			return nil, 0, err
 		}
-		if _, err := stdio.Copy(w, sp.f); err != nil {
-			return fmt.Errorf("backup: assemble canonical manifest: %w", err)
+		if _, err := stdio.Copy(w, s.f); err != nil {
+			return nil, 0, fmt.Errorf("backup: assemble canonical manifest: %w", err)
 		}
 		_ = w.WriteByte(']')
 	}
 	_, _ = w.Write(suffix)
 	if err := w.Flush(); err != nil {
-		return fmt.Errorf("backup: assemble canonical manifest: %w", err)
+		return nil, 0, fmt.Errorf("backup: assemble canonical manifest: %w", err)
 	}
 	st, err := canon.Stat()
 	if err != nil {
-		return err
+		return nil, 0, err
 	}
 	msg, unmap, err := mapReadOnly(canon, st.Size())
 	if err != nil {
-		return fmt.Errorf("backup: map canonical manifest: %w", err)
+		return nil, 0, fmt.Errorf("backup: map canonical manifest: %w", err)
 	}
 	pubPEM, perr := signer.PublicKeyPEM()
 	if perr != nil {
 		_ = unmap()
-		return perr
+		return nil, 0, perr
 	}
 	sig := signer.Sign(msg)
 	_ = unmap()
@@ -221,24 +389,28 @@ func (ms *ManifestStore) CommitSpooled(ctx context.Context, m *Manifest, sp *Man
 		PublicKey: string(pubPEM),
 		Signature: base64.StdEncoding.EncodeToString(sig),
 	}
+	ok = true
+	return canon, st.Size(), nil
+}
 
-	// On-disk form = canonical bytes with the attestation appended as the
-	// last field, exactly what MarshalToBytes produces.
-	var att bytes.Buffer
-	ae := json.NewEncoder(&att)
+// spooledManifestBody is the on-disk form of a signed spooled document:
+// the canonical bytes with att appended as the last field, exactly what
+// MarshalToBytes produces. open may be called repeatedly.
+func spooledManifestBody(canon *os.File, size int64, att *Attestation) (manifestBody, error) {
+	var ab bytes.Buffer
+	ae := json.NewEncoder(&ab)
 	ae.SetEscapeHTML(false)
-	if err := ae.Encode(m.Attestation); err != nil {
-		return err
+	if err := ae.Encode(att); err != nil {
+		return manifestBody{}, err
 	}
-	tail := `,"attestation":` + strings.TrimSuffix(att.String(), "\n") + "}"
-	head := st.Size() - 1 // everything but the closing '}'
-	body := manifestBody{
+	tail := `,"attestation":` + strings.TrimSuffix(ab.String(), "\n") + "}"
+	head := size - 1 // everything but the closing '}'
+	return manifestBody{
 		size: head + int64(len(tail)),
 		open: func() (stdio.ReadCloser, error) {
 			return &spoolBody{head: stdio.NewSectionReader(canon, 0, head), headLen: head, tail: strings.NewReader(tail)}, nil
 		},
-	}
-	return ms.commitBody(ctx, m, body, opts)
+	}, nil
 }
 
 func (s *ManifestSpool) dir() string {

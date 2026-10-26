@@ -46,6 +46,13 @@ type StreamOptions struct {
 	// the manifest (VerifyEmbedded semantics). Ignored if Verifier is set.
 	VerifyEmbedded bool
 
+	// CanonicalHash computes StreamInfo.CanonicalSHA256, the SHA-256 of
+	// the canonical signing bytes (what Manifest.Canonicalize returns),
+	// without holding them: they are spooled to disk and hashed from
+	// there. Implied by Verifier/VerifyEmbedded. With neither set no
+	// signature is checked.
+	CanonicalHash bool
+
 	// Validate applies the same invariants as Manifest.Validate, one
 	// entry at a time.
 	Validate bool
@@ -73,6 +80,9 @@ type StreamInfo struct {
 	RawSHA256 [32]byte
 	// Verified is true when a signature was checked and held.
 	Verified bool
+	// CanonicalSHA256 is the SHA-256 of the canonical signing bytes,
+	// set when StreamOptions.CanonicalHash or a verify option was given.
+	CanonicalSHA256 [32]byte
 	// Key is the storage key the document was read from (set by the
 	// ManifestStore readers, empty for a bare StreamManifest).
 	Key string
@@ -92,7 +102,8 @@ func StreamManifest(r io.Reader, opts StreamOptions, fn func(*FileEntry) error) 
 	if opts.Validate {
 		sw.fileSet = spill.NewHashSet(spill.Options{Dir: opts.SpoolDir, MemEntries: opts.PathSetMemEntries})
 	}
-	verify := opts.Verifier != nil || opts.VerifyEmbedded
+	checkSig := opts.Verifier != nil || opts.VerifyEmbedded
+	verify := checkSig || opts.CanonicalHash
 
 	if tok, err := dec.Token(); err != nil {
 		return nil, fmt.Errorf("manifest: parse: %w", err)
@@ -222,10 +233,10 @@ func StreamManifest(r io.Reader, opts StreamOptions, fn func(*FileEntry) error) 
 	sw.info.RawSHA256 = [32]byte(h.Sum(nil))
 
 	if verify {
-		if err := sw.verify(m, p0, spoolOpen); err != nil {
+		if err := sw.verify(m, p0, spoolOpen, checkSig); err != nil {
 			return nil, err
 		}
-		sw.info.Verified = true
+		sw.info.Verified = checkSig
 	}
 	info := sw.info
 	return &info, nil
@@ -312,29 +323,33 @@ func (s *streamState) entry(raw json.RawMessage, verify bool) error {
 }
 
 // verify finishes the canonical message and checks the signature.
-func (s *streamState) verify(m *Manifest, p0 []byte, spoolOpen bool) error {
-	if m.Attestation == nil {
-		return ErrUnsigned
-	}
-	if m.Attestation.Scheme != SchemeEd25519 {
-		return fmt.Errorf("manifest: unsupported signature scheme %q", m.Attestation.Scheme)
-	}
+func (s *streamState) verify(m *Manifest, p0 []byte, spoolOpen, checkSig bool) error {
 	var v *Verifier
-	if s.opts.Verifier != nil {
-		v = s.opts.Verifier
-		if err := matchPublicKeys(m.Attestation.PublicKey, v); err != nil {
-			return err
+	var sig []byte
+	if checkSig {
+		if m.Attestation == nil {
+			return ErrUnsigned
 		}
-	} else {
-		emb, err := LoadVerifier([]byte(m.Attestation.PublicKey))
+		if m.Attestation.Scheme != SchemeEd25519 {
+			return fmt.Errorf("manifest: unsupported signature scheme %q", m.Attestation.Scheme)
+		}
+		if s.opts.Verifier != nil {
+			v = s.opts.Verifier
+			if err := matchPublicKeys(m.Attestation.PublicKey, v); err != nil {
+				return err
+			}
+		} else {
+			emb, err := LoadVerifier([]byte(m.Attestation.PublicKey))
+			if err != nil {
+				return fmt.Errorf("manifest: parse embedded public key: %w", err)
+			}
+			v = emb
+		}
+		var err error
+		sig, err = base64.StdEncoding.DecodeString(m.Attestation.Signature)
 		if err != nil {
-			return fmt.Errorf("manifest: parse embedded public key: %w", err)
+			return fmt.Errorf("manifest: decode signature: %w", err)
 		}
-		v = emb
-	}
-	sig, err := base64.StdEncoding.DecodeString(m.Attestation.Signature)
-	if err != nil {
-		return fmt.Errorf("manifest: decode signature: %w", err)
 	}
 	prefix, suffix, err := canonicalSplit(m)
 	if err != nil {
@@ -350,6 +365,10 @@ func (s *streamState) verify(m *Manifest, p0 []byte, spoolOpen bool) error {
 			body = "[]"
 		}
 		msg := append(append(append([]byte{}, prefix...), body...), suffix...)
+		s.info.CanonicalSHA256 = sha256.Sum256(msg)
+		if !checkSig {
+			return nil
+		}
 		if err := v.Verify(msg, sig); err != nil {
 			return s.sigErr(m, err)
 		}
@@ -397,6 +416,17 @@ func (s *streamState) verify(m *Manifest, p0 []byte, spoolOpen bool) error {
 	st, err := f.Stat()
 	if err != nil {
 		return err
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	ch := sha256.New()
+	if _, err := io.Copy(ch, f); err != nil {
+		return fmt.Errorf("manifest: hash canonical form: %w", err)
+	}
+	copy(s.info.CanonicalSHA256[:], ch.Sum(nil))
+	if !checkSig {
+		return nil
 	}
 	msg, unmap, err := mapReadOnly(f, st.Size())
 	if err != nil {
