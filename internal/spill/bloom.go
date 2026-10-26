@@ -11,11 +11,18 @@ type bloom struct {
 	m    uint64
 }
 
-func newBloom(n int64) *bloom {
+// newBloom sizes a filter for n keys, but never past maxBytes (0 = no cap).
+// A capped filter only gets leakier — it answers "maybe" more often, which
+// costs a disk read, never a wrong answer — so the heap stays bounded while
+// the number of on-disk keys grows without limit.
+func newBloom(n int64, maxBytes int64) *bloom {
 	if n < 1 {
 		n = 1
 	}
 	m := uint64(n) * bloomBitsPerKey
+	if maxBytes > 0 && m > uint64(maxBytes)*8 {
+		m = uint64(maxBytes) * 8
+	}
 	m = (m + 63) &^ 63
 	return &bloom{bits: make([]uint64, m/64), m: m}
 }
@@ -47,7 +54,7 @@ func (b *bloom) test(k Key) bool {
 type Bloom struct{ b *bloom }
 
 // NewBloom sizes a filter for about n keys at roughly a 1% false-positive rate.
-func NewBloom(n int64) *Bloom { return &Bloom{b: newBloom(n)} }
+func NewBloom(n int64) *Bloom { return &Bloom{b: newBloom(n, 0)} }
 
 // Add inserts k.
 func (f *Bloom) Add(k Key) { f.b.add(k) }

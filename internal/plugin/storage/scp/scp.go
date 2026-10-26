@@ -72,6 +72,7 @@
 package scp
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/rand"
@@ -452,15 +453,18 @@ func (p *Plugin) List(ctx context.Context, prefix string) iter.Seq2[storage.Obje
 		// explicitly with a test-then-find (absent root => exit 0,
 		// no output), and (b) keep find's stderr so a real failure
 		// propagates, but only AFTER yielding whatever find produced.
-		out, err := p.runShell(ctx, listCommand(full))
-		for _, line := range strings.Split(out, "\n") {
-			line = strings.TrimRight(line, "\r")
+		// Streamed line by line: a repository's listing is hundreds of
+		// millions of lines, and buffering find's whole stdout (then
+		// splitting it into a second copy) was an out-of-memory failure.
+		stopped := false
+		err = p.runShellLines(ctx, listCommand(full), func(line string) bool {
+			line = strings.TrimRight(line, "\r\n")
 			if line == "" {
-				continue
+				return true
 			}
 			parts := strings.SplitN(line, "\t", 3)
 			if len(parts) != 3 {
-				continue
+				return true
 			}
 			rel := parts[0]
 			// Hide scp-internal staging temps ("<key>.hstmp-<rand>",
@@ -469,7 +473,7 @@ func (p *Plugin) List(ctx context.Context, prefix string) iter.Seq2[storage.Obje
 			// commit temps, which GC must be able to reap) are NOT
 			// filtered — ".hstmp-" is reserved for backend staging.
 			if strings.Contains(rel, ".hstmp-") {
-				continue
+				return true
 			}
 			size, _ := strconv.ParseInt(parts[1], 10, 64)
 			mtimeFloat, _ := strconv.ParseFloat(parts[2], 64)
@@ -482,8 +486,13 @@ func (p *Plugin) List(ctx context.Context, prefix string) iter.Seq2[storage.Obje
 				Size:    size,
 				ModTime: mtime,
 			}, nil) {
-				return
+				stopped = true
+				return false
 			}
+			return true
+		})
+		if stopped {
+			return
 		}
 		// A find failure (permission denied, entry vanished mid-walk,
 		// SSH drop) is surfaced only after emitting the partial
@@ -674,6 +683,69 @@ func (p *Plugin) runShell(ctx context.Context, command string) (string, error) {
 		return "", ctx.Err()
 	}
 }
+
+// runShellLines runs command and calls fn with each line of its stdout as it
+// arrives, in constant memory (runShell buffers the whole output). fn
+// returning false stops the command early and is not an error. The error,
+// if any, is runShell's: the command's failure with its stderr, or the
+// context's error.
+func (p *Plugin) runShellLines(ctx context.Context, command string, fn func(line string) bool) error {
+	sess, err := p.newSession()
+	if err != nil {
+		return fmt.Errorf("scp: new session: %w", err)
+	}
+	defer sess.Close()
+	stdout, err := sess.StdoutPipe()
+	if err != nil {
+		return fmt.Errorf("scp: stdout pipe: %w", err)
+	}
+	errBuf := &cappedBuffer{max: 64 << 10}
+	sess.Stderr = errBuf
+	if err := sess.Start(command); err != nil {
+		return fmt.Errorf("scp: start command: %w", err)
+	}
+	// A read parked in the SSH pipe does not look at ctx; tear the session
+	// down on cancellation so it returns.
+	stop := context.AfterFunc(ctx, func() {
+		_ = sess.Signal(ssh.SIGTERM)
+		_ = sess.Close()
+	})
+	defer stop()
+	br := bufio.NewReaderSize(stdout, 1<<20)
+	for {
+		line, rerr := br.ReadString('\n')
+		if line != "" && !fn(line) {
+			_ = sess.Signal(ssh.SIGTERM)
+			return nil
+		}
+		if rerr != nil {
+			break
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := sess.Wait(); err != nil {
+		return fmt.Errorf("%w (stderr: %s)", err, strings.TrimSpace(errBuf.String()))
+	}
+	return nil
+}
+
+// cappedBuffer keeps the first max bytes written and discards the rest, so a
+// chatty remote command cannot grow our heap through its stderr.
+type cappedBuffer struct {
+	max int
+	buf bytes.Buffer
+}
+
+func (c *cappedBuffer) Write(p []byte) (int, error) {
+	if room := c.max - c.buf.Len(); room > 0 {
+		c.buf.Write(p[:min(room, len(p))])
+	}
+	return len(p), nil
+}
+
+func (c *cappedBuffer) String() string { return c.buf.String() }
 
 // uploadVia opens a session for command (typically `cat > path`)
 // and streams r to its stdin.  Returns the byte count.

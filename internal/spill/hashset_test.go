@@ -5,6 +5,7 @@ import (
 	"container/heap"
 	"crypto/sha256"
 	"encoding/binary"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -246,5 +247,41 @@ func TestMergeHeap_PushPop(t *testing.T) {
 			t.Fatal("heap popped out of order")
 		}
 		prev = cur
+	}
+}
+
+// The Bloom filter heap is capped; a set far past the cap stays exact (a
+// leaky filter only costs extra block reads).
+func TestHashSet_BloomCapKeepsSetExact(t *testing.T) {
+	if b := newBloom(1<<40, 1<<20); len(b.bits)*8 > 1<<20 {
+		t.Fatalf("bloom is %d bytes, cap is %d", len(b.bits)*8, 1<<20)
+	}
+	if b := newBloom(1000, 1<<20); len(b.bits)*8 > 2000 {
+		t.Fatalf("a small set must not be inflated: %d bytes", len(b.bits)*8)
+	}
+	s := NewHashSet(Options{MemEntries: 64, Dir: t.TempDir(), MaxBloomBytes: 64})
+	defer s.Close()
+	const n = 2000
+	for i := 0; i < n; i++ {
+		s.Add(sha256.Sum256([]byte(fmt.Sprintf("k%d", i))))
+	}
+	if s.Spilled() == 0 {
+		t.Fatal("expected the set to spill")
+	}
+	for i := 0; i < n; i++ {
+		if !s.Has(sha256.Sum256([]byte(fmt.Sprintf("k%d", i)))) {
+			t.Fatalf("lost key %d", i)
+		}
+	}
+	for i := 0; i < n; i++ {
+		if s.Has(sha256.Sum256([]byte(fmt.Sprintf("absent%d", i)))) {
+			t.Fatalf("false positive for absent key %d", i)
+		}
+	}
+	if got := s.Len(); got != n {
+		t.Fatalf("Len = %d, want %d", got, n)
+	}
+	if err := s.Err(); err != nil {
+		t.Fatal(err)
 	}
 }

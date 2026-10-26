@@ -51,11 +51,29 @@ type Options struct {
 	// The directory is only created (and only needs to be writable)
 	// once the set outgrows MemEntries.
 	Dir string
+	// MaxBloomBytes caps the in-memory Bloom filter of any one run file.
+	// Zero means DefaultMaxBloomBytes. Without a cap the filters cost
+	// ~1.25 bytes per on-disk key, i.e. memory that grows with the
+	// repository (1.25 GB per billion distinct chunks); with it, a run
+	// past the cap just gets a leakier filter and a few more block reads.
+	MaxBloomBytes int64
+}
+
+// DefaultMaxBloomBytes is the per-run Bloom filter cap: 128 MiB holds the
+// full 10 bits/key for ~107M keys per run.
+const DefaultMaxBloomBytes int64 = 128 << 20
+
+func (o Options) maxBloomBytes() int64 {
+	if o.MaxBloomBytes > 0 {
+		return o.MaxBloomBytes
+	}
+	return DefaultMaxBloomBytes
 }
 
 // HashSet is an exact, concurrency-safe set of hashes whose heap use is
-// bounded by Options.MemEntries (plus ~1.25 bytes of Bloom filter and
-// 1/1024 of a key per on-disk key). Call Close to remove spill files.
+// bounded by Options.MemEntries (plus a Bloom filter of at most
+// Options.MaxBloomBytes per run file, ~1.25 bytes per key below that cap,
+// and 1/1024 of a key per on-disk key). Call Close to remove spill files.
 type HashSet struct {
 	opts Options
 
@@ -320,7 +338,7 @@ func (s *HashSet) writeRunLocked(level int, upper int64, next func() (Key, bool,
 	if err != nil {
 		return nil, fmt.Errorf("spill: create run: %w", err)
 	}
-	r := &run{f: f, path: path, level: level, bloom: newBloom(upper)}
+	r := &run{f: f, path: path, level: level, bloom: newBloom(upper, s.opts.maxBloomBytes())}
 	w := bufio.NewWriterSize(f, 1<<20)
 	var prev Key
 	for {

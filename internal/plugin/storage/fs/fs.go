@@ -197,7 +197,7 @@ func (p *Plugin) ReapStaging(ctx context.Context, olderThan time.Duration) (stor
 	p.mu.Unlock()
 	cutoff := time.Now().Add(-olderThan)
 	dirs := map[string]bool{}
-	err := filepath.WalkDir(p.root, func(path string, d stdfs.DirEntry, err error) error {
+	err := walkDirBounded(p.root, func(path string, d stdfs.DirEntry, err error) error {
 		if cerr := ctx.Err(); cerr != nil {
 			return cerr
 		}
@@ -610,7 +610,7 @@ func (p *Plugin) List(ctx context.Context, prefix string) iter.Seq2[storage.Obje
 		if prefix != "" {
 			base = filepath.Join(p.root, filepath.Clean("/"+prefix))
 		}
-		walkErr := filepath.WalkDir(base, func(path string, d stdfs.DirEntry, err error) error {
+		walkErr := walkDirBounded(base, func(path string, d stdfs.DirEntry, err error) error {
 			// Honour ctx between dir entries — large trees
 			// (chunks/sha256/aa/bb/... × 65k buckets) need this
 			// to be Ctrl-C interruptive.
