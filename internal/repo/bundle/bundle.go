@@ -430,7 +430,7 @@ func Import(ctx context.Context, r io.Reader, sp storage.StoragePlugin, opts Imp
 			maxEntry = storage.MaxMetadataBytes // manifests are metadata, not chunks
 		}
 		if hdr.Size > maxEntry {
-			return nil, fmt.Errorf("bundle: entry %q size %d exceeds the entry limit (%d)",
+			return nil, fmt.Errorf("bundle: entry %q size %d exceeds MaxEntryBytes limit (%d)",
 				clean, hdr.Size, maxEntry)
 		}
 
