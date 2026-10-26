@@ -360,11 +360,9 @@ func (e *Engine) Execute(ctx context.Context, deployment string, strategy Strate
 			failing[h] = struct{}{}
 		}
 	}
-	var rank int64
 	walkErr := refs.ForEach(func(k spill.Key) error {
 		h := repo.Hash(k)
-		inSample := sample.has(rank)
-		rank++
+		inSample := sample.next()
 		if len(run.Chunks.Failures) >= maxRecordedChunkFailures {
 			// A repository that lost its bucket, or a backend that fails
 			// every request, fails on every one of hundreds of millions of
@@ -575,27 +573,40 @@ func isHashMismatchErr(err error) bool {
 		strings.Contains(msg, "checksum mismatch")
 }
 
-// sampleRanks is the set of positions, in ascending hash order, chosen
-// for content verification. all means every position.
+// sampleRanks selects positions, in ascending hash order, for content
+// verification. all means every position. Otherwise it is a streaming
+// selection sampler (Knuth's Algorithm S): next is called once per rank,
+// in order, and holds O(1) state however many chunks there are — a rank map
+// for 10% of a billion chunks would itself need tens of GB.
 type sampleRanks struct {
-	all    bool
-	chosen map[int64]struct{}
+	all  bool
+	left int64 // ranks not yet visited
+	need int64 // picks still to make
+	r    *rand.Rand
 }
 
-func (r sampleRanks) has(rank int64) bool {
-	if r.all {
+// next reports whether the next rank (0, 1, 2, ...) is in the sample.
+// Each of the n ranks is visited exactly once; exactly count are chosen.
+func (s *sampleRanks) next() bool {
+	if s.all {
 		return true
 	}
-	_, ok := r.chosen[rank]
-	return ok
+	if s.need <= 0 || s.left <= 0 {
+		return false
+	}
+	pick := s.r.Int63n(s.left) < s.need
+	s.left--
+	if pick {
+		s.need--
+	}
+	return pick
 }
 
 // pickSampleRanks resolves the strategy into which of the n distinct
-// chunks (ranked by ascending hash) to content-verify. It never
-// materialises the chunks: a partial Fisher-Yates over a SPARSE array
-// draws exactly the picks the old dense shuffle drew (same rng calls,
-// same swaps), but costs O(count) rather than O(n), and n can be
-// billions.
+// chunks (ranked by ascending hash) to content-verify: exactly the
+// requested count (or percent of n), uniformly at random, reproducibly for a
+// given seed. The picks differ from the pre-streaming dense shuffle for the
+// same seed; the guarantees (exact count, determinism, uniformity) do not.
 func pickSampleRanks(n int, s Strategy, rng func(int64) *rand.Rand) sampleRanks {
 	if n == 0 {
 		return sampleRanks{}
@@ -623,23 +634,7 @@ func pickSampleRanks(n int, s Strategy, rng func(int64) *rand.Rand) sampleRanks 
 		if seed == 0 {
 			seed = int64(n)
 		}
-		r := rng(seed)
-		// idx[i] defaults to i; only swapped slots are stored.
-		idx := make(map[int]int, 2*count)
-		at := func(i int) int {
-			if v, ok := idx[i]; ok {
-				return v
-			}
-			return i
-		}
-		chosen := make(map[int64]struct{}, count)
-		for i := 0; i < count; i++ {
-			j := i + r.Intn(n-i)
-			vi, vj := at(i), at(j)
-			idx[i], idx[j] = vj, vi
-			chosen[int64(idx[i])] = struct{}{}
-		}
-		return sampleRanks{chosen: chosen}
+		return sampleRanks{left: int64(n), need: int64(count), r: rng(seed)}
 	}
 	return sampleRanks{}
 }
