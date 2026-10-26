@@ -245,6 +245,12 @@ func NewEngine(opts EngineOptions) *Engine {
 	}
 }
 
+// maxRecordedChunkFailures bounds Run.Chunks.Failures: the walk stops (and
+// the run reports issues) once this many chunks have failed.
+var maxRecordedChunkFailures = 100_000
+
+var errTooManyChunkFailures = errors.New("integrity: too many chunk failures")
+
 // Execute walks the configured deployments, validates manifests,
 // checks chunk presence, optionally re-hashes a sample of chunks.
 // Returns the populated Run in unsigned form (caller signs).
@@ -359,6 +365,17 @@ func (e *Engine) Execute(ctx context.Context, deployment string, strategy Strate
 		h := repo.Hash(k)
 		inSample := sample.has(rank)
 		rank++
+		if len(run.Chunks.Failures) >= maxRecordedChunkFailures {
+			// A repository that lost its bucket, or a backend that fails
+			// every request, fails on every one of hundreds of millions of
+			// chunks; recording each would exhaust memory. Say so in the
+			// report (which then reports issues) and stop walking.
+			run.Chunks.Failures = append(run.Chunks.Failures, ChunkFailure{
+				Reason: "aborted_too_many_failures",
+				Detail: fmt.Sprintf("stopped after %d chunk failures; the remaining chunks were not checked", maxRecordedChunkFailures),
+			})
+			return errTooManyChunkFailures
+		}
 		if err := ctx.Err(); err != nil {
 			// Cancelled: abort rather than record every remaining
 			// chunk as missing and sign that as an attestation.
@@ -425,7 +442,7 @@ func (e *Engine) Execute(ctx context.Context, deployment string, strategy Strate
 		run.Chunks.Verified++
 		return nil
 	})
-	if walkErr != nil {
+	if walkErr != nil && !errors.Is(walkErr, errTooManyChunkFailures) {
 		return nil, walkErr
 	}
 	if err := refs.Err(); err != nil {

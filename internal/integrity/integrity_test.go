@@ -586,3 +586,36 @@ func TestRunID_LexSortable(t *testing.T) {
 		t.Errorf("expected r1.ID < r2.ID, got %q vs %q", r1.ID, r2.ID)
 	}
 }
+
+// A repository that is missing nearly everything must not make the run keep
+// a failure record per chunk: the walk stops at the cap, says so, and the
+// run still reports issues.
+func TestExecute_StopsRecordingAtTheFailureCap(t *testing.T) {
+	defer integrity.SetMaxRecordedChunkFailures(3)()
+	f := newFixture(t)
+	m := f.commitBackup(t, "db1", "x", 8)
+	for _, c := range m.Files[0].Chunks {
+		if err := f.sp.Delete(context.Background(), repo.ChunkKey(c.Hash)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	eng := integrity.NewEngine(integrity.EngineOptions{
+		Storage: f.sp, Manifests: f.manifests, Verifier: f.verifier,
+	})
+	r, err := eng.Execute(context.Background(), "", integrity.Strategy{Mode: "presence"}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Status != integrity.StatusFoundIssues {
+		t.Errorf("Status = %s, want found_issues", r.Status)
+	}
+	if len(r.Chunks.Failures) != 4 { // 3 recorded + the "aborted" marker
+		t.Fatalf("len(Failures) = %d, want 4", len(r.Chunks.Failures))
+	}
+	if last := r.Chunks.Failures[3]; last.Reason != "aborted_too_many_failures" {
+		t.Errorf("last failure = %+v", last)
+	}
+	if r.Chunks.Missing != 3 {
+		t.Errorf("Missing = %d, want 3 (the walk stopped at the cap)", r.Chunks.Missing)
+	}
+}

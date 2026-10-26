@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"sort"
 	"strings"
 	"time"
 
@@ -212,169 +211,146 @@ func WALPrune(ctx context.Context, sp storage.StoragePlugin, opts WALPruneOption
 	res.FrontierLSN = frontierLSN.String()
 	res.FrontierBackupID = frontierBackupID
 
-	// 2. Walk WAL segment manifests under wal/<dep>/<TLI>/*.json.
-	keys, err := listWALSegmentKeys(ctx, sp, opts.Deployment)
-	if err != nil {
-		finish()
-		return res, fmt.Errorf("repo wal prune: list segments: %w", err)
-	}
-
-	// The keys are sorted lexicographically (listWALSegmentKeys), so
-	// they form contiguous per-timeline blocks (the TLI directory is
-	// one path element) and, within a block, 24-char segment names in
-	// WAL order. WAL segments are contiguous within a timeline
-	// (walsink enforces the opening-record gate), so end_lsn is
-	// non-decreasing inside a block. That lets us PROVE the retained
-	// suffix of a block from the ordering alone: binary-search each
-	// block for the last segment whose end_lsn is below the frontier,
-	// and read manifests only for that prefix (the time-floor rule
-	// and the deletion bookkeeping need them). Reading every
-	// manifest on every prune is the cost this removes (perf audit
-	// #3: O(N) object reads where O(prunable + log N) suffice).
+	// 2. Walk WAL segment manifests under wal/<dep>/<TLI>/*.json, as a
+	//    STREAM: one listing pass, one segment at a time. A deployment
+	//    archiving WAL for years holds tens of millions of segment
+	//    manifests; the previous shape collected and sorted every key
+	//    (several GB of heap) before touching the first.
 	//
-	// The proof is safe in only one direction, and that is the right
-	// one: a segment past the boundary is only ever KEPT, never
-	// deleted. A violation of the monotonicity premise (corrupt or
-	// lying end_lsn values) can therefore only under-prune, never
-	// over-prune — the data-loss direction is impossible.
-	process := func(block []string) error {
-		// Binary search for the last index whose end_lsn <
-		// frontierLSN (-1 when none). A probe that cannot be read or
-		// parsed aborts the search: probesFailed then routes the
-		// whole block through the full read-each pass, which
-		// accounts the failure exactly as before.
-		boundary := -1
-		probesFailed := false
-		lo, hi := 0, len(block)-1
-		for lo <= hi {
-			mid := (lo + hi) / 2
-			mani, rerr := readSegmentManifest(ctx, sp, block[mid])
-			if rerr != nil {
-				probesFailed = true
-				break
-			}
-			end, perr := pglogrepl.ParseLSN(mani.EndLSN)
-			if perr != nil {
-				probesFailed = true
-				break
-			}
-			if end < frontierLSN {
-				boundary = mid
-				lo = mid + 1
-			} else {
-				hi = mid - 1
-			}
+	// WAL segments are contiguous within a timeline (walsink enforces the
+	// opening-record gate), so end_lsn is non-decreasing in segment-name
+	// order. The listing of a timeline directory normally arrives in that
+	// order (object stores list lexicographically; the fs and sftp backends
+	// sort a directory), and that lets us PROVE the retained suffix from the
+	// ordering alone: read manifests only while end_lsn < frontier, and the
+	// first segment at or past the frontier ends the prunable prefix of its
+	// timeline — everything after it is kept without being read. Reading
+	// every manifest on every prune is the cost this avoids (perf audit #3).
+	//
+	// The proof is safe in only one direction, and that is the right one: a
+	// segment past the boundary is only ever KEPT, never deleted. Corrupt or
+	// lying end_lsn values, or a listing that is not in order (a backend
+	// that does not sort), can therefore only under-prune, never
+	// over-prune — the data-loss direction is impossible. An out-of-order key
+	// switches the shortcut off for the rest of the listing, so a late
+	// low-LSN segment is still classified by its own manifest.
+	var (
+		curTLI       string
+		pastBoundary bool // current timeline: a segment >= frontier was seen
+		orderBroken  bool // listing proved not to be in key order
+		lastKey      string
+		prefix       = "wal/" + opts.Deployment + "/"
+	)
+	for info, lerr := range sp.List(ctx, prefix) {
+		if lerr != nil {
+			finish()
+			return res, fmt.Errorf("repo wal prune: list segments: %w", lerr)
 		}
-
-		for k, key := range block {
-			if err := ctx.Err(); err != nil {
-				return err
-			}
-			res.SegmentsConsidered++
-			segName := segmentNameFromKey(key)
-
-			// Past the proven boundary the ordering already shows
-			// end_lsn >= frontier: retained, no manifest read.
-			if !probesFailed && k > boundary {
-				res.SegmentsKept++
-				emitWALPruneProgress(opts, segName, "kept",
-					fmt.Sprintf("end_lsn >= frontier %s (proven by segment ordering; manifest not read)", frontierLSN))
-				continue
-			}
-
-			// Read the segment manifest to get its end_lsn + CreatedAt.
-			mani, err := readSegmentManifest(ctx, sp, key)
-			if err != nil {
-				recordWALPruneFailure(res, key, fmt.Errorf("read segment manifest: %w", err))
-				res.SegmentsFailed++
-				emitWALPruneProgress(opts, segName, "failed", err.Error())
-				continue
-			}
-
-			segEnd, err := pglogrepl.ParseLSN(mani.EndLSN)
-			if err != nil {
-				recordWALPruneFailure(res, key, fmt.Errorf("parse end_lsn %q: %w", mani.EndLSN, err))
-				res.SegmentsFailed++
-				emitWALPruneProgress(opts, segName, "failed", err.Error())
-				continue
-			}
-
-			// Primary rule: end_lsn < frontier → candidate.
-			if segEnd >= frontierLSN {
-				res.SegmentsKept++
-				emitWALPruneProgress(opts, segName, "kept",
-					fmt.Sprintf("end_lsn %s >= frontier %s", segEnd, frontierLSN))
-				continue
-			}
-
-			// Time-floor: if KeepFloorTime is set, keep the segment
-			// unless we can PROVE it predates the floor.
-			//
-			// An unknown CreatedAt — a legacy manifest without the
-			// field, or one whose producer renamed the tag — used to
-			// skip this branch entirely, so `--keep-since 7d` silently
-			// stopped protecting anything and the LSN rule deleted WAL
-			// the operator had explicitly asked to retain. Unknown means
-			// unknown: we cannot show the segment is older than the
-			// floor, so it stays.
-			//
-			// This is the posture gc already takes on the same kind of
-			// decision — "When ModTime is the zero value (backend
-			// doesn't expose it) we conservatively treat the tombstone
-			// as YOUNG (still in grace) so silent data loss is
-			// impossible". Two deletion paths in one repository must not
-			// disagree about which way an unknown timestamp rounds.
-			if !opts.KeepFloorTime.IsZero() &&
-				(mani.CreatedAt.IsZero() || !mani.CreatedAt.Before(opts.KeepFloorTime)) {
-				res.SegmentsKept++
-				res.SegmentsKeptByFloor++
-				reason := fmt.Sprintf("CreatedAt %s >= keep-floor %s",
-					mani.CreatedAt.Format(time.RFC3339), opts.KeepFloorTime.Format(time.RFC3339))
-				if mani.CreatedAt.IsZero() {
-					res.SegmentsKeptByUnknownAge++
-					reason = fmt.Sprintf("CreatedAt unknown; keeping under the %s keep-floor "+
-						"rather than deleting WAL we cannot prove is old",
-						opts.KeepFloorTime.Format(time.RFC3339))
-				}
-				emitWALPruneProgress(opts, segName, "kept", reason)
-				continue
-			}
-
-			if opts.DryRun {
-				res.SegmentsDeleted++
-				res.BytesDeleted += sumChunkLengths(mani.Chunks)
-				emitWALPruneProgress(opts, segName, "would_delete",
-					fmt.Sprintf("end_lsn %s < frontier %s", segEnd, frontierLSN))
-				continue
-			}
-
-			// Real delete — manifest only; chunks are GC's job.
-			if err := sp.Delete(ctx, key); err != nil {
-				recordWALPruneFailure(res, key, fmt.Errorf("delete: %w", err))
-				res.SegmentsFailed++
-				emitWALPruneProgress(opts, segName, "failed", err.Error())
-				continue
-			}
-			res.SegmentsDeleted++
-			res.BytesDeleted += sumChunkLengths(mani.Chunks)
-			emitWALPruneProgress(opts, segName, "deleted", "")
+		key := info.Key
+		if !isWALSegmentManifestRel(strings.TrimPrefix(key, prefix)) {
+			continue
 		}
-		return nil
-	}
-
-	// Contiguous same-TLI runs of the sorted keys; each block is
-	// ordered by segment name, so it is ordered by end_lsn.
-	i := 0
-	for i < len(keys) {
-		j := i + 1
-		for j < len(keys) && tliOfKey(keys[j]) == tliOfKey(keys[i]) {
-			j++
-		}
-		if err := process(keys[i:j]); err != nil {
+		if err := ctx.Err(); err != nil {
 			finish()
 			return res, err
 		}
-		i = j
+		if tli := tliOfKey(key); tli != curTLI {
+			curTLI, pastBoundary, lastKey = tli, false, ""
+		}
+		if key < lastKey {
+			orderBroken, pastBoundary = true, false
+		}
+		lastKey = key
+
+		res.SegmentsConsidered++
+		segName := segmentNameFromKey(key)
+
+		// Past the proven boundary the ordering already shows
+		// end_lsn >= frontier: retained, no manifest read.
+		if pastBoundary && !orderBroken {
+			res.SegmentsKept++
+			emitWALPruneProgress(opts, segName, "kept",
+				fmt.Sprintf("end_lsn >= frontier %s (proven by segment ordering; manifest not read)", frontierLSN))
+			continue
+		}
+
+		// Read the segment manifest to get its end_lsn + CreatedAt.
+		mani, err := readSegmentManifest(ctx, sp, key)
+		if err != nil {
+			recordWALPruneFailure(res, key, fmt.Errorf("read segment manifest: %w", err))
+			res.SegmentsFailed++
+			emitWALPruneProgress(opts, segName, "failed", err.Error())
+			continue
+		}
+
+		segEnd, err := pglogrepl.ParseLSN(mani.EndLSN)
+		if err != nil {
+			recordWALPruneFailure(res, key, fmt.Errorf("parse end_lsn %q: %w", mani.EndLSN, err))
+			res.SegmentsFailed++
+			emitWALPruneProgress(opts, segName, "failed", err.Error())
+			continue
+		}
+
+		// Primary rule: end_lsn < frontier → candidate.
+		if segEnd >= frontierLSN {
+			pastBoundary = true
+			res.SegmentsKept++
+			emitWALPruneProgress(opts, segName, "kept",
+				fmt.Sprintf("end_lsn %s >= frontier %s", segEnd, frontierLSN))
+			continue
+		}
+
+		// Time-floor: if KeepFloorTime is set, keep the segment
+		// unless we can PROVE it predates the floor.
+		//
+		// An unknown CreatedAt — a legacy manifest without the
+		// field, or one whose producer renamed the tag — used to
+		// skip this branch entirely, so `--keep-since 7d` silently
+		// stopped protecting anything and the LSN rule deleted WAL
+		// the operator had explicitly asked to retain. Unknown means
+		// unknown: we cannot show the segment is older than the
+		// floor, so it stays.
+		//
+		// This is the posture gc already takes on the same kind of
+		// decision — "When ModTime is the zero value (backend
+		// doesn't expose it) we conservatively treat the tombstone
+		// as YOUNG (still in grace) so silent data loss is
+		// impossible". Two deletion paths in one repository must not
+		// disagree about which way an unknown timestamp rounds.
+		if !opts.KeepFloorTime.IsZero() &&
+			(mani.CreatedAt.IsZero() || !mani.CreatedAt.Before(opts.KeepFloorTime)) {
+			res.SegmentsKept++
+			res.SegmentsKeptByFloor++
+			reason := fmt.Sprintf("CreatedAt %s >= keep-floor %s",
+				mani.CreatedAt.Format(time.RFC3339), opts.KeepFloorTime.Format(time.RFC3339))
+			if mani.CreatedAt.IsZero() {
+				res.SegmentsKeptByUnknownAge++
+				reason = fmt.Sprintf("CreatedAt unknown; keeping under the %s keep-floor "+
+					"rather than deleting WAL we cannot prove is old",
+					opts.KeepFloorTime.Format(time.RFC3339))
+			}
+			emitWALPruneProgress(opts, segName, "kept", reason)
+			continue
+		}
+
+		if opts.DryRun {
+			res.SegmentsDeleted++
+			res.BytesDeleted += sumChunkLengths(mani.Chunks)
+			emitWALPruneProgress(opts, segName, "would_delete",
+				fmt.Sprintf("end_lsn %s < frontier %s", segEnd, frontierLSN))
+			continue
+		}
+
+		// Real delete — manifest only; chunks are GC's job.
+		if err := sp.Delete(ctx, key); err != nil {
+			recordWALPruneFailure(res, key, fmt.Errorf("delete: %w", err))
+			res.SegmentsFailed++
+			emitWALPruneProgress(opts, segName, "failed", err.Error())
+			continue
+		}
+		res.SegmentsDeleted++
+		res.BytesDeleted += sumChunkLengths(mani.Chunks)
+		emitWALPruneProgress(opts, segName, "deleted", "")
 	}
 
 	finish()
@@ -605,35 +581,15 @@ func oldestKeptBackupFrontier(ctx context.Context, sp storage.StoragePlugin, dep
 	return minLSN, minBackupID, nil
 }
 
-// listWALSegmentKeys enumerates wal/<deployment>/<tli>/<seg>.json
-// keys. Sorted lexicographically (which matches WAL chronological
-// order when timeline + segment numbers monotonically increase, the
-// normal case).
-//
-// Only keys of the segment-manifest SHAPE are admitted — an 8-hex
-// timeline directory holding a hex-named .json — rather than
-// "any .json except a few known siblings". wal/<dep>/ also holds gap
-// records (gaps/*.json) and timeline histories (timelines/), and a
-// deny-list that forgot gaps/ read every gap record as a segment: with
-// no end_lsn it was counted as a permanent prune failure, and a record
-// that ever decoded with one would have been deleted, erasing the
-// evidence restore uses to refuse a PITR into a hole. An allow-list
+// The WAL walk admits only keys of the segment-manifest SHAPE (see
+// isWALSegmentManifestRel) — an 8-hex timeline directory holding a
+// hex-named .json — rather than "any .json except a few known siblings".
+// wal/<dep>/ also holds gap records (gaps/*.json) and timeline histories
+// (timelines/), and a deny-list that forgot gaps/ read every gap record as
+// a segment: with no end_lsn it was counted as a permanent prune failure,
+// and a record that ever decoded with one would have been deleted, erasing
+// the evidence restore uses to refuse a PITR into a hole. An allow-list
 // fails safe when a new sibling tree appears.
-func listWALSegmentKeys(ctx context.Context, sp storage.StoragePlugin, deployment string) ([]string, error) {
-	prefix := "wal/" + deployment + "/"
-	var out []string
-	for info, err := range sp.List(ctx, prefix) {
-		if err != nil {
-			return nil, err
-		}
-		if !isWALSegmentManifestRel(strings.TrimPrefix(info.Key, prefix)) {
-			continue
-		}
-		out = append(out, info.Key)
-	}
-	sort.Strings(out)
-	return out, nil
-}
 
 // isWALSegmentManifestRel reports whether rel (a key relative to
 // wal/<deployment>/) is `<8 hex tli>/<hex segment>.json`. Temp files
@@ -709,7 +665,7 @@ func segmentNameFromKey(key string) string {
 }
 
 // tliOfKey extracts the timeline directory from a key of the form
-// wal/<dep>/<TLI>/<segment>.json (listWALSegmentKeys' layout; the
+// wal/<dep>/<TLI>/<segment>.json (the WALPrune walk's layout; the
 // TLI is the third path element). Returns "" when the key is not
 // of that shape; such keys never occur, but a "" group still
 // groups them together harmlessly.

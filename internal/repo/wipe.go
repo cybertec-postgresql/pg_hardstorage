@@ -60,22 +60,21 @@ func Wipe(ctx context.Context, sp storage.StoragePlugin, onProgress func(key str
 	}
 	res := &WipeResult{Schema: WipeSchema}
 
-	// Pass 1: collect every key. Sorting + deferred delete keeps the
-	// HSREPO-deleted-last invariant simple.
-	var keys []string
+	// Pass 1+2, streamed: delete every non-HSREPO key as the listing
+	// produces it. The old shape collected every key first (a repository of
+	// a 100 TB database lists hundreds of millions of them) so the HSREPO
+	// invariant stayed simple; it is still simple, because HSREPO and the
+	// version marker are skipped here and removed last in pass 3.
+	//
+	// The `_repo_version.json` marker is treated like HSREPO: we hold it
+	// for the very-last step so a partially-wiped repo can still be
+	// recognised as one (a marker without HSREPO would leave the repo in a
+	// "no HSREPO but format=" limbo).
 	for info, err := range sp.List(ctx, "") {
 		if err != nil {
 			return res, fmt.Errorf("repo wipe: list: %w", err)
 		}
-		keys = append(keys, info.Key)
-	}
-
-	// Pass 2: delete every non-HSREPO key. HSREPO last.  The
-	// `_repo_version.json` marker is treated like HSREPO: we hold
-	// it for the very-last step so a partially-wiped repo can
-	// still be recognised as one (a marker without HSREPO would
-	// leave the repo in a "no HSREPO but format=" limbo).
-	for _, k := range keys {
+		k := info.Key
 		if k == HSREPOFilename || k == RepoVersionFilename {
 			continue
 		}

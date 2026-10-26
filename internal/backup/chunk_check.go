@@ -28,7 +28,23 @@ type ChunkCheckResult struct {
 	// signal — these chunk hashes are referenced by the
 	// manifest but not present in the repo.
 	Present int
-	Missing []repo.Hash
+	// Missing holds the first maxCheckMissingListed missing hashes in
+	// ascending order; MissingCount is the exact number (a backup whose
+	// storage is gone is missing hundreds of millions of chunks, and
+	// listing each would exhaust memory).
+	Missing      []repo.Hash
+	MissingCount int
+}
+
+// maxCheckMissingListed bounds ChunkCheckResult.Missing.
+var maxCheckMissingListed = 1000
+
+// NumMissing is the exact number of missing chunks.
+func (r *ChunkCheckResult) NumMissing() int {
+	if r == nil {
+		return 0
+	}
+	return max(r.MissingCount, len(r.Missing))
 }
 
 // AllPresent reports whether every chunk referenced by the
@@ -37,7 +53,7 @@ type ChunkCheckResult struct {
 // at least the bytes are addressable; integrity is a separate
 // concern).
 func (r *ChunkCheckResult) AllPresent() bool {
-	return r != nil && len(r.Missing) == 0
+	return r != nil && r.NumMissing() == 0
 }
 
 // CheckChunkExistence walks every unique chunk hash in m's
@@ -93,7 +109,10 @@ func CheckChunkExistence(ctx context.Context, sp storage.StoragePlugin, m *Manif
 			return nil
 		}
 		if errors.Is(err, storage.ErrNotFound) {
-			res.Missing = append(res.Missing, h)
+			res.MissingCount++
+			if len(res.Missing) < maxCheckMissingListed {
+				res.Missing = append(res.Missing, h)
+			}
 			return nil
 		}
 		// Real backend error (network, permission). Surface

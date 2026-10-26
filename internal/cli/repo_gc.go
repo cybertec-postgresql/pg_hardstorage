@@ -228,7 +228,7 @@ func runRepoGC(cmd *cobra.Command, repoURL string, apply bool, approvalID string
 	body := repoGCBody{
 		DryRun:            !apply,
 		ManifestRefCount:  res.RefCount,
-		OrphanCount:       len(res.Orphans),
+		OrphanCount:       res.OrphanCount,
 		BytesReclaimable:  res.OrphanBytes,
 		StaleTempCount:    len(res.StaleTemps),
 		RunID:             res.RunID,
@@ -247,7 +247,7 @@ func runRepoGC(cmd *cobra.Command, repoURL string, apply bool, approvalID string
 		body.StaleTempDeleted = res.StaleTempDeleted
 		body.StagingReaped = res.StagingReaped
 		body.StagingReapedBytes = res.StagingReapedBytes
-		failureCount := len(res.Failures)
+		failureCount := res.FailureCount
 		failures := res.Failures
 		const maxFailures = 16
 		if failureCount > maxFailures {
@@ -285,7 +285,7 @@ func runRepoGC(cmd *cobra.Command, repoURL string, apply bool, approvalID string
 					"approval_op":     string(gateReq.Op),
 					"threshold":       gateReq.Threshold,
 					"approvers":       len(gateReq.Approvals),
-					"orphans_found":   len(res.Orphans),
+					"orphans_found":   res.OrphanCount,
 					"orphans_deleted": res.Deleted,
 					"bytes_reclaimed": res.DeletedBytes,
 				},
@@ -300,7 +300,7 @@ func runRepoGC(cmd *cobra.Command, repoURL string, apply bool, approvalID string
 	const maxListedHashes = 64
 	for i, h := range res.Orphans {
 		if i >= maxListedHashes {
-			body.Hashes = append(body.Hashes, fmt.Sprintf("... +%d more", len(res.Orphans)-maxListedHashes))
+			body.Hashes = append(body.Hashes, fmt.Sprintf("... +%d more", res.OrphanCount-maxListedHashes))
 			break
 		}
 		body.Hashes = append(body.Hashes, h.String())

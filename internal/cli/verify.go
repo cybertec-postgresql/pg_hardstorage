@@ -228,7 +228,7 @@ func runVerify(cmd *cobra.Command, deployment, backupID, repoURL string, sample 
 	// the chain. Best-effort: a chain-write failure must never fail the
 	// verification itself.
 	verifyOutcome := "ok"
-	if len(stats.Mismatches) > 0 {
+	if stats.MismatchCount > 0 {
 		verifyOutcome = "failed"
 	}
 	verifyMode := "fast"
@@ -249,7 +249,7 @@ func runVerify(cmd *cobra.Command, deployment, backupID, repoURL string, sample 
 		ChunksUnique:      stats.ChunksUnique,
 		ChunksSampled:     stats.ChunksSampled,
 		ChunksVerified:    stats.ChunksVerified,
-		ChunksMismatched:  len(stats.Mismatches),
+		ChunksMismatched:  stats.MismatchCount,
 		BytesVerified:     stats.BytesVerified,
 		DurationMS:        stats.DurationMS,
 		ExistenceOnly:     existenceOnly,
@@ -257,7 +257,7 @@ func runVerify(cmd *cobra.Command, deployment, backupID, repoURL string, sample 
 	for _, h := range stats.Mismatches {
 		body.Mismatches = append(body.Mismatches, h.String())
 	}
-	if len(stats.Mismatches) > 0 {
+	if stats.MismatchCount > 0 {
 		// Existence-only mismatches are MISSING chunks — point
 		// at chunk-GC + repo scrub. Full-verify mismatches are
 		// CORRUPTION — point at repair scrub. The summary
@@ -269,11 +269,11 @@ func runVerify(cmd *cobra.Command, deployment, backupID, repoURL string, sample 
 		commandHint := "pg_hardstorage repair scrub --repo " + repoURL
 		hashList := summarizeHashes(stats.Mismatches, 5)
 		summary := fmt.Sprintf("verify: %d chunk(s) failed integrity check: %s",
-			len(stats.Mismatches), hashList)
+			stats.MismatchCount, hashList)
 		if existenceOnly {
 			errCode = "verify.chunks_missing"
 			summary = fmt.Sprintf("verify --existence-only: %d chunk(s) missing from the repo: %s",
-				len(stats.Mismatches), hashList)
+				stats.MismatchCount, hashList)
 			humanHint = "the named chunks are absent from the repo — chunk-GC may have already reclaimed them, or the manifest references chunks never written. Restoring from this backup will fail; a tombstoned manifest with missing chunks is no longer recoverable via `backup undelete`."
 			commandHint = ""
 		}
@@ -432,7 +432,20 @@ type verifyStats struct {
 	ChunksVerified   int         // how many round-tripped successfully
 	BytesVerified    int64       // sum of plaintext bytes for verified chunks
 	DurationMS       int64       // wall-clock elapsed for the chunk walk
-	Mismatches       []repo.Hash // hashes whose stored bytes failed verification
+	Mismatches       []repo.Hash // hashes whose stored bytes failed verification (first maxVerifyMismatches)
+	MismatchCount    int         // exact number of failures; Mismatches is capped
+}
+
+// maxVerifyMismatches bounds the failing hashes verify keeps. A backup whose
+// storage vanished fails on every one of hundreds of millions of chunks; the
+// count stays exact, the list is the first (ascending) few.
+const maxVerifyMismatches = 10_000
+
+func (s *verifyStats) noteMismatch(h repo.Hash) {
+	s.MismatchCount++
+	if len(s.Mismatches) < maxVerifyMismatches {
+		s.Mismatches = append(s.Mismatches, h)
+	}
 }
 
 // verifyChunks walks every unique chunk hash in the manifest, fetches
@@ -483,7 +496,7 @@ func verifyChunks(ctx context.Context, cas *repo.CAS, m *backup.Manifest, sample
 			// divergence (the exact path a restore reads through). So a
 			// non-ctx error here IS the corruption / missing-chunk
 			// finding; record it.
-			stats.Mismatches = append(stats.Mismatches, h)
+			stats.noteMismatch(h)
 			continue
 		}
 		// No second SHA pass. A body returned WITHOUT error already
@@ -564,7 +577,7 @@ func verifyChunkExistence(ctx context.Context, sp storage.StoragePlugin, m *back
 			// Treat ErrNotFound (the common case — chunk-GC
 			// reclaimed the body) the same as any other
 			// fetch failure: it's a "missing" finding.
-			stats.Mismatches = append(stats.Mismatches, h)
+			stats.noteMismatch(h)
 			continue
 		}
 		stats.ChunksVerified++
@@ -618,6 +631,9 @@ func (b verifyBody) WriteText(w io.Writer) error {
 		fmt.Fprintf(bw, "  ✗ %d chunk(s) %s:\n", b.ChunksMismatched, label)
 		for _, h := range b.Mismatches {
 			fmt.Fprintf(bw, "      %s\n", h)
+		}
+		if n := b.ChunksMismatched - len(b.Mismatches); n > 0 {
+			fmt.Fprintf(bw, "      ... +%d more\n", n)
 		}
 	}
 	_, err := io.WriteString(w, strings.TrimRight(bw.String(), "\n"))

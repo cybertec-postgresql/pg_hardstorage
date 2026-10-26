@@ -165,7 +165,7 @@ func runRepoCheck(cmd *cobra.Command, repoURL string) error {
 			fmt.Sprintf("repo check: collect references: %v", err)).Wrap(err)
 	}
 	defer refs.Close()
-	missing, err := repo.FindMissing(cmd.Context(), sp, refs)
+	missing, missingTotal, err := repo.FindMissingLimit(cmd.Context(), sp, refs, maxListedMissingHashes)
 	if err != nil {
 		return output.NewError("repo.check.find_missing_failed",
 			fmt.Sprintf("repo check: find missing chunks: %v", err)).Wrap(err)
@@ -181,7 +181,7 @@ func runRepoCheck(cmd *cobra.Command, repoURL string) error {
 		SignatureFailedManifests: capList(sigFailedKeys, maxListedSignatureFailures),
 		UnreadableManifests:      totalUnreadable,
 		ChunkRefs:                refs.Len(),
-		MissingChunks:            len(missing),
+		MissingChunks:            missingTotal,
 		OrphanedReplicas:         orphanedReplicas,
 		WORM:                     meta.WORM,
 		CommitMode:               commitMode,
@@ -190,7 +190,7 @@ func runRepoCheck(cmd *cobra.Command, repoURL string) error {
 	for i, h := range missing {
 		if i >= maxListedHashes {
 			body.MissingHashes = append(body.MissingHashes,
-				fmt.Sprintf("... +%d more", len(missing)-maxListedHashes))
+				fmt.Sprintf("... +%d more", missingTotal-maxListedHashes))
 			break
 		}
 		body.MissingHashes = append(body.MissingHashes, h.String())
@@ -339,19 +339,26 @@ func checkDeploymentManifests(ctx context.Context, sp storage.StoragePlugin, dep
 			}
 			continue
 		}
-		body, rerr := backup.ReadAllLimited(rc, backup.MaxManifestBytes)
+		// Streamed: a manifest of a 100 TB database is tens of GB, far
+		// past what ReadAllLimited may hold, and ParseAndVerify would
+		// need it, its parse and its canonical form in memory at once.
+		// StreamManifest verifies the signature holding one file entry
+		// (the canonical form goes to a temp file). A stream that stopped
+		// because the READ failed is "unreadable", not a signature failure.
+		er := &errCaptureReader{r: rc}
+		_, verr := backup.StreamManifest(er, backup.StreamOptions{Verifier: verifier}, nil)
 		_ = rc.Close()
-		if rerr != nil {
+		if verr != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return w, ctxErr
 			}
-			w.unreadable++
-			if w.firstReadErr == nil {
-				w.firstReadErr = fmt.Errorf("%s: %w", key, rerr)
+			if er.err != nil {
+				w.unreadable++
+				if w.firstReadErr == nil {
+					w.firstReadErr = fmt.Errorf("%s: %w", key, er.err)
+				}
+				continue
 			}
-			continue
-		}
-		if _, verr := backup.ParseAndVerify(body, verifier); verr != nil {
 			w.sigFailed++
 			w.sigFailedKeys = append(w.sigFailedKeys, key)
 			continue
@@ -359,6 +366,21 @@ func checkDeploymentManifests(ctx context.Context, sp storage.StoragePlugin, dep
 		w.live++
 	}
 	return w, nil
+}
+
+// errCaptureReader remembers the first non-EOF error of the reader it wraps,
+// so a caller can tell a failed read from a failed parse.
+type errCaptureReader struct {
+	r   io.Reader
+	err error
+}
+
+func (e *errCaptureReader) Read(p []byte) (int, error) {
+	n, err := e.r.Read(p)
+	if err != nil && err != io.EOF && e.err == nil {
+		e.err = err
+	}
+	return n, err
 }
 
 // countTombstones walks the deployment's manifest tree once and
@@ -377,6 +399,11 @@ func countTombstones(ctx context.Context, sp storage.StoragePlugin, deployment s
 	}
 	return count, nil
 }
+
+// maxListedMissingHashes bounds how many missing hashes repo check keeps
+// (it lists 64); the count is exact. A repo that lost a bucket can be
+// missing hundreds of millions of chunks.
+const maxListedMissingHashes = 1024
 
 // repoCheckDeployment is the per-deployment line in the report.
 type repoCheckDeployment struct {

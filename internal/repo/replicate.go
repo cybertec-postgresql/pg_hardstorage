@@ -333,39 +333,24 @@ func Replicate(ctx context.Context, src, dst storage.StoragePlugin, opts Replica
 		replicateManifest(ctx, src, dst, key, backupID, harvestBackup, opts, res)
 	}
 
-	// Pass 3: WAL — same flow, gated on opts.IncludeWAL.
+	// Pass 3: WAL — same flow, gated on opts.IncludeWAL. Streamed: years of
+	// archived WAL are tens of millions of segment manifests, so neither
+	// the keys nor a sorted copy of them are ever held. Two listing passes
+	// keep the old order (every segment manifest, then every aux file)
+	// without buffering either group.
 	if opts.IncludeWAL {
-		var walKeys, walAuxKeys []string
 		for info, err := range src.List(ctx, "wal/") {
 			if err != nil {
 				finish()
 				return res, fmt.Errorf("repo replicate: list src wal: %w", err)
 			}
 			key := info.Key
-			if tmpMarkerInBasename(key) {
-				continue // staging temp (manifest or .history)
-			}
-			switch {
-			case strings.HasSuffix(key, ".json"):
-				walKeys = append(walKeys, key)
-			case strings.HasSuffix(key, ".history"),
-				strings.HasSuffix(key, ".backup"),
-				strings.HasSuffix(key, ".partial"):
-				// Direct-byte aux files — timeline history, backup-label,
-				// and partial segments. REQUIRED for PITR across a
-				// failover at the DR site (the .history navigates the
-				// timeline switch); copying only the .json segment
-				// manifests would leave the replica unable to recover
-				// across a timeline change.
-				walAuxKeys = append(walAuxKeys, key)
-			}
-		}
-		sort.Strings(walKeys)
-		sort.Strings(walAuxKeys)
-		for _, key := range walKeys {
 			if err := ctx.Err(); err != nil {
 				finish()
 				return res, err
+			}
+			if tmpMarkerInBasename(key) || !strings.HasSuffix(key, ".json") {
+				continue // staging temp (manifest or .history), or not a segment manifest
 			}
 			res.WALManifestsConsidered++
 			if opts.OnProgress != nil {
@@ -373,10 +358,25 @@ func Replicate(ctx context.Context, src, dst storage.StoragePlugin, opts Replica
 			}
 			replicateWALManifest(ctx, src, dst, key, opts, res)
 		}
-		for _, key := range walAuxKeys {
+		for info, err := range src.List(ctx, "wal/") {
+			if err != nil {
+				finish()
+				return res, fmt.Errorf("repo replicate: list src wal: %w", err)
+			}
+			key := info.Key
 			if err := ctx.Err(); err != nil {
 				finish()
 				return res, err
+			}
+			// Direct-byte aux files — timeline history, backup-label,
+			// and partial segments. REQUIRED for PITR across a
+			// failover at the DR site (the .history navigates the
+			// timeline switch); copying only the .json segment
+			// manifests would leave the replica unable to recover
+			// across a timeline change.
+			if tmpMarkerInBasename(key) ||
+				!(strings.HasSuffix(key, ".history") || strings.HasSuffix(key, ".backup") || strings.HasSuffix(key, ".partial")) {
+				continue
 			}
 			res.WALAuxConsidered++
 			if opts.OnProgress != nil {

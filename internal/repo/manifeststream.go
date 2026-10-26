@@ -78,26 +78,7 @@ func streamFilesArray(dec *json.Decoder, visit func(string) error) error {
 				}
 				continue
 			}
-			tok, err := dec.Token()
-			if err != nil {
-				return err
-			}
-			if tok == nil {
-				continue
-			}
-			if d, ok := tok.(json.Delim); !ok || d != '[' {
-				return fmt.Errorf("manifest: chunks is not an array")
-			}
-			for dec.More() {
-				var c chunkRef
-				if err := dec.Decode(&c); err != nil {
-					return err
-				}
-				if err := visit(c.Hash); err != nil {
-					return err
-				}
-			}
-			if err := msExpectDelim(dec, ']'); err != nil {
+			if err := streamChunksArray(dec, visit); err != nil {
 				return err
 			}
 		}
@@ -106,6 +87,58 @@ func streamFilesArray(dec *json.Decoder, visit func(string) error) error {
 		}
 	}
 	return msExpectDelim(dec, ']')
+}
+
+// streamChunksArray consumes one "chunks" value (an array of chunk
+// references, or null) and calls visit with each reference's hash.
+func streamChunksArray(dec *json.Decoder, visit func(string) error) error {
+	tok, err := dec.Token()
+	if err != nil {
+		return err
+	}
+	if tok == nil {
+		return nil
+	}
+	if d, ok := tok.(json.Delim); !ok || d != '[' {
+		return fmt.Errorf("manifest: chunks is not an array")
+	}
+	for dec.More() {
+		var c chunkRef
+		if err := dec.Decode(&c); err != nil {
+			return err
+		}
+		if err := visit(c.Hash); err != nil {
+			return err
+		}
+	}
+	return msExpectDelim(dec, ']')
+}
+
+// streamSegmentChunkRefs is streamBackupChunkRefs for a WAL or
+// logical-stream segment manifest, whose references sit in a top-level
+// "chunks" array. Same case folding and repeated-key rules, so the set of
+// references it yields is a superset of what json.Unmarshal would bind.
+func streamSegmentChunkRefs(r io.Reader, visit func(hash string) error) error {
+	dec := json.NewDecoder(io.LimitReader(r, MaxStreamedMetadataBytes))
+	if err := msExpectDelim(dec, '{'); err != nil {
+		return err
+	}
+	for dec.More() {
+		key, err := msReadKey(dec)
+		if err != nil {
+			return err
+		}
+		if !strings.EqualFold(key, "chunks") {
+			if err := msSkipValue(dec); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := streamChunksArray(dec, visit); err != nil {
+			return err
+		}
+	}
+	return msExpectDelim(dec, '}')
 }
 
 func msExpectDelim(dec *json.Decoder, want json.Delim) error {

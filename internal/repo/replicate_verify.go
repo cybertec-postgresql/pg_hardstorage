@@ -5,6 +5,7 @@
 package repo
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -487,10 +488,17 @@ func verifyKey(ctx context.Context, src, dst storage.StoragePlugin, key string, 
 	if !opts.Deep {
 		return false, nil
 	}
-	// Deep mode: fetch + compare bytes.  We don't compare in
-	// constant memory (could stream + chunk-hash); for v1, fetch
-	// both bodies + compare equality.  Acceptable trade-off:
-	// deep mode is opt-in and runs against a small sample.
+	// Deep mode: fetch + compare bytes. Sizes already agree. Anything over
+	// deepInMemoryBytes (in practice a backup manifest, which can be tens of
+	// GB) is compared as two streams in constant memory; a chunk envelope or
+	// WAL segment manifest is small enough to fetch whole.
+	if expectedSize > deepInMemoryBytes {
+		same, err := objectsEqual(ctx, src, dst, key)
+		if err != nil {
+			return false, fmt.Errorf("deep compare: %w", err)
+		}
+		return !same, nil
+	}
 	srcBody, err := readAll(ctx, src, key)
 	if err != nil {
 		return false, fmt.Errorf("deep src.Get: %w", err)
@@ -499,16 +507,12 @@ func verifyKey(ctx context.Context, src, dst storage.StoragePlugin, key string, 
 	if err != nil {
 		return false, fmt.Errorf("deep dst.Get: %w", err)
 	}
-	if len(srcBody) != len(dstBody) {
-		return true, nil
-	}
-	for i := range srcBody {
-		if srcBody[i] != dstBody[i] {
-			return true, nil
-		}
-	}
-	return false, nil
+	return !bytes.Equal(srcBody, dstBody), nil
 }
+
+// deepInMemoryBytes is the largest object a deep replica comparison reads
+// whole; larger ones are compared as streams.
+const deepInMemoryBytes = 4 << 20
 
 // readAll Get + reads body fully.  Helper.
 func readAll(ctx context.Context, sp storage.StoragePlugin, key string) ([]byte, error) {

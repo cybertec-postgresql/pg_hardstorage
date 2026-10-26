@@ -919,17 +919,18 @@ func runRepairChunks(cmd *cobra.Command, repoURL string, orphans, apply bool, mi
 						"hint":            "omit the flag (or pass a positive duration) to keep the default floor; here 0 means DISABLE, not 'use default'",
 					}))
 		}
-		hashes, err := repo.FindOrphansWithOptions(cmd.Context(), sp, refs,
-			repo.FindOrphansOptions{MinAge: minAgeForCall})
+		hashes, total, err := repo.FindOrphansLimit(cmd.Context(), sp, refs,
+			repo.FindOrphansOptions{MinAge: minAgeForCall}, maxRepairChunksListed)
 		if err != nil {
 			return output.NewError("repair.find_orphans_failed",
 				fmt.Sprintf("repair chunks: find orphans: %v", err)).Wrap(err)
 		}
 		body := repairChunksBody{
-			DryRun:   !apply,
-			Mode:     "orphans",
-			Total:    len(hashes),
-			RefCount: refs.Len(),
+			DryRun:    !apply,
+			Mode:      "orphans",
+			Total:     total,
+			RefCount:  refs.Len(),
+			Truncated: total > len(hashes),
 		}
 		for _, h := range hashes {
 			body.Chunks = append(body.Chunks, h.String())
@@ -964,7 +965,7 @@ func runRepairChunks(cmd *cobra.Command, repoURL string, orphans, apply bool, mi
 			}
 			if len(res.Failures) > 0 {
 				return output.NewError("repair.delete_failed",
-					fmt.Sprintf("repair chunks: %d deletion(s) failed: %s", len(res.Failures), res.Failures[0]))
+					fmt.Sprintf("repair chunks: %d deletion(s) failed: %s", res.FailureCount, res.Failures[0]))
 			}
 			body.Applied = res.Deleted
 		}
@@ -972,16 +973,17 @@ func runRepairChunks(cmd *cobra.Command, repoURL string, orphans, apply bool, mi
 	}
 
 	// --missing path
-	hashes, err := repo.FindMissing(cmd.Context(), sp, refs)
+	hashes, total, err := repo.FindMissingLimit(cmd.Context(), sp, refs, maxRepairChunksListed)
 	if err != nil {
 		return output.NewError("repair.find_missing_failed",
 			fmt.Sprintf("repair chunks: find missing: %v", err)).Wrap(err)
 	}
 	body := repairChunksBody{
-		DryRun:   true, // --missing is read-only
-		Mode:     "missing",
-		Total:    len(hashes),
-		RefCount: refs.Len(),
+		DryRun:    true, // --missing is read-only
+		Mode:      "missing",
+		Total:     total,
+		RefCount:  refs.Len(),
+		Truncated: total > len(hashes),
 	}
 	for _, h := range hashes {
 		body.Chunks = append(body.Chunks, h.String())
@@ -1199,7 +1201,15 @@ type repairChunksBody struct {
 	Applied  int      `json:"applied,omitempty"`
 	RefCount int      `json:"ref_count"`
 	Chunks   []string `json:"chunks,omitempty"`
+	// Truncated is set when Total exceeds the maxRepairChunksListed hashes
+	// Chunks carries (a damaged 100 TB repository can have hundreds of
+	// millions); Chunks then holds the smallest hashes in ascending order.
+	Truncated bool `json:"truncated,omitempty"`
 }
+
+// maxRepairChunksListed bounds the hashes `repair chunks` puts in its
+// result body, so memory does not grow with the number of findings.
+const maxRepairChunksListed = 100_000
 
 // maxHashLines caps how many chunk hashes the human-readable renderers
 // print. The JSON body always carries the full list; text output has to
@@ -1252,6 +1262,9 @@ func (b repairChunksBody) WriteText(w io.Writer) error {
 		}
 	}
 	writeHashLines(bw, b.Chunks)
+	if b.Truncated {
+		fmt.Fprintf(bw, "    (the result lists only the first %d of %d)\n", len(b.Chunks), b.Total)
+	}
 	_, err := io.WriteString(w, strings.TrimRight(bw.String(), "\n"))
 	return err
 }
