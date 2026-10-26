@@ -583,7 +583,7 @@ func runWalFetch(cmd *cobra.Command, opts walFetchOptions) error {
 		return output.NewError("wal.fetch.read_failed",
 			fmt.Sprintf("wal fetch: read manifest %q: %v", key, err)).Wrap(err)
 	}
-	body, err := io.ReadAll(rc)
+	body, err := storage.ReadAllLimited(rc, storage.MaxRecordBytes)
 	_ = rc.Close()
 	if err != nil {
 		return output.NewError("wal.fetch.read_failed",
@@ -701,7 +701,7 @@ func fetchAuxBody(ctx context.Context, sp storage.StoragePlugin, key string, kin
 	rc, err := sp.Get(ctx, key)
 	if err == nil {
 		defer rc.Close()
-		return io.ReadAll(rc)
+		return storage.ReadAllLimited(rc, storage.MaxRecordBytes)
 	}
 	if !errors.Is(err, storage.ErrNotFound) {
 		return nil, err
@@ -1625,7 +1625,7 @@ func firstSegmentManifestWhere(ctx context.Context, sp storage.StoragePlugin, de
 			// Racing prune/delete between List and Get — try the next key.
 			continue
 		}
-		raw, rerr := io.ReadAll(rc)
+		raw, rerr := storage.ReadAllLimited(rc, storage.MaxRecordBytes)
 		_ = rc.Close()
 		if rerr != nil {
 			continue

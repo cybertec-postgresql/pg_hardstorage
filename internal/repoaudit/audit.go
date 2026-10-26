@@ -652,7 +652,7 @@ func summarizeChain(ctx context.Context, sp storage.StoragePlugin, now time.Time
 	// without parsing each one (expensive at scale), so we emit a
 	// count-only summary in v1 with an opt-out flag if even that is
 	// too expensive on huge chains.
-	keysWithMeta := map[string]int64{}
+	eventCount := 0 // a counter, not a key->size map: the chain can hold millions of events
 	for info, err := range sp.List(ctx, "audit/") {
 		if err != nil {
 			return nil, err
@@ -671,9 +671,9 @@ func summarizeChain(ctx context.Context, sp storage.StoragePlugin, now time.Time
 		if !strings.HasSuffix(info.Key, ".json") {
 			continue
 		}
-		keysWithMeta[info.Key] = info.Size
+		eventCount++
 	}
-	cs.EventCount = len(keysWithMeta)
+	cs.EventCount = eventCount
 
 	// Anchor walk — much cheaper because anchors are compact and we
 	// already have a primitive that returns the latest one.

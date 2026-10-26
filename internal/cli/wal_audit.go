@@ -89,11 +89,11 @@ func runWalAudit(cmd *cobra.Command, deployment, repoURL string, tliFilter uint3
 	defer sp.Close()
 
 	startedAt := time.Now().UTC()
-	segs, err := scanWALSegments(cmd.Context(), sp, deployment, tliFilter)
+	segs, segSize, err := scanWALSegments(cmd.Context(), sp, deployment, tliFilter)
 	if err != nil {
 		return err
 	}
-	gaps := findLineageGaps(segs, repoTimelineForks(cmd.Context(), sp, deployment, segs))
+	gaps := findLineageGaps(segs, repoTimelineForks(cmd.Context(), sp, deployment, segs, segSize))
 	timelines := summariseTimelines(segs)
 	stoppedAt := time.Now().UTC()
 

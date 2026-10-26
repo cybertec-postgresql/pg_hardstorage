@@ -3,8 +3,6 @@ package cli
 import (
 	"context"
 
-	"github.com/jackc/pglogrepl"
-
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
 )
 
@@ -65,16 +63,10 @@ func findLineageGaps(segs []walSegment, forks timelineForkLookup) []walGap {
 // captured in the repo's timeline store. segSize comes from the scanned
 // segments (every walSegment spans exactly one segment); with no
 // segments there is nothing to check and the lookup is nil.
-func repoTimelineForks(ctx context.Context, sp storage.StoragePlugin, deployment string, segs []walSegment) timelineForkLookup {
-	if len(segs) == 0 {
+func repoTimelineForks(ctx context.Context, sp storage.StoragePlugin, deployment string, segs []walSegment, segSize int64) timelineForkLookup {
+	if len(segs) == 0 || segSize <= 0 {
 		return nil
 	}
-	start, serr := pglogrepl.ParseLSN(segs[0].StartLSN)
-	end, eerr := pglogrepl.ParseLSN(segs[0].EndLSN)
-	if serr != nil || eerr != nil || end <= start {
-		return nil
-	}
-	segSize := int64(end - start)
 	return func(newTLI, prevTLI uint32) (uint64, bool) {
 		lsn, ok := lineageForkSegmentStart(ctx, sp, deployment, newTLI, prevTLI, segSize)
 		if !ok {

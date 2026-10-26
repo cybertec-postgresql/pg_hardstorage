@@ -674,16 +674,23 @@ func (s *Store) head(ctx context.Context, shard string) (*Event, error) {
 	// and new key layouts does not sort by Sequence at all. The current
 	// "<hexSeq>.json" layout does sort correctly, but keying off the
 	// parsed Sequence is correct for every layout.
-	all, err := s.listShardEventKeys(ctx, shard)
-	if err != nil {
-		return nil, err
-	}
-	if len(all) == 0 {
-		return nil, nil
-	}
-	tail := ""
+	// Streamed: only the current tail is retained, not every key of a
+	// chain that may hold millions of events.
+	dir := shardEventDir(shard)
+	hk := headKeyForShard(shard)
+	tail, lexTail := "", ""
 	var tailSeq int64 = -1
-	for _, k := range all {
+	for info, lerr := range s.sp.List(ctx, dir) {
+		if lerr != nil {
+			return nil, lerr
+		}
+		k := info.Key
+		if !s.isShardEventKey(shard, k, hk) {
+			continue
+		}
+		if k > lexTail {
+			lexTail = k
+		}
 		seq, ok := seqFromEventKey(k)
 		if !ok {
 			continue
@@ -692,10 +699,13 @@ func (s *Store) head(ctx context.Context, shard string) (*Event, error) {
 			tail, tailSeq = k, seq
 		}
 	}
+	if lexTail == "" {
+		return nil, nil
+	}
 	if tail == "" {
 		// No parseable key (unexpected); fall back to the lex-tail so we
 		// still return a head rather than nil.
-		tail = all[len(all)-1]
+		tail = lexTail
 	}
 	return s.getByKey(ctx, tail)
 }
@@ -739,26 +749,29 @@ func (s *Store) listShardEventKeys(ctx context.Context, shard string) ([]string,
 		if err != nil {
 			return nil, err
 		}
-		if !strings.HasSuffix(info.Key, ".json") {
+		if !s.isShardEventKey(shard, info.Key, headKey) {
 			continue
-		}
-		if info.Key == headKey {
-			continue
-		}
-		if shard == "" {
-			// The global chain must not pick up sharded events or
-			// anchor sidecars that live under the same audit/ root.
-			if strings.HasPrefix(info.Key, shardsRoot) {
-				continue
-			}
-			if strings.HasPrefix(info.Key, AnchorPrefix) {
-				continue
-			}
 		}
 		out = append(out, info.Key)
 	}
 	sort.Strings(out)
 	return out, nil
+}
+
+// isShardEventKey reports whether key is an event object of shard's
+// chain (not a head pointer, shard sub-tree or anchor sidecar).
+func (s *Store) isShardEventKey(shard, key, headKey string) bool {
+	if !strings.HasSuffix(key, ".json") || key == headKey {
+		return false
+	}
+	if shard == "" {
+		// The global chain must not pick up sharded events or
+		// anchor sidecars that live under the same audit/ root.
+		if strings.HasPrefix(key, shardsRoot) || strings.HasPrefix(key, AnchorPrefix) {
+			return false
+		}
+	}
+	return true
 }
 
 // listShards enumerates every chain in the repo: the global chain ("")
@@ -828,6 +841,27 @@ type ListFilters struct {
 	Reverse       bool      // newest-first ordering when true (commit order otherwise)
 }
 
+func sortAuditEvents(out []*Event) {
+	sort.Slice(out, func(i, j int) bool {
+		if !out[i].Timestamp.Equal(out[j].Timestamp) {
+			return out[i].Timestamp.Before(out[j].Timestamp)
+		}
+		return out[i].ID < out[j].ID
+	})
+}
+
+// trimAuditMatches keeps the limit oldest events (newest when reverse),
+// leaving the survivors in unspecified order.
+func trimAuditMatches(out []*Event, limit int, reverse bool) []*Event {
+	sortAuditEvents(out)
+	if reverse {
+		out = out[len(out)-limit:]
+	} else {
+		out = out[:limit]
+	}
+	return append([]*Event(nil), out...)
+}
+
 // Search walks the chain and returns events matching filters in
 // commit order (or reverse-commit order when Reverse is set).
 // For huge audit logs this is O(N);+ adds an index file
@@ -859,15 +893,17 @@ func (s *Store) Search(ctx context.Context, f ListFilters) ([]*Event, error) {
 			}
 			if matches(ev, f) {
 				out = append(out, ev)
+				// Bounded retention: with a Limit only the oldest (or,
+				// Reverse, newest) Limit matches can be returned, so
+				// compact periodically instead of holding every match
+				// of a multi-million-event chain.
+				if f.Limit > 0 && len(out) >= 2*f.Limit+1024 {
+					out = trimAuditMatches(out, f.Limit, f.Reverse)
+				}
 			}
 		}
 	}
-	sort.Slice(out, func(i, j int) bool {
-		if !out[i].Timestamp.Equal(out[j].Timestamp) {
-			return out[i].Timestamp.Before(out[j].Timestamp)
-		}
-		return out[i].ID < out[j].ID
-	})
+	sortAuditEvents(out)
 	if f.Reverse {
 		for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
 			out[i], out[j] = out[j], out[i]

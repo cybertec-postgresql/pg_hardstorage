@@ -2,10 +2,13 @@
 package cli
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"io"
+	"slices"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -32,6 +35,7 @@ func newWalListCmd() *cobra.Command {
 		repoURL  string
 		timeline uint32
 		gapsOnly bool
+		limit    int
 	)
 	c := &cobra.Command{
 		Use:          "list <deployment>",
@@ -39,7 +43,7 @@ func newWalListCmd() *cobra.Command {
 		Args:         cobra.ExactArgs(1),
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runWalList(cmd, args[0], repoURL, timeline, gapsOnly)
+			return runWalList(cmd, args[0], repoURL, timeline, gapsOnly, limit)
 		},
 	}
 	c.Flags().StringVar(&repoURL, "repo", "",
@@ -49,10 +53,17 @@ func newWalListCmd() *cobra.Command {
 		"only list segments on this timeline (0 = all timelines)")
 	c.Flags().BoolVar(&gapsOnly, "gaps-only", false,
 		"only print the gap report; suppress per-segment listing")
+	c.Flags().IntVar(&limit, "limit", defaultWalListLimit,
+		"list at most this many segments (0 = unlimited); gap and timeline summaries always cover every segment")
 	return c
 }
 
-func runWalList(cmd *cobra.Command, deployment, repoURL string, tliFilter uint32, gapsOnly bool) error {
+// defaultWalListLimit caps the per-segment rows `wal list` renders. A
+// repo with years of WAL holds 100M+ segments; the summary and gap
+// report always cover all of them, only the row dump is truncated.
+const defaultWalListLimit = 100000
+
+func runWalList(cmd *cobra.Command, deployment, repoURL string, tliFilter uint32, gapsOnly bool, limit int) error {
 	d := DispatcherFrom(cmd)
 	_, sp, err := repo.Open(cmd.Context(), repoURL)
 	if err != nil {
@@ -60,20 +71,26 @@ func runWalList(cmd *cobra.Command, deployment, repoURL string, tliFilter uint32
 	}
 	defer sp.Close()
 
-	segs, err := scanWALSegments(cmd.Context(), sp, deployment, tliFilter)
+	segs, segSize, err := scanWALSegments(cmd.Context(), sp, deployment, tliFilter)
 	if err != nil {
 		return err
 	}
 	// Timeline-aware: a new timeline must be covered from its fork, which
 	// segment numbers alone cannot tell (see findLineageGaps).
-	gaps := findLineageGaps(segs, repoTimelineForks(cmd.Context(), sp, deployment, segs))
+	gaps := findLineageGaps(segs, repoTimelineForks(cmd.Context(), sp, deployment, segs, segSize))
 	body := walListBody{
 		Deployment: deployment,
 		Timelines:  summariseTimelines(segs),
 		GapCount:   len(gaps),
 	}
 	if !gapsOnly {
-		body.Segments = segs
+		n := len(segs)
+		if limit > 0 && n > limit {
+			n = limit
+			body.SegmentsTruncated = true
+			body.SegmentCount = len(segs)
+		}
+		body.Segments = walSegmentRows(segs[:n], segSize)
 	}
 	body.Gaps = gaps
 	return d.Result(output.NewResult(cmd.CommandPath()).WithBody(body))
@@ -83,11 +100,36 @@ func runWalList(cmd *cobra.Command, deployment, repoURL string, tliFilter uint32
 // a dedicated `wal show <segment>` would parse the manifest body for
 // chunk-level detail.
 type walSegment struct {
+	Timeline      uint32
+	SegmentNumber uint64
+}
+
+// walSegmentRow is the rendered form of a walSegment. It is built only
+// for the (capped) rows that are printed; the scan itself keeps the
+// 16-byte walSegment so 100M+ archived segments fit in memory.
+type walSegmentRow struct {
 	Timeline      uint32 `json:"timeline"`
 	SegmentNumber uint64 `json:"segment_number"`
 	SegmentName   string `json:"segment_name"`
 	StartLSN      string `json:"start_lsn"`
 	EndLSN        string `json:"end_lsn"`
+}
+
+func walSegmentRows(segs []walSegment, segSize int64) []walSegmentRow {
+	per := walsink.SegmentsPerLog(segSize)
+	out := make([]walSegmentRow, 0, len(segs))
+	for _, sg := range segs {
+		startLSN := pglogrepl.LSN(sg.SegmentNumber * uint64(segSize))
+		out = append(out, walSegmentRow{
+			Timeline:      sg.Timeline,
+			SegmentNumber: sg.SegmentNumber,
+			SegmentName: fmt.Sprintf("%08X%08X%08X", sg.Timeline,
+				uint32(sg.SegmentNumber/per), uint32(sg.SegmentNumber%per)),
+			StartLSN: startLSN.String(),
+			EndLSN:   (startLSN + pglogrepl.LSN(segSize)).String(),
+		})
+	}
+	return out
 }
 
 // walGap is a contiguous range of missing segments on a single
@@ -120,18 +162,18 @@ func (g walGap) describe() string {
 
 // scanWALSegments lists every segment manifest under wal/<dep>/ and
 // returns them sorted by (timeline, segment_number).
-func scanWALSegments(ctx context.Context, sp storage.StoragePlugin, deployment string, tliFilter uint32) ([]walSegment, error) {
+func scanWALSegments(ctx context.Context, sp storage.StoragePlugin, deployment string, tliFilter uint32) ([]walSegment, int64, error) {
 	prefix := "wal/" + deployment + "/"
 	const wantSuffix = ".json"
-	type rawSeg struct {
-		tli  uint32
-		base string
-		key  string
-	}
-	var raws []rawSeg
+	// Memory is O(segments) at 16 B each, not O(segments) x (key + name +
+	// LSN strings): a repo with years of WAL holds 100M+ of them. Until
+	// the cluster's segment size is known SegmentNumber temporarily holds
+	// logID<<32|segInLog; it is rewritten in place below.
+	var raws []walSegment
+	var probeKeys []string // first few keys, for the segment-size probe
 	for info, err := range sp.List(ctx, prefix) {
 		if err != nil {
-			return nil, output.NewError("wal.list_failed",
+			return nil, 0, output.NewError("wal.list_failed",
 				fmt.Sprintf("wal list: %v", err)).Wrap(err)
 		}
 		key := info.Key
@@ -155,7 +197,15 @@ func scanWALSegments(ctx context.Context, sp storage.StoragePlugin, deployment s
 		if tliFilter != 0 && tli != tliFilter {
 			continue
 		}
-		raws = append(raws, rawSeg{tli: tli, base: base, key: key})
+		logID, lerr := strconv.ParseUint(base[8:16], 16, 32)
+		segLo, serr := strconv.ParseUint(base[16:24], 16, 32)
+		if lerr != nil || serr != nil {
+			continue
+		}
+		raws = append(raws, walSegment{Timeline: tli, SegmentNumber: logID<<32 | segLo})
+		if len(probeKeys) < maxSegmentSizeProbes {
+			probeKeys = append(probeKeys, key)
+		}
 	}
 
 	// The segment_number and LSNs a name maps to depend on the cluster's
@@ -163,18 +213,14 @@ func scanWALSegments(ctx context.Context, sp storage.StoragePlugin, deployment s
 	// Read it from any one segment's manifest — it is cluster-wide and
 	// constant — and compute every entry with it. Falls back to the
 	// 16 MiB default when no manifest is readable.
-	keys := make([]string, 0, len(raws))
-	for _, r := range raws {
-		keys = append(keys, r.key)
-	}
-	segSize, readAny := deploymentSegmentSize(ctx, sp, keys)
+	segSize, readAny := deploymentSegmentSize(ctx, sp, probeKeys)
 	if len(raws) > 0 && !readAny {
 		// Every candidate manifest was unreadable, so the cluster's
 		// wal_segment_size is genuinely unknown. Do NOT proceed on the
 		// 16 MiB default: segment NUMBERS are derived from it, so on a
 		// cluster using any other supported size every number is wrong
 		// and so is everything computed from them. See the error text.
-		return nil, output.NewError("wal.segment_size_unknown",
+		return nil, 0, output.NewError("wal.segment_size_unknown",
 			fmt.Sprintf("wal: %d segment manifest(s) for %q are present but none of the first %d "+
 				"could be fetched or parsed, so the cluster's wal_segment_size is unknown and "+
 				"segment numbering cannot be computed",
@@ -184,26 +230,17 @@ func scanWALSegments(ctx context.Context, sp storage.StoragePlugin, deployment s
 			})
 	}
 
-	out := make([]walSegment, 0, len(raws))
-	for _, r := range raws {
-		_, segNum, _ := walsink.ParseSegmentName(r.base, segSize)
-		startLSN := pglogrepl.LSN(uint64(segNum) * uint64(segSize))
-		endLSN := startLSN + pglogrepl.LSN(segSize)
-		out = append(out, walSegment{
-			Timeline:      r.tli,
-			SegmentNumber: segNum,
-			SegmentName:   r.base,
-			StartLSN:      startLSN.String(),
-			EndLSN:        endLSN.String(),
-		})
+	per := walsink.SegmentsPerLog(segSize)
+	for i := range raws {
+		raws[i].SegmentNumber = (raws[i].SegmentNumber>>32)*per + raws[i].SegmentNumber&0xFFFFFFFF
 	}
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].Timeline != out[j].Timeline {
-			return out[i].Timeline < out[j].Timeline
+	slices.SortFunc(raws, func(a, b walSegment) int {
+		if a.Timeline != b.Timeline {
+			return cmp.Compare(a.Timeline, b.Timeline)
 		}
-		return out[i].SegmentNumber < out[j].SegmentNumber
+		return cmp.Compare(a.SegmentNumber, b.SegmentNumber)
 	})
-	return out, nil
+	return raws, segSize, nil
 }
 
 // deploymentSegmentSize reads the wal_segment_size recorded on the
@@ -261,7 +298,7 @@ func deploymentSegmentSize(ctx context.Context, sp storage.StoragePlugin, keys [
 		if err != nil {
 			continue
 		}
-		raw, rerr := io.ReadAll(rc)
+		raw, rerr := storage.ReadAllLimited(rc, storage.MaxRecordBytes)
 		_ = rc.Close()
 		if rerr != nil {
 			continue
@@ -326,7 +363,11 @@ type walListBody struct {
 	Timelines  []walTimelineSummary `json:"timelines"`
 	GapCount   int                  `json:"gap_count"`
 	Gaps       []walGap             `json:"gaps,omitempty"`
-	Segments   []walSegment         `json:"segments,omitempty"`
+	Segments   []walSegmentRow      `json:"segments,omitempty"`
+	// SegmentCount and SegmentsTruncated are set only when Segments was
+	// cut at --limit; SegmentCount is then the true total.
+	SegmentCount      int  `json:"segment_count,omitempty"`
+	SegmentsTruncated bool `json:"segments_truncated,omitempty"`
 }
 
 // WriteText renders the WAL inventory — per-timeline counts plus any gap
@@ -357,6 +398,10 @@ func (b walListBody) WriteText(w io.Writer) error {
 		for _, s := range b.Segments {
 			fmt.Fprintf(bw, "  %s  TLI %d  %s -> %s\n",
 				s.SegmentName, s.Timeline, s.StartLSN, s.EndLSN)
+		}
+		if b.SegmentsTruncated {
+			fmt.Fprintf(bw, "  ... %d of %d segments shown (raise --limit, or 0 for all)\n",
+				len(b.Segments), b.SegmentCount)
 		}
 	}
 	_, err := io.WriteString(w, bw.String())
