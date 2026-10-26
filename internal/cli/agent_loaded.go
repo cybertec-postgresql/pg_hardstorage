@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/config"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/fsutil"
 )
 
 // agentLoadedFile is the state-dir record of the schedules the running
@@ -62,7 +63,7 @@ func newAgentLoadedRecord(deps map[string]config.DeploymentConfig, addErrs []age
 	return rec
 }
 
-// writeAgentLoaded persists rec atomically (tmp + rename) under stateDir.
+// writeAgentLoaded persists rec atomically (tmp + rename + dir fsync) under stateDir.
 func writeAgentLoaded(stateDir string, rec *agentLoadedRecord) error {
 	if err := os.MkdirAll(stateDir, 0o755); err != nil {
 		return err
@@ -72,21 +73,10 @@ func writeAgentLoaded(stateDir string, rec *agentLoadedRecord) error {
 		return err
 	}
 	path := filepath.Join(stateDir, agentLoadedFile)
-	tmp, err := os.CreateTemp(stateDir, agentLoadedFile+".tmp.*")
-	if err != nil {
-		return err
-	}
-	_, werr := tmp.Write(b)
-	cerr := tmp.Close()
-	if werr != nil || cerr != nil {
-		_ = os.Remove(tmp.Name())
-		return errors.Join(werr, cerr)
-	}
-	if err := os.Rename(tmp.Name(), path); err != nil {
-		_ = os.Remove(tmp.Name())
-		return err
-	}
-	return nil
+	// WriteFileAtomic refuses a stale tmp left by a crash; the record is
+	// advisory, so clear it rather than fail the agent's start.
+	_ = os.Remove(path + ".tmp")
+	return fsutil.WriteFileAtomic(path, b, 0o644)
 }
 
 // removeAgentLoaded deletes the record, but only if it is still ours: a
