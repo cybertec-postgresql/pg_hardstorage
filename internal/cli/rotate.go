@@ -390,7 +390,8 @@ func selectDeployments(ctx context.Context, store *backup.ManifestStore, filter 
 // by ManifestStore.List.
 func loadDeploymentManifests(ctx context.Context, store *backup.ManifestStore, dep string, verifier *backup.Verifier) ([]*backup.Manifest, error) {
 	var out []*backup.Manifest
-	for m, err := range store.List(ctx, dep, verifier) {
+	// Headers only: retention needs no file lists (see ListHeaders).
+	for m, err := range store.ListHeaders(ctx, dep, verifier) {
 		if err != nil {
 			// ABORT the whole rotation for this deployment. Do not skip
 			// the manifest and continue.

@@ -218,7 +218,7 @@ func countPendingApprovals(ctx context.Context, sp storage.StoragePlugin) (int, 
 func summarizeDeployment(ctx context.Context, store *backup.ManifestStore, deployment string, verifier *backup.Verifier) deploymentStatus {
 	s := deploymentStatus{Deployment: deployment, Healthy: true}
 	var latest *backup.Manifest
-	for entry, err := range store.ListIncludingTombstoned(ctx, deployment, verifier) {
+	for entry, err := range store.ListIncludingTombstonedHeaders(ctx, deployment, verifier) {
 		if err != nil {
 			s.SkippedCount++
 			s.Healthy = false

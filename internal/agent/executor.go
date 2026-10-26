@@ -321,7 +321,9 @@ func resolveIncrementalParent(ctx context.Context, repoURL, deployment, parentID
 		}
 		parentID = id
 	}
-	parent, err := backup.NewManifestStore(sp).Read(ctx, deployment, parentID, verifier)
+	// ReadStreaming, not Read: only the parent header (PGBackupManifest) is
+	// needed, and a very large database's manifest is many GB.
+	parent, err := backup.NewManifestStore(sp).ReadStreaming(ctx, deployment, parentID, verifier)
 	if err != nil {
 		return nil, fmt.Errorf("backup-executor: incremental_from: parent %q: %w", parentID, err)
 	}

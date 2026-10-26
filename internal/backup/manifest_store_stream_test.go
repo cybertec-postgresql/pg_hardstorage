@@ -236,3 +236,37 @@ func TestReadStreaming_DetectsSwapAfterVerification(t *testing.T) {
 		t.Fatal("EachFile did not notice the object changed after verification")
 	}
 }
+
+// TestListHeaders_YieldsHeaderOnlyManifests proves the retention listing
+// holds no file lists even for a small manifest (List and ListAuto keep
+// those whole), while still carrying the header fields and file counts.
+func TestListHeaders_YieldsHeaderOnlyManifests(t *testing.T) {
+	store, _, signer, verifier := newStore(t)
+	m := validManifest()
+	ctx := context.Background()
+	if err := store.Commit(ctx, m, signer, backup.CommitOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	for got, err := range store.ListHeaders(ctx, m.Deployment, verifier) {
+		if err != nil {
+			t.Fatal(err)
+		}
+		n++
+		if got.Files != nil || !got.Streaming() {
+			t.Errorf("ListHeaders held the file list (Files=%v streaming=%v)", got.Files != nil, got.Streaming())
+		}
+		if got.BackupID != m.BackupID || got.NumFiles() != len(m.Files) {
+			t.Errorf("header = %s files=%d, want %s files=%d", got.BackupID, got.NumFiles(), m.BackupID, len(m.Files))
+		}
+	}
+	if n != 1 {
+		t.Fatalf("yielded %d manifests, want 1", n)
+	}
+	for _, err := range store.ListHeaders(ctx, m.Deployment, nil) {
+		if err == nil {
+			t.Error("nil verifier accepted")
+		}
+		break
+	}
+}

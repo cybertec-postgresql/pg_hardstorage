@@ -47,6 +47,14 @@ import (
 // Stat probe that falls through to the normal write path), so ~1.25 bytes
 // per chunk is the right trade. The previous manifest is streamed twice —
 // once to size the filter, once to fill it — and never held.
+// maxHintFilterKeys caps the hint filter's sizing: 128M keys is ~160 MiB at
+// the filter's 10 bits per key, a constant independent of database size
+// (100 TB at 1 MiB average chunks is ~100M chunks and fits in full). Past
+// the cap the filter saturates gracefully — more false positives, each one
+// a Stat probe that falls through to the normal write path — rather than
+// growing with the database.
+var maxHintFilterKeys int64 = 128 << 20
+
 func loadDedupHints(ctx context.Context, sp storage.StoragePlugin, deployment string) (*spill.Bloom, int64, error) {
 	prefix := "manifests/" + deployment + "/"
 	var (
@@ -94,7 +102,7 @@ func loadDedupHints(ctx context.Context, sp storage.StoragePlugin, deployment st
 		return nil, 0, err
 	}
 	defer rc2.Close()
-	filter := spill.NewBloom(info.ChunkRefs)
+	filter := spill.NewBloom(min(info.ChunkRefs, maxHintFilterKeys))
 	var n int64
 	if _, err := backup.StreamManifest(rc2, backup.StreamOptions{}, func(f *backup.FileEntry) error {
 		for _, c := range f.Chunks {

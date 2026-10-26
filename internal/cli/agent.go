@@ -720,7 +720,9 @@ func buildRotateTask(name string, dep config.DeploymentConfig, verifier *backup.
 			store := backup.NewManifestStore(sp)
 
 			var manifests []*backup.Manifest
-			for m, err := range store.List(ctx, name, verifier) {
+			// Headers only: retention needs no file lists, and a deployment of
+			// very large backups would otherwise be held whole, N manifests at once.
+			for m, err := range store.ListHeaders(ctx, name, verifier) {
 				if err != nil {
 					return fmt.Errorf("list: %w", err)
 				}

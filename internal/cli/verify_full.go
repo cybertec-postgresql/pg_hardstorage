@@ -76,7 +76,7 @@ func runVerifyFull(cmd *cobra.Command, deployment, backupID, repoURL, pgMajorOve
 		}
 		backupID = latest
 	}
-	m, err := store.Read(cmd.Context(), deployment, backupID, verifier)
+	m, err := store.ReadStreaming(cmd.Context(), deployment, backupID, verifier) // header fields only
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			return output.NewError("notfound.backup",

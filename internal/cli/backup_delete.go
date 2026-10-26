@@ -133,7 +133,9 @@ func runBackupDelete(cmd *cobra.Command, deployment, backupID, repoURL, reason, 
 		return err
 	}
 	store := backup.NewManifestStore(sp)
-	m, err := store.Read(cmd.Context(), deployment, backupID, verifier)
+	// ReadAuto: only the header fields are used, and Read refuses a manifest
+	// past MaxManifestBytes, which would make a very large backup undeletable.
+	m, err := store.ReadAuto(cmd.Context(), deployment, backupID, verifier)
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			return output.NewError("notfound.backup",

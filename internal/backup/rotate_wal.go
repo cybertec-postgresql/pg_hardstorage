@@ -6,7 +6,6 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
-	"sort"
 	"strings"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/pg/walsink"
@@ -27,9 +26,8 @@ const walManifestPrefix = "wal/"
 // consults the shared-DEK slot or a backup manifest when one is present.
 //
 // The walk is repo-wide on the wal/ prefix rather than per backup
-// deployment for the same reason. Keys are collected before any rewrite
-// so a backend whose List walks the live tree (fs) never sees its own
-// tmp files.
+// deployment for the same reason. Keys are processed as the listing
+// produces them (see the loop).
 //
 // Idempotent and resumable exactly like the manifest pass: a segment
 // already on NewKEKRef — or on OldKEKRef but already wrapped under the
@@ -46,18 +44,19 @@ const walManifestPrefix = "wal/"
 // a per-segment failure, which keeps the rotation INCOMPLETE — the old
 // KEK must then be kept for as long as those segments are retained.
 func rotateWALSegments(ctx context.Context, sp storage.StoragePlugin, opts RotateKEKOptions, res *RotateKEKResult) error {
-	var keys []string
+	// Streamed: years of WAL are tens of millions of segment manifests, so
+	// the keys are neither collected nor sorted. A rewrite replaces an
+	// existing key (plus a hidden staging temp the listings filter out), so
+	// a listing that happens to revisit a rewritten segment finds it already
+	// rotated — the pass is idempotent.
 	for info, err := range sp.List(ctx, walManifestPrefix) {
 		if err != nil {
 			return fmt.Errorf("list WAL segment manifests: %w", err)
 		}
-		if _, ok := WALSegmentManifestDeployment(info.Key); ok {
-			keys = append(keys, info.Key)
+		key := info.Key
+		if _, ok := WALSegmentManifestDeployment(key); !ok {
+			continue
 		}
-	}
-	sort.Strings(keys)
-
-	for _, key := range keys {
 		if err := ctx.Err(); err != nil {
 			return err
 		}

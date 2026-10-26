@@ -1666,10 +1666,11 @@ func (ms *ManifestStore) Undelete(ctx context.Context, deployment, backupID stri
 			missing = append(missing, h.String())
 		}
 		return false, &UndeleteChunksMissingError{
-			Deployment:  deployment,
-			BackupID:    backupID,
-			TotalUnique: res.TotalUnique,
-			Missing:     missing,
+			Deployment:   deployment,
+			BackupID:     backupID,
+			TotalUnique:  res.TotalUnique,
+			Missing:      missing,
+			MissingCount: res.NumMissing(),
 		}
 	}
 	// Parent-chain pre-flight: resurrecting an incremental whose
@@ -1750,10 +1751,11 @@ func (ms *ManifestStore) Undelete(ctx context.Context, deployment, backupID stri
 			missing = append(missing, h.String())
 		}
 		return false, &UndeleteChunksMissingError{
-			Deployment:  deployment,
-			BackupID:    backupID,
-			TotalUnique: recheck.TotalUnique,
-			Missing:     missing,
+			Deployment:   deployment,
+			BackupID:     backupID,
+			TotalUnique:  recheck.TotalUnique,
+			Missing:      missing,
+			MissingCount: recheck.NumMissing(),
 		}
 	}
 
@@ -2221,13 +2223,19 @@ type UndeleteChunksMissingError struct {
 	Deployment  string
 	BackupID    string
 	TotalUnique int
-	Missing     []string
+	// Missing lists the first few missing hashes; MissingCount is the exact
+	// total (0 means len(Missing)).
+	Missing      []string
+	MissingCount int
 }
+
+// NumMissing is the exact number of missing chunks.
+func (e *UndeleteChunksMissingError) NumMissing() int { return max(e.MissingCount, len(e.Missing)) }
 
 // Error implements error.
 func (e *UndeleteChunksMissingError) Error() string {
 	return fmt.Sprintf("backup: %s/%s references %d chunk(s) no longer in the repo (%d of %d missing); resurrecting it would be un-restorable — use force to recover the metadata anyway",
-		e.Deployment, e.BackupID, len(e.Missing), len(e.Missing), e.TotalUnique)
+		e.Deployment, e.BackupID, e.NumMissing(), e.NumMissing(), e.TotalUnique)
 }
 
 // ErrUndeleteChunksMissing is the sentinel for errors.Is checks

@@ -308,6 +308,29 @@ func (ms *ManifestStore) ListAuto(ctx context.Context, deployment string, verifi
 	}
 }
 
+// ListHeaders is List for callers that need only each manifest's header
+// fields (ID, type, parent, timestamps, encryption...), such as retention:
+// every manifest is verified as a stream and yielded header-only
+// (Files == nil, entries reachable through EachFile), however small. A
+// caller that collects the result holds N headers, not N manifests: List
+// and ListAuto keep every manifest up to AutoStreamThreshold (64 MiB) whole.
+func (ms *ManifestStore) ListHeaders(ctx context.Context, deployment string, verifier *Verifier) iter.Seq2[*Manifest, error] {
+	return func(yield func(*Manifest, error) bool) {
+		for e, err := range ms.listStreamingEntries(ctx, deployment, StreamOptions{Verifier: verifier}, verifier != nil, false, false) {
+			if !yield(e.Manifest, err) {
+				return
+			}
+		}
+	}
+}
+
+// ListIncludingTombstonedHeaders is ListHeaders that also yields the
+// soft-deleted manifests, flagged: header-only readers (status, the gap
+// janitor) that must see the tombstoned set too.
+func (ms *ManifestStore) ListIncludingTombstonedHeaders(ctx context.Context, deployment string, verifier *Verifier) iter.Seq2[ManifestEntry, error] {
+	return ms.listStreamingEntries(ctx, deployment, StreamOptions{Verifier: verifier}, verifier != nil, true, false)
+}
+
 // ListAttestationlessAuto is ListAuto without signature verification.
 func (ms *ManifestStore) ListAttestationlessAuto(ctx context.Context, deployment string) iter.Seq2[*Manifest, error] {
 	return func(yield func(*Manifest, error) bool) {

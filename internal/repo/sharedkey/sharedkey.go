@@ -24,6 +24,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"time"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/invariant"
@@ -397,12 +398,8 @@ func readWrappedDEK(ctx context.Context, sp storage.StoragePlugin, key, wantKEKR
 		return nil, false
 	}
 	defer rc.Close()
-	body, err := storage.ReadAllLimited(rc, storage.MaxMetadataBytes)
+	m, err := scanEncryptionEnvelope(rc)
 	if err != nil {
-		return nil, false
-	}
-	var m manifestEnvelope
-	if err := json.Unmarshal(body, &m); err != nil {
 		return nil, false
 	}
 	if m.Encryption == nil || m.Encryption.Scheme != Scheme || m.Encryption.KEKRef != wantKEKRef {
@@ -413,6 +410,77 @@ func readWrappedDEK(ctx context.Context, sp storage.StoragePlugin, key, wantKEKR
 		return nil, false
 	}
 	return wrapped, true
+}
+
+// scanEncryptionEnvelope reads a manifest document as a token stream and
+// returns its top-level "encryption" block, without ever holding more than
+// that block: a base-backup manifest of a very large database is tens of
+// GB (its files array), and the previous read-it-all-then-Unmarshal cost
+// up to the 1 GiB metadata cap per manifest — and, past that cap, a silent
+// "no DEK here" that let a fresh, deduplication-breaking DEK be minted.
+//
+// Commit writes the encryption block before the files array, so the scan
+// stops at "files": an absent block costs a few KB, not a pass over the
+// document. WAL segment manifests are small and carry no files key; they
+// are skipped through to the end.
+func scanEncryptionEnvelope(r io.Reader) (manifestEnvelope, error) {
+	var out manifestEnvelope
+	dec := json.NewDecoder(r)
+	tok, err := dec.Token()
+	if err != nil {
+		return out, err
+	}
+	if d, ok := tok.(json.Delim); !ok || d != '{' {
+		return out, errors.New("sharedkey: manifest is not a JSON object")
+	}
+	for dec.More() {
+		kt, err := dec.Token()
+		if err != nil {
+			return out, err
+		}
+		key, _ := kt.(string)
+		switch {
+		case strings.EqualFold(key, "encryption"):
+			var e *envelope
+			if err := dec.Decode(&e); err != nil {
+				return out, err
+			}
+			out.Encryption = e
+			return out, nil
+		case strings.EqualFold(key, "files"):
+			return out, nil
+		}
+		if err := skipJSONValue(dec); err != nil {
+			return out, err
+		}
+	}
+	return out, nil
+}
+
+// skipJSONValue consumes one value from dec without retaining it.
+func skipJSONValue(dec *json.Decoder) error {
+	tok, err := dec.Token()
+	if err != nil {
+		return err
+	}
+	if d, ok := tok.(json.Delim); !ok || (d != '{' && d != '[') {
+		return nil
+	}
+	for depth := 1; depth > 0; {
+		tok, err := dec.Token()
+		if err != nil {
+			return err
+		}
+		if d, ok := tok.(json.Delim); ok {
+			switch d {
+			case '{', '[':
+				depth++
+			case '}', ']':
+				depth--
+			}
+		}
+	}
+	return nil
 }
 
 // unwrapsToSame reports whether wrapped unwraps (under the caller's

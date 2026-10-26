@@ -467,8 +467,11 @@ func (s *Sink) OnTablespaceEnd(idx int) error {
 	}
 
 	if idx == basebackup.ManifestSinkIndex {
-		s.manifestBytes = append([]byte(nil), s.manifestBuf.Bytes()...)
-		s.manifestBuf.Reset()
+		// Hand the buffer's bytes over instead of copying them: PG's
+		// backup_manifest can be hundreds of MiB, and a copy plus the
+		// still-allocated buffer would triple the footprint.
+		s.manifestBytes = s.manifestBuf.Bytes()
+		s.manifestBuf = bytes.Buffer{}
 		s.currentIdx = unsetIdx
 		s.mu.Unlock()
 		return nil
