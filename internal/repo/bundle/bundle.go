@@ -30,7 +30,6 @@ package bundle
 
 import (
 	"archive/tar"
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -152,27 +151,17 @@ func Export(ctx context.Context, sp storage.StoragePlugin, w io.Writer, opts Exp
 	// When opts.Verifier is non-nil we still verify on the
 	// source side (the operator's "I want a verified bundle"
 	// posture).
-	var manifests []*backup.Manifest
+	var ids []string
 	if opts.BackupID != "" {
-		m, err := readBundleManifest(ctx, sp, opts.Deployment, opts.BackupID, opts.Verifier)
-		if err != nil {
-			return nil, fmt.Errorf("bundle: read manifest %s/%s: %w", opts.Deployment, opts.BackupID, err)
-		}
-		manifests = append(manifests, m)
+		ids = []string{opts.BackupID}
 	} else {
-		ids, err := listManifestIDs(ctx, sp, opts.Deployment)
+		var err error
+		ids, err = listManifestIDs(ctx, sp, opts.Deployment)
 		if err != nil {
 			return nil, fmt.Errorf("bundle: list deployment %s: %w", opts.Deployment, err)
 		}
-		for _, id := range ids {
-			m, err := readBundleManifest(ctx, sp, opts.Deployment, id, opts.Verifier)
-			if err != nil {
-				return nil, fmt.Errorf("bundle: read %s/%s: %w", opts.Deployment, id, err)
-			}
-			manifests = append(manifests, m)
-		}
 	}
-	if len(manifests) == 0 {
+	if len(ids) == 0 {
 		return nil, fmt.Errorf("bundle: no manifests for deployment %s (BackupID=%q)", opts.Deployment, opts.BackupID)
 	}
 
@@ -184,22 +173,21 @@ func Export(ctx context.Context, sp storage.StoragePlugin, w io.Writer, opts Exp
 
 	chunkSeen := spill.NewHashSet(spill.Options{})
 	defer chunkSeen.Close()
-	for _, m := range manifests {
+	for _, id := range ids {
+		// Step 2 — copy the manifest itself, byte for byte, while
+		// verifying it as a stream: a manifest can be far larger than
+		// memory, so it is never held. The header (everything but the
+		// file list) comes back from that pass.
+		m, wantSHA, err := copyManifestStreaming(ctx, sp, tw, opts.Deployment, id, opts.Verifier)
+		if err != nil {
+			return nil, fmt.Errorf("bundle: read %s/%s: %w", opts.Deployment, id, err)
+		}
 		bundleManifest.Backups = append(bundleManifest.Backups, BackupEntry{
 			Deployment: m.Deployment,
 			BackupID:   m.BackupID,
 			Type:       string(m.Type),
 			Tenant:     m.Tenant,
 		})
-
-		// Step 2 — write the manifest itself.  We re-marshal from
-		// the in-memory struct (canonical) so the bundle has
-		// reproducible bytes regardless of how the source repo
-		// stored them.
-		mPath := backup.PrimaryPath(m.Deployment, m.BackupID)
-		if err := writeManifestEntry(tw, mPath, m); err != nil {
-			return nil, err
-		}
 		// Replica copy (best-effort: missing replica is not an
 		// error, the source repo may have skipped manifest
 		// redundancy at commit time).
@@ -213,8 +201,9 @@ func Export(ctx context.Context, sp storage.StoragePlugin, w io.Writer, opts Exp
 			return nil, fmt.Errorf("bundle: copy attestation %s: %w", attestKey, err)
 		}
 
-		// Step 3 — every chunk this manifest references.
-		for _, fe := range m.Files {
+		// Step 3 — every chunk this manifest references, from a second
+		// pass over the same object (its digest must match the first).
+		if err := streamManifestFiles(ctx, sp, backup.PrimaryPath(opts.Deployment, id), wantSHA, func(fe *backup.FileEntry) error {
 			for _, ref := range fe.Chunks {
 				if !chunkSeen.Add(ref.Hash) {
 					continue
@@ -222,11 +211,14 @@ func Export(ctx context.Context, sp storage.StoragePlugin, w io.Writer, opts Exp
 				key := repo.ChunkKey(ref.Hash)
 				size, err := copyChunk(ctx, sp, tw, key)
 				if err != nil {
-					return nil, fmt.Errorf("bundle: copy chunk %s: %w", key, err)
+					return fmt.Errorf("bundle: copy chunk %s: %w", key, err)
 				}
 				bundleManifest.ChunkCount++
 				bundleManifest.ChunkBytes += size
 			}
+			return nil
+		}); err != nil {
+			return nil, err
 		}
 
 		// Step 4 — WAL files when requested.  WAL layout:
@@ -433,9 +425,13 @@ func Import(ctx context.Context, r io.Reader, sp storage.StoragePlugin, opts Imp
 		// 4× the FastCDC max chunk size; one MaxFile from
 		// our own writers will always fit, anything bigger
 		// is suspect).
-		if hdr.Size > MaxEntryBytes {
-			return nil, fmt.Errorf("bundle: entry %q size %d exceeds MaxEntryBytes (%d)",
-				clean, hdr.Size, MaxEntryBytes)
+		maxEntry := int64(MaxEntryBytes)
+		if isSignedBackupManifestKey(clean) {
+			maxEntry = storage.MaxMetadataBytes // manifests are metadata, not chunks
+		}
+		if hdr.Size > maxEntry {
+			return nil, fmt.Errorf("bundle: entry %q size %d exceeds the entry limit (%d)",
+				clean, hdr.Size, maxEntry)
 		}
 
 		switch {
@@ -484,17 +480,20 @@ func Import(ctx context.Context, r io.Reader, sp storage.StoragePlugin, opts Imp
 			// land in the repo when the operator asked us to check.)
 			// Replica/attestation/WAL entries are not ed25519 backup
 			// manifests and stream as-is.
-			body, err := storage.ReadAllLimited(tr, MaxEntryBytes)
+			// Staged straight to disk: a primary manifest can be far
+			// larger than memory, and is verified from the staged file.
+			limit := int64(MaxEntryBytes)
+			if isSignedBackupManifestKey(clean) {
+				limit = storage.MaxMetadataBytes
+			}
+			path, err := stage.addFrom(clean, tr, limit)
 			if err != nil {
 				return nil, fmt.Errorf("bundle: read %s: %w", clean, err)
 			}
 			if opts.Verifier != nil && isSignedBackupManifestKey(clean) {
-				if _, verr := backup.ParseAndVerify(body, opts.Verifier); verr != nil {
+				if verr := verifyStagedManifest(path, opts.Verifier); verr != nil {
 					return nil, fmt.Errorf("bundle: reject %s: manifest signature verification failed: %w", clean, verr)
 				}
-			}
-			if err := stage.add(clean, body); err != nil {
-				return nil, err
 			}
 		default:
 			// Unknown top-level: skip.  Future bundle versions
@@ -601,13 +600,61 @@ func newImportStage() (*importStage, error) {
 	return &importStage{dir: dir}, nil
 }
 
-func (s *importStage) add(key string, body []byte) error {
+// addFrom stages up to limit bytes of r under key and returns the file's
+// path. More than limit bytes is an error.
+func (s *importStage) addFrom(key string, r io.Reader, limit int64) (string, error) {
 	path := filepath.Join(s.dir, strconv.Itoa(len(s.entries)))
-	if err := os.WriteFile(path, body, 0o600); err != nil {
-		return fmt.Errorf("bundle: stage %s: %w", key, err)
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return "", fmt.Errorf("bundle: stage %s: %w", key, err)
+	}
+	n, err := io.Copy(f, io.LimitReader(r, limit+1))
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err == nil && n > limit {
+		err = fmt.Errorf("entry exceeds %d bytes", limit)
+	}
+	if err != nil {
+		return "", fmt.Errorf("bundle: stage %s: %w", key, err)
 	}
 	s.entries = append(s.entries, stagedEntry{key: key, path: path})
-	return nil
+	return path, nil
+}
+
+// verifyStagedManifest checks a staged manifest's signature as a stream.
+func verifyStagedManifest(path string, v *backup.Verifier) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	_, err = backup.StreamManifest(f, backup.StreamOptions{Verifier: v}, nil)
+	return err
+}
+
+// putStagedIfNotExists is putIfNotExists for a staged file, uploaded from
+// disk rather than held in memory.
+func putStagedIfNotExists(ctx context.Context, sp storage.StoragePlugin, key, path string) error {
+	if _, err := sp.Stat(ctx, key); err == nil {
+		return nil
+	} else if !isNotFound(err) {
+		return err
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	_, err = sp.Put(ctx, key, f, storage.PutOptions{IfNotExists: true, ContentLength: fi.Size()})
+	if isAlreadyExists(err) {
+		return nil
+	}
+	return err
 }
 
 // commit writes the staged entries, primary backup manifests last.
@@ -626,11 +673,7 @@ func (s *importStage) commit(ctx context.Context, sp storage.StoragePlugin) erro
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		body, err := os.ReadFile(e.path)
-		if err != nil {
-			return fmt.Errorf("bundle: read staged %s: %w", e.key, err)
-		}
-		if _, err := putIfNotExists(ctx, sp, e.key, bytes.NewReader(body)); err != nil {
+		if err := putStagedIfNotExists(ctx, sp, e.key, e.path); err != nil {
 			return fmt.Errorf("bundle: write %s: %w", e.key, err)
 		}
 	}
@@ -899,24 +942,65 @@ func walSegmentKey(deployment string, timeline uint32, segName string) string {
 	return fmt.Sprintf("wal/%s/%08X/%s.json", deployment, timeline, segName)
 }
 
-// readBundleManifest reads + parses one manifest, optionally
-// verifying its signature.  Distinct from ManifestStore.Read so
-// the bundle can operate on unsigned forensic repos.
-func readBundleManifest(ctx context.Context, sp storage.StoragePlugin, deployment, backupID string, verifier *backup.Verifier) (*backup.Manifest, error) {
+// copyManifestStreaming writes one primary manifest into the tar verbatim
+// and, in the same single read, parses it as a stream (verifying the
+// signature when verifier is non-nil). Distinct from ManifestStore.Read so
+// the bundle can operate on unsigned forensic repos. It returns the header
+// (Files == nil) and the SHA-256 of the bytes written.
+func copyManifestStreaming(ctx context.Context, sp storage.StoragePlugin, tw *tar.Writer, deployment, backupID string, verifier *backup.Verifier) (*backup.Manifest, [32]byte, error) {
+	var zero [32]byte
 	key := backup.PrimaryPath(deployment, backupID)
+	st, err := sp.Stat(ctx, key)
+	if err != nil {
+		return nil, zero, err
+	}
+	if st.Size > storage.MaxMetadataBytes {
+		return nil, zero, fmt.Errorf("manifest %s is %d bytes, over the %d-byte metadata cap", key, st.Size, storage.MaxMetadataBytes)
+	}
 	rc, err := sp.Get(ctx, key)
 	if err != nil {
-		return nil, err
+		return nil, zero, err
 	}
 	defer rc.Close()
-	body, err := storage.ReadAllLimited(rc, storage.MaxMetadataBytes)
+	if err := tw.WriteHeader(&tar.Header{
+		Name: key, Mode: 0o644, Size: st.Size, ModTime: time.Time{}, Format: tar.FormatPAX,
+	}); err != nil {
+		return nil, zero, fmt.Errorf("bundle: tar header for %s: %w", key, err)
+	}
+	tee := io.TeeReader(rc, tw)
+	info, err := backup.StreamManifest(tee, backup.StreamOptions{Verifier: verifier}, nil)
 	if err != nil {
-		return nil, err
+		return nil, zero, err
 	}
-	if verifier != nil {
-		return backup.ParseAndVerify(body, verifier)
+	// StreamManifest stops at the end of the JSON value; the tar entry
+	// must carry every byte the header promised.
+	if _, err := io.Copy(io.Discard, tee); err != nil {
+		return nil, zero, err
 	}
-	return backup.ParseAttestationless(body)
+	return info.Manifest, info.RawSHA256, nil
+}
+
+// streamManifestFiles walks the file entries of the manifest at key and
+// fails if its bytes differ from the pass that wrote it into the bundle.
+func streamManifestFiles(ctx context.Context, sp storage.StoragePlugin, key string, wantSHA [32]byte, fn func(*backup.FileEntry) error) error {
+	rc, err := sp.Get(ctx, key)
+	if err != nil {
+		return err
+	}
+	defer rc.Close()
+	info, err := backup.StreamManifest(rc, backup.StreamOptions{}, func(fe *backup.FileEntry) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		return fn(fe)
+	})
+	if err != nil {
+		return err
+	}
+	if info.RawSHA256 != wantSHA {
+		return fmt.Errorf("bundle: manifest %s changed while it was being exported", key)
+	}
+	return nil
 }
 
 // listManifestIDs enumerates the live (non-tombstoned) backup
