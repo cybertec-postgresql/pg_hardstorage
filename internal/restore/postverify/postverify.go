@@ -47,6 +47,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/url"
 	"os"
@@ -949,14 +950,22 @@ func probeCatalogs(ctx context.Context, psql, dsn string) error {
 // readTail returns up to n bytes from the end of path, or
 // empty string on any error.  Best-effort diagnostic.
 func readTail(path string, n int) string {
-	body, err := os.ReadFile(path)
+	f, err := os.Open(path)
 	if err != nil {
 		return ""
 	}
-	if len(body) <= n {
-		return string(body)
+	defer f.Close()
+	// Seek to the tail: a postgres log can be many GB.
+	if st, serr := f.Stat(); serr == nil && st.Size() > int64(n) {
+		if _, serr := f.Seek(st.Size()-int64(n), io.SeekStart); serr != nil {
+			return ""
+		}
 	}
-	return string(body[len(body)-n:])
+	body, err := io.ReadAll(io.LimitReader(f, int64(n)))
+	if err != nil {
+		return ""
+	}
+	return string(body)
 }
 
 // truncate caps a byte slice at n bytes, appending "…" when

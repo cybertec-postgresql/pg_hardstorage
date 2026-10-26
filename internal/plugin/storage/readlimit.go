@@ -39,7 +39,7 @@ import (
 // above any real object while bounding the blast radius of a corrupt or
 // planted one. Chunk BODIES are not metadata and keep their own,
 // separate cap — see repo.MaxChunkEnvelopeBytes.
-const MaxMetadataBytes = 1 << 30
+var MaxMetadataBytes int64 = 1 << 30
 
 // ReadAllLimited reads up to max bytes from r, returning an error
 // rather than allocating unboundedly when the source exceeds it.
@@ -59,3 +59,11 @@ func ReadAllLimited(r io.Reader, max int64) ([]byte, error) {
 	}
 	return body, nil
 }
+
+// MaxRecordBytes caps a single read of a small, bounded-by-design
+// repository record: approval requests, JIT tokens, SCIM entries, ACL
+// policies, threshold rosters and signatures, WAL segment manifests,
+// drill-history entries. Real objects are KiB-sized; 64 MiB leaves
+// headroom while keeping a planted or corrupt object from taking the
+// reader down.
+const MaxRecordBytes = 64 << 20

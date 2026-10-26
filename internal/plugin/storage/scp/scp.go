@@ -575,16 +575,17 @@ func (p *Plugin) ReapStaging(ctx context.Context, olderThan time.Duration) (stor
 	if err := p.assertOpen(); err != nil {
 		return st, err
 	}
-	out, err := p.runShell(ctx, reapStagingCommand(p.root, olderThan))
-	// Count what was removed even when find failed part way.
-	for _, line := range strings.Split(out, "\n") {
+	// Streamed line by line: one line per reaped temp, which can be
+	// millions after a crash storm. Count what was removed even when
+	// find failed part way.
+	err := p.runShellLines(ctx, reapStagingCommand(p.root, olderThan), func(line string) bool {
 		n, perr := strconv.ParseInt(strings.TrimSpace(line), 10, 64)
-		if perr != nil {
-			continue
+		if perr == nil {
+			st.Removed++
+			st.Bytes += n
 		}
-		st.Removed++
-		st.Bytes += n
-	}
+		return true
+	})
 	if err != nil {
 		return st, fmt.Errorf("scp: reap staging: %w", err)
 	}
@@ -666,9 +667,9 @@ func (p *Plugin) runShell(ctx context.Context, command string) (string, error) {
 		return "", fmt.Errorf("scp: new session: %w", err)
 	}
 	defer sess.Close()
-	var out, errBuf bytes.Buffer
-	sess.Stdout = &out
-	sess.Stderr = &errBuf
+	out, errBuf := &cappedBuffer{max: 16 << 20}, &cappedBuffer{max: 1 << 20}
+	sess.Stdout = out
+	sess.Stderr = errBuf
 	done := make(chan error, 1)
 	go func() { done <- sess.Run(command) }()
 	select {
@@ -759,8 +760,8 @@ func (p *Plugin) uploadVia(ctx context.Context, command string, r io.Reader) (in
 	if err != nil {
 		return 0, fmt.Errorf("scp: stdin pipe: %w", err)
 	}
-	var errBuf bytes.Buffer
-	sess.Stderr = &errBuf
+	errBuf := &cappedBuffer{max: 1 << 20}
+	sess.Stderr = errBuf
 
 	if err := sess.Start(command); err != nil {
 		return 0, fmt.Errorf("scp: start command: %w", err)

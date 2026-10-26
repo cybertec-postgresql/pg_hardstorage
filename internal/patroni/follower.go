@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"sync"
 	"time"
@@ -294,7 +295,7 @@ func (f *Follower) probeSystemIDHTTP(ctx context.Context) (string, bool, error) 
 	var raw struct {
 		SystemID json.RawMessage `json:"system_identifier"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 32<<20)).Decode(&raw); err != nil {
 		return "", false, fmt.Errorf("patroni: decode /cluster system_identifier: %w", err)
 	}
 	if len(raw.SystemID) == 0 || string(raw.SystemID) == "null" {

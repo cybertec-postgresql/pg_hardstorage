@@ -351,7 +351,7 @@ func (s *Sink) findExistingIssue(ctx context.Context, ev *output.Event) (string,
 			} `json:"fields"`
 		} `json:"issues"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 32<<20)).Decode(&out); err != nil {
 		return "", fmt.Errorf("jira: decode search: %w", err)
 	}
 	for _, is := range out.Issues {

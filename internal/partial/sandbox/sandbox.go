@@ -314,7 +314,13 @@ func Start(ctx context.Context, opts Options) (*Sandbox, error) {
 		// went wrong. Read it BEFORE cleanup: the log lives in the
 		// socket dir that cleanup removes.
 		var logTail string
-		if body, rerr := os.ReadFile(logFile); rerr == nil {
+		if f, oerr := os.Open(logFile); oerr == nil {
+			// Read only the last 64 KiB: the postgres log can be huge.
+			if st, serr := f.Stat(); serr == nil && st.Size() > 64<<10 {
+				_, _ = f.Seek(st.Size()-64<<10, io.SeekStart)
+			}
+			body, _ := io.ReadAll(io.LimitReader(f, 64<<10))
+			_ = f.Close()
 			logTail = tailString(string(body), 4096)
 		}
 		// `pg_ctl -w start` failing (e.g. "server did not start in

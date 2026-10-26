@@ -67,7 +67,10 @@ func (b *MemoryBackend) Get(_ context.Context, id string) (*Job, error) {
 func (b *MemoryBackend) List(_ context.Context, opts ListOptions) ([]Job, error) {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
-	out := make([]Job, 0, len(b.jobs))
+	// Filter, order and truncate the live pointers first; cloning (which
+	// copies each job's progress history) only the survivors keeps a
+	// limit=10 query from copying every retained job.
+	sel := make([]*Job, 0, len(b.jobs))
 	for _, j := range b.jobs {
 		if opts.State != "" && j.State != opts.State {
 			continue
@@ -78,13 +81,17 @@ func (b *MemoryBackend) List(_ context.Context, opts ListOptions) ([]Job, error)
 		if opts.Deployment != "" && j.Deployment != opts.Deployment {
 			continue
 		}
-		out = append(out, *cloneJob(j))
+		sel = append(sel, j)
 	}
-	sort.Slice(out, func(i, j int) bool {
-		return out[i].CreatedAt.After(out[j].CreatedAt)
+	sort.Slice(sel, func(i, j int) bool {
+		return sel[i].CreatedAt.After(sel[j].CreatedAt)
 	})
-	if opts.Limit > 0 && len(out) > opts.Limit {
-		out = out[:opts.Limit]
+	if opts.Limit > 0 && len(sel) > opts.Limit {
+		sel = sel[:opts.Limit]
+	}
+	out := make([]Job, 0, len(sel))
+	for _, j := range sel {
+		out = append(out, *cloneJob(j))
 	}
 	return out, nil
 }

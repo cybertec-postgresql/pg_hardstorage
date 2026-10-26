@@ -50,7 +50,6 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
-	stdio "io"
 	"sort"
 	"strings"
 	"time"
@@ -315,7 +314,7 @@ func (s *Store) Get(ctx context.Context, id string) (*Request, error) {
 		return nil, fmt.Errorf("approval: get request: %w", err)
 	}
 	defer rc.Close()
-	body, err := stdio.ReadAll(rc)
+	body, err := storage.ReadAllLimited(rc, storage.MaxRecordBytes)
 	if err != nil {
 		return nil, err
 	}
@@ -346,7 +345,7 @@ func (s *Store) Get(ctx context.Context, id string) (*Request, error) {
 			}
 			return nil, fmt.Errorf("approval: get approver vote %q: %w", info.Key, gerr)
 		}
-		body, rerr := stdio.ReadAll(approverRC)
+		body, rerr := storage.ReadAllLimited(approverRC, storage.MaxRecordBytes)
 		_ = approverRC.Close()
 		if rerr != nil {
 			return nil, fmt.Errorf("approval: read approver vote %q: %w", info.Key, rerr)
@@ -381,7 +380,7 @@ func (s *Store) Get(ctx context.Context, id string) (*Request, error) {
 	switch {
 	case cerr == nil:
 		var c consumption
-		cbody, rerr := stdio.ReadAll(crc)
+		cbody, rerr := storage.ReadAllLimited(crc, storage.MaxRecordBytes)
 		_ = crc.Close()
 		if rerr != nil {
 			return nil, fmt.Errorf("approval: read consumption marker: %w", rerr)

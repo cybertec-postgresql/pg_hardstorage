@@ -38,7 +38,6 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
-	"io"
 	"path"
 	"sort"
 	"strings"
@@ -741,7 +740,7 @@ func (s *ScanStore) Get(ctx context.Context, id string) (*Scan, error) {
 		return nil, fmt.Errorf("%w: %s: %v", ErrScanNotFound, id, err)
 	}
 	defer rd.Close()
-	body, err := io.ReadAll(rd)
+	body, err := storage.ReadAllLimited(rd, storage.MaxMetadataBytes)
 	if err != nil {
 		return nil, fmt.Errorf("insider: scan read: %w", err)
 	}

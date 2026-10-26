@@ -47,7 +47,6 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
-	"io"
 	"path"
 	"sort"
 	"strings"
@@ -664,7 +663,7 @@ func (s *ReportStore) Get(ctx context.Context, id string) (*Report, error) {
 		return nil, fmt.Errorf("%w: %s: %v", ErrReportNotFound, id, err)
 	}
 	defer rd.Close()
-	body, err := io.ReadAll(rd)
+	body, err := storage.ReadAllLimited(rd, storage.MaxMetadataBytes)
 	if err != nil {
 		return nil, fmt.Errorf("dsa: read: %w", err)
 	}

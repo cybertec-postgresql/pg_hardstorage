@@ -46,7 +46,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"sort"
 	"strings"
 	"time"
@@ -582,7 +581,7 @@ func (s *Store) Get(ctx context.Context, id string) (*Token, error) {
 		return nil, fmt.Errorf("jit: get token: %w", err)
 	}
 	defer rc.Close()
-	body, err := io.ReadAll(rc)
+	body, err := storage.ReadAllLimited(rc, storage.MaxRecordBytes)
 	if err != nil {
 		return nil, fmt.Errorf("jit: read token: %w", err)
 	}
@@ -618,7 +617,7 @@ func (s *Store) GetRevocation(ctx context.Context, id string) (*Revocation, erro
 		return nil, fmt.Errorf("jit: get revocation: %w", err)
 	}
 	defer rc.Close()
-	body, err := io.ReadAll(rc)
+	body, err := storage.ReadAllLimited(rc, storage.MaxRecordBytes)
 	if err != nil {
 		return nil, fmt.Errorf("jit: read revocation: %w", err)
 	}

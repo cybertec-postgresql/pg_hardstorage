@@ -309,7 +309,7 @@ func (c *Client) do(ctx context.Context, method, path string, body io.Reader) ([
 		return nil, err
 	}
 	defer resp.Body.Close()
-	bodyBytes, err := io.ReadAll(resp.Body)
+	bodyBytes, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
 	if err != nil {
 		return nil, fmt.Errorf("patroni: read %s %s: %w", method, path, err)
 	}

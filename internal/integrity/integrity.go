@@ -44,7 +44,6 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
-	"io"
 	"math/rand"
 	"path"
 	"sort"
@@ -919,7 +918,7 @@ func (s *RunStore) Get(ctx context.Context, id string) (*Run, error) {
 		return nil, fmt.Errorf("%w: %s: %v", ErrRunNotFound, id, err)
 	}
 	defer rd.Close()
-	body, err := io.ReadAll(rd)
+	body, err := storage.ReadAllLimited(rd, storage.MaxRecordBytes)
 	if err != nil {
 		return nil, fmt.Errorf("integrity: run read: %w", err)
 	}

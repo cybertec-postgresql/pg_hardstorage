@@ -105,7 +105,7 @@ func (c *DispatchClient) enqueue(ctx context.Context, path string, body map[stri
 		return "", fmt.Errorf("dispatch: POST %s: %w", path, err)
 	}
 	defer resp.Body.Close()
-	raw, _ := io.ReadAll(resp.Body)
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
 	if resp.StatusCode != http.StatusAccepted {
 		return "", fmt.Errorf("dispatch: POST %s: status=%d body=%s",
 			path, resp.StatusCode, raw)
@@ -208,7 +208,7 @@ func (c *DispatchClient) getJob(ctx context.Context, id string) (*PolledJob, err
 		return nil, fmt.Errorf("dispatch: GET /v1/jobs/%s: %w", id, err)
 	}
 	defer resp.Body.Close()
-	raw, _ := io.ReadAll(resp.Body)
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("dispatch: GET /v1/jobs/%s: status=%d body=%s",
 			id, resp.StatusCode, raw)
