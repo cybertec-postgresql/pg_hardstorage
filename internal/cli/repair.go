@@ -1068,6 +1068,7 @@ func runRepairScrub(cmd *cobra.Command, repoURL string, limit int, heal bool, re
 	// decryptor lookup failed and the loop counted the failure as
 	// a "mismatch") — that's the bug this rewrite fixes.
 	res, refsTotal, err := scrubManifestAware(cmd.Context(), sp, limit, scrubWindowIndex(time.Now()))
+	defer res.Close()
 	if err != nil {
 		return output.NewError("repair.scrub_failed",
 			fmt.Sprintf("repair scrub: %v", err)).Wrap(err)
@@ -1075,7 +1076,8 @@ func runRepairScrub(cmd *cobra.Command, repoURL string, limit int, heal bool, re
 	body := repairScrubBody{
 		Sampled:                 res.Sampled,
 		OK:                      res.OK,
-		MismatchCount:           len(res.Mismatches),
+		MismatchCount:           res.MismatchCount,
+		MismatchesTruncated:     res.MismatchCount > len(res.Mismatches),
 		BytesVerified:           res.Bytes,
 		ReferencedTotal:         refsTotal,
 		UnverifiableManifests:   res.UnverifiableManifests,
@@ -1094,7 +1096,7 @@ func runRepairScrub(cmd *cobra.Command, repoURL string, limit int, heal bool, re
 	coverage := scrubCoverageError("repair scrub", repoURL, res, refsTotal)
 
 	// No mismatches → nothing to heal.
-	if len(res.Mismatches) == 0 {
+	if res.MismatchCount == 0 {
 		if rerr := d.Result(output.NewResult(cmd.CommandPath()).WithBody(body)); rerr != nil {
 			return rerr
 		}
@@ -1106,7 +1108,7 @@ func runRepairScrub(cmd *cobra.Command, repoURL string, limit int, heal bool, re
 	// suggestion that points at the actual heal command.
 	if !heal {
 		return output.NewError("verify.scrub_mismatch",
-			fmt.Sprintf("repair scrub: %d chunk(s) failed verification", len(res.Mismatches))).
+			fmt.Sprintf("repair scrub: %d chunk(s) failed verification", res.MismatchCount)).
 			WithSuggestion(&output.Suggestion{
 				Human:   "auto-heal from a replica region: pass --heal --replica <replica-url>. The replica is the one populated by `pg_hardstorage repo replicate`.",
 				Command: fmt.Sprintf("pg_hardstorage repair scrub --repo %s --heal --replica <replica-url>", repoURL),
@@ -1124,8 +1126,9 @@ func runRepairScrub(cmd *cobra.Command, repoURL string, limit int, heal bool, re
 	// Carry the destination repo's WORM policy so healed chunks are re-locked
 	// on a compliance repo (the heal's IfNotExists Put carries no retention).
 	healUntil, healMode := wormPolicyFor(scrubMeta)
-	healTargets := res.Mismatches
-	healRes, herr := repo.Heal(cmd.Context(), sp, replicaSP, healTargets, repo.HealOptions{
+	// Streamed from the spilled mismatch set: a repository with widespread
+	// damage must not need a slice of every damaged hash.
+	healRes, herr := repo.HealStream(cmd.Context(), sp, replicaSP, res.eachMismatch, repo.HealOptions{
 		RetainUntil:   healUntil,
 		RetentionMode: healMode,
 		// Same decoder set `repo bundle import` uses to check a chunk's
@@ -1155,7 +1158,7 @@ func runRepairScrub(cmd *cobra.Command, repoURL string, limit int, heal bool, re
 		// below has always named its hashes; this path simply did not.
 		return output.NewError("verify.heal_incomplete",
 			fmt.Sprintf("repair scrub --heal: %d healed, %d not at replica, %d failed (out of %d mismatches)%s",
-				healRes.Healed, healRes.NotAtReplica, healRes.Failed, len(res.Mismatches),
+				healRes.Healed, healRes.NotAtReplica, healRes.Failed, res.MismatchCount,
 				healFailuresForMsg(healRes.Failures))).
 			WithSuggestion(&output.Suggestion{
 				Human: "each chunk above names why it could not be healed; a copy that does not match its content address means the REPLICA is corrupt for that chunk (repair or re-replicate it, or heal from a different replica), while chunks not at the replica may need to be re-backed-up at the source",
@@ -1171,15 +1174,15 @@ func runRepairScrub(cmd *cobra.Command, repoURL string, limit int, heal bool, re
 	// and report "healed" while the chunk is still broken. Re-verify
 	// the once-mismatched chunks through the per-manifest CAS (which
 	// HAS the keys) so that silent failure surfaces loudly instead.
-	stillBad, verr := reverifyChunksPlaintext(cmd.Context(), sp, res.Mismatches)
+	stillBadN, stillBad, verr := reverifyChunksPlaintext(cmd.Context(), sp, &res)
 	if verr != nil {
 		return output.NewError("repair.heal_reverify_failed",
 			fmt.Sprintf("repair scrub --heal: re-verify after heal: %v", verr)).Wrap(verr)
 	}
-	if len(stillBad) > 0 {
+	if stillBadN > 0 {
 		return output.NewError("verify.heal_unverified",
 			fmt.Sprintf("repair scrub --heal: %d of %d chunk(s) still fail verification after heal — the replica's copy is itself corrupt: %s",
-				len(stillBad), len(res.Mismatches), hashListForMsg(stillBad))).
+				stillBadN, res.MismatchCount, hashListForMsg(stillBad, stillBadN))).
 			WithSuggestion(&output.Suggestion{
 				Human: "heal replaced the local chunks with the replica's bytes, but those bytes do not decrypt to the expected content — the replica is corrupt for these chunks too. They must be re-backed-up from a live source; no good copy exists in either repo.",
 			})
@@ -1276,6 +1279,9 @@ type repairScrubBody struct {
 	BytesVerified   int64    `json:"bytes_verified"`
 	ReferencedTotal int      `json:"referenced_total"`
 	Mismatches      []string `json:"mismatches,omitempty"`
+	// MismatchesTruncated is set when MismatchCount exceeds the hashes
+	// Mismatches carries (the count is exact; the list is capped).
+	MismatchesTruncated bool `json:"mismatches_truncated,omitempty"`
 
 	// Heal-mode fields. Populated only when --heal was passed and
 	// at least one mismatch was found. ReplicaURL records which
@@ -1315,6 +1321,9 @@ func (b repairScrubBody) WriteText(w io.Writer) error {
 	} else {
 		fmt.Fprintf(bw, "  ✗ %d chunk(s) failed integrity check:\n", b.MismatchCount)
 		writeHashLines(bw, b.Mismatches)
+		if b.MismatchesTruncated {
+			fmt.Fprintf(bw, "    (the result lists only the first %d of %d)\n", len(b.Mismatches), b.MismatchCount)
+		}
 		if b.HealResult != nil {
 			fmt.Fprintf(bw, "  heal — replica %s\n", b.ReplicaURL)
 			fmt.Fprintf(bw, "    Healed:         %d\n", b.HealResult.Healed)
@@ -1337,10 +1346,17 @@ func (b repairScrubBody) WriteText(w io.Writer) error {
 
 // scrubResultAgg accumulates ScrubResult across multiple manifests.
 type scrubResultAgg struct {
-	Sampled    int
-	OK         int
-	Bytes      int64
-	Mismatches []repo.Hash
+	Sampled int
+	OK      int
+	Bytes   int64
+	// Mismatches holds the first maxScrubMismatchesListed mismatching
+	// hashes in discovery order (what the result body names);
+	// MismatchCount is the exact number. Every mismatch is kept in
+	// mismatchSet, a disk-spilling set, so --heal can process all of them
+	// without a slice that grows with the damage. Close releases it.
+	Mismatches    []repo.Hash
+	MismatchCount int
+	mismatchSet   *spill.HashSet
 
 	// WindowStart / WindowCount describe WHICH slice of the repo this
 	// run examined. A sampling scrub that always picks the same slice
@@ -1364,6 +1380,37 @@ type scrubResultAgg struct {
 	KeyUnavailableManifests int
 	KeyUnavailableChunks    int
 	KeyUnavailable          []string
+}
+
+// maxScrubMismatchesListed bounds the mismatch hashes a scrub result body
+// carries (the count is always exact).
+const maxScrubMismatchesListed = 1000
+
+// noteMismatch records one mismatching chunk (callers de-duplicate).
+func (a *scrubResultAgg) noteMismatch(h repo.Hash) {
+	a.MismatchCount++
+	if len(a.Mismatches) < maxScrubMismatchesListed {
+		a.Mismatches = append(a.Mismatches, h)
+	}
+	if a.mismatchSet == nil {
+		a.mismatchSet = spill.NewHashSet(spill.Options{})
+	}
+	a.mismatchSet.Add(h)
+}
+
+// eachMismatch calls fn for every mismatch, in ascending hash order.
+func (a *scrubResultAgg) eachMismatch(fn func(repo.Hash) error) error {
+	if a.mismatchSet == nil {
+		return nil
+	}
+	return a.mismatchSet.ForEach(func(k spill.Key) error { return fn(repo.Hash(k)) })
+}
+
+// Close releases the mismatch set's spill files.
+func (a *scrubResultAgg) Close() {
+	if a.mismatchSet != nil {
+		_ = a.mismatchSet.Close()
+	}
 }
 
 // noteKeyUnavailable records one manifest whose DEK could not be resolved.
@@ -1395,15 +1442,17 @@ func healFailuresForMsg(fs []repo.HealFailure) string {
 	return "; " + strings.Join(parts, "; ")
 }
 
-func hashListForMsg(hs []repo.Hash) string {
+func hashListForMsg(hs []repo.Hash, total int) string {
 	const cap = 8
 	parts := make([]string, 0, cap+1)
 	for i, h := range hs {
 		if i == cap {
-			parts = append(parts, fmt.Sprintf("… (+%d more)", len(hs)-cap))
 			break
 		}
 		parts = append(parts, h.String())
+	}
+	if total > len(parts) {
+		parts = append(parts, fmt.Sprintf("… (+%d more)", total-len(parts)))
 	}
 	return strings.Join(parts, ", ")
 }
@@ -1423,31 +1472,44 @@ func hashListForMsg(hs []repo.Hash) string {
 //
 // The empty Hash (scrubManifestAware's synthetic KEK-missing marker) is
 // not a real chunk and is skipped.
-func reverifyChunksPlaintext(ctx context.Context, sp storage.StoragePlugin, targets []repo.Hash) ([]repo.Hash, error) {
-	pending := make(map[repo.Hash]struct{}, len(targets))
-	for _, h := range targets {
-		if h == (repo.Hash{}) {
-			continue
-		}
-		pending[h] = struct{}{}
+func reverifyChunksPlaintext(ctx context.Context, sp storage.StoragePlugin, targets *scrubResultAgg) (int, []repo.Hash, error) {
+	// targets is a disk-spilling set, so "pending" is tracked as a counter
+	// plus a done set rather than a map that shrinks: memory stays bounded
+	// however many chunks were damaged. The result is the exact count of
+	// chunks that still fail and the first few of them (sorted).
+	if targets.mismatchSet == nil || targets.MismatchCount == 0 {
+		return 0, nil, nil
 	}
-	if len(pending) == 0 {
-		return nil, nil
-	}
+	remaining := targets.MismatchCount
+	done := spill.NewHashSet(spill.Options{})
+	defer done.Close()
+	stillBad := spill.NewHashSet(spill.Options{})
+	defer stillBad.Close()
+	var stillBadN int
+	var sample []repo.Hash
 	verifier, verr := loadVerifier()
 	if verr != nil {
-		return nil, verr
+		return 0, nil, verr
 	}
-	stillBad := map[repo.Hash]struct{}{}
 
-	verify := func(cas *repo.CAS, h repo.Hash) {
-		if _, want := pending[h]; !want {
+	// check verifies h once, whichever walk reaches it first.
+	check := func(cas *repo.CAS, h repo.Hash) {
+		if !done.Add(h) {
 			return
 		}
-		delete(pending, h)
+		remaining--
 		body, gerr := cas.GetChunkBytes(ctx, h)
 		if gerr != nil || repo.Hash(sha256.Sum256(body)) != h {
-			stillBad[h] = struct{}{}
+			stillBadN++
+			if len(sample) < 8 {
+				sample = append(sample, h)
+			}
+			stillBad.Add(h)
+		}
+	}
+	verify := func(cas *repo.CAS, h repo.Hash) {
+		if targets.mismatchSet.Has(h) {
+			check(cas, h)
 		}
 	}
 
@@ -1456,7 +1518,7 @@ func reverifyChunksPlaintext(ctx context.Context, sp storage.StoragePlugin, targ
 	ms := backup.NewManifestStore(sp)
 	deployments, err := ms.Deployments(ctx)
 	if err != nil {
-		return nil, err
+		return 0, nil, err
 	}
 	for _, dep := range deployments {
 		for m, merr := range ms.ListAuto(ctx, dep, verifier) {
@@ -1477,17 +1539,17 @@ func reverifyChunksPlaintext(ctx context.Context, sp storage.StoragePlugin, targ
 				return nil
 			}); err != nil {
 				if ctx.Err() != nil {
-					return nil, ctx.Err()
+					return 0, nil, ctx.Err()
 				}
 				// Unreadable entries: this manifest cannot vouch for
 				// anything; the chunks stay pending and are reported.
 				continue
 			}
-			if len(pending) == 0 {
+			if remaining == 0 {
 				break
 			}
 		}
-		if len(pending) == 0 {
+		if remaining == 0 {
 			break
 		}
 	}
@@ -1497,13 +1559,13 @@ func reverifyChunksPlaintext(ctx context.Context, sp storage.StoragePlugin, targ
 	// segment's own (decrypting) CAS — the plain CAS used here before
 	// failed every encrypted WAL chunk and turned a successful heal into
 	// verify.heal_unverified.
-	if len(pending) > 0 {
+	if remaining > 0 {
 		walCAS := newWALScrubCASCache(sp)
 		for info, lerr := range sp.List(ctx, "wal/") {
 			if lerr != nil {
-				return nil, lerr
+				return 0, nil, lerr
 			}
-			if len(pending) == 0 {
+			if remaining == 0 {
 				break
 			}
 			if !isWALSegmentKey(info.Key) {
@@ -1526,19 +1588,23 @@ func reverifyChunksPlaintext(ctx context.Context, sp storage.StoragePlugin, targ
 	// with a usable key: verify via the default CAS; if it can't be
 	// read/round-tripped, treat it as still-bad — heal cannot claim a
 	// success it can't confirm.
-	if len(pending) > 0 {
+	if remaining > 0 {
 		defaultCAS := casdefault.New(sp)
-		for h := range pending {
-			verify(defaultCAS, h)
+		if err := targets.eachMismatch(func(h repo.Hash) error {
+			check(defaultCAS, h) // done.Add skips the ones already verified
+			return nil
+		}); err != nil {
+			return 0, nil, err
 		}
 	}
-
-	out := make([]repo.Hash, 0, len(stillBad))
-	for h := range stillBad {
-		out = append(out, h)
+	if err := stillBad.Err(); err != nil {
+		return 0, nil, fmt.Errorf("still-bad set: %w", err)
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].String() < out[j].String() })
-	return out, nil
+	if err := done.Err(); err != nil {
+		return 0, nil, fmt.Errorf("verified set: %w", err)
+	}
+	sort.Slice(sample, func(i, j int) bool { return sample[i].String() < sample[j].String() })
+	return stillBadN, sample, nil
 }
 
 // scrubManifestAware walks every backup manifest in the repo, builds
@@ -1636,7 +1702,7 @@ func scrubManifestAware(ctx context.Context, sp storage.StoragePlugin, limit, wi
 				agg.KeyUnavailableChunks++
 				return
 			}
-			agg.Mismatches = append(agg.Mismatches, h)
+			agg.noteMismatch(h)
 			return
 		}
 		// Defensive re-hash: CAS.GetChunkBytes already verifies, but
@@ -1644,7 +1710,7 @@ func scrubManifestAware(ctx context.Context, sp storage.StoragePlugin, limit, wi
 		// without this second guard.
 		if repo.Hash(sha256.Sum256(body)) != h {
 			agg.Sampled++
-			agg.Mismatches = append(agg.Mismatches, h)
+			agg.noteMismatch(h)
 			return
 		}
 		agg.Sampled++

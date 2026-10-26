@@ -35,6 +35,12 @@ memory. The on-disk format is unchanged.
   `SpoolDir` (defaults to the system temp dir).
 - **Spill files** for the hash sets: about 32 bytes per distinct chunk
   while a command runs (verify, integrity, GC, restore plan, list).
+  They go to the system temp dir, i.e. `$TMPDIR`; point it at a large
+  disk-backed volume. Merging runs transiently needs the merged size again
+  on top, so a set checks the free space first and fails with a clear
+  "not enough free space ... set TMPDIR" error instead of hitting ENOSPC
+  mid-run. A warning is printed once when the directory is on tmpfs/ramfs,
+  because spilled hashes would then live in RAM.
 
 ## Fewer, larger chunks
 

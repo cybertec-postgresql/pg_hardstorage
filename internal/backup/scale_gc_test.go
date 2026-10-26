@@ -234,7 +234,7 @@ func TestScale_GCOverHugeManifest(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Sweep(apply=%v): %v", o.Apply, err)
 		}
-		t.Logf("sweep apply=%v: refs=%d orphans=%d deleted=%d in %s", o.Apply, res.RefCount, len(res.Orphans), res.Deleted, time.Since(start).Round(time.Millisecond))
+		t.Logf("sweep apply=%v: refs=%d orphans=%d deleted=%d in %s", o.Apply, res.RefCount, res.OrphanCount, res.Deleted, time.Since(start).Round(time.Millisecond))
 		return res
 	}
 	assertExist := func(what string, hs []repo.Hash, want bool) {
@@ -255,8 +255,8 @@ func TestScale_GCOverHugeManifest(t *testing.T) {
 	if res.RefCount != n+shared {
 		t.Errorf("RefCount = %d, want %d distinct referenced chunks", res.RefCount, n+shared)
 	}
-	if len(res.Orphans) != wantOrphans || res.Deleted != 0 {
-		t.Errorf("dry run: %d orphans, %d deleted; want %d and 0", len(res.Orphans), res.Deleted, wantOrphans)
+	if res.OrphanCount != wantOrphans || res.Deleted != 0 {
+		t.Errorf("dry run: %d orphans, %d deleted; want %d and 0", res.OrphanCount, res.Deleted, wantOrphans)
 	}
 	if len(res.StaleTemps) != 1 || res.StaleTempDeleted != 0 {
 		t.Errorf("dry run stale temps = %v deleted=%d", res.StaleTemps, res.StaleTempDeleted)
@@ -307,8 +307,8 @@ func TestScale_GCOverHugeManifest(t *testing.T) {
 	}
 
 	// 3. Idempotent.
-	if res = sweep(repo.SweepOptions{Apply: true}); res.Deleted != 0 || len(res.Orphans) != 0 {
-		t.Errorf("second apply: deleted=%d orphans=%d, want a no-op", res.Deleted, len(res.Orphans))
+	if res = sweep(repo.SweepOptions{Apply: true}); res.Deleted != 0 || res.OrphanCount != 0 {
+		t.Errorf("second apply: deleted=%d orphans=%d, want a no-op", res.Deleted, res.OrphanCount)
 	}
 
 	// 4. Tombstone the huge backup. Inside the grace window it counts as live.
