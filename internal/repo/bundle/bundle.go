@@ -192,7 +192,7 @@ func Export(ctx context.Context, sp storage.StoragePlugin, w io.Writer, opts Exp
 		// error, the source repo may have skipped manifest
 		// redundancy at commit time).
 		replicaKey := backup.ReplicaPath(m.BackupID)
-		if err := copyKey(ctx, sp, tw, replicaKey, true); err != nil {
+		if err := copyKeyStreamed(ctx, sp, tw, replicaKey, true); err != nil {
 			return nil, fmt.Errorf("bundle: copy replica %s: %w", replicaKey, err)
 		}
 		// Attestation if present.
@@ -426,8 +426,12 @@ func Import(ctx context.Context, r io.Reader, sp storage.StoragePlugin, opts Imp
 		// our own writers will always fit, anything bigger
 		// is suspect).
 		maxEntry := int64(MaxEntryBytes)
-		if isSignedBackupManifestKey(clean) {
-			maxEntry = storage.MaxMetadataBytes // manifests are metadata, not chunks
+		if isManifestObjectKey(clean) {
+			// Manifests are metadata, not chunks, and a 100 TB backup's
+			// is multi-GB: they are staged to disk and verified as a
+			// stream, never held, so only the streaming reader's bound
+			// applies.
+			maxEntry = backup.MaxStreamedManifestBytes
 		}
 		if hdr.Size > maxEntry {
 			return nil, fmt.Errorf("bundle: entry %q size %d exceeds MaxEntryBytes limit (%d)",
@@ -483,8 +487,8 @@ func Import(ctx context.Context, r io.Reader, sp storage.StoragePlugin, opts Imp
 			// Staged straight to disk: a primary manifest can be far
 			// larger than memory, and is verified from the staged file.
 			limit := int64(MaxEntryBytes)
-			if isSignedBackupManifestKey(clean) {
-				limit = storage.MaxMetadataBytes
+			if isManifestObjectKey(clean) {
+				limit = backup.MaxStreamedManifestBytes
 			}
 			path, err := stage.addFrom(clean, tr, limit)
 			if err != nil {
@@ -693,6 +697,14 @@ func isSignedBackupManifestKey(key string) bool {
 		strings.HasSuffix(key, "/manifest.json")
 }
 
+// isManifestObjectKey reports whether key is a primary or replica backup
+// manifest — the bundle entries that scale with the database and are
+// therefore staged and verified as streams.
+func isManifestObjectKey(key string) bool {
+	return isSignedBackupManifestKey(key) ||
+		(strings.HasPrefix(key, "manifests/_replicas/") && strings.HasSuffix(key, ".manifest.json"))
+}
+
 // MaxEntryBytes caps the size of any single tar entry the
 // importer will accept.  256 MiB is well above the FastCDC
 // max chunk size (64 KiB by default; 256 KiB worst-case
@@ -752,6 +764,36 @@ func copyKey(ctx context.Context, sp storage.StoragePlugin, tw *tar.Writer, key 
 		return err
 	}
 	return writeTarEntry(tw, key, body)
+}
+
+// copyKeyStreamed is copyKey for objects that can be far larger than
+// memory (the replica copy of a backup manifest): the body is streamed
+// into the tar entry, sized by a Stat.
+func copyKeyStreamed(ctx context.Context, sp storage.StoragePlugin, tw *tar.Writer, key string, skipMissing bool) error {
+	st, err := sp.Stat(ctx, key)
+	if err != nil {
+		if skipMissing && isNotFound(err) {
+			return nil
+		}
+		return err
+	}
+	rc, err := sp.Get(ctx, key)
+	if err != nil {
+		if skipMissing && isNotFound(err) {
+			return nil
+		}
+		return err
+	}
+	defer rc.Close()
+	if err := tw.WriteHeader(&tar.Header{
+		Name: key, Mode: 0o644, Size: st.Size, ModTime: time.Time{}, Format: tar.FormatPAX,
+	}); err != nil {
+		return fmt.Errorf("bundle: tar header for %s: %w", key, err)
+	}
+	if _, err := io.Copy(tw, io.LimitReader(rc, st.Size)); err != nil {
+		return fmt.Errorf("bundle: tar write %s: %w", key, err)
+	}
+	return nil
 }
 
 // copyChunk is copyKey for chunks, returning the chunk's byte
@@ -953,9 +995,6 @@ func copyManifestStreaming(ctx context.Context, sp storage.StoragePlugin, tw *ta
 	st, err := sp.Stat(ctx, key)
 	if err != nil {
 		return nil, zero, err
-	}
-	if st.Size > storage.MaxMetadataBytes {
-		return nil, zero, fmt.Errorf("manifest %s is %d bytes, over the %d-byte metadata cap", key, st.Size, storage.MaxMetadataBytes)
 	}
 	rc, err := sp.Get(ctx, key)
 	if err != nil {

@@ -1,6 +1,8 @@
 package backup_test
 
 import (
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -300,5 +302,34 @@ func TestCompare_ShapesAreSerializable(t *testing.T) {
 	_ = res.LogicalBytes.Delta
 	if len(res.TopFileDeltas) > 0 {
 		_ = res.TopFileDeltas[0].Path
+	}
+}
+
+// TopFileDeltas is a bounded top-N (|delta| desc, path asc), not a sorted
+// copy of every differing file; ties break by path.
+func TestCompare_TopFileDeltasBounded(t *testing.T) {
+	var af, bf []backup.FileEntry
+	for i := 0; i < 50; i++ {
+		af = append(af, fileWithChunks(fmt.Sprintf("f%02d", i), "x"))
+		// Every file changes; |delta| = i+1 bytes except two ties at the top.
+		bf = append(bf, fileWithChunks(fmt.Sprintf("f%02d", i), "x", strings.Repeat("y", i+1)))
+	}
+	bf = append(bf, fileWithChunks("zz-added", strings.Repeat("z", 51)))
+	a := manifestWith("a", time.Now(), af...)
+	b := manifestWith("b", time.Now(), bf...)
+	res, err := backup.Compare(a, b, backup.CompareOptions{TopN: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.TopFileDeltas) != 3 {
+		t.Fatalf("len = %d, want 3", len(res.TopFileDeltas))
+	}
+	// zz-added delta = 51, f49 delta = 50, f48 delta = 49.
+	got := []string{res.TopFileDeltas[0].Path, res.TopFileDeltas[1].Path, res.TopFileDeltas[2].Path}
+	if got[0] != "zz-added" || got[1] != "f49" || got[2] != "f48" {
+		t.Fatalf("order = %v", got)
+	}
+	if res.FileCounts.Changed != 50 || res.FileCounts.OnlyInB != 1 {
+		t.Fatalf("counts = %+v", res.FileCounts)
 	}
 }

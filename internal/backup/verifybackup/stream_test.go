@@ -44,3 +44,18 @@ func TestVerify_StreamedDecode(t *testing.T) {
 		t.Errorf("null Files: %v", err)
 	}
 }
+
+// VerifyReader takes the manifest as a stream (a merged 100 TB manifest is
+// tens of GB) with Verify's results, and an empty stream is "no manifest".
+func TestVerifyReader(t *testing.T) {
+	a := []byte("aaa")
+	root := writeFiles(t, map[string][]byte{"a": a})
+	doc := `{"PostgreSQL-Backup-Manifest-Version":2,"Files":[{"Path":"a","Size":3,"Checksum-Algorithm":"SHA256","Checksum":"` + sha256Hex(a) + `"}]}`
+	res, err := verifybackup.VerifyReader(context.Background(), strings.NewReader(doc), root)
+	if err != nil || res.FilesChecked != 1 {
+		t.Fatalf("VerifyReader: %v %+v", err, res)
+	}
+	if _, err := verifybackup.VerifyReader(context.Background(), strings.NewReader(""), root); !errors.Is(err, verifybackup.ErrNoManifest) {
+		t.Fatalf("empty stream: %v", err)
+	}
+}

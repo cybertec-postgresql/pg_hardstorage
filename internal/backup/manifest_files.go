@@ -325,7 +325,13 @@ func (ms *ManifestStore) ReadIncludingTombstonedAuto(ctx context.Context, deploy
 // produces the real error (or its replica fallback).
 func (ms *ManifestStore) bigPrimary(ctx context.Context, deployment, backupID string) bool {
 	st, err := ms.sp.Stat(ctx, PrimaryPath(deployment, backupID))
-	return err == nil && st.Size > AutoStreamThreshold
+	if err != nil {
+		// The held reader would fall back to the replica; if that is
+		// the oversized copy (primary lost), it must be streamed too.
+		rst, rerr := ms.sp.Stat(ctx, ReplicaPath(backupID))
+		return rerr == nil && rst.Size > AutoStreamThreshold
+	}
+	return st.Size > AutoStreamThreshold
 }
 
 // ListAuto is List with per-manifest shape selection (see ReadAuto).

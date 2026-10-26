@@ -43,6 +43,7 @@
 package verifybackup
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -147,13 +148,27 @@ func Verify(ctx context.Context, manifestBytes []byte, dataDir string) (*Result,
 	if len(manifestBytes) == 0 {
 		return nil, ErrNoManifest
 	}
+	return VerifyReader(ctx, bytes.NewReader(manifestBytes), dataDir)
+}
+
+// VerifyReader is Verify over a stream, so a backup_manifest that is
+// itself tens of GB (100 TB cluster) never has to be held in memory.
+// An empty stream returns ErrNoManifest.
+func VerifyReader(ctx context.Context, r io.Reader, dataDir string) (*Result, error) {
+	br := bufio.NewReaderSize(r, 1<<20)
+	if _, err := br.Peek(1); err != nil {
+		if errors.Is(err, io.EOF) {
+			return nil, ErrNoManifest
+		}
+		return nil, fmt.Errorf("verifybackup: read backup_manifest: %w", err)
+	}
 	// Stream-decode the document: the Files array of a 100 TB cluster's
 	// manifest has millions of entries, and unmarshalling it whole would
 	// hold every one of them (~250 B each) at once. Only one entry is live
 	// at a time here; the checks and their order are otherwise unchanged.
 	res := &Result{}
 	algos := map[string]struct{}{}
-	if err := streamPGManifest(ctx, manifestBytes, dataDir, res, algos); err != nil {
+	if err := streamPGManifest(ctx, br, dataDir, res, algos); err != nil {
 		return res, err
 	}
 
@@ -188,11 +203,11 @@ func Verify(ctx context.Context, manifestBytes []byte, dataDir string) (*Result,
 // verifying each against dataDir. Errors that json.Unmarshal used to raise
 // up front (malformed JSON, missing version, no files) are raised here as
 // soon as the stream reveals them.
-func streamPGManifest(ctx context.Context, doc []byte, dataDir string, res *Result, algos map[string]struct{}) error {
+func streamPGManifest(ctx context.Context, doc io.Reader, dataDir string, res *Result, algos map[string]struct{}) error {
 	parseErr := func(err error) error {
 		return fmt.Errorf("verifybackup: parse PG backup_manifest JSON: %w", err)
 	}
-	dec := json.NewDecoder(bytes.NewReader(doc))
+	dec := json.NewDecoder(doc)
 	if tok, err := dec.Token(); err != nil {
 		return parseErr(err)
 	} else if d, ok := tok.(json.Delim); !ok || d != '{' {

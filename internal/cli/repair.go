@@ -4,7 +4,6 @@ package cli
 import (
 	"context"
 	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -133,8 +132,11 @@ func runRepairAttestation(cmd *cobra.Command, deployment, backupID, repoURL, act
 	}
 
 	primaryKey := backup.PrimaryPath(deployment, backupID)
-	body, err := readManifestKey(cmd.Context(), sp, primaryKey)
-	if err != nil {
+	ctx := cmd.Context()
+	// The manifest is inspected and re-signed as a stream: it scales with
+	// the database and can be many GB, so it is never held in memory.
+	primary := storedManifest{ctx: ctx, sp: sp, key: primaryKey}
+	if _, err := sp.Stat(ctx, primaryKey); err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			return output.NewError("notfound.backup",
 				fmt.Sprintf("repair attestation: backup %s/%s not found",
@@ -147,7 +149,8 @@ func runRepairAttestation(cmd *cobra.Command, deployment, backupID, repoURL, act
 	// Determine current verification state. Refuses to re-sign a
 	// valid manifest without --force.
 	var origFingerprint string
-	if currentlyValid(body, verifier) {
+	valid := primary.verifies(verifier)
+	if valid {
 		if !force {
 			return output.NewError("aborted.attestation_valid",
 				fmt.Sprintf("repair attestation: %s/%s already verifies; pass --force to re-sign anyway",
@@ -157,15 +160,21 @@ func runRepairAttestation(cmd *cobra.Command, deployment, backupID, repoURL, act
 				})
 		}
 	}
-	// Capture the original fingerprint before re-sign for the audit.
-	origFingerprint = extractAttestationFingerprint(body)
 
 	// Parse without verify so we can re-sign even when verify fails.
-	m, err := backup.ParseAttestationless(body)
+	hinfo, err := primary.header()
 	if err != nil {
+		var rerr *storedReadError
+		if errors.As(err, &rerr) {
+			return output.NewError("repair.attestation.read",
+				fmt.Sprintf("repair attestation: read manifest: %v", err)).Wrap(err)
+		}
 		return output.NewError("repair.attestation.parse",
 			fmt.Sprintf("repair attestation: parse: %v", err)).Wrap(err)
 	}
+	m := hinfo.Manifest
+	// Capture the original fingerprint before re-sign for the audit.
+	origFingerprint = attestationFingerprint(m)
 	if m.Deployment != deployment || m.BackupID != backupID {
 		return output.NewError("verify.identity_mismatch",
 			fmt.Sprintf("repair attestation: manifest body says %s/%s, operator asked for %s/%s",
@@ -184,7 +193,7 @@ func runRepairAttestation(cmd *cobra.Command, deployment, backupID, repoURL, act
 	// for); an invalid one means the bytes don't match what was signed —
 	// refuse, --force or not. (Mirrors repair manifest's "never manufacture
 	// a bad copy" posture.)
-	if _, scerr := backup.VerifyEmbedded(body); scerr != nil {
+	if scerr := primary.embeddedErr(); scerr != nil {
 		return output.NewError("verify.attestation_tampered",
 			fmt.Sprintf("repair attestation: refusing to re-sign %s/%s — its content does not match its own embedded signature, so it was altered after signing (not a key rotation): %v",
 				deployment, backupID, scerr)).
@@ -202,19 +211,26 @@ func runRepairAttestation(cmd *cobra.Command, deployment, backupID, repoURL, act
 	// already trusts: the current keyring key (the --force re-sign
 	// case) or a recorded retired operator key (the rotation case this
 	// command exists for).
-	trustedBy, terr := trustedSignerOf(body, verifier, trustedKeyFiles)
+	trustedBy, terr := trustedSignerOfWith(valid, primary.verifies, origFingerprint, trustedKeyFiles)
 	if terr != nil {
 		return terr
 	}
 
-	if err := m.Sign(signer); err != nil {
+	rc, err := primary.open()
+	if err != nil {
+		return output.NewError("repair.attestation.read",
+			fmt.Sprintf("repair attestation: read manifest: %v", err)).Wrap(err)
+	}
+	resigned, err := backup.ResignStreamed(rc, signer)
+	_ = rc.Close()
+	if err != nil {
 		return output.NewError("repair.attestation.sign",
 			fmt.Sprintf("repair attestation: sign: %v", err)).Wrap(err)
 	}
-	newBytes, err := m.MarshalToBytes()
-	if err != nil {
-		return output.NewError("repair.attestation.marshal",
-			fmt.Sprintf("repair attestation: marshal: %v", err)).Wrap(err)
+	defer resigned.Close()
+	if resigned.SourceSHA256 != hinfo.RawSHA256 {
+		return output.NewError("repair.attestation.sign",
+			fmt.Sprintf("repair attestation: %s changed while it was being checked; nothing was written, re-run", primaryKey))
 	}
 
 	// The manifest is stored in TWO copies — primary and replica —
@@ -238,11 +254,19 @@ func runRepairAttestation(cmd *cobra.Command, deployment, backupID, repoURL, act
 	// compliance repo must not leave the manifest deletable).
 	wormUntil, wormMode := wormPolicyFor(repoMeta)
 	replicaKey := backup.ReplicaPath(backupID)
-	if err := installManifestOverwrite(cmd.Context(), sp, replicaKey, newBytes, "attest", wormUntil, wormMode); err != nil {
+	install := func(key string) error {
+		nrc, err := resigned.Open()
+		if err != nil {
+			return err
+		}
+		defer nrc.Close()
+		return installManifestFromReader(ctx, sp, key, resigned.Size(), nrc, wormUntil, wormMode)
+	}
+	if err := install(replicaKey); err != nil {
 		return output.NewError("repair.attestation.install_replica",
 			fmt.Sprintf("repair attestation: install replica: %v", err)).Wrap(err)
 	}
-	if err := installManifestOverwrite(cmd.Context(), sp, primaryKey, newBytes, "attest", wormUntil, wormMode); err != nil {
+	if err := install(primaryKey); err != nil {
 		return output.NewError("repair.attestation.install",
 			fmt.Sprintf("repair attestation: install primary: %v", err)).Wrap(err)
 	}
@@ -252,7 +276,7 @@ func runRepairAttestation(cmd *cobra.Command, deployment, backupID, repoURL, act
 	// separate audit verify-chain run would surface the missing
 	// event. Better than rolling back a successful re-sign.
 	auditStore := audit.NewStoreWithRetention(sp, repoMeta.WORM)
-	newFingerprint := extractAttestationFingerprint(newBytes)
+	newFingerprint := attestationFingerprint(resigned.Header)
 	auditEv := &audit.Event{
 		Action: "repair.attestation.resigned",
 		Actor:  actor,
@@ -339,26 +363,6 @@ func loadSignerAndVerifier() (*backup.Signer, *backup.Verifier, error) {
 	// Repair re-signs and verifies with the repository's own key; a key
 	// minted here would re-sign manifests under a key nothing trusts.
 	return loadExistingKeypair("repair")
-}
-
-// currentlyValid reports whether the on-disk manifest verifies
-// against verifier — used to decide whether --force is required.
-func currentlyValid(body []byte, verifier *backup.Verifier) bool {
-	_, err := backup.ParseAndVerify(body, verifier)
-	return err == nil
-}
-
-// extractAttestationFingerprint returns a SHA-256 fingerprint of the
-// manifest's embedded public key, or "" if no attestation is present
-// or the body can't be parsed. Used to record what the manifest WAS
-// signed by before we re-signed it.
-func extractAttestationFingerprint(body []byte) string {
-	m, err := backup.ParseAttestationless(body)
-	if err != nil || m.Attestation == nil {
-		return ""
-	}
-	sum := sha256.Sum256([]byte(m.Attestation.PublicKey))
-	return hex.EncodeToString(sum[:8])
 }
 
 func errString(err error) string {
@@ -483,7 +487,11 @@ func runRepairManifest(cmd *cobra.Command, deployment, backupID, repoURL string,
 	replicaKey := backup.ReplicaPath(backupID)
 
 	// Read the replica first — it's what we're recovering FROM.
-	replicaBytes, err := readManifestKey(cmd.Context(), sp, replicaKey)
+	// The manifest scales with the database, so both copies are checked and
+	// copied as streams, never held.
+	replica := storedManifest{ctx: cmd.Context(), sp: sp, key: replicaKey}
+	primary := storedManifest{ctx: cmd.Context(), sp: sp, key: primaryKey}
+	_, err = sp.Stat(cmd.Context(), replicaKey)
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			// The replica is the MISSING side (e.g. the commit-time
@@ -513,7 +521,7 @@ func runRepairManifest(cmd *cobra.Command, deployment, backupID, repoURL string,
 		return output.NewError("repair.manifest.read_replica",
 			fmt.Sprintf("repair manifest: read replica: %v", err)).Wrap(err)
 	}
-	repM, err := backup.ParseAndVerify(replicaBytes, verifier)
+	rinfo, err := replica.verify(verifier)
 	if err != nil {
 		// Replica is PRESENT but corrupt / foreign-signed. Don't
 		// declare the manifest unrecoverable yet: the primary may be
@@ -543,6 +551,7 @@ func runRepairManifest(cmd *cobra.Command, deployment, backupID, repoURL string,
 			RebuiltReplica:  rebuilt,
 		}))
 	}
+	repM := rinfo.Manifest
 	// Cross-check: the body's identity must match the operator's args.
 	// Replica filename uses backup_id only; a wrong-deployment body
 	// would be silent corruption otherwise.
@@ -553,12 +562,7 @@ func runRepairManifest(cmd *cobra.Command, deployment, backupID, repoURL string,
 	}
 
 	// If the primary IS already valid, refuse without --force.
-	primaryValid := false
-	if pBytes, err := readManifestKey(cmd.Context(), sp, primaryKey); err == nil {
-		if _, perr := backup.ParseAndVerify(pBytes, verifier); perr == nil {
-			primaryValid = true
-		}
-	}
+	primaryValid := primary.verifies(verifier)
 	if primaryValid && !force {
 		return output.NewError("aborted.primary_intact",
 			fmt.Sprintf("repair manifest: primary %s is already valid; pass --force to overwrite anyway",
@@ -573,7 +577,7 @@ func runRepairManifest(cmd *cobra.Command, deployment, backupID, repoURL string,
 	// past the "primary intact + no force" abort gate, so we know we want to
 	// write — either primary was invalid (corrupt content present) or
 	// operator passed --force.
-	if err := installManifestOverwrite(cmd.Context(), sp, primaryKey, replicaBytes, "repair", wormUntil, wormMode); err != nil {
+	if err := installManifestCopy(cmd.Context(), sp, primaryKey, replicaKey, rinfo.RawSHA256, wormUntil, wormMode); err != nil {
 		return output.NewError("repair.manifest.rename",
 			fmt.Sprintf("repair manifest: install primary: %v", err)).Wrap(err)
 	}
@@ -585,17 +589,6 @@ func runRepairManifest(cmd *cobra.Command, deployment, backupID, repoURL string,
 		PrimaryWasValid: primaryValid,
 		Forced:          force,
 	}))
-}
-
-// readManifestKey is a tiny helper that reads + closes. Returns
-// storage.ErrNotFound on absent key.
-func readManifestKey(ctx context.Context, sp storage.StoragePlugin, key string) ([]byte, error) {
-	rc, err := sp.Get(ctx, key)
-	if err != nil {
-		return nil, err
-	}
-	defer rc.Close()
-	return io.ReadAll(rc)
 }
 
 // randHex8 returns 8 random hex chars for tmp-file disambiguation.
@@ -1849,8 +1842,13 @@ const trustedKeysDirName = "trusted-keys"
 // current keyring verifier, every <keyring>/trusted-keys/*.pem, and
 // every --trusted-key file. A key file that cannot be read or parsed is
 // an error, not a silent skip — the operator named it on purpose.
-func trustedSignerOf(body []byte, current *backup.Verifier, extraFiles []string) (string, error) {
-	if _, err := backup.ParseAndVerify(body, current); err == nil {
+//
+// currentOK says the manifest already verifies under the current keyring
+// key; verifiesWith answers the same for any other key (one streaming pass
+// over the stored manifest per call); fingerprint names the signing key
+// for the refusal message.
+func trustedSignerOfWith(currentOK bool, verifiesWith func(*backup.Verifier) bool, fingerprint string, extraFiles []string) (string, error) {
+	if currentOK {
 		return "keyring", nil
 	}
 	var files []string
@@ -1871,13 +1869,13 @@ func trustedSignerOf(body []byte, current *backup.Verifier, extraFiles []string)
 			return "", output.NewError("usage.bad_flag",
 				fmt.Sprintf("repair attestation: parse trusted key %s: %v", f, err)).Wrap(output.ErrUsage)
 		}
-		if _, err := backup.ParseAndVerify(body, v); err == nil {
+		if verifiesWith(v) {
 			return f, nil
 		}
 	}
 	return "", output.NewError("verify.attestation_untrusted_key",
 		fmt.Sprintf("repair attestation: refusing to re-sign — the manifest is signed by key %s, which is neither the current keyring key nor a trusted retired operator key",
-			extractAttestationFingerprint(body))).
+			fingerprint)).
 		WithSuggestion(&output.Suggestion{
 			Human: "a manifest's embedded public key is part of the manifest, so a valid self-signature proves nothing about WHO signed it. If this really is your previous signing key, install its public half under <keyring>/" + trustedKeysDirName + "/ (or pass --trusted-key <pem>) and re-run; otherwise treat the manifest as forged and recover with `repair manifest` or a fresh backup.",
 		})

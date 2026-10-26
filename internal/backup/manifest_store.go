@@ -94,7 +94,7 @@ func validateRef(deployment, backupID string) error {
 // or a corrupt/oversized object, would otherwise OOM the reader via an
 // unbounded io.ReadAll before Validate ever runs (input-validation audit
 // #2). 1 GiB is far above any real manifest yet bounds the blast radius.
-const MaxManifestBytes = 1 << 30
+var MaxManifestBytes int64 = 1 << 30
 
 // ReadAllLimited reads up to max bytes from rc, returning an error
 // rather than allocating unboundedly when the source exceeds it.
@@ -1828,7 +1828,7 @@ func (ms *ManifestStore) readRaw(ctx context.Context, key string) ([]byte, error
 		return nil, err
 	}
 	defer rc.Close()
-	return stdio.ReadAll(rc)
+	return storage.ReadAllLimited(rc, storage.MaxRecordBytes)
 }
 
 // UndeleteParentTombstonedError is returned by Undelete when the

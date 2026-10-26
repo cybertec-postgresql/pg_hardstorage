@@ -689,9 +689,13 @@ func validateTarEntryName(name string) error {
 // captureSpecial reads the entire current tar entry into *dst.
 // Used for backup_label and tablespace_map (both small files).
 func (s *Sink) captureSpecial(tr *tar.Reader, dst *[]byte) error {
-	body, err := io.ReadAll(tr)
+	const maxSpecial = 16 << 20
+	body, err := io.ReadAll(io.LimitReader(tr, maxSpecial+1))
 	if err != nil {
 		return err
+	}
+	if len(body) > maxSpecial {
+		return fmt.Errorf("tarsink: special file exceeds %d bytes", maxSpecial)
 	}
 	s.mu.Lock()
 	*dst = body

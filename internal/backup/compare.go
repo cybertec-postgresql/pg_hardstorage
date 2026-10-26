@@ -177,44 +177,42 @@ func CompareContext(ctx context.Context, a, b *Manifest, opts CompareOptions) (*
 	res.ChunkCounts.AOnly = res.A.UniqueChunkCount - bSide.shared
 	res.ChunkCounts.AOnlyBytes = res.A.UniqueChunkBytes - bSide.sharedBytes
 
-	// File-level diff.
-	allPaths := make([]string, 0, len(aIdx)+len(bIdx))
-	for p := range aIdx {
-		allPaths = append(allPaths, p)
-	}
-	for p := range bIdx {
-		if _, ok := aIdx[p]; !ok {
-			allPaths = append(allPaths, p)
-		}
-	}
-	sort.Strings(allPaths)
-
-	deltas := make([]FileDelta, 0, len(allPaths))
+	// File-level diff. Only the TopN ranked deltas are kept (a bounded
+	// insertion list), not one FileDelta per differing file: a diff of
+	// two multi-million-file backups would otherwise materialise them
+	// all plus a sorted copy of every path.
 	var sharedLogical int64
-	for _, p := range allPaths {
-		af, aOK := aIdx[p]
+	top := make([]FileDelta, 0, opts.TopN)
+	// before reports whether x ranks ahead of y: |delta| desc, path asc.
+	before := func(x, y FileDelta) bool {
+		ax, ay := abs(x.Delta), abs(y.Delta)
+		if ax != ay {
+			return ax > ay
+		}
+		return x.Path < y.Path
+	}
+	offer := func(d FileDelta) {
+		if len(top) == opts.TopN && !before(d, top[len(top)-1]) {
+			return
+		}
+		i := sort.Search(len(top), func(i int) bool { return before(d, top[i]) })
+		if len(top) < opts.TopN {
+			top = append(top, FileDelta{})
+		}
+		copy(top[i+1:], top[i:])
+		top[i] = d
+	}
+	for p, af := range aIdx {
 		bf, bOK := bIdx[p]
 		switch {
-		case aOK && !bOK:
+		case !bOK:
 			res.FileCounts.OnlyInA++
-			deltas = append(deltas, FileDelta{
-				Path: p, ASize: af.size, BSize: 0,
-				Delta: -af.size, Class: "removed",
-			})
-		case !aOK && bOK:
-			res.FileCounts.OnlyInB++
-			deltas = append(deltas, FileDelta{
-				Path: p, ASize: 0, BSize: bf.size,
-				Delta: bf.size, Class: "added",
-			})
+			offer(FileDelta{Path: p, ASize: af.size, BSize: 0, Delta: -af.size, Class: "removed"})
 		default:
 			res.FileCounts.InBoth++
 			if af != bf {
 				res.FileCounts.Changed++
-				deltas = append(deltas, FileDelta{
-					Path: p, ASize: af.size, BSize: bf.size,
-					Delta: bf.size - af.size, Class: "changed",
-				})
+				offer(FileDelta{Path: p, ASize: af.size, BSize: bf.size, Delta: bf.size - af.size, Class: "changed"})
 			} else {
 				// Same chunk list + same size = same bytes.
 				// Count toward shared-logical-bytes.
@@ -222,18 +220,14 @@ func CompareContext(ctx context.Context, a, b *Manifest, opts CompareOptions) (*
 			}
 		}
 	}
-	// TopFileDeltas: sort by |delta| desc, then path asc.
-	sort.Slice(deltas, func(i, j int) bool {
-		ai, aj := abs(deltas[i].Delta), abs(deltas[j].Delta)
-		if ai != aj {
-			return ai > aj
+	for p, bf := range bIdx {
+		if _, ok := aIdx[p]; ok {
+			continue
 		}
-		return deltas[i].Path < deltas[j].Path
-	})
-	if len(deltas) > opts.TopN {
-		deltas = deltas[:opts.TopN]
+		res.FileCounts.OnlyInB++
+		offer(FileDelta{Path: p, ASize: 0, BSize: bf.size, Delta: bf.size, Class: "added"})
 	}
-	res.TopFileDeltas = deltas
+	res.TopFileDeltas = top
 
 	// Logical bytes.
 	res.LogicalBytes = LogicalBytesBreakdown{

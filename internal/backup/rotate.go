@@ -496,16 +496,7 @@ func rotateStreamedManifest(ctx context.Context, sp storage.StoragePlugin, m *Ma
 	enc := *m.Encryption
 	enc.WrappedDEK, enc.KEKRef = wrappedNew, opts.NewKEKRef
 	hdr.Encryption = &enc
-	if err := spool.ValidateManifest(&hdr); err != nil {
-		return rotateOutcomeFailed, fmt.Errorf("rewritten manifest invalid: %w", err)
-	}
-	if err := spool.w.Flush(); err != nil {
-		return rotateOutcomeFailed, err
-	}
-	if err := spool.fileSet.Err(); err != nil {
-		return rotateOutcomeFailed, err
-	}
-	canon, size, err := spool.assembleAndSign(&hdr, opts.Signer)
+	canon, size, err := spool.validateAndSign(&hdr, opts.Signer)
 	if err != nil {
 		return rotateOutcomeFailed, fmt.Errorf("re-sign manifest: %w", err)
 	}
