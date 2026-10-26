@@ -383,6 +383,10 @@ func AcquireBackupLease(ctx context.Context, sp storage.StoragePlugin, deploymen
 		l.dropClaim(ctx, claimKey)
 		return nil, fmt.Errorf("backup: retake stale lease for %q: %w", deployment, err)
 	}
+	// Our live body is now in the repo. From here an error return means
+	// "not held" to the caller, who therefore never releases it; hand it
+	// back ourselves or it blocks the deployment for a whole TTL.
+	l.setBody(body)
 	if leaseHookAfterReclaimPut != nil {
 		leaseHookAfterReclaimPut()
 	}
@@ -406,14 +410,30 @@ func AcquireBackupLease(ctx context.Context, sp storage.StoragePlugin, deploymen
 		if attempt < reclaimEchoRetries && errors.Is(verr, ErrBackupInProgress) &&
 			obs.Owner == recheck.Owner && obs.AcquiredAt.Equal(recheck.AcquiredAt) {
 			if perr := l.put(ctx, body, false); perr != nil {
+				l.abandonReclaim(ctx)
 				return nil, fmt.Errorf("backup: retake stale lease for %q: %w", deployment, perr)
 			}
 			continue
+		}
+		if !errors.Is(verr, ErrBackupInProgress) {
+			// Cancelled or the repo failed mid-verify: we never learned
+			// whether we hold it, and our body may still be what is stored.
+			l.abandonReclaim(ctx)
 		}
 		return nil, verr
 	}
 	l.setBody(body)
 	return l, nil
+}
+
+// abandonReclaim tombstones the lease body an acquisition wrote but could not
+// confirm. Release is ownership-checked, so if a rival has since taken the
+// lease this is a no-op. It uses a context detached from ctx's cancellation
+// (the usual reason we are here) but bounded in time.
+func (l *Lease) abandonReclaim(ctx context.Context) {
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer cancel()
+	_ = l.Release(rctx)
 }
 
 // settleVerify waits the settle window and confirms the stored lease

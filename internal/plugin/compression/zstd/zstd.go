@@ -21,6 +21,7 @@ package zstd
 
 import (
 	"fmt"
+	"runtime"
 	"sync"
 
 	"github.com/klauspost/compress/zstd"
@@ -54,6 +55,20 @@ type Compressor struct {
 // past it is by definition adversarial.
 const DefaultMaxDecodedSize uint64 = 256 << 20
 
+// maxEncoderConcurrencyCap is the most encoder states a Compressor keeps.
+const maxEncoderConcurrencyCap = 8
+
+func maxEncoderConcurrency() int {
+	n := runtime.GOMAXPROCS(0)
+	if n > maxEncoderConcurrencyCap {
+		n = maxEncoderConcurrencyCap
+	}
+	if n < 1 {
+		n = 1
+	}
+	return n
+}
+
 // New returns a Compressor configured at the given encoder level.
 // Pass zstd.SpeedDefault (~level 3) for max throughput; SpeedBetterCompression
 // (~level 7) for our default. zstd.SpeedBestCompression (~level 11)
@@ -85,7 +100,16 @@ func (c *Compressor) Algorithm() compression.AlgorithmID { return compression.Al
 // the agent.
 func (c *Compressor) init() {
 	c.once.Do(func() {
-		enc, err := zstd.NewWriter(nil, zstd.WithEncoderLevel(c.Level))
+		// Bound the encoder pool. klauspost allocates one encoder state per
+		// concurrent EncodeAll (default GOMAXPROCS), each retaining a
+		// 2x-window history buffer (16 MiB at SpeedBetterCompression) plus
+		// ~4 MiB of tables for the Compressor's whole life: ~20 MiB x cores,
+		// i.e. 2.5 GiB resident on a 128-core host that compresses one
+		// stream. Every producer in this codebase (tarsink, walsink) caps
+		// its compression fan-out at maxEncoderConcurrency, so the cap
+		// costs no throughput; extra callers just queue on the pool.
+		enc, err := zstd.NewWriter(nil, zstd.WithEncoderLevel(c.Level),
+			zstd.WithEncoderConcurrency(maxEncoderConcurrency()))
 		if err != nil {
 			// klauspost/compress's NewWriter never returns a non-nil
 			// error in practice for valid level constants; we panic

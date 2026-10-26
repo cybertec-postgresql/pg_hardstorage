@@ -69,6 +69,13 @@ type scheduledTask struct {
 	nextDue time.Time
 	lastRun time.Time
 	lastErr error
+
+	// inflight is closed when the most recent Run goroutine has returned.
+	// A run that was abandoned (ignored its cancellation) leaves it open;
+	// the engine then refuses to start another Run of the same task on top
+	// of it, so a wedged task holds ONE leaked goroutine instead of one per
+	// cadence tick -- and never runs two overlapping instances of a backup.
+	inflight chan struct{}
 }
 
 // Clock abstracts time.Now / time.After for tests. Production code
@@ -340,7 +347,18 @@ func (e *Engine) runOne(ctx context.Context, st *scheduledTask, dueAt time.Time)
 		e.onStart(st.t.Name, dueAt)
 	}
 	start := e.clock.Now()
-	err := e.runBounded(ctx, st)
+	var err error
+	if st.inflight != nil {
+		select {
+		case <-st.inflight:
+			st.inflight = nil
+		default:
+			err = fmt.Errorf("schedule: task %q skipped: its previous run was abandoned after exceeding its run ceiling and has still not returned", st.t.Name)
+		}
+	}
+	if err == nil {
+		err = e.runBounded(ctx, st)
+	}
 	dur := e.clock.Now().Sub(start)
 	if e.onFinish != nil {
 		e.onFinish(st.t.Name, dueAt, dur, err)
@@ -405,7 +423,13 @@ func (e *Engine) runBounded(ctx context.Context, st *scheduledTask) error {
 	defer cancel()
 
 	done := make(chan error, 1)
-	go func() { done <- safeRun(tctx, st.t.Run) }()
+	fin := make(chan struct{})
+	st.inflight = fin
+	go func() {
+		err := safeRun(tctx, st.t.Run)
+		close(fin)
+		done <- err
+	}()
 
 	select {
 	case err := <-done:
