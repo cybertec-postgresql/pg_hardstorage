@@ -24,6 +24,24 @@ import (
 	"sync"
 )
 
+// OnWarning receives non-fatal spill findings (the spill directory is on
+// tmpfs). The default writes one line to stderr. Replace it before any set
+// spills; it is called with no locks held by the caller's data.
+var OnWarning = func(msg string) { fmt.Fprintln(os.Stderr, "pg_hardstorage: warning: "+msg) }
+
+// Seams for tests.
+var (
+	freeBytesFn  = freeBytes
+	inMemoryFSFn = inMemoryFS
+)
+
+// warnedDirs makes the tmpfs warning fire once per directory per process.
+var warnedDirs sync.Map
+
+// hotSlots is the size of the recently-seen-present cache a spilled set
+// keeps for Add (65536 keys, 2 MiB).
+const hotSlots = 1 << 16
+
 // Key is a SHA-256 content hash.
 type Key = [32]byte
 
@@ -91,6 +109,14 @@ type HashSet struct {
 	// amortised while the buffer, which cannot be shed, keeps growing.
 	retryAt int
 
+	// hot is a direct-mapped cache of keys Add already found in a run
+	// file. The set only grows, so a cached key is present forever; a
+	// re-Add of it (the same chunk referenced again soon after, which
+	// manifests do all the time) answers without the Bloom positive's
+	// 32 KiB block read. Allocated at the first spill; written only by Add
+	// (under the write lock), so concurrent Has may read it.
+	hot []Key
+
 	// errMu guards err on its own: lookups run under the read lock and
 	// must still be able to record a damaged run file.
 	errMu sync.Mutex
@@ -121,7 +147,13 @@ func (s *HashSet) Add(k Key) bool {
 	if _, ok := s.mem[k]; ok {
 		return false
 	}
-	if s.inRunsLocked(k) {
+	if s.hot != nil && s.hot[hotSlot(k)] == k {
+		return false
+	}
+	if found, clean := s.lookupRunsLocked(k); found {
+		if clean && s.hot != nil && k != (Key{}) {
+			s.hot[hotSlot(k)] = k
+		}
 		return false
 	}
 	s.mem[k] = struct{}{}
@@ -141,6 +173,9 @@ func (s *HashSet) Has(k Key) bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	if _, ok := s.mem[k]; ok {
+		return true
+	}
+	if s.hot != nil && k != (Key{}) && s.hot[hotSlot(k)] == k {
 		return true
 	}
 	return s.inRunsLocked(k)
@@ -226,13 +261,25 @@ func (s *HashSet) Close() error {
 	}
 	s.runs = nil
 	s.mem = nil
+	s.hot = nil
 	if s.dir != "" {
 		_ = os.RemoveAll(s.dir)
 	}
 	return s.Err()
 }
 
+// hotSlot maps a (uniformly distributed) key to its cache slot.
+func hotSlot(k Key) int { return int(k[0])<<8 | int(k[1]) }
+
 func (s *HashSet) inRunsLocked(k Key) bool {
+	found, _ := s.lookupRunsLocked(k)
+	return found
+}
+
+// lookupRunsLocked is inRunsLocked that also reports whether the answer is
+// trustworthy (clean=false: a run could not be read and "present" is a
+// conservative guess, not a fact worth caching).
+func (s *HashSet) lookupRunsLocked(k Key) (found, clean bool) {
 	for i := len(s.runs) - 1; i >= 0; i-- {
 		found, err := s.runs[i].has(k)
 		if err != nil {
@@ -240,13 +287,13 @@ func (s *HashSet) inRunsLocked(k Key) bool {
 			// "present" so a GC never deletes a chunk because of it, and
 			// record the failure for callers that check Err.
 			s.setErr(err)
-			return true
+			return true, false
 		}
 		if found {
-			return true
+			return true, true
 		}
 	}
-	return false
+	return false, true
 }
 
 func (s *HashSet) ensureDirLocked() error {
@@ -258,6 +305,33 @@ func (s *HashSet) ensureDirLocked() error {
 		return fmt.Errorf("spill: create temp dir: %w", err)
 	}
 	s.dir = d
+	if inMemoryFSFn(d) {
+		if _, dup := warnedDirs.LoadOrStore(s.opts.Dir, struct{}{}); !dup && OnWarning != nil {
+			OnWarning(fmt.Sprintf("the spill directory %s is on tmpfs/ramfs: spilled hashes are held in RAM, defeating the memory bound; point TMPDIR (or the command's spool directory) at a disk-backed volume", d))
+		}
+	}
+	return nil
+}
+
+// ErrNoSpace is wrapped by the spill preflight when the spill volume cannot
+// hold the file about to be written.
+var ErrNoSpace = errors.New("spill: not enough free space")
+
+// preflightLocked refuses to start writing a run of `keys` keys when the
+// spill volume visibly cannot take it, so a 100 TB run fails with a clear
+// message instead of ENOSPC halfway through a merge. A merge writes its
+// output BEFORE removing its inputs, so it transiently needs the full size
+// of the merged run on top of what is already there.
+func (s *HashSet) preflightLocked(keys int64) error {
+	free, ok := freeBytesFn(s.dir)
+	if !ok {
+		return nil
+	}
+	need := keys * keyLen
+	if free < need {
+		return fmt.Errorf("%w in %s: need about %d MiB for the next merge (inputs are removed only after it completes), %d MiB free; set TMPDIR to a larger volume",
+			ErrNoSpace, s.dir, need>>20, free>>20)
+	}
 	return nil
 }
 
@@ -268,6 +342,9 @@ func (s *HashSet) flushLocked() error {
 		return nil
 	}
 	if err := s.ensureDirLocked(); err != nil {
+		return err
+	}
+	if err := s.preflightLocked(int64(len(s.mem))); err != nil {
 		return err
 	}
 	keys := make([]Key, 0, len(s.mem))
@@ -288,6 +365,9 @@ func (s *HashSet) flushLocked() error {
 		return err
 	}
 	s.runs = append(s.runs, r)
+	if s.hot == nil {
+		s.hot = make([]Key, hotSlots)
+	}
 	s.mem = make(map[Key]struct{})
 	for n := len(s.runs); n >= 2 && s.runs[n-1].level == s.runs[n-2].level; n = len(s.runs) {
 		if err := s.mergeTailLocked(2); err != nil {
@@ -313,6 +393,9 @@ func (s *HashSet) mergeTailLocked(n int) error {
 			level = r.level + 1
 		}
 		upper += r.n
+	}
+	if err := s.preflightLocked(upper); err != nil {
+		return err
 	}
 	next, stop := newMergeIter(in)
 	defer stop()
