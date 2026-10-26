@@ -622,6 +622,15 @@ func runWalFetch(cmd *cobra.Command, opts walFetchOptions) error {
 			fmt.Sprintf("wal fetch: manifest segment_number=%d but caller asked for %d (segment %q, size %d)",
 				m.SegmentNumber, expectedSegNum, opts.segmentName, m.SegmentSize))
 	}
+	// The manifest is unsigned, so confirm it is the one this key is
+	// supposed to hold: a manifest copied from another timeline, segment
+	// or deployment would otherwise assemble hash-valid but WRONG WAL.
+	if m.Timeline != tli || m.SegmentName != opts.segmentName ||
+		(m.Deployment != "" && m.Deployment != opts.deployment) {
+		return output.NewError("wal.fetch.manifest_mismatch",
+			fmt.Sprintf("wal fetch: manifest at %s describes %s/%s timeline %d, not %s/%s timeline %d (replayed or misplaced segment manifest)",
+				key, m.Deployment, m.SegmentName, m.Timeline, opts.deployment, opts.segmentName, tli))
+	}
 	if err := checkFetchSystemIdentifier(opts.expectSysID, m.SystemIdentifier, opts.segmentName); err != nil {
 		return err
 	}

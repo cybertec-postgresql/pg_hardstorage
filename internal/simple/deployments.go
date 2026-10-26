@@ -4,6 +4,7 @@ package simple
 import (
 	"errors"
 	"fmt"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/pg/dsnredact"
 	"sort"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/simple/prompt"
@@ -83,31 +84,9 @@ func pickDeployment(env *Env, question string) (Deployment, error) {
 // next step instead of a raw error.
 var errNoDeployments = errors.New("no deployments configured")
 
-// redactPassword turns `postgres://user:secret@host/db` into
-// `postgres://user:***@host/db` for terminal display.  Best-effort —
-// we only collapse the standard libpq URL shape; anything weirder
-// shows as-is.
-func redactPassword(dsn string) string {
-	// `postgres://U:P@H/D` → split at "://", then at "@".
-	const sep = "://"
-	i := indexOf(dsn, sep)
-	if i < 0 {
-		return dsn
-	}
-	scheme := dsn[:i+len(sep)]
-	rest := dsn[i+len(sep):]
-	at := indexOf(rest, "@")
-	if at < 0 {
-		return dsn // no auth segment
-	}
-	auth := rest[:at]
-	tail := rest[at:]
-	colon := indexOf(auth, ":")
-	if colon < 0 {
-		return dsn
-	}
-	return scheme + auth[:colon+1] + "***" + tail
-}
+// redactPassword masks credentials in a connection string for terminal
+// display, handling both URI and keyword/value libpq forms.
+func redactPassword(dsn string) string { return dsnredact.Redact(dsn) }
 
 func indexOf(s, sub string) int {
 	for i := 0; i+len(sub) <= len(s); i++ {

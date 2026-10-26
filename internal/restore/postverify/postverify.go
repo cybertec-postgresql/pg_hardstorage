@@ -440,7 +440,14 @@ func Verify(ctx context.Context, opts Options) (*Result, error) {
 	// (see bootHBA), and the operator's pg_hba.conf is never touched.
 	// pg_ctl passes -o through /bin/sh, hence the single quotes;
 	// makeWorkDir guarantees the path contains none.
-	pgOpts := fmt.Sprintf("-p %d -c listen_addresses='' -c unix_socket_directories='%s' -c hba_file='%s' -c logging_collector=off -c shared_buffers=128MB",
+	//
+	// archive_mode=off: the restored postgresql.conf is the SOURCE's, and
+	// the usual one carries archive_mode=on with archive_command=
+	// `pg_hardstorage wal push` aimed at the PRODUCTION repository. The
+	// boot test finishes recovery and promotes onto a new timeline, after
+	// which that archiver would push timeline-N history and WAL from a
+	// throwaway verification cluster into the live archive.
+	pgOpts := fmt.Sprintf("-p %d -c listen_addresses='' -c unix_socket_directories='%s' -c hba_file='%s' -c logging_collector=off -c shared_buffers=128MB -c archive_mode=off",
 		port, workDir, hbaFile)
 	startArgs := []string{
 		"-D", opts.DataDir,

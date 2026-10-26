@@ -203,7 +203,7 @@ type Error struct {
 func NewError(code, msg string) *Error {
 	return &Error{
 		Code:     code,
-		Message:  msg,
+		Message:  ScrubSecrets(msg),
 		Severity: SeverityError,
 	}
 }
@@ -223,6 +223,12 @@ func (e *Error) WithSubject(s Subject) *Error {
 
 // WithSuggestion attaches a remediation hint.
 func (e *Error) WithSuggestion(s *Suggestion) *Error {
+	if s != nil {
+		cp := *s
+		cp.Human = ScrubSecrets(cp.Human)
+		cp.Command = ScrubSecrets(cp.Command)
+		s = &cp
+	}
 	e.Suggestion = s
 	return e
 }
@@ -275,7 +281,7 @@ func ToError(err error) *Error {
 	}
 	return &Error{
 		Code:     "internal",
-		Message:  err.Error(),
+		Message:  ScrubSecrets(err.Error()),
 		Severity: SeverityError,
 		Cause:    err,
 	}

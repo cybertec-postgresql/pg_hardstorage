@@ -58,7 +58,7 @@ func (ms *ManifestStore) streamFilesT(ctx context.Context, deployment, backupID 
 		}
 	}
 	primaryKey := PrimaryPath(deployment, backupID)
-	info, key, primaryErr := ms.streamOne(ctx, primaryKey, opts, gate, fn)
+	info, key, primaryErr := ms.streamOne(ctx, primaryKey, deployment, backupID, opts, gate, fn)
 	if primaryErr == nil {
 		info.Key = key
 		return info, nil
@@ -74,7 +74,7 @@ func (ms *ManifestStore) streamFilesT(ctx context.Context, deployment, backupID 
 		return nil, de.err
 	}
 	replicaKey := ReplicaPath(backupID)
-	rinfo, rkey, replicaErr := ms.streamOne(ctx, replicaKey, opts, gate, fn)
+	rinfo, rkey, replicaErr := ms.streamOne(ctx, replicaKey, deployment, backupID, opts, gate, fn)
 	if replicaErr == nil {
 		if rinfo.Manifest.Deployment == deployment && rinfo.Manifest.BackupID == backupID {
 			rinfo.Key = rkey
@@ -90,7 +90,7 @@ func (ms *ManifestStore) streamFilesT(ctx context.Context, deployment, backupID 
 }
 
 // streamOne reads one object: verify pass (when gate), then deliver pass.
-func (ms *ManifestStore) streamOne(ctx context.Context, key string, opts StreamOptions, gate bool, fn func(*FileEntry) error) (*StreamInfo, string, error) {
+func (ms *ManifestStore) streamOne(ctx context.Context, key, deployment, backupID string, opts StreamOptions, gate bool, fn func(*FileEntry) error) (*StreamInfo, string, error) {
 	get := func(o StreamOptions, cb func(*FileEntry) error) (*StreamInfo, error) {
 		rc, err := ms.sp.Get(ctx, key)
 		if err != nil {
@@ -115,6 +115,13 @@ func (ms *ManifestStore) streamOne(ctx context.Context, key string, opts StreamO
 	first, err := get(opts, nil)
 	if err != nil {
 		return nil, key, err
+	}
+	// The signature does not cover the storage key: a validly-signed
+	// manifest copied over another backup's key (rollback / replay) must
+	// not be served as that backup. Checked before any entry is delivered.
+	if first.Manifest != nil && (first.Manifest.Deployment != deployment || first.Manifest.BackupID != backupID) {
+		return nil, key, fmt.Errorf("backup: manifest at %s is for %s/%s, not %s/%s (replayed or misplaced manifest)",
+			key, first.Manifest.Deployment, first.Manifest.BackupID, deployment, backupID)
 	}
 	if fn == nil {
 		return first, key, nil

@@ -656,7 +656,7 @@ func Restore(ctx context.Context, opts Options) (res *Result, err error) {
 		if err != nil {
 			return nil, fmt.Errorf("restore: dir %s: %w", d.Path, err)
 		}
-		mode := stdfs.FileMode(d.Mode)
+		mode := stdfs.FileMode(d.Mode).Perm()
 		if mode == 0 {
 			mode = 0o700
 		}
@@ -1367,7 +1367,7 @@ func materializeFile(ctx context.Context, cas *repo.CAS, destRoot string, f *bac
 		return 0, 0, fmt.Errorf("mkdir parent: %w", err)
 	}
 
-	mode := stdfs.FileMode(f.Mode)
+	mode := stdfs.FileMode(f.Mode).Perm()
 	if mode == 0 {
 		mode = 0o600 // PG default for data files
 	}

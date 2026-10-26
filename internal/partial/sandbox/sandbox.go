@@ -399,6 +399,7 @@ func buildSandboxAutoConf(existing []byte, sockDir string) []byte {
 		"# pg_hardstorage sandbox overrides — restored on Stop\n"+
 			"port = 5432\n"+ // socket-file name suffix
 			"listen_addresses = ''\n"+
+			"archive_mode = off\n"+ // never push this throwaway cluster's WAL to the source archive
 			"unix_socket_directories = '%s'\n"+
 			"hba_file = '%s'\n",
 		sockDir, filepath.Join(sockDir, "pg_hba.conf"),

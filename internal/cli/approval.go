@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -599,7 +600,7 @@ func runApprovalRevoke(cmd *cobra.Command, id, repoURL, by, reason string) error
 func loadPrivateKeyForApproval(keyFile string) (ed25519.PrivateKey, error) {
 	var pemBody []byte
 	if keyFile != "" {
-		body, err := os.ReadFile(keyFile)
+		body, err := keystore.ReadPrivateKeyFile(keyFile)
 		if err != nil {
 			return nil, output.NewError("usage.bad_key_file",
 				fmt.Sprintf("approval approve: read key file: %v", err)).Wrap(output.ErrUsage)
@@ -613,7 +614,7 @@ func loadPrivateKeyForApproval(keyFile string) (ed25519.PrivateKey, error) {
 		if err != nil {
 			return nil, output.NewError("internal", err.Error()).Wrap(err)
 		}
-		body, err := os.ReadFile(p.Keyring.Value + "/" + keystore.PrivateKeyFile)
+		body, err := keystore.ReadPrivateKeyFile(filepath.Join(p.Keyring.Value, keystore.PrivateKeyFile))
 		if err != nil {
 			return nil, output.NewError("approval.no_signing_key",
 				fmt.Sprintf("approval approve: pass --key to point at the approver's private key, or run any backup/restore command first to bootstrap a signing key (%v)", err)).

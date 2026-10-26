@@ -49,6 +49,31 @@ func assertKEKFileMode(path string) error {
 	return nil
 }
 
+// ReadKEKFile loads a raw 32-byte KEK from an operator-supplied path
+// (--kek-file / --old-kek-file / --new-kek-file) under the same rules as
+// the keyring's own kek.bin: a regular file, no group/other permission
+// bits, exactly KeyLen bytes and not all zeros. Without these a
+// world-readable or zeroed file would silently become the key that wraps
+// every DEK.
+func ReadKEKFile(path string) ([encryption.KeyLen]byte, error) {
+	var kek [encryption.KeyLen]byte
+	if err := assertKEKFileMode(path); err != nil {
+		return kek, err
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		return kek, fmt.Errorf("keystore: read %s: %w", path, err)
+	}
+	if len(body) != encryption.KeyLen {
+		return kek, fmt.Errorf("keystore: %s: expected %d bytes, got %d", path, encryption.KeyLen, len(body))
+	}
+	if err := rejectZeroKEK(path, body); err != nil {
+		return kek, err
+	}
+	copy(kek[:], body)
+	return kek, nil
+}
+
 // KEKRefLocal is the manifest's KEKRef value when the KEK was loaded
 // from the local keyring file.+ adds kms-backed KEKs with refs
 // like "kms:aws:arn:..." or "kms:vault:secret/..." — the manifest

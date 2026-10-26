@@ -532,7 +532,7 @@ func (ms *ManifestStore) Read(ctx context.Context, deployment, backupID string, 
 		return nil, ErrTombstoned
 	}
 	primaryKey := PrimaryPath(deployment, backupID)
-	m, primaryErr := ms.readVerified(ctx, primaryKey, verifier)
+	m, primaryErr := ms.readVerifiedFor(ctx, primaryKey, verifier, deployment, backupID)
 	if primaryErr == nil {
 		return m, nil
 	}
@@ -600,12 +600,12 @@ func (ms *ManifestStore) ReadIncludingTombstoned(ctx context.Context, deployment
 		return nil, false, fmt.Errorf("backup: tombstone check %s: %w", backupID, err)
 	}
 	primaryKey := PrimaryPath(deployment, backupID)
-	m, primaryErr := ms.readVerified(ctx, primaryKey, verifier)
+	m, primaryErr := ms.readVerifiedFor(ctx, primaryKey, verifier, deployment, backupID)
 	if primaryErr == nil {
 		return m, dead, nil
 	}
 	replicaKey := ReplicaPath(backupID)
-	replicaM, replicaErr := ms.readVerified(ctx, replicaKey, verifier)
+	replicaM, replicaErr := ms.readVerifiedFor(ctx, replicaKey, verifier, deployment, backupID)
 	if replicaErr == nil {
 		return replicaM, dead, nil
 	}
@@ -615,6 +615,24 @@ func (ms *ManifestStore) ReadIncludingTombstoned(ctx context.Context, deployment
 	}
 	return nil, false, fmt.Errorf("backup: read %s: primary failed (%w) and replica failed (%v)",
 		backupID, primaryErr, replicaErr)
+}
+
+// readVerifiedFor is readVerified plus an identity check: the signed
+// manifest body must name the deployment and backup ID it was fetched
+// under. The Ed25519 signature covers the body but not the storage key,
+// so without this an attacker with repo write access can copy an older,
+// validly-signed manifest over a newer backup's key (rollback / replay)
+// and a restore of "backup B" silently materialises backup A's data.
+func (ms *ManifestStore) readVerifiedFor(ctx context.Context, key string, verifier *Verifier, deployment, backupID string) (*Manifest, error) {
+	m, err := ms.readVerified(ctx, key, verifier)
+	if err != nil {
+		return nil, err
+	}
+	if m.Deployment != deployment || m.BackupID != backupID {
+		return nil, fmt.Errorf("backup: manifest at %s is for %s/%s, not %s/%s (replayed or misplaced manifest)",
+			key, m.Deployment, m.BackupID, deployment, backupID)
+	}
+	return m, nil
 }
 
 func (ms *ManifestStore) readVerified(ctx context.Context, key string, verifier *Verifier) (*Manifest, error) {
@@ -960,6 +978,10 @@ func (ms *ManifestStore) List(ctx context.Context, deployment string, verifier *
 				}
 			}
 			m, err := ms.readVerified(ctx, key, verifier)
+			if err == nil && slash > 0 && (m.BackupID != rel[:slash] || m.Deployment != deployment) {
+				m, err = nil, fmt.Errorf("backup: manifest at %s is for %s/%s (replayed or misplaced manifest)",
+					key, m.Deployment, m.BackupID)
+			}
 			if !yield(m, err) {
 				return
 			}
@@ -1029,6 +1051,10 @@ func (ms *ManifestStore) ListIncludingTombstoned(ctx context.Context, deployment
 			}
 			_, dead := tombstoned[id]
 			m, err := ms.readVerified(ctx, key, verifier)
+			if err == nil && id != "" && (m.BackupID != id || m.Deployment != deployment) {
+				m, err = nil, fmt.Errorf("backup: manifest at %s is for %s/%s (replayed or misplaced manifest)",
+					key, m.Deployment, m.BackupID)
+			}
 			if err != nil {
 				if !yield(ManifestEntry{}, err) {
 					return

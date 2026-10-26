@@ -4,8 +4,8 @@ package cli
 import (
 	"context"
 	"fmt"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup/keystore"
 	"io"
-	"os"
 	"strings"
 	"time"
 
@@ -251,17 +251,7 @@ func runKMSRotate(cmd *cobra.Command, f kmsRotateFlags) error {
 // readKEKFile reads exactly KeyLen bytes from path. Files larger
 // or smaller are an error (KEKs are fixed-size 32-byte values).
 func readKEKFile(path string) ([encryption.KeyLen]byte, error) {
-	var k [encryption.KeyLen]byte
-	body, err := os.ReadFile(path)
-	if err != nil {
-		return k, fmt.Errorf("read %s: %w", path, err)
-	}
-	if len(body) != encryption.KeyLen {
-		return k, fmt.Errorf("%s: expected %d bytes, got %d",
-			path, encryption.KeyLen, len(body))
-	}
-	copy(k[:], body)
-	return k, nil
+	return keystore.ReadKEKFile(path)
 }
 
 // emitKMSRotateAudits appends ONE kms.rotate audit event per run
