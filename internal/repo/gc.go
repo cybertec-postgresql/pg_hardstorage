@@ -513,10 +513,24 @@ func FindMissingLimit(ctx context.Context, sp storage.StoragePlugin, refs *RefSe
 // chunks. mismatch is the count of chunks whose on-disk hash
 // disagreed with their key. Bytes is the total bytes read.
 type ScrubResult struct {
-	Sampled    int
-	OK         int
-	Mismatches []Hash
-	Bytes      int64
+	Sampled int
+	OK      int
+	// Mismatches holds the first ScrubMismatchListLimit mismatching hashes
+	// in discovery order; MismatchCount is the exact number. A repository
+	// with widespread damage has far more than fits in a list.
+	Mismatches    []Hash
+	MismatchCount int
+	Bytes         int64
+}
+
+// ScrubMismatchListLimit bounds ScrubResult.Mismatches.
+const ScrubMismatchListLimit = 1024
+
+func (r *ScrubResult) noteMismatch(h Hash) {
+	r.MismatchCount++
+	if len(r.Mismatches) < ScrubMismatchListLimit {
+		r.Mismatches = append(r.Mismatches, h)
+	}
 }
 
 // Scrub samples up to limit chunks, fetches each, and verifies the
@@ -552,7 +566,7 @@ func Scrub(ctx context.Context, cas *CAS, refs *RefSet, limit int) (ScrubResult,
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				return err
 			}
-			res.Mismatches = append(res.Mismatches, h)
+			res.noteMismatch(h)
 			res.Sampled++
 			return nil
 		}
@@ -560,7 +574,7 @@ func Scrub(ctx context.Context, cas *CAS, refs *RefSet, limit int) (ScrubResult,
 		// re-verify here to guard against any future wrapping that
 		// might silently bypass that check.
 		if Hash(sha256.Sum256(body)) != h {
-			res.Mismatches = append(res.Mismatches, h)
+			res.noteMismatch(h)
 			res.Sampled++
 			return nil
 		}

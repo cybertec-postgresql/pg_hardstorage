@@ -93,27 +93,66 @@ func replicateManifestStreamed(ctx context.Context, src, dst storage.StoragePlug
 		res.ManifestsFailed++
 		return
 	}
-	if !copyKeyStreamed(ctx, src, dst, key, size, opts, res) {
+	if !copyKeyStreamed(ctx, src, dst, key, size, opts, res, false) {
 		return
 	}
 	if !confirmDstFence(ctx, src, dst, key, fence, adopted, opts, res) {
 		res.ManifestsFailed++
 		return
 	}
-	if backupID != "" {
-		replicaKey := "manifests/_replicas/" + backupID + ".manifest.json"
-		if rb, rerr := readKey(ctx, src, replicaKey); rerr == nil {
-			copyKey(ctx, src, dst, replicaKey, rb, opts, res, manifestKind, true)
-		}
+	mirrorManifestReplica(ctx, src, dst, backupID, opts, res)
+}
+
+// mirrorManifestReplica copies manifests/_replicas/<id>.manifest.json when
+// the source has one. It is best-effort redundancy (the primary already
+// committed at dst), but never silent: a replica that cannot be read or
+// copied is recorded and counted in ManifestReplicasFailed. A sidecar of a
+// huge backup is as large as the manifest itself, so anything above
+// replicateStreamThreshold is copied as a stream rather than read whole.
+func mirrorManifestReplica(ctx context.Context, src, dst storage.StoragePlugin, backupID string, opts ReplicateOptions, res *ReplicateResult) {
+	if backupID == "" {
+		return
 	}
+	replicaKey := "manifests/_replicas/" + backupID + ".manifest.json"
+	st, serr := src.Stat(ctx, replicaKey)
+	if errors.Is(serr, storage.ErrNotFound) {
+		return // no sidecar: normal
+	}
+	if serr != nil {
+		recordReplicateFailure(res, replicaKey, fmt.Errorf("stat manifest replica at src (not copied): %w", serr))
+		res.ManifestReplicasFailed++
+		return
+	}
+	if st.Size > replicateStreamThreshold {
+		copyKeyStreamed(ctx, src, dst, replicaKey, st.Size, opts, res, true)
+		return
+	}
+	rb, rerr := readKey(ctx, src, replicaKey)
+	if rerr != nil {
+		if errors.Is(rerr, storage.ErrNotFound) {
+			return // raced with a delete
+		}
+		recordReplicateFailure(res, replicaKey, fmt.Errorf("read manifest replica at src (not copied): %w", rerr))
+		res.ManifestReplicasFailed++
+		return
+	}
+	copyKey(ctx, src, dst, replicaKey, rb, opts, res, manifestKind, true)
 }
 
 // copyKeyStreamed is copyKey + refreshKey for a manifest copied as a
 // stream: idempotent (IfNotExists), and a differing existing object
 // (kms rotate rewrote the source) is refreshed, not skipped.
-func copyKeyStreamed(ctx context.Context, src, dst storage.StoragePlugin, key string, size int64, opts ReplicateOptions, res *ReplicateResult) bool {
+//
+// bestEffort (the _replicas/ sidecar) counts failures in
+// ManifestReplicasFailed instead of ManifestsFailed and reports success so
+// the primary's outcome is unaffected.
+func copyKeyStreamed(ctx context.Context, src, dst storage.StoragePlugin, key string, size int64, opts ReplicateOptions, res *ReplicateResult, bestEffort bool) bool {
 	fail := func(err error) bool {
 		recordReplicateFailure(res, key, err)
+		if bestEffort {
+			res.ManifestReplicasFailed++
+			return true
+		}
 		res.ManifestsFailed++
 		return false
 	}

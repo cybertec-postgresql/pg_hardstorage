@@ -334,3 +334,33 @@ func TestHeal_AppliesWORMLock(t *testing.T) {
 		t.Errorf("retention mode = %q, want compliance", rec.mode)
 	}
 }
+
+// HealStream consumes hashes one at a time and heals the same as Heal.
+func TestHealStream_HealsFromProducer(t *testing.T) {
+	dst, replica := twoRepos(t)
+	var hs []repo.Hash
+	for _, b := range []string{"a-chunk", "b-chunk", "c-chunk"} {
+		h := putChunk(t, replica, env([]byte(b)))
+		corruptChunkAt(t, dst, h, env([]byte("garbage-"+b)))
+		hs = append(hs, h)
+	}
+	res, err := repo.HealStream(context.Background(), dst, replica, func(fn func(repo.Hash) error) error {
+		for _, h := range hs {
+			if err := fn(h); err != nil {
+				return err
+			}
+		}
+		return nil
+	}, repo.HealOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Considered != 3 || res.Healed != 3 {
+		t.Fatalf("Considered=%d Healed=%d, want 3/3: %+v", res.Considered, res.Healed, res)
+	}
+	// A producer error aborts with the partial result.
+	stop := errors.New("stop")
+	if _, err := repo.HealStream(context.Background(), dst, replica, func(fn func(repo.Hash) error) error { return stop }, repo.HealOptions{}); !errors.Is(err, stop) {
+		t.Fatalf("err = %v, want producer error", err)
+	}
+}

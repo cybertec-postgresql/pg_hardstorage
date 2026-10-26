@@ -43,6 +43,17 @@ type SweepOptions struct {
 	BatchSize         int
 	DeleteConcurrency int
 
+	// BatchDuration lets one fence checkpoint (run-record bump, pin read,
+	// lease check and the manifest rescan) cover several BatchSize slices
+	// of deletes for up to this long, so a repository with hundreds of
+	// millions of orphans pays for the rescan once per BatchDuration of
+	// deleting instead of once per BatchSize chunks. Zero means: adaptive
+	// (GCFenceMaxWait/5) when BatchSize is also zero, else one checkpoint
+	// per BatchSize slice. Negative forces one checkpoint per slice. It is
+	// always capped so rescan + deletes stay well inside GCFenceMaxWait:
+	// a writer waits for the whole checkpoint (see gcfence.go).
+	BatchDuration time.Duration
+
 	// Now is the clock (default time.Now).
 	Now func() time.Time
 
@@ -485,7 +496,9 @@ type orphanInfo struct {
 //     no orphan is Stat'd (neither for the reclaim estimate nor before
 //     its delete);
 //   - the pre-delete rescans are incremental: only manifests that are
-//     new or changed since the previous scan are read;
+//     new or changed since the previous scan are read, and one fence
+//     checkpoint (one rescan) covers up to BatchDuration of deletes, so
+//     the listing cost is not paid once per 4096 chunks;
 //   - manifests are read concurrently, hashes sort by bytes.
 func Sweep(ctx context.Context, sp storage.StoragePlugin, opts SweepOptions) (*SweepResult, error) {
 	clock := opts.Now
@@ -594,12 +607,24 @@ func Sweep(ctx context.Context, sp storage.StoragePlugin, opts SweepOptions) (*S
 	if conc <= 0 {
 		conc = 16
 	}
+	// How long one checkpoint may keep deleting. A writer that pinned after
+	// the checkpoint's pin read waits for the NEXT checkpoint (seq+1), i.e.
+	// for the rescan and every delete of this one, and gives up after
+	// GCFenceMaxWait; the whole checkpoint is therefore held to 3/5 of it.
+	slice := opts.BatchDuration
+	if slice == 0 && opts.BatchSize <= 0 {
+		slice = GCFenceMaxWait / 5
+	}
+	maxCheckpoint := GCFenceMaxWait * 3 / 5
 	pins := newGCPinSet()
 	defer pins.close()
 	var mu sync.Mutex
 	remaining := res.OrphanCount
 	b := 0
-	berr := olog.batches(batchSize, func(batch []orphanInfo) error {
+	var deadline time.Time // end of the open checkpoint's delete window
+	warnedSlow := false
+	checkpoint := func() error {
+		began := time.Now()
 		// Checkpoint: publish seq, THEN read pins and rescan.
 		if err := fence.advance(ctx); err != nil {
 			return fmt.Errorf("repo: gc: publish batch checkpoint (refusing to delete without the fence): %w", err)
@@ -632,6 +657,31 @@ func Sweep(ctx context.Context, sp storage.StoragePlugin, opts SweepOptions) (*S
 		}
 		if opts.beforeDelete != nil {
 			opts.beforeDelete(b)
+		}
+		spent := time.Since(began)
+		window := max(slice, 0)
+		if left := maxCheckpoint - spent; left < window {
+			window = max(left, 0)
+		}
+		if spent > maxCheckpoint {
+			if !warnedSlow && opts.OnWarning != nil {
+				warnedSlow = true
+				opts.OnWarning(fmt.Sprintf("gc: the manifest rescan took %s, more than 3/5 of the writer fence wait (%s); a committing backup may be told to retry", spent.Round(time.Second), GCFenceMaxWait))
+			}
+		}
+		deadline = time.Now().Add(window)
+		b++
+		return nil
+	}
+	berr := olog.batches(batchSize, func(batch []orphanInfo) error {
+		// Open a new checkpoint unless the current one still has delete
+		// time left. Pins read at its start stay valid for every slice
+		// under it: a writer pinning later waits for the NEXT checkpoint,
+		// which is published only after these deletes finished.
+		if !time.Now().Before(deadline) {
+			if err := checkpoint(); err != nil {
+				return err
+			}
 		}
 		if err := fence.checkFresh(); err != nil {
 			return err
@@ -666,7 +716,6 @@ func Sweep(ctx context.Context, sp storage.StoragePlugin, opts SweepOptions) (*S
 		}
 		wg.Wait()
 		remaining -= len(batch)
-		b++
 		return ctx.Err()
 	})
 	if berr != nil {

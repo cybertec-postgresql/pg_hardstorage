@@ -462,13 +462,9 @@ func replicateManifest(ctx context.Context, src, dst storage.StoragePlugin, key,
 	// Mirror the _replicas/<id>.manifest.json copy if it exists at
 	// src. The replica is best-effort redundancy; failure to copy
 	// it does NOT bump ManifestsFailed (the primary already
-	// committed at dst, which is the contract).
-	if backupID != "" {
-		replicaKey := "manifests/_replicas/" + backupID + ".manifest.json"
-		if rb, rerr := readKey(ctx, src, replicaKey); rerr == nil {
-			copyKey(ctx, src, dst, replicaKey, rb, opts, res, manifestKind, true /* best-effort */)
-		}
-	}
+	// committed at dst, which is the contract) but is counted in
+	// ManifestReplicasFailed and recorded.
+	mirrorManifestReplica(ctx, src, dst, backupID, opts, res)
 }
 
 // replicateWALManifest copies one WAL segment manifest + its chunks.

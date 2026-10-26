@@ -86,3 +86,25 @@ func TestReplicate_Streamed_RewrittenSourceIsRefreshed(t *testing.T) {
 		t.Fatalf("want refresh: %+v", res)
 	}
 }
+
+// A redundancy sidecar above the stream threshold is streamed to the
+// replica instead of being silently skipped by the in-memory read cap.
+func TestReplicate_Streamed_ManifestReplicaSidecarIsCopied(t *testing.T) {
+	defer repo.SetReplicateStreamThresholdForTest(1)()
+	src, dst := twoRepos(t)
+	c1 := putChunk(t, src, []byte("one"))
+	putManifest(t, src, "db1", "db1.full.20260430T0900Z", []repo.Hash{c1})
+	const rk = "manifests/_replicas/db1.full.20260430T0900Z.manifest.json"
+	putRaw(t, src, rk, []byte(`{"replica":"body larger than the threshold"}`))
+
+	res, err := repo.Replicate(context.Background(), src, dst, repo.ReplicateOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.ManifestReplicasFailed != 0 || res.ManifestsFailed != 0 {
+		t.Fatalf("unexpected failures: %+v", res)
+	}
+	if !statExists(t, dst, rk) {
+		t.Fatal("manifest replica sidecar was not copied to dst")
+	}
+}
