@@ -59,6 +59,16 @@ event) and treated as empty, so tasks err toward running now rather
 than later; a failed write is reported as
 `schedule.state_write_failed`.
 
+**Editing a schedule.** The agent builds its task list once, when it
+starts; it does not watch `pg_hardstorage.yaml`. A schedule you change in
+the file or with `pg_hardstorage schedule <deployment> <expression>` takes
+effect only after the agent is restarted. While an agent is running on the
+host, `schedule` compares the configured schedule with the one the agent
+loaded (recorded in `<state dir>/agent-loaded-schedule.json`) and marks
+every difference `NOT RUNNING YET: agent still runs ...`; the JSON output
+carries `pending_restart`, `agent_running` and an `agent` object with
+`restart_required`. A record left behind by a crashed agent is ignored.
+
 ## Steps
 
 ### 1. Show all schedules (fleet view)

@@ -26,6 +26,10 @@ List committed WAL segments in the repository
 	help for list
 
 .PP
+\fB--limit\fP=100000
+	list at most this many segments (0 = unlimited); gap and timeline summaries always cover every segment
+
+.PP
 \fB--repo\fP=""
 	repository URL (file://, s3://, ...) — must already exist (required)
 

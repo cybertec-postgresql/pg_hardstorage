@@ -68,6 +68,7 @@ pg_hardstorage recovery drill <deployment> [flags]
       --rto-seconds int                  RTO target in seconds for actual-vs-target comparison
       --skip-verify                      don't run the sandbox verify at all (Docker-free run)
       --tablespace-mapping stringArray   redirect a tablespace: --tablespace-mapping=<old-abs-path>=<new-abs-path> (repeatable). Required when the backup has non-default tablespaces: without it they would be restored to their original absolute paths, overwriting live data on the source host. The mapped dirs are drill scratch: mounted into the verify sandbox at the same path and removed (or, if they pre-existed, emptied) at teardown unless --keep
+      --tablespace-mapping-all string    redirect EVERY non-default tablespace under one absolute scratch directory: tablespace <oid> goes to <dir>/<oid> (pgBackRest's --tablespace-map-all), including tablespaces added after the drill was scheduled. An explicit --tablespace-mapping for a tablespace wins. The per-tablespace dirs are drill scratch, cleaned like mapped dirs
       --temp-base string                 parent directory for the temporary target dir (default: $TMPDIR)
 ```
 

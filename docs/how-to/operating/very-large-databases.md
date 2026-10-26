@@ -58,7 +58,43 @@ manifest at 160 MiB/s, per pass. `list`, `show`, `verify` and `restore`
 each do one or two passes per backup. There is no per-file index; "restore
 one table" still scans the manifest.
 
-## Not yet covered
+## Size limits
 
-`kms rotate`, `backup bundle` and `repair attestation` rewrite manifests and
-still load them whole; they refuse a manifest over 1 GiB.
+No command refuses a manifest because of its size. Every reader of a backup
+manifest (`list`, `show`, `status`, `verify` and `verify --full`,
+`repo check`, `repo scrub`, `restore` and its planning, `backup delete` /
+`undelete`, `rotate`, `integrity`, `doctor`, `recovery drill`, `kms rotate`
+and `kms shred`, `repo bundle export` / `import`, `repo replicate`, `repo gc`
+and `wal prune`) streams it, and the two repair commands that rewrite one,
+`repair manifest` and `repair attestation`, copy and re-sign it as a stream
+through a temp file. `repair attestation` needs disk for the re-signed copy
+(about the manifest size) in `$TMPDIR`.
+
+The 1 GiB constants that earlier releases applied to manifests
+(`MaxManifestBytes`, `MaxMetadataBytes`) now only bound objects that are read
+whole on purpose: tombstones, holds, WAL segment manifests, key records, and
+backup manifests under 64 MiB. A manifest above 64 MiB is always streamed,
+so an existing multi-GB manifest written by 1.5.0 is read as it is; nothing
+has to be re-taken. The streaming readers bound one file entry (256 MiB of
+JSON, a 1 GiB relation segment is about 2 MiB) and the whole document at
+16 TiB.
+
+## Scheduled backups
+
+`backup --chunk-size` has an agent equivalent, because a scheduled backup
+has no command line:
+
+```yaml
+deployments:
+  db1:
+    schedule:
+      backup: { every: "24h" }
+    backup:
+      chunk_size: 1MiB   # average; min = 1/16, max = 4x. One value per deployment, set before the first backup.
+      timeout: 36h       # wall-clock ceiling for one run
+```
+
+Without `backup.timeout` the agent stops a run after twice the schedule
+interval, clamped to 1 h .. 48 h (so `every: 6h` gives 12 h). A full backup of
+a multi-TB database that needs longer than that must either set
+`backup.timeout` or use a longer interval.

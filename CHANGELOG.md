@@ -38,6 +38,35 @@ keeps reading that version for at least 24 months after a successor lands.
   - Memory is bounded by the spill budgets (`spill.DefaultMemEntries`),
     not by database size: a 6M-reference (1.4 GB) manifest is committed,
     verified and walked at a 52 MiB heap peak.
+- **No command refuses a multi-GB manifest any more (#81).** 1.5.0 failed
+  on a 4.2 GB manifest ("object exceeds the 1073741824-byte read limit")
+  in `list`, `status`, `show`, `verify`, `repo check`, `restore`, `backup
+  delete`, `doctor` and `repair manifest`. The streaming readers of the
+  earlier entries cover those; this closes what was left, and an
+  end-to-end test now runs every manifest-reading command against a
+  manifest far above shrunken read caps. An existing oversized manifest
+  is read as it is; no backup has to be re-taken.
+  - `repair manifest` and `repair attestation` verify, copy and re-sign
+    manifests as streams (a re-signed copy is staged in `$TMPDIR`)
+    instead of reading them whole with no cap.
+  - `repo bundle export` / `import` no longer refuse a manifest or its
+    replica over 1 GiB (the replica was also held in memory).
+  - `kms shred`'s affected-backup scan no longer skips an oversized
+    replica manifest, which understated what the shred destroys.
+  - A manifest whose primary object is gone is now streamed from the
+    replica when the replica is large (it hit the held-read cap).
+  - `backup.MaxManifestBytes` and `storage.MaxMetadataBytes` are
+    variables instead of constants, so tests can shrink them; their
+    defaults (1 GiB) only bound objects that are read whole by design.
+- **`schedule` no longer presents an unapplied schedule as running
+  (#80).** The agent builds its task list at start; after editing
+  `pg_hardstorage.yaml` (or `schedule <deployment> <expr>`) it keeps the
+  old schedule until restarted, but `schedule` showed only the new one.
+  The agent now records the schedules it loaded in
+  `<state dir>/agent-loaded-schedule.json`; while it runs, `schedule`
+  marks every differing slot `NOT RUNNING YET: agent still runs ...`
+  (JSON: `pending_restart`, `agent_running`, `agent.restart_required`) and
+  says a restart is needed. A record from a crashed agent is ignored.
 - **Spill-set hardening found by the pre-release review.**
   - A spill file truncated or unreadable behind the set's back used to
     answer "absent" for the members it held; `Has` now answers "present"
@@ -57,6 +86,19 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Added
 
+- **`restore --tablespace-mapping-all <dir>`, `recovery drill
+  --tablespace-mapping-all <dir>` and `drill.tablespace_mapping_all` (#79)**
+  restore every non-default tablespace to `<dir>/<tablespace-oid>`
+  (pgBackRest's `--tablespace-map-all`), including tablespaces added after
+  the command or schedule was written. Explicit `--tablespace-mapping` /
+  `drill.tablespace_mapping` entries win for the tablespaces they name.
+  The scheduled drill applies it, so a deployment with several
+  tablespaces needs one line instead of one per tablespace.
+- **`deployments[].backup.chunk_size` and `backup.timeout`** give the
+  agent's scheduled backups what `backup --chunk-size` gives the CLI, and
+  a way to raise the per-run ceiling (twice the schedule interval,
+  clamped to 1 h..48 h, unless set; `every: 6h` gave 12 h, which a
+  multi-TB full backup can exceed).
 - **`backup --chunk-size`** sets the average chunk size (16 KiB–16 MiB,
   default 64 KiB). A 1 MiB average cuts a 200 TB database from ~3.3
   billion chunks to ~210 million. Boundaries change with the size, so
@@ -72,8 +114,6 @@ keeps reading that version for at least 24 months after a successor lands.
   hold it in RAM.
 - Every verified read of a huge manifest is a full pass over it (hours at
   200 TB); there is no per-file index.
-- `kms rotate`, `backup bundle` and `repair attestation` still load whole
-  manifests and refuse ones over 1 GiB.
 
 ## [1.5.0] — 2026-09-30
 
