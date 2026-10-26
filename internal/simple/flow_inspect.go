@@ -46,7 +46,7 @@ func (flowInspect) Run(ctx context.Context, env *Env) error {
 		}
 		store := backup.NewManifestStore(sp)
 		var manifests []*backup.Manifest
-		for m, mErr := range store.ListAuto(ctx, dep.Name, verifier) {
+		for m, mErr := range store.ListHeaders(ctx, dep.Name, verifier) {
 			if mErr != nil {
 				env.Prompter.Printf("    (manifest read error: %v)\n", mErr)
 				continue

@@ -212,7 +212,7 @@ func projectedBytesFromDeployment(ctx context.Context, sp storage.StoragePlugin,
 	store := backup.NewManifestStore(sp)
 	var latestAny, latestKind *backup.Manifest
 	var lastListErr error
-	for m, err := range store.ListAuto(ctx, deployment, verifier) {
+	for m, err := range store.ListHeaders(ctx, deployment, verifier) {
 		if err != nil {
 			lastListErr = err
 			continue

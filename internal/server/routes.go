@@ -508,7 +508,7 @@ func (s *Server) handleDeployments(w http.ResponseWriter, r *http.Request) {
 				// verifier would reject every signed manifest and
 				// underreport every deployment as empty.
 				var lastAt time.Time
-				for m, lerr := range ms.ListAttestationlessAuto(r.Context(), dep) {
+				for m, lerr := range ms.ListAttestationlessHeaders(r.Context(), dep) {
 					if lerr != nil || m == nil {
 						continue
 					}
@@ -619,7 +619,7 @@ func (s *Server) handleDeploymentBackups(w http.ResponseWriter, r *http.Request,
 			// sibling endpoint above — listing for the API isn't a
 			// trust path, and ms.List with nil rejects every
 			// signed manifest.
-			for m, lerr := range ms.ListAttestationlessAuto(r.Context(), name) {
+			for m, lerr := range ms.ListAttestationlessHeaders(r.Context(), name) {
 				if lerr != nil || m == nil {
 					continue
 				}

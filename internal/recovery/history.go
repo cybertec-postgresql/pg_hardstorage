@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	stdio "io"
 	"sort"
 	"strings"
 	"time"
@@ -347,7 +346,7 @@ func (s *HistoryStore) get(ctx context.Context, key string) (*DrillHistoryEntry,
 		return nil, fmt.Errorf("recovery: get history %q: %w", key, err)
 	}
 	defer rc.Close()
-	body, err := stdio.ReadAll(rc)
+	body, err := storage.ReadAllLimited(rc, storage.MaxRecordBytes)
 	if err != nil {
 		return nil, fmt.Errorf("recovery: read history %q: %w", key, err)
 	}

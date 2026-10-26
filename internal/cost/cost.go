@@ -142,7 +142,7 @@ func Compute(ctx context.Context, sp storage.StoragePlugin, repoURL string, pric
 		// which rejected every signed manifest as "nil verifier",
 		// so cost report misreported $0 against any repo with
 		// signed backups.
-		for m, err := range ms.ListAttestationlessAuto(ctx, dep) {
+		for m, err := range ms.ListAttestationlessHeaders(ctx, dep) {
 			if err != nil {
 				continue
 			}

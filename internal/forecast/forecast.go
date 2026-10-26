@@ -416,7 +416,7 @@ func buildDeploymentForecast(ctx context.Context, store *backup.ManifestStore, d
 	var current, latestAny int64
 	var latest, latestSized, oldest time.Time
 
-	for m, lerr := range store.ListAuto(ctx, dep, opts.Verifier) {
+	for m, lerr := range store.ListHeaders(ctx, dep, opts.Verifier) {
 		if lerr != nil {
 			continue
 		}
@@ -744,7 +744,7 @@ func detectAnomalies(ctx context.Context, store *backup.ManifestStore, fcs []Dep
 			return out
 		}
 		var pre, tail []sample
-		for m, lerr := range store.ListAuto(ctx, fc.Name, opts.Verifier) {
+		for m, lerr := range store.ListHeaders(ctx, fc.Name, opts.Verifier) {
 			if lerr != nil || !sizesDatabase(m) {
 				continue
 			}

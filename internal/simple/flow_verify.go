@@ -56,7 +56,7 @@ func (f flowVerify) Run(ctx context.Context, env *Env) error {
 	// Build the manifest picker.
 	var manifests []*backup.Manifest
 	skipped := 0
-	for m, mErr := range store.ListAuto(ctx, dep.Name, verifier) {
+	for m, mErr := range store.ListHeaders(ctx, dep.Name, verifier) {
 		if mErr != nil {
 			skipped++
 			continue

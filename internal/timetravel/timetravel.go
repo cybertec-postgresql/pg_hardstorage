@@ -332,7 +332,7 @@ func (m *Manager) pickBackupForTarget(ctx context.Context, repoURL, deployment s
 	var bestStopped time.Time
 	var bestVersion int
 	skipped := 0
-	for mm, lerr := range rs.store.ListAuto(ctx, deployment, verifier) {
+	for mm, lerr := range rs.store.ListHeaders(ctx, deployment, verifier) {
 		if lerr != nil || mm == nil {
 			skipped++
 			continue

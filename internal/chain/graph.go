@@ -227,7 +227,7 @@ func BuildGraph(ctx context.Context, sp storage.StoragePlugin, deployment string
 	// Graph.UnreadableCount.
 	unreadable := 0
 	if opts.IncludeTombstoned {
-		for entry, lerr := range store.ListIncludingTombstonedAuto(ctx, deployment, opts.Verifier) {
+		for entry, lerr := range store.ListIncludingTombstonedHeaders(ctx, deployment, opts.Verifier) {
 			if err := ctx.Err(); err != nil {
 				finish()
 				return g, err
@@ -241,7 +241,7 @@ func BuildGraph(ctx context.Context, sp storage.StoragePlugin, deployment string
 			byID[n.BackupID] = n
 		}
 	} else {
-		for m, lerr := range store.ListAuto(ctx, deployment, opts.Verifier) {
+		for m, lerr := range store.ListHeaders(ctx, deployment, opts.Verifier) {
 			if err := ctx.Err(); err != nil {
 				finish()
 				return g, err

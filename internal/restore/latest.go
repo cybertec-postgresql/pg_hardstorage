@@ -57,7 +57,7 @@ func ResolveLatestDetailed(ctx context.Context, sp storage.StoragePlugin, deploy
 		seen    int
 		errored int
 	)
-	for m, err := range store.ListAuto(ctx, deployment, verifier) {
+	for m, err := range store.ListHeaders(ctx, deployment, verifier) {
 		if err != nil {
 			errored++
 			continue

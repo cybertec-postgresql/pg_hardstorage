@@ -153,7 +153,7 @@ func Windows(ctx context.Context, sp storage.StoragePlugin, deployment string, o
 		cutoff = now.Add(-opts.IncludeOlderThan)
 	}
 
-	for m, lerr := range store.ListAuto(ctx, deployment, opts.Verifier) {
+	for m, lerr := range store.ListHeaders(ctx, deployment, opts.Verifier) {
 		if err := ctx.Err(); err != nil {
 			finish()
 			return r, err

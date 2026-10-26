@@ -291,7 +291,7 @@ func Readiness(ctx context.Context, sp storage.StoragePlugin, deployment string,
 		oldest time.Time
 		count  int
 	)
-	for m, lerr := range store.ListAuto(ctx, deployment, opts.Verifier) {
+	for m, lerr := range store.ListHeaders(ctx, deployment, opts.Verifier) {
 		if err := ctx.Err(); err != nil {
 			finish()
 			return r, err

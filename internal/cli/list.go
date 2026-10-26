@@ -85,7 +85,7 @@ func runList(cmd *cobra.Command, deployment, repoURL string, includeDeleted, onl
 	// iterator when EITHER flag is set; the differentiation is
 	// purely in what we yield to the body.
 	if includeDeleted || onlyDeleted {
-		for entry, err := range store.ListIncludingTombstonedAuto(cmd.Context(), deployment, verifier) {
+		for entry, err := range store.ListIncludingTombstonedHeaders(cmd.Context(), deployment, verifier) {
 			if err != nil {
 				skipped++
 				// Mirror the live-only path: a key mismatch means the
@@ -122,7 +122,7 @@ func runList(cmd *cobra.Command, deployment, repoURL string, includeDeleted, onl
 			summaries = append(summaries, s)
 		}
 	} else {
-		for m, err := range store.ListAuto(cmd.Context(), deployment, verifier) {
+		for m, err := range store.ListHeaders(cmd.Context(), deployment, verifier) {
 			if err != nil {
 				skipped++
 				if errors.Is(err, backup.ErrPublicKeyMismatch) {
