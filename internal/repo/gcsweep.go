@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -530,6 +531,10 @@ func Sweep(ctx context.Context, sp storage.StoragePlugin, opts SweepOptions) (*S
 		}
 	}
 
+	if opts.Apply {
+		reapStaleSpill(opts.RefSpill.Dir, start, opts.OnWarning)
+	}
+
 	fo := FindOrphansOptions{MinAge: opts.MinChunkAge, Now: start}
 	minAge := fo.effectiveMinAge()
 	snap := newManifestSnapshot(opts.RefSpill, CollectReferencesOptions{TombstoneGrace: opts.TombstoneGrace, Now: start})
@@ -616,7 +621,7 @@ func Sweep(ctx context.Context, sp storage.StoragePlugin, opts SweepOptions) (*S
 		slice = GCFenceMaxWait / 5
 	}
 	maxCheckpoint := GCFenceMaxWait * 3 / 5
-	pins := newGCPinSet()
+	pins := newGCPinSet(opts.RefSpill)
 	defer pins.close()
 	var mu sync.Mutex
 	remaining := res.OrphanCount
@@ -730,6 +735,16 @@ func Sweep(ctx context.Context, sp storage.StoragePlugin, opts SweepOptions) (*S
 			continue
 		}
 		res.StaleTempDeleted++
+	}
+
+	// Empty directories the deletes left behind (fs: chunks/sha256/xx/yy
+	// shells, the id directory of a reaped manifest temp). Best-effort.
+	// Always, not only after deleting: a run that crashed or hit faults after
+	// its deletes must still be cleaned up by the next one.
+	for _, prefix := range []string{"chunks", "manifests", "wal", "logical"} {
+		if _, err := storage.PruneEmptyDirsOf(ctx, sp, prefix, false); err != nil && opts.OnWarning != nil {
+			opts.OnWarning(fmt.Sprintf("prune empty %s directories: %v", prefix, err))
+		}
 	}
 
 	// Backend staging files (.deferred-/.excl-/.hstmp-) a crashed writer
@@ -873,6 +888,53 @@ func (r *gcRun) finish(ctx context.Context, warn func(string)) {
 		if gerr := getJSON(ctx, r.sp, info.Key, &rec); gerr == nil && !rec.liveAt(now) &&
 			now.Sub(rec.HeartbeatAt) > gcRunRecordRetention {
 			_ = r.sp.Delete(ctx, info.Key)
+		}
+	}
+}
+
+// staleSpillAge is how old spill leftovers must be to be reaped. A gc killed
+// with SIGKILL/OOM never runs its deferred Close, and its spill files then sat
+// in the temp dir forever. Spill run files are written once and not touched
+// again, so this is far beyond the lifetime of any live sweep; a live set that
+// lost its files fails closed (Err), it never under-counts.
+const staleSpillAge = 7 * 24 * time.Hour
+
+// reapStaleSpill removes pghs-spill-* directories and pghs-orphans-* files
+// older than staleSpillAge from dir (default: the system temp dir).
+func reapStaleSpill(dir string, now time.Time, warn func(string)) {
+	if dir == "" {
+		dir = os.TempDir()
+	}
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	cutoff := now.Add(-staleSpillAge)
+	for _, e := range ents {
+		n := e.Name()
+		isDir := strings.HasPrefix(n, "pghs-spill-") && e.IsDir()
+		if !isDir && !(strings.HasPrefix(n, "pghs-orphans-") && !e.IsDir()) {
+			continue
+		}
+		fi, err := e.Info()
+		if err != nil || fi.ModTime().After(cutoff) {
+			continue
+		}
+		if isDir {
+			// newest entry decides: a dir's own mtime moves only on create/unlink
+			newest := fi.ModTime()
+			sub, _ := os.ReadDir(filepath.Join(dir, n))
+			for _, se := range sub {
+				if si, err := se.Info(); err == nil && si.ModTime().After(newest) {
+					newest = si.ModTime()
+				}
+			}
+			if newest.After(cutoff) {
+				continue
+			}
+		}
+		if err := os.RemoveAll(filepath.Join(dir, n)); err != nil && warn != nil {
+			warn(fmt.Sprintf("reap stale spill leftover %s: %v", n, err))
 		}
 	}
 }

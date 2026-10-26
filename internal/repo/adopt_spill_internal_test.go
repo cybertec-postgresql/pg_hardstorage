@@ -78,7 +78,7 @@ func TestFence_PinWrittenInPartsAndReadBackByGC(t *testing.T) {
 	if parts != 5 {
 		t.Fatalf("pin parts = %d, want 5 (450 hashes / 100)", parts)
 	}
-	ps := newGCPinSet()
+	ps := newGCPinSet(spill.Options{})
 	defer ps.close()
 	if err := ps.refresh(context.Background(), sp, time.Now()); err != nil {
 		t.Fatal(err)

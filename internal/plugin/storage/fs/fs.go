@@ -371,7 +371,7 @@ func (p *Plugin) Put(ctx context.Context, key string, r io.Reader, opts storage.
 	if err != nil {
 		return storage.PutResult{}, err
 	}
-	if err := mkdirAllDurable(filepath.Dir(full)); err != nil {
+	if err := mkdirAllRetry(filepath.Dir(full)); err != nil {
 		return storage.PutResult{}, fmt.Errorf("fs: mkdir parent of %q: %w", key, err)
 	}
 
@@ -397,7 +397,7 @@ func (p *Plugin) putExclusive(ctx context.Context, key, full string, r io.Reader
 	// was still empty: a concurrent reader could read 0 bytes and fail
 	// to parse it. Surfaced by the backup-lease concurrency test.)
 	staging := full + ".excl-" + randHex()
-	f, err := os.OpenFile(staging, os.O_WRONLY|os.O_CREATE|os.O_EXCL, repoFileMode)
+	f, err := createStaging(staging)
 	if err != nil {
 		return storage.PutResult{}, fmt.Errorf("fs: open staging for %q: %w", key, err)
 	}
@@ -455,7 +455,7 @@ func (p *Plugin) putDeferred(ctx context.Context, key, full string, r io.Reader,
 		return storage.PutResult{}, fmt.Errorf("fs: stat %q: %w", key, err)
 	}
 	staging := full + ".deferred-" + randHex()
-	f, err := os.OpenFile(staging, os.O_WRONLY|os.O_CREATE|os.O_EXCL, repoFileMode)
+	f, err := createStaging(staging)
 	if err != nil {
 		return storage.PutResult{}, fmt.Errorf("fs: open staging for %q: %w", key, err)
 	}
@@ -485,7 +485,7 @@ func (p *Plugin) putOverwrite(ctx context.Context, key, full string, r io.Reader
 	// (last-writer-wins, which is the overwrite contract). Mirrors the
 	// IfNotExists path's `.excl-<rand>` staging.
 	tmp := full + ".hstmp-" + randHex()
-	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, repoFileMode)
+	f, err := createStaging(tmp)
 	if err != nil {
 		return storage.PutResult{}, fmt.Errorf("fs: open tmp %q: %w", tmp, err)
 	}
@@ -727,10 +727,21 @@ func (p *Plugin) RenameIfNotExists(ctx context.Context, src, dst string) error {
 	if err != nil {
 		return err
 	}
-	if err := mkdirAllDurable(filepath.Dir(dstFull)); err != nil {
+	if err := mkdirAllRetry(filepath.Dir(dstFull)); err != nil {
 		return fmt.Errorf("fs: mkdir parent of %q: %w", dst, err)
 	}
-	if err := os.Link(srcFull, dstFull); err != nil {
+	err = os.Link(srcFull, dstFull)
+	if errors.Is(err, stdfs.ErrNotExist) {
+		// dst's directory was pruned (PruneEmptyDirs) between the mkdir
+		// and the link; src exists, so the missing piece is the directory.
+		for i := 0; i < pruneRaceRetries && errors.Is(err, stdfs.ErrNotExist); i++ {
+			if merr := mkdirAllRetry(filepath.Dir(dstFull)); merr != nil {
+				break
+			}
+			err = os.Link(srcFull, dstFull)
+		}
+	}
+	if err != nil {
 		if errors.Is(err, stdfs.ErrExist) {
 			return storage.ErrAlreadyExists
 		}
@@ -860,4 +871,105 @@ func syncDir(dir string) error {
 		return fmt.Errorf("fsync dir: %w", err)
 	}
 	return nil
+}
+
+// pruneRaceRetries bounds how often a writer re-creates a directory that a
+// concurrent PruneEmptyDirs removed under it.
+const pruneRaceRetries = 100
+
+// mkdirAllRetry is mkdirAllDurable, retried when it loses a race with
+// PruneEmptyDirs (the directory it just saw, or created, vanished again).
+func mkdirAllRetry(dir string) error {
+	var err error
+	for i := 0; i < pruneRaceRetries; i++ {
+		if err = mkdirAllDurable(dir); err == nil ||
+			!(errors.Is(err, stdfs.ErrExist) || errors.Is(err, stdfs.ErrNotExist)) {
+			return err
+		}
+	}
+	return err
+}
+
+// createStaging creates a staging file exclusively. If the parent directory
+// vanished after Put's mkdir (PruneEmptyDirs, run by `repo gc`, removes
+// directories that were empty at that instant), it re-creates it and retries
+// — a few times, since a prune can win the race again.
+func createStaging(path string) (*os.File, error) {
+	for attempt := 0; ; attempt++ {
+		f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, repoFileMode)
+		if err == nil || !errors.Is(err, stdfs.ErrNotExist) || attempt >= pruneRaceRetries {
+			return f, err
+		}
+		if merr := mkdirAllRetry(filepath.Dir(path)); merr != nil {
+			return nil, merr
+		}
+	}
+}
+
+// PruneEmptyDirs (storage.EmptyDirPruner) removes directories under dir that
+// hold nothing, deepest first, and dir itself when includeSelf is set. The
+// store root is never removed. rmdir(2) refuses a non-empty directory, so a
+// concurrent writer's file is never lost; a writer racing the removal of its
+// parent directory re-creates it (createStaging). It returns how many
+// directories were removed.
+func (p *Plugin) PruneEmptyDirs(ctx context.Context, dir string, includeSelf bool) (int, error) {
+	if p.root == "" {
+		return 0, errors.New("fs: plugin not opened")
+	}
+	full := p.root
+	if d := strings.Trim(dir, "/"); d != "" {
+		var err error
+		if full, err = p.resolve(d); err != nil {
+			return 0, err
+		}
+	}
+	n := 0
+	var rec func(path string, self bool) (bool, error)
+	rec = func(path string, self bool) (bool, error) {
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
+		ents, err := os.ReadDir(path)
+		if err != nil {
+			if errors.Is(err, stdfs.ErrNotExist) {
+				return true, nil
+			}
+			return false, err
+		}
+		empty := true
+		for _, e := range ents {
+			if !e.IsDir() {
+				empty = false
+				continue
+			}
+			gone, err := rec(filepath.Join(path, e.Name()), true)
+			if err != nil {
+				return false, err
+			}
+			if !gone {
+				empty = false
+			}
+		}
+		if !empty || !self || path == p.root {
+			return false, nil
+		}
+		if err := os.Remove(path); err != nil {
+			if errors.Is(err, stdfs.ErrNotExist) {
+				return true, nil
+			}
+			return false, nil // not empty any more (a writer got there first)
+		}
+		n++
+		return true, nil
+	}
+	if _, err := rec(full, includeSelf); err != nil {
+		return n, err
+	}
+	if n > 0 {
+		_ = syncDir(full)
+		if includeSelf {
+			_ = syncDir(filepath.Dir(full))
+		}
+	}
+	return n, nil
 }

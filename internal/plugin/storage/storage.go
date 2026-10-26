@@ -431,3 +431,22 @@ func DeleteLazy(ctx context.Context, sp StoragePlugin, key string) error {
 	}
 	return sp.Delete(ctx, key)
 }
+
+// EmptyDirPruner is an OPTIONAL capability for hierarchical backends (fs):
+// PruneEmptyDirs removes directories under dir that hold no objects (and
+// dir itself when includeSelf), never the store root, and reports how many
+// it removed. Object stores have no directories and need not implement it.
+// `repo gc` calls it after deleting objects so a sweep leaves no empty
+// chunks/sha256/xx/yy shells behind.
+type EmptyDirPruner interface {
+	PruneEmptyDirs(ctx context.Context, dir string, includeSelf bool) (int, error)
+}
+
+// PruneEmptyDirsOf calls sp.PruneEmptyDirs when sp implements
+// EmptyDirPruner and is a no-op otherwise.
+func PruneEmptyDirsOf(ctx context.Context, sp StoragePlugin, dir string, includeSelf bool) (int, error) {
+	if pr, ok := sp.(EmptyDirPruner); ok {
+		return pr.PruneEmptyDirs(ctx, dir, includeSelf)
+	}
+	return 0, nil
+}

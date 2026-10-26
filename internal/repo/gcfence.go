@@ -488,8 +488,8 @@ type gcPinSet struct {
 	hashes *spill.HashSet
 }
 
-func newGCPinSet() *gcPinSet {
-	return &gcPinSet{read: map[string]struct{}{}, hashes: spill.NewHashSet(spill.Options{})}
+func newGCPinSet(o spill.Options) *gcPinSet {
+	return &gcPinSet{read: map[string]struct{}{}, hashes: spill.NewHashSet(o)}
 }
 
 // close releases the set's spill files.
