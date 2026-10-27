@@ -14,10 +14,10 @@
 # On a tag push the rendered site is published to GitHub
 # Pages (custom domain docs.pghardstorage.org via docs/CNAME).
 #
-# On push to main the rendered site is published to GitHub
-# Pages (custom domain docs.pghardstorage.org via docs/CNAME).
-# PRs only build + preview — the deploy job is gated to
-# push-to-main, so a fork PR can never publish.
+# A manual dispatch on main also publishes (to refresh the site
+# after a docs-only fix without cutting a release).  Nothing
+# else deploys: PRs never run this workflow, and a dispatch on
+# any other ref only builds.
 
 name: docs
 
@@ -150,11 +150,11 @@ jobs:
           fail: false
 
   deploy:
-    # Publish to GitHub Pages.  Gated to push-on-main so PRs
-    # (including from forks) only build + preview, never
-    # publish.  Needs the strict build to have passed.
+    # Publish to GitHub Pages.  Gated to a release tag push or a
+    # manual dispatch on main; any other ref only builds.  Needs
+    # the strict build to have passed.
     name: deploy to GitHub Pages
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
     runs-on: ubuntu-24.04
     needs: [build]
     environment:
