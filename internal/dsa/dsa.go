@@ -46,8 +46,8 @@ import (
 	stdjson "encoding/json"
 	"errors"
 	"fmt"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/topn"
 	"hash/fnv"
-	"io"
 	"path"
 	"sort"
 	"strings"
@@ -316,7 +316,7 @@ func (l *Locator) Locate(ctx context.Context, opts LocateOptions) (*Report, erro
 		// the subject's data is still held and must be disclosed (Art.
 		// 15) / erased (Art. 17). List hides tombstones, which made the
 		// report understate the holdings.
-		for entry, err := range l.manifests.ListIncludingTombstoned(ctx, d, l.verifier) {
+		for entry, err := range l.manifests.ListIncludingTombstonedHeaders(ctx, d, l.verifier) {
 			if err != nil {
 				// One bad manifest doesn't kill the whole scan -- but
 				// it is RECORDED, which the previous comment promised
@@ -385,11 +385,9 @@ func manifestToAffected(m *backup.Manifest) AffectedBackup {
 		Tenant:     m.Tenant,
 		StartedAt:  m.StartedAt,
 		StoppedAt:  m.StoppedAt,
-		FileCount:  len(m.Files),
+		FileCount:  m.NumFiles(),
 	}
-	for _, f := range m.Files {
-		ab.ChunkCount += len(f.Chunks)
-	}
+	ab.ChunkCount = int(m.NumChunkRefs())
 	if m.Encryption != nil {
 		ab.Encrypted = true
 		ab.KEKRef = m.Encryption.KEKRef
@@ -666,7 +664,7 @@ func (s *ReportStore) Get(ctx context.Context, id string) (*Report, error) {
 		return nil, fmt.Errorf("%w: %s: %v", ErrReportNotFound, id, err)
 	}
 	defer rd.Close()
-	body, err := io.ReadAll(rd)
+	body, err := storage.ReadAllLimited(rd, storage.MaxMetadataBytes)
 	if err != nil {
 		return nil, fmt.Errorf("dsa: read: %w", err)
 	}
@@ -683,12 +681,14 @@ type ListFilter struct {
 	Tenant        string
 	Article       Article
 	SubjectIDHash string
+	// Limit keeps only the newest Limit reports (0 = all).
+	Limit int
 }
 
 // List returns every report newest-first matching the filter.
 func (s *ReportStore) List(ctx context.Context, f ListFilter) ([]*Report, error) {
 	const prefix = "dsa/reports/"
-	var out []*Report
+	out := topn.New(f.Limit, func(a, b *Report) bool { return a.GeneratedAt.After(b.GeneratedAt) })
 	for obj, err := range s.sp.List(ctx, prefix) {
 		if err != nil {
 			return nil, fmt.Errorf("dsa: list: %w", err)
@@ -714,12 +714,9 @@ func (s *ReportStore) List(ctx context.Context, f ListFilter) ([]*Report, error)
 		if f.SubjectIDHash != "" && r.SubjectIDHash != f.SubjectIDHash {
 			continue
 		}
-		out = append(out, r)
+		out.Add(r)
 	}
-	sort.Slice(out, func(i, j int) bool {
-		return out[i].GeneratedAt.After(out[j].GeneratedAt)
-	})
-	return out, nil
+	return out.Result(), nil
 }
 
 // ----- helpers -----

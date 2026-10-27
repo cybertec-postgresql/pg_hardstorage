@@ -189,7 +189,7 @@ func Restore(ctx context.Context, opts RestoreOptions) (*RestoreResult, error) {
 	}
 	defer sp.Close()
 	store := backup.NewManifestStore(sp)
-	m, err := store.Read(ctx, opts.Deployment, opts.BackupID, opts.Verifier)
+	m, err := store.ReadAuto(ctx, opts.Deployment, opts.BackupID, opts.Verifier)
 	if err != nil {
 		finish()
 		return res, fmt.Errorf("partial restore: read manifest: %w", err)
@@ -241,7 +241,15 @@ func Restore(ctx context.Context, opts RestoreOptions) (*RestoreResult, error) {
 
 	// 5. For each resolved table, find matching FileEntries +
 	//    materialise. NotFound tables get appended to res.NotFound.
-	byPath := indexFiles(m.Files)
+	// One pass over the manifest materialises each file of a requested
+	// relation as it goes by. Nothing but the written paths is kept: a
+	// 10 TB table is ~10,000 segments whose chunk lists (~1 GB) must not
+	// all be resident, and a streamed manifest has no file list to index.
+	fams, ierr := materialiseFamilies(ctx, m, cas, opts.TargetDir, rfns)
+	if ierr != nil {
+		finish()
+		return res, fmt.Errorf("partial restore: %w", ierr)
+	}
 	for _, rfn := range rfns {
 		if rfn.NotFound || rfn.Path == "" {
 			res.NotFound = append(res.NotFound, rfn.Qualified)
@@ -255,12 +263,7 @@ func Restore(ctx context.Context, opts RestoreOptions) (*RestoreResult, error) {
 			HeapPath:  rfn.Path,
 		}
 		// Heap + segments + _vm + _fsm.
-		heapWritten, heapBytes, err := materialiseRelfilenodeFamily(
-			ctx, cas, opts.TargetDir, rfn.Path, byPath)
-		if err != nil {
-			finish()
-			return res, fmt.Errorf("partial restore: heap %s: %w", rfn.Path, err)
-		}
+		heapWritten, heapBytes := fams.get(rfn.Path)
 		mapping.HeapFiles = heapWritten
 		mapping.HeapBytes = heapBytes
 		res.FilesWritten += len(heapWritten)
@@ -275,12 +278,7 @@ func Restore(ctx context.Context, opts RestoreOptions) (*RestoreResult, error) {
 		// TOAST family (if present).
 		if rfn.ToastPath != "" {
 			mapping.ToastPath = rfn.ToastPath
-			toastWritten, toastBytes, err := materialiseRelfilenodeFamily(
-				ctx, cas, opts.TargetDir, rfn.ToastPath, byPath)
-			if err != nil {
-				finish()
-				return res, fmt.Errorf("partial restore: toast %s: %w", rfn.ToastPath, err)
-			}
+			toastWritten, toastBytes := fams.get(rfn.ToastPath)
 			mapping.ToastFiles = toastWritten
 			mapping.ToastBytes = toastBytes
 			res.FilesWritten += len(toastWritten)
@@ -326,23 +324,13 @@ func resolveRelfilenodes(ctx context.Context, opts RestoreOptions) ([]Relfilenod
 	return out, nil
 }
 
-// indexFiles builds a relation-path → FileEntry index for fast lookup
-// during family-walks. Returned map is read-only after construction.
-//
-// Keys are in pg_relation_filepath's namespace, because that is what
-// the lookup side holds: default-tablespace files as-is
-// ("base/16384/2619"), files of a non-default tablespace as
-// "pg_tblspc/<oid>/<path>". The manifest stores the latter relative to
-// the tablespace root plus a TablespaceOID; keyed by bare Path they
-// could never match (and a same-named default-tablespace file could
-// shadow them).
-func indexFiles(files []backup.FileEntry) map[string]*backup.FileEntry {
-	out := make(map[string]*backup.FileEntry, len(files))
-	for i := range files {
-		out[relationPath(&files[i])] = &files[i]
-	}
-	return out
-}
+// Keys of the family index are in pg_relation_filepath's namespace
+// (see relationPath), because that is what the lookup side holds:
+// default-tablespace files as-is ("base/16384/2619"), files of a
+// non-default tablespace as "pg_tblspc/<oid>/<path>". The manifest stores
+// the latter relative to the tablespace root plus a TablespaceOID; keyed
+// by bare Path they could never match (and a same-named
+// default-tablespace file could shadow them).
 
 // relationPath is f's path as pg_relation_filepath would spell it.
 func relationPath(f *backup.FileEntry) string {
@@ -368,58 +356,110 @@ func hasMainFork(written []string, basePath string) bool {
 	return false
 }
 
-// materialiseRelfilenodeFamily writes every manifest file under a
-// relfilenode's path family — the base file (e.g. "base/16384/2619")
-// plus segments (".1", ".2", ...) and visibility-map / FSM siblings
-// ("_vm", "_fsm", "_vm.1", ...). PG's pg_relation_filepath returns
-// the base path; the family is everything that shares its prefix
-// followed by an empty string, "." + digits, "_vm", "_fsm" tokens.
-//
-// Why explicit family-walk rather than prefix match: a naive
-// prefix match against "base/16384/2619" would also match
-// "base/16384/26190" (a different relation). The specific tokens
-// keep the match precise.
-func materialiseRelfilenodeFamily(
-	ctx context.Context, cas *repo.CAS, target, basePath string, byPath map[string]*backup.FileEntry,
-) (written []string, totalBytes int64, err error) {
-	// First, the base file itself.
-	if entry, ok := byPath[basePath]; ok {
-		n, err := materialiseOneFile(ctx, cas, target, basePath, entry)
-		if err != nil {
-			return written, totalBytes, err
-		}
-		written = append(written, basePath)
-		totalBytes += n
+// familyFiles is what one relfilenode family wrote: paths and bytes only.
+type familyFiles struct {
+	names []string
+	bytes int64
+}
+
+// familySet maps a family's base path to what was written for it.
+type familySet map[string]*familyFiles
+
+// get returns the family's written paths (base file first, then the
+// siblings sorted — HeapFiles/ToastFiles are output and must not depend on
+// manifest order) and byte total.
+func (fs familySet) get(base string) ([]string, int64) {
+	ff := fs[base]
+	if ff == nil {
+		return nil, 0
 	}
-	// Then any sibling that matches the family pattern. We walk
-	// all known paths once rather than enumerating every possible
-	// suffix (segment counts can be unbounded).
-	//
-	// Collected and SORTED before materialising: byPath is a map, so
-	// ranging it directly made both the write order and the reported
-	// HeapFiles/ToastFiles list depend on Go's randomised iteration.
-	// That list is output — two runs over one backup could not be
-	// diffed, and the segment files were written in a different order
-	// every time.
-	siblings := make([]string, 0, 8)
-	for path := range byPath {
-		if path == basePath {
+	sort.Slice(ff.names, func(i, j int) bool {
+		a, b := ff.names[i], ff.names[j]
+		if (a == base) != (b == base) {
+			return a == base
+		}
+		return a < b
+	})
+	return ff.names, ff.bytes
+}
+
+// familyBases returns the base paths a manifest path could belong to
+// (a superset; the caller confirms with isFamilyMember): the path itself,
+// minus a ".N" segment, minus a "_vm"/"_fsm"/"_init" fork tag, or both.
+func familyBases(rp string) [4]string {
+	trimSeg := func(p string) string {
+		i := strings.LastIndexByte(p, '.')
+		if i < 0 || i == len(p)-1 || strings.Trim(p[i+1:], "0123456789") != "" {
+			return p
+		}
+		return p[:i]
+	}
+	trimTag := func(p string) string {
+		for _, t := range [...]string{"_vm", "_fsm", "_init"} {
+			if strings.HasSuffix(p, t) {
+				return p[:len(p)-len(t)]
+			}
+		}
+		return p
+	}
+	seg := trimSeg(rp)
+	return [4]string{rp, seg, trimTag(rp), trimTag(seg)}
+}
+
+// materialiseFamilies writes every manifest file under each requested
+// relfilenode's path family — the base file (e.g. "base/16384/2619") plus
+// segments (".1", ".2", ...) and visibility-map / FSM siblings ("_vm",
+// "_fsm", "_vm.1", ...) — in a single streaming pass over the manifest.
+// PG's pg_relation_filepath returns the base path; the family is everything
+// that shares its prefix followed by an empty string, "." + digits, "_vm",
+// "_fsm" tokens.
+//
+// Why explicit family matching rather than prefix match: a naive prefix
+// match against "base/16384/2619" would also match "base/16384/26190" (a
+// different relation). The specific tokens keep the match precise.
+//
+// A file is written once even if it belongs to several requested families
+// (the same table named twice); each family still reports it.
+func materialiseFamilies(ctx context.Context, m *backup.Manifest, cas *repo.CAS, target string, rfns []Relfilenode) (familySet, error) {
+	fams := familySet{}
+	for _, r := range rfns {
+		if r.NotFound || r.Path == "" {
 			continue
 		}
-		if isFamilyMember(path, basePath) {
-			siblings = append(siblings, path)
+		fams[r.Path] = &familyFiles{}
+		if r.ToastPath != "" {
+			fams[r.ToastPath] = &familyFiles{}
 		}
 	}
-	sort.Strings(siblings)
-	for _, path := range siblings {
-		n, err := materialiseOneFile(ctx, cas, target, path, byPath[path])
+	if len(fams) == 0 {
+		return fams, nil
+	}
+	err := m.EachFile(ctx, func(f *backup.FileEntry) error {
+		rp := relationPath(f)
+		var hit []*familyFiles
+		cands := familyBases(rp)
+		for i, b := range cands {
+			if i > 0 && (b == cands[0] || (i > 1 && b == cands[1]) || (i > 2 && b == cands[2])) {
+				continue // candidate already considered
+			}
+			if ff := fams[b]; ff != nil && (rp == b || isFamilyMember(rp, b)) {
+				hit = append(hit, ff)
+			}
+		}
+		if len(hit) == 0 {
+			return nil
+		}
+		n, err := materialiseOneFile(ctx, cas, target, rp, f)
 		if err != nil {
-			return written, totalBytes, err
+			return fmt.Errorf("%s: %w", rp, err)
 		}
-		written = append(written, path)
-		totalBytes += n
-	}
-	return written, totalBytes, nil
+		for _, ff := range hit {
+			ff.names = append(ff.names, rp)
+			ff.bytes += n
+		}
+		return nil
+	})
+	return fams, err
 }
 
 // isFamilyMember reports whether path is a sibling of basePath in

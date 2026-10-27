@@ -41,6 +41,10 @@ The repository must already exist — create it with \fBpg_hardstorage repo init
 	safety multiplier for the capacity pre-flight (default 1.1 = 110% of projected); ignored under --ignore-capacity
 
 .PP
+\fB--chunk-size\fP=""
+	average chunk size (e.g. 256KiB, 1MiB; 16KiB..16MiB, default 64KiB). Larger chunks mean far fewer chunk objects and manifest entries for very large databases, at the cost of coarser dedup; boundaries differ per size, so keep one value per deployment
+
+.PP
 \fB--control-plane\fP=""
 	control-plane base URL — when set, the command is dispatched there instead of running locally
 

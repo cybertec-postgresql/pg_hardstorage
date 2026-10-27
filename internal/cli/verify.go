@@ -7,8 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"iter"
 	"os"
-	"sort"
 	"strings"
 	"time"
 
@@ -25,6 +25,7 @@ import (
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo/casdefault"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/spill"
 )
 
 // newVerifyCmd implements `pg_hardstorage verify <deployment>
@@ -164,7 +165,7 @@ func runVerify(cmd *cobra.Command, deployment, backupID, repoURL string, sample 
 		backupID = latest
 	}
 
-	m, err := store.Read(cmd.Context(), deployment, backupID, verifier)
+	m, err := store.ReadAuto(cmd.Context(), deployment, backupID, verifier)
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			return output.NewError("notfound.backup",
@@ -227,7 +228,7 @@ func runVerify(cmd *cobra.Command, deployment, backupID, repoURL string, sample 
 	// the chain. Best-effort: a chain-write failure must never fail the
 	// verification itself.
 	verifyOutcome := "ok"
-	if len(stats.Mismatches) > 0 {
+	if stats.MismatchCount > 0 {
 		verifyOutcome = "failed"
 	}
 	verifyMode := "fast"
@@ -248,7 +249,7 @@ func runVerify(cmd *cobra.Command, deployment, backupID, repoURL string, sample 
 		ChunksUnique:      stats.ChunksUnique,
 		ChunksSampled:     stats.ChunksSampled,
 		ChunksVerified:    stats.ChunksVerified,
-		ChunksMismatched:  len(stats.Mismatches),
+		ChunksMismatched:  stats.MismatchCount,
 		BytesVerified:     stats.BytesVerified,
 		DurationMS:        stats.DurationMS,
 		ExistenceOnly:     existenceOnly,
@@ -256,7 +257,7 @@ func runVerify(cmd *cobra.Command, deployment, backupID, repoURL string, sample 
 	for _, h := range stats.Mismatches {
 		body.Mismatches = append(body.Mismatches, h.String())
 	}
-	if len(stats.Mismatches) > 0 {
+	if stats.MismatchCount > 0 {
 		// Existence-only mismatches are MISSING chunks — point
 		// at chunk-GC + repo scrub. Full-verify mismatches are
 		// CORRUPTION — point at repair scrub. The summary
@@ -268,11 +269,11 @@ func runVerify(cmd *cobra.Command, deployment, backupID, repoURL string, sample 
 		commandHint := "pg_hardstorage repair scrub --repo " + repoURL
 		hashList := summarizeHashes(stats.Mismatches, 5)
 		summary := fmt.Sprintf("verify: %d chunk(s) failed integrity check: %s",
-			len(stats.Mismatches), hashList)
+			stats.MismatchCount, hashList)
 		if existenceOnly {
 			errCode = "verify.chunks_missing"
 			summary = fmt.Sprintf("verify --existence-only: %d chunk(s) missing from the repo: %s",
-				len(stats.Mismatches), hashList)
+				stats.MismatchCount, hashList)
 			humanHint = "the named chunks are absent from the repo — chunk-GC may have already reclaimed them, or the manifest references chunks never written. Restoring from this backup will fail; a tombstoned manifest with missing chunks is no longer recoverable via `backup undelete`."
 			commandHint = ""
 		}
@@ -294,7 +295,7 @@ func pickLatestBackup(ctx context.Context, store *backup.ManifestStore, deployme
 	var latestID string
 	var latestStop time.Time
 	skipped := 0
-	for m, err := range store.List(ctx, deployment, verifier) {
+	for m, err := range store.ListAuto(ctx, deployment, verifier) {
 		if err != nil {
 			// Counted, not merely skipped. A manifest that fails
 			// verification yields no stopped_at and cannot be ranked,
@@ -431,7 +432,20 @@ type verifyStats struct {
 	ChunksVerified   int         // how many round-tripped successfully
 	BytesVerified    int64       // sum of plaintext bytes for verified chunks
 	DurationMS       int64       // wall-clock elapsed for the chunk walk
-	Mismatches       []repo.Hash // hashes whose stored bytes failed verification
+	Mismatches       []repo.Hash // hashes whose stored bytes failed verification (first maxVerifyMismatches)
+	MismatchCount    int         // exact number of failures; Mismatches is capped
+}
+
+// maxVerifyMismatches bounds the failing hashes verify keeps. A backup whose
+// storage vanished fails on every one of hundreds of millions of chunks; the
+// count stays exact, the list is the first (ascending) few.
+const maxVerifyMismatches = 10_000
+
+func (s *verifyStats) noteMismatch(h repo.Hash) {
+	s.MismatchCount++
+	if len(s.Mismatches) < maxVerifyMismatches {
+		s.Mismatches = append(s.Mismatches, h)
+	}
 }
 
 // verifyChunks walks every unique chunk hash in the manifest, fetches
@@ -449,28 +463,20 @@ type verifyStats struct {
 // abort.
 func verifyChunks(ctx context.Context, cas *repo.CAS, m *backup.Manifest, sample int) (verifyStats, error) {
 	stats := verifyStats{}
-	unique := map[repo.Hash]struct{}{}
-	for _, f := range m.Files {
-		for _, c := range f.Chunks {
-			stats.ChunksReferenced++
-			unique[c.Hash] = struct{}{}
-		}
+	unique, referenced, err := uniqueChunkSet(ctx, m)
+	if err != nil {
+		return stats, err
 	}
-	stats.ChunksUnique = len(unique)
+	defer unique.Close()
+	stats.ChunksReferenced = referenced
+	stats.ChunksUnique = unique.Len()
+	hashes, err := firstHashes(unique, sample)
+	if err != nil {
+		return stats, err
+	}
+	stats.ChunksSampled = hashes.n
 
-	hashes := make([]repo.Hash, 0, len(unique))
-	for h := range unique {
-		hashes = append(hashes, h)
-	}
-	sort.Slice(hashes, func(i, j int) bool {
-		return hashes[i].String() < hashes[j].String()
-	})
-	if sample > 0 && sample < len(hashes) {
-		hashes = hashes[:sample]
-	}
-	stats.ChunksSampled = len(hashes)
-
-	for _, h := range hashes {
+	for h := range hashes.each() {
 		// Cooperative cancellation point. We check BEFORE each
 		// GetChunkBytes — checking after would still let one
 		// ctx-cancelled call leak into stats.Mismatches.
@@ -490,7 +496,7 @@ func verifyChunks(ctx context.Context, cas *repo.CAS, m *backup.Manifest, sample
 			// divergence (the exact path a restore reads through). So a
 			// non-ctx error here IS the corruption / missing-chunk
 			// finding; record it.
-			stats.Mismatches = append(stats.Mismatches, h)
+			stats.noteMismatch(h)
 			continue
 		}
 		// No second SHA pass. A body returned WITHOUT error already
@@ -546,28 +552,20 @@ func summarizeHashes(h []repo.Hash, max int) string {
 // inflating Mismatches.
 func verifyChunkExistence(ctx context.Context, sp storage.StoragePlugin, m *backup.Manifest, sample int) (verifyStats, error) {
 	stats := verifyStats{}
-	unique := map[repo.Hash]struct{}{}
-	for _, f := range m.Files {
-		for _, c := range f.Chunks {
-			stats.ChunksReferenced++
-			unique[c.Hash] = struct{}{}
-		}
+	unique, referenced, err := uniqueChunkSet(ctx, m)
+	if err != nil {
+		return stats, err
 	}
-	stats.ChunksUnique = len(unique)
+	defer unique.Close()
+	stats.ChunksReferenced = referenced
+	stats.ChunksUnique = unique.Len()
+	hashes, err := firstHashes(unique, sample)
+	if err != nil {
+		return stats, err
+	}
+	stats.ChunksSampled = hashes.n
 
-	hashes := make([]repo.Hash, 0, len(unique))
-	for h := range unique {
-		hashes = append(hashes, h)
-	}
-	sort.Slice(hashes, func(i, j int) bool {
-		return hashes[i].String() < hashes[j].String()
-	})
-	if sample > 0 && sample < len(hashes) {
-		hashes = hashes[:sample]
-	}
-	stats.ChunksSampled = len(hashes)
-
-	for _, h := range hashes {
+	for h := range hashes.each() {
 		if err := ctx.Err(); err != nil {
 			return stats, err
 		}
@@ -579,7 +577,7 @@ func verifyChunkExistence(ctx context.Context, sp storage.StoragePlugin, m *back
 			// Treat ErrNotFound (the common case — chunk-GC
 			// reclaimed the body) the same as any other
 			// fetch failure: it's a "missing" finding.
-			stats.Mismatches = append(stats.Mismatches, h)
+			stats.noteMismatch(h)
 			continue
 		}
 		stats.ChunksVerified++
@@ -634,6 +632,9 @@ func (b verifyBody) WriteText(w io.Writer) error {
 		for _, h := range b.Mismatches {
 			fmt.Fprintf(bw, "      %s\n", h)
 		}
+		if n := b.ChunksMismatched - len(b.Mismatches); n > 0 {
+			fmt.Fprintf(bw, "      ... +%d more\n", n)
+		}
 	}
 	_, err := io.WriteString(w, strings.TrimRight(bw.String(), "\n"))
 	return err
@@ -656,4 +657,57 @@ func emitVerifyLatestSkipWarning(_ context.Context, deployment, chosen string, s
 			"could not be verified or read; %q is the newest of the ones that COULD be read, and a "+
 			"skipped manifest may have been newer.\n",
 		deployment, skipped, chosen)
+}
+
+// uniqueChunkSet collects the distinct chunk hashes a manifest references
+// into a bounded-memory set (billions of chunks do not fit a map) and
+// counts the total references. The caller closes the set.
+func uniqueChunkSet(ctx context.Context, m *backup.Manifest) (*spill.HashSet, int, error) {
+	set := spill.NewHashSet(spill.Options{})
+	referenced := 0
+	if err := m.EachFile(ctx, func(f *backup.FileEntry) error {
+		for _, c := range f.Chunks {
+			referenced++
+			set.Add(c.Hash)
+		}
+		return nil
+	}); err != nil {
+		set.Close()
+		return nil, 0, err
+	}
+	if err := set.Err(); err != nil {
+		set.Close()
+		return nil, 0, err
+	}
+	return set, referenced, nil
+}
+
+// firstHashes selects the first n hashes (all when n <= 0 or n exceeds the
+// set) in ascending hash order — the order verify has always walked in.
+type hashWindow struct {
+	set *spill.HashSet
+	n   int
+}
+
+func firstHashes(set *spill.HashSet, sample int) (hashWindow, error) {
+	n := set.Len()
+	if sample > 0 && sample < n {
+		n = sample
+	}
+	return hashWindow{set: set, n: n}, set.Err()
+}
+
+// each yields the window's hashes in ascending order.
+func (w hashWindow) each() iter.Seq[repo.Hash] {
+	return func(yield func(repo.Hash) bool) {
+		i := 0
+		stop := errors.New("stop")
+		_ = w.set.ForEach(func(k spill.Key) error {
+			if i >= w.n || !yield(repo.Hash(k)) {
+				return stop
+			}
+			i++
+			return nil
+		})
+	}
 }

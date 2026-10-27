@@ -60,7 +60,7 @@ func (f flowRestore) Run(ctx context.Context, env *Env) error {
 	store := backup.NewManifestStore(sp)
 	var manifests []*backup.Manifest
 	skipped := 0
-	for m, mErr := range store.List(ctx, dep.Name, verifier) {
+	for m, mErr := range store.ListHeaders(ctx, dep.Name, verifier) {
 		if mErr != nil {
 			skipped++
 			continue
@@ -91,7 +91,7 @@ func (f flowRestore) Run(ctx context.Context, env *Env) error {
 	for i, m := range manifests {
 		choices[i] = prompt.Choice{
 			Label:  m.BackupID,
-			Detail: fmt.Sprintf("%s · %d files", humanWhen(m.StartedAt), len(m.Files)),
+			Detail: fmt.Sprintf("%s · %d files", humanWhen(m.StartedAt), m.NumFiles()),
 		}
 	}
 	idx, err := env.Prompter.PromptChoice("Which backup?", choices, 0)
@@ -134,7 +134,7 @@ func (f flowRestore) Run(ctx context.Context, env *Env) error {
 	}
 
 	env.Prompter.Printf("\n  About to restore:\n")
-	env.Prompter.Printf("    backup: %s (%d files)\n", m.BackupID, len(m.Files))
+	env.Prompter.Printf("    backup: %s (%d files)\n", m.BackupID, m.NumFiles())
 	env.Prompter.Printf("    target: %s\n\n", target)
 	ok, err := env.Prompter.YesNo("Continue?", true)
 	if err != nil {

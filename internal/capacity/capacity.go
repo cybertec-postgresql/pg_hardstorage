@@ -109,14 +109,11 @@ func Project(ctx context.Context, sp storage.StoragePlugin, repoURL string, opts
 		// not a trust path.  Passing nil to ms.List would reject
 		// every signed manifest with "nil verifier" and silently
 		// report the deployment as empty.
-		for m, lerr := range ms.ListAttestationless(ctx, dep) {
+		for m, lerr := range ms.ListAttestationlessHeaders(ctx, dep) {
 			if lerr != nil || m == nil {
 				continue
 			}
-			var manifestBytes int64
-			for _, f := range m.Files {
-				manifestBytes += f.Size
-			}
+			manifestBytes := m.TotalFileBytes()
 			totalLogical += manifestBytes
 			depSamples = append(depSamples, sample{at: m.StartedAt, cumulative: totalLogical})
 		}

@@ -58,6 +58,30 @@ agent task, which surfaces through the agent's normal
 task-failure event stream and your
 [alerting](alerting-recipes.md).
 
+### Backups with non-default tablespaces
+
+A drill restores each non-default tablespace to its recorded absolute
+path unless told otherwise, which on the source host is the live
+tablespace, so the drill refuses such a backup without a mapping. Map
+them in `drill:`:
+
+```yaml
+deployments:
+  db1:
+    drill:
+      # Every tablespace is drilled at <dir>/<tablespace-oid>, including
+      # tablespaces created after this was written.
+      tablespace_mapping_all: /var/tmp/drill/tablespaces
+      # Optional: an explicit entry wins for the tablespace it names.
+      tablespace_mapping:
+        - /srv/pg/ts_fast=/var/tmp/drill/ts_fast
+```
+
+The interactive equivalents are `recovery drill --tablespace-mapping-all
+<dir>` and `restore --tablespace-mapping-all <dir>` (same
+`<dir>/<tablespace-oid>` layout; `--tablespace-mapping OLD=NEW` entries
+take precedence). Drill scratch directories are removed at teardown.
+
 Convention: drill **after** the typical backup window (backup
 at 02:00 → drill at 03:00) so the drill proves the backup the
 schedule just took, not yesterday's.

@@ -170,3 +170,34 @@ func TestCheckChunkExistence_EmptyManifest(t *testing.T) {
 		t.Errorf("empty manifest should be vacuously AllPresent")
 	}
 }
+
+// A backup whose storage is gone is missing every chunk; the result keeps an
+// exact count but only lists the first few, and still reports not-all-present.
+func TestCheckChunkExistence_MissingListIsCappedCountIsExact(t *testing.T) {
+	defer backup.SetMaxCheckMissingListed(2)()
+	sp, cas := fsRepoForCheck(t)
+	var infos []repo.ChunkInfo
+	for _, body := range []string{"one", "two", "three", "four", "five"} {
+		info, err := cas.PutChunk(context.Background(), []byte(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		infos = append(infos, info)
+		if err := sp.Delete(context.Background(), repo.ChunkKey(info.Hash)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	res, err := backup.CheckChunkExistence(context.Background(), sp, manifestWithChunks(infos...))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.MissingCount != 5 || res.NumMissing() != 5 || len(res.Missing) != 2 {
+		t.Fatalf("MissingCount=%d NumMissing=%d len(Missing)=%d", res.MissingCount, res.NumMissing(), len(res.Missing))
+	}
+	if res.AllPresent() {
+		t.Error("AllPresent must be false")
+	}
+	if res.Missing[0].Compare(res.Missing[1]) >= 0 {
+		t.Error("listed hashes must be ascending")
+	}
+}

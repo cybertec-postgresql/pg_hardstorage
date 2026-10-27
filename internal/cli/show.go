@@ -2,6 +2,7 @@
 package cli
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -17,6 +18,7 @@ import (
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/output"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/spill"
 )
 
 // newManifestCmd implements `pg_hardstorage manifest`, the documented
@@ -117,9 +119,9 @@ func runShow(cmd *cobra.Command, deployment, backupID, repoURL string, includeDe
 		readErr error
 	)
 	if includeDeleted {
-		m, dead, readErr = store.ReadIncludingTombstoned(cmd.Context(), deployment, backupID, verifier)
+		m, dead, readErr = store.ReadIncludingTombstonedAuto(cmd.Context(), deployment, backupID, verifier)
 	} else {
-		m, readErr = store.Read(cmd.Context(), deployment, backupID, verifier)
+		m, readErr = store.ReadAuto(cmd.Context(), deployment, backupID, verifier)
 	}
 	if readErr != nil {
 		if errors.Is(readErr, storage.ErrNotFound) {
@@ -143,10 +145,24 @@ func runShow(cmd *cobra.Command, deployment, backupID, repoURL string, includeDe
 					Command: "pg_hardstorage backup undelete " + deployment + " " + backupID + " --repo " + repoURL,
 				}).Wrap(readErr)
 		}
+		// A manifest that exists but cannot be parsed or verified is
+		// damage the operator must act on, not an internal error: report
+		// it in the same namespace `verify` uses for the same failure.
+		if isManifestDamage(readErr) {
+			return output.NewError("verify.manifest_signature",
+				fmt.Sprintf("show: manifest of %s is unreadable or fails verification: %v", backupID, readErr)).
+				WithSuggestion(&output.Suggestion{
+					Human:   "check the damage with `pg_hardstorage verify`, then `pg_hardstorage repair manifest` can restore a damaged copy from its replica",
+					Command: "pg_hardstorage verify " + deployment + " " + backupID + " --repo " + repoURL,
+				}).Wrap(readErr)
+		}
 		return fmt.Errorf("show: read manifest: %w", readErr)
 	}
 
-	body := buildShowBody(m)
+	body, berr := buildShowBody(cmd.Context(), m)
+	if berr != nil {
+		return output.NewError("internal", fmt.Sprintf("show: read file entries of %s: %v", backupID, berr)).Wrap(berr)
+	}
 	if dead {
 		body.Tombstoned = true
 		// Best-effort tombstone-body read; same posture as the
@@ -180,28 +196,43 @@ type showBody struct {
 	DeletedAt        *time.Time `json:"deleted_at,omitempty"`
 	DeleteReason     string     `json:"delete_reason,omitempty"`
 	DeletePolicy     string     `json:"delete_policy,omitempty"`
+
+	// FilesOmitted is set when the manifest was too large to hold, so the
+	// per-file list ("files") is not part of this body; FileCount carries
+	// how many there are. Both are absent for ordinary manifests, whose
+	// body is unchanged.
+	FilesOmitted bool  `json:"files_omitted,omitempty"`
+	FileCount    int64 `json:"file_count,omitempty"`
 }
 
-func buildShowBody(m *backup.Manifest) showBody {
+func buildShowBody(ctx context.Context, m *backup.Manifest) (showBody, error) {
 	body := showBody{
 		Manifest:   m,
 		DurationMS: m.StoppedAt.Sub(m.StartedAt).Milliseconds(),
 	}
-	uniqueBytes := map[[32]byte]int64{}
-	for _, f := range m.Files {
+	// Distinct-chunk accounting through a bounded-memory set.
+	seen := spill.NewHashSet(spill.Options{})
+	defer seen.Close()
+	if err := m.EachFile(ctx, func(f *backup.FileEntry) error {
 		body.LogicalBytes += f.Size
 		for _, c := range f.Chunks {
-			uniqueBytes[[32]byte(c.Hash)] = c.Len
+			if seen.Add(c.Hash) {
+				body.UniqueChunkCount++
+				body.UniqueChunkBytes += c.Len
+			}
 		}
+		return nil
+	}); err != nil {
+		return body, err
 	}
-	body.UniqueChunkCount = len(uniqueBytes)
-	for _, sz := range uniqueBytes {
-		body.UniqueChunkBytes += sz
+	if m.Streaming() {
+		body.FilesOmitted = true
+		body.FileCount = int64(m.NumFiles())
 	}
 	if m.Attestation != nil {
 		body.PublicKeyFP = fingerprintPubKeyPEM(m.Attestation.PublicKey)
 	}
-	return body
+	return body, seen.Err()
 }
 
 // fingerprintPubKeyPEM returns a short SHA-256 hex of the PEM bytes.
@@ -253,7 +284,7 @@ func (b showBody) WriteText(w io.Writer) error {
 	for _, t := range b.Tablespaces {
 		row("  oid="+fmt.Sprintf("%d", t.OID), t.Location)
 	}
-	row("Files", fmt.Sprintf("%d", len(b.Files)))
+	row("Files", fmt.Sprintf("%d", b.NumFiles()))
 	row("Logical bytes", humanBytes(b.LogicalBytes))
 	row("Unique chunks", fmt.Sprintf("%d (%s)", b.UniqueChunkCount, humanBytes(b.UniqueChunkBytes)))
 	if b.LogicalBytes > 0 && b.UniqueChunkBytes > 0 {
@@ -292,4 +323,15 @@ func (b showBody) WriteText(w io.Writer) error {
 	}
 	_, err := io.WriteString(w, bw.String())
 	return err
+}
+
+// isManifestDamage reports whether err says a manifest was found but is
+// corrupt, unsigned or fails verification (as opposed to being absent or
+// the store being unreachable).
+func isManifestDamage(err error) bool {
+	if errors.Is(err, backup.ErrUnsigned) || errors.Is(err, backup.ErrPublicKeyMismatch) ||
+		errors.Is(err, backup.ErrAmbiguousManifest) {
+		return true
+	}
+	return strings.Contains(err.Error(), "manifest: ")
 }

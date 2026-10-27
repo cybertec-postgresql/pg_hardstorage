@@ -336,6 +336,10 @@ func rotateBatchError(dep string, derr error, deleted []string, applied []rotati
 func buildPolicy(opts rotateOpts) (retention.Policy, error) {
 	switch strings.ToLower(opts.policy) {
 	case "gfs":
+		if opts.keepDaily < 0 || opts.keepWeekly < 0 || opts.keepMonthly < 0 || opts.keepYearly < 0 {
+			return nil, output.NewError("usage.bad_flag",
+				"rotate: GFS --keep-daily, --keep-weekly, --keep-monthly, and --keep-yearly must all be >= 0").Wrap(output.ErrUsage)
+		}
 		return retention.GFSPolicy{
 			KeepDaily:   opts.keepDaily,
 			KeepWeekly:  opts.keepWeekly,
@@ -390,7 +394,8 @@ func selectDeployments(ctx context.Context, store *backup.ManifestStore, filter 
 // by ManifestStore.List.
 func loadDeploymentManifests(ctx context.Context, store *backup.ManifestStore, dep string, verifier *backup.Verifier) ([]*backup.Manifest, error) {
 	var out []*backup.Manifest
-	for m, err := range store.List(ctx, dep, verifier) {
+	// Headers only: retention needs no file lists (see ListHeaders).
+	for m, err := range store.ListHeaders(ctx, dep, verifier) {
 		if err != nil {
 			// ABORT the whole rotation for this deployment. Do not skip
 			// the manifest and continue.

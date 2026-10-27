@@ -19,6 +19,7 @@ import (
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/paths"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/spill"
 )
 
 // newRealListCmd implements `list <deployment>`.
@@ -84,7 +85,7 @@ func runList(cmd *cobra.Command, deployment, repoURL string, includeDeleted, onl
 	// iterator when EITHER flag is set; the differentiation is
 	// purely in what we yield to the body.
 	if includeDeleted || onlyDeleted {
-		for entry, err := range store.ListIncludingTombstoned(cmd.Context(), deployment, verifier) {
+		for entry, err := range store.ListIncludingTombstonedHeaders(cmd.Context(), deployment, verifier) {
 			if err != nil {
 				skipped++
 				// Mirror the live-only path: a key mismatch means the
@@ -100,7 +101,11 @@ func runList(cmd *cobra.Command, deployment, repoURL string, includeDeleted, onl
 			if onlyDeleted && !entry.Tombstoned {
 				continue
 			}
-			s := summarizeManifest(entry.Manifest)
+			s, serr := summarizeManifest(cmd.Context(), entry.Manifest)
+			if serr != nil {
+				skipped++
+				continue
+			}
 			s.Tombstoned = entry.Tombstoned
 			if entry.Tombstoned {
 				// Best-effort tombstone-body read. A read
@@ -117,7 +122,7 @@ func runList(cmd *cobra.Command, deployment, repoURL string, includeDeleted, onl
 			summaries = append(summaries, s)
 		}
 	} else {
-		for m, err := range store.List(cmd.Context(), deployment, verifier) {
+		for m, err := range store.ListHeaders(cmd.Context(), deployment, verifier) {
 			if err != nil {
 				skipped++
 				if errors.Is(err, backup.ErrPublicKeyMismatch) {
@@ -125,7 +130,12 @@ func runList(cmd *cobra.Command, deployment, repoURL string, includeDeleted, onl
 				}
 				continue
 			}
-			summaries = append(summaries, summarizeManifest(m))
+			s, serr := summarizeManifest(cmd.Context(), m)
+			if serr != nil {
+				skipped++
+				continue
+			}
+			summaries = append(summaries, s)
 		}
 	}
 	// Newest first by StoppedAt.
@@ -179,7 +189,7 @@ type backupSummary struct {
 
 // summarizeManifest collapses a Manifest into the per-row summary shape.
 // Logical bytes and unique-chunk metrics are computed by walking Files.
-func summarizeManifest(m *backup.Manifest) backupSummary {
+func summarizeManifest(ctx context.Context, m *backup.Manifest) (backupSummary, error) {
 	s := backupSummary{
 		BackupID:   m.BackupID,
 		Type:       string(m.Type),
@@ -189,20 +199,25 @@ func summarizeManifest(m *backup.Manifest) backupSummary {
 		DurationMS: m.StoppedAt.Sub(m.StartedAt).Milliseconds(),
 		StopLSN:    m.StopLSN,
 		Timeline:   m.Timeline,
-		FileCount:  len(m.Files),
+		FileCount:  m.NumFiles(),
 	}
-	uniqueBytes := map[repo.Hash]int64{}
-	for _, f := range m.Files {
+	// Distinct-chunk accounting through a bounded-memory set: a very
+	// large backup has billions of distinct chunks.
+	seen := spill.NewHashSet(spill.Options{})
+	defer seen.Close()
+	if err := m.EachFile(ctx, func(f *backup.FileEntry) error {
 		s.LogicalBytes += f.Size
 		for _, c := range f.Chunks {
-			uniqueBytes[c.Hash] = c.Len
+			if seen.Add(c.Hash) {
+				s.UniqueChunkCount++
+				s.UniqueChunkBytes += c.Len
+			}
 		}
+		return nil
+	}); err != nil {
+		return s, err
 	}
-	s.UniqueChunkCount = len(uniqueBytes)
-	for _, sz := range uniqueBytes {
-		s.UniqueChunkBytes += sz
-	}
-	return s
+	return s, seen.Err()
 }
 
 type listBody struct {

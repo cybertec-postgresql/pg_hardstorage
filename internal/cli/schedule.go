@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 	"text/tabwriter"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -79,9 +80,13 @@ deployments without a schedule configured.`,
 // fleet view is deterministic across runs.
 func runScheduleList(cmd *cobra.Command) error {
 	d := DispatcherFrom(cmd)
-	_, cfg, _, err := loadEditableConfig()
+	p, cfg, _, err := loadEditableConfig()
 	if err != nil {
 		return err
+	}
+	var drift *scheduleDrift
+	if rec := readRunningAgent(p.State.Value); rec != nil {
+		drift = &scheduleDrift{rec: rec}
 	}
 	names := make([]string, 0, len(cfg.Deployments))
 	for name := range cfg.Deployments {
@@ -102,10 +107,17 @@ func runScheduleList(cmd *cobra.Command) error {
 			if !spec.IsZero() {
 				row.Description = describeSpec(spec)
 			}
+			if drift != nil && drift.stale(name, task, spec) {
+				row.PendingRestart = true
+				row.AgentRunning = describeRunning(drift.running(name, task))
+			}
 			rows = append(rows, row)
 		}
 	}
 	body := scheduleListBody{Schedules: rows}
+	if drift != nil {
+		body.Agent = newScheduleAgentInfo(drift, cfg, rows)
+	}
 	return d.Result(output.NewResult(cmd.CommandPath()).WithBody(body))
 }
 
@@ -116,6 +128,10 @@ func runScheduleList(cmd *cobra.Command) error {
 // apply to read-only listing.
 type scheduleListBody struct {
 	Schedules []scheduleListRow `json:"schedules"`
+	// Agent is present when an agent is running on this host. The rows show
+	// the CONFIGURED schedule; the agent only applies a changed one after a
+	// restart, and Agent says whether that is pending.
+	Agent *scheduleAgentInfo `json:"agent,omitempty"`
 }
 
 type scheduleListRow struct {
@@ -123,6 +139,54 @@ type scheduleListRow struct {
 	Task        string              `json:"task"`
 	Spec        config.ScheduleSpec `json:"spec"`
 	Description string              `json:"description,omitempty"`
+	// PendingRestart is true when the running agent loaded a different
+	// schedule for this slot than the configured one; AgentRunning is what
+	// it is actually running ("off" = not scheduled).
+	PendingRestart bool   `json:"pending_restart,omitempty"`
+	AgentRunning   string `json:"agent_running,omitempty"`
+}
+
+// scheduleAgentInfo describes the running agent a schedule view was
+// compared against.
+type scheduleAgentInfo struct {
+	PID       int       `json:"pid"`
+	StartedAt time.Time `json:"started_at"`
+	// RestartRequired: at least one configured schedule differs from what
+	// the agent loaded (including deployments removed from the config).
+	RestartRequired bool `json:"restart_required"`
+	// RemovedDeployments are still scheduled by the agent but no longer
+	// configured.
+	RemovedDeployments []string `json:"removed_deployments,omitempty"`
+}
+
+func newScheduleAgentInfo(drift *scheduleDrift, cfg *config.Config, rows []scheduleListRow) *scheduleAgentInfo {
+	info := &scheduleAgentInfo{
+		PID: drift.rec.PID, StartedAt: drift.rec.StartedAt,
+		RemovedDeployments: drift.removedDeployments(cfg),
+	}
+	info.RestartRequired = len(info.RemovedDeployments) > 0
+	for _, r := range rows {
+		if r.PendingRestart {
+			info.RestartRequired = true
+		}
+	}
+	return info
+}
+
+// describeRunning renders what the agent runs for a slot.
+func describeRunning(spec config.ScheduleSpec) string {
+	if spec.IsZero() {
+		return "off"
+	}
+	return describeSpec(spec)
+}
+
+// restartNote is the one-line explanation printed wherever a configured
+// schedule differs from the running agent's.
+func (a *scheduleAgentInfo) restartNote() string {
+	return fmt.Sprintf("the running agent (pid %d, started %s) loaded its schedules at start and applies "+
+		"changes only after a restart: restart it (e.g. systemctl restart pg_hardstorage-agent)",
+		a.PID, a.StartedAt.Local().Format("2006-01-02 15:04:05"))
 }
 
 // WriteText renders a tabular fleet view. Deployments without a
@@ -150,10 +214,20 @@ func (b scheduleListBody) WriteText(w io.Writer) error {
 		if desc == "" {
 			desc = "off"
 		}
+		if r.PendingRestart {
+			desc += "   <-- NOT RUNNING YET: agent still runs " + r.AgentRunning
+		}
 		fmt.Fprintf(tw, "  %s\t%s\t%s\n", r.Deployment, r.Task, desc)
 	}
 	if err := tw.Flush(); err != nil {
 		return err
+	}
+	if b.Agent != nil && b.Agent.RestartRequired {
+		fmt.Fprintf(bw, "\nNote: %s.\n", b.Agent.restartNote())
+		if len(b.Agent.RemovedDeployments) > 0 {
+			fmt.Fprintf(bw, "The agent still schedules removed deployment(s): %s.\n",
+				strings.Join(b.Agent.RemovedDeployments, ", "))
+		}
 	}
 	_, err := io.WriteString(w, strings.TrimRight(bw.String(), "\n"))
 	return err
@@ -161,7 +235,7 @@ func (b scheduleListBody) WriteText(w io.Writer) error {
 
 func runScheduleShow(cmd *cobra.Command, deployment, task string) error {
 	d := DispatcherFrom(cmd)
-	_, cfg, _, err := loadEditableConfig()
+	p, cfg, _, err := loadEditableConfig()
 	if err != nil {
 		return err
 	}
@@ -181,6 +255,7 @@ func runScheduleShow(cmd *cobra.Command, deployment, task string) error {
 	if !spec.IsZero() {
 		body.Description = describeSpec(spec)
 	}
+	body.noteAgent(readRunningAgent(p.State.Value), deployment, task, spec)
 	return d.Result(output.NewResult(cmd.CommandPath()).WithBody(body))
 }
 
@@ -197,7 +272,7 @@ func runScheduleSet(cmd *cobra.Command, deployment, task, expr string) error {
 		}
 	}
 
-	_, cfg, write, err := loadEditableConfig()
+	p, cfg, write, err := loadEditableConfig()
 	if err != nil {
 		return err
 	}
@@ -220,6 +295,13 @@ func runScheduleSet(cmd *cobra.Command, deployment, task, expr string) error {
 	}
 	if !spec.IsZero() {
 		body.Description = describeSpec(spec)
+	}
+	body.noteAgent(readRunningAgent(p.State.Value), deployment, task, spec)
+	if body.Agent == nil {
+		// No running agent was found on this host (it may run elsewhere or
+		// under a supervisor with another state dir): the edit is still
+		// applied only when an agent (re)starts.
+		body.RestartNote = "the schedule applies when the agent (re)starts; a running agent keeps the schedule it loaded at start"
 	}
 	return d.Result(output.NewResult(cmd.CommandPath()).WithBody(body))
 }
@@ -275,6 +357,27 @@ type scheduleBody struct {
 	Spec        config.ScheduleSpec `json:"spec"`
 	Description string              `json:"description,omitempty"`
 	Updated     bool                `json:"updated,omitempty"`
+	// Agent, PendingRestart and AgentRunning are set when an agent is
+	// running on this host and its loaded schedule for this slot differs
+	// from Spec: Spec is what is CONFIGURED, AgentRunning what is running.
+	Agent          *scheduleAgentInfo `json:"agent,omitempty"`
+	PendingRestart bool               `json:"pending_restart,omitempty"`
+	AgentRunning   string             `json:"agent_running,omitempty"`
+	RestartNote    string             `json:"restart_note,omitempty"`
+}
+
+// noteAgent compares spec with the running agent's loaded schedule.
+func (b *scheduleBody) noteAgent(rec *agentLoadedRecord, deployment, task string, spec config.ScheduleSpec) {
+	if rec == nil {
+		return
+	}
+	drift := &scheduleDrift{rec: rec}
+	b.Agent = &scheduleAgentInfo{PID: rec.PID, StartedAt: rec.StartedAt}
+	if drift.stale(deployment, task, spec) {
+		b.PendingRestart = true
+		b.AgentRunning = describeRunning(drift.running(deployment, task))
+		b.Agent.RestartRequired = true
+	}
 }
 
 // WriteText renders the task schedule as human-readable text to w, noting
@@ -301,6 +404,11 @@ func (b scheduleBody) WriteText(w io.Writer) error {
 		if b.Spec.At != "" {
 			fmt.Fprintf(bw, "  at:       %s\n", b.Spec.At)
 		}
+	}
+	if b.PendingRestart && b.Agent != nil {
+		fmt.Fprintf(bw, "  NOT RUNNING YET: the agent still runs %s.\n  Note: %s.\n", b.AgentRunning, b.Agent.restartNote())
+	} else if b.RestartNote != "" {
+		fmt.Fprintf(bw, "  Note: %s.\n", b.RestartNote)
 	}
 	_, err := io.WriteString(w, strings.TrimRight(bw.String(), "\n"))
 	return err

@@ -30,7 +30,6 @@ package bundle
 
 import (
 	"archive/tar"
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -45,9 +44,12 @@ import (
 	"time"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/pg/walsink"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/compression"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/spill"
+	"github.com/jackc/pglogrepl"
 )
 
 // SchemaBundle is the on-disk schema string carried in
@@ -104,17 +106,11 @@ type ExportOptions struct {
 	// included.
 	BackupID string
 
-	// IncludeWAL pulls every WAL segment listed in each manifest's
-	// WALRequired field.
-	//
-	// NOTE: nothing populates Manifest.WALRequired today — the backup
-	// runner sets it to nil — so on a repository written by this build
-	// there is nothing for this option to pull, and Build REFUSES rather
-	// than emit a bundle whose base backups have no WAL to replay. The
-	// timeline-history files this comment used to promise ("plus every
-	// timeline-history file under wal/<deployment>/timelines/") were
-	// never copied either, and BundleManifest.Timelines is never
-	// populated by anything.
+	// IncludeWAL pulls every WAL segment each backup needs: those in its
+	// manifest's WALRequired when recorded, otherwise every segment from
+	// its start LSN to its stop LSN on its timeline (backups do not yet
+	// record WALRequired — issue #77). A needed segment missing from the
+	// repository fails the export rather than yield an unrestorable bundle.
 	IncludeWAL bool
 
 	// SourceRepoURL is recorded in the bundle's manifest so
@@ -151,27 +147,17 @@ func Export(ctx context.Context, sp storage.StoragePlugin, w io.Writer, opts Exp
 	// When opts.Verifier is non-nil we still verify on the
 	// source side (the operator's "I want a verified bundle"
 	// posture).
-	var manifests []*backup.Manifest
+	var ids []string
 	if opts.BackupID != "" {
-		m, err := readBundleManifest(ctx, sp, opts.Deployment, opts.BackupID, opts.Verifier)
-		if err != nil {
-			return nil, fmt.Errorf("bundle: read manifest %s/%s: %w", opts.Deployment, opts.BackupID, err)
-		}
-		manifests = append(manifests, m)
+		ids = []string{opts.BackupID}
 	} else {
-		ids, err := listManifestIDs(ctx, sp, opts.Deployment)
+		var err error
+		ids, err = listManifestIDs(ctx, sp, opts.Deployment)
 		if err != nil {
 			return nil, fmt.Errorf("bundle: list deployment %s: %w", opts.Deployment, err)
 		}
-		for _, id := range ids {
-			m, err := readBundleManifest(ctx, sp, opts.Deployment, id, opts.Verifier)
-			if err != nil {
-				return nil, fmt.Errorf("bundle: read %s/%s: %w", opts.Deployment, id, err)
-			}
-			manifests = append(manifests, m)
-		}
 	}
-	if len(manifests) == 0 {
+	if len(ids) == 0 {
 		return nil, fmt.Errorf("bundle: no manifests for deployment %s (BackupID=%q)", opts.Deployment, opts.BackupID)
 	}
 
@@ -181,28 +167,28 @@ func Export(ctx context.Context, sp storage.StoragePlugin, w io.Writer, opts Exp
 		SourceRepo:  opts.SourceRepoURL,
 	}
 
-	chunkSeen := map[repo.Hash]struct{}{}
-	for _, m := range manifests {
+	chunkSeen := spill.NewHashSet(spill.Options{})
+	defer chunkSeen.Close()
+	for _, id := range ids {
+		// Step 2 — copy the manifest itself, byte for byte, while
+		// verifying it as a stream: a manifest can be far larger than
+		// memory, so it is never held. The header (everything but the
+		// file list) comes back from that pass.
+		m, wantSHA, err := copyManifestStreaming(ctx, sp, tw, opts.Deployment, id, opts.Verifier)
+		if err != nil {
+			return nil, fmt.Errorf("bundle: read %s/%s: %w", opts.Deployment, id, err)
+		}
 		bundleManifest.Backups = append(bundleManifest.Backups, BackupEntry{
 			Deployment: m.Deployment,
 			BackupID:   m.BackupID,
 			Type:       string(m.Type),
 			Tenant:     m.Tenant,
 		})
-
-		// Step 2 — write the manifest itself.  We re-marshal from
-		// the in-memory struct (canonical) so the bundle has
-		// reproducible bytes regardless of how the source repo
-		// stored them.
-		mPath := backup.PrimaryPath(m.Deployment, m.BackupID)
-		if err := writeManifestEntry(tw, mPath, m); err != nil {
-			return nil, err
-		}
 		// Replica copy (best-effort: missing replica is not an
 		// error, the source repo may have skipped manifest
 		// redundancy at commit time).
 		replicaKey := backup.ReplicaPath(m.BackupID)
-		if err := copyKey(ctx, sp, tw, replicaKey, true); err != nil {
+		if err := copyKeyStreamed(ctx, sp, tw, replicaKey, true); err != nil {
 			return nil, fmt.Errorf("bundle: copy replica %s: %w", replicaKey, err)
 		}
 		// Attestation if present.
@@ -211,21 +197,24 @@ func Export(ctx context.Context, sp storage.StoragePlugin, w io.Writer, opts Exp
 			return nil, fmt.Errorf("bundle: copy attestation %s: %w", attestKey, err)
 		}
 
-		// Step 3 — every chunk this manifest references.
-		for _, fe := range m.Files {
+		// Step 3 — every chunk this manifest references, from a second
+		// pass over the same object (its digest must match the first).
+		if err := streamManifestFiles(ctx, sp, backup.PrimaryPath(opts.Deployment, id), wantSHA, func(fe *backup.FileEntry) error {
 			for _, ref := range fe.Chunks {
-				if _, dup := chunkSeen[ref.Hash]; dup {
+				if !chunkSeen.Add(ref.Hash) {
 					continue
 				}
-				chunkSeen[ref.Hash] = struct{}{}
 				key := repo.ChunkKey(ref.Hash)
 				size, err := copyChunk(ctx, sp, tw, key)
 				if err != nil {
-					return nil, fmt.Errorf("bundle: copy chunk %s: %w", key, err)
+					return fmt.Errorf("bundle: copy chunk %s: %w", key, err)
 				}
 				bundleManifest.ChunkCount++
 				bundleManifest.ChunkBytes += size
 			}
+			return nil
+		}); err != nil {
+			return nil, err
 		}
 
 		// Step 4 — WAL files when requested.  WAL layout:
@@ -235,10 +224,39 @@ func Export(ctx context.Context, sp storage.StoragePlugin, w io.Writer, opts Exp
 		// bytes for readability but the bundle keeps the same
 		// path so an Import doesn't need to reshape.
 		if opts.IncludeWAL {
-			for _, seg := range m.WALRequired {
+			segs, err := requiredWAL(ctx, sp, m)
+			if err != nil {
+				return nil, fmt.Errorf("bundle: resolve WAL for %s/%s: %w", m.Deployment, m.BackupID, err)
+			}
+			for _, seg := range segs {
 				key := walSegmentKey(m.Deployment, m.Timeline, seg)
-				if err := copyKey(ctx, sp, tw, key, false); err != nil {
+				body, err := readKey(ctx, sp, key)
+				if err != nil {
+					if isNotFound(err) {
+						return nil, fmt.Errorf("bundle: --include-wal: backup %s/%s needs WAL segment %s to reach consistency, "+
+							"but it is not archived at %s (is `wal stream` or archive_command running for this deployment?). "+
+							"Export without --include-wal if the base backups alone are what you want", m.Deployment, m.BackupID, seg, key)
+					}
 					return nil, fmt.Errorf("bundle: copy WAL %s: %w", key, err)
+				}
+				if err := writeTarEntry(tw, key, body); err != nil {
+					return nil, err
+				}
+				// The segment manifest only references its bytes: carry
+				// the chunks too, or the imported WAL is unreadable.
+				if sm, perr := walsink.ParseSegmentManifest(body); perr == nil {
+					for _, ref := range sm.Chunks {
+						h := ref.Hash
+						if !chunkSeen.Add(h) {
+							continue
+						}
+						size, err := copyChunk(ctx, sp, tw, repo.ChunkKey(h))
+						if err != nil {
+							return nil, fmt.Errorf("bundle: copy WAL chunk %s: %w", repo.ChunkKey(h), err)
+						}
+						bundleManifest.ChunkCount++
+						bundleManifest.ChunkBytes += size
+					}
 				}
 				bundleManifest.WAL = append(bundleManifest.WAL, WALSegment{
 					Deployment: m.Deployment,
@@ -250,34 +268,10 @@ func Export(ctx context.Context, sp storage.StoragePlugin, w io.Writer, opts Exp
 	}
 
 	// --include-wal must not silently produce a bundle with no WAL.
-	//
-	// The loop above draws its segment list from each manifest's
-	// WALRequired, and nothing populates that field: the backup runner
-	// sets `WALRequired: nil` with the note "empty in v0.1: WAL
-	// streaming lands in Slice 8". WAL streaming has since landed; the
-	// field did not follow. So the loop body never ran, and
-	// bundleManifest.Timelines — declared as "one timeline-history file
-	// the bundle carries" — is never populated by anything either.
-	//
-	// The result was an air-gap export that reported success, carried
-	// the base backups, and contained not one WAL segment. A base backup
-	// cannot reach a consistent state without the WAL between its start
-	// and stop LSN, so every such bundle was unrestorable — discovered
-	// at restore time, from the air-gapped copy, which is the worst
-	// possible moment to find out.
-	//
-	// Refusing is the fail-closed reading of an unmet completeness
-	// claim. If a repository's manifests DO carry wal_required (written
-	// by a build that populates it), the loop collects them and this
-	// never fires.
+	// requiredWAL always yields at least the segment holding the start
+	// LSN, so an empty result means a logic error; fail closed.
 	if opts.IncludeWAL && len(bundleManifest.WAL) == 0 {
-		return nil, fmt.Errorf("bundle: --include-wal was requested but no manifest in this " +
-			"selection declares any required WAL (the manifest field wal_required is not " +
-			"populated at backup time), so the bundle would carry base backups with none of " +
-			"the WAL needed to bring them to a consistent state. Refusing to write an " +
-			"unrestorable bundle: export without --include-wal if the base backups alone are " +
-			"what you want, or copy the repository with `repo replicate` to a local " +
-			"destination and archive that instead")
+		return nil, fmt.Errorf("bundle: --include-wal was requested but no WAL segment was resolved for the selection")
 	}
 
 	// Step 5 — bundle.json at the tar root.  Sort embedded slices
@@ -432,9 +426,17 @@ func Import(ctx context.Context, r io.Reader, sp storage.StoragePlugin, opts Imp
 		// 4× the FastCDC max chunk size; one MaxFile from
 		// our own writers will always fit, anything bigger
 		// is suspect).
-		if hdr.Size > MaxEntryBytes {
-			return nil, fmt.Errorf("bundle: entry %q size %d exceeds MaxEntryBytes (%d)",
-				clean, hdr.Size, MaxEntryBytes)
+		maxEntry := int64(MaxEntryBytes)
+		if isManifestObjectKey(clean) {
+			// Manifests are metadata, not chunks, and a 100 TB backup's
+			// is multi-GB: they are staged to disk and verified as a
+			// stream, never held, so only the streaming reader's bound
+			// applies.
+			maxEntry = backup.MaxStreamedManifestBytes
+		}
+		if hdr.Size > maxEntry {
+			return nil, fmt.Errorf("bundle: entry %q size %d exceeds MaxEntryBytes limit (%d)",
+				clean, hdr.Size, maxEntry)
 		}
 
 		switch {
@@ -483,17 +485,20 @@ func Import(ctx context.Context, r io.Reader, sp storage.StoragePlugin, opts Imp
 			// land in the repo when the operator asked us to check.)
 			// Replica/attestation/WAL entries are not ed25519 backup
 			// manifests and stream as-is.
-			body, err := storage.ReadAllLimited(tr, MaxEntryBytes)
+			// Staged straight to disk: a primary manifest can be far
+			// larger than memory, and is verified from the staged file.
+			limit := int64(MaxEntryBytes)
+			if isManifestObjectKey(clean) {
+				limit = backup.MaxStreamedManifestBytes
+			}
+			path, err := stage.addFrom(clean, tr, limit)
 			if err != nil {
 				return nil, fmt.Errorf("bundle: read %s: %w", clean, err)
 			}
 			if opts.Verifier != nil && isSignedBackupManifestKey(clean) {
-				if _, verr := backup.ParseAndVerify(body, opts.Verifier); verr != nil {
+				if verr := verifyStagedManifest(path, opts.Verifier); verr != nil {
 					return nil, fmt.Errorf("bundle: reject %s: manifest signature verification failed: %w", clean, verr)
 				}
-			}
-			if err := stage.add(clean, body); err != nil {
-				return nil, err
 			}
 		default:
 			// Unknown top-level: skip.  Future bundle versions
@@ -600,13 +605,61 @@ func newImportStage() (*importStage, error) {
 	return &importStage{dir: dir}, nil
 }
 
-func (s *importStage) add(key string, body []byte) error {
+// addFrom stages up to limit bytes of r under key and returns the file's
+// path. More than limit bytes is an error.
+func (s *importStage) addFrom(key string, r io.Reader, limit int64) (string, error) {
 	path := filepath.Join(s.dir, strconv.Itoa(len(s.entries)))
-	if err := os.WriteFile(path, body, 0o600); err != nil {
-		return fmt.Errorf("bundle: stage %s: %w", key, err)
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return "", fmt.Errorf("bundle: stage %s: %w", key, err)
+	}
+	n, err := io.Copy(f, io.LimitReader(r, limit+1))
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err == nil && n > limit {
+		err = fmt.Errorf("entry exceeds %d bytes", limit)
+	}
+	if err != nil {
+		return "", fmt.Errorf("bundle: stage %s: %w", key, err)
 	}
 	s.entries = append(s.entries, stagedEntry{key: key, path: path})
-	return nil
+	return path, nil
+}
+
+// verifyStagedManifest checks a staged manifest's signature as a stream.
+func verifyStagedManifest(path string, v *backup.Verifier) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	_, err = backup.StreamManifest(f, backup.StreamOptions{Verifier: v}, nil)
+	return err
+}
+
+// putStagedIfNotExists is putIfNotExists for a staged file, uploaded from
+// disk rather than held in memory.
+func putStagedIfNotExists(ctx context.Context, sp storage.StoragePlugin, key, path string) error {
+	if _, err := sp.Stat(ctx, key); err == nil {
+		return nil
+	} else if !isNotFound(err) {
+		return err
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	_, err = sp.Put(ctx, key, f, storage.PutOptions{IfNotExists: true, ContentLength: fi.Size()})
+	if isAlreadyExists(err) {
+		return nil
+	}
+	return err
 }
 
 // commit writes the staged entries, primary backup manifests last.
@@ -625,11 +678,7 @@ func (s *importStage) commit(ctx context.Context, sp storage.StoragePlugin) erro
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		body, err := os.ReadFile(e.path)
-		if err != nil {
-			return fmt.Errorf("bundle: read staged %s: %w", e.key, err)
-		}
-		if _, err := putIfNotExists(ctx, sp, e.key, bytes.NewReader(body)); err != nil {
+		if err := putStagedIfNotExists(ctx, sp, e.key, e.path); err != nil {
 			return fmt.Errorf("bundle: write %s: %w", e.key, err)
 		}
 	}
@@ -647,6 +696,14 @@ func (s *importStage) cleanup() { _ = os.RemoveAll(s.dir) }
 func isSignedBackupManifestKey(key string) bool {
 	return strings.HasPrefix(key, "manifests/") &&
 		strings.HasSuffix(key, "/manifest.json")
+}
+
+// isManifestObjectKey reports whether key is a primary or replica backup
+// manifest — the bundle entries that scale with the database and are
+// therefore staged and verified as streams.
+func isManifestObjectKey(key string) bool {
+	return isSignedBackupManifestKey(key) ||
+		(strings.HasPrefix(key, "manifests/_replicas/") && strings.HasSuffix(key, ".manifest.json"))
 }
 
 // MaxEntryBytes caps the size of any single tar entry the
@@ -694,6 +751,59 @@ func writeTarEntry(tw *tar.Writer, name string, body []byte) error {
 // it as a tar entry under the same name.  When skipMissing is
 // true, an absent source key is a no-op; otherwise it's an
 // error.
+func readKey(ctx context.Context, sp storage.StoragePlugin, key string) ([]byte, error) {
+	rc, err := sp.Get(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	defer rc.Close()
+	return storage.ReadAllLimited(rc, storage.MaxMetadataBytes)
+}
+
+// requiredWAL names the WAL segments a backup needs to reach consistency:
+// the manifest's wal_required when a build recorded one, otherwise every
+// segment from the backup's start LSN to its stop LSN on its timeline.
+// Backups written so far never record wal_required (issue #77), so the
+// range is derived; the cluster's segment size is read from the archived
+// segment manifests (16 MiB when none can be read).
+func requiredWAL(ctx context.Context, sp storage.StoragePlugin, m *backup.Manifest) ([]string, error) {
+	if len(m.WALRequired) > 0 {
+		return m.WALRequired, nil
+	}
+	start, err := pglogrepl.ParseLSN(m.StartLSN)
+	if err != nil {
+		return nil, fmt.Errorf("start_lsn %q: %w", m.StartLSN, err)
+	}
+	stop, err := pglogrepl.ParseLSN(m.StopLSN)
+	if err != nil {
+		return nil, fmt.Errorf("stop_lsn %q: %w", m.StopLSN, err)
+	}
+	prefix := fmt.Sprintf("wal/%s/%08X/", m.Deployment, m.Timeline)
+	var segSize int64
+	for info, lerr := range sp.List(ctx, prefix) {
+		if lerr != nil {
+			return nil, lerr
+		}
+		if !strings.HasSuffix(info.Key, ".json") {
+			continue
+		}
+		body, gerr := readKey(ctx, sp, info.Key)
+		if gerr != nil {
+			continue
+		}
+		if sm, perr := walsink.ParseSegmentManifest(body); perr == nil && walsink.ValidSegmentSize(sm.SegmentSize) {
+			segSize = sm.SegmentSize
+			break
+		}
+	}
+	segSize = walsink.NormSegmentSize(segSize)
+	var out []string
+	for n := uint64(start) / uint64(segSize); n <= uint64(stop)/uint64(segSize); n++ {
+		out = append(out, walsink.SegmentFileName(m.Timeline, n, segSize))
+	}
+	return out, nil
+}
+
 func copyKey(ctx context.Context, sp storage.StoragePlugin, tw *tar.Writer, key string, skipMissing bool) error {
 	rc, err := sp.Get(ctx, key)
 	if err != nil {
@@ -708,6 +818,36 @@ func copyKey(ctx context.Context, sp storage.StoragePlugin, tw *tar.Writer, key 
 		return err
 	}
 	return writeTarEntry(tw, key, body)
+}
+
+// copyKeyStreamed is copyKey for objects that can be far larger than
+// memory (the replica copy of a backup manifest): the body is streamed
+// into the tar entry, sized by a Stat.
+func copyKeyStreamed(ctx context.Context, sp storage.StoragePlugin, tw *tar.Writer, key string, skipMissing bool) error {
+	st, err := sp.Stat(ctx, key)
+	if err != nil {
+		if skipMissing && isNotFound(err) {
+			return nil
+		}
+		return err
+	}
+	rc, err := sp.Get(ctx, key)
+	if err != nil {
+		if skipMissing && isNotFound(err) {
+			return nil
+		}
+		return err
+	}
+	defer rc.Close()
+	if err := tw.WriteHeader(&tar.Header{
+		Name: key, Mode: 0o644, Size: st.Size, ModTime: time.Time{}, Format: tar.FormatPAX,
+	}); err != nil {
+		return fmt.Errorf("bundle: tar header for %s: %w", key, err)
+	}
+	if _, err := io.Copy(tw, io.LimitReader(rc, st.Size)); err != nil {
+		return fmt.Errorf("bundle: tar write %s: %w", key, err)
+	}
+	return nil
 }
 
 // copyChunk is copyKey for chunks, returning the chunk's byte
@@ -898,24 +1038,62 @@ func walSegmentKey(deployment string, timeline uint32, segName string) string {
 	return fmt.Sprintf("wal/%s/%08X/%s.json", deployment, timeline, segName)
 }
 
-// readBundleManifest reads + parses one manifest, optionally
-// verifying its signature.  Distinct from ManifestStore.Read so
-// the bundle can operate on unsigned forensic repos.
-func readBundleManifest(ctx context.Context, sp storage.StoragePlugin, deployment, backupID string, verifier *backup.Verifier) (*backup.Manifest, error) {
+// copyManifestStreaming writes one primary manifest into the tar verbatim
+// and, in the same single read, parses it as a stream (verifying the
+// signature when verifier is non-nil). Distinct from ManifestStore.Read so
+// the bundle can operate on unsigned forensic repos. It returns the header
+// (Files == nil) and the SHA-256 of the bytes written.
+func copyManifestStreaming(ctx context.Context, sp storage.StoragePlugin, tw *tar.Writer, deployment, backupID string, verifier *backup.Verifier) (*backup.Manifest, [32]byte, error) {
+	var zero [32]byte
 	key := backup.PrimaryPath(deployment, backupID)
+	st, err := sp.Stat(ctx, key)
+	if err != nil {
+		return nil, zero, err
+	}
 	rc, err := sp.Get(ctx, key)
 	if err != nil {
-		return nil, err
+		return nil, zero, err
 	}
 	defer rc.Close()
-	body, err := storage.ReadAllLimited(rc, storage.MaxMetadataBytes)
+	if err := tw.WriteHeader(&tar.Header{
+		Name: key, Mode: 0o644, Size: st.Size, ModTime: time.Time{}, Format: tar.FormatPAX,
+	}); err != nil {
+		return nil, zero, fmt.Errorf("bundle: tar header for %s: %w", key, err)
+	}
+	tee := io.TeeReader(rc, tw)
+	info, err := backup.StreamManifest(tee, backup.StreamOptions{Verifier: verifier}, nil)
 	if err != nil {
-		return nil, err
+		return nil, zero, err
 	}
-	if verifier != nil {
-		return backup.ParseAndVerify(body, verifier)
+	// StreamManifest stops at the end of the JSON value; the tar entry
+	// must carry every byte the header promised.
+	if _, err := io.Copy(io.Discard, tee); err != nil {
+		return nil, zero, err
 	}
-	return backup.ParseAttestationless(body)
+	return info.Manifest, info.RawSHA256, nil
+}
+
+// streamManifestFiles walks the file entries of the manifest at key and
+// fails if its bytes differ from the pass that wrote it into the bundle.
+func streamManifestFiles(ctx context.Context, sp storage.StoragePlugin, key string, wantSHA [32]byte, fn func(*backup.FileEntry) error) error {
+	rc, err := sp.Get(ctx, key)
+	if err != nil {
+		return err
+	}
+	defer rc.Close()
+	info, err := backup.StreamManifest(rc, backup.StreamOptions{}, func(fe *backup.FileEntry) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		return fn(fe)
+	})
+	if err != nil {
+		return err
+	}
+	if info.RawSHA256 != wantSHA {
+		return fmt.Errorf("bundle: manifest %s changed while it was being exported", key)
+	}
+	return nil
 }
 
 // listManifestIDs enumerates the live (non-tombstoned) backup

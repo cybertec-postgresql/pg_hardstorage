@@ -193,17 +193,66 @@ func Heal(ctx context.Context, dst, replica storage.StoragePlugin, hashes []Hash
 	sort.Slice(sortedHashes, func(i, j int) bool {
 		return sortedHashes[i].String() < sortedHashes[j].String()
 	})
+	return healEach(ctx, dst, replica, func(fn func(Hash) error) error {
+		for _, h := range sortedHashes {
+			if err := fn(h); err != nil {
+				return err
+			}
+		}
+		return nil
+	}, opts, res, finish)
+}
 
-	for _, h := range sortedHashes {
+// HealStream is Heal over hashes produced by each, one at a time, so the
+// set of damaged chunks of a very large repository need not be held in
+// memory (a spill.HashSet's ForEach, which yields ascending hashes — the
+// same order Heal sorts into, since hex order equals byte order, is the
+// intended source). each must call fn for every hash and stop at the first
+// error fn returns.
+func HealStream(ctx context.Context, dst, replica storage.StoragePlugin, each func(fn func(Hash) error) error, opts HealOptions) (*HealResult, error) {
+	if dst == nil || replica == nil {
+		return nil, errors.New("repo heal: dst and replica plugins required")
+	}
+	res := &HealResult{
+		Schema:    HealSchema,
+		StartedAt: time.Now().UTC(),
+		DryRun:    opts.DryRun,
+	}
+	finish := func() {
+		res.StoppedAt = time.Now().UTC()
+		res.DurationMS = res.StoppedAt.Sub(res.StartedAt).Milliseconds()
+	}
+	if _, err := dst.Stat(ctx, HSREPOFilename); err != nil {
+		finish()
+		if errors.Is(err, storage.ErrNotFound) {
+			return res, ErrNotARepo
+		}
+		return res, fmt.Errorf("repo heal: stat dst HSREPO: %w", err)
+	}
+	if _, err := replica.Stat(ctx, HSREPOFilename); err != nil {
+		finish()
+		if errors.Is(err, storage.ErrNotFound) {
+			return res, fmt.Errorf("repo heal: replica is not a repo: %w", ErrNotARepo)
+		}
+		return res, fmt.Errorf("repo heal: stat replica HSREPO: %w", err)
+	}
+	return healEach(ctx, dst, replica, each, opts, res, finish)
+}
+
+// healEach runs healOne over every hash each produces.
+func healEach(ctx context.Context, dst, replica storage.StoragePlugin, each func(fn func(Hash) error) error, opts HealOptions, res *HealResult, finish func()) (*HealResult, error) {
+	err := each(func(h Hash) error {
 		if err := ctx.Err(); err != nil {
-			finish()
-			return res, err
+			return err
 		}
 		res.Considered++
 		healOne(ctx, dst, replica, h, opts, res)
-	}
-
+		return nil
+	})
 	finish()
+	if err != nil {
+		return res, err
+	}
 	return res, nil
 }
 

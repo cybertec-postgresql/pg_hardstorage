@@ -46,7 +46,7 @@ func (flowInspect) Run(ctx context.Context, env *Env) error {
 		}
 		store := backup.NewManifestStore(sp)
 		var manifests []*backup.Manifest
-		for m, mErr := range store.List(ctx, dep.Name, verifier) {
+		for m, mErr := range store.ListHeaders(ctx, dep.Name, verifier) {
 			if mErr != nil {
 				env.Prompter.Printf("    (manifest read error: %v)\n", mErr)
 				continue
@@ -75,7 +75,7 @@ func (flowInspect) Run(ctx context.Context, env *Env) error {
 				enc = m.Encryption.KEKRef
 			}
 			env.Prompter.Printf("    %-40s  %-18s  %-8d  %s\n",
-				m.BackupID, when, len(m.Files), enc)
+				m.BackupID, when, m.NumFiles(), enc)
 		}
 		env.Prompter.Println("")
 	}

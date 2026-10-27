@@ -36,7 +36,6 @@ import (
 	stdjson "encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"path"
 	"sort"
 	"strings"
@@ -565,7 +564,7 @@ func (s *Store) read(ctx context.Context, key string) ([]byte, error) {
 		return nil, fmt.Errorf("%w: %s", ErrNotFound, key)
 	}
 	defer rd.Close()
-	return io.ReadAll(rd)
+	return storage.ReadAllLimited(rd, storage.MaxRecordBytes)
 }
 
 // putUserLocked writes u. create=true makes the write create-only

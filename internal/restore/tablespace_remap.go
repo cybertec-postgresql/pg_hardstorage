@@ -5,7 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strconv"
 	"strings"
+
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup"
 )
 
 // TablespaceRemap is the operator-supplied mapping from
@@ -104,6 +107,62 @@ func ParseTablespaceRemap(entries []string) (TablespaceRemap, error) {
 		out = append(out, TablespaceRemapEntry{Old: old, New: neu})
 	}
 	return out, nil
+}
+
+// CleanTablespaceMapAll validates a --tablespace-mapping-all parent
+// directory and returns it cleaned. It must be an absolute path without
+// control characters, for the same reasons ParseTablespaceRemap's NEW side
+// must (a newline would forge a tablespace_map line). "" means "not
+// requested".
+func CleanTablespaceMapAll(parent string) (string, error) {
+	if strings.TrimSpace(parent) == "" {
+		return "", nil
+	}
+	if !filepath.IsAbs(parent) {
+		return "", fmt.Errorf("restore: tablespace-mapping-all %q: parent directory must be an absolute path", parent)
+	}
+	if strings.ContainsAny(parent, "\n\r\x00") {
+		return "", fmt.Errorf("restore: tablespace-mapping-all %q: path contains an illegal control character", parent)
+	}
+	return filepath.Clean(parent), nil
+}
+
+// WithMapAll extends the remap so EVERY non-default tablespace of the
+// backup lands under one parent directory, the way pgBackRest's
+// --tablespace-map-all does: tablespace <oid> goes to <parent>/<oid>. The
+// expansion is computed from the backup's own tablespace list at restore
+// time, so a tablespace added after the mapping was configured is covered
+// without touching it, and the result is deterministic (the OID is the
+// only input).
+//
+// An explicit entry for a tablespace's recorded location always wins over
+// the parent mapping. parent == "" returns r unchanged. parent must
+// already have passed CleanTablespaceMapAll.
+func (r TablespaceRemap) WithMapAll(parent string, tablespaces []backup.Tablespace) TablespaceRemap {
+	if parent == "" {
+		return r
+	}
+	have := make(map[string]struct{}, len(r))
+	for _, e := range r {
+		have[e.Old] = struct{}{}
+	}
+	out := append(TablespaceRemap(nil), r...)
+	for _, ts := range tablespaces {
+		// Same discriminator as tablespaceDestRoots: only a real external
+		// tablespace (non-zero OID, absolute location) has anything to move.
+		if ts.OID == 0 || !filepath.IsAbs(ts.Location) {
+			continue
+		}
+		if _, explicit := have[ts.Location]; explicit {
+			continue
+		}
+		have[ts.Location] = struct{}{}
+		out = append(out, TablespaceRemapEntry{
+			Old: ts.Location,
+			New: filepath.Join(parent, strconv.FormatUint(uint64(ts.OID), 10)),
+		})
+	}
+	return out
 }
 
 // Empty reports whether the remap has no entries.

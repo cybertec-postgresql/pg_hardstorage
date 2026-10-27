@@ -4,16 +4,22 @@
 package repo
 
 import (
+	"bufio"
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/spill"
 )
 
 // SweepOptions configures Sweep.
@@ -38,8 +44,24 @@ type SweepOptions struct {
 	BatchSize         int
 	DeleteConcurrency int
 
+	// BatchDuration lets one fence checkpoint (run-record bump, pin read,
+	// lease check and the manifest rescan) cover several BatchSize slices
+	// of deletes for up to this long, so a repository with hundreds of
+	// millions of orphans pays for the rescan once per BatchDuration of
+	// deleting instead of once per BatchSize chunks. Zero means: adaptive
+	// (GCFenceMaxWait/5) when BatchSize is also zero, else one checkpoint
+	// per BatchSize slice. Negative forces one checkpoint per slice. It is
+	// always capped so rescan + deletes stay well inside GCFenceMaxWait:
+	// a writer waits for the whole checkpoint (see gcfence.go).
+	BatchDuration time.Duration
+
 	// Now is the clock (default time.Now).
 	Now func() time.Time
+
+	// RefSpill tunes the reference set's heap budget and spill
+	// directory. The zero value keeps up to spill.DefaultMemEntries
+	// hashes on the heap and spills the rest to the system temp dir.
+	RefSpill spill.Options
 
 	// OnWarning, when set, receives non-fatal findings (a pin or run
 	// record that could not be cleaned up, ...).
@@ -58,10 +80,26 @@ type SweepOptions struct {
 // blocks or stops an Apply sweep. Retry-safe.
 var ErrSweepBackupInFlight = errors.New("repo: gc: a backup is in flight")
 
+// SweepOrphanSampleLimit bounds SweepResult.Orphans: a 100 TB repository
+// can hold hundreds of millions of orphans, and a report that names each
+// one is itself an out-of-memory failure. The sample is the smallest
+// hashes, in ascending order; OrphanCount is the true total.
+const SweepOrphanSampleLimit = 1024
+
+// maxSweepFailures bounds SweepResult.Failures (FailureCount is exact).
+const maxSweepFailures = 1024
+
+// sweepOrphanMemRecords is how many orphan records Sweep keeps on the heap
+// before they go to a temp file (variable so tests can force a spill).
+var sweepOrphanMemRecords = 1 << 20
+
 // SweepResult is the outcome of Sweep.
 type SweepResult struct {
-	RefCount         int
-	Orphans          []Hash // sorted
+	RefCount int
+	// OrphanCount is the exact number of orphan chunks found; Orphans is
+	// the smallest SweepOrphanSampleLimit of them, sorted.
+	OrphanCount      int
+	Orphans          []Hash // sorted sample (at most SweepOrphanSampleLimit)
 	OrphanBytes      int64  // from the chunk listing; no per-orphan Stat
 	StaleTemps       []string
 	Deleted          int
@@ -71,7 +109,10 @@ type SweepResult struct {
 	// (hidden from List) left by crashed writers and removed by Apply.
 	StagingReaped      int
 	StagingReapedBytes int64
-	Failures           []string // per-key delete failures (uncapped)
+	// Failures holds the first maxSweepFailures per-key delete failures
+	// (sorted); FailureCount is the exact number.
+	Failures     []string
+	FailureCount int
 	// SkippedReferenced counts orphans spared because a manifest
 	// committed after the snapshot, or a writer's pin, claimed them.
 	SkippedReferenced int
@@ -81,31 +122,280 @@ type SweepResult struct {
 	RunID        string
 }
 
+// orphanLog holds the orphans found by the chunk listing. Up to
+// sweepOrphanMemRecords of them live on the heap; past that they are
+// appended to a temp file and read back batch by batch, so memory does not
+// grow with the number of orphans. Apply-only: a dry run keeps just the
+// counters and the sample.
+type orphanLog struct {
+	dir   string
+	mem   []orphanInfo
+	f     *os.File
+	w     *bufio.Writer
+	nFile int
+	err   error
+}
+
+const orphanRecLen = len(Hash{}) + 8
+
+func (l *orphanLog) add(o orphanInfo) error {
+	if l.err != nil {
+		return l.err
+	}
+	l.mem = append(l.mem, o)
+	if len(l.mem) < sweepOrphanMemRecords {
+		return nil
+	}
+	if l.f == nil {
+		f, err := os.CreateTemp(l.dir, "pghs-orphans-*")
+		if err != nil {
+			l.err = fmt.Errorf("repo: gc: spill orphan list: %w", err)
+			return l.err
+		}
+		l.f, l.w = f, bufio.NewWriterSize(f, 1<<20)
+	}
+	var rec [orphanRecLen]byte
+	for _, m := range l.mem {
+		copy(rec[:], m.hash[:])
+		binary.LittleEndian.PutUint64(rec[len(m.hash):], uint64(m.size))
+		if _, err := l.w.Write(rec[:]); err != nil {
+			l.err = fmt.Errorf("repo: gc: spill orphan list: %w", err)
+			return l.err
+		}
+	}
+	l.nFile += len(l.mem)
+	l.mem = l.mem[:0]
+	return nil
+}
+
+// batches calls fn with consecutive slices of at most n orphans: the spilled
+// records first (in the order found), then the heap tail. fn must not keep
+// the slice. A list that never spilled is sorted by hash first, so small
+// sweeps delete in a deterministic order.
+func (l *orphanLog) batches(n int, fn func(batch []orphanInfo) error) error {
+	if l.err != nil {
+		return l.err
+	}
+	if l.f == nil {
+		sort.Slice(l.mem, func(i, j int) bool { return l.mem[i].hash.Compare(l.mem[j].hash) < 0 })
+	} else {
+		if err := l.w.Flush(); err != nil {
+			return fmt.Errorf("repo: gc: spill orphan list: %w", err)
+		}
+		r := bufio.NewReaderSize(io.NewSectionReader(l.f, 0, int64(l.nFile)*int64(orphanRecLen)), 1<<20)
+		buf := make([]orphanInfo, 0, n)
+		var rec [orphanRecLen]byte
+		for i := 0; i < l.nFile; i++ {
+			if _, err := io.ReadFull(r, rec[:]); err != nil {
+				return fmt.Errorf("repo: gc: read orphan list: %w", err)
+			}
+			var o orphanInfo
+			copy(o.hash[:], rec[:len(o.hash)])
+			o.size = int64(binary.LittleEndian.Uint64(rec[len(o.hash):]))
+			buf = append(buf, o)
+			if len(buf) == n {
+				if err := fn(buf); err != nil {
+					return err
+				}
+				buf = buf[:0]
+			}
+		}
+		if len(buf) > 0 {
+			if err := fn(buf); err != nil {
+				return err
+			}
+		}
+	}
+	for lo := 0; lo < len(l.mem); lo += n {
+		if err := fn(l.mem[lo:min(lo+n, len(l.mem))]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (l *orphanLog) close() {
+	if l.f != nil {
+		name := l.f.Name()
+		_ = l.f.Close()
+		_ = os.Remove(name)
+		l.f = nil
+	}
+}
+
+// hashSample keeps the smallest `limit` hashes it is offered.
+type hashSample struct {
+	limit int
+	buf   []Hash
+}
+
+func (s *hashSample) offer(h Hash) {
+	s.buf = append(s.buf, h)
+	if len(s.buf) >= 2*s.limit {
+		s.trim()
+	}
+}
+
+func (s *hashSample) trim() {
+	sortHashes(s.buf)
+	if len(s.buf) > s.limit {
+		s.buf = s.buf[:s.limit]
+	}
+}
+
+func (s *hashSample) sorted() []Hash {
+	s.trim()
+	return s.buf
+}
+
+// noteFailure counts a failed delete and keeps the first maxSweepFailures.
+func (r *SweepResult) noteFailure(msg string) {
+	r.FailureCount++
+	if len(r.Failures) < maxSweepFailures {
+		r.Failures = append(r.Failures, msg)
+	}
+}
+
 // manifestSnapshot is the reference set plus what was harvested, so a
 // later rescan only has to read manifests that are new or changed.
+//
+// harvested is a bounded-memory set of digests of (key, size, mtime), not a
+// map keyed by manifest key: a deployment archiving WAL for years holds tens
+// of millions of segment manifests, and every one of them is remembered.
 type manifestSnapshot struct {
 	refs      *RefSet
-	harvested map[string]storage.ObjectInfo
+	harvested *spill.HashSet
 	opts      CollectReferencesOptions
 	stale     []string
 	minAge    time.Duration
 	ageCutoff time.Time
 }
 
+// newManifestSnapshot builds a snapshot whose reference set and harvest
+// memo both spill to refSpill.Dir. Close it when done.
+func newManifestSnapshot(refSpill spill.Options, opts CollectReferencesOptions) *manifestSnapshot {
+	memo := spill.Options{Dir: refSpill.Dir, MemEntries: 1 << 18}
+	if refSpill.MemEntries > 0 && refSpill.MemEntries < memo.MemEntries {
+		memo.MemEntries = refSpill.MemEntries
+	}
+	return &manifestSnapshot{
+		refs:      NewRefSetWithOptions(refSpill),
+		harvested: spill.NewHashSet(memo),
+		opts:      opts,
+	}
+}
+
+// close releases both sets' spill files.
+func (s *manifestSnapshot) close() {
+	_ = s.refs.Close()
+	_ = s.harvested.Close()
+}
+
+// harvestDigest identifies one observed version of a manifest object.
+func harvestDigest(info storage.ObjectInfo) spill.Key {
+	h := sha256.New()
+	var n [12]byte
+	_, _ = h.Write([]byte(info.Key))
+	binary.LittleEndian.PutUint64(n[:8], uint64(info.Size))
+	binary.LittleEndian.PutUint32(n[8:], uint32(info.ModTime.Nanosecond()))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write(n[:])
+	var sec [8]byte
+	binary.LittleEndian.PutUint64(sec[:], uint64(info.ModTime.Unix()))
+	_, _ = h.Write(sec[:])
+	var out spill.Key
+	h.Sum(out[:0])
+	return out
+}
+
+// harvestConcurrency bounds the parallel manifest reads of one scan.
+const harvestConcurrency = 16
+
+type harvestJob struct {
+	key  string
+	kind harvestKind
+	info storage.ObjectInfo
+}
+
 // scan walks manifests/, wal/ and logical/ ONCE each and harvests every
 // live manifest not already harvested with the same size and mtime.
 // Stale staging temps (manifests/ and wal/) are detected in the same
 // walk when collectStale is set. Manifests are read concurrently.
+//
+// Memory is independent of the number of manifests: backup manifests
+// (hundreds) are held as keys, but WAL and logical-stream segment
+// manifests (potentially tens of millions) are handed to the workers as
+// the listing produces them, through a bounded channel.
 func (s *manifestSnapshot) scan(ctx context.Context, sp storage.StoragePlugin, collectStale bool) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var (
+		wg       sync.WaitGroup
+		mu       sync.Mutex
+		firstErr error
+		jobs     = make(chan harvestJob, harvestConcurrency)
+	)
+	fail := func(err error) {
+		mu.Lock()
+		if firstErr == nil {
+			firstErr = err
+			cancel()
+		}
+		mu.Unlock()
+	}
+	for i := 0; i < harvestConcurrency; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := range jobs {
+				if ctx.Err() != nil {
+					continue // drain
+				}
+				if err := harvestManifest(ctx, sp, j.key, s.refs, j.kind); err != nil {
+					fail(err)
+					continue
+				}
+				s.harvested.Add(harvestDigest(j.info))
+			}
+		}()
+	}
+	send := func(j harvestJob) bool {
+		select {
+		case jobs <- j:
+			return true
+		case <-ctx.Done():
+			return false
+		}
+	}
+
+	lerr := s.listAndDispatch(ctx, sp, collectStale, send)
+	close(jobs)
+	wg.Wait()
+
+	mu.Lock()
+	err := firstErr
+	mu.Unlock()
+	if err != nil {
+		return err
+	}
+	if lerr != nil {
+		return lerr
+	}
+	// A harvest memo that lost a spill write or read can answer "already
+	// harvested" for a manifest that never was: refs would be short.
+	if err := s.harvested.Err(); err != nil {
+		return fmt.Errorf("harvest memo unreliable: %w", err)
+	}
+	return ctx.Err()
+}
+
+// listAndDispatch produces the harvest jobs. It returns when the listings
+// are exhausted or send reports cancellation.
+func (s *manifestSnapshot) listAndDispatch(ctx context.Context, sp storage.StoragePlugin, collectStale bool, send func(harvestJob) bool) error {
 	grace := s.opts.effectiveGrace()
 	graceCutoff := s.opts.effectiveNow().Add(-grace)
 
-	type job struct {
-		key  string
-		kind harvestKind
-		info storage.ObjectInfo
-	}
-	var jobs []job
 	var stale []string
 	tombstoned := map[string]struct{}{}
 	var backupKeys []storage.ObjectInfo
@@ -145,7 +435,9 @@ func (s *manifestSnapshot) scan(ctx context.Context, sp storage.StoragePlugin, c
 		if s.fresh(info) {
 			continue
 		}
-		jobs = append(jobs, job{info.Key, harvestBackup, info})
+		if !send(harvestJob{info.Key, harvestBackup, info}) {
+			return ctx.Err()
+		}
 	}
 	for _, prefix := range []string{"wal/", "logical/"} {
 		for info, err := range sp.List(ctx, prefix) {
@@ -164,60 +456,23 @@ func (s *manifestSnapshot) scan(ctx context.Context, sp storage.StoragePlugin, c
 			if !strings.HasSuffix(info.Key, ".json") || s.fresh(info) {
 				continue
 			}
-			jobs = append(jobs, job{info.Key, harvestWAL, info})
-		}
-	}
-
-	// Concurrent harvest: on an object store each manifest is a round
-	// trip, and a shared repository holds tens of thousands of them.
-	const harvestConcurrency = 16
-	var (
-		wg       sync.WaitGroup
-		mu       sync.Mutex
-		firstErr error
-		sem      = make(chan struct{}, harvestConcurrency)
-	)
-	for _, j := range jobs {
-		mu.Lock()
-		failed := firstErr != nil
-		mu.Unlock()
-		if failed {
-			break
-		}
-		sem <- struct{}{}
-		wg.Add(1)
-		go func(j job) {
-			defer func() { <-sem; wg.Done() }()
-			if err := harvestManifest(ctx, sp, j.key, s.refs, j.kind); err != nil {
-				mu.Lock()
-				if firstErr == nil {
-					firstErr = err
-				}
-				mu.Unlock()
-				return
+			if !send(harvestJob{info.Key, harvestWAL, info}) {
+				return ctx.Err()
 			}
-			mu.Lock()
-			s.harvested[j.key] = j.info
-			mu.Unlock()
-		}(j)
-	}
-	wg.Wait()
-	if firstErr != nil {
-		return firstErr
+		}
 	}
 	if collectStale {
 		sort.Strings(stale)
 		s.stale = stale
 	}
-	return ctx.Err()
+	return nil
 }
 
 // fresh reports whether key was harvested before with identical
 // size and mtime — a manifest rewritten in place (kms rotate) is
 // harvested again; refs only ever grow, which is the safe direction.
 func (s *manifestSnapshot) fresh(info storage.ObjectInfo) bool {
-	prev, ok := s.harvested[info.Key]
-	return ok && prev.Size == info.Size && prev.ModTime.Equal(info.ModTime)
+	return s.harvested.Has(harvestDigest(info))
 }
 
 func (s *manifestSnapshot) isStaleAged(info storage.ObjectInfo) bool {
@@ -242,7 +497,9 @@ type orphanInfo struct {
 //     no orphan is Stat'd (neither for the reclaim estimate nor before
 //     its delete);
 //   - the pre-delete rescans are incremental: only manifests that are
-//     new or changed since the previous scan are read;
+//     new or changed since the previous scan are read, and one fence
+//     checkpoint (one rescan) covers up to BatchDuration of deletes, so
+//     the listing cost is not paid once per 4096 chunks;
 //   - manifests are read concurrently, hashes sort by bytes.
 func Sweep(ctx context.Context, sp storage.StoragePlugin, opts SweepOptions) (*SweepResult, error) {
 	clock := opts.Now
@@ -274,21 +531,32 @@ func Sweep(ctx context.Context, sp storage.StoragePlugin, opts SweepOptions) (*S
 		}
 	}
 
+	if opts.Apply {
+		reapStaleSpill(opts.RefSpill.Dir, start, opts.OnWarning)
+	}
+
 	fo := FindOrphansOptions{MinAge: opts.MinChunkAge, Now: start}
 	minAge := fo.effectiveMinAge()
-	snap := &manifestSnapshot{
-		refs:      NewRefSet(),
-		harvested: map[string]storage.ObjectInfo{},
-		opts:      CollectReferencesOptions{TombstoneGrace: opts.TombstoneGrace, Now: start},
-		minAge:    minAge,
-		ageCutoff: start.Add(-minAge),
-	}
+	snap := newManifestSnapshot(opts.RefSpill, CollectReferencesOptions{TombstoneGrace: opts.TombstoneGrace, Now: start})
+	snap.minAge = minAge
+	snap.ageCutoff = start.Add(-minAge)
+	defer snap.close()
 	if err := snap.scan(ctx, sp, true); err != nil {
 		return nil, fmt.Errorf("repo: gc: collect references: %w", err)
 	}
+	// A spill I/O failure means a negative Has may be wrong; deleting on
+	// that basis would destroy live chunks, so refuse to continue.
+	if err := snap.refs.Err(); err != nil {
+		return nil, fmt.Errorf("repo: gc: reference set unreliable: %w", err)
+	}
 
-	// One chunks/ listing: orphan set with sizes.
-	var orphans []orphanInfo
+	// One chunks/ listing: orphan counters, a bounded sample for the
+	// report and, on Apply, the orphan log (spilled past a heap budget) the
+	// delete loop reads back in batches. Nothing here grows with the number
+	// of orphans.
+	olog := &orphanLog{dir: opts.RefSpill.Dir}
+	defer olog.close()
+	sample := hashSample{limit: SweepOrphanSampleLimit}
 	for info, err := range sp.List(ctx, "chunks/sha256/") {
 		if err != nil {
 			return nil, fmt.Errorf("repo: gc: list chunks: %w", err)
@@ -309,16 +577,18 @@ func Sweep(ctx context.Context, sp storage.StoragePlugin, opts SweepOptions) (*S
 		if !info.ModTime.IsZero() && info.ModTime.After(start) {
 			continue
 		}
-		orphans = append(orphans, orphanInfo{hash: h, size: info.Size})
+		res.OrphanCount++
+		res.OrphanBytes += info.Size
+		sample.offer(h)
+		if opts.Apply {
+			if err := olog.add(orphanInfo{hash: h, size: info.Size}); err != nil {
+				return nil, err
+			}
+		}
 	}
-	sort.Slice(orphans, func(i, j int) bool { return orphans[i].hash.Compare(orphans[j].hash) < 0 })
 	res.RefCount = snap.refs.Len()
 	res.StaleTemps = snap.stale
-	res.Orphans = make([]Hash, len(orphans))
-	for i, o := range orphans {
-		res.Orphans[i] = o.hash
-		res.OrphanBytes += o.size
-	}
+	res.Orphans = sample.sorted()
 	if !opts.Apply {
 		return res, nil
 	}
@@ -342,43 +612,88 @@ func Sweep(ctx context.Context, sp storage.StoragePlugin, opts SweepOptions) (*S
 	if conc <= 0 {
 		conc = 16
 	}
-	pins := newGCPinSet()
+	// How long one checkpoint may keep deleting. A writer that pinned after
+	// the checkpoint's pin read waits for the NEXT checkpoint (seq+1), i.e.
+	// for the rescan and every delete of this one, and gives up after
+	// GCFenceMaxWait; the whole checkpoint is therefore held to 3/5 of it.
+	slice := opts.BatchDuration
+	if slice == 0 && opts.BatchSize <= 0 {
+		slice = GCFenceMaxWait / 5
+	}
+	maxCheckpoint := GCFenceMaxWait * 3 / 5
+	pins := newGCPinSet(opts.RefSpill)
+	defer pins.close()
 	var mu sync.Mutex
-	for b, lo := 0, 0; lo < len(orphans); b, lo = b+1, lo+batchSize {
-		hi := min(lo+batchSize, len(orphans))
+	remaining := res.OrphanCount
+	b := 0
+	var deadline time.Time // end of the open checkpoint's delete window
+	warnedSlow := false
+	checkpoint := func() error {
+		began := time.Now()
 		// Checkpoint: publish seq, THEN read pins and rescan.
 		if err := fence.advance(ctx); err != nil {
-			return res, fmt.Errorf("repo: gc: publish batch checkpoint (refusing to delete without the fence): %w", err)
+			return fmt.Errorf("repo: gc: publish batch checkpoint (refusing to delete without the fence): %w", err)
 		}
 		if opts.beforeBatch != nil {
 			opts.beforeBatch(b)
 		}
 		if err := pins.refresh(ctx, sp, clock()); err != nil {
-			return res, fmt.Errorf("repo: gc: read writer pins: %w", err)
+			return fmt.Errorf("repo: gc: read writer pins: %w", err)
+		}
+		if err := pins.err(); err != nil {
+			return fmt.Errorf("repo: gc: writer pin set unreliable: %w", err)
 		}
 		if opts.LiveLeases != nil {
 			live, err := opts.LiveLeases(ctx)
 			if err != nil {
-				return res, fmt.Errorf("repo: gc: re-scan backup leases: %w", err)
+				return fmt.Errorf("repo: gc: re-scan backup leases: %w", err)
 			}
 			if len(live) > 0 {
 				res.StoppedEarly = "backup started: " + strings.Join(live, ", ")
-				return res, fmt.Errorf("%w (started during the sweep) for: %s; %d orphan(s) left for the next run",
-					ErrSweepBackupInFlight, strings.Join(live, ", "), len(orphans)-lo)
+				return fmt.Errorf("%w (started during the sweep) for: %s; %d orphan(s) left for the next run",
+					ErrSweepBackupInFlight, strings.Join(live, ", "), remaining)
 			}
 		}
 		if err := snap.scan(ctx, sp, false); err != nil {
-			return res, fmt.Errorf("repo: gc: rescan references before delete: %w", err)
+			return fmt.Errorf("repo: gc: rescan references before delete: %w", err)
+		}
+		if err := snap.refs.Err(); err != nil {
+			return fmt.Errorf("repo: gc: reference set unreliable: %w", err)
 		}
 		if opts.beforeDelete != nil {
 			opts.beforeDelete(b)
 		}
+		spent := time.Since(began)
+		window := max(slice, 0)
+		if left := maxCheckpoint - spent; left < window {
+			window = max(left, 0)
+		}
+		if spent > maxCheckpoint {
+			if !warnedSlow && opts.OnWarning != nil {
+				warnedSlow = true
+				opts.OnWarning(fmt.Sprintf("gc: the manifest rescan took %s, more than 3/5 of the writer fence wait (%s); a committing backup may be told to retry", spent.Round(time.Second), GCFenceMaxWait))
+			}
+		}
+		deadline = time.Now().Add(window)
+		b++
+		return nil
+	}
+	berr := olog.batches(batchSize, func(batch []orphanInfo) error {
+		// Open a new checkpoint unless the current one still has delete
+		// time left. Pins read at its start stay valid for every slice
+		// under it: a writer pinning later waits for the NEXT checkpoint,
+		// which is published only after these deletes finished.
+		if !time.Now().Before(deadline) {
+			if err := checkpoint(); err != nil {
+				return err
+			}
+		}
 		if err := fence.checkFresh(); err != nil {
-			return res, err
+			return err
 		}
 		sem := make(chan struct{}, conc)
 		var wg sync.WaitGroup
-		for _, o := range orphans[lo:hi] {
+		for _, o := range batch {
 			if snap.refs.Has(o.hash) || pins.has(o.hash) {
 				mu.Lock()
 				res.SkippedReferenced++
@@ -397,7 +712,7 @@ func Sweep(ctx context.Context, sp storage.StoragePlugin, opts SweepOptions) (*S
 				mu.Lock()
 				defer mu.Unlock()
 				if err != nil {
-					res.Failures = append(res.Failures, fmt.Sprintf("%s: %v", o.hash, err))
+					res.noteFailure(fmt.Sprintf("%s: %v", o.hash, err))
 					return
 				}
 				res.Deleted++
@@ -405,19 +720,31 @@ func Sweep(ctx context.Context, sp storage.StoragePlugin, opts SweepOptions) (*S
 			}(o)
 		}
 		wg.Wait()
-		if err := ctx.Err(); err != nil {
-			return res, err
-		}
+		remaining -= len(batch)
+		return ctx.Err()
+	})
+	if berr != nil {
+		return res, berr
 	}
 
 	// Stale staging files. Best-effort: a tmp under an active object
 	// lock cannot be deleted until it expires; a later run reaps it.
 	for _, key := range snap.stale {
 		if err := sp.Delete(ctx, key); err != nil {
-			res.Failures = append(res.Failures, fmt.Sprintf("%s: %v", key, err))
+			res.noteFailure(fmt.Sprintf("%s: %v", key, err))
 			continue
 		}
 		res.StaleTempDeleted++
+	}
+
+	// Empty directories the deletes left behind (fs: chunks/sha256/xx/yy
+	// shells, the id directory of a reaped manifest temp). Best-effort.
+	// Always, not only after deleting: a run that crashed or hit faults after
+	// its deletes must still be cleaned up by the next one.
+	for _, prefix := range []string{"chunks", "manifests", "wal", "logical"} {
+		if _, err := storage.PruneEmptyDirsOf(ctx, sp, prefix, false); err != nil && opts.OnWarning != nil {
+			opts.OnWarning(fmt.Sprintf("prune empty %s directories: %v", prefix, err))
+		}
 	}
 
 	// Backend staging files (.deferred-/.excl-/.hstmp-) a crashed writer
@@ -561,6 +888,53 @@ func (r *gcRun) finish(ctx context.Context, warn func(string)) {
 		if gerr := getJSON(ctx, r.sp, info.Key, &rec); gerr == nil && !rec.liveAt(now) &&
 			now.Sub(rec.HeartbeatAt) > gcRunRecordRetention {
 			_ = r.sp.Delete(ctx, info.Key)
+		}
+	}
+}
+
+// staleSpillAge is how old spill leftovers must be to be reaped. A gc killed
+// with SIGKILL/OOM never runs its deferred Close, and its spill files then sat
+// in the temp dir forever. Spill run files are written once and not touched
+// again, so this is far beyond the lifetime of any live sweep; a live set that
+// lost its files fails closed (Err), it never under-counts.
+const staleSpillAge = 7 * 24 * time.Hour
+
+// reapStaleSpill removes pghs-spill-* directories and pghs-orphans-* files
+// older than staleSpillAge from dir (default: the system temp dir).
+func reapStaleSpill(dir string, now time.Time, warn func(string)) {
+	if dir == "" {
+		dir = os.TempDir()
+	}
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	cutoff := now.Add(-staleSpillAge)
+	for _, e := range ents {
+		n := e.Name()
+		isDir := strings.HasPrefix(n, "pghs-spill-") && e.IsDir()
+		if !isDir && !(strings.HasPrefix(n, "pghs-orphans-") && !e.IsDir()) {
+			continue
+		}
+		fi, err := e.Info()
+		if err != nil || fi.ModTime().After(cutoff) {
+			continue
+		}
+		if isDir {
+			// newest entry decides: a dir's own mtime moves only on create/unlink
+			newest := fi.ModTime()
+			sub, _ := os.ReadDir(filepath.Join(dir, n))
+			for _, se := range sub {
+				if si, err := se.Info(); err == nil && si.ModTime().After(newest) {
+					newest = si.ModTime()
+				}
+			}
+			if newest.After(cutoff) {
+				continue
+			}
+		}
+		if err := os.RemoveAll(filepath.Join(dir, n)); err != nil && warn != nil {
+			warn(fmt.Sprintf("reap stale spill leftover %s: %v", n, err))
 		}
 	}
 }

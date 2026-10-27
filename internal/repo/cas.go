@@ -17,12 +17,8 @@ import (
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/compression/none"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/encryption"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/spill"
 )
-
-// asArray converts repo.Hash back to [32]byte for the storage plugin's
-// PutOptions.ContentSHA256. Hash and [32]byte share an underlying type;
-// this is just a typed conversion at the API boundary.
-func (h Hash) asArray() [32]byte { return [32]byte(h) }
 
 // CASRetention configures per-Put retention propagation. When
 // active, every PutChunk includes a RetainUntil deadline in
@@ -136,6 +132,12 @@ type CAS struct {
 	// first backup.
 	hints map[Hash]struct{}
 
+	// hintFilter is the memory-bounded form of hints: a Bloom filter over
+	// the same kind of set (see WithDedupHintFilter). A false positive
+	// costs one Stat probe that falls through to the normal write path,
+	// so it needs no exactness and no per-hash heap.
+	hintFilter *spill.Bloom
+
 	// dedup counters — atomics because PutChunk runs concurrently
 	// (the base-backup chunk worker pool). Read via DedupStats.
 	dedupMiss    atomic.Int64 // chunks newly written to the repo
@@ -169,6 +171,15 @@ type CAS struct {
 	// existence at manifest-commit time, closing the sweep race from
 	// the writer's side no matter how gc's own guards are timed.
 	adopted sync.Map // Hash -> struct{}
+
+	// adoptedSpill, when set (WithSpilledAdoption), replaces the map above
+	// with a bounded-memory set: a second backup of a very large database
+	// deduplicates against billions of chunks, every one of them adopted,
+	// which no map holds. The spill set cannot delete, so the few hashes
+	// forgotten after a missing-chunk finding go in adoptedGone and are
+	// filtered out of every read.
+	adoptedSpill *spill.HashSet
+	adoptedGone  sync.Map // Hash -> struct{}
 
 	// adopt guards the one-shot cross-DEK check. See ensureAdoptable.
 	adopt adoptGuard
@@ -358,17 +369,89 @@ func (d DedupStats) HitRate() float64 {
 // chunks whose durability was trusted rather than produced — see
 // AdoptedHashes.
 func (c *CAS) WasAdopted(h Hash) bool {
+	if c.adoptedSpill != nil {
+		if _, gone := c.adoptedGone.Load(h); gone {
+			return false
+		}
+		return c.adoptedSpill.Has(h)
+	}
 	_, ok := c.adopted.Load(h)
 	return ok
 }
 
+// AdoptedHashes materialises the adoption set. Fine for the WAL path and
+// small backups; a caller that may hold billions should use AdoptedLen
+// and ForEachAdopted.
 func (c *CAS) AdoptedHashes() []Hash {
 	var out []Hash
-	c.adopted.Range(func(k, _ any) bool {
-		out = append(out, k.(Hash))
-		return true
-	})
+	_ = c.ForEachAdopted(func(h Hash) error { out = append(out, h); return nil })
 	return out
+}
+
+// AdoptedLen is the number of adopted hashes.
+func (c *CAS) AdoptedLen() int {
+	if c.adoptedSpill == nil {
+		n := 0
+		c.adopted.Range(func(_, _ any) bool { n++; return true })
+		return n
+	}
+	n := c.adoptedSpill.Len()
+	c.adoptedGone.Range(func(_, _ any) bool { n--; return true })
+	return n
+}
+
+// ForEachAdopted calls fn for every adopted hash (ascending order when
+// the set is spilled, unspecified otherwise) without materialising them.
+func (c *CAS) ForEachAdopted(fn func(Hash) error) error {
+	if c.adoptedSpill == nil {
+		var err error
+		c.adopted.Range(func(k, _ any) bool {
+			err = fn(k.(Hash))
+			return err == nil
+		})
+		return err
+	}
+	return c.adoptedSpill.ForEach(func(k spill.Key) error {
+		h := Hash(k)
+		if _, gone := c.adoptedGone.Load(h); gone {
+			return nil
+		}
+		return fn(h)
+	})
+}
+
+// AdoptedErr is the first I/O error of a spilled adoption set. A set that
+// failed to record an adoption would silently shrink the commit-time
+// existence gate, so callers check it before trusting the gate.
+func (c *CAS) AdoptedErr() error {
+	if c.adoptedSpill == nil {
+		return nil
+	}
+	return c.adoptedSpill.Err()
+}
+
+// WithSpilledAdoption keeps the adoption set in a bounded-memory spill
+// set instead of a map (see CAS.adoptedSpill). Call CAS.CloseAdopted when
+// the CAS is done to remove the spill files.
+func WithSpilledAdoption(o spill.Options) CASOption {
+	return func(c *CAS) { c.adoptedSpill = spill.NewHashSet(o) }
+}
+
+// CloseAdopted releases a spilled adoption set's files. No-op otherwise.
+func (c *CAS) CloseAdopted() error {
+	if c.adoptedSpill == nil {
+		return nil
+	}
+	return c.adoptedSpill.Close()
+}
+
+// forgetAdoption drops one adoption.
+func (c *CAS) forgetAdoption(h Hash) {
+	if c.adoptedSpill != nil {
+		c.adoptedGone.Store(h, struct{}{})
+		return
+	}
+	c.adopted.Delete(h)
 }
 
 // ForgetAdopted drops the given hashes from this CAS's adoption set.
@@ -390,7 +473,7 @@ func (c *CAS) AdoptedHashes() []Hash {
 // twice is harmless.
 func (c *CAS) ForgetAdopted(hashes ...Hash) {
 	for _, h := range hashes {
-		c.adopted.Delete(h)
+		c.forgetAdoption(h)
 	}
 }
 
@@ -407,7 +490,7 @@ func (c *CAS) ForgetAdopted(hashes ...Hash) {
 func (c *CAS) ForgetChunk(hashes ...Hash) {
 	for _, h := range hashes {
 		c.unmarkSeen(h)
-		c.adopted.Delete(h)
+		c.forgetAdoption(h)
 	}
 }
 
@@ -579,6 +662,17 @@ func WithSeenCacheLimit(n int) CASOption {
 	}
 }
 
+// WithDedupHintFilter is WithDedupHints for a hint set too large to hold
+// as a map: a Bloom filter over the hashes the caller believes are
+// already in the repo. A database with billions of chunks has a hint set
+// of hundreds of GB as a map; the filter is about 1.25 bytes per hash.
+// A false positive only causes one extra Stat probe — the probe's result,
+// not the filter, decides — so the filter being approximate is safe.
+// nil is a no-op. The filter must not be modified after this call.
+func WithDedupHintFilter(f *spill.Bloom) CASOption {
+	return func(cas *CAS) { cas.hintFilter = f }
+}
+
 // WithDedupHints supplies a set of plaintext chunk hashes the caller
 // believes are ALREADY present in the repo — typically every chunk
 // referenced by the deployment's most recent prior backup manifest.
@@ -716,7 +810,9 @@ func (c *CAS) PutChunk(ctx context.Context, body []byte) (ChunkInfo, error) {
 	if v, ok := c.seen.Load(hash); ok {
 		e, _ := v.(seenEntry)
 		if e.writtenAt.IsZero() || c.clock().Sub(e.writtenAt) >= seenWriteTrust {
-			c.markAdopted(hash)
+			if err := c.markAdopted(hash); err != nil {
+				return ChunkInfo{}, err
+			}
 		}
 		if until, err := c.ensureRetention(ctx, hash, e.retainedUntil); err != nil {
 			return ChunkInfo{}, err
@@ -736,8 +832,15 @@ func (c *CAS) PutChunk(ctx context.Context, body []byte) (ChunkInfo, error) {
 	// since the hint set was built, or a transient Stat error) just
 	// falls through to the normal write path below; the IfNotExists
 	// Put is the correctness backstop either way.
-	if c.hints != nil {
-		if _, hinted := c.hints[hash]; hinted {
+	if c.hints != nil || c.hintFilter != nil {
+		hinted := false
+		if c.hints != nil {
+			_, hinted = c.hints[hash]
+		}
+		if !hinted && c.hintFilter != nil {
+			hinted = c.hintFilter.Test(hash)
+		}
+		if hinted {
 			if _, statErr := c.sp.Stat(ctx, ChunkKey(hash)); statErr == nil {
 				if err := c.ensureAdoptable(ctx, hash); err != nil {
 					return ChunkInfo{}, err
@@ -747,7 +850,9 @@ func (c *CAS) PutChunk(ctx context.Context, body []byte) (ChunkInfo, error) {
 					return ChunkInfo{}, err
 				}
 				c.markSeen(hash, seenEntry{retainedUntil: until})
-				c.markAdopted(hash)
+				if err := c.markAdopted(hash); err != nil {
+					return ChunkInfo{}, err
+				}
 				c.dedupStorage.Add(1)
 				info.Deduped = true
 				return info, nil
@@ -823,7 +928,9 @@ func (c *CAS) PutChunk(ctx context.Context, body []byte) (ChunkInfo, error) {
 			return ChunkInfo{}, rerr
 		}
 		c.markSeen(hash, seenEntry{retainedUntil: until})
-		c.markAdopted(hash)
+		if err := c.markAdopted(hash); err != nil {
+			return ChunkInfo{}, err
+		}
 		c.dedupStorage.Add(1)
 		info.Deduped = true
 		return info, nil

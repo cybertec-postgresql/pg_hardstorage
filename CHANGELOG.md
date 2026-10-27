@@ -9,6 +9,282 @@ on-disk and on-the-wire schema (backup manifests, configuration, output JSON,
 and the on-disk chunk envelope): an agent built against a given schema version
 keeps reading that version for at least 24 months after a successor lands.
 
+## [Unreleased]
+
+## [1.6.0] — 2026-10-27
+
+### Fixed
+
+- **CLI hardening merged from the July quality pass.** `restore` now
+  validates `--verify` / `--verify-restore` before any dispatch and the
+  agent's restore executor validates and honours a `verify_restore` job
+  arg; capacity preflight, `rotate` (negative GFS counts), `repair scrub`
+  (negative `--limit`), `threshold` and several rare numeric flags are
+  range-checked up front; `integrity run --skip-sign` is genuinely
+  read-only (no read-only-repo bypass, no audit append);
+  `ManifestStore.UndeleteForce` validates its deployment/backup-id
+  reference like every other entry point. The July pass's repository-wide
+  mutation lock, its single-record encryption domain, its plaintext-writer
+  refusal and its control-plane flag filter (HEAD's per-verb refusal list is richer) were
+  NOT adopted: the gc commit fence, per-KEK shared-DEK slots and
+  read-side posture mitigation already cover those hazards without making
+  every backup and WAL commit fail while a gc runs.
+- **Memory on the 100 TB paths is bounded by spill budgets, not database
+  size.** A pass over every command that held a per-chunk, per-file or
+  per-segment list in memory (backup, restore, PITR, retention, verify,
+  `repo gc`, `repair chunks --orphans`, `repo wipe`, `repo replicate`,
+  `repo check`, `integrity`, `wal prune`, `partial`) replaced the lists
+  with streams, 1-bit-per-segment bitmaps, counters with bounded samples,
+  or disk-spilling sets (see [Very large
+  databases](docs/how-to/operating/very-large-databases.md)). Commands
+  that only need a manifest's header (`list`, `status`, `capacity`,
+  `cost`, `forecast`, `slo`, `doctor`, `fleet search`, `recovery`
+  windows, `timetravel`, `restore --to`, retention, ...) no longer parse
+  its file entries. User-visible consequences:
+  - Failure and mismatch lists in `verify`, `integrity`, `repo check`,
+    `repo scrub` and `repair scrub` are capped (scrub: the first 1000
+    hashes, `mismatches_truncated`); the counts stay exact.
+  - `integrity` samples chunks with an O(1)-memory streaming selection,
+    so the same `--seed` now picks different chunks than before.
+  - `wal list` and `wal audit` keep 16 bytes per segment and gain
+    `--limit` (default 100000) with `segment_count` and
+    `segments_truncated` in the result; the audit-log head fallback and
+    `audit search` are bounded.
+  - Spill sets check free space before flushing or merging and fail with
+    "not enough free space ... set TMPDIR" instead of ENOSPC mid-run, and
+    warn once when the spill directory is on tmpfs/ramfs.
+  - Repository objects read whole by design (approvals, JIT grants,
+    SCIM/ACL/threshold/insider records, drill history, integrity run
+    records, Patroni and ticketing responses, the doctor head pointer)
+    are capped at `storage.MaxRecordBytes` (64 MiB); a PostgreSQL server
+    message body is capped at 256 MiB; `scp` and docker verify output is
+    capped.
+- **`restore` resume no longer holds the completed-file list in memory.**
+  Completed files are appended to `.pg_hardstorage_restore_done.log` in
+  the target directory (next to `.pg_hardstorage_restore_state.json`,
+  which now records only the committed log length) and consulted through
+  a spill set. A checkpoint written by an earlier version, with an inline
+  `completed_files` list, is still read and migrated. Re-running the same
+  command resumes; a torn log tail from a crash is ignored.
+  `partial` restore materialises matching files in one streaming pass.
+- **`repo gc --apply` re-lists manifests once per sweep window, not once
+  per 4096 deletions.** One fence checkpoint (run-record bump, pin read,
+  lease check, rescan of newly committed manifests) now covers
+  consecutive delete slices for up to a fifth of `GCFenceMaxWait`
+  (adaptive), so a repository with hundreds of millions of orphans is no
+  longer dominated by rescans. The exclusion invariants are unchanged:
+  writers still wait for the in-flight checkpoint. Sidecar replica
+  manifests of huge manifests are streamed, and a failed one is counted
+  instead of silently skipped. The orphan list in the result is a sample.
+
+- **Backups of very large databases no longer hit the 1 GiB manifest
+  ceiling.** A manifest is ~115 bytes per chunk, so a 200 TB database
+  (about 3.3 billion chunks at the default 64 KiB average) is a ~380 GB
+  document; every reader capped manifests at 1 GiB and loaded them whole,
+  which stopped working near 0.6 TB. No on-disk format change: the same
+  manifests are written and read, and existing repositories are untouched.
+  - Backups spool file entries to disk as the tar stream is chunked and
+    sign a memory-mapped canonical copy (`CommitSpooled`, byte-identical
+    to `Commit`). Restore, `restore --preview`, `verify`, `list`, `show`,
+    `integrity`, `repo check`/`scrub`/`repair`, `partial`, `backup
+    compare`, `backup graph`, `capacity`, `cost`, `forecast`, `anomaly`
+    and `recovery` walk manifests as streams (`ReadAuto`/`ListAuto`); a
+    manifest under 64 MiB still takes the old single-read path.
+  - `repo gc` marks references with a disk-spilling exact set and streams
+    the manifests; `repo replicate` and `replicate verify` stream large
+    manifests and copy them as streams.
+  - Dedup hints are a Bloom filter, the encryption-key reuse probe reads
+    only the manifest head (it used to fail past 1 GiB, silently turning
+    off dedup for encrypted repositories), and the adopted-chunk set that
+    the commit gate and the GC fence walk is no longer a map.
+  - The S3 plugin uploads objects over 64 MiB as multipart (a single PUT
+    is capped at 5 GiB), keeping `If-None-Match` on completion.
+  - Memory is bounded by the spill budgets (`spill.DefaultMemEntries`),
+    not by database size: a 6M-reference (1.4 GB) manifest is committed,
+    verified and walked at a 52 MiB heap peak.
+- **No command refuses a multi-GB manifest any more (#81).** 1.5.0 failed
+  on a 4.2 GB manifest ("object exceeds the 1073741824-byte read limit")
+  in `list`, `status`, `show`, `verify`, `repo check`, `restore`, `backup
+  delete`, `doctor` and `repair manifest`. The streaming readers of the
+  earlier entries cover those; this closes what was left, and an
+  end-to-end test now runs every manifest-reading command against a
+  manifest far above shrunken read caps. An existing oversized manifest
+  is read as it is; no backup has to be re-taken.
+  - `repair manifest` and `repair attestation` verify, copy and re-sign
+    manifests as streams (a re-signed copy is staged in `$TMPDIR`)
+    instead of reading them whole with no cap.
+  - `repo bundle export` / `import` no longer refuse a manifest or its
+    replica over 1 GiB (the replica was also held in memory).
+  - `kms shred`'s affected-backup scan no longer skips an oversized
+    replica manifest, which understated what the shred destroys.
+  - A manifest whose primary object is gone is now streamed from the
+    replica when the replica is large (it hit the held-read cap).
+  - `backup.MaxManifestBytes` and `storage.MaxMetadataBytes` are
+    variables instead of constants, so tests can shrink them; their
+    defaults (1 GiB) only bound objects that are read whole by design.
+- **`schedule` no longer presents an unapplied schedule as running
+  (#80).** The agent builds its task list at start; after editing
+  `pg_hardstorage.yaml` (or `schedule <deployment> <expr>`) it keeps the
+  old schedule until restarted, but `schedule` showed only the new one.
+  The agent now records the schedules it loaded in
+  `<state dir>/agent-loaded-schedule.json`; while it runs, `schedule`
+  marks every differing slot `NOT RUNNING YET: agent still runs ...`
+  (JSON: `pending_restart`, `agent_running`, `agent.restart_required`) and
+  says a restart is needed. A record from a crashed agent is ignored.
+- **Spill-set hardening found by the pre-release review.**
+  - A spill file truncated or unreadable behind the set's back used to
+    answer "absent" for the members it held; `Has` now answers "present"
+    and records the error, so a GC keeps the chunk (fail closed).
+  - After a failed flush (spill volume full) every `Add` re-sorted the
+    whole heap buffer and retried, so a backup crawled instead of
+    failing. Flushes now back off as the buffer doubles, and adopting a
+    chunk into a broken spilled adoption set fails that chunk — and the
+    backup — immediately.
+  - The manifest spool reports a spill I/O error as such (not as a
+    "duplicate file path") and refuses to commit when its path set or
+    unique-chunk counters lost data; the adoption gate refuses to pass
+    when its walk stopped early; `repo gc`'s reference set closes
+    explicitly.
+  - `show` reports a corrupt manifest as `verify.manifest_signature`
+    instead of `internal`.
+
+- **`repo bundle export --include-wal` always refused** (#77). No backup
+  records `wal_required`, so the export had nothing to pull. It now
+  derives the segments each backup needs from its start and stop LSN,
+  fails if one is not archived, and carries each segment's chunks (the
+  bundle previously held only the segment manifests).
+- **`repo replicate` could not use different credentials for two `s3://`
+  URLs** (#76). `s3://` URLs accept `profile=NAME` and
+  `credentials_env=PREFIX` to authenticate one URL on its own.
+- **The sftp subsystem handshake had no deadline** (#73). A peer that
+  authenticated but never answered the SFTP version exchange hung the
+  first `Open` and every reconnect. It is now bounded like the other
+  data-plane reads.
+- **sftp/scp data-plane reads had no deadline** (#72). A wedged read on
+  a live connection hung forever; it now fails after 60 s of no progress
+  and the next operation reconnects. This is the likely cause of the
+  stalled `restore_command` in #71.
+
+- **Security hardening pass (v1.6 validation).** A manifest copied over
+  another backup's key (rollback/replay) is refused: its deployment and
+  backup id must match the key. Credentials in repo URLs (`user:pw@`,
+  `?sig=`, `?token=`, `?secret_key=`) are scrubbed from errors, suggestions
+  and events. The restore boot test and the partial-restore sandbox start
+  with `archive_mode=off`, so a verified restore can no longer push a
+  timeline-2 history file and WAL into the production archive. Keyword-form
+  DSN passwords are masked; `kms rotate`/`kms verify` key files and the
+  approver private key must be owner-only regular files (KEKs 32 bytes,
+  non-zero); `wal fetch` checks the segment manifest's timeline, name and
+  deployment; restore masks setuid/setgid/sticky bits.
+- **`repo gc` leaves a clean repo:** the fs backend prunes the empty
+  `chunks/` and `manifests/` directories gc leaves behind; the pin set
+  honours the configured spill directory; spill and orphan-log leftovers of
+  a killed gc older than 7 days are reaped on `--apply`.
+- **Leaks:** a backup cancelled during the lease settle window no longer
+  holds its lease for the full TTL (it blocked every later backup with
+  `conflict.backup_in_progress`); the scheduler no longer relaunches a
+  task whose abandoned run is still alive (a wedged task now stays
+  skipped until it returns); the zstd compressor caps encoder state at 8
+  (it grew with core count); a failed spill flush removes its run file.
+- **Memory on huge manifests:** `backup compare` and `audit
+  verify-chain`/`summary`/`search` stream through disk-backed sorted runs
+  instead of in-memory maps; `spill.DefaultMemEntries` is 1M (was 4M);
+  `wal list`/`wal audit` cap gap rows at 100,000 (`gaps_truncated`, counts
+  stay exact); the PostgreSQL `backup_manifest` ceiling is 1 GiB (was
+  256 MiB) and is held once; the s3events and webhook logical sinks also
+  flush at `BatchBytes` (default 16 MiB).
+
+### Added
+
+- **`restore --tablespace-mapping-all <dir>`, `recovery drill
+  --tablespace-mapping-all <dir>` and `drill.tablespace_mapping_all` (#79)**
+  restore every non-default tablespace to `<dir>/<tablespace-oid>`
+  (pgBackRest's `--tablespace-map-all`), including tablespaces added after
+  the command or schedule was written. Explicit `--tablespace-mapping` /
+  `drill.tablespace_mapping` entries win for the tablespaces they name.
+  The scheduled drill applies it, so a deployment with several
+  tablespaces needs one line instead of one per tablespace.
+- **`deployments[].backup.chunk_size` and `backup.timeout`** give the
+  agent's scheduled backups what `backup --chunk-size` gives the CLI, and
+  a way to raise the per-run ceiling (twice the schedule interval,
+  clamped to 1 h..48 h, unless set; `every: 6h` gave 12 h, which a
+  multi-TB full backup can exceed).
+- **`backup --chunk-size`** sets the average chunk size (16 KiB–16 MiB,
+  default 64 KiB). A 1 MiB average cuts a 200 TB database from ~3.3
+  billion chunks to ~210 million. Boundaries change with the size, so
+  keep one value per deployment.
+- `backup.TakeOptions.SpoolDir`: where the manifest spool lives (needs
+  free space of about the manifest size, twice while signing).
+
+- **`backup:` block per deployment** (#75): `include_wal`, `fast` and
+  `encrypt` set the options of the agent's scheduled backups.
+
+### Changed
+
+- **Test fixtures:** the sftp and ssh-exec sink containers run with `RLIMIT_NOFILE` capped; an unbounded limit made sshd sessions spin and stalled the SFTP handshake on some Docker hosts.
+
+### Known limits
+
+- Signing and verifying need the whole canonical manifest as one buffer
+  (Ed25519 is not streamable); it is memory-mapped, so it costs disk and
+  page cache, not heap — and a platform without `mmap` (Windows) must
+  hold it in RAM.
+- Every verified read of a huge manifest is a full pass over it (hours at
+  200 TB); there is no per-file index.
+- WAL segment manifests are unsigned: an attacker with write access to
+  the repo can forge a hash-valid WAL chain that PITR would replay.
+  Signing the chain needs a format change (planned for v1.7).
+- A PITR-restored cluster keeps `archive_mode` as configured; decide
+  whether it may archive into the production repo before starting it.
+- The PostgreSQL `backup_manifest` is embedded in the backup manifest
+  header, so a gigabyte-scale one costs gigabytes of memory; `audit
+  export-bundle` holds its window in memory.
+- sftp and scp repos keep empty directories after gc.
+
+## [1.5.1] — 2026-10-05
+
+A patch release. It fixes a streamer holding a Patroni demote over slow
+links (#69), alerts that did not name their deployment (#70), and the
+Homebrew cask publishing that failed for 1.5.0. Nothing on disk or on
+the wire changes; 1.5.0 repositories are used as-is.
+
+### Fixed
+
+- **`wal stream` could hold a Patroni demote indefinitely when the
+  streamer was not on the same host as PostgreSQL** (#69). While a
+  primary shuts down, its walsender trades keepalives with the streamer
+  until the streamer confirms a flush it cannot give (the shutdown
+  checkpoint lands in a partial segment). The issue #34 detector ends
+  the stream on that spin, but it required 200 keepalives within a
+  one-shot 2 s window. The spin runs at one keepalive per network round
+  trip, so across subnets it never reached the threshold, and the window
+  never reset. The streamer answered forever, and the demoting node
+  stayed in "demote in progress" until the streamer was restarted. The
+  window now slides (100 keepalives per 10 s), which detects round trips
+  up to ~100 ms. A healthy primary pings seconds apart and stays far
+  below.
+- **Alerts from `wal stream` and the agent's scheduled tasks named no
+  deployment** (#70). An email reading only `wal.stream/reconnecting`
+  gave no clue which deployment it was about. Every `wal stream` event
+  now carries its deployment, and `agent` `task.started`/`task.finished`
+  carry the task's deployment. Sinks already render it.
+- **The Homebrew cask is published through a pull request.** The
+  `homebrew-tap` repository's `main` requires a reviewed PR, so
+  goreleaser's direct push was rejected (409). The v1.5.0 release run
+  failed after every asset had uploaded, and Homebrew stayed on 1.4.2
+  until the cask went in by hand. goreleaser now pushes the cask to a
+  `pg_hardstorage-<version>` branch and opens a PR. The release workflow's
+  Homebrew smoke test reports an open tap PR as a warning, with the
+  command to run once it is merged, instead of failing.
+  `HOMEBREW_TAP_TOKEN` needs `pull_requests:write` in addition to
+  `contents:write`.
+
+- **Two timeline conversions could wrap on out-of-range input.** A
+  parsed `uint32` timeline was narrowed to a signed 32-bit value without
+  a bound in `fleet search timeline:` and when starting replication.
+  No real cluster has 2^31 timelines; both now refuse such a value
+  instead of wrapping it (flagged by CodeQL).
+
 ## [1.5.0] — 2026-09-30
 
 ### Added

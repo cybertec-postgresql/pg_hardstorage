@@ -328,7 +328,7 @@ func scanAffectedBackups(ctx context.Context, sp storage.StoragePlugin, kekRef s
 		affected = append(affected, id)
 	}
 	for _, dep := range deployments {
-		for e, mErr := range ms.ListAttestationlessIncludingTombstoned(ctx, dep) {
+		for e, mErr := range ms.ListAttestationlessIncludingTombstonedHeaders(ctx, dep) {
 			if mErr != nil {
 				if firstErr == nil {
 					firstErr = fmt.Errorf("deployment %q: %w", dep, mErr)
@@ -422,15 +422,16 @@ func scanAffectedReplicas(ctx context.Context, sp storage.StoragePlugin, matches
 		if gerr != nil {
 			continue // racing prune/delete; not in scope for this scan
 		}
-		raw, rerr := io.ReadAll(rc)
+		// A replica is a full manifest copy and can be far larger than
+		// any read cap, so only its header is decoded (streamed): a
+		// skipped oversized replica would under-state the shred's blast
+		// radius.
+		sinfo, perr := backup.StreamManifest(rc, backup.StreamOptions{}, nil)
 		_ = rc.Close()
-		if rerr != nil {
+		if perr != nil || sinfo.Manifest.Encryption == nil {
 			continue
 		}
-		m, perr := backup.ParseAttestationless(raw)
-		if perr != nil || m.Encryption == nil {
-			continue
-		}
+		m := sinfo.Manifest
 		if matches(m.Encryption.KEKRef) {
 			add(strings.TrimSuffix(strings.TrimPrefix(key, prefix), suffix))
 		}

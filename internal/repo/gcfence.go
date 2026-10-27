@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/spill"
 )
 
 // THE PROBLEM
@@ -229,7 +230,7 @@ type FenceOptions struct {
 // the adopted chunks, commit, then call Confirm.
 type CommitFence struct {
 	sp       storage.StoragePlugin
-	adopted  []Hash
+	src      HashSource
 	owner    string
 	start    time.Time // monotonic, taken before the R1 read
 	seenRuns map[string]struct{}
@@ -245,8 +246,41 @@ type CommitFence struct {
 // finish — bounded by GCFenceMaxWait. The caller MUST re-Stat the
 // adopted chunks after this returns and before committing.
 func BeginCommitFence(ctx context.Context, sp storage.StoragePlugin, adopted []Hash, opts FenceOptions) (*CommitFence, error) {
-	f := &CommitFence{sp: sp, adopted: append([]Hash(nil), adopted...), owner: opts.Owner, start: time.Now()}
-	if len(f.adopted) == 0 {
+	return BeginCommitFenceSource(ctx, sp, sliceSource(append([]Hash(nil), adopted...)), opts)
+}
+
+// HashSource is a set of chunk hashes a fence protects, iterable without
+// materialising it. The adoption set of a backup of a very large database
+// is billions of hashes; a []Hash of them does not fit.
+type HashSource interface {
+	Len() int
+	ForEachHash(fn func(Hash) error) error
+}
+
+type sliceSource []Hash
+
+func (s sliceSource) Len() int { return len(s) }
+func (s sliceSource) ForEachHash(fn func(Hash) error) error {
+	for _, h := range s {
+		if err := fn(h); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// AdoptedSource returns this CAS's adoption set as a HashSource.
+func (c *CAS) AdoptedSource() HashSource { return adoptedSource{c} }
+
+type adoptedSource struct{ c *CAS }
+
+func (a adoptedSource) Len() int                              { return a.c.AdoptedLen() }
+func (a adoptedSource) ForEachHash(fn func(Hash) error) error { return a.c.ForEachAdopted(fn) }
+
+// BeginCommitFenceSource is BeginCommitFence over a HashSource.
+func BeginCommitFenceSource(ctx context.Context, sp storage.StoragePlugin, src HashSource, opts FenceOptions) (*CommitFence, error) {
+	f := &CommitFence{sp: sp, src: src, owner: opts.Owner, start: time.Now()}
+	if src.Len() == 0 {
 		return f, nil
 	}
 	runs, err := listGCRuns(ctx, sp)
@@ -274,9 +308,41 @@ func BeginCommitFence(ctx context.Context, sp storage.StoragePlugin, adopted []H
 // pin write to advance past its current batch (or end).
 func (f *CommitFence) pinAndWait(ctx context.Context) error {
 	if !f.pinned {
-		pin := gcPin{Schema: gcPinSchema, Owner: f.owner, CreatedAt: time.Now().UTC(), Hashes: f.adopted}
-		if err := putJSON(ctx, f.sp, gcPinsPrefix+newFenceID()+".json", pin); err != nil {
-			return fmt.Errorf("repo: gc fence: write pin: %w", err)
+		// The pin is written in parts of at most pinPartHashes hashes:
+		// gc reads each part whole, and a single pin naming billions of
+		// chunks would be a multi-hundred-GB JSON document. All parts are
+		// durable before the fence counts as pinned.
+		id := newFenceID()
+		created := time.Now().UTC()
+		part := make([]Hash, 0, 1024)
+		parts := 0
+		flush := func() error {
+			if len(part) == 0 {
+				return nil
+			}
+			key := gcPinsPrefix + id + ".json"
+			if parts > 0 {
+				key = fmt.Sprintf("%s%s-p%06d.json", gcPinsPrefix, id, parts)
+			}
+			pin := gcPin{Schema: gcPinSchema, Owner: f.owner, CreatedAt: created, Hashes: part}
+			if err := putJSON(ctx, f.sp, key, pin); err != nil {
+				return fmt.Errorf("repo: gc fence: write pin: %w", err)
+			}
+			parts++
+			part = part[:0]
+			return nil
+		}
+		if err := f.src.ForEachHash(func(h Hash) error {
+			part = append(part, h)
+			if len(part) >= pinPartHashes {
+				return flush()
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+		if err := flush(); err != nil {
+			return err
 		}
 		f.pinned = true
 		f.pinnedAt = time.Now()
@@ -320,8 +386,16 @@ func (f *CommitFence) pinAndWait(ctx context.Context) error {
 	return nil
 }
 
-// Adopted returns the chunks this fence protects.
-func (f *CommitFence) Adopted() []Hash { return f.adopted }
+// pinPartHashes caps how many hashes one pin object names (~70 MB of JSON).
+var pinPartHashes = 1 << 20
+
+// Adopted returns the chunks this fence protects, materialised. Prefer
+// the HashSource the fence was built from when the set may be huge.
+func (f *CommitFence) Adopted() []Hash {
+	var out []Hash
+	_ = f.src.ForEachHash(func(h Hash) error { out = append(out, h); return nil })
+	return out
+}
 
 // Confirm completes the fence after the commit returned. It returns an
 // error wrapping ErrAdoptedChunkSwept when the committed manifest
@@ -329,7 +403,7 @@ func (f *CommitFence) Adopted() []Hash { return f.adopted }
 // the commit overran GCFenceWriterBudget while a gc run started — so the
 // caller can fail loudly rather than report a broken backup as good.
 func (f *CommitFence) Confirm(ctx context.Context) error {
-	if f == nil || len(f.adopted) == 0 {
+	if f == nil || f.src == nil || f.src.Len() == 0 {
 		return nil
 	}
 	elapsed := time.Since(f.start)
@@ -357,17 +431,27 @@ func (f *CommitFence) Confirm(ctx context.Context) error {
 		return err
 	}
 	var missing []string
-	for _, h := range f.adopted {
-		if _, serr := f.sp.Stat(ctx, ChunkKey(h)); errors.Is(serr, storage.ErrNotFound) {
-			missing = append(missing, h.String())
+	nMissing := 0
+	if err := f.src.ForEachHash(func(h Hash) error {
+		if err := ctx.Err(); err != nil {
+			return err
 		}
+		if _, serr := f.sp.Stat(ctx, ChunkKey(h)); errors.Is(serr, storage.ErrNotFound) {
+			nMissing++
+			if len(missing) < 8 {
+				missing = append(missing, h.String())
+			}
+		}
+		return nil
+	}); err != nil {
+		return err
 	}
-	if len(missing) > 0 {
-		if len(missing) > 8 {
-			missing = append(missing[:8], fmt.Sprintf("… +%d more", len(missing)-8))
+	if nMissing > 0 {
+		if nMissing > 8 {
+			missing = append(missing, fmt.Sprintf("… +%d more", nMissing-8))
 		}
 		return fmt.Errorf("%w: the manifest was committed, but %d chunk(s) it deduplicated against were deleted by a `repo gc --apply` that started while the commit was in progress: %s — the committed manifest is NOT restorable; re-run the operation (it rewrites the chunks)",
-			ErrAdoptedChunkSwept, len(missing), strings.Join(missing, ", "))
+			ErrAdoptedChunkSwept, nMissing, strings.Join(missing, ", "))
 	}
 	return nil
 }
@@ -401,12 +485,15 @@ func FencedCommit(ctx context.Context, sp storage.StoragePlugin, cas *CAS, adopt
 type gcPinSet struct {
 	mu     sync.Mutex
 	read   map[string]struct{}
-	hashes map[Hash]struct{}
+	hashes *spill.HashSet
 }
 
-func newGCPinSet() *gcPinSet {
-	return &gcPinSet{read: map[string]struct{}{}, hashes: map[Hash]struct{}{}}
+func newGCPinSet(o spill.Options) *gcPinSet {
+	return &gcPinSet{read: map[string]struct{}{}, hashes: spill.NewHashSet(o)}
 }
+
+// close releases the set's spill files.
+func (p *gcPinSet) close() { _ = p.hashes.Close() }
 
 // refresh reads every pin not seen before. A pin older than GCPinTTL is
 // ignored (and reaped at the end of the run). A pin that cannot be read
@@ -434,7 +521,7 @@ func (p *gcPinSet) refresh(ctx context.Context, sp storage.StoragePlugin, now ti
 		p.read[info.Key] = struct{}{}
 		if now.Sub(pin.CreatedAt) < GCPinTTL {
 			for _, h := range pin.Hashes {
-				p.hashes[h] = struct{}{}
+				p.hashes.Add(h)
 			}
 		}
 		p.mu.Unlock()
@@ -442,9 +529,8 @@ func (p *gcPinSet) refresh(ctx context.Context, sp storage.StoragePlugin, now ti
 	return nil
 }
 
-func (p *gcPinSet) has(h Hash) bool {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	_, ok := p.hashes[h]
-	return ok
-}
+func (p *gcPinSet) has(h Hash) bool { return p.hashes.Has(h) }
+
+// err is the first spill I/O error; a pin set that failed to record a pin
+// would let gc delete a chunk a committing writer pinned.
+func (p *gcPinSet) err() error { return p.hashes.Err() }

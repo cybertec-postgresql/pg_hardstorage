@@ -20,6 +20,7 @@ import (
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/encryption"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/spill"
 )
 
 // compressorFor maps the operator-facing compression preset
@@ -60,6 +61,8 @@ type config struct {
 	level      repo.CompressionLevel
 	durability storage.Durability
 	hints      map[repo.Hash]struct{}
+	hintFilter *spill.Bloom
+	spillAdopt *spill.Options
 }
 
 // WithCompressionLevel pins the zstd encoder level for new
@@ -95,6 +98,19 @@ func WithDedupHints(h map[repo.Hash]struct{}) Option {
 	return func(c *config) { c.hints = h }
 }
 
+// WithDedupHintFilter is WithDedupHints for hint sets too large for a
+// map — see repo.WithDedupHintFilter.
+func WithDedupHintFilter(f *spill.Bloom) Option {
+	return func(c *config) { c.hintFilter = f }
+}
+
+// WithSpilledAdoption keeps the CAS's adoption set in a bounded-memory
+// spill set — see repo.WithSpilledAdoption. Call CAS.CloseAdopted when
+// done.
+func WithSpilledAdoption(o spill.Options) Option {
+	return func(c *config) { c.spillAdopt = &o }
+}
+
 func resolveOpts(opts ...Option) config {
 	var c config
 	for _, o := range opts {
@@ -120,6 +136,8 @@ func New(sp storage.StoragePlugin, opts ...Option) *repo.CAS {
 		repo.WithCompressor(compressorFor(c.level)),
 		repo.WithChunkDurability(c.durability),
 		repo.WithDedupHints(c.hints),
+		repo.WithDedupHintFilter(c.hintFilter),
+		spillAdoptOpt(c.spillAdopt),
 	)
 }
 
@@ -137,6 +155,8 @@ func NewEncrypted(sp storage.StoragePlugin, enc encryption.Encryptor, opts ...Op
 		repo.WithCompressor(compressorFor(c.level)),
 		repo.WithChunkDurability(c.durability),
 		repo.WithDedupHints(c.hints),
+		repo.WithDedupHintFilter(c.hintFilter),
+		spillAdoptOpt(c.spillAdopt),
 		repo.WithEncryptor(enc),
 	)
 }
@@ -165,6 +185,8 @@ func NewWithRetention(sp storage.StoragePlugin, policy *repo.WORMPolicy, now tim
 		repo.WithCompressor(compressorFor(c.level)),
 		repo.WithChunkDurability(c.durability),
 		repo.WithDedupHints(c.hints),
+		repo.WithDedupHintFilter(c.hintFilter),
+		spillAdoptOpt(c.spillAdopt),
 		repo.WithRetention(repo.CASRetention{
 			RetainUntil: policy.RetainUntil(now),
 			Mode:        storage.WORMMode(policy.Mode),
@@ -188,6 +210,8 @@ func NewWithRetentionClock(sp storage.StoragePlugin, policy *repo.WORMPolicy, no
 		repo.WithCompressor(compressorFor(c.level)),
 		repo.WithChunkDurability(c.durability),
 		repo.WithDedupHints(c.hints),
+		repo.WithDedupHintFilter(c.hintFilter),
+		spillAdoptOpt(c.spillAdopt),
 		repo.WithRetention(repo.CASRetention{
 			RetainUntilFunc: func() time.Time { return policy.RetainUntil(now()) },
 			Mode:            storage.WORMMode(policy.Mode),
@@ -206,6 +230,8 @@ func NewEncryptedWithRetentionClock(sp storage.StoragePlugin, enc encryption.Enc
 		repo.WithCompressor(compressorFor(c.level)),
 		repo.WithChunkDurability(c.durability),
 		repo.WithDedupHints(c.hints),
+		repo.WithDedupHintFilter(c.hintFilter),
+		spillAdoptOpt(c.spillAdopt),
 		repo.WithEncryptor(enc),
 		repo.WithRetention(repo.CASRetention{
 			RetainUntilFunc: func() time.Time { return policy.RetainUntil(now()) },
@@ -224,10 +250,20 @@ func NewEncryptedWithRetention(sp storage.StoragePlugin, enc encryption.Encrypto
 		repo.WithCompressor(compressorFor(c.level)),
 		repo.WithChunkDurability(c.durability),
 		repo.WithDedupHints(c.hints),
+		repo.WithDedupHintFilter(c.hintFilter),
+		spillAdoptOpt(c.spillAdopt),
 		repo.WithEncryptor(enc),
 		repo.WithRetention(repo.CASRetention{
 			RetainUntil: policy.RetainUntil(now),
 			Mode:        storage.WORMMode(policy.Mode),
 		}),
 	)
+}
+
+// spillAdoptOpt is repo.WithSpilledAdoption when requested, else a no-op.
+func spillAdoptOpt(o *spill.Options) repo.CASOption {
+	if o == nil {
+		return func(*repo.CAS) {}
+	}
+	return repo.WithSpilledAdoption(*o)
 }

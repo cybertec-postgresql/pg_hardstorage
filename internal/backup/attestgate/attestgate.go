@@ -39,7 +39,6 @@ package attestgate
 import (
 	"context"
 	"crypto/ed25519"
-	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -140,11 +139,12 @@ func Verify(ctx context.Context, sp storage.StoragePlugin, m *backup.Manifest, o
 	// operators pass to `threshold attest sign --hash`.  Manifest
 	// signature verification is the caller's responsibility (this
 	// package gates consumption, not authenticity).
-	canon, err := m.Canonicalize()
+	// m may be streamed (ReadAuto/ReadStreaming): CanonicalSHA256 then
+	// hashes the canonical form from a disk spool in bounded memory.
+	expected, err := m.CanonicalSHA256(ctx)
 	if err != nil {
 		return fmt.Errorf("attestgate: canonicalize manifest: %w", err)
 	}
-	expected := sha256.Sum256(canon)
 	expectedHex := hex.EncodeToString(expected[:])
 
 	// Load the roster (we need its threshold value + member list)
@@ -230,11 +230,10 @@ func VerifyDetailed(ctx context.Context, sp storage.StoragePlugin, m *backup.Man
 		return res, errors.New("attestgate: manifest has no BackupID")
 	}
 
-	canon, err := m.Canonicalize()
+	expected, err := m.CanonicalSHA256(ctx)
 	if err != nil {
 		return res, fmt.Errorf("attestgate: canonicalize manifest: %w", err)
 	}
-	expected := sha256.Sum256(canon)
 	expectedHex := hex.EncodeToString(expected[:])
 
 	rosters, err := opts.rosterStore(sp)

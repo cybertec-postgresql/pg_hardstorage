@@ -5,10 +5,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sort"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/spill"
 )
 
 // ChunkCheckResult records a manifest's chunk-existence check.
@@ -28,7 +28,23 @@ type ChunkCheckResult struct {
 	// signal — these chunk hashes are referenced by the
 	// manifest but not present in the repo.
 	Present int
-	Missing []repo.Hash
+	// Missing holds the first maxCheckMissingListed missing hashes in
+	// ascending order; MissingCount is the exact number (a backup whose
+	// storage is gone is missing hundreds of millions of chunks, and
+	// listing each would exhaust memory).
+	Missing      []repo.Hash
+	MissingCount int
+}
+
+// maxCheckMissingListed bounds ChunkCheckResult.Missing.
+var maxCheckMissingListed = 1000
+
+// NumMissing is the exact number of missing chunks.
+func (r *ChunkCheckResult) NumMissing() int {
+	if r == nil {
+		return 0
+	}
+	return max(r.MissingCount, len(r.Missing))
 }
 
 // AllPresent reports whether every chunk referenced by the
@@ -37,7 +53,7 @@ type ChunkCheckResult struct {
 // at least the bytes are addressable; integrity is a separate
 // concern).
 func (r *ChunkCheckResult) AllPresent() bool {
-	return r != nil && len(r.Missing) == 0
+	return r != nil && r.NumMissing() == 0
 }
 
 // CheckChunkExistence walks every unique chunk hash in m's
@@ -63,39 +79,49 @@ func CheckChunkExistence(ctx context.Context, sp storage.StoragePlugin, m *Manif
 	if m == nil {
 		return nil, errors.New("backup: CheckChunkExistence requires a non-nil Manifest")
 	}
-	uniq := make(map[repo.Hash]struct{}, 64)
-	for _, f := range m.Files {
+	// A bounded-memory set: a 200 TB backup references billions of
+	// distinct chunks, far more than a map holds. ForEach yields them in
+	// ascending order, which is also the sorted-hex order the result
+	// promises.
+	uniq := spill.NewHashSet(spill.Options{})
+	defer uniq.Close()
+	if err := m.EachFile(ctx, func(f *FileEntry) error {
 		for _, c := range f.Chunks {
-			uniq[c.Hash] = struct{}{}
+			uniq.Add(c.Hash)
 		}
+		return nil
+	}); err != nil {
+		return nil, err
 	}
-	res := &ChunkCheckResult{TotalUnique: len(uniq)}
-
-	hashes := make([]repo.Hash, 0, len(uniq))
-	for h := range uniq {
-		hashes = append(hashes, h)
+	if err := uniq.Err(); err != nil {
+		return nil, fmt.Errorf("backup: chunk set: %w", err)
 	}
-	sort.Slice(hashes, func(i, j int) bool {
-		return hashes[i].String() < hashes[j].String()
-	})
+	res := &ChunkCheckResult{TotalUnique: uniq.Len()}
 
-	for _, h := range hashes {
+	err := uniq.ForEach(func(k spill.Key) error {
+		h := repo.Hash(k)
 		if err := ctx.Err(); err != nil {
-			return res, err
+			return err
 		}
 		_, err := sp.Stat(ctx, repo.ChunkKey(h))
 		if err == nil {
 			res.Present++
-			continue
+			return nil
 		}
 		if errors.Is(err, storage.ErrNotFound) {
-			res.Missing = append(res.Missing, h)
-			continue
+			res.MissingCount++
+			if len(res.Missing) < maxCheckMissingListed {
+				res.Missing = append(res.Missing, h)
+			}
+			return nil
 		}
 		// Real backend error (network, permission). Surface
 		// it — we can't tell whether the chunk is there or
 		// not, and answering "missing" would be wrong.
-		return res, fmt.Errorf("backup: stat chunk %s: %w", h, err)
+		return fmt.Errorf("backup: stat chunk %s: %w", h, err)
+	})
+	if err != nil {
+		return res, err
 	}
 	return res, nil
 }

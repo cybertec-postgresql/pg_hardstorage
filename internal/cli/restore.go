@@ -24,6 +24,7 @@ import (
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/restore"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/restore/naturaltime"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/restore/postverify"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/restore/walfetchcmd"
 )
 
@@ -127,6 +128,10 @@ targets never combine with the requested one.`,
 		"redirect a tablespace from OLDDIR to NEWDIR (repeatable; both paths must be absolute). "+
 			"Plain restores rewrite the manifest's tablespace_map; chain restores pass through to "+
 			"pg_combinebackup. Example: --tablespace-mapping=/mnt/ssd/ts_fast=/var/lib/pg/ts_fast")
+	c.Flags().StringVar(&opts.tablespaceMapAll, "tablespace-mapping-all", "",
+		"redirect EVERY non-default tablespace under one absolute parent directory: tablespace <oid> is restored to "+
+			"<dir>/<oid> (pgBackRest's --tablespace-map-all). Covers tablespaces added after the command was scripted; "+
+			"an explicit --tablespace-mapping for a tablespace wins. Example: --tablespace-mapping-all=/restore/tablespaces")
 	registerDispatchFlags(c, &opts.dispatch)
 	return c
 }
@@ -162,6 +167,10 @@ type restoreOpts struct {
 	// for malformed entries (non-absolute paths, missing
 	// separator, duplicate OLDDIR). Empty / nil = no remap.
 	tablespaceMapping []string
+
+	// tablespaceMapAll is --tablespace-mapping-all: one parent directory
+	// every tablespace not named by --tablespace-mapping is moved under.
+	tablespaceMapAll string
 
 	// skipGapCheck bypasses the+ WAL-gap pre-flight when
 	// the operator has validated restore safety some other way
@@ -219,6 +228,13 @@ func runRestore(cmd *cobra.Command, opts restoreOpts) error {
 	if err := validateRestoreTargets(&opts); err != nil {
 		return err
 	}
+	verifyMode, err := restore.ParseVerifyMode(opts.verifyMode)
+	if err != nil {
+		return err
+	}
+	if _, err := postverify.ParseMode(opts.verifyRestoreMode); err != nil {
+		return output.NewError("usage.bad_verify_restore_mode", err.Error()).Wrap(output.ErrUsage)
+	}
 
 	// Control-plane mode short-circuits the local execution path.
 	// The repo / keyring are the agent's concern; the operator only
@@ -240,11 +256,6 @@ func runRestore(cmd *cobra.Command, opts restoreOpts) error {
 	}
 	if len(missing) > 0 {
 		return missingFlagErr(cmd, missing...)
-	}
-
-	verifyMode, err := restore.ParseVerifyMode(opts.verifyMode)
-	if err != nil {
-		return err
 	}
 
 	// Resolve the keyring path the same way the backup command does.
@@ -416,6 +427,11 @@ func runRestore(cmd *cobra.Command, opts restoreOpts) error {
 			fmt.Sprintf("restore: %v", err)).Wrap(output.ErrUsage)
 	}
 
+	tsMapAll, err := restore.CleanTablespaceMapAll(opts.tablespaceMapAll)
+	if err != nil {
+		return output.NewError("usage.bad_tablespace_mapping", err.Error()).Wrap(output.ErrUsage)
+	}
+
 	// Threshold-attestation gate.  When --require-threshold-attestation
 	// is set, refuse to restore unless a k-of-n attestation under the
 	// named roster exists for THIS manifest body.  Defence-in-depth on
@@ -442,6 +458,7 @@ func runRestore(cmd *cobra.Command, opts restoreOpts) error {
 		AllowForeignCluster: opts.forceForeign,
 		Recovery:            recovery,
 		TablespaceRemap:     tsRemap,
+		TablespaceMapAll:    tsMapAll,
 		ChainStagingRoot:    opts.chainStagingRoot,
 		ResetChainStaging:   opts.resetChainStaging,
 		VerifyMode:          opts.verifyRestoreMode,
@@ -550,6 +567,7 @@ func runRestore(cmd *cobra.Command, opts restoreOpts) error {
 		}
 		body.TablespaceRemap = rows
 	}
+	body.TablespaceMapAll = tsMapAll
 	if err := d.Result(output.NewResult(cmd.CommandPath()).WithBody(body)); err != nil {
 		return err
 	}
@@ -800,7 +818,7 @@ func validateExplicitBackupForTime(ctx context.Context, repoURL, deployment, bac
 	}
 	defer sp.Close()
 	store := backup.NewManifestStore(sp)
-	m, rerr := store.Read(ctx, deployment, backupID, verifier)
+	m, rerr := store.ReadAuto(ctx, deployment, backupID, verifier)
 	if rerr != nil {
 		// If we can't read the manifest, the actual restore
 		// will surface that error. Don't fabricate a different
@@ -854,6 +872,9 @@ type restoreResultBody struct {
 	// default body shape stays byte-identical to+
 	// (24-month JSON-compat).
 	TablespaceRemap []tablespaceRemapRow `json:"tablespace_remap,omitempty"`
+	// TablespaceMapAll echoes --tablespace-mapping-all: every tablespace
+	// not listed in TablespaceRemap was restored to <this>/<oid>.
+	TablespaceMapAll string `json:"tablespace_map_all,omitempty"`
 }
 
 // tablespaceRemapRow surfaces one OLD→NEW path remap in the
@@ -1056,7 +1077,9 @@ func preflightAttestationGate(
 	}
 	defer sp.Close()
 	store := backup.NewManifestStore(sp)
-	m, err := store.Read(ctx, deployment, backupID, verifier)
+	// ReadAuto: a huge manifest comes back streamed and attestgate hashes
+	// its canonical form from a disk spool in bounded memory.
+	m, err := store.ReadAuto(ctx, deployment, backupID, verifier)
 	if err != nil {
 		return err
 	}

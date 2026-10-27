@@ -105,6 +105,7 @@ func runRepoScrub(cmd *cobra.Command, urlArg string, samplePercent int, fullScan
 		return output.NewError("repo.scrub.collect_refs_failed",
 			fmt.Sprintf("repo scrub: collect references: %v", err)).Wrap(err)
 	}
+	defer refs.Close()
 
 	// Convert sample-percent to a chunk-count limit. limit=0 means
 	// "everything" — what --full requests.
@@ -125,6 +126,7 @@ func runRepoScrub(cmd *cobra.Command, urlArg string, samplePercent int, fullScan
 	// This is the same machinery `repair scrub` uses.
 	startedAt := time.Now().UTC()
 	agg, refsTotal, err := scrubManifestAware(cmd.Context(), sp, limit, scrubWindowIndex(time.Now()))
+	defer agg.Close()
 	stoppedAt := time.Now().UTC()
 	if err != nil {
 		return output.NewError("repo.scrub.failed",
@@ -135,7 +137,8 @@ func runRepoScrub(cmd *cobra.Command, urlArg string, samplePercent int, fullScan
 		ReferencedTotal:         refsTotal,
 		Sampled:                 agg.Sampled,
 		OK:                      agg.OK,
-		MismatchCount:           len(agg.Mismatches),
+		MismatchCount:           agg.MismatchCount,
+		MismatchesTruncated:     agg.MismatchCount > len(agg.Mismatches),
 		SampleWindow:            agg.WindowStart,
 		SampleWindows:           agg.WindowCount,
 		UnverifiableManifests:   agg.UnverifiableManifests,
@@ -151,7 +154,7 @@ func runRepoScrub(cmd *cobra.Command, urlArg string, samplePercent int, fullScan
 		body.Mismatches = append(body.Mismatches, h.String())
 	}
 
-	if len(agg.Mismatches) > 0 {
+	if agg.MismatchCount > 0 {
 		// Audit emission for mismatches. Bit-rot is rare enough
 		// that the chain entry is signal — operators investigating
 		// "when did we first see corruption?" can walk the chain
@@ -164,7 +167,7 @@ func runRepoScrub(cmd *cobra.Command, urlArg string, samplePercent int, fullScan
 				"sample_percent":   samplePercent,
 				"sampled":          agg.Sampled,
 				"referenced_total": refs.Len(),
-				"mismatch_count":   len(agg.Mismatches),
+				"mismatch_count":   agg.MismatchCount,
 				"first_mismatch":   body.Mismatches[0],
 				"bytes_scanned":    agg.Bytes,
 				"duration_ms":      body.DurationMS,
@@ -172,7 +175,7 @@ func runRepoScrub(cmd *cobra.Command, urlArg string, samplePercent int, fullScan
 		})
 		return output.NewError("verify.scrub_mismatch",
 			fmt.Sprintf("repo scrub: %d chunk(s) failed verification (sampled %d of %d referenced)",
-				len(agg.Mismatches), agg.Sampled, refsTotal)).
+				agg.MismatchCount, agg.Sampled, refsTotal)).
 			WithSuggestion(&output.Suggestion{
 				Human:   "the storage backend has corrupted bytes for the listed chunks. Heal from a replica with `pg_hardstorage repair scrub --heal --replica <replica-url>`.",
 				Command: fmt.Sprintf("pg_hardstorage repair scrub --repo %s --heal --replica <replica-url>", urlArg),
@@ -212,14 +215,16 @@ type repoScrubBody struct {
 	UnverifiableManifests int `json:"unverifiable_manifests,omitempty"`
 	// KeyUnavailableManifests / KeyUnavailableChunks: encrypted data this
 	// host could not decrypt, so could not scrub. Key access, not rot.
-	KeyUnavailableManifests int       `json:"key_unavailable_manifests,omitempty"`
-	KeyUnavailableChunks    int       `json:"key_unavailable_chunks,omitempty"`
-	BytesScanned            int64     `json:"bytes_scanned"`
-	Mismatches              []string  `json:"mismatches,omitempty"`
-	SamplePercent           int       `json:"sample_percent"`
-	StartedAt               time.Time `json:"started_at"`
-	StoppedAt               time.Time `json:"stopped_at"`
-	DurationMS              int64     `json:"duration_ms"`
+	KeyUnavailableManifests int      `json:"key_unavailable_manifests,omitempty"`
+	KeyUnavailableChunks    int      `json:"key_unavailable_chunks,omitempty"`
+	BytesScanned            int64    `json:"bytes_scanned"`
+	Mismatches              []string `json:"mismatches,omitempty"`
+	// MismatchesTruncated: MismatchCount exceeds the hashes listed.
+	MismatchesTruncated bool      `json:"mismatches_truncated,omitempty"`
+	SamplePercent       int       `json:"sample_percent"`
+	StartedAt           time.Time `json:"started_at"`
+	StoppedAt           time.Time `json:"stopped_at"`
+	DurationMS          int64     `json:"duration_ms"`
 }
 
 // WriteText renders the scrub result — sample size, mismatch list, and
@@ -249,6 +254,9 @@ func (b repoScrubBody) WriteText(w io.Writer) error {
 		fmt.Fprintf(bw, "  ✗ FAILED HASHES:\n")
 		for _, h := range b.Mismatches {
 			fmt.Fprintf(bw, "    %s\n", h)
+		}
+		if b.MismatchesTruncated {
+			fmt.Fprintf(bw, "    (the result lists only the first %d of %d)\n", len(b.Mismatches), b.MismatchCount)
 		}
 	} else if b.UnverifiableManifests == 0 && b.KeyUnavailableManifests == 0 && b.KeyUnavailableChunks == 0 {
 		fmt.Fprintln(bw, "  ✓ no integrity findings")

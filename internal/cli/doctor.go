@@ -453,7 +453,7 @@ func appendPGVersionChecks(ctx context.Context, cfg *config.LoadResult, issues [
 			// are silently skipped, same posture as
 			// pickLatestBackup in the verify command.
 			var latest *backup.Manifest
-			for m, mErr := range store.List(ctx, p.name, verifier) {
+			for m, mErr := range store.ListHeaders(ctx, p.name, verifier) {
 				if mErr != nil {
 					continue
 				}
@@ -542,7 +542,7 @@ func appendManifestSignatureChecks(ctx context.Context, cfg *config.LoadResult, 
 			store := backup.NewManifestStore(sp)
 			var checked, mismatched, failed int
 			sampled := false
-			for _, mErr := range store.List(ctx, p.name, verifier) {
+			for _, mErr := range store.ListHeaders(ctx, p.name, verifier) {
 				if checked >= doctorMaxManifestsVerified {
 					sampled = true
 					break
@@ -930,7 +930,7 @@ func readAuditHeadSequence(ctx context.Context, sp storage.StoragePlugin, shard 
 	}
 	defer rc.Close()
 	var hp audit.HeadPointer
-	if err := json.NewDecoder(rc).Decode(&hp); err != nil {
+	if err := json.NewDecoder(io.LimitReader(rc, 1<<20)).Decode(&hp); err != nil {
 		return 0, false
 	}
 	if hp.Schema != audit.HeadPointerSchema {

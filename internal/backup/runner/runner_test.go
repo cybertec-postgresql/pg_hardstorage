@@ -202,7 +202,17 @@ func TestSummarize_DedupAccounting(t *testing.T) {
 	startedAt := time.Now().UTC()
 	stoppedAt := startedAt.Add(123 * time.Millisecond)
 
-	res := summarize(opts, m, nil, identity, 17, startedAt, stoppedAt)
+	spool, err := backup.NewManifestSpool(t.TempDir(), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer spool.Close()
+	for i := range m.Files {
+		if err := spool.Add(&m.Files[i]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	res := summarize(opts, m, spool, identity, 17, startedAt, stoppedAt)
 	if res.LogicalBytes != 180 {
 		t.Errorf("LogicalBytes = %d, want 180 (100+50+30)", res.LogicalBytes)
 	}

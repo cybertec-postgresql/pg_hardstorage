@@ -667,3 +667,62 @@ func TestRotateKEK_AppliesWORMLock(t *testing.T) {
 		t.Errorf("rotated replica not WORM-locked; got mode %q for %s", rec.keys[replicaKey], replicaKey)
 	}
 }
+
+// With AutoStreamThreshold lowered every manifest is rotated through the
+// streamed (spool) path. The result must be a normally verifiable
+// manifest with the same entries and the new wrap, on primary and
+// replica, and a stranded replica must still be healed.
+func TestRotateKEK_StreamedPathMatchesHeld(t *testing.T) {
+	defer func(n int64) { backup.AutoStreamThreshold = n }(backup.AutoStreamThreshold)
+	backup.AutoStreamThreshold = 1
+
+	w := setupRotateWorld(t)
+	oldKEK, newKEK := mkKEK(t), mkKEK(t)
+	w.commitEncrypted(t, "db1", "db1.full.big", oldKEK, "test:old", 1)
+	ctx := context.Background()
+	before, err := w.store.Read(ctx, "db1", "db1.full.big", w.verifier)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replicaKey := backup.ReplicaPath("db1.full.big")
+	oldReplica := rotGetKey(t, w.sp, replicaKey)
+
+	opts := backup.RotateKEKOptions{
+		OldKEKRef: "test:old", OldKEK: oldKEK, NewKEKRef: "test:new", NewKEK: newKEK,
+		Signer: w.signer, Verifier: w.verifier,
+	}
+	res, err := backup.RotateKEK(ctx, w.sp, opts)
+	if err != nil || res.Rotated != 1 || !res.Complete() {
+		t.Fatalf("rotate: %+v err %v", res, err)
+	}
+	after, err := w.store.Read(ctx, "db1", "db1.full.big", w.verifier) // held, fully verified
+	if err != nil {
+		t.Fatalf("rotated manifest does not verify: %v", err)
+	}
+	if after.Encryption.KEKRef != "test:new" {
+		t.Errorf("KEKRef = %q", after.Encryption.KEKRef)
+	}
+	wb, _ := base64.StdEncoding.DecodeString(after.Encryption.WrappedDEK)
+	if _, err := encryption.Unwrap(newKEK, wb); err != nil {
+		t.Errorf("new KEK cannot unwrap: %v", err)
+	}
+	if len(after.Files) != len(before.Files) || after.Files[0].Path != before.Files[0].Path ||
+		after.Files[0].Chunks[0] != before.Files[0].Chunks[0] {
+		t.Errorf("entries changed: %+v vs %+v", after.Files, before.Files)
+	}
+	if got := rotReplicaKEKRef(t, w.sp, replicaKey); got != "test:new" {
+		t.Errorf("replica KEKRef = %q", got)
+	}
+
+	// Strand the replica and resume: healed from the (streamed) primary.
+	rotPutKey(t, w.sp, replicaKey, oldReplica)
+	if res, err = backup.RotateKEK(ctx, w.sp, opts); err != nil || res.ReplicaFailures != 0 {
+		t.Fatalf("resume: %+v err %v", res, err)
+	}
+	if got := rotReplicaKEKRef(t, w.sp, replicaKey); got != "test:new" {
+		t.Errorf("replica not healed: %q", got)
+	}
+	if _, err := w.store.Read(ctx, "db1", "db1.full.big", w.verifier); err != nil {
+		t.Errorf("manifest unreadable after heal: %v", err)
+	}
+}

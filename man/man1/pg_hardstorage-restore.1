@@ -122,6 +122,10 @@ targets never combine with the requested one.
 	redirect a tablespace from OLDDIR to NEWDIR (repeatable; both paths must be absolute). Plain restores rewrite the manifest's tablespace_map; chain restores pass through to pg_combinebackup. Example: --tablespace-mapping=/mnt/ssd/ts_fast=/var/lib/pg/ts_fast
 
 .PP
+\fB--tablespace-mapping-all\fP=""
+	redirect EVERY non-default tablespace under one absolute parent directory: tablespace  is restored to / (pgBackRest's --tablespace-map-all). Covers tablespaces added after the command was scripted; an explicit --tablespace-mapping for a tablespace wins. Example: --tablespace-mapping-all=/restore/tablespaces
+
+.PP
 \fB--target\fP=""
 	directory where the data dir will be materialised (required)
 

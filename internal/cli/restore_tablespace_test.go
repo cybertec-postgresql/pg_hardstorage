@@ -199,3 +199,34 @@ func TestRestore_TablespaceMapping_FlagDiscoverable(t *testing.T) {
 		}
 	}
 }
+
+// --tablespace-mapping-all (issue #79): a relative parent is a usage
+// error before any storage round-trip, an absolute one is echoed in the
+// result body, and both `restore` and `recovery drill` advertise the flag.
+func TestRestore_TablespaceMappingAll(t *testing.T) {
+	w := newReadWorld(t)
+	id := commitVerifiableBackupWithTablespaceMap(t, w, "db1", 0, []byte("17\n"), "")
+
+	_, stderr, exit := runCLI(t, "restore", "db1", id, "--repo", w.repoURL,
+		"--target", t.TempDir()+"/r1", "--tablespace-mapping-all", "rel/dir", "-o", "json")
+	if exit != int(output.ExitMisuse) || !strings.Contains(stderr, "usage.bad_tablespace_mapping") {
+		t.Errorf("relative parent: exit=%d\n%s", exit, stderr)
+	}
+
+	parent := t.TempDir() + "/ts"
+	stdout, _, exit := runCLI(t, "restore", "db1", id, "--repo", w.repoURL,
+		"--target", t.TempDir()+"/r2", "--tablespace-mapping-all", parent, "-o", "json")
+	if exit != int(output.ExitOK) {
+		t.Fatalf("restore exit=%d\n%s", exit, stdout)
+	}
+	if !strings.Contains(stdout, `"tablespace_map_all": "`+parent+`"`) {
+		t.Errorf("body does not echo tablespace_map_all:\n%s", stdout)
+	}
+
+	for _, cmd := range [][]string{{"restore", "--help"}, {"recovery", "drill", "--help"}} {
+		out, _, _ := runCLI(t, cmd...)
+		if !strings.Contains(out, "--tablespace-mapping-all") {
+			t.Errorf("%v does not advertise --tablespace-mapping-all", cmd)
+		}
+	}
+}

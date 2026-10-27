@@ -11,7 +11,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	stdio "io"
 	"time"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
@@ -205,7 +204,7 @@ func checkRepoFormat(ctx context.Context, sp storage.StoragePlugin) error {
 		}
 		return fmt.Errorf("repo: read %s (refusing to assume the repo format): %w", RepoVersionFilename, rvErr)
 	}
-	rvBody, readErr := stdio.ReadAll(rvc)
+	rvBody, readErr := storage.ReadAllLimited(rvc, storage.MaxRecordBytes)
 	_ = rvc.Close()
 	if readErr != nil {
 		return fmt.Errorf("repo: read %s body: %w", RepoVersionFilename, readErr)

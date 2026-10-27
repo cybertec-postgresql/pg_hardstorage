@@ -16,6 +16,7 @@ import (
 // DeploymentConfig without a merge arm fails here instead of
 // silently disappearing in production.
 func TestMergeDeployment_CarriesEveryField(t *testing.T) {
+	encOn := true
 	base := DeploymentConfig{
 		PGConnection:   "postgres://base@h/db",
 		Repo:           "file:///base",
@@ -35,9 +36,10 @@ func TestMergeDeployment_CarriesEveryField(t *testing.T) {
 			AuditAnchor: ScheduleSpec{Every: "30m"},
 		},
 		Drill: DrillConfig{
-			TablespaceMapping: []string{"/srv/over/ts=/var/tmp/over/ts"},
-			SkipVerify:        true,
-			TempBase:          "/var/tmp/over",
+			TablespaceMapping:    []string{"/srv/over/ts=/var/tmp/over/ts"},
+			TablespaceMappingAll: "/var/tmp/over/all",
+			SkipVerify:           true,
+			TempBase:             "/var/tmp/over",
 		},
 		Retention:      RetentionConfig{Policy: "gfs", KeepDaily: 9, KeepWeekly: 8, KeepMonthly: 60, KeepYearly: 20, KeepFor: "720h", KeepFulls: 7},
 		Classification: "restricted",
@@ -50,6 +52,7 @@ func TestMergeDeployment_CarriesEveryField(t *testing.T) {
 			Interval: "10s",
 		},
 		AllowUnenforceableLease: true,
+		Backup:                  BackupConfig{IncludeWAL: true, Fast: true, Encrypt: &encOn, ChunkSize: "1MiB", Timeout: "36h"},
 	}
 
 	got := mergeDeployment(base, overlay)

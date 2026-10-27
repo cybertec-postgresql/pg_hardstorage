@@ -241,7 +241,9 @@ func VerifyEnvelopes(ctx context.Context, sp storage.StoragePlugin, opts VerifyE
 			finish()
 			return res, err
 		}
-		for m, lerr := range store.List(ctx, deployment, opts.Verifier) {
+		// Headers only (ListHeaders): the encryption block is all this reads, and
+		// a held manifest of a large database is gigabytes.
+		for m, lerr := range store.ListHeaders(ctx, deployment, opts.Verifier) {
 			if err := ctx.Err(); err != nil {
 				finish()
 				return res, err

@@ -112,3 +112,48 @@ func TestDrill_DefaultTablespaceStillDrills(t *testing.T) {
 		t.Fatal("no report")
 	}
 }
+
+// TablespaceMapAll covers every tablespace without a per-tablespace entry
+// (issue #79): the drill proceeds on a backup with external tablespaces,
+// and restore sees one <parent>/<oid> mapping per tablespace — a
+// tablespace added after the schedule was written included.
+func TestDrill_TablespaceMapAllExpandsPerTablespace(t *testing.T) {
+	w := setupDrillWorld(t)
+	w.commitDrillBackupWithTablespaces(t, "db1", time.Now().UTC().Add(-time.Hour), 100,
+		"/srv/live/ts_fast", "/srv/live/ts_added_later")
+
+	var seen restore.TablespaceRemap
+	_, err := recovery.Drill(context.Background(), w.repoURL, "db1", recovery.DrillOptionsWithStubs(
+		recovery.DrillOptions{Verifier: w.verifier, SkipVerifyEntirely: true, TablespaceMapAll: t.TempDir() + "/scratch"},
+		func(ctx context.Context, opts restore.Options) (*restore.Result, error) {
+			seen = opts.TablespaceRemap
+			return &restore.Result{}, nil
+		},
+		nil,
+	))
+	if err != nil {
+		t.Fatalf("Drill with TablespaceMapAll: %v", err)
+	}
+	if len(seen) != 2 {
+		t.Fatalf("restore saw %d mappings (%+v), want one per tablespace", len(seen), seen)
+	}
+	for _, e := range seen {
+		if !strings.HasPrefix(e.Old, "/srv/live/") || strings.HasPrefix(e.New, "/srv/live/") {
+			t.Errorf("mapping %+v does not move the tablespace off its live path", e)
+		}
+	}
+}
+
+func TestDrill_TablespaceMapAllRejectsRelativeParent(t *testing.T) {
+	w := setupDrillWorld(t)
+	w.commitDrillBackupWithTablespaces(t, "db1", time.Now().UTC().Add(-time.Hour), 100, "/srv/live/ts_fast")
+	_, err := recovery.Drill(context.Background(), w.repoURL, "db1", recovery.DrillOptionsWithStubs(
+		recovery.DrillOptions{Verifier: w.verifier, SkipVerifyEntirely: true, TablespaceMapAll: "scratch"},
+		func(ctx context.Context, opts restore.Options) (*restore.Result, error) {
+			t.Error("restore ran with an invalid tablespace parent")
+			return &restore.Result{}, nil
+		}, nil))
+	if err == nil || !strings.Contains(err.Error(), "absolute") {
+		t.Errorf("err = %v, want an absolute-path refusal", err)
+	}
+}

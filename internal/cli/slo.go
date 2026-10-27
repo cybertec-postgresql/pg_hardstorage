@@ -278,7 +278,7 @@ func computeRPOActual(ctx context.Context, row sloReportRow, repoURL string, now
 
 	store := backup.NewManifestStore(sp)
 	var latest time.Time
-	for m, err := range store.List(ctx, row.Deployment, verifier) {
+	for m, err := range store.ListHeaders(ctx, row.Deployment, verifier) {
 		if err != nil {
 			continue
 		}

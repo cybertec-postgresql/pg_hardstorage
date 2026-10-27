@@ -168,7 +168,7 @@ func runBackupUndelete(cmd *cobra.Command, deployment string, ids []string, repo
 	// --check-chunks pre-pass is moot under --force.
 	if checkChunks && !force {
 		for _, id := range ids {
-			m, _, rerr := store.ReadIncludingTombstoned(cmd.Context(), deployment, id, verifier)
+			m, _, rerr := store.ReadIncludingTombstonedAuto(cmd.Context(), deployment, id, verifier)
 			if rerr != nil {
 				return output.NewError("backup.undelete.read_failed",
 					fmt.Sprintf("backup undelete --check-chunks: read manifest %s/%s: %v", deployment, id, rerr)).Wrap(rerr)
@@ -182,7 +182,7 @@ func runBackupUndelete(cmd *cobra.Command, deployment string, ids []string, repo
 				BackupID:    id,
 				TotalUnique: res.TotalUnique,
 				Present:     res.Present,
-				MissingN:    len(res.Missing),
+				MissingN:    res.NumMissing(),
 			}
 			row.Missing = summarizeMissingHashes(res.Missing, 5)
 			chunkChecks = append(chunkChecks, row)
@@ -319,7 +319,7 @@ func runBackupUndelete(cmd *cobra.Command, deployment string, ids []string, repo
 			if errors.As(uerr, &cm) {
 				return output.NewError("conflict.chunks_missing",
 					fmt.Sprintf("backup undelete: %s/%s references %d chunk(s) no longer in the repo (%d missing); resurrecting it would be un-restorable",
-						deployment, id, cm.TotalUnique, len(cm.Missing))).
+						deployment, id, cm.TotalUnique, cm.NumMissing())).
 					WithSuggestion(&output.Suggestion{
 						Human:   "the manifest's chunks were reclaimed by chunk-GC (or never wrote). Pass --force to recover the metadata anyway (the resurrected backup will NOT restore), or restore from a different backup.",
 						Command: "pg_hardstorage backup undelete " + deployment + " " + id + " --repo " + repoURL + " --force",
@@ -343,7 +343,7 @@ func runBackupUndelete(cmd *cobra.Command, deployment string, ids []string, repo
 			// standby / time-target recovery that would silently
 			// truncate at the pruned hole, instead of a Warning buried
 			// at restore time.
-			if m, _, rerr := store.ReadIncludingTombstoned(cmd.Context(), deployment, id, verifier); rerr == nil {
+			if m, _, rerr := store.ReadIncludingTombstonedAuto(cmd.Context(), deployment, id, verifier); rerr == nil {
 				oc.WALGapRecorded = recordResurrectedWALGap(cmd.Context(), d, sp, deployment, id, m)
 			}
 		}

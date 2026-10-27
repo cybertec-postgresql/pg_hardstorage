@@ -58,9 +58,10 @@ pg_hardstorage repo bundle export \
     --out /mnt/transport/db1-bundle-with-wal.tar
 ```
 
-`--include-wal` pulls every WAL segment listed in each
-manifest's `wal_required` field, plus the corresponding
-timeline-history files. Without it the destination can
+`--include-wal` pulls every WAL segment each backup needs to reach
+consistency (from its start LSN to its stop LSN, plus the segments'
+chunks). If one of those segments is not archived in the repository the
+export fails instead of writing an unrestorable bundle. Without it the destination can
 restore the backup but cannot replay WAL.
 
 ### 4. Inspect the bundle without unpacking

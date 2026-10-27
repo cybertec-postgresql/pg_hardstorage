@@ -43,6 +43,7 @@ func newRecoveryDrillCmd() *cobra.Command {
 		sandboxImage       string
 		tempBaseDir        string
 		tablespaceMapping  []string
+		tablespaceMapAll   string
 		keepTargetDir      bool
 		allowSkipVerify    bool
 		skipVerifyEntirely bool
@@ -95,6 +96,7 @@ For Docker-free runs, pass --skip-verify; the report's RTO actual
 				sandboxImage:       sandboxImage,
 				tempBaseDir:        tempBaseDir,
 				tablespaceMapping:  tablespaceMapping,
+				tablespaceMapAll:   tablespaceMapAll,
 				keepTargetDir:      keepTargetDir,
 				allowSkipVerify:    allowSkipVerify,
 				skipVerifyEntirely: skipVerifyEntirely,
@@ -118,6 +120,10 @@ For Docker-free runs, pass --skip-verify; the report's RTO actual
 		"redirect a tablespace: --tablespace-mapping=<old-abs-path>=<new-abs-path> (repeatable). "+
 			"Required when the backup has non-default tablespaces: without it they would be "+
 			"restored to their original absolute paths, overwriting live data on the source host. The mapped dirs are drill scratch: mounted into the verify sandbox at the same path and removed (or, if they pre-existed, emptied) at teardown unless --keep")
+	c.Flags().StringVar(&tablespaceMapAll, "tablespace-mapping-all", "",
+		"redirect EVERY non-default tablespace under one absolute scratch directory: tablespace <oid> goes to "+
+			"<dir>/<oid> (pgBackRest's --tablespace-map-all), including tablespaces added after the drill was scheduled. "+
+			"An explicit --tablespace-mapping for a tablespace wins. The per-tablespace dirs are drill scratch, cleaned like mapped dirs")
 	c.Flags().StringVar(&tempBaseDir, "temp-base", "",
 		"parent directory for the temporary target dir (default: $TMPDIR)")
 	c.Flags().BoolVar(&keepTargetDir, "keep", false,
@@ -151,6 +157,7 @@ type recoveryDrillFlags struct {
 	sandboxImage       string
 	tempBaseDir        string
 	tablespaceMapping  []string
+	tablespaceMapAll   string
 	keepTargetDir      bool
 	allowSkipVerify    bool
 	skipVerifyEntirely bool
@@ -197,6 +204,12 @@ func runRecoveryDrill(cmd *cobra.Command, deployment string, f recoveryDrillFlag
 			fmt.Sprintf("recovery drill: %v", tsErr)).Wrap(output.ErrUsage)
 	}
 
+	tsMapAll, tsAllErr := restore.CleanTablespaceMapAll(f.tablespaceMapAll)
+	if tsAllErr != nil {
+		return output.NewError("usage.bad_tablespace_mapping",
+			fmt.Sprintf("recovery drill: %v", tsAllErr)).Wrap(output.ErrUsage)
+	}
+
 	opts := recovery.DrillOptions{
 		Verifier:           verifier,
 		BackupID:           f.backupID,
@@ -204,6 +217,7 @@ func runRecoveryDrill(cmd *cobra.Command, deployment string, f recoveryDrillFlag
 		SandboxImage:       f.sandboxImage,
 		TempBaseDir:        f.tempBaseDir,
 		TablespaceRemap:    tsRemap,
+		TablespaceMapAll:   tsMapAll,
 		KeepTargetDir:      f.keepTargetDir,
 		AllowSkipVerify:    f.allowSkipVerify,
 		SkipVerifyEntirely: f.skipVerifyEntirely,

@@ -30,6 +30,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"time"
 )
 
@@ -46,14 +47,22 @@ import (
 // whatever the caller passes for it is ignored, since "may not
 // overwrite" is the contract rather than an option.
 func CommitExclusive(ctx context.Context, sp StoragePlugin, key string, body []byte, opts PutOptions) error {
+	return CommitExclusiveReader(ctx, sp, key, bytes.NewReader(body), int64(len(body)), opts)
+}
+
+// CommitExclusiveReader is CommitExclusive for a body that is streamed
+// rather than held: it reads exactly size bytes from body, once. Used
+// for manifests too large for memory. The fallback path stages the same
+// single stream, so body is never read twice.
+func CommitExclusiveReader(ctx context.Context, sp StoragePlugin, key string, body io.Reader, size int64, opts PutOptions) error {
 	if sp == nil {
 		return fmt.Errorf("storage: CommitExclusive requires a plugin")
 	}
-	opts.ContentLength = int64(len(body))
+	opts.ContentLength = size
 
 	if sp.Capabilities().ConditionalPut {
 		opts.IfNotExists = true
-		if _, err := sp.Put(ctx, key, bytes.NewReader(body), opts); err != nil {
+		if _, err := sp.Put(ctx, key, body, opts); err != nil {
 			// ErrAlreadyExists passes through unwrapped: it is a
 			// result, not a fault, and callers match on it.
 			return err
@@ -77,7 +86,7 @@ func CommitExclusive(ctx context.Context, sp StoragePlugin, key string, body []b
 	staged.IfNotExists = false
 	staged.RetainUntil = time.Time{}
 	staged.RetentionMode = WORMNone
-	if _, err := sp.Put(ctx, tmp, bytes.NewReader(body), staged); err != nil {
+	if _, err := sp.Put(ctx, tmp, body, staged); err != nil {
 		return fmt.Errorf("storage: stage %s: %w", key, err)
 	}
 	if err := sp.RenameIfNotExists(ctx, tmp, key); err != nil {

@@ -94,6 +94,8 @@ The repository must already exist — create it with ` + "`" + `pg_hardstorage r
 	c.Flags().StringVar(&opts.incrementalFrom, "incremental-from", "",
 		"take a PG 17+ incremental backup against this parent backup ID; "+
 			"requires summarize_wal=on on the source DB")
+	c.Flags().StringVar(&opts.chunkSize, "chunk-size", "",
+		"average chunk size (e.g. 256KiB, 1MiB; 16KiB..16MiB, default 64KiB). Larger chunks mean far fewer chunk objects and manifest entries for very large databases, at the cost of coarser dedup; boundaries differ per size, so keep one value per deployment")
 	c.Flags().BoolVar(&opts.ignoreCapacity, "ignore-capacity", false,
 		"skip the capacity pre-flight (refuse-on-low-free-space gate); use only when the projection is misleading")
 	c.Flags().Float64Var(&opts.capacitySafetyFactor, "capacity-safety-factor", capacity.DefaultSafetyFactor,
@@ -170,6 +172,9 @@ type runOptions struct {
 	// the orchestrator indefinitely.
 	stallTimeout time.Duration
 
+	// chunkSize is --chunk-size, a human byte size ("1MiB").
+	chunkSize string
+
 	// allowConcurrent disables the per-deployment backup lease, so a
 	// second backup of the same deployment can run alongside one
 	// that's already in progress.  Off by default; the operator opts
@@ -193,6 +198,11 @@ func runBackup(cmd *cobra.Command, opts runOptions) error {
 	// args.
 	if opts.dispatch.controlPlane != "" {
 		return runBackupControlPlane(cmd, opts)
+	}
+	if !finiteFloat(opts.capacitySafetyFactor) || opts.capacitySafetyFactor <= 0 {
+		return output.NewError("usage.bad_flag",
+			fmt.Sprintf("backup: --capacity-safety-factor must be a finite value > 0; got %v", opts.capacitySafetyFactor)).
+			Wrap(output.ErrUsage)
 	}
 
 	// `backup <deployment>` resolves --pg-connection / --repo from the
@@ -307,6 +317,15 @@ func runBackup(cmd *cobra.Command, opts runOptions) error {
 		}
 	}
 
+	chunkAvg := 0
+	if opts.chunkSize != "" {
+		n, perr := parseThroughput(opts.chunkSize)
+		if perr != nil || n < 16<<10 || n > 16<<20 {
+			return output.NewError("usage.invalid_chunk_size",
+				fmt.Sprintf("backup: --chunk-size %q: want a size between 16KiB and 16MiB (e.g. 1MiB)", opts.chunkSize)).Wrap(output.ErrUsage)
+		}
+		chunkAvg = int(n)
+	}
 	res, err := runner.Take(cmd.Context(), runner.TakeOptions{
 		PGConnString: opts.pgConn,
 		RepoURL:      opts.repoURL,
@@ -321,6 +340,7 @@ func runBackup(cmd *cobra.Command, opts runOptions) error {
 		SourceTDE:    sourceTDE,
 		Incremental:  incrConfig,
 		StallTimeout: opts.stallTimeout,
+		ChunkAvgSize: chunkAvg,
 		SkipLease:    opts.allowConcurrent,
 		OnEvent: func(e *output.Event) {
 			if suppressEvents {
@@ -455,7 +475,9 @@ func loadIncrementalConfig(ctx context.Context, repoURL, deployment, parentID st
 		parentID = resolved
 	}
 	store := backup.NewManifestStore(sp)
-	parent, err := store.Read(ctx, deployment, parentID, verifier)
+	// ReadStreaming, not Read: the parent of a very large database has a
+	// manifest of many GB, and only its header (PGBackupManifest) is needed.
+	parent, err := store.ReadStreaming(ctx, deployment, parentID, verifier)
 	if err != nil {
 		return nil, incrementalParentReadError(parentID, err)
 	}

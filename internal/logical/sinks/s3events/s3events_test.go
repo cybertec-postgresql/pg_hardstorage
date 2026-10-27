@@ -531,3 +531,30 @@ func readKey(t *testing.T, sp storage.StoragePlugin, key string) []byte {
 	}
 	return body
 }
+
+// TestSink_BatchBytes_FlushesBeforeCountCap: wide rows flush on payload
+// bytes long before BatchSize records.
+func TestSink_BatchBytes_FlushesBeforeCountCap(t *testing.T) {
+	sp, _ := freshStorage(t)
+	sink, err := s3events.New(s3events.Options{
+		Storage: sp, Deployment: "d", Stream: "s", Slot: "sl",
+		BatchSize: 1000, BatchBytes: 1 << 10, Now: fixedNow(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	wide := strings.Repeat("x", 600)
+	if err := sink.OnRecord(ctx, rec(0x1000, 0x1100, wide)); err != nil {
+		t.Fatal(err)
+	}
+	if b, _, _, _ := sink.StatsSnapshot(); b != 0 {
+		t.Fatalf("flushed below the byte cap")
+	}
+	if err := sink.OnRecord(ctx, rec(0x1100, 0x1200, wide)); err != nil {
+		t.Fatal(err)
+	}
+	if b, _, _, _ := sink.StatsSnapshot(); b != 1 {
+		t.Errorf("%d batches after crossing BatchBytes, want 1", b)
+	}
+}

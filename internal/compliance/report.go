@@ -507,7 +507,7 @@ func collectWindowedManifests(ctx context.Context, sp storage.StoragePlugin, opt
 			ws.walkErr = err
 			return ws
 		}
-		for m, lerr := range store.List(ctx, dep, opts.Verifier) {
+		for m, lerr := range store.ListHeaders(ctx, dep, opts.Verifier) {
 			if lerr != nil {
 				// The Options contract: an unverifiable manifest
 				// shows up as signature_failed, it does not vanish

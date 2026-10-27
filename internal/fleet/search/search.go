@@ -27,6 +27,7 @@ package search
 import (
 	"context"
 	"fmt"
+	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -117,6 +118,9 @@ func newPredicate(key, val string) (Predicate, error) {
 		v, err := strconv.ParseUint(val, 10, 32)
 		if err != nil {
 			return nil, fmt.Errorf("search: timeline: %w", err)
+		}
+		if v > math.MaxInt32 {
+			return nil, fmt.Errorf("search: timeline %d out of range", v)
 		}
 		return eqInt{field: "timeline", want: int(v), get: func(m *backup.Manifest) int { return int(m.Timeline) }}, nil
 	case "since":
@@ -272,7 +276,7 @@ func Search(ctx context.Context, sp storage.StoragePlugin, q And, opts SearchOpt
 		if err := ctx.Err(); err != nil {
 			return Result{}, err
 		}
-		for m, lerr := range ms.List(ctx, dep, opts.Verifier) {
+		for m, lerr := range ms.ListHeaders(ctx, dep, opts.Verifier) {
 			if lerr != nil {
 				// Keep walking, but record it -- see doc comment.
 				res.Unreadable++
@@ -307,7 +311,7 @@ func manifestToHit(m *backup.Manifest) Hit {
 		StopLSN:    m.StopLSN,
 		StartedAt:  m.StartedAt,
 		StoppedAt:  m.StoppedAt,
-		Files:      len(m.Files),
+		Files:      m.NumFiles(),
 	}
 }
 

@@ -245,7 +245,7 @@ func runWalGapPurge(cmd *cobra.Command, deployment, repoURL string, orphans, all
 func collectLiveTimelines(ctx context.Context, store *backup.ManifestStore, deployment string, verifier *backup.Verifier) (map[uint32]struct{}, error) {
 	out := make(map[uint32]struct{})
 	graceCutoff := time.Now().UTC().Add(-repo.DefaultTombstoneGracePeriod)
-	for entry, err := range store.ListIncludingTombstoned(ctx, deployment, verifier) {
+	for entry, err := range store.ListIncludingTombstonedHeaders(ctx, deployment, verifier) {
 		if err != nil {
 			// Only a SIGNATURE failure may be skipped: a manifest that
 			// does not verify is one restore would refuse anyway, so its

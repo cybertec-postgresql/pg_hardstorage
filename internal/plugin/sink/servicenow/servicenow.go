@@ -344,7 +344,7 @@ func (s *Sink) findExistingIncident(ctx context.Context, ev *output.Event) (sysI
 			Number string `json:"number"`
 		} `json:"result"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 32<<20)).Decode(&out); err != nil {
 		return "", "", fmt.Errorf("servicenow: decode search: %w", err)
 	}
 	if len(out.Result) == 0 {

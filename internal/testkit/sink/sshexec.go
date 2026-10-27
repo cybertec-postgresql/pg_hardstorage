@@ -117,6 +117,7 @@ func (s *sshExecRuntime) Up(ctx context.Context) error {
 	out, err := exec.CommandContext(ctx, "docker", "run", "-d",
 		"--name", s.container,
 		"-p", fmt.Sprintf("127.0.0.1:%d:22", s.port),
+		"--ulimit", sinkNofile, // see sftp.go: an unbounded nofile makes sshd sessions spin
 		"-e", sshExecAuthKeyEnv+"="+strings.TrimSpace(string(pub)),
 		image).CombinedOutput()
 	if err != nil {

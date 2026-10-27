@@ -72,6 +72,7 @@
 package scp
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/rand"
@@ -452,15 +453,18 @@ func (p *Plugin) List(ctx context.Context, prefix string) iter.Seq2[storage.Obje
 		// explicitly with a test-then-find (absent root => exit 0,
 		// no output), and (b) keep find's stderr so a real failure
 		// propagates, but only AFTER yielding whatever find produced.
-		out, err := p.runShell(ctx, listCommand(full))
-		for _, line := range strings.Split(out, "\n") {
-			line = strings.TrimRight(line, "\r")
+		// Streamed line by line: a repository's listing is hundreds of
+		// millions of lines, and buffering find's whole stdout (then
+		// splitting it into a second copy) was an out-of-memory failure.
+		stopped := false
+		err = p.runShellLines(ctx, listCommand(full), func(line string) bool {
+			line = strings.TrimRight(line, "\r\n")
 			if line == "" {
-				continue
+				return true
 			}
 			parts := strings.SplitN(line, "\t", 3)
 			if len(parts) != 3 {
-				continue
+				return true
 			}
 			rel := parts[0]
 			// Hide scp-internal staging temps ("<key>.hstmp-<rand>",
@@ -469,7 +473,7 @@ func (p *Plugin) List(ctx context.Context, prefix string) iter.Seq2[storage.Obje
 			// commit temps, which GC must be able to reap) are NOT
 			// filtered — ".hstmp-" is reserved for backend staging.
 			if strings.Contains(rel, ".hstmp-") {
-				continue
+				return true
 			}
 			size, _ := strconv.ParseInt(parts[1], 10, 64)
 			mtimeFloat, _ := strconv.ParseFloat(parts[2], 64)
@@ -482,8 +486,13 @@ func (p *Plugin) List(ctx context.Context, prefix string) iter.Seq2[storage.Obje
 				Size:    size,
 				ModTime: mtime,
 			}, nil) {
-				return
+				stopped = true
+				return false
 			}
+			return true
+		})
+		if stopped {
+			return
 		}
 		// A find failure (permission denied, entry vanished mid-walk,
 		// SSH drop) is surfaced only after emitting the partial
@@ -566,16 +575,17 @@ func (p *Plugin) ReapStaging(ctx context.Context, olderThan time.Duration) (stor
 	if err := p.assertOpen(); err != nil {
 		return st, err
 	}
-	out, err := p.runShell(ctx, reapStagingCommand(p.root, olderThan))
-	// Count what was removed even when find failed part way.
-	for _, line := range strings.Split(out, "\n") {
+	// Streamed line by line: one line per reaped temp, which can be
+	// millions after a crash storm. Count what was removed even when
+	// find failed part way.
+	err := p.runShellLines(ctx, reapStagingCommand(p.root, olderThan), func(line string) bool {
 		n, perr := strconv.ParseInt(strings.TrimSpace(line), 10, 64)
-		if perr != nil {
-			continue
+		if perr == nil {
+			st.Removed++
+			st.Bytes += n
 		}
-		st.Removed++
-		st.Bytes += n
-	}
+		return true
+	})
 	if err != nil {
 		return st, fmt.Errorf("scp: reap staging: %w", err)
 	}
@@ -621,45 +631,45 @@ func (p *Plugin) SetRetention(ctx context.Context, key string, until time.Time, 
 // A session that cannot be opened because the TRANSPORT is gone
 // (keepalive teardown, peer restart, reset) marks the connection dead
 // and is retried once over a fresh dial — see keepalive.go.
-func (p *Plugin) newSession() (*ssh.Session, error) {
+func (p *Plugin) newSession() (*ssh.Session, uint64, error) {
 	var lastErr error
 	redialed := false
 	for attempt := 0; attempt < 5; attempt++ {
 		cli, gen, cerr := p.conn()
 		if cerr != nil {
-			return nil, cerr
+			return nil, 0, cerr
 		}
 		sess, err := cli.NewSession()
 		if err == nil {
-			return sess, nil
+			return sess, gen, nil
 		}
 		lastErr = err
 		if isTransportGone(err) {
 			p.markDead(gen)
 			if redialed {
-				return nil, err
+				return nil, 0, err
 			}
 			redialed = true
 			continue
 		}
 		msg := err.Error()
 		if !strings.Contains(msg, "rejected") && !strings.Contains(msg, "open failed") {
-			return nil, err
+			return nil, 0, err
 		}
 		time.Sleep(time.Duration(20*(attempt+1)) * time.Millisecond)
 	}
-	return nil, lastErr
+	return nil, 0, lastErr
 }
 
 func (p *Plugin) runShell(ctx context.Context, command string) (string, error) {
-	sess, err := p.newSession()
+	sess, _, err := p.newSession()
 	if err != nil {
 		return "", fmt.Errorf("scp: new session: %w", err)
 	}
 	defer sess.Close()
-	var out, errBuf bytes.Buffer
-	sess.Stdout = &out
-	sess.Stderr = &errBuf
+	out, errBuf := &cappedBuffer{max: 16 << 20}, &cappedBuffer{max: 1 << 20}
+	sess.Stdout = out
+	sess.Stderr = errBuf
 	done := make(chan error, 1)
 	go func() { done <- sess.Run(command) }()
 	select {
@@ -675,10 +685,81 @@ func (p *Plugin) runShell(ctx context.Context, command string) (string, error) {
 	}
 }
 
+// runShellLines runs command and calls fn with each line of its stdout as it
+// arrives, in constant memory (runShell buffers the whole output). fn
+// returning false stops the command early and is not an error. The error,
+// if any, is runShell's: the command's failure with its stderr, or the
+// context's error.
+func (p *Plugin) runShellLines(ctx context.Context, command string, fn func(line string) bool) error {
+	sess, gen, err := p.newSession()
+	if err != nil {
+		return fmt.Errorf("scp: new session: %w", err)
+	}
+	defer sess.Close()
+	stdout, err := sess.StdoutPipe()
+	if err != nil {
+		return fmt.Errorf("scp: stdout pipe: %w", err)
+	}
+	errBuf := &cappedBuffer{max: 64 << 10}
+	sess.Stderr = errBuf
+	if err := sess.Start(command); err != nil {
+		return fmt.Errorf("scp: start command: %w", err)
+	}
+	// A read parked in the SSH pipe does not look at ctx; tear the session
+	// down on cancellation so it returns.
+	stop := context.AfterFunc(ctx, func() {
+		_ = sess.Signal(ssh.SIGTERM)
+		_ = sess.Close()
+	})
+	defer stop()
+	// The same no-progress guard as a Get's drain: a wedged listing on a
+	// live peer would otherwise hang forever.
+	gr := &sessionReader{stdout: stdout, p: p, gen: gen, idle: readIdleTimeout}
+	br := bufio.NewReaderSize(readFunc(gr.guardedStdoutRead), 1<<20)
+	for {
+		line, rerr := br.ReadString('\n')
+		if line != "" && !fn(line) {
+			_ = sess.Signal(ssh.SIGTERM)
+			return nil
+		}
+		if rerr != nil {
+			break
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := sess.Wait(); err != nil {
+		return fmt.Errorf("%w (stderr: %s)", err, strings.TrimSpace(errBuf.String()))
+	}
+	return nil
+}
+
+// readFunc adapts a function to io.Reader.
+type readFunc func([]byte) (int, error)
+
+func (f readFunc) Read(p []byte) (int, error) { return f(p) }
+
+// cappedBuffer keeps the first max bytes written and discards the rest, so a
+// chatty remote command cannot grow our heap through its stderr.
+type cappedBuffer struct {
+	max int
+	buf bytes.Buffer
+}
+
+func (c *cappedBuffer) Write(p []byte) (int, error) {
+	if room := c.max - c.buf.Len(); room > 0 {
+		c.buf.Write(p[:min(room, len(p))])
+	}
+	return len(p), nil
+}
+
+func (c *cappedBuffer) String() string { return c.buf.String() }
+
 // uploadVia opens a session for command (typically `cat > path`)
 // and streams r to its stdin.  Returns the byte count.
 func (p *Plugin) uploadVia(ctx context.Context, command string, r io.Reader) (int64, error) {
-	sess, err := p.newSession()
+	sess, _, err := p.newSession()
 	if err != nil {
 		return 0, fmt.Errorf("scp: new session: %w", err)
 	}
@@ -687,8 +768,8 @@ func (p *Plugin) uploadVia(ctx context.Context, command string, r io.Reader) (in
 	if err != nil {
 		return 0, fmt.Errorf("scp: stdin pipe: %w", err)
 	}
-	var errBuf bytes.Buffer
-	sess.Stderr = &errBuf
+	errBuf := &cappedBuffer{max: 1 << 20}
+	sess.Stderr = errBuf
 
 	if err := sess.Start(command); err != nil {
 		return 0, fmt.Errorf("scp: start command: %w", err)
@@ -731,7 +812,7 @@ func (p *Plugin) uploadVia(ctx context.Context, command string, r io.Reader) (in
 // and returns a ReadCloser that drains stdout.  Closing the
 // reader closes the session.
 func (p *Plugin) streamRead(ctx context.Context, command string, classify func(error) error) (io.ReadCloser, error) {
-	sess, err := p.newSession()
+	sess, gen, err := p.newSession()
 	if err != nil {
 		return nil, fmt.Errorf("scp: new session: %w", err)
 	}
@@ -744,7 +825,8 @@ func (p *Plugin) streamRead(ctx context.Context, command string, classify func(e
 		_ = sess.Close()
 		return nil, fmt.Errorf("scp: start command: %w", err)
 	}
-	sr := &sessionReader{sess: sess, stdout: stdout, ctx: ctx, classify: classify}
+	sr := &sessionReader{sess: sess, stdout: stdout, ctx: ctx, classify: classify,
+		p: p, gen: gen, idle: readIdleTimeout}
 	// A Read blocked in the SSH stdout pipe does not look at ctx; tear
 	// the session down on cancellation so the blocked Read returns.
 	sr.stopCancel = context.AfterFunc(ctx, func() {
@@ -761,6 +843,14 @@ type sessionReader struct {
 	stdout io.Reader
 	ctx    context.Context
 
+	// p + gen let a stalled stdout read tear down the SSH transport
+	// of exactly the generation it read on (the only lever that
+	// unblocks a read parked in ssh's buffered channel reader). idle
+	// is the no-progress window; 0 disables the guard.
+	p    *Plugin
+	gen  uint64
+	idle time.Duration
+
 	// waited guards ssh.Session.Wait, which may be called exactly once.
 	// Read calls it on EOF so a failed remote command surfaces to
 	// io.ReadAll; Close calls it only if Read did not.
@@ -772,6 +862,48 @@ type sessionReader struct {
 
 	// stopCancel detaches the ctx-cancellation teardown (streamRead).
 	stopCancel func() bool
+	// stallOnce ensures a wedged read tears the transport down exactly
+	// once, even if the caller keeps calling Read after the first stall.
+	stallOnce sync.Once
+}
+
+var errSCPReadStalled = errors.New("scp: read stalled: no progress for readIdleTimeout; tore down the connection, the next operation reconnects")
+
+// guardedStdoutRead races one stdout read against the no-progress idle
+// window. A read that returns (data, EOF, or a genuine error) is passed
+// through untouched; a read that blocks for the whole window with no
+// progress tears down the SSH transport of the generation it read on
+// (the only lever that wakes a read parked in x/crypto/ssh's buffered
+// channel reader) and reports a stall, so the caller's retry/refusal
+// machinery sees an error instead of a hang. A cancelled context tears
+// the session down (as before) and surfaces the context error.
+func (s *sessionReader) guardedStdoutRead(p []byte) (int, error) {
+	if s.idle <= 0 {
+		return s.stdout.Read(p)
+	}
+	type res struct {
+		n   int
+		err error
+	}
+	done := make(chan res, 1)
+	go func() {
+		n, err := s.stdout.Read(p)
+		done <- res{n, err}
+	}()
+	// A NewTimer (not time.After) so the healthy path — hit once per
+	// chunk by the Get's stdout drain — releases the timer instead of
+	// leaving a live readIdleTimeout timer in the heap until it fires.
+	t := time.NewTimer(s.idle)
+	defer t.Stop()
+	select {
+	case rr := <-done:
+		return rr.n, rr.err
+	case <-t.C:
+		if s.p != nil {
+			s.stallOnce.Do(func() { s.p.transportTearDown(s.gen) })
+		}
+		return 0, errSCPReadStalled
+	}
 }
 
 // Read implements io.Reader. A cancelled context surfaces as its own
@@ -782,7 +914,7 @@ func (s *sessionReader) Read(p []byte) (int, error) {
 	if err := s.ctx.Err(); err != nil {
 		return 0, err
 	}
-	n, err := s.stdout.Read(p)
+	n, err := s.guardedStdoutRead(p)
 	if err != nil {
 		if cerr := s.ctx.Err(); cerr != nil {
 			return n, cerr

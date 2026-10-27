@@ -105,10 +105,43 @@ func FirstWALHoleInRange(ctx context.Context, sp storage.StoragePlugin, deployme
 		return 0, false, nil
 	}
 	prefix := fmt.Sprintf("wal/%s/%08X/", deployment, timeline)
+
+	// Memory is bounded by the RANGE asked about, not by how much WAL
+	// the archive holds: one bit per segment of [fromLSN, toLSN], and
+	// only for segments inside it. A years-long archive (hundreds of
+	// millions of segments) used to be materialised as a name slice
+	// plus a presence map — tens of GB. The segment size must be known
+	// before the first name can be mapped to a bit, so the first few
+	// names wait in a tiny buffer while it is learned from a manifest.
 	var (
-		names   []string
-		segSize int64
+		segSize   int64
+		pending   []string // names seen before segSize was fixed (<= holeScanSizeProbes)
+		anySeg    bool
+		fromSeg   uint64
+		spanSegs  uint64
+		bits      []uint64
+		prepErr   error
+		probesTry int
 	)
+	prepare := func() {
+		segSize = walsink.NormSegmentSize(segSize) // default 16 MiB if unreadable
+		fromSeg = uint64(fromLSN) / uint64(segSize)
+		toSeg := uint64(toLSN) / uint64(segSize)
+		spanSegs = toSeg - fromSeg + 1
+		if spanSegs > holeScanMaxSegments {
+			prepErr = fmt.Errorf("inventory: WAL hole scan over %d segments exceeds the %d-segment bound", spanSegs, holeScanMaxSegments)
+			return
+		}
+		bits = make([]uint64, (spanSegs+63)/64)
+	}
+	mark := func(base string) {
+		if _, segNum, err := walsink.ParseSegmentName(base, segSize); err == nil {
+			if segNum >= fromSeg && segNum-fromSeg < spanSegs {
+				i := segNum - fromSeg
+				bits[i>>6] |= 1 << (i & 63)
+			}
+		}
+	}
 	for info, lerr := range sp.List(ctx, prefix) {
 		if lerr != nil {
 			return 0, false, lerr
@@ -124,9 +157,15 @@ func FirstWALHoleInRange(ctx context.Context, sp storage.StoragePlugin, deployme
 		if len(base) != 24 {
 			continue
 		}
-		names = append(names, base)
+		anySeg = true
+		if bits != nil {
+			mark(base)
+			continue
+		}
+		pending = append(pending, base)
 		if segSize == 0 {
-			// Learn the cluster's segment size from the first manifest.
+			// Learn the cluster's segment size from the first readable manifest.
+			probesTry++
 			if rc, gerr := sp.Get(ctx, key); gerr == nil {
 				raw, rerr := storage.ReadAllLimited(rc, storage.MaxMetadataBytes)
 				_ = rc.Close()
@@ -137,27 +176,46 @@ func FirstWALHoleInRange(ctx context.Context, sp storage.StoragePlugin, deployme
 				}
 			}
 		}
-	}
-	if len(names) == 0 {
-		return 0, false, nil // no archived WAL on this timeline
-	}
-	segSize = walsink.NormSegmentSize(segSize) // default 16 MiB if unreadable
-
-	present := make(map[uint64]struct{}, len(names))
-	for _, base := range names {
-		if _, segNum, err := walsink.ParseSegmentName(base, segSize); err == nil {
-			present[segNum] = struct{}{}
+		if segSize != 0 || probesTry >= holeScanSizeProbes {
+			prepare()
+			if prepErr != nil {
+				return 0, false, prepErr
+			}
+			for _, n := range pending {
+				mark(n)
+			}
+			pending = nil
 		}
 	}
-	fromSeg := uint64(fromLSN) / uint64(segSize)
-	toSeg := uint64(toLSN) / uint64(segSize)
-	for seg := fromSeg; seg <= toSeg; seg++ {
-		if _, ok := present[seg]; !ok {
-			return pglogrepl.LSN(seg * uint64(segSize)), true, nil
+	if !anySeg {
+		return 0, false, nil // no archived WAL on this timeline
+	}
+	if bits == nil { // fewer names than probes, none readable
+		prepare()
+		if prepErr != nil {
+			return 0, false, prepErr
+		}
+		for _, n := range pending {
+			mark(n)
+		}
+	}
+	for i := uint64(0); i < spanSegs; i++ {
+		if bits[i>>6]&(1<<(i&63)) == 0 {
+			return pglogrepl.LSN((fromSeg + i) * uint64(segSize)), true, nil
 		}
 	}
 	return 0, false, nil
 }
+
+// holeScanMaxSegments bounds the presence bitmap of FirstWALHoleInRange
+// (one bit per segment): 1<<29 segments is a 64 MiB bitmap covering 8 PiB
+// of 16 MiB WAL. A wider range (an absurd --to-lsn) returns an error,
+// which every caller already treats as "probe unavailable".
+var holeScanMaxSegments uint64 = 1 << 29
+
+// holeScanSizeProbes is how many segment manifests are tried when
+// learning the cluster's segment size before falling back to 16 MiB.
+const holeScanSizeProbes = 16
 
 // highestSegmentKey returns the repo key of the highest committed
 // segment manifest on the timeline. Comparison is by the monotonic

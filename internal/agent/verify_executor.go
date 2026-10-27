@@ -143,7 +143,7 @@ func (e *VerifyExecutor) Execute(ctx context.Context, job *ControlPlaneJob, prog
 	// structured "backup not found" error before doing anything
 	// expensive.
 	store := backup.NewManifestStore(sp)
-	m, err := store.Read(ctx, job.Deployment, backupID, e.verifier)
+	m, err := store.ReadStreaming(ctx, job.Deployment, backupID, e.verifier) // header fields only
 	if err != nil {
 		return nil, fmt.Errorf("verify-executor: read manifest %s/%s: %w", job.Deployment, backupID, err)
 	}

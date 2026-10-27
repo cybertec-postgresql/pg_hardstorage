@@ -61,7 +61,6 @@ import (
 	stdjson "encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/url"
 	"path"
 	"sort"
@@ -693,7 +692,7 @@ func (s *RosterStore) Get(ctx context.Context, id string) (*Roster, error) {
 		return nil, fmt.Errorf("%w: %s: %v", ErrRosterNotFound, id, err)
 	}
 	defer rd.Close()
-	body, err := io.ReadAll(rd)
+	body, err := storage.ReadAllLimited(rd, storage.MaxRecordBytes)
 	if err != nil {
 		return nil, fmt.Errorf("threshold: roster read: %w", err)
 	}
@@ -826,7 +825,7 @@ func (s *AttestationStore) GetHeader(ctx context.Context, kind, id string) (*Att
 		return nil, fmt.Errorf("%w: %s/%s: %v", ErrAttestationNotFound, kind, id, err)
 	}
 	defer rd.Close()
-	body, err := io.ReadAll(rd)
+	body, err := storage.ReadAllLimited(rd, storage.MaxRecordBytes)
 	if err != nil {
 		return nil, err
 	}
@@ -878,7 +877,7 @@ func commitIfBytesMatch(
 	conflictErr error,
 ) error {
 	if rd, err := sp.Get(ctx, key); err == nil {
-		existing, _ := io.ReadAll(rd)
+		existing, _ := storage.ReadAllLimited(rd, storage.MaxRecordBytes)
 		_ = rd.Close()
 		if string(existing) == string(body) {
 			return nil
@@ -891,7 +890,7 @@ func commitIfBytesMatch(
 		// Race: did a concurrent writer win this slot with byte-equal
 		// content?  Re-Get and compare; treat byte-equal as idempotent.
 		if rd, gerr := sp.Get(ctx, key); gerr == nil {
-			existing, _ := io.ReadAll(rd)
+			existing, _ := storage.ReadAllLimited(rd, storage.MaxRecordBytes)
 			_ = rd.Close()
 			if string(existing) == string(body) {
 				return nil
@@ -936,7 +935,7 @@ func (s *AttestationStore) ListSignatures(ctx context.Context, kind, id string) 
 		if err != nil {
 			continue
 		}
-		body, _ := io.ReadAll(rd)
+		body, _ := storage.ReadAllLimited(rd, storage.MaxRecordBytes)
 		_ = rd.Close()
 		var sig AttestationSignature
 		if err := stdjson.Unmarshal(body, &sig); err != nil {

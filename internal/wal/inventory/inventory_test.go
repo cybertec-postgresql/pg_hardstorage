@@ -279,3 +279,30 @@ func TestFirstWALHoleInRange(t *testing.T) {
 		t.Error("inverted range must report no hole")
 	}
 }
+
+// TestFirstWALHoleInRange_BoundedBitmap pins that the scan's memory is
+// bounded by the queried range: segments outside the range are ignored,
+// a range wider than the bound is refused with an error (callers treat
+// it as "probe unavailable"), and a hole at the very start is found.
+func TestFirstWALHoleInRange_BoundedBitmap(t *testing.T) {
+	sp := newSP(t)
+	ctx := context.Background()
+	const seg = walsink.SegmentSize
+	for _, n := range []uint64{0, 1, 2, 5, 6} {
+		putSegmentManifest(t, sp, "db1", 1, walsink.SegmentFileName(1, n, seg))
+	}
+	// Range [5,6] sits after the hole at 3,4 — fully present, outside noise ignored.
+	if _, found, err := inventory.FirstWALHoleInRange(ctx, sp, "db1", 1, pglogrepl.LSN(5*uint64(seg)), pglogrepl.LSN(6*uint64(seg))); err != nil || found {
+		t.Errorf("range [5,6] found=%v err=%v, want no hole", found, err)
+	}
+	// Range starting in the hole reports its first segment.
+	hole, found, err := inventory.FirstWALHoleInRange(ctx, sp, "db1", 1, pglogrepl.LSN(3*uint64(seg)), pglogrepl.LSN(6*uint64(seg)))
+	if err != nil || !found || uint64(hole) != 3*uint64(seg) {
+		t.Errorf("hole=%#x found=%v err=%v, want hole at segment 3", uint64(hole), found, err)
+	}
+	// A range wider than the bound is an error, not an allocation.
+	defer inventory.SetHoleScanMaxForTest(4)()
+	if _, _, err := inventory.FirstWALHoleInRange(ctx, sp, "db1", 1, 0, pglogrepl.LSN(6*uint64(seg))); err == nil {
+		t.Error("range of 7 segments over a bound of 4 must error")
+	}
+}

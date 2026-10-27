@@ -425,12 +425,16 @@ func suggest(key string, names []string) string {
 	if best != "" {
 		return best
 	}
+	// Several fields can match ("backup_schedule" contains both "backup"
+	// and "schedule"); the longest is the most specific, ties go to the
+	// first in sorted order.
+	match := ""
 	for _, n := range names {
-		if len(n) >= 4 && (strings.Contains(key, n) || strings.Contains(n, key)) {
-			return n
+		if len(n) >= 4 && (strings.Contains(key, n) || strings.Contains(n, key)) && len(n) > len(match) {
+			match = n
 		}
 	}
-	return ""
+	return match
 }
 
 func join(path, seg string) string {

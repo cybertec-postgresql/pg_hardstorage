@@ -84,7 +84,7 @@ func ResolveBackupForTimeDetailed(ctx context.Context, sp storage.StoragePlugin,
 		// backup before target exists.
 		laterCount int
 	)
-	for m, err := range store.List(ctx, deployment, verifier) {
+	for m, err := range store.ListHeaders(ctx, deployment, verifier) {
 		if err != nil {
 			errored++
 			continue

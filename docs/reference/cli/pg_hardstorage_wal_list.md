@@ -23,6 +23,7 @@ pg_hardstorage wal list <deployment> [flags]
 ```
       --gaps-only         only print the gap report; suppress per-segment listing
   -h, --help              help for list
+      --limit int         list at most this many segments (0 = unlimited); gap and timeline summaries always cover every segment (default 100000)
       --repo string       repository URL (file://, s3://, ...) — must already exist (required)
       --timeline uint32   only list segments on this timeline (0 = all timelines)
 ```

@@ -155,8 +155,16 @@ func Connect(ctx context.Context, dsn string, mode Mode, opts ...ConnectOption) 
 	if err != nil {
 		return nil, classifyConnectError(err)
 	}
+	// A corrupt or hostile server must not make us allocate GBs from one
+	// length field. Real frames are tiny (CopyData <= ~256 KiB; rows are
+	// bounded by what we query), so a generous ceiling is safe.
+	pg.Frontend().SetMaxBodyLen(MaxServerMessageBytes)
 	return &Conn{pg: pg, mode: mode}, nil
 }
+
+// MaxServerMessageBytes bounds the body of any single protocol message
+// accepted from the server (see Connect).
+const MaxServerMessageBytes = 256 << 20
 
 // Close terminates the connection. Safe to call on a nil receiver and
 // on an already-closed connection.

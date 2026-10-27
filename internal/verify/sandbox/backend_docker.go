@@ -142,12 +142,17 @@ func (dockerBackend) Verify(ctx context.Context, opts Options) (*Result, error) 
 // fall back to treating the whole thing as stderr so the
 // classifier still gets a chance to see the message — the same
 // place PG would have written it.
+// maxExecOutputBytes bounds the captured output of one sandbox exec.
+const maxExecOutputBytes = 16 << 20
+
 func readMultiplexed(r interface{ Read(p []byte) (int, error) }) (string, string) {
 	if r == nil {
 		return "", ""
 	}
 	var raw bytes.Buffer
-	_, _ = io.Copy(&raw, asReader(r))
+	// Capped: pg_verifybackup on a badly broken 100 TB cluster can emit
+	// millions of per-file lines; keep the head only.
+	_, _ = io.Copy(&raw, io.LimitReader(asReader(r), maxExecOutputBytes))
 	body := raw.Bytes()
 
 	var outBuf, errBuf bytes.Buffer

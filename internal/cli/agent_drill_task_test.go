@@ -26,6 +26,21 @@ func TestBuildDrillTask(t *testing.T) {
 	}, config.KMSConfig{}, nil); err == nil {
 		t.Error("missing repo accepted")
 	}
+	// A relative tablespace_mapping_all is refused at registration too.
+	if _, err := buildDrillTask("db1", config.DeploymentConfig{
+		Repo:     "file:///tmp/x",
+		Drill:    config.DrillConfig{TablespaceMappingAll: "relative/dir"},
+		Schedule: config.DeploymentSchedule{Drill: config.ScheduleSpec{Every: "24h"}},
+	}, config.KMSConfig{}, nil); err == nil {
+		t.Error("relative drill.tablespace_mapping_all accepted")
+	}
+	if _, err := buildDrillTask("db1", config.DeploymentConfig{
+		Repo:     "file:///tmp/x",
+		Drill:    config.DrillConfig{TablespaceMappingAll: "/var/tmp/drill"},
+		Schedule: config.DeploymentSchedule{Drill: config.ScheduleSpec{Every: "24h"}},
+	}, config.KMSConfig{}, nil); err != nil {
+		t.Errorf("absolute drill.tablespace_mapping_all refused: %v", err)
+	}
 	// Bad spec refused.
 	if _, err := buildDrillTask("db1", config.DeploymentConfig{
 		Repo:     "file:///tmp/x",

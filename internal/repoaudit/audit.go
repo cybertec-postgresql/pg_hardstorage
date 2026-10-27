@@ -371,7 +371,9 @@ func Audit(ctx context.Context, sp storage.StoragePlugin, meta *repo.Metadata, r
 		encryptedCount := 0
 		plaintextCount := 0
 
-		for m, lerr := range store.List(ctx, deployment, opts.Verifier) {
+		// Headers only (ListHeaders): the audit reads no file lists, and a held
+		// manifest of a large database is gigabytes.
+		for m, lerr := range store.ListHeaders(ctx, deployment, opts.Verifier) {
 			if err := ctx.Err(); err != nil {
 				finish()
 				return rep, err
@@ -428,7 +430,7 @@ func Audit(ctx context.Context, sp storage.StoragePlugin, meta *repo.Metadata, r
 		// Tombstone count is the difference between total committed
 		// (active + tombstoned) and active. Computed via a separate
 		// listing pass that includes tombstoned entries.
-		da.Tombstoned = countTombstoned(ctx, store, deployment, opts.Verifier)
+		da.Tombstoned = countTombstoned(ctx, sp, deployment)
 
 		// Hold counts (active vs expired) come from the pre-loaded
 		// fleet index.
@@ -518,17 +520,37 @@ func Audit(ctx context.Context, sp storage.StoragePlugin, meta *repo.Metadata, r
 	return rep, nil
 }
 
-// countTombstoned counts soft-deleted manifests for a deployment.
-// We use ListIncludingTombstoned and subtract Active afterwards;
-// this is a separate pass but shares the storage layer's prefix
-// listing with the main walk's worth.
-func countTombstoned(ctx context.Context, store *backup.ManifestStore, deployment string, verifier *backup.Verifier) int {
-	count := 0
-	for entry, err := range store.ListIncludingTombstoned(ctx, deployment, verifier) {
+// countTombstoned counts soft-deleted manifests for a deployment: tombstone
+// markers whose manifest is still present. One key listing — reading every
+// manifest again just to learn which have a marker would stream gigabytes
+// per backup for a count the listing already carries.
+func countTombstoned(ctx context.Context, sp storage.StoragePlugin, deployment string) int {
+	const (
+		manifestSuffix  = "/manifest.json"
+		tombstoneSuffix = "/manifest.json.tombstone"
+	)
+	prefix := "manifests/" + deployment + "/backups/"
+	manifests := map[string]struct{}{}
+	tombstones := map[string]struct{}{}
+	for info, err := range sp.List(ctx, prefix) {
 		if err != nil {
+			return 0
+		}
+		rel := strings.TrimPrefix(info.Key, prefix)
+		id, _, ok := strings.Cut(rel, "/")
+		if !ok || id == "" {
 			continue
 		}
-		if entry.Tombstoned {
+		switch {
+		case strings.HasSuffix(info.Key, tombstoneSuffix):
+			tombstones[id] = struct{}{}
+		case strings.HasSuffix(info.Key, manifestSuffix):
+			manifests[id] = struct{}{}
+		}
+	}
+	count := 0
+	for id := range tombstones {
+		if _, ok := manifests[id]; ok {
 			count++
 		}
 	}
@@ -630,7 +652,7 @@ func summarizeChain(ctx context.Context, sp storage.StoragePlugin, now time.Time
 	// without parsing each one (expensive at scale), so we emit a
 	// count-only summary in v1 with an opt-out flag if even that is
 	// too expensive on huge chains.
-	keysWithMeta := map[string]int64{}
+	eventCount := 0 // a counter, not a key->size map: the chain can hold millions of events
 	for info, err := range sp.List(ctx, "audit/") {
 		if err != nil {
 			return nil, err
@@ -649,9 +671,9 @@ func summarizeChain(ctx context.Context, sp storage.StoragePlugin, now time.Time
 		if !strings.HasSuffix(info.Key, ".json") {
 			continue
 		}
-		keysWithMeta[info.Key] = info.Size
+		eventCount++
 	}
-	cs.EventCount = len(keysWithMeta)
+	cs.EventCount = eventCount
 
 	// Anchor walk — much cheaper because anchors are compact and we
 	// already have a primitive that returns the latest one.

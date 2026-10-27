@@ -24,7 +24,7 @@ func SeedSystemIdentifier(ctx context.Context, repoURL, deployment, backupID str
 		return ""
 	}
 	defer sp.Close()
-	m, _, err := backup.NewManifestStore(sp).ReadIncludingTombstoned(ctx, deployment, backupID, verifier)
+	m, _, err := backup.NewManifestStore(sp).ReadIncludingTombstonedAuto(ctx, deployment, backupID, verifier)
 	if err != nil || m == nil {
 		return ""
 	}

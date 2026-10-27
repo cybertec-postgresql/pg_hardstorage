@@ -89,18 +89,14 @@ func runWalAudit(cmd *cobra.Command, deployment, repoURL string, tliFilter uint3
 	defer sp.Close()
 
 	startedAt := time.Now().UTC()
-	segs, err := scanWALSegments(cmd.Context(), sp, deployment, tliFilter)
+	segs, segSize, err := scanWALSegments(cmd.Context(), sp, deployment, tliFilter)
 	if err != nil {
 		return err
 	}
-	gaps := findLineageGaps(segs, repoTimelineForks(cmd.Context(), sp, deployment, segs))
+	gr := scanLineageGaps(segs, repoTimelineForks(cmd.Context(), sp, deployment, segs, segSize))
+	gaps, totalMissing := gr.Gaps, gr.Missing
 	timelines := summariseTimelines(segs)
 	stoppedAt := time.Now().UTC()
-
-	var totalMissing uint64
-	for _, g := range gaps {
-		totalMissing += g.MissingCount
-	}
 
 	body := walAuditBody{
 		Schema:         "pg_hardstorage.wal.audit.v1",
@@ -109,15 +105,16 @@ func runWalAudit(cmd *cobra.Command, deployment, repoURL string, tliFilter uint3
 		TimelineFilter: tliFilter,
 		Timelines:      timelines,
 		SegmentCount:   len(segs),
-		GapCount:       len(gaps),
+		GapCount:       gr.Count,
 		Gaps:           gaps,
+		GapsTruncated:  gr.Truncated,
 		MissingTotal:   totalMissing,
 		StartedAt:      startedAt,
 		StoppedAt:      stoppedAt,
 		DurationMS:     stoppedAt.Sub(startedAt).Milliseconds(),
 	}
 
-	if len(gaps) == 0 {
+	if gr.Count == 0 {
 		return d.Result(output.NewResult(cmd.CommandPath()).WithBody(body))
 	}
 
@@ -131,17 +128,30 @@ func runWalAudit(cmd *cobra.Command, deployment, repoURL string, tliFilter uint3
 	// JSON body. Shape mirrors anomaly.detected's error.
 	var lines []string
 	for _, g := range gaps {
+		if len(lines) >= maxGapErrorLines {
+			break
+		}
 		lines = append(lines, g.describe())
+	}
+	if gr.Count > len(lines) {
+		lines = append(lines, fmt.Sprintf("... %d more gap(s) not listed (see the JSON body / wal list --gaps-only)", gr.Count-len(lines)))
 	}
 	return output.NewError("verify.wal_gap_detected",
 		fmt.Sprintf("wal audit: %d gap(s) totalling %d missing segment(s)\n%s",
-			len(gaps), totalMissing, strings.Join(lines, "\n"))).
+			gr.Count, totalMissing, strings.Join(lines, "\n"))).
 		WithSuggestion(&output.Suggestion{
 			Human:   "WAL is missing between segments. If a slot was dropped during a network blip, take a fresh full backup; gaps within a single timeline can also indicate a partial-archive failure.",
 			Command: fmt.Sprintf("pg_hardstorage wal list %s --repo %s --gaps-only", deployment, repoURL),
 			DocURL:  "docs/runbooks/wal-gap-detected.md",
 		})
 }
+
+// maxGapErrorLines and maxGapAuditEntries bound how many individual gaps
+// the error text and the audit event carry; the counts stay exact.
+const (
+	maxGapErrorLines   = 100
+	maxGapAuditEntries = 1000
+)
 
 // emitWALGapAudit writes ONE wal.gap_detected audit event per audit
 // run. We deliberately emit once-per-run (not once-per-gap) — a
@@ -151,8 +161,11 @@ func runWalAudit(cmd *cobra.Command, deployment, repoURL string, tliFilter uint3
 // CLI verdict path never depends on audit-chain availability.
 func emitWALGapAudit(ctx context.Context, sp storage.StoragePlugin, repoMeta *repo.Metadata, repoURL, deployment string, body *walAuditBody) {
 	store := audit.NewStoreWithRetention(sp, repoMeta.WORM)
-	gapBodies := make([]map[string]any, 0, len(body.Gaps))
+	gapBodies := make([]map[string]any, 0, min(len(body.Gaps), maxGapAuditEntries))
 	for _, g := range body.Gaps {
+		if len(gapBodies) >= maxGapAuditEntries {
+			break
+		}
 		gapBodies = append(gapBodies, map[string]any{
 			"timeline":      g.Timeline,
 			"start_segment": g.StartSegment,
@@ -193,7 +206,10 @@ type walAuditBody struct {
 	SegmentCount int                  `json:"segment_count"`
 	GapCount     int                  `json:"gap_count"`
 	Gaps         []walGap             `json:"gaps,omitempty"`
-	MissingTotal uint64               `json:"missing_total"`
+	// GapsTruncated is set when Gaps was cut at maxReportedGaps; GapCount
+	// and MissingTotal remain exact.
+	GapsTruncated bool   `json:"gaps_truncated,omitempty"`
+	MissingTotal  uint64 `json:"missing_total"`
 
 	StartedAt  time.Time `json:"started_at"`
 	StoppedAt  time.Time `json:"stopped_at"`

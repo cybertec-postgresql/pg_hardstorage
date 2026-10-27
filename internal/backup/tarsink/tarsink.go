@@ -130,8 +130,18 @@ type Sink struct {
 	pipeWriter *io.PipeWriter
 	parserDone chan parserResult
 
+	// entryHandler, when set, receives every file entry as it is produced
+	// instead of the sink accumulating it in files. See WithEntryHandler.
+	entryHandler func(*backup.FileEntry) error
+
+	// entryStream, when set, receives each file's chunk refs one at a
+	// time, in order, as they complete. See WithEntryStream.
+	entryStream EntryStream
+
 	// manifestBuf accumulates raw bytes when currentIdx == ManifestSinkIndex.
 	manifestBuf bytes.Buffer
+	// skipPGManifest drops the manifest CopyOut instead of buffering it.
+	skipPGManifest bool
 
 	mu sync.Mutex // protects files / *bytes / per-tablespace state across the goroutines
 }
@@ -145,6 +155,13 @@ type parserResult struct {
 }
 
 // Option tunes a Sink at construction time.
+// WithoutPGManifestCopy stops the sink from buffering PG's own
+// backup_manifest. The base-backup driver already holds those bytes in
+// basebackup.Result.ManifestBytes; a second copy in the sink doubles the
+// footprint of a manifest that can be gigabytes on a cluster with tens of
+// millions of files. ManifestBytes() then returns nil.
+func WithoutPGManifestCopy() Option { return func(s *Sink) { s.skipPGManifest = true } }
+
 type Option func(*Sink)
 
 // WithChunkerFactory replaces the default chunker.New with f. Each
@@ -180,6 +197,37 @@ func defaultChunkConcurrency() int {
 		n = 1
 	}
 	return n
+}
+
+// WithEntryHandler hands every finished FileEntry to fn, in the order
+// the tar stream produced them, instead of accumulating them in memory.
+// With it set, Files and AllFiles return nothing: the caller owns the
+// entries. This is what lets a backup of a database with billions of
+// chunks keep its manifest off the heap — the runner spools each entry
+// to disk as it arrives. fn runs on the tar-parsing goroutine, one
+// tablespace at a time; it must not block for long (it back-pressures
+// the basebackup pipe). The entry is only valid during the call.
+func WithEntryHandler(fn func(*backup.FileEntry) error) Option {
+	return func(s *Sink) { s.entryHandler = fn }
+}
+
+// EntryStream receives a file entry in pieces so that a single file with
+// an enormous chunk list (a custom --with-segsize of hundreds of GB) never
+// has its whole list on the heap. For each regular file the sink calls
+// BeginFile (entry carries every field except Chunks), then AddChunk once
+// per chunk in file-offset order, then EndFile. Files without data get
+// BeginFile + EndFile only. Calls come from the tar-parsing goroutine,
+// never concurrently. An error from any call aborts the tablespace.
+type EntryStream interface {
+	BeginFile(fe *backup.FileEntry) error
+	AddChunk(c backup.ChunkRef) error
+	EndFile() error
+}
+
+// WithEntryStream streams every regular file's chunk refs to es instead of
+// collecting them. It takes precedence over WithEntryHandler.
+func WithEntryStream(es EntryStream) Option {
+	return func(s *Sink) { s.entryStream = es }
 }
 
 // FileStats summarises a single regular file's pass through the
@@ -388,7 +436,9 @@ func (s *Sink) OnTablespaceData(idx int, data []byte) error {
 		return fmt.Errorf("tarsink: OnTablespaceData(%d) but currentIdx=%d", idx, s.currentIdx)
 	}
 	if idx == basebackup.ManifestSinkIndex {
-		s.manifestBuf.Write(data)
+		if !s.skipPGManifest {
+			s.manifestBuf.Write(data)
+		}
 		s.mu.Unlock()
 		return nil
 	}
@@ -451,8 +501,11 @@ func (s *Sink) OnTablespaceEnd(idx int) error {
 	}
 
 	if idx == basebackup.ManifestSinkIndex {
-		s.manifestBytes = append([]byte(nil), s.manifestBuf.Bytes()...)
-		s.manifestBuf.Reset()
+		// Hand the buffer's bytes over instead of copying them: PG's
+		// backup_manifest can be hundreds of MiB, and a copy plus the
+		// still-allocated buffer would triple the footprint.
+		s.manifestBytes = s.manifestBuf.Bytes()
+		s.manifestBuf = bytes.Buffer{}
 		s.currentIdx = unsetIdx
 		s.mu.Unlock()
 		return nil
@@ -592,14 +645,19 @@ func (s *Sink) parseTar(ctx context.Context, r io.Reader, idx int, tsOID uint32)
 			continue
 		}
 
-		entry, err := s.chunkFile(ctx, hdr, tr)
+		entry, err := s.chunkFile(ctx, hdr, tr, tsOID)
 		if err != nil {
 			return files, dirs, fmt.Errorf("chunk %s: %w", hdr.Name, err)
 		}
-		// Stamp the owning tablespace so restore materialises a
-		// non-default-tablespace file under its real location rather
-		// than flattening it under PGDATA root.
-		entry.TablespaceOID = tsOID
+		if s.entryStream != nil {
+			continue
+		}
+		if s.entryHandler != nil {
+			if err := s.entryHandler(&entry); err != nil {
+				return files, dirs, fmt.Errorf("record %s: %w", hdr.Name, err)
+			}
+			continue
+		}
 		files = append(files, entry)
 	}
 }
@@ -642,9 +700,13 @@ func validateTarEntryName(name string) error {
 // captureSpecial reads the entire current tar entry into *dst.
 // Used for backup_label and tablespace_map (both small files).
 func (s *Sink) captureSpecial(tr *tar.Reader, dst *[]byte) error {
-	body, err := io.ReadAll(tr)
+	const maxSpecial = 16 << 20
+	body, err := io.ReadAll(io.LimitReader(tr, maxSpecial+1))
 	if err != nil {
 		return err
+	}
+	if len(body) > maxSpecial {
+		return fmt.Errorf("tarsink: special file exceeds %d bytes", maxSpecial)
 	}
 	s.mu.Lock()
 	*dst = body
@@ -660,12 +722,31 @@ func (s *Sink) captureSpecial(tr *tar.Reader, dst *[]byte) error {
 // When a file observer is wired (issue #9 / `--verbose`), this also
 // counts deduped chunks and unique bytes so the observer's
 // FileStats payload reports the file's local dedup story.
-func (s *Sink) chunkFile(ctx context.Context, hdr *tar.Header, tr *tar.Reader) (backup.FileEntry, error) {
+func (s *Sink) chunkFile(ctx context.Context, hdr *tar.Header, tr *tar.Reader, tsOID uint32) (backup.FileEntry, error) {
+	// The owning tablespace is stamped so restore materialises a
+	// non-default-tablespace file under its real location rather
+	// than flattening it under PGDATA root.
 	entry := backup.FileEntry{
-		Path:    hdr.Name,
-		Size:    hdr.Size,
-		Mode:    uint32(hdr.Mode),
-		ModTime: normalizeModTime(hdr.ModTime),
+		Path:          hdr.Name,
+		Size:          hdr.Size,
+		Mode:          uint32(hdr.Mode),
+		ModTime:       normalizeModTime(hdr.ModTime),
+		TablespaceOID: tsOID,
+	}
+	stream := s.entryStream
+	if stream != nil {
+		if err := stream.BeginFile(&entry); err != nil {
+			return entry, fmt.Errorf("tarsink: begin %q: %w", entry.Path, err)
+		}
+	}
+	finish := func() error {
+		if stream == nil {
+			return nil
+		}
+		if err := stream.EndFile(); err != nil {
+			return fmt.Errorf("tarsink: end %q: %w", entry.Path, err)
+		}
+		return nil
 	}
 
 	// Empty file: no chunks. Common for things like postmaster.opts
@@ -675,7 +756,7 @@ func (s *Sink) chunkFile(ctx context.Context, hdr *tar.Header, tr *tar.Reader) (
 		if s.fileObserver != nil {
 			s.fileObserver(FileStats{Path: entry.Path})
 		}
-		return entry, nil
+		return entry, finish()
 	}
 
 	// A file's chunks are PRODUCED sequentially — the chunker makes a
@@ -687,6 +768,12 @@ func (s *Sink) chunkFile(ctx context.Context, hdr *tar.Header, tr *tar.Reader) (
 	// blocks the producer when the pool is full, so memory stays at
 	// O(chunkConcurrency) chunk bodies. Only the producer touches
 	// the tar.Reader, so there is no read race on the stream.
+	//
+	// Workers finish out of order, but refs must be emitted in file
+	// order. The producer keeps a FIFO of per-chunk result channels of
+	// at most `window` entries and pops the oldest (blocking until its
+	// worker is done) whenever the FIFO is full, so the reorder state
+	// is O(window), independent of the file's chunk count.
 	type chunkSlot struct {
 		ref         backup.ChunkRef
 		deduped     bool
@@ -695,10 +782,46 @@ func (s *Sink) chunkFile(ctx context.Context, hdr *tar.Header, tr *tar.Reader) (
 	ch := s.chunkerFactory()
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(s.chunkConcurrency)
+	window := 2 * s.chunkConcurrency
+	if window < 2 {
+		window = 2
+	}
 
-	var results sync.Map // chunk index (int) -> chunkSlot
-	count := 0
+	var (
+		queue         []chan chunkSlot
+		count         int
+		dedupedChunks int
+		uniqueBytes   int64
+		emitErr       error
+	)
+	// popOldest waits for the oldest in-flight chunk and emits its ref.
+	// It reports false when the pipeline must stop (worker failure
+	// or emit failure); g.Wait surfaces worker errors.
+	popOldest := func() bool {
+		done := queue[0]
+		queue[0] = nil
+		queue = queue[1:]
+		var slot chunkSlot
+		select {
+		case slot = <-done:
+		case <-gctx.Done():
+			return false
+		}
+		if slot.deduped {
+			dedupedChunks++
+		} else {
+			uniqueBytes += slot.uniqueBytes
+		}
+		if stream != nil {
+			emitErr = stream.AddChunk(slot.ref)
+		} else {
+			entry.Chunks = append(entry.Chunks, slot.ref)
+		}
+		return emitErr == nil
+	}
+
 	var produceErr error
+	ok := true
 	for chk, err := range ch.Iter(tr) {
 		if err != nil {
 			produceErr = err
@@ -706,20 +829,23 @@ func (s *Sink) chunkFile(ctx context.Context, hdr *tar.Header, tr *tar.Reader) (
 		}
 		// A worker failed: stop feeding — g.Wait surfaces the error.
 		if gctx.Err() != nil {
+			ok = false
 			break
 		}
 		// The chunker reuses its buffer across iterations; copy
 		// before the bytes cross into a worker goroutine.
 		body := make([]byte, len(chk.Data))
 		copy(body, chk.Data)
-		idx, offset := count, chk.Offset
+		offset := chk.Offset
 		count++
+		done := make(chan chunkSlot, 1)
+		queue = append(queue, done)
 		g.Go(func() error {
 			info, err := s.cas.PutChunk(gctx, body)
 			if err != nil {
 				return fmt.Errorf("cas put: %w", err)
 			}
-			results.Store(idx, chunkSlot{
+			done <- chunkSlot{
 				ref: backup.ChunkRef{
 					Hash:   info.Hash,
 					Offset: offset,
@@ -727,46 +853,43 @@ func (s *Sink) chunkFile(ctx context.Context, hdr *tar.Header, tr *tar.Reader) (
 				},
 				deduped:     info.Deduped,
 				uniqueBytes: info.Size,
-			})
+			}
 			return nil
 		})
+		for ok && len(queue) >= window {
+			ok = popOldest()
+		}
+		if !ok {
+			break
+		}
+	}
+	// Drain the tail of the window (skipped on any failure above).
+	for ok && produceErr == nil && len(queue) > 0 {
+		ok = popOldest()
 	}
 	if err := g.Wait(); err != nil {
 		return entry, err
 	}
+	if emitErr != nil {
+		return entry, fmt.Errorf("tarsink: record chunk of %q: %w", entry.Path, emitErr)
+	}
 	if produceErr != nil {
 		return entry, produceErr
 	}
-
-	// Workers finished out of order; reassemble the chunk list in
-	// the file's offset order — the manifest needs it sequential.
-	entry.Chunks = make([]backup.ChunkRef, count)
-	var dedupedChunks int
-	var uniqueBytes int64
-	for i := 0; i < count; i++ {
-		v, ok := results.Load(i)
-		if !ok {
-			return entry, fmt.Errorf("tarsink: chunk %d of %q missing after PutChunk", i, entry.Path)
-		}
-		slot := v.(chunkSlot)
-		entry.Chunks[i] = slot.ref
-		if slot.deduped {
-			dedupedChunks++
-		} else {
-			uniqueBytes += slot.uniqueBytes
-		}
+	if !ok {
+		return entry, fmt.Errorf("tarsink: chunk pipeline of %q stopped: %w", entry.Path, gctx.Err())
 	}
 
 	if s.fileObserver != nil {
 		s.fileObserver(FileStats{
 			Path:          entry.Path,
 			Size:          entry.Size,
-			ChunkCount:    len(entry.Chunks),
+			ChunkCount:    count,
 			DedupedChunks: dedupedChunks,
 			UniqueBytes:   uniqueBytes,
 		})
 	}
-	return entry, nil
+	return entry, finish()
 }
 
 // normalizeModTime drops sub-second precision from tar mtimes so the

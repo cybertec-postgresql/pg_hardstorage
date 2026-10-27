@@ -13,17 +13,25 @@ package cli
 // Caught by TestFindGaps_AcrossATimelineChange (the straddle cases) and
 // TestWalAudit_HoleStraddlingAPromotionIsDetected.
 func findGaps(segs []walSegment) []walGap {
-	if len(segs) < 2 {
-		return nil
-	}
 	var gaps []walGap
+	eachGap(segs, func(g walGap) { gaps = append(gaps, g) })
+	return gaps
+}
+
+// eachGap is findGaps as a visitor: it reports every gap without collecting
+// them, so callers over a very large archive (every other segment missing
+// is tens of millions of gaps) can count and keep only a bounded sample.
+func eachGap(segs []walSegment, emit func(walGap)) {
+	if len(segs) < 2 {
+		return
+	}
 	for i := 1; i < len(segs); i++ {
 		prev, curr := segs[i-1], segs[i]
 		if prev.Timeline != curr.Timeline {
 			continue
 		}
 		if curr.SegmentNumber > prev.SegmentNumber+1 {
-			gaps = append(gaps, walGap{
+			emit(walGap{
 				Timeline:     prev.Timeline,
 				StartSegment: prev.SegmentNumber + 1,
 				EndSegment:   curr.SegmentNumber - 1,
@@ -31,5 +39,4 @@ func findGaps(segs []walSegment) []walGap {
 			})
 		}
 	}
-	return gaps
 }

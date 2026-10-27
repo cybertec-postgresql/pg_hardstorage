@@ -54,7 +54,7 @@ func recordPreStreamGap(ctx context.Context, d *output.Dispatcher, sp storage.St
 	}
 	var minStop pglogrepl.LSN
 	found := false
-	for m, lerr := range backup.NewManifestStore(sp).ListAttestationless(ctx, opts.deployment) {
+	for m, lerr := range backup.NewManifestStore(sp).ListAttestationlessHeaders(ctx, opts.deployment) {
 		if lerr != nil || m == nil || m.StopLSN == "" {
 			continue
 		}

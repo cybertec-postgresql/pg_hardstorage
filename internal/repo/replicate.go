@@ -333,39 +333,24 @@ func Replicate(ctx context.Context, src, dst storage.StoragePlugin, opts Replica
 		replicateManifest(ctx, src, dst, key, backupID, harvestBackup, opts, res)
 	}
 
-	// Pass 3: WAL — same flow, gated on opts.IncludeWAL.
+	// Pass 3: WAL — same flow, gated on opts.IncludeWAL. Streamed: years of
+	// archived WAL are tens of millions of segment manifests, so neither
+	// the keys nor a sorted copy of them are ever held. Two listing passes
+	// keep the old order (every segment manifest, then every aux file)
+	// without buffering either group.
 	if opts.IncludeWAL {
-		var walKeys, walAuxKeys []string
 		for info, err := range src.List(ctx, "wal/") {
 			if err != nil {
 				finish()
 				return res, fmt.Errorf("repo replicate: list src wal: %w", err)
 			}
 			key := info.Key
-			if tmpMarkerInBasename(key) {
-				continue // staging temp (manifest or .history)
-			}
-			switch {
-			case strings.HasSuffix(key, ".json"):
-				walKeys = append(walKeys, key)
-			case strings.HasSuffix(key, ".history"),
-				strings.HasSuffix(key, ".backup"),
-				strings.HasSuffix(key, ".partial"):
-				// Direct-byte aux files — timeline history, backup-label,
-				// and partial segments. REQUIRED for PITR across a
-				// failover at the DR site (the .history navigates the
-				// timeline switch); copying only the .json segment
-				// manifests would leave the replica unable to recover
-				// across a timeline change.
-				walAuxKeys = append(walAuxKeys, key)
-			}
-		}
-		sort.Strings(walKeys)
-		sort.Strings(walAuxKeys)
-		for _, key := range walKeys {
 			if err := ctx.Err(); err != nil {
 				finish()
 				return res, err
+			}
+			if tmpMarkerInBasename(key) || !strings.HasSuffix(key, ".json") {
+				continue // staging temp (manifest or .history), or not a segment manifest
 			}
 			res.WALManifestsConsidered++
 			if opts.OnProgress != nil {
@@ -373,10 +358,25 @@ func Replicate(ctx context.Context, src, dst storage.StoragePlugin, opts Replica
 			}
 			replicateWALManifest(ctx, src, dst, key, opts, res)
 		}
-		for _, key := range walAuxKeys {
+		for info, err := range src.List(ctx, "wal/") {
+			if err != nil {
+				finish()
+				return res, fmt.Errorf("repo replicate: list src wal: %w", err)
+			}
+			key := info.Key
 			if err := ctx.Err(); err != nil {
 				finish()
 				return res, err
+			}
+			// Direct-byte aux files — timeline history, backup-label,
+			// and partial segments. REQUIRED for PITR across a
+			// failover at the DR site (the .history navigates the
+			// timeline switch); copying only the .json segment
+			// manifests would leave the replica unable to recover
+			// across a timeline change.
+			if tmpMarkerInBasename(key) ||
+				!(strings.HasSuffix(key, ".history") || strings.HasSuffix(key, ".backup") || strings.HasSuffix(key, ".partial")) {
+				continue
 			}
 			res.WALAuxConsidered++
 			if opts.OnProgress != nil {
@@ -394,6 +394,12 @@ func Replicate(ctx context.Context, src, dst storage.StoragePlugin, opts Replica
 // recorded in res but do NOT abort the replicate run — operators
 // running this from cron want the full report, not a fail-on-first.
 func replicateManifest(ctx context.Context, src, dst storage.StoragePlugin, key, backupID string, kind harvestKind, opts ReplicateOptions, res *ReplicateResult) {
+	if kind == harvestBackup {
+		if st, serr := src.Stat(ctx, key); serr == nil && st.Size > replicateStreamThreshold {
+			replicateManifestStreamed(ctx, src, dst, key, backupID, st.Size, opts, res)
+			return
+		}
+	}
 	body, err := readKey(ctx, src, key)
 	if err != nil {
 		recordReplicateFailure(res, key, err)
@@ -433,12 +439,12 @@ func replicateManifest(ctx context.Context, src, dst storage.StoragePlugin, key,
 		res.ManifestsFailed++
 		return
 	}
-	fence, ok := beginDstFence(ctx, dst, key, adopted, opts, res)
+	fence, ok := beginDstFence(ctx, dst, key, sliceSource(adopted), opts, res)
 	if !ok {
 		res.ManifestsFailed++
 		return
 	}
-	if !reverifyAdopted(ctx, src, dst, key, adopted, opts, res, false) {
+	if !reverifyAdopted(ctx, src, dst, key, sliceSource(adopted), opts, res, false) {
 		recordReplicateFailure(res, key, errors.New("manifest withheld from replica: an adopted chunk vanished from the replica before the manifest committed (concurrent `repo gc --apply` on the replica?) and could not be re-copied; re-run replicate"))
 		res.ManifestsFailed++
 		return
@@ -448,7 +454,7 @@ func replicateManifest(ctx context.Context, src, dst storage.StoragePlugin, key,
 	if !copyKey(ctx, src, dst, key, body, opts, res, manifestKind, false /* not best-effort */) {
 		return
 	}
-	if !confirmDstFence(ctx, src, dst, key, fence, adopted, opts, res) {
+	if !confirmDstFence(ctx, src, dst, key, fence, sliceSource(adopted), opts, res) {
 		res.ManifestsFailed++
 		return
 	}
@@ -456,13 +462,9 @@ func replicateManifest(ctx context.Context, src, dst storage.StoragePlugin, key,
 	// Mirror the _replicas/<id>.manifest.json copy if it exists at
 	// src. The replica is best-effort redundancy; failure to copy
 	// it does NOT bump ManifestsFailed (the primary already
-	// committed at dst, which is the contract).
-	if backupID != "" {
-		replicaKey := "manifests/_replicas/" + backupID + ".manifest.json"
-		if rb, rerr := readKey(ctx, src, replicaKey); rerr == nil {
-			copyKey(ctx, src, dst, replicaKey, rb, opts, res, manifestKind, true /* best-effort */)
-		}
-	}
+	// committed at dst, which is the contract) but is counted in
+	// ManifestReplicasFailed and recorded.
+	mirrorManifestReplica(ctx, src, dst, backupID, opts, res)
 }
 
 // replicateWALManifest copies one WAL segment manifest + its chunks.
@@ -499,12 +501,12 @@ func replicateWALManifest(ctx context.Context, src, dst storage.StoragePlugin, k
 		res.WALManifestsFailed++
 		return
 	}
-	fence, ok := beginDstFence(ctx, dst, key, adopted, opts, res)
+	fence, ok := beginDstFence(ctx, dst, key, sliceSource(adopted), opts, res)
 	if !ok {
 		res.WALManifestsFailed++
 		return
 	}
-	if !reverifyAdopted(ctx, src, dst, key, adopted, opts, res, false) {
+	if !reverifyAdopted(ctx, src, dst, key, sliceSource(adopted), opts, res, false) {
 		recordReplicateFailure(res, key, errors.New("wal manifest withheld from replica: an adopted chunk vanished from the replica before the manifest committed (concurrent `repo gc --apply` on the replica?) and could not be re-copied; re-run replicate"))
 		res.WALManifestsFailed++
 		return
@@ -512,7 +514,7 @@ func replicateWALManifest(ctx context.Context, src, dst storage.StoragePlugin, k
 	if !copyKey(ctx, src, dst, key, body, opts, res, walKind, false) {
 		return
 	}
-	if !confirmDstFence(ctx, src, dst, key, fence, adopted, opts, res) {
+	if !confirmDstFence(ctx, src, dst, key, fence, sliceSource(adopted), opts, res) {
 		res.WALManifestsFailed++
 	}
 }
@@ -522,11 +524,11 @@ func replicateWALManifest(ctx context.Context, src, dst storage.StoragePlugin, k
 // --apply` running against the replica cannot then delete them between
 // the re-verify and the manifest landing. DryRun writes nothing and
 // needs no fence.
-func beginDstFence(ctx context.Context, dst storage.StoragePlugin, key string, adopted []Hash, opts ReplicateOptions, res *ReplicateResult) (*CommitFence, bool) {
-	if opts.DryRun || len(adopted) == 0 {
+func beginDstFence(ctx context.Context, dst storage.StoragePlugin, key string, adopted HashSource, opts ReplicateOptions, res *ReplicateResult) (*CommitFence, bool) {
+	if opts.DryRun || adopted.Len() == 0 {
 		return nil, true
 	}
-	fence, err := BeginCommitFence(ctx, dst, adopted, FenceOptions{Owner: "replicate " + key})
+	fence, err := BeginCommitFenceSource(ctx, dst, adopted, FenceOptions{Owner: "replicate " + key})
 	if err != nil {
 		recordReplicateFailure(res, key, fmt.Errorf("manifest withheld from replica: %w", err))
 		return nil, false
@@ -539,7 +541,7 @@ func beginDstFence(ctx context.Context, dst storage.StoragePlugin, key string, a
 // being written, the chunk is re-copied from src (src is
 // authoritative), so the replica ends up whole instead of holding a
 // manifest over a hole.
-func confirmDstFence(ctx context.Context, src, dst storage.StoragePlugin, key string, fence *CommitFence, adopted []Hash, opts ReplicateOptions, res *ReplicateResult) bool {
+func confirmDstFence(ctx context.Context, src, dst storage.StoragePlugin, key string, fence *CommitFence, adopted HashSource, opts ReplicateOptions, res *ReplicateResult) bool {
 	if fence == nil {
 		return true
 	}
@@ -754,8 +756,8 @@ func bumpKeyFailed(res *ReplicateResult, kind keyKind) {
 // afterCommit re-checks even though the manifest is now at dst: it is
 // the fence's post-commit repair path, where a gc swept a chunk while
 // the manifest was being written.
-func reverifyAdopted(ctx context.Context, src, dst storage.StoragePlugin, manifestKey string, adopted []Hash, opts ReplicateOptions, res *ReplicateResult, afterCommit bool) bool {
-	if len(adopted) == 0 || opts.DryRun {
+func reverifyAdopted(ctx context.Context, src, dst storage.StoragePlugin, manifestKey string, adopted HashSource, opts ReplicateOptions, res *ReplicateResult, afterCommit bool) bool {
+	if adopted.Len() == 0 || opts.DryRun {
 		return true
 	}
 	switch _, err := dst.Stat(ctx, manifestKey); {
@@ -767,25 +769,26 @@ func reverifyAdopted(ctx context.Context, src, dst storage.StoragePlugin, manife
 		// Cannot tell whether the manifest pins the chunks; verify.
 	}
 	ok := true
-	for _, h := range adopted {
+	_ = adopted.ForEachHash(func(h Hash) error {
 		if ctx.Err() != nil {
-			return false
+			ok = false
+			return ctx.Err()
 		}
 		chunkKey := ChunkKey(h)
 		switch _, err := dst.Stat(ctx, chunkKey); {
 		case err == nil:
-			continue
+			return nil
 		case errors.Is(err, storage.ErrNotFound):
 			// swept — fall through to re-copy
 		default:
-			continue // transient; present at adoption, not evidence of loss
+			return nil // transient; present at adoption, not evidence of loss
 		}
 		cb, rerr := readKey(ctx, src, chunkKey)
 		if rerr != nil {
 			recordReplicateFailure(res, chunkKey, fmt.Errorf("adopted chunk vanished from replica; re-read src: %w", rerr))
 			res.ChunksMissing++
 			ok = false
-			continue
+			return nil
 		}
 		putOpts := storage.PutOptions{IfNotExists: true, ContentLength: int64(len(cb))}
 		putOpts.RetainUntil, putOpts.RetentionMode = opts.retentionPut()
@@ -793,11 +796,12 @@ func reverifyAdopted(ctx context.Context, src, dst storage.StoragePlugin, manife
 			recordReplicateFailure(res, chunkKey, fmt.Errorf("adopted chunk vanished from replica; re-copy: %w", perr))
 			res.ChunksFailed++
 			ok = false
-			continue
+			return nil
 		}
 		res.ChunksRecopied++
 		res.BytesCopied += int64(len(cb))
-	}
+		return nil
+	})
 	return ok
 }
 

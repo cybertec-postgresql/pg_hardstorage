@@ -233,6 +233,11 @@ type DeploymentConfig struct {
 	// Schedule declares the recurring tasks for this deployment.
 	Schedule DeploymentSchedule `yaml:"schedule,omitempty"`
 
+	// Backup tunes the SCHEDULED backup, mirroring the `backup` flags an
+	// unattended agent has no way to pass (issue #75, --chunk-size, and a
+	// run ceiling that is otherwise derived from the schedule interval).
+	Backup BackupConfig `yaml:"backup,omitempty" json:"backup,omitempty"`
+
 	// Drill tunes the SCHEDULED recovery drill. The interactive
 	// `recovery drill` command takes the same settings as flags; this
 	// is how an unattended drill gets them, since nobody is at a
@@ -460,6 +465,14 @@ type DrillConfig struct {
 	// refuses rather than overwrite the recorded locations.
 	TablespaceMapping []string `yaml:"tablespace_mapping,omitempty" json:"tablespace_mapping,omitempty"`
 
+	// TablespaceMappingAll is an absolute parent directory that EVERY
+	// non-default tablespace is redirected under: tablespace <oid> is
+	// drilled at <dir>/<oid> (pgBackRest's --tablespace-map-all). Unlike
+	// TablespaceMapping it needs no per-tablespace entry, so a tablespace
+	// created after this config was written is covered too. Entries in
+	// TablespaceMapping take precedence for the tablespaces they name.
+	TablespaceMappingAll string `yaml:"tablespace_mapping_all,omitempty" json:"tablespace_mapping_all,omitempty"`
+
 	// SkipVerify runs the restore but not pg_verifybackup, yielding a
 	// "partial" verdict. For fleets where the verify step is too
 	// expensive to run on every drill; the restore itself — the part
@@ -470,6 +483,35 @@ type DrillConfig struct {
 	// target. Default: the system temp dir. Useful when /tmp is too
 	// small for a real data directory.
 	TempBase string `yaml:"temp_base,omitempty" json:"temp_base,omitempty"`
+}
+
+// BackupConfig sets the options of the agent's scheduled backups — the
+// settings `pg_hardstorage backup` takes as flags.
+type BackupConfig struct {
+	// IncludeWAL is `backup --include-wal`: embed the WAL needed for a
+	// consistent restore in the backup itself. For deployments with no
+	// WAL streaming/archiving, where PITR is not needed.
+	IncludeWAL bool `yaml:"include_wal,omitempty" json:"include_wal,omitempty"`
+	// Fast is `backup --fast`: request an immediate checkpoint.
+	Fast bool `yaml:"fast,omitempty" json:"fast,omitempty"`
+	// Encrypt is `--encrypt` (true) / `--no-encrypt` (false). Unset
+	// keeps the auto-detect posture: encrypt when a KEK is available.
+	Encrypt *bool `yaml:"encrypt,omitempty" json:"encrypt,omitempty"`
+
+	// ChunkSize is the content-defined chunker's AVERAGE chunk size, the
+	// same value as `backup --chunk-size` ("256KiB", "1MiB"; 16KiB..16MiB,
+	// default 64KiB; minimum and maximum are 1/16 and 4x the average).
+	// Larger chunks cut chunk objects, manifest size and dedup-hash memory
+	// proportionally and make dedup coarser. Choose one value per
+	// deployment before its first backup: boundaries differ per size, so
+	// changing it later shares few chunks with earlier backups.
+	ChunkSize string `yaml:"chunk_size,omitempty" json:"chunk_size,omitempty"`
+
+	// Timeout is the wall-clock ceiling for ONE scheduled backup run
+	// ("36h", "3d"). Empty derives it from the schedule: twice the
+	// interval, clamped to 1h..48h, which is 12h for `every: 6h` and can
+	// cut off a long full backup of a multi-TB database.
+	Timeout string `yaml:"timeout,omitempty" json:"timeout,omitempty"`
 }
 
 // DeploymentSchedule lists per-task schedule specs.
@@ -1038,8 +1080,23 @@ func mergeDeployment(existing, overlay DeploymentConfig) DeploymentConfig {
 	if overlay.KEKRef != "" {
 		existing.KEKRef = overlay.KEKRef
 	}
+	if overlay.Backup.ChunkSize != "" {
+		existing.Backup.ChunkSize = overlay.Backup.ChunkSize
+	}
+	if overlay.Backup.Timeout != "" {
+		existing.Backup.Timeout = overlay.Backup.Timeout
+	}
 	if overlay.Schedule.Backup.Every != "" || overlay.Schedule.Backup.DailyAt != "" || overlay.Schedule.Backup.At != "" {
 		existing.Schedule.Backup = overlay.Schedule.Backup
+	}
+	if overlay.Backup.IncludeWAL {
+		existing.Backup.IncludeWAL = true
+	}
+	if overlay.Backup.Fast {
+		existing.Backup.Fast = true
+	}
+	if overlay.Backup.Encrypt != nil {
+		existing.Backup.Encrypt = overlay.Backup.Encrypt
 	}
 	if overlay.Schedule.Rotate.Every != "" || overlay.Schedule.Rotate.DailyAt != "" || overlay.Schedule.Rotate.At != "" {
 		existing.Schedule.Rotate = overlay.Schedule.Rotate
@@ -1053,6 +1110,9 @@ func mergeDeployment(existing, overlay DeploymentConfig) DeploymentConfig {
 	// turns a safe scheduled drill into a refused one.
 	if len(overlay.Drill.TablespaceMapping) > 0 {
 		existing.Drill.TablespaceMapping = overlay.Drill.TablespaceMapping
+	}
+	if overlay.Drill.TablespaceMappingAll != "" {
+		existing.Drill.TablespaceMappingAll = overlay.Drill.TablespaceMappingAll
 	}
 	if overlay.Drill.SkipVerify {
 		existing.Drill.SkipVerify = overlay.Drill.SkipVerify

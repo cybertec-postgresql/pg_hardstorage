@@ -2,10 +2,13 @@
 package backup
 
 import (
+	"context"
+	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"sort"
 
-	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/spill"
 )
 
 // ComparisonResult is the structured output of Compare. It
@@ -123,17 +126,30 @@ type CompareOptions struct {
 // DefaultCompareTopN is the default cap on TopFileDeltas.
 const DefaultCompareTopN = 20
 
+// compareSortMemBytes is the in-memory buffer of each side's per-file
+// signature sorter (0 = the sorter's default). A variable so tests can force
+// the spill path with a handful of files.
+var compareSortMemBytes int
+
 // Compare diffs two manifests and returns a structured
 // ComparisonResult. Both manifests must be non-nil; an empty
 // FileEntry slice on either side is treated as "no files",
 // not an error.
 //
-// CPU + memory: O(F_a + F_b + C_a + C_b) where F is file count
-// and C is chunk count per side. Two-pass: build per-side
-// indices, then walk the union of paths and the union of
-// chunk hashes. Determinism: TopFileDeltas sort is
-// (|delta| desc, path asc) so ties are stable across runs.
+// Memory: bounded, independent of both file and chunk counts. Chunks go
+// through a bounded-memory spill set per side; the per-file signatures
+// (path, size, a digest of the chunk list) go through an external sorter
+// per side and are merge-joined in path order, so a manifest with 100M
+// files costs a few tens of MiB of heap rather than tens of GiB. Each side
+// is walked once through EachFile, so streamed manifests work.
+// Determinism: TopFileDeltas sort is (|delta| desc, path asc) so ties
+// are stable across runs.
 func Compare(a, b *Manifest, opts CompareOptions) (*ComparisonResult, error) {
+	return CompareContext(context.Background(), a, b, opts)
+}
+
+// CompareContext is Compare with a context for the manifest walks.
+func CompareContext(ctx context.Context, a, b *Manifest, opts CompareOptions) (*ComparisonResult, error) {
 	if a == nil || b == nil {
 		return nil, errors.New("backup: Compare requires both manifests to be non-nil")
 	}
@@ -141,92 +157,126 @@ func Compare(a, b *Manifest, opts CompareOptions) (*ComparisonResult, error) {
 		opts.TopN = DefaultCompareTopN
 	}
 
-	res := &ComparisonResult{
-		A: summarizeManifestForCompare(a),
-		B: summarizeManifestForCompare(b),
-	}
+	setA := spill.NewHashSet(spill.Options{})
+	defer setA.Close()
+	setB := spill.NewHashSet(spill.Options{})
+	defer setB.Close()
 
-	// File-level diff.
-	aByPath := indexFilesByPath(a.Files)
-	bByPath := indexFilesByPath(b.Files)
-	allPaths := make([]string, 0, len(aByPath)+len(bByPath))
-	for p := range aByPath {
-		allPaths = append(allPaths, p)
-	}
-	for p := range bByPath {
-		if _, ok := aByPath[p]; !ok {
-			allPaths = append(allPaths, p)
-		}
-	}
-	sort.Strings(allPaths)
+	// Per-file signatures go to external sorters keyed by path rather than
+	// into a map: a manifest with 100M files would otherwise cost tens of
+	// GiB of heap per side. The two sorted streams are merge-joined below.
+	aIdx := spill.NewSorter(spill.SorterOptions{MemBytes: compareSortMemBytes})
+	defer aIdx.Close()
+	bIdx := spill.NewSorter(spill.SorterOptions{MemBytes: compareSortMemBytes})
+	defer bIdx.Close()
 
-	deltas := make([]FileDelta, 0, len(allPaths))
+	aSide, err := scanSide(ctx, a, setA, nil, aIdx)
+	if err != nil {
+		return nil, err
+	}
+	res := &ComparisonResult{A: aSide.ComparisonSide}
+	bSide, err := scanSide(ctx, b, setB, setA, bIdx)
+	if err != nil {
+		return nil, err
+	}
+	res.B = bSide.ComparisonSide
+
+	// Chunk-level diff. B's scan counted the chunks shared with A; the
+	// rest of each side is exclusive to it.
+	res.ChunkCounts.Shared = bSide.shared
+	res.ChunkCounts.SharedBytes = bSide.sharedBytes
+	res.ChunkCounts.BOnly = res.B.UniqueChunkCount - bSide.shared
+	res.ChunkCounts.BOnlyBytes = res.B.UniqueChunkBytes - bSide.sharedBytes
+	res.ChunkCounts.AOnly = res.A.UniqueChunkCount - bSide.shared
+	res.ChunkCounts.AOnlyBytes = res.A.UniqueChunkBytes - bSide.sharedBytes
+
+	// File-level diff. Only the TopN ranked deltas are kept (a bounded
+	// insertion list), not one FileDelta per differing file: a diff of
+	// two multi-million-file backups would otherwise materialise them
+	// all plus a sorted copy of every path.
 	var sharedLogical int64
-	for _, p := range allPaths {
-		af, aOK := aByPath[p]
-		bf, bOK := bByPath[p]
+	top := make([]FileDelta, 0, opts.TopN)
+	// before reports whether x ranks ahead of y: |delta| desc, path asc.
+	before := func(x, y FileDelta) bool {
+		ax, ay := abs(x.Delta), abs(y.Delta)
+		if ax != ay {
+			return ax > ay
+		}
+		return x.Path < y.Path
+	}
+	offer := func(d FileDelta) {
+		if len(top) == opts.TopN && !before(d, top[len(top)-1]) {
+			return
+		}
+		i := sort.Search(len(top), func(i int) bool { return before(d, top[i]) })
+		if len(top) < opts.TopN {
+			top = append(top, FileDelta{})
+		}
+		copy(top[i+1:], top[i:])
+		top[i] = d
+	}
+	ai, err := aIdx.Iter()
+	if err != nil {
+		return nil, err
+	}
+	defer ai.Close()
+	bi, err := bIdx.Iter()
+	if err != nil {
+		return nil, err
+	}
+	defer bi.Close()
+	// pull copies the record out of the iterator's reusable buffers.
+	type rec struct {
+		ok   bool
+		path string
+		sig  fileSig
+	}
+	pull := func(it *spill.Iter) (rec, error) {
+		k, v, ok, err := it.Next()
+		if err != nil || !ok {
+			return rec{}, err
+		}
+		r := rec{ok: true, path: string(k)}
+		r.sig.size = int64(binary.BigEndian.Uint64(v[:8]))
+		copy(r.sig.digest[:], v[8:])
+		return r, nil
+	}
+	ar, err := pull(ai)
+	if err != nil {
+		return nil, err
+	}
+	br, err := pull(bi)
+	if err != nil {
+		return nil, err
+	}
+	for ar.ok || br.ok {
 		switch {
-		case aOK && !bOK:
+		case !br.ok || (ar.ok && ar.path < br.path):
 			res.FileCounts.OnlyInA++
-			deltas = append(deltas, FileDelta{
-				Path: p, ASize: af.Size, BSize: 0,
-				Delta: -af.Size, Class: "removed",
-			})
-		case !aOK && bOK:
+			offer(FileDelta{Path: ar.path, ASize: ar.sig.size, BSize: 0, Delta: -ar.sig.size, Class: "removed"})
+			ar, err = pull(ai)
+		case !ar.ok || br.path < ar.path:
 			res.FileCounts.OnlyInB++
-			deltas = append(deltas, FileDelta{
-				Path: p, ASize: 0, BSize: bf.Size,
-				Delta: bf.Size, Class: "added",
-			})
+			offer(FileDelta{Path: br.path, ASize: 0, BSize: br.sig.size, Delta: br.sig.size, Class: "added"})
+			br, err = pull(bi)
 		default:
 			res.FileCounts.InBoth++
-			if !filesEqual(af, bf) {
+			if ar.sig != br.sig {
 				res.FileCounts.Changed++
-				deltas = append(deltas, FileDelta{
-					Path: p, ASize: af.Size, BSize: bf.Size,
-					Delta: bf.Size - af.Size, Class: "changed",
-				})
+				offer(FileDelta{Path: ar.path, ASize: ar.sig.size, BSize: br.sig.size, Delta: br.sig.size - ar.sig.size, Class: "changed"})
 			} else {
-				// Same chunk set + same size = same bytes.
-				// Count toward shared-logical-bytes.
-				sharedLogical += af.Size
+				// Same chunk list + same size = same bytes.
+				sharedLogical += ar.sig.size
+			}
+			if ar, err = pull(ai); err == nil {
+				br, err = pull(bi)
 			}
 		}
-	}
-	// TopFileDeltas: sort by |delta| desc, then path asc.
-	sort.Slice(deltas, func(i, j int) bool {
-		ai, aj := abs(deltas[i].Delta), abs(deltas[j].Delta)
-		if ai != aj {
-			return ai > aj
-		}
-		return deltas[i].Path < deltas[j].Path
-	})
-	if len(deltas) > opts.TopN {
-		deltas = deltas[:opts.TopN]
-	}
-	res.TopFileDeltas = deltas
-
-	// Chunk-level diff using the per-side hash→size maps.
-	aChunks := uniqueChunkSizes(a.Files)
-	bChunks := uniqueChunkSizes(b.Files)
-	for h, sz := range aChunks {
-		if bSz, ok := bChunks[h]; ok {
-			res.ChunkCounts.Shared++
-			// Shared bytes use the A-side size; for the
-			// CAS-deduped case the sizes match.
-			res.ChunkCounts.SharedBytes += sz
-			_ = bSz
-		} else {
-			res.ChunkCounts.AOnly++
-			res.ChunkCounts.AOnlyBytes += sz
+		if err != nil {
+			return nil, err
 		}
 	}
-	for h, sz := range bChunks {
-		if _, ok := aChunks[h]; !ok {
-			res.ChunkCounts.BOnly++
-			res.ChunkCounts.BOnlyBytes += sz
-		}
-	}
+	res.TopFileDeltas = top
 
 	// Logical bytes.
 	res.LogicalBytes = LogicalBytesBreakdown{
@@ -239,84 +289,64 @@ func Compare(a, b *Manifest, opts CompareOptions) (*ComparisonResult, error) {
 	return res, nil
 }
 
-// summarizeManifestForCompare builds the per-side rollup
-// embedded in ComparisonResult. Mirrors the
-// per-row summary the list / show commands compute.
-func summarizeManifestForCompare(m *Manifest) ComparisonSide {
-	uniq := uniqueChunkSizes(m.Files)
-	var uniqBytes int64
-	for _, sz := range uniq {
-		uniqBytes += sz
-	}
-	var logical int64
-	for _, f := range m.Files {
-		logical += f.Size
-	}
-	stoppedAt := ""
+// fileSig identifies a file's bytes: its size and a digest of the
+// ordered chunk list (hash, length, offset). Equal sigs mean the same
+// bytes; Mode and ModTime are deliberately not part of it (touching a
+// file's mtime does not change its bytes).
+type fileSig struct {
+	size   int64
+	digest [32]byte
+}
+
+type sideScan struct {
+	ComparisonSide
+	shared      int
+	sharedBytes int64
+}
+
+// scanSide walks one manifest once: builds its per-file index and its
+// rollup, adds its chunks to set, and — when other is the other side's
+// completed set — counts the chunks the two share.
+func scanSide(ctx context.Context, m *Manifest, set, other *spill.HashSet, idx *spill.Sorter) (sideScan, error) {
+	sc := sideScan{ComparisonSide: ComparisonSide{
+		BackupID:  m.BackupID,
+		Type:      string(m.Type),
+		FileCount: m.NumFiles(),
+	}}
 	if !m.StoppedAt.IsZero() {
-		stoppedAt = m.StoppedAt.UTC().Format("2006-01-02T15:04:05Z07:00")
+		sc.StoppedAt = m.StoppedAt.UTC().Format("2006-01-02T15:04:05Z07:00")
 	}
-	return ComparisonSide{
-		BackupID:         m.BackupID,
-		Type:             string(m.Type),
-		StoppedAt:        stoppedAt,
-		FileCount:        len(m.Files),
-		UniqueChunkCount: len(uniq),
-		UniqueChunkBytes: uniqBytes,
-		LogicalBytes:     logical,
-	}
-}
-
-// indexFilesByPath builds a path→entry index over a manifest's
-// Files slice. A FileEntry's Path is unique within a manifest;
-// duplicates are silently last-wins (the manifest store would
-// have refused duplicate keys at commit time).
-func indexFilesByPath(files []FileEntry) map[string]FileEntry {
-	out := make(map[string]FileEntry, len(files))
-	for _, f := range files {
-		out[f.Path] = f
-	}
-	return out
-}
-
-// uniqueChunkSizes builds a hash→len map across every
-// FileEntry's Chunks slice. CAS dedup means the same hash
-// always has the same Len; pick whichever wins on insertion
-// (lengths are identical so it's idempotent).
-func uniqueChunkSizes(files []FileEntry) map[repo.Hash]int64 {
-	out := make(map[repo.Hash]int64)
-	for _, f := range files {
+	var buf [8]byte
+	err := m.EachFile(ctx, func(f *FileEntry) error {
+		sc.LogicalBytes += f.Size
+		h := sha256.New()
 		for _, c := range f.Chunks {
-			out[c.Hash] = c.Len
+			h.Write(c.Hash[:])
+			binary.BigEndian.PutUint64(buf[:], uint64(c.Len))
+			h.Write(buf[:])
+			binary.BigEndian.PutUint64(buf[:], uint64(c.Offset))
+			h.Write(buf[:])
+			if set.Add(c.Hash) {
+				sc.UniqueChunkCount++
+				sc.UniqueChunkBytes += c.Len
+				if other != nil && other.Has(c.Hash) {
+					sc.shared++
+					sc.sharedBytes += c.Len
+				}
+			}
 		}
+		var sig fileSig
+		sig.size = f.Size
+		copy(sig.digest[:], h.Sum(nil))
+		var val [8 + 32]byte
+		binary.BigEndian.PutUint64(val[:8], uint64(sig.size))
+		copy(val[8:], sig.digest[:])
+		return idx.Add([]byte(f.Path), val[:])
+	})
+	if err == nil {
+		err = set.Err()
 	}
-	return out
-}
-
-// filesEqual reports whether two FileEntry values represent
-// the same bytes. Same Size + same chunk-hash list (in
-// order). Doesn't compare Mode or ModTime — those can change
-// without the bytes changing (touch a file's mtime; PG-side
-// processes do this).
-func filesEqual(a, b FileEntry) bool {
-	if a.Size != b.Size {
-		return false
-	}
-	if len(a.Chunks) != len(b.Chunks) {
-		return false
-	}
-	for i := range a.Chunks {
-		if a.Chunks[i].Hash != b.Chunks[i].Hash {
-			return false
-		}
-		if a.Chunks[i].Len != b.Chunks[i].Len {
-			return false
-		}
-		if a.Chunks[i].Offset != b.Chunks[i].Offset {
-			return false
-		}
-	}
-	return true
+	return sc, err
 }
 
 // abs returns |x| for int64 without overflow concerns at the

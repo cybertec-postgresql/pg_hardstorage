@@ -1,6 +1,7 @@
 package keystore_test
 
 import (
+	"bytes"
 	"errors"
 	"os"
 	"path/filepath"
@@ -200,5 +201,43 @@ func TestLoadKEK_ReadOnlyOwnerModeAccepted(t *testing.T) {
 	}
 	if _, _, err := keystore.LoadOrGenerateKEK(dir); err != nil {
 		t.Fatalf("0400 KEK refused: %v — read-only-owner is stricter than 0600, not broader", err)
+	}
+}
+
+func TestReadKEKFile_Policy(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name string, body []byte, mode os.FileMode) string {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, body, mode); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(p, mode); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	good := bytes.Repeat([]byte{7}, 32)
+	if _, err := keystore.ReadKEKFile(write("ok", good, 0o600)); err != nil {
+		t.Errorf("0600 good key refused: %v", err)
+	}
+	if _, err := keystore.ReadKEKFile(write("ro", good, 0o400)); err != nil {
+		t.Errorf("0400 good key refused: %v", err)
+	}
+	for name, c := range map[string]struct {
+		body []byte
+		mode os.FileMode
+	}{
+		"world": {good, 0o644},
+		"group": {good, 0o640},
+		"zero":  {make([]byte, 32), 0o600},
+		"short": {good[:31], 0o600},
+		"long":  {append(append([]byte{}, good...), 0), 0o600},
+	} {
+		if _, err := keystore.ReadKEKFile(write(name, c.body, c.mode)); err == nil {
+			t.Errorf("%s: ReadKEKFile accepted a bad key file", name)
+		}
+	}
+	if _, err := keystore.ReadKEKFile(dir); err == nil {
+		t.Error("directory accepted")
 	}
 }

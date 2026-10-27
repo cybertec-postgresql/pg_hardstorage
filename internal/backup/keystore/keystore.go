@@ -212,3 +212,22 @@ func generate(keyringDir, privPath, pubPath string) (*backup.Signer, *backup.Ver
 	}
 	return signer, verifier, nil
 }
+
+// ReadPrivateKeyFile reads a signing private key PEM from path, refusing
+// a file that is not a regular file or that carries any group/other
+// permission bit -- the same gate load applies to the keyring's own key.
+// For callers that take an operator-supplied --key path.
+func ReadPrivateKeyFile(path string) ([]byte, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, fmt.Errorf("keystore: stat private key: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("keystore: %s is not a regular file", path)
+	}
+	if mode := info.Mode().Perm(); mode&^privateKeyMode != 0 {
+		return nil, fmt.Errorf("keystore: %s has mode %#o; require %#o (chmod 0600 the file)",
+			path, mode, privateKeyMode)
+	}
+	return os.ReadFile(path)
+}

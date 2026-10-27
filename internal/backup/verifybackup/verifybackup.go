@@ -43,6 +43,7 @@
 package verifybackup
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -60,16 +61,10 @@ import (
 	"strings"
 )
 
-// pgManifest is the subset of PG's backup_manifest JSON we
-// consume.  PG-versioned fields we don't read — WAL-Ranges,
-// Manifest-Checksum, System-Identifier — are deliberately
-// absent here so adding new ones in PG 19+ doesn't break
-// parsing (encoding/json is permissive on unknown fields).
-type pgManifest struct {
-	Version int              `json:"PostgreSQL-Backup-Manifest-Version"`
-	Files   []pgManifestFile `json:"Files"`
-}
-
+// pgManifestFile is one entry of the Files array of PG's backup_manifest
+// JSON, the part of the document we consume. PG-versioned fields we don't
+// read — WAL-Ranges, Manifest-Checksum, System-Identifier — are skipped, so
+// adding new ones in PG 19+ doesn't break parsing.
 type pgManifestFile struct {
 	Path string `json:"Path"`
 	// EncodedPath is PG's alternative to Path for filenames that
@@ -153,37 +148,28 @@ func Verify(ctx context.Context, manifestBytes []byte, dataDir string) (*Result,
 	if len(manifestBytes) == 0 {
 		return nil, ErrNoManifest
 	}
-	var m pgManifest
-	if err := json.Unmarshal(manifestBytes, &m); err != nil {
-		return nil, fmt.Errorf("verifybackup: parse PG backup_manifest JSON: %w", err)
-	}
-	if m.Version == 0 {
-		return nil, errors.New("verifybackup: backup_manifest has no PostgreSQL-Backup-Manifest-Version field")
-	}
-	if len(m.Files) == 0 {
-		return nil, ErrEmptyManifest
-	}
+	return VerifyReader(ctx, bytes.NewReader(manifestBytes), dataDir)
+}
 
+// VerifyReader is Verify over a stream, so a backup_manifest that is
+// itself tens of GB (100 TB cluster) never has to be held in memory.
+// An empty stream returns ErrNoManifest.
+func VerifyReader(ctx context.Context, r io.Reader, dataDir string) (*Result, error) {
+	br := bufio.NewReaderSize(r, 1<<20)
+	if _, err := br.Peek(1); err != nil {
+		if errors.Is(err, io.EOF) {
+			return nil, ErrNoManifest
+		}
+		return nil, fmt.Errorf("verifybackup: read backup_manifest: %w", err)
+	}
+	// Stream-decode the document: the Files array of a 100 TB cluster's
+	// manifest has millions of entries, and unmarshalling it whole would
+	// hold every one of them (~250 B each) at once. Only one entry is live
+	// at a time here; the checks and their order are otherwise unchanged.
 	res := &Result{}
 	algos := map[string]struct{}{}
-
-	for i := range m.Files {
-		if err := ctx.Err(); err != nil {
-			return res, err
-		}
-		f := &m.Files[i]
-		if err := verifyOne(dataDir, f, res); err != nil {
-			// Prefer the resolved (possibly hex-decoded) path in the
-			// error; fall back to whatever raw path field was set.
-			name := f.Path
-			if rp, rerr := f.resolvePath(); rerr == nil {
-				name = rp
-			}
-			return res, fmt.Errorf("verifybackup: file[%d] %q: %w", i, name, err)
-		}
-		if alg := strings.ToUpper(f.ChecksumAlgorithm); alg != "" {
-			algos[alg] = struct{}{}
-		}
+	if err := streamPGManifest(ctx, br, dataDir, res, algos); err != nil {
+		return res, err
 	}
 
 	switch {
@@ -211,6 +197,94 @@ func Verify(ctx context.Context, manifestBytes []byte, dataDir string) (*Result,
 		res.Algorithm = "mixed:" + strings.Join(keys, ",")
 	}
 	return res, nil
+}
+
+// streamPGManifest walks PG's backup_manifest one Files entry at a time,
+// verifying each against dataDir. Errors that json.Unmarshal used to raise
+// up front (malformed JSON, missing version, no files) are raised here as
+// soon as the stream reveals them.
+func streamPGManifest(ctx context.Context, doc io.Reader, dataDir string, res *Result, algos map[string]struct{}) error {
+	parseErr := func(err error) error {
+		return fmt.Errorf("verifybackup: parse PG backup_manifest JSON: %w", err)
+	}
+	dec := json.NewDecoder(doc)
+	if tok, err := dec.Token(); err != nil {
+		return parseErr(err)
+	} else if d, ok := tok.(json.Delim); !ok || d != '{' {
+		return parseErr(errors.New("top level is not a JSON object"))
+	}
+	version, nfiles := 0, 0
+	for dec.More() {
+		kt, err := dec.Token()
+		if err != nil {
+			return parseErr(err)
+		}
+		key, _ := kt.(string)
+		switch {
+		case strings.EqualFold(key, "PostgreSQL-Backup-Manifest-Version"):
+			if err := dec.Decode(&version); err != nil {
+				return parseErr(err)
+			}
+		case strings.EqualFold(key, "Files"):
+			if version == 0 {
+				return errors.New("verifybackup: backup_manifest has no PostgreSQL-Backup-Manifest-Version field")
+			}
+			open, err := dec.Token()
+			if err != nil {
+				return parseErr(err)
+			}
+			if open == nil { // "Files": null
+				continue
+			}
+			if d, ok := open.(json.Delim); !ok || d != '[' {
+				return parseErr(errors.New(`"Files" is not an array`))
+			}
+			for dec.More() {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				var f pgManifestFile
+				if err := dec.Decode(&f); err != nil {
+					return parseErr(err)
+				}
+				i := nfiles
+				nfiles++
+				if err := verifyOne(dataDir, &f, res); err != nil {
+					// Prefer the resolved (possibly hex-decoded) path in the
+					// error; fall back to whatever raw path field was set.
+					name := f.Path
+					if rp, rerr := f.resolvePath(); rerr == nil {
+						name = rp
+					}
+					return fmt.Errorf("verifybackup: file[%d] %q: %w", i, name, err)
+				}
+				if alg := strings.ToUpper(f.ChecksumAlgorithm); alg != "" {
+					algos[alg] = struct{}{}
+				}
+			}
+			if _, err := dec.Token(); err != nil { // closing ']'
+				return parseErr(err)
+			}
+		default:
+			var skip json.RawMessage
+			if err := dec.Decode(&skip); err != nil {
+				return parseErr(err)
+			}
+		}
+	}
+	if _, err := dec.Token(); err != nil { // closing '}'
+		return parseErr(err)
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		return parseErr(errors.New("trailing data after top-level object"))
+	}
+	if version == 0 {
+		return errors.New("verifybackup: backup_manifest has no PostgreSQL-Backup-Manifest-Version field")
+	}
+	if nfiles == 0 {
+		return ErrEmptyManifest
+	}
+	return nil
 }
 
 // verifyOne stats + hashes one file, comparing against the

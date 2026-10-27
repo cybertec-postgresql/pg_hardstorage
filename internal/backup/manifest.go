@@ -150,6 +150,13 @@ type Manifest struct {
 
 	// Attestation is set after Sign and zeroed during canonicalisation.
 	Attestation *Attestation `json:"attestation,omitempty"`
+
+	// stream, when non-nil, means this manifest was read with
+	// ReadStreaming: Files is nil and the entries are delivered by
+	// EachFile from the store instead of being held in memory. Such a
+	// manifest is read-only: it cannot be canonicalised, signed or
+	// re-marshalled, because it does not hold its own file list.
+	stream *fileStream
 }
 
 // WALGap is the manifest-embedded form of a leader-follow
@@ -295,6 +302,9 @@ type Attestation struct {
 //   - SetEscapeHTML is off so < / > / & are preserved verbatim;
 //   - no pretty-printing whitespace is added.
 func (m *Manifest) Canonicalize() ([]byte, error) {
+	if m.stream != nil {
+		return nil, ErrStreamedManifest
+	}
 	cp := *m
 	cp.Attestation = nil
 	// json.Encoder lets us turn off HTML escaping; the trailing newline
@@ -315,6 +325,9 @@ func (m *Manifest) Canonicalize() ([]byte, error) {
 // We deliberately skip indentation: the manifest is a machine document.
 // Humans wanting to read it pipe through `jq`.
 func (m *Manifest) MarshalToBytes() ([]byte, error) {
+	if m.stream != nil {
+		return nil, ErrStreamedManifest
+	}
 	var buf canonicalBuffer
 	enc := json.NewEncoder(&buf)
 	enc.SetEscapeHTML(false)
@@ -423,11 +436,18 @@ var ErrAmbiguousManifest = errors.New("manifest: ambiguous document")
 func rejectDuplicateKeys(raw []byte) error {
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.UseNumber()
-	if err := checkNoDupKeys(dec, "$"); err != nil {
+	if err := checkNoDupKeys(dec, "$"); err != nil && !errors.Is(err, errMalformedJSON) {
 		return err
 	}
 	return nil
 }
+
+// errMalformedJSON stops the duplicate-key walk at malformed input. The
+// caller's Unmarshal reports the parse error; the walk must merely STOP:
+// once json.Decoder is in an error state dec.More() stays true, so a walk
+// that swallowed the error and carried on looped forever (a fuzzer found a
+// two-line input that hung ParseAndVerify, i.e. verify/list/restore).
+var errMalformedJSON = errors.New("manifest: malformed JSON")
 
 // checkNoDupKeys consumes exactly one JSON value from dec, recursing
 // through objects and arrays. path is used only to name the offender.
@@ -435,8 +455,8 @@ func checkNoDupKeys(dec *json.Decoder, path string) error {
 	tok, err := dec.Token()
 	if err != nil {
 		// Malformed JSON is the caller's Unmarshal error to report, not
-		// ours; treat it as "nothing to say about duplicates".
-		return nil //nolint:nilerr // parse errors are reported by Unmarshal
+		// ours; stop the walk (see errMalformedJSON).
+		return errMalformedJSON
 	}
 	delim, ok := tok.(json.Delim)
 	if !ok {
@@ -448,11 +468,11 @@ func checkNoDupKeys(dec *json.Decoder, path string) error {
 		for dec.More() {
 			kt, err := dec.Token()
 			if err != nil {
-				return nil //nolint:nilerr // see above
+				return errMalformedJSON
 			}
 			key, ok := kt.(string)
 			if !ok {
-				return nil
+				return errMalformedJSON
 			}
 			if !isSchemaKey(key) {
 				return fmt.Errorf("%w: object %s has key %q, which is not lowercase-ASCII "+
@@ -698,6 +718,46 @@ func (v *Verifier) publicKeyEquals(other *Verifier) bool {
 // violation found.  Callers should treat any non-nil return as
 // a hard fail.
 func (m *Manifest) Validate() error {
+	if err := m.validateHeader(); err != nil {
+		return err
+	}
+	if m.stream != nil {
+		// No file list in memory: walk the stored object once, checking
+		// every file-level invariant (including path uniqueness and
+		// dir/file collisions) as the entries stream past.
+		return m.stream.validate()
+	}
+	seenFile := map[string]bool{}
+	for i := range m.Files {
+		f := &m.Files[i]
+		if err := validateFileEntry(i, f); err != nil {
+			return err
+		}
+		fileKey := fileIdentity(f)
+		if seenFile[fileKey] {
+			return fmt.Errorf("manifest: duplicate file path %q in tablespace %d", f.Path, f.TablespaceOID)
+		}
+		seenFile[fileKey] = true
+	}
+	return m.validateTail(func(key string) bool { return seenFile[key] })
+}
+
+// fileIdentity is the (tablespace, path) key file uniqueness is judged on.
+//
+// Uniqueness is keyed on (TablespaceOID, Path), not Path alone:
+// a non-default tablespace's tar entries are named relative to
+// the tablespace root (e.g. "PG_18_202209061/16384/12345"), so
+// two DIFFERENT tablespaces can legitimately carry the same
+// relative path.  Keying on Path alone would reject a
+// perfectly-valid multi-tablespace backup.
+func fileIdentity(f *FileEntry) string {
+	return fmt.Sprintf("%d\x00%s", f.TablespaceOID, f.Path)
+}
+
+// validateHeader checks every manifest-level invariant that does not
+// depend on the file list. Split out so the streaming reader, which
+// never holds the file list, applies exactly the same rules.
+func (m *Manifest) validateHeader() error {
 	if m == nil {
 		return errors.New("manifest: nil")
 	}
@@ -762,56 +822,51 @@ func (m *Manifest) Validate() error {
 		return errors.New("manifest: no tablespaces (default tablespace must be present)")
 	}
 
-	// File invariants — uniqueness, chunk-len-sums-to-size,
-	// every chunk has a non-zero hash and len.
-	//
-	// Uniqueness is keyed on (TablespaceOID, Path), not Path alone:
-	// a non-default tablespace's tar entries are named relative to
-	// the tablespace root (e.g. "PG_18_202209061/16384/12345"), so
-	// two DIFFERENT tablespaces can legitimately carry the same
-	// relative path.  Keying on Path alone would reject a
-	// perfectly-valid multi-tablespace backup.
-	seenFile := map[string]bool{}
-	for i := range m.Files {
-		f := &m.Files[i]
-		if f.Path == "" {
-			return fmt.Errorf("manifest: files[%d] empty path", i)
-		}
-		fileKey := fmt.Sprintf("%d\x00%s", f.TablespaceOID, f.Path)
-		if seenFile[fileKey] {
-			return fmt.Errorf("manifest: duplicate file path %q in tablespace %d", f.Path, f.TablespaceOID)
-		}
-		if err := safeManifestPath(f.Path); err != nil {
-			return fmt.Errorf("manifest: files[%d]: %w", i, err)
-		}
-		seenFile[fileKey] = true
-		if f.Size < 0 {
-			return fmt.Errorf("manifest: files[%d] %q size=%d (must be ≥0)", i, f.Path, f.Size)
-		}
-		var chunkSum int64
-		var nextOff int64
-		for j, ref := range f.Chunks {
-			if ref.Hash == (repo.Hash{}) {
-				return fmt.Errorf("manifest: files[%d] %q chunk[%d] zero hash", i, f.Path, j)
-			}
-			if ref.Len <= 0 {
-				return fmt.Errorf("manifest: files[%d] %q chunk[%d] len=%d", i, f.Path, j, ref.Len)
-			}
-			if ref.Offset != nextOff {
-				return fmt.Errorf("manifest: files[%d] %q chunk[%d] offset=%d, want %d (chunks must be contiguous)",
-					i, f.Path, j, ref.Offset, nextOff)
-			}
-			nextOff += ref.Len
-			chunkSum += ref.Len
-		}
-		if chunkSum != f.Size {
-			return fmt.Errorf("manifest: files[%d] %q chunks total %d != size %d",
-				i, f.Path, chunkSum, f.Size)
-		}
-		// (Size==0 with non-empty Chunks is naturally caught
-		// by the sum check above — chunkSum will be ≥1 ≠ 0.)
-	}
+	return nil
+}
 
+// validateFileEntry checks one file's own invariants — non-empty safe
+// path, size, and chunks that are contiguous, non-zero and sum to the
+// size. Uniqueness across files is the caller's job (it needs the set
+// of every path seen).
+func validateFileEntry(i int, f *FileEntry) error {
+	if f.Path == "" {
+		return fmt.Errorf("manifest: files[%d] empty path", i)
+	}
+	if err := safeManifestPath(f.Path); err != nil {
+		return fmt.Errorf("manifest: files[%d]: %w", i, err)
+	}
+	if f.Size < 0 {
+		return fmt.Errorf("manifest: files[%d] %q size=%d (must be ≥0)", i, f.Path, f.Size)
+	}
+	var chunkSum int64
+	var nextOff int64
+	for j, ref := range f.Chunks {
+		if ref.Hash == (repo.Hash{}) {
+			return fmt.Errorf("manifest: files[%d] %q chunk[%d] zero hash", i, f.Path, j)
+		}
+		if ref.Len <= 0 {
+			return fmt.Errorf("manifest: files[%d] %q chunk[%d] len=%d", i, f.Path, j, ref.Len)
+		}
+		if ref.Offset != nextOff {
+			return fmt.Errorf("manifest: files[%d] %q chunk[%d] offset=%d, want %d (chunks must be contiguous)",
+				i, f.Path, j, ref.Offset, nextOff)
+		}
+		nextOff += ref.Len
+		chunkSum += ref.Len
+	}
+	if chunkSum != f.Size {
+		return fmt.Errorf("manifest: files[%d] %q chunks total %d != size %d",
+			i, f.Path, chunkSum, f.Size)
+	}
+	// (Size==0 with non-empty Chunks is naturally caught
+	// by the sum check above — chunkSum will be ≥1 ≠ 0.)
+	return nil
+}
+
+// validateTail checks the directory and encryption invariants. hasFile
+// reports whether a fileIdentity key names a file in the manifest.
+func (m *Manifest) validateTail(hasFile func(key string) bool) error {
 	// Dir invariants — uniqueness, no collision with file paths.
 	// Collisions matter because the restore loop calls MkdirAll on
 	// dirs AFTER materialising files; if a path appears as both,
@@ -830,7 +885,7 @@ func (m *Manifest) Validate() error {
 			return fmt.Errorf("manifest: dirs[%d]: %w", i, err)
 		}
 		seenDir[dirKey] = true
-		if seenFile[dirKey] {
+		if hasFile(dirKey) {
 			return fmt.Errorf("manifest: dir %q collides with a file path of the same name in tablespace %d", d.Path, d.TablespaceOID)
 		}
 	}

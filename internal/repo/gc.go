@@ -4,14 +4,13 @@ package repo
 import (
 	"context"
 	"crypto/sha256"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
-	"sync"
 	"time"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/spill"
 )
 
 // DefaultTombstoneGracePeriod is the conservative default applied
@@ -45,6 +44,9 @@ type CollectReferencesOptions struct {
 	// means time.Now (real wallclock).  Tests inject a fixed
 	// instant for deterministic behaviour.
 	Now time.Time
+
+	// RefSpill tunes the returned RefSet's heap budget and spill dir.
+	RefSpill spill.Options
 }
 
 func (o CollectReferencesOptions) effectiveGrace() time.Duration {
@@ -76,35 +78,43 @@ func (o CollectReferencesOptions) effectiveNow() time.Time {
 // puts chunks in the shared CAS MUST have its manifests reachable from
 // one of these prefixes, or GC will reap its chunks as orphans.
 type RefSet struct {
-	mu     sync.Mutex
-	hashes map[Hash]struct{}
+	set *spill.HashSet
 }
 
-// NewRefSet returns an empty RefSet.
+// NewRefSet returns an empty RefSet that spills to the system temp dir
+// once it outgrows spill.DefaultMemEntries hashes.
 func NewRefSet() *RefSet {
-	return &RefSet{hashes: map[Hash]struct{}{}}
+	return NewRefSetWithOptions(spill.Options{})
+}
+
+// NewRefSetWithOptions returns an empty RefSet with an explicit heap
+// budget and spill directory. A repository whose backups reference
+// billions of chunks needs far more than RAM to hold every hash, so the
+// set is a spill.HashSet: exact, but bounded on the heap.
+func NewRefSetWithOptions(o spill.Options) *RefSet {
+	return &RefSet{set: spill.NewHashSet(o)}
 }
 
 // Add records hash as referenced.
-func (r *RefSet) Add(h Hash) {
-	r.mu.Lock()
-	r.hashes[h] = struct{}{}
-	r.mu.Unlock()
-}
+func (r *RefSet) Add(h Hash) { r.set.Add(h) }
 
-// Has reports whether hash is in the set.
-func (r *RefSet) Has(h Hash) bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	_, ok := r.hashes[h]
-	return ok
-}
+// Has reports whether hash is in the set. Callers that act on a
+// negative answer (GC deletes) MUST check Err first: after a spill I/O
+// failure a negative answer is not trustworthy.
+func (r *RefSet) Has(h Hash) bool { return r.set.Has(h) }
 
 // Len returns the number of distinct references.
-func (r *RefSet) Len() int {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return len(r.hashes)
+func (r *RefSet) Len() int { return r.set.Len() }
+
+// Err returns the first spill I/O error, or nil.
+func (r *RefSet) Err() error { return r.set.Err() }
+
+// Close removes any spill files. Safe to call more than once.
+func (r *RefSet) Close() error { return r.set.Close() }
+
+// ForEach visits every reference in ascending hash order.
+func (r *RefSet) ForEach(fn func(Hash) error) error {
+	return r.set.ForEach(func(k spill.Key) error { return fn(Hash(k)) })
 }
 
 // CollectReferences walks every visible manifest in the repo and
@@ -156,8 +166,16 @@ func CollectReferencesWithOptions(ctx context.Context, sp storage.StoragePlugin,
 	// Staging temps are skipped by BASENAME only (isStaleTempKey): a
 	// committed segment under a deployment whose name contains
 	// ".json.tmp." must still be harvested.
-	snap := &manifestSnapshot{refs: NewRefSet(), harvested: map[string]storage.ObjectInfo{}, opts: opts}
+	snap := newManifestSnapshot(opts.RefSpill, opts)
+	// The harvest memo is only for incremental rescans; this one-shot
+	// collection hands back the reference set alone.
+	defer func() { _ = snap.harvested.Close() }()
 	if err := snap.scan(ctx, sp, false); err != nil {
+		snap.refs.Close()
+		return nil, err
+	}
+	if err := snap.refs.Err(); err != nil {
+		snap.refs.Close()
 		return nil, err
 	}
 	return snap.refs, nil
@@ -208,39 +226,22 @@ func harvestManifest(ctx context.Context, sp storage.StoragePlugin, key string, 
 		return err
 	}
 	defer rc.Close()
-	body, err := storage.ReadAllLimited(rc, storage.MaxMetadataBytes)
-	if err != nil {
-		return err
+	// Streamed for both kinds: a backup manifest of a 100 TB database is
+	// tens of GB and a segment manifest is only small by convention, so
+	// neither is ever held, unmarshalled or capped by an allocation limit.
+	// References are walked one at a time.
+	visit := func(hash string) error {
+		h, err := parseHexHash(hash)
+		if err != nil {
+			return unparseableRef(key, hash, err)
+		}
+		refs.Add(h)
+		return nil
 	}
-	switch kind {
-	case harvestBackup:
-		var m backupManifestShape
-		if err := json.Unmarshal(body, &m); err != nil {
-			return err
-		}
-		for _, f := range m.Files {
-			for _, c := range f.Chunks {
-				h, err := parseHexHash(c.Hash)
-				if err != nil {
-					return unparseableRef(key, c.Hash, err)
-				}
-				refs.Add(h)
-			}
-		}
-	case harvestWAL:
-		var m walManifestShape
-		if err := json.Unmarshal(body, &m); err != nil {
-			return err
-		}
-		for _, c := range m.Chunks {
-			h, err := parseHexHash(c.Hash)
-			if err != nil {
-				return unparseableRef(key, c.Hash, err)
-			}
-			refs.Add(h)
-		}
+	if kind == harvestBackup {
+		return streamBackupChunkRefs(rc, visit)
 	}
-	return nil
+	return streamSegmentChunkRefs(rc, visit)
 }
 
 // unparseableRef fails reference collection CLOSED when a live manifest
@@ -354,21 +355,32 @@ func FindOrphans(ctx context.Context, sp storage.StoragePlugin, refs *RefSet) ([
 // rationale (the GC-vs-backup race).  The slice is sorted (lex by hex
 // hash) for deterministic output.
 func FindOrphansWithOptions(ctx context.Context, sp storage.StoragePlugin, refs *RefSet, opts FindOrphansOptions) ([]Hash, error) {
+	orphans, _, err := FindOrphansLimit(ctx, sp, refs, opts, -1)
+	return orphans, err
+}
+
+// FindOrphansLimit is FindOrphansWithOptions with a bounded result: it
+// returns the smallest `limit` orphan hashes (sorted) and the exact total.
+// A negative limit returns every orphan. Memory is O(limit), however many
+// orphans the repository holds.
+func FindOrphansLimit(ctx context.Context, sp storage.StoragePlugin, refs *RefSet, opts FindOrphansOptions, limit int) ([]Hash, int, error) {
 	minAge := opts.effectiveMinAge()
 	var ageCutoff time.Time
 	if minAge > 0 {
 		ageCutoff = opts.effectiveNow().Add(-minAge)
 	}
 	var orphans []Hash
+	sample := hashSample{limit: limit}
+	total := 0
 	for info, err := range sp.List(ctx, "chunks/sha256/") {
 		if err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 		// Same cooperative-cancellation rationale as
 		// CollectReferences: a million-chunk walk shouldn't be
 		// uninterruptible from the operator's keyboard.
 		if err := ctx.Err(); err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 		hash, err := ParseChunkKey(info.Key)
 		if err != nil {
@@ -386,10 +398,19 @@ func FindOrphansWithOptions(ctx context.Context, sp storage.StoragePlugin, refs 
 				continue
 			}
 		}
-		orphans = append(orphans, hash)
+		total++
+		switch {
+		case limit < 0:
+			orphans = append(orphans, hash)
+		case limit > 0:
+			sample.offer(hash)
+		}
+	}
+	if limit >= 0 {
+		orphans = sample.sorted()
 	}
 	sortHashes(orphans)
-	return orphans, nil
+	return orphans, total, nil
 }
 
 // FindStaleTempManifests returns the keys of orphaned staging files
@@ -449,21 +470,23 @@ func FindStaleTempManifests(ctx context.Context, sp storage.StoragePlugin, opts 
 // rare, but a real scenario after a buggy restore plugin or a
 // misdirected `aws s3 rm`.
 func FindMissing(ctx context.Context, sp storage.StoragePlugin, refs *RefSet) ([]Hash, error) {
-	refs.mu.Lock()
-	hashes := make([]Hash, 0, len(refs.hashes))
-	for h := range refs.hashes {
-		hashes = append(hashes, h)
-	}
-	refs.mu.Unlock()
-	sortHashes(hashes)
+	missing, _, err := FindMissingLimit(ctx, sp, refs, -1)
+	return missing, err
+}
 
+// FindMissingLimit is FindMissing with a bounded result: the first `limit`
+// missing hashes in ascending order and the exact total. A negative limit
+// returns every one. A repository that lost a bucket can be missing
+// hundreds of millions of chunks; the caller should not have to hold them.
+func FindMissingLimit(ctx context.Context, sp storage.StoragePlugin, refs *RefSet, limit int) ([]Hash, int, error) {
 	var missing []Hash
-	for _, h := range hashes {
+	total := 0
+	err := refs.ForEach(func(h Hash) error {
 		// Cooperative cancellation. Same rationale as
 		// CollectReferences/FindOrphans: a million-chunk Stat loop
 		// shouldn't be uninterruptible.
 		if err := ctx.Err(); err != nil {
-			return missing, err
+			return err
 		}
 		_, err := sp.Stat(ctx, ChunkKey(h))
 		if err != nil {
@@ -473,23 +496,41 @@ func FindMissing(ctx context.Context, sp storage.StoragePlugin, refs *RefSet) ([
 			// the backup as damaged — otherwise a blip during a scan
 			// would flag healthy chunks and trigger needless alarm.
 			if errors.Is(err, storage.ErrNotFound) {
-				missing = append(missing, h)
-				continue
+				total++
+				if limit < 0 || len(missing) < limit {
+					missing = append(missing, h)
+				}
+				return nil
 			}
-			return missing, fmt.Errorf("repo: FindMissing: stat %s: %w", ChunkKey(h), err)
+			return fmt.Errorf("repo: FindMissing: stat %s: %w", ChunkKey(h), err)
 		}
-	}
-	return missing, nil
+		return nil
+	})
+	return missing, total, err
 }
 
 // ScrubResult records the outcome of a SHA-256 spot-check across
 // chunks. mismatch is the count of chunks whose on-disk hash
 // disagreed with their key. Bytes is the total bytes read.
 type ScrubResult struct {
-	Sampled    int
-	OK         int
-	Mismatches []Hash
-	Bytes      int64
+	Sampled int
+	OK      int
+	// Mismatches holds the first ScrubMismatchListLimit mismatching hashes
+	// in discovery order; MismatchCount is the exact number. A repository
+	// with widespread damage has far more than fits in a list.
+	Mismatches    []Hash
+	MismatchCount int
+	Bytes         int64
+}
+
+// ScrubMismatchListLimit bounds ScrubResult.Mismatches.
+const ScrubMismatchListLimit = 1024
+
+func (r *ScrubResult) noteMismatch(h Hash) {
+	r.MismatchCount++
+	if len(r.Mismatches) < ScrubMismatchListLimit {
+		r.Mismatches = append(r.Mismatches, h)
+	}
 }
 
 // Scrub samples up to limit chunks, fetches each, and verifies the
@@ -503,19 +544,11 @@ type ScrubResult struct {
 func Scrub(ctx context.Context, cas *CAS, refs *RefSet, limit int) (ScrubResult, error) {
 	res := ScrubResult{}
 
-	refs.mu.Lock()
-	hashes := make([]Hash, 0, len(refs.hashes))
-	for h := range refs.hashes {
-		hashes = append(hashes, h)
-	}
-	refs.mu.Unlock()
-
-	sortHashes(hashes)
-	if limit > 0 && limit < len(hashes) {
-		hashes = hashes[:limit]
-	}
-
-	for _, h := range hashes {
+	var stop = errors.New("scrub: limit reached")
+	err := refs.ForEach(func(h Hash) error {
+		if limit > 0 && res.Sampled >= limit {
+			return stop
+		}
 		// Cooperative cancellation. Scrub re-reads + re-hashes every
 		// chunk; on a million-chunk repo that's hours of work. A
 		// cancelled ctx mid-loop should bail without continuing to
@@ -524,30 +557,34 @@ func Scrub(ctx context.Context, cas *CAS, refs *RefSet, limit int) (ScrubResult,
 		// a verification finding. (cas.GetChunkBytes propagates ctx
 		// too, but we want the early bail in the CPU-heavy path.)
 		if err := ctx.Err(); err != nil {
-			return res, err
+			return err
 		}
 		body, err := cas.GetChunkBytes(ctx, h)
 		if err != nil {
 			// Distinguish ctx-cancelled from a real fetch failure —
 			// the former is not a "mismatch."
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-				return res, err
+				return err
 			}
-			res.Mismatches = append(res.Mismatches, h)
+			res.noteMismatch(h)
 			res.Sampled++
-			continue
+			return nil
 		}
 		// CAS.GetChunkBytes already verifies plaintext SHA. We
 		// re-verify here to guard against any future wrapping that
 		// might silently bypass that check.
 		if Hash(sha256.Sum256(body)) != h {
-			res.Mismatches = append(res.Mismatches, h)
+			res.noteMismatch(h)
 			res.Sampled++
-			continue
+			return nil
 		}
 		res.OK++
 		res.Sampled++
 		res.Bytes += int64(len(body))
+		return nil
+	})
+	if err != nil && !errors.Is(err, stop) {
+		return res, err
 	}
 	return res, nil
 }

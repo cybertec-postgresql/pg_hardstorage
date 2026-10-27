@@ -6,6 +6,7 @@ package backup
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -93,7 +94,7 @@ func validateRef(deployment, backupID string) error {
 // or a corrupt/oversized object, would otherwise OOM the reader via an
 // unbounded io.ReadAll before Validate ever runs (input-validation audit
 // #2). 1 GiB is far above any real manifest yet bounds the blast radius.
-const MaxManifestBytes = 1 << 30
+var MaxManifestBytes int64 = 1 << 30
 
 // ReadAllLimited reads up to max bytes from rc, returning an error
 // rather than allocating unboundedly when the source exceeds it.
@@ -233,11 +234,39 @@ func (ms *ManifestStore) Commit(ctx context.Context, m *Manifest, signer *Signer
 	invariant.Assert(m.Attestation != nil,
 		"manifest %s reached commit without an attestation after signing", m.BackupID)
 
-	body, err := m.MarshalToBytes()
+	raw, err := m.MarshalToBytes()
 	if err != nil {
 		return fmt.Errorf("backup: marshal manifest %s: %w", m.BackupID, err)
 	}
+	return ms.commitBody(ctx, m, bytesBody(raw), opts)
+}
 
+// manifestBody is a manifest document as bytes to publish: held in
+// memory (Commit) or streamed from a spool file (CommitSpooled). open
+// returns a FRESH reader of exactly size bytes each call, because the
+// primary, a retried replica and a WORM rollback can each need one.
+type manifestBody struct {
+	size int64
+	open func() (stdio.ReadCloser, error)
+}
+
+func bytesBody(b []byte) manifestBody {
+	return manifestBody{size: int64(len(b)), open: func() (stdio.ReadCloser, error) {
+		return seekCloser{bytes.NewReader(b)}, nil
+	}}
+}
+
+// seekCloser keeps a reader seekable through the ReadCloser interface:
+// object-store clients (S3) rewind the body to sign it, and a plain
+// NopCloser would hide the Seek.
+type seekCloser struct{ *bytes.Reader }
+
+func (seekCloser) Close() error { return nil }
+
+// commitBody publishes an already-validated, already-signed manifest
+// document: the primary exclusively, the chain-safety re-check for
+// incrementals, the deployment index, and the best-effort replica.
+func (ms *ManifestStore) commitBody(ctx context.Context, m *Manifest, body manifestBody, opts CommitOptions) error {
 	primaryKey := PrimaryPath(m.Deployment, m.BackupID)
 	if err := ms.commitAtomic(ctx, primaryKey, body, opts); err != nil {
 		if errors.Is(err, storage.ErrAlreadyExists) {
@@ -362,11 +391,17 @@ func (ms *ManifestStore) rollbackPrimaryCommit(ctx context.Context, primaryKey s
 // stays an ordinary, deletable staging object (reaped by the rename's
 // source-delete on success, or by `repo gc`'s stale-staging sweep if a
 // crash orphaned it).
-func (ms *ManifestStore) commitAtomic(ctx context.Context, key string, body []byte, opts CommitOptions) error {
+func (ms *ManifestStore) commitAtomic(ctx context.Context, key string, body manifestBody, opts CommitOptions) error {
 	// Conditional PUT where the backend supports it, tmp+rename where
 	// it does not. The staging path costs a DELETE per commit, which
 	// an append-only repository cannot accept (issue #45).
-	if err := storage.CommitExclusive(ctx, ms.sp, key, body, storage.PutOptions{}); err != nil {
+	rd, err := body.open()
+	if err != nil {
+		return fmt.Errorf("open manifest body: %w", err)
+	}
+	err = storage.CommitExclusiveReader(ctx, ms.sp, key, rd, body.size, storage.PutOptions{})
+	_ = rd.Close()
+	if err != nil {
 		return err
 	}
 	// Apply WORM retention to the committed manifest itself.  A backend
@@ -421,7 +456,7 @@ const (
 // already-present replica (ErrAlreadyExists — a concurrent commit, or a
 // prior attempt whose rename actually landed) counts as success. Returns
 // the last error if every attempt failed; the caller keeps it non-fatal.
-func (ms *ManifestStore) commitReplica(ctx context.Context, replicaKey string, body []byte, opts CommitOptions) error {
+func (ms *ManifestStore) commitReplica(ctx context.Context, replicaKey string, body manifestBody, opts CommitOptions) error {
 	var lastErr error
 	for attempt := 0; attempt < replicaCommitAttempts; attempt++ {
 		if attempt > 0 {
@@ -497,7 +532,7 @@ func (ms *ManifestStore) Read(ctx context.Context, deployment, backupID string, 
 		return nil, ErrTombstoned
 	}
 	primaryKey := PrimaryPath(deployment, backupID)
-	m, primaryErr := ms.readVerified(ctx, primaryKey, verifier)
+	m, primaryErr := ms.readVerifiedFor(ctx, primaryKey, verifier, deployment, backupID)
 	if primaryErr == nil {
 		return m, nil
 	}
@@ -565,12 +600,12 @@ func (ms *ManifestStore) ReadIncludingTombstoned(ctx context.Context, deployment
 		return nil, false, fmt.Errorf("backup: tombstone check %s: %w", backupID, err)
 	}
 	primaryKey := PrimaryPath(deployment, backupID)
-	m, primaryErr := ms.readVerified(ctx, primaryKey, verifier)
+	m, primaryErr := ms.readVerifiedFor(ctx, primaryKey, verifier, deployment, backupID)
 	if primaryErr == nil {
 		return m, dead, nil
 	}
 	replicaKey := ReplicaPath(backupID)
-	replicaM, replicaErr := ms.readVerified(ctx, replicaKey, verifier)
+	replicaM, replicaErr := ms.readVerifiedFor(ctx, replicaKey, verifier, deployment, backupID)
 	if replicaErr == nil {
 		return replicaM, dead, nil
 	}
@@ -580,6 +615,24 @@ func (ms *ManifestStore) ReadIncludingTombstoned(ctx context.Context, deployment
 	}
 	return nil, false, fmt.Errorf("backup: read %s: primary failed (%w) and replica failed (%v)",
 		backupID, primaryErr, replicaErr)
+}
+
+// readVerifiedFor is readVerified plus an identity check: the signed
+// manifest body must name the deployment and backup ID it was fetched
+// under. The Ed25519 signature covers the body but not the storage key,
+// so without this an attacker with repo write access can copy an older,
+// validly-signed manifest over a newer backup's key (rollback / replay)
+// and a restore of "backup B" silently materialises backup A's data.
+func (ms *ManifestStore) readVerifiedFor(ctx context.Context, key string, verifier *Verifier, deployment, backupID string) (*Manifest, error) {
+	m, err := ms.readVerified(ctx, key, verifier)
+	if err != nil {
+		return nil, err
+	}
+	if m.Deployment != deployment || m.BackupID != backupID {
+		return nil, fmt.Errorf("backup: manifest at %s is for %s/%s, not %s/%s (replayed or misplaced manifest)",
+			key, m.Deployment, m.BackupID, deployment, backupID)
+	}
+	return m, nil
 }
 
 func (ms *ManifestStore) readVerified(ctx context.Context, key string, verifier *Verifier) (*Manifest, error) {
@@ -925,6 +978,10 @@ func (ms *ManifestStore) List(ctx context.Context, deployment string, verifier *
 				}
 			}
 			m, err := ms.readVerified(ctx, key, verifier)
+			if err == nil && slash > 0 && (m.BackupID != rel[:slash] || m.Deployment != deployment) {
+				m, err = nil, fmt.Errorf("backup: manifest at %s is for %s/%s (replayed or misplaced manifest)",
+					key, m.Deployment, m.BackupID)
+			}
 			if !yield(m, err) {
 				return
 			}
@@ -994,6 +1051,10 @@ func (ms *ManifestStore) ListIncludingTombstoned(ctx context.Context, deployment
 			}
 			_, dead := tombstoned[id]
 			m, err := ms.readVerified(ctx, key, verifier)
+			if err == nil && id != "" && (m.BackupID != id || m.Deployment != deployment) {
+				m, err = nil, fmt.Errorf("backup: manifest at %s is for %s/%s (replayed or misplaced manifest)",
+					key, m.Deployment, m.BackupID)
+			}
 			if err != nil {
 				if !yield(ManifestEntry{}, err) {
 					return
@@ -1631,10 +1692,11 @@ func (ms *ManifestStore) Undelete(ctx context.Context, deployment, backupID stri
 			missing = append(missing, h.String())
 		}
 		return false, &UndeleteChunksMissingError{
-			Deployment:  deployment,
-			BackupID:    backupID,
-			TotalUnique: res.TotalUnique,
-			Missing:     missing,
+			Deployment:   deployment,
+			BackupID:     backupID,
+			TotalUnique:  res.TotalUnique,
+			Missing:      missing,
+			MissingCount: res.NumMissing(),
 		}
 	}
 	// Parent-chain pre-flight: resurrecting an incremental whose
@@ -1715,10 +1777,11 @@ func (ms *ManifestStore) Undelete(ctx context.Context, deployment, backupID stri
 			missing = append(missing, h.String())
 		}
 		return false, &UndeleteChunksMissingError{
-			Deployment:  deployment,
-			BackupID:    backupID,
-			TotalUnique: recheck.TotalUnique,
-			Missing:     missing,
+			Deployment:   deployment,
+			BackupID:     backupID,
+			TotalUnique:  recheck.TotalUnique,
+			Missing:      missing,
+			MissingCount: recheck.NumMissing(),
 		}
 	}
 
@@ -1791,7 +1854,7 @@ func (ms *ManifestStore) readRaw(ctx context.Context, key string) ([]byte, error
 		return nil, err
 	}
 	defer rc.Close()
-	return stdio.ReadAll(rc)
+	return storage.ReadAllLimited(rc, storage.MaxRecordBytes)
 }
 
 // UndeleteParentTombstonedError is returned by Undelete when the
@@ -1818,6 +1881,9 @@ func (e *UndeleteParentTombstonedError) Error() string {
 // chunks). The resurrected backup may be un-restorable — that is the
 // caller's explicit, eyes-open choice. Prefer Undelete.
 func (ms *ManifestStore) UndeleteForce(ctx context.Context, deployment, backupID string) (bool, error) {
+	if err := validateRef(deployment, backupID); err != nil {
+		return false, err
+	}
 	if deployment == "" || backupID == "" {
 		return false, errors.New("backup: UndeleteForce requires deployment and backupID")
 	}
@@ -1861,37 +1927,12 @@ func (ms *ManifestStore) backupIsLive(ctx context.Context, deployment, backupID 
 // tombstoned manifest (the tombstone is a sidecar; manifest.json
 // itself is still present until chunk-GC hard-deletes it).
 func (ms *ManifestStore) readManifestUnverified(ctx context.Context, deployment, backupID string) (*Manifest, error) {
-	primaryKey := PrimaryPath(deployment, backupID)
-	if rc, err := ms.sp.Get(ctx, primaryKey); err == nil {
-		body, rerr := ReadAllLimited(rc, MaxManifestBytes)
-		_ = rc.Close()
-		if rerr == nil {
-			if m, perr := ParseAttestationless(body); perr == nil {
-				return m, nil
-			}
-		}
+	// Streamed: only the header is held, so this works on a manifest too
+	// large for memory. Callers that need the files use m.EachFile.
+	if m, err := ms.streamHeader(ctx, PrimaryPath(deployment, backupID), StreamOptions{}); err == nil {
+		return m, nil
 	}
-	replicaKey := ReplicaPath(backupID)
-	rc2, err := ms.sp.Get(ctx, replicaKey)
-	if err != nil {
-		return nil, err
-	}
-	defer rc2.Close()
-	body2, rerr2 := ReadAllLimited(rc2, MaxManifestBytes)
-	if rerr2 != nil {
-		return nil, rerr2
-	}
-	return ParseAttestationless(body2)
-}
-
-// readKeyBytes returns the raw body at key (Get + ReadAll).
-func (ms *ManifestStore) readKeyBytes(ctx context.Context, key string) ([]byte, error) {
-	rc, err := ms.sp.Get(ctx, key)
-	if err != nil {
-		return nil, err
-	}
-	defer rc.Close()
-	return ReadAllLimited(rc, MaxManifestBytes)
+	return ms.streamHeader(ctx, ReplicaPath(backupID), StreamOptions{})
 }
 
 // EnsureReplica guarantees the redundant replica copy of a committed
@@ -1920,9 +1961,12 @@ func (ms *ManifestStore) EnsureReplica(ctx context.Context, deployment, backupID
 	}
 	replicaKey := ReplicaPath(backupID)
 
-	// Replica already present AND verifies → redundancy intact.
-	if rb, err := ms.readKeyBytes(ctx, replicaKey); err == nil {
-		if _, perr := ParseAndVerify(rb, verifier); perr == nil {
+	// Replica already present AND verifies → redundancy intact. Verified
+	// as a stream: the manifest may be far larger than memory.
+	if rc, err := ms.sp.Get(ctx, replicaKey); err == nil {
+		_, perr := StreamManifest(rc, StreamOptions{Verifier: verifier}, nil)
+		_ = rc.Close()
+		if perr == nil {
 			return false, nil
 		}
 		// Present but corrupt — fall through and rebuild it.
@@ -1931,16 +1975,23 @@ func (ms *ManifestStore) EnsureReplica(ctx context.Context, deployment, backupID
 	}
 
 	// Rebuild from the verified primary.
-	pb, err := ms.readKeyBytes(ctx, PrimaryPath(deployment, backupID))
+	primaryKey := PrimaryPath(deployment, backupID)
+	prc, err := ms.sp.Get(ctx, primaryKey)
 	if err != nil {
 		return false, fmt.Errorf("backup: EnsureReplica: read primary (no good copy to rebuild from): %w", err)
 	}
-	pm, err := ParseAndVerify(pb, verifier)
+	pinfo, err := StreamManifest(prc, StreamOptions{Verifier: verifier}, nil)
+	_ = prc.Close()
 	if err != nil {
 		return false, fmt.Errorf("backup: EnsureReplica: primary does not verify, refusing to write an unverified replica: %w", err)
 	}
+	pm := pinfo.Manifest
 	if pm.Deployment != deployment || pm.BackupID != backupID {
 		return false, fmt.Errorf("backup: EnsureReplica: primary identity %s/%s != requested %s/%s", pm.Deployment, pm.BackupID, deployment, backupID)
+	}
+	st, err := ms.sp.Stat(ctx, primaryKey)
+	if err != nil {
+		return false, fmt.Errorf("backup: EnsureReplica: stat primary: %w", err)
 	}
 
 	// A rebuild deliberately REPLACES whatever is at the replica key —
@@ -1950,9 +2001,28 @@ func (ms *ManifestStore) EnsureReplica(ctx context.Context, deployment, backupID
 	// the rebuilt one; the previous shape deleted it first and left a
 	// window with no replica at all, and cost three deletes besides
 	// (issue #45).
-	if _, err := ms.sp.Put(ctx, replicaKey, bytes.NewReader(pb),
-		storage.PutOptions{ContentLength: int64(len(pb))}); err != nil {
-		return false, fmt.Errorf("backup: EnsureReplica: install replica: %w", err)
+	//
+	// The body is copied as a stream and hashed on the way; if the
+	// primary changed after it was verified the replica is taken back
+	// down rather than left holding bytes nobody verified.
+	src, err := ms.sp.Get(ctx, primaryKey)
+	if err != nil {
+		return false, fmt.Errorf("backup: EnsureReplica: re-read primary: %w", err)
+	}
+	h := sha256.New()
+	_, perr := ms.sp.Put(ctx, replicaKey, stdio.TeeReader(src, h),
+		storage.PutOptions{ContentLength: st.Size})
+	_ = src.Close()
+	if perr != nil {
+		return false, fmt.Errorf("backup: EnsureReplica: install replica: %w", perr)
+	}
+	var got [32]byte
+	copy(got[:], h.Sum(nil))
+	if got != pinfo.RawSHA256 {
+		cctx, cancel := storage.CleanupContext(ctx)
+		_ = ms.sp.Delete(cctx, replicaKey)
+		cancel()
+		return false, fmt.Errorf("backup: EnsureReplica: primary %s changed while the replica was being built; replica removed, retry", primaryKey)
 	}
 
 	// Apply the repo's WORM retention to the rebuilt replica, matching what
@@ -2075,13 +2145,11 @@ func (ms *ManifestStore) loadChainSnapshot(ctx context.Context, deployment strin
 		if err != nil {
 			return chainSnapshot{}, fmt.Errorf("read %s: %w", key, err)
 		}
-		body, err := ReadAllLimited(rc, MaxManifestBytes)
+		// Token-scanned: only two string fields are needed, and the
+		// document can be far larger than memory.
+		fields, err := scanTopLevelStrings(rc, "backup_id", "parent_backup_id")
 		_ = rc.Close()
 		if err != nil {
-			return chainSnapshot{}, fmt.Errorf("read body %s: %w", key, err)
-		}
-		var s slim
-		if err := json.Unmarshal(body, &s); err != nil {
 			// Fail CLOSED, like the Get failure a few lines above.
 			//
 			// This snapshot answers one question: would tombstoning X
@@ -2109,6 +2177,7 @@ func (ms *ManifestStore) loadChainSnapshot(ctx context.Context, deployment strin
 					"a hidden edge means tombstoning its ancestor would orphan it; heal or "+
 					"remove that manifest first (`repair manifest`)", key, err)
 		}
+		s := slim{BackupID: fields["backup_id"], ParentBackupID: fields["parent_backup_id"]}
 		if s.ParentBackupID == "" {
 			continue
 		}
@@ -2183,13 +2252,19 @@ type UndeleteChunksMissingError struct {
 	Deployment  string
 	BackupID    string
 	TotalUnique int
-	Missing     []string
+	// Missing lists the first few missing hashes; MissingCount is the exact
+	// total (0 means len(Missing)).
+	Missing      []string
+	MissingCount int
 }
+
+// NumMissing is the exact number of missing chunks.
+func (e *UndeleteChunksMissingError) NumMissing() int { return max(e.MissingCount, len(e.Missing)) }
 
 // Error implements error.
 func (e *UndeleteChunksMissingError) Error() string {
 	return fmt.Sprintf("backup: %s/%s references %d chunk(s) no longer in the repo (%d of %d missing); resurrecting it would be un-restorable — use force to recover the metadata anyway",
-		e.Deployment, e.BackupID, len(e.Missing), len(e.Missing), e.TotalUnique)
+		e.Deployment, e.BackupID, e.NumMissing(), e.NumMissing(), e.TotalUnique)
 }
 
 // ErrUndeleteChunksMissing is the sentinel for errors.Is checks

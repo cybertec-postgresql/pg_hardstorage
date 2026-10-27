@@ -47,6 +47,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/url"
 	"os"
@@ -439,7 +440,14 @@ func Verify(ctx context.Context, opts Options) (*Result, error) {
 	// (see bootHBA), and the operator's pg_hba.conf is never touched.
 	// pg_ctl passes -o through /bin/sh, hence the single quotes;
 	// makeWorkDir guarantees the path contains none.
-	pgOpts := fmt.Sprintf("-p %d -c listen_addresses='' -c unix_socket_directories='%s' -c hba_file='%s' -c logging_collector=off -c shared_buffers=128MB",
+	//
+	// archive_mode=off: the restored postgresql.conf is the SOURCE's, and
+	// the usual one carries archive_mode=on with archive_command=
+	// `pg_hardstorage wal push` aimed at the PRODUCTION repository. The
+	// boot test finishes recovery and promotes onto a new timeline, after
+	// which that archiver would push timeline-N history and WAL from a
+	// throwaway verification cluster into the live archive.
+	pgOpts := fmt.Sprintf("-p %d -c listen_addresses='' -c unix_socket_directories='%s' -c hba_file='%s' -c logging_collector=off -c shared_buffers=128MB -c archive_mode=off",
 		port, workDir, hbaFile)
 	startArgs := []string{
 		"-D", opts.DataDir,
@@ -949,14 +957,22 @@ func probeCatalogs(ctx context.Context, psql, dsn string) error {
 // readTail returns up to n bytes from the end of path, or
 // empty string on any error.  Best-effort diagnostic.
 func readTail(path string, n int) string {
-	body, err := os.ReadFile(path)
+	f, err := os.Open(path)
 	if err != nil {
 		return ""
 	}
-	if len(body) <= n {
-		return string(body)
+	defer f.Close()
+	// Seek to the tail: a postgres log can be many GB.
+	if st, serr := f.Stat(); serr == nil && st.Size() > int64(n) {
+		if _, serr := f.Seek(st.Size()-int64(n), io.SeekStart); serr != nil {
+			return ""
+		}
 	}
-	return string(body[len(body)-n:])
+	body, err := io.ReadAll(io.LimitReader(f, int64(n)))
+	if err != nil {
+		return ""
+	}
+	return string(body)
 }
 
 // truncate caps a byte slice at n bytes, appending "…" when

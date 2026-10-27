@@ -13,6 +13,10 @@ operator deciding whether to upgrade.
 
 ## Releases
 
+- **[v1.6](v1.6.md)** — a 100 TB database no longer exhausts memory in
+  backup, restore or `repo gc`; `repo gc` leaves a clean repository;
+  manifest replay, credential leaks and the restore boot test's
+  archiving are fixed; includes v1.5.1.
 - **[v1.5](v1.5.md)** — continuous archiving gets its own systemd unit,
   retention follows the policy you declared whoever runs `rotate`, error
   codes name the system that actually failed, and backup under sustained

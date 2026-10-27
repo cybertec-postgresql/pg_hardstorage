@@ -106,6 +106,10 @@ type capacityPreflightOptions struct {
 
 func runCapacityPreflight(cmd *cobra.Command, opts capacityPreflightOptions) error {
 	d := DispatcherFrom(cmd)
+	if !finiteFloat(opts.safetyFactor) || opts.safetyFactor <= 0 {
+		return output.NewError("usage.bad_flag",
+			fmt.Sprintf("capacity preflight: --safety-factor must be a finite value > 0; got %v", opts.safetyFactor)).Wrap(output.ErrUsage)
+	}
 	// Positional-or-flag: guard the resolved value, not the flag.
 	if opts.repoURL == "" {
 		return missingFlagErr(cmd, "--repo (or a positional <url>)")
@@ -212,7 +216,7 @@ func projectedBytesFromDeployment(ctx context.Context, sp storage.StoragePlugin,
 	store := backup.NewManifestStore(sp)
 	var latestAny, latestKind *backup.Manifest
 	var lastListErr error
-	for m, err := range store.List(ctx, deployment, verifier) {
+	for m, err := range store.ListHeaders(ctx, deployment, verifier) {
 		if err != nil {
 			lastListErr = err
 			continue
@@ -248,11 +252,7 @@ func projectedBytesFromDeployment(ctx context.Context, sp storage.StoragePlugin,
 				Command: "pg_hardstorage capacity preflight --repo <url> --projected-bytes <N>",
 			})
 	}
-	var total int64
-	for _, f := range pick.Files {
-		total += f.Size
-	}
-	return total, nil
+	return pick.TotalFileBytes(), nil
 }
 
 // capacityPreflightBody is the v1-stable result for `capacity

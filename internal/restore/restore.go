@@ -21,7 +21,6 @@
 package restore
 
 import (
-	"bytes"
 	"context"
 	"encoding/binary"
 	stdjson "encoding/json"
@@ -168,6 +167,14 @@ type Options struct {
 	// Empty / nil = no remap; the manifest's recorded paths are
 	// used verbatim (the previous+ behaviour).
 	TablespaceRemap TablespaceRemap
+
+	// TablespaceMapAll, when non-empty, redirects every non-default
+	// tablespace of the backup that TablespaceRemap does not name to
+	// <TablespaceMapAll>/<tablespace-oid> (pgBackRest's
+	// --tablespace-map-all). Tablespaces added after the option was
+	// configured are covered, because the expansion happens against the
+	// backup's own tablespace list.
+	TablespaceMapAll string
 
 	// ChainStagingRoot lets the operator pin the directory chain
 	// restores use to materialise each link before merging via
@@ -323,9 +330,20 @@ func Restore(ctx context.Context, opts Options) (res *Result, err error) {
 	store := backup.NewManifestStore(sp)
 
 	// 2. Read + verify the manifest.
-	m, err := store.Read(ctx, opts.Deployment, opts.BackupID, opts.Verifier)
+	// ReadStreaming, not Read: a 200 TB database's manifest is hundreds of
+	// GB and must not be held in memory. Verification (signature and
+	// every invariant) happens in this call; the entries are walked on
+	// demand by m.EachFile.
+	m, err := store.ReadAuto(ctx, opts.Deployment, opts.BackupID, opts.Verifier)
 	if err != nil {
 		return nil, mapManifestReadErr("restore", opts.Deployment, opts.BackupID, err)
+	}
+	if opts.TablespaceMapAll != "" {
+		parent, perr := CleanTablespaceMapAll(opts.TablespaceMapAll)
+		if perr != nil {
+			return nil, output.NewError("usage.bad_flag", perr.Error()).Wrap(output.ErrUsage)
+		}
+		opts.TablespaceRemap = opts.TablespaceRemap.WithMapAll(parent, m.Tablespaces)
 	}
 
 	// 2pre. WAL-gap pre-flight. Refuse if the operator's PITR
@@ -400,7 +418,7 @@ func Restore(ctx context.Context, opts Options) (res *Result, err error) {
 			LSN:        m.StopLSN,
 		}).
 		WithBody(map[string]any{
-			"file_count":  len(m.Files),
+			"file_count":  m.NumFiles(),
 			"tablespaces": len(m.Tablespaces),
 			"pg_version":  m.PGVersion,
 		}))
@@ -447,11 +465,14 @@ func Restore(ctx context.Context, opts Options) (res *Result, err error) {
 	// the data dir. We refuse loudly when that mismatch shows up;
 	// "wrong target dir" is what the operator wants to see, not a
 	// silent half-from-X half-from-Y mix.
-	cp, err := LoadCheckpoint(opts.TargetDir)
+	cp, done, err := LoadCompleted(opts.TargetDir, 0)
 	if err != nil {
 		return nil, output.NewError("restore.checkpoint_load_failed",
 			fmt.Sprintf("restore: load checkpoint: %v", err)).Wrap(err)
 	}
+	// done is the bounded (spilling) set of already-materialised files;
+	// nil when this is a fresh restore. See CompletedKeys.
+	defer done.Close()
 	resumed := cp != nil
 	if resumed && cp.BackupID != "" && cp.BackupID != m.BackupID {
 		return nil, output.NewError("conflict.checkpoint_mismatch",
@@ -468,18 +489,16 @@ func Restore(ctx context.Context, opts Options) (res *Result, err error) {
 					m.Deployment, cp.BackupID, opts.TargetDir),
 			})
 	}
-	completed := map[string]struct{}{}
 	var resumedBytes int64
 	var resumedChunks int
 	if resumed {
-		completed = cp.CompletedSet()
 		resumedBytes = cp.BytesWritten
 		resumedChunks = cp.ChunksFetched
 		emit(output.NewEvent(output.SeverityNotice, "restore", "resumed").
 			WithSubject(output.Subject{Deployment: opts.Deployment, BackupID: opts.BackupID}).
 			WithBody(map[string]any{
 				"target":          opts.TargetDir,
-				"completed_files": len(cp.CompletedFiles),
+				"completed_files": done.Len(),
 				"resumed_bytes":   resumedBytes,
 				"resumed_chunks":  resumedChunks,
 				"started_at":      cp.StartedAt.Format(time.RFC3339),
@@ -501,16 +520,28 @@ func Restore(ctx context.Context, opts Options) (res *Result, err error) {
 		}
 	}
 
-	cw := NewCheckpointWriter(opts.TargetDir, Checkpoint{
-		Schema:         SchemaCheckpoint,
-		BackupID:       m.BackupID,
-		Deployment:     m.Deployment,
-		TargetDir:      opts.TargetDir,
-		StartedAt:      orResumeTime(resumed, cp, startedAt),
-		CompletedFiles: completedSlice(cp),
-		BytesWritten:   resumedBytes,
-		ChunksFetched:  resumedChunks,
-	}, 0)
+	cpInit := Checkpoint{
+		Schema:        SchemaCheckpoint,
+		BackupID:      m.BackupID,
+		Deployment:    m.Deployment,
+		TargetDir:     opts.TargetDir,
+		StartedAt:     orResumeTime(resumed, cp, startedAt),
+		BytesWritten:  resumedBytes,
+		ChunksFetched: resumedChunks,
+	}
+	var cw *CheckpointWriter
+	if resumed {
+		// Extend the existing completed-files log (migrating a legacy
+		// inline list) rather than re-seeding it from memory.
+		cpInit.CompletedLogBytes, cpInit.CompletedCount = cp.CompletedLogBytes, cp.CompletedCount
+		cpInit.legacyInline = cp.legacyInline
+		if cw, err = ResumeCheckpointWriter(opts.TargetDir, cpInit, 0); err != nil {
+			return nil, output.NewError("restore.checkpoint_load_failed",
+				fmt.Sprintf("restore: resume checkpoint: %v", err)).Wrap(err)
+		}
+	} else {
+		cw = NewCheckpointWriter(opts.TargetDir, cpInit, 0)
+	}
 
 	emit(output.NewEvent(output.SeverityInfo, "restore", "started").
 		WithSubject(output.Subject{Deployment: opts.Deployment, BackupID: opts.BackupID}).
@@ -519,8 +550,8 @@ func Restore(ctx context.Context, opts Options) (res *Result, err error) {
 	// 4. Materialise every file. Skip files already in the checkpoint.
 	matCtx, matSpan := tracing.Tracer().Start(ctx, "restore.materialise",
 		trace.WithAttributes(
-			attribute.Int("file_count_total", len(m.Files)),
-			attribute.Int("file_count_already_done", len(completed)),
+			attribute.Int("file_count_total", m.NumFiles()),
+			attribute.Int("file_count_already_done", done.Len()),
 		))
 	var bytesWritten int64 = resumedBytes
 	var chunksFetched int = resumedChunks
@@ -528,20 +559,19 @@ func Restore(ctx context.Context, opts Options) (res *Result, err error) {
 	// tablespace files land at their real location (consistent with the
 	// tablespace_map we write below), not flattened under PGDATA root.
 	tsDests := tablespaceDestRoots(m, opts.TablespaceRemap)
-	for i := range m.Files {
-		f := &m.Files[i]
+	walkErr := m.EachFile(matCtx, func(f *backup.FileEntry) error {
 		// Checkpoint identity is (tablespace, path): two tablespaces
 		// can carry the same relative path, so keying resume on the
 		// bare path would wrongly skip a not-yet-written file.
 		fkey := checkpointKey(f)
 		destRoot, err := fileDestRoot(opts.TargetDir, tsDests, f.TablespaceOID)
 		if err != nil {
-			matSpan.SetStatus(codes.Error, err.Error())
-			matSpan.End()
-			span.SetStatus(codes.Error, err.Error())
-			return nil, err
+			return err
 		}
-		if _, alreadyDone := completed[fkey]; alreadyDone {
+		if done.Has(fkey) {
+			if err := done.Err(); err != nil {
+				return fmt.Errorf("restore: resume set: %w", err)
+			}
 			// Cheap on-disk revalidation before trusting the
 			// checkpoint. After an OS crash / power loss the journal
 			// can persist the checkpoint's rename while dropping the
@@ -555,10 +585,10 @@ func Restore(ctx context.Context, opts Options) (res *Result, err error) {
 			// re-materialised). A stat + size compare is O(#files)
 			// and negligible next to chunk fetches.
 			if st, serr := os.Stat(filepath.Join(destRoot, filepath.FromSlash(f.Path))); serr == nil && st.Size() == f.Size {
-				continue
+				return nil
 			}
-			// Missing or wrong size: drop the claim and re-materialise.
-			delete(completed, fkey)
+			// Missing or wrong size: re-materialise (each file is visited
+			// once, so the stale claim needs no removal from the set).
 		}
 		n, k, err := materializeFile(matCtx, cas, destRoot, f)
 		if err != nil {
@@ -566,22 +596,26 @@ func Restore(ctx context.Context, opts Options) (res *Result, err error) {
 			// resume picks up here. A flush failure is non-fatal —
 			// the original error is what the caller needs to see.
 			_ = cw.Flush()
-			matSpan.SetStatus(codes.Error, err.Error())
-			matSpan.End()
-			span.SetStatus(codes.Error, err.Error())
-			return nil, fmt.Errorf("restore: file %s: %w", f.Path, err)
+			return fmt.Errorf("restore: file %s: %w", f.Path, err)
 		}
 		bytesWritten += n
 		chunksFetched += k
 		if err := cw.MarkFileDone(fkey, n, k); err != nil {
-			return nil, output.NewError("restore.checkpoint_write_failed",
+			return output.NewError("restore.checkpoint_write_failed",
 				fmt.Sprintf("restore: write checkpoint: %v", err)).Wrap(err)
 		}
 		if err := ctx.Err(); err != nil {
 			_ = cw.Flush()
-			matSpan.End()
-			return nil, err
+			return err
 		}
+		return nil
+	})
+	_ = done.Close() // release the resume set's heap and spill files
+	if walkErr != nil {
+		matSpan.SetStatus(codes.Error, walkErr.Error())
+		matSpan.End()
+		span.SetStatus(codes.Error, walkErr.Error())
+		return nil, walkErr
 	}
 	matSpan.SetAttributes(
 		attribute.Int64("bytes_written", bytesWritten),
@@ -622,7 +656,7 @@ func Restore(ctx context.Context, opts Options) (res *Result, err error) {
 		if err != nil {
 			return nil, fmt.Errorf("restore: dir %s: %w", d.Path, err)
 		}
-		mode := stdfs.FileMode(d.Mode)
+		mode := stdfs.FileMode(d.Mode).Perm()
 		if mode == 0 {
 			mode = 0o700
 		}
@@ -882,7 +916,7 @@ func Restore(ctx context.Context, opts Options) (res *Result, err error) {
 		BackupID:          m.BackupID,
 		Deployment:        m.Deployment,
 		TargetDir:         opts.TargetDir,
-		FileCount:         len(m.Files),
+		FileCount:         m.NumFiles(),
 		BytesWritten:      bytesWritten,
 		ChunksFetched:     chunksFetched,
 		BackupLabelSize:   len(m.BackupLabel),
@@ -1294,7 +1328,9 @@ func hasFile(entries []os.DirEntry, name string) bool {
 // for backupID, i.e. this run resumes an interrupted restore of the
 // same backup. An unreadable checkpoint is not a resume.
 func resumesBackup(target, backupID string) bool {
-	cp, err := LoadCheckpoint(target)
+	// Header only: the completed-files list is not needed (and at millions
+	// of files not wanted) just to learn which backup the checkpoint is for.
+	cp, err := scanState(filepath.Join(target, CheckpointFilename), func(string, bool) error { return nil })
 	return err == nil && cp != nil && cp.BackupID == backupID
 }
 
@@ -1331,7 +1367,7 @@ func materializeFile(ctx context.Context, cas *repo.CAS, destRoot string, f *bac
 		return 0, 0, fmt.Errorf("mkdir parent: %w", err)
 	}
 
-	mode := stdfs.FileMode(f.Mode)
+	mode := stdfs.FileMode(f.Mode).Perm()
 	if mode == 0 {
 		mode = 0o600 // PG default for data files
 	}
@@ -2005,7 +2041,7 @@ func restoreIncrementalChain(ctx context.Context, opts Options, sp storage.Stora
 			WithBody(map[string]any{
 				"index":          i,
 				"chain_length":   len(chain),
-				"file_count":     len(m.Files),
+				"file_count":     m.NumFiles(),
 				"bytes_written":  bw,
 				"chunks_fetched": ck,
 				"is_anchor":      i == 0,
@@ -2059,7 +2095,7 @@ func restoreIncrementalChain(ctx context.Context, opts Options, sp storage.Stora
 	// atomic; a failed/crashed merge leaves TargetDir absent.
 	combineOut := opts.TargetDir + ".pgcombine-staging"
 	_ = os.RemoveAll(combineOut) // clear any leftover from a prior crash
-	var stderr bytes.Buffer
+	stderr := &cappedBuffer{max: maxToolOutputBytes}
 	combineCtx, combineSpan := tracing.Tracer().Start(chainCtx, "pg_combinebackup",
 		trace.WithAttributes(
 			attribute.Int("input_dirs", len(inputDirs)),
@@ -2082,7 +2118,7 @@ func restoreIncrementalChain(ctx context.Context, opts Options, sp storage.Stora
 		// the operator's OLD=NEW (original locations) cannot be
 		// passed through verbatim.
 		ExtraArgs: chainTablespaceCombineArgs(leaf, inputDirs[len(inputDirs)-1], opts.TablespaceRemap),
-		Stderr:    &stderr,
+		Stderr:    stderr,
 	}); err != nil {
 		combineSpan.SetStatus(codes.Error, err.Error())
 		combineSpan.End()
@@ -2137,8 +2173,10 @@ func restoreIncrementalChain(ctx context.Context, opts Options, sp storage.Stora
 				"reason": "source PG had TDE enabled at backup time; merged bytes are ciphertext and PG's plaintext checksums cannot match in-process. Boot the restored datadir under a TDE-capable PG with key access to run a meaningful pg_verifybackup.",
 				"engine": leaf.SourceTDE.Engine,
 			}))
-	} else if mergedManifest, rerr := os.ReadFile(filepath.Join(opts.TargetDir, "backup_manifest")); rerr == nil {
-		if vbRes, vberr := verifybackup.Verify(chainCtx, mergedManifest, opts.TargetDir); vberr != nil {
+	} else if mergedManifest, rerr := os.Open(filepath.Join(opts.TargetDir, "backup_manifest")); rerr == nil {
+		// Streamed: the merged manifest of a 100 TB cluster is tens of GB.
+		defer mergedManifest.Close()
+		if vbRes, vberr := verifybackup.VerifyReader(chainCtx, mergedManifest, opts.TargetDir); vberr != nil {
 			if errors.Is(vberr, verifybackup.ErrNoManifest) {
 				emit(output.NewEvent(output.SeverityNotice, "restore", "verifybackup_skipped_no_manifest").
 					WithSubject(output.Subject{Deployment: leaf.Deployment, BackupID: leaf.BackupID}).
@@ -2393,20 +2431,20 @@ func materializeManifestInto(ctx context.Context, cas *repo.CAS, m *backup.Manif
 	// data and let same-named files of different tablespaces
 	// overwrite each other, while pg_combinebackup never saw the
 	// tablespace at all.
-	for i := range m.Files {
-		if err := ctx.Err(); err != nil {
-			return totalBytes, totalChunks, err
-		}
-		root, err := fileDestRoot(dir, tsRoots, m.Files[i].TablespaceOID)
+	if err := m.EachFile(ctx, func(f *backup.FileEntry) error {
+		root, err := fileDestRoot(dir, tsRoots, f.TablespaceOID)
 		if err != nil {
-			return totalBytes, totalChunks, err
+			return err
 		}
-		bw, ck, err := materializeFile(ctx, cas, root, &m.Files[i])
+		bw, ck, err := materializeFile(ctx, cas, root, f)
 		if err != nil {
-			return totalBytes, totalChunks, err
+			return err
 		}
 		totalBytes += bw
 		totalChunks += ck
+		return nil
+	}); err != nil {
+		return totalBytes, totalChunks, err
 	}
 	if err := writeTablespaceSymlinks(dir, tsRoots); err != nil {
 		return totalBytes, totalChunks, err
@@ -2490,7 +2528,7 @@ func chainTablespaceCombineArgs(leaf *backup.Manifest, leafDir string, remap Tab
 func sumFileCount(chain combine.Chain) int {
 	var n int
 	for _, m := range chain {
-		n += len(m.Files)
+		n += m.NumFiles()
 	}
 	return n
 }
@@ -2634,11 +2672,7 @@ func totalChunkCountForManifest(m *backup.Manifest) int {
 	if m == nil {
 		return 0
 	}
-	var n int
-	for i := range m.Files {
-		n += len(m.Files[i].Chunks)
-	}
-	return n
+	return int(m.NumChunkRefs())
 }
 
 // postverifySkipHint picks advice that matches WHY the boot check was

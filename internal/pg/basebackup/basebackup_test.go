@@ -296,6 +296,38 @@ func TestDrive_HappyPath_ManifestEnabled(t *testing.T) {
 	}
 }
 
+// TestDrive_ManifestCeilingIsConfigurable: the DoS guard on PG's
+// backup_manifest is a variable, not the former hard 256 MiB constant, so a
+// cluster with tens of millions of files can be backed up; lowered, it still
+// refuses a stream that runs past it.
+func TestDrive_ManifestCeilingIsConfigurable(t *testing.T) {
+	old := MaxManifestBytes
+	MaxManifestBytes = 8
+	defer func() { MaxManifestBytes = old }()
+
+	r, be, ctx, cancel := pipeDrive(t)
+	defer cancel()
+	go func() {
+		msgs := []pgproto3.BackendMessage{}
+		msgs = append(msgs, lsnResult("0/2000028", "1")...)
+		msgs = append(msgs,
+			tablespaceListSchema(),
+			dataRow("1663", "pg_default", "1024"),
+			&pgproto3.CommandComplete{CommandTag: []byte("SELECT")},
+			&pgproto3.CopyOutResponse{},
+			archiveFrame("base.tar", ""),
+			manifestStartFrame(),
+			dataFrame([]byte(`{"manifest":1}`)), // 14 bytes > 8
+			&pgproto3.CopyDone{},
+		)
+		emit(t, be, msgs...)
+	}()
+	err := drive(ctx, r, Options{Manifest: true}, newRecordingSink(), &Result{})
+	if err == nil || !strings.Contains(err.Error(), "manifest exceeds 8 bytes") {
+		t.Fatalf("drive err = %v, want the manifest-ceiling refusal", err)
+	}
+}
+
 func TestDrive_ManifestUnexpectedWhenDisabled(t *testing.T) {
 	r, be, ctx, cancel := pipeDrive(t)
 	defer cancel()

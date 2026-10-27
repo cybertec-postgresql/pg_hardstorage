@@ -599,7 +599,7 @@ func readKey(ctx context.Context, sp storage.StoragePlugin, key string) ([]byte,
 		return nil, fmt.Errorf("%w: %s: %v", ErrPolicyNotFound, key, err)
 	}
 	defer rd.Close()
-	return io.ReadAll(rd)
+	return storage.ReadAllLimited(rd, storage.MaxRecordBytes)
 }
 
 func putKey(ctx context.Context, sp storage.StoragePlugin, key string, body []byte) error {

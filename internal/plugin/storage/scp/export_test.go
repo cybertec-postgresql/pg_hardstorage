@@ -1,5 +1,7 @@
 package scp
 
+import "testing"
+
 // ShellQuoteForTest exposes the unexported shellQuote helper to
 // the _test package.  Single-quote escaping is the only
 // shell-injection defence in this backend; testing it directly
@@ -28,4 +30,13 @@ func ResolvePrefixForTest(root, prefix string) (string, error) {
 func ResolveForTest(root, key string) (string, error) {
 	p := &Plugin{root: root}
 	return p.resolve(key)
+}
+
+// OpenInprocForTest starts the in-process exec SSH server and opens a
+// plugin against it, for external test packages (which may import
+// packages that themselves import scp).
+func OpenInprocForTest(t *testing.T) *Plugin {
+	t.Helper()
+	srv := startExecServer(t)
+	return openExecPlugin(t, srv.addr, srv.hostPub)
 }

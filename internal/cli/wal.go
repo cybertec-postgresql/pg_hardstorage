@@ -583,7 +583,7 @@ func runWalFetch(cmd *cobra.Command, opts walFetchOptions) error {
 		return output.NewError("wal.fetch.read_failed",
 			fmt.Sprintf("wal fetch: read manifest %q: %v", key, err)).Wrap(err)
 	}
-	body, err := io.ReadAll(rc)
+	body, err := storage.ReadAllLimited(rc, storage.MaxRecordBytes)
 	_ = rc.Close()
 	if err != nil {
 		return output.NewError("wal.fetch.read_failed",
@@ -621,6 +621,15 @@ func runWalFetch(cmd *cobra.Command, opts walFetchOptions) error {
 		return output.NewError("wal.fetch.manifest_mismatch",
 			fmt.Sprintf("wal fetch: manifest segment_number=%d but caller asked for %d (segment %q, size %d)",
 				m.SegmentNumber, expectedSegNum, opts.segmentName, m.SegmentSize))
+	}
+	// The manifest is unsigned, so confirm it is the one this key is
+	// supposed to hold: a manifest copied from another timeline, segment
+	// or deployment would otherwise assemble hash-valid but WRONG WAL.
+	if m.Timeline != tli || m.SegmentName != opts.segmentName ||
+		(m.Deployment != "" && m.Deployment != opts.deployment) {
+		return output.NewError("wal.fetch.manifest_mismatch",
+			fmt.Sprintf("wal fetch: manifest at %s describes %s/%s timeline %d, not %s/%s timeline %d (replayed or misplaced segment manifest)",
+				key, m.Deployment, m.SegmentName, m.Timeline, opts.deployment, opts.segmentName, tli))
 	}
 	if err := checkFetchSystemIdentifier(opts.expectSysID, m.SystemIdentifier, opts.segmentName); err != nil {
 		return err
@@ -701,7 +710,7 @@ func fetchAuxBody(ctx context.Context, sp storage.StoragePlugin, key string, kin
 	rc, err := sp.Get(ctx, key)
 	if err == nil {
 		defer rc.Close()
-		return io.ReadAll(rc)
+		return storage.ReadAllLimited(rc, storage.MaxRecordBytes)
 	}
 	if !errors.Is(err, storage.ErrNotFound) {
 		return nil, err
@@ -927,7 +936,7 @@ func parseSegmentNameForFetch(name string) (uint32, uint64, bool) {
 // failure is consistent and the error already names the unreadable chunk.
 func buildWALDecryptingCAS(ctx context.Context, sp storage.StoragePlugin, deployment string) (*repo.CAS, bool) {
 	var info *backup.EncryptionInfo
-	for m, lerr := range backup.NewManifestStore(sp).ListAttestationless(ctx, deployment) {
+	for m, lerr := range backup.NewManifestStore(sp).ListAttestationlessAuto(ctx, deployment) {
 		if lerr != nil || m == nil || m.Encryption == nil {
 			continue
 		}
@@ -1012,7 +1021,7 @@ func decryptingCASFromEnvelope(ctx context.Context, sp storage.StoragePlugin, sc
 // posture as buildWALDecryptingCAS — the KEKRef only steers posture, the
 // unwrap step is the real gate).
 func deploymentBackupKEKRef(ctx context.Context, sp storage.StoragePlugin, deployment string) (string, bool) {
-	for m, lerr := range backup.NewManifestStore(sp).ListAttestationless(ctx, deployment) {
+	for m, lerr := range backup.NewManifestStore(sp).ListAttestationlessAuto(ctx, deployment) {
 		if lerr != nil || m == nil || m.Encryption == nil {
 			continue
 		}
@@ -1625,7 +1634,7 @@ func firstSegmentManifestWhere(ctx context.Context, sp storage.StoragePlugin, de
 			// Racing prune/delete between List and Get — try the next key.
 			continue
 		}
-		raw, rerr := io.ReadAll(rc)
+		raw, rerr := storage.ReadAllLimited(rc, storage.MaxRecordBytes)
 		_ = rc.Close()
 		if rerr != nil {
 			continue
@@ -1830,7 +1839,11 @@ func runWalStream(cmd *cobra.Command, opts walStreamOptions) error {
 		if !shouldEmitEvent(suppressEvents, e.Severity) {
 			return
 		}
-		_ = d.Event(streamCtx, e)
+		// Every event this stream emits concerns its deployment. Sinks
+		// render Subject.Deployment, so an alert without it (an email
+		// reading only "wal.stream/reconnecting") left an operator with
+		// several deployments unable to tell which one (issue #70).
+		_ = d.Event(streamCtx, stampDeployment(e, opts.deployment))
 	}
 
 	// 4. Per-attempt resume loop.  Each iteration re-runs
@@ -3378,4 +3391,13 @@ func splitBrainCode(err error) string {
 		return ""
 	}
 	return splitBrainRe.FindString(err.Error())
+}
+
+// stampDeployment sets the event's deployment when the emitter left it
+// empty. An event that already names one keeps it.
+func stampDeployment(e *output.Event, deployment string) *output.Event {
+	if e.Subject.Deployment == "" {
+		e.Subject.Deployment = deployment
+	}
+	return e
 }

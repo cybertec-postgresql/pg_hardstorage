@@ -25,6 +25,8 @@ import (
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/config"
 )
 
+var encOff = false
+
 // fullDeployment is a DeploymentConfig with every field non-zero, so
 // the round trip below actually exercises each one.
 func fullDeployment(useSlots bool) config.DeploymentConfig {
@@ -63,14 +65,16 @@ func fullDeployment(useSlots bool) config.DeploymentConfig {
 			Interval:     "10s",
 		},
 		AllowUnenforceableLease: true,
+		Backup:                  config.BackupConfig{IncludeWAL: true, Fast: true, Encrypt: &encOff, ChunkSize: "1MiB", Timeout: "36h"},
 		// Scheduled-drill settings. The mapping is the field that
 		// matters: a deployment with non-default tablespaces cannot be
 		// drilled safely without it, so losing it in a round trip would
 		// turn a safe scheduled drill into a refused one.
 		Drill: config.DrillConfig{
-			TablespaceMapping: []string{"/srv/live/ts_fast=/var/tmp/drill/ts_fast"},
-			SkipVerify:        true,
-			TempBase:          "/var/tmp/drill",
+			TablespaceMapping:    []string{"/srv/live/ts_fast=/var/tmp/drill/ts_fast"},
+			TablespaceMappingAll: "/var/tmp/drill/all",
+			SkipVerify:           true,
+			TempBase:             "/var/tmp/drill",
 		},
 	}
 }
