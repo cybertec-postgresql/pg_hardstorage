@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
 )
@@ -91,6 +92,9 @@ func Preflight(ctx context.Context, sp storage.StoragePlugin, opts PreflightOpti
 		return nil, errors.New("capacity: Preflight requires ProjectedBytes > 0")
 	}
 	safety := opts.SafetyFactor
+	if math.IsNaN(safety) || math.IsInf(safety, 0) {
+		return nil, errors.New("capacity: Preflight requires a finite SafetyFactor")
+	}
 	if safety <= 0 {
 		safety = DefaultSafetyFactor
 	}

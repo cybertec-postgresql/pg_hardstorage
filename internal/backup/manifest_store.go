@@ -1881,6 +1881,9 @@ func (e *UndeleteParentTombstonedError) Error() string {
 // chunks). The resurrected backup may be un-restorable — that is the
 // caller's explicit, eyes-open choice. Prefer Undelete.
 func (ms *ManifestStore) UndeleteForce(ctx context.Context, deployment, backupID string) (bool, error) {
+	if err := validateRef(deployment, backupID); err != nil {
+		return false, err
+	}
 	if deployment == "" || backupID == "" {
 		return false, errors.New("backup: UndeleteForce requires deployment and backupID")
 	}

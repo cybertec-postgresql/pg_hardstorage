@@ -31,8 +31,8 @@ successful heal restores the local copy to a state where the CAS's
 plaintext-SHA round-trip passes again.
 
 Heal is best-effort: a chunk missing at the replica is reported as
-NotAtReplica and the run continues with the next mismatch. Use
---dry-run-heal to see what *would* heal without writing.
+NotAtReplica and the run continues with the next mismatch. Omit
+--heal to run the read-only diagnostic scrub.
 
 ```
 pg_hardstorage repair scrub [flags]

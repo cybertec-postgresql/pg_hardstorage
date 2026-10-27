@@ -30,8 +30,8 @@ plaintext-SHA round-trip passes again.
 
 .PP
 Heal is best-effort: a chunk missing at the replica is reported as
-NotAtReplica and the run continues with the next mismatch. Use
---dry-run-heal to see what \fIwould\fP heal without writing.
+NotAtReplica and the run continues with the next mismatch. Omit
+--heal to run the read-only diagnostic scrub.
 
 
 .SH OPTIONS

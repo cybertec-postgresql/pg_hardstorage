@@ -336,6 +336,10 @@ func rotateBatchError(dep string, derr error, deleted []string, applied []rotati
 func buildPolicy(opts rotateOpts) (retention.Policy, error) {
 	switch strings.ToLower(opts.policy) {
 	case "gfs":
+		if opts.keepDaily < 0 || opts.keepWeekly < 0 || opts.keepMonthly < 0 || opts.keepYearly < 0 {
+			return nil, output.NewError("usage.bad_flag",
+				"rotate: GFS --keep-daily, --keep-weekly, --keep-monthly, and --keep-yearly must all be >= 0").Wrap(output.ErrUsage)
+		}
 		return retention.GFSPolicy{
 			KeepDaily:   opts.keepDaily,
 			KeepWeekly:  opts.keepWeekly,

@@ -1011,8 +1011,8 @@ successful heal restores the local copy to a state where the CAS's
 plaintext-SHA round-trip passes again.
 
 Heal is best-effort: a chunk missing at the replica is reported as
-NotAtReplica and the run continues with the next mismatch. Use
---dry-run-heal to see what *would* heal without writing.`,
+NotAtReplica and the run continues with the next mismatch. Omit
+--heal to run the read-only diagnostic scrub.`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return runRepairScrub(cmd, repoURL, limit, heal, replicaURL)
 		},
@@ -1031,6 +1031,10 @@ NotAtReplica and the run continues with the next mismatch. Use
 
 func runRepairScrub(cmd *cobra.Command, repoURL string, limit int, heal bool, replicaURL string) error {
 	d := DispatcherFrom(cmd)
+	if limit < 0 {
+		return output.NewError("usage.bad_flag",
+			"repair scrub: --limit must be >= 0").Wrap(output.ErrUsage)
+	}
 	if heal && replicaURL == "" {
 		return output.NewError("usage.missing_flag",
 			"repair scrub: --heal requires --replica <url>").Wrap(output.ErrUsage)

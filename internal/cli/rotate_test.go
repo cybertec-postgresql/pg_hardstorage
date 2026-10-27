@@ -69,6 +69,20 @@ func TestBuildPolicy_CountRejectsNegativeKeepFulls(t *testing.T) {
 	}
 }
 
+func TestBuildPolicy_GFSRejectsNegativeCounts(t *testing.T) {
+	tests := []rotateOpts{
+		{policy: "gfs", keepDaily: -1},
+		{policy: "gfs", keepWeekly: -1},
+		{policy: "gfs", keepMonthly: -1},
+		{policy: "gfs", keepYearly: -1},
+	}
+	for _, opts := range tests {
+		if _, err := buildPolicy(opts); err == nil {
+			t.Fatalf("negative GFS count accepted: %+v", opts)
+		}
+	}
+}
+
 func TestShapeDecisions_KeepBeforeDeleteWhenSameStoppedAt(t *testing.T) {
 	now := time.Date(2026, 4, 28, 12, 0, 0, 0, time.UTC)
 	keep := &backup.Manifest{BackupID: "k1", StoppedAt: now}

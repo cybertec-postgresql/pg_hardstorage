@@ -185,3 +185,32 @@ func TestBackup_ControlPlane_FastFlowsThroughArgs(t *testing.T) {
 		t.Fatalf("exit=%d\nstdout=%s\nstderr=%s", exit, stdout, stderr)
 	}
 }
+
+func TestBackup_ControlPlane_RefusesUnrepresentableFlags(t *testing.T) {
+	tests := [][]string{
+		{"--pg-connection", "postgres://ignored"},
+		{"--kek", "local:archive"},
+		{"--kms-config", "region=eu-central-1"},
+		{"--ignore-capacity"},
+		{"--capacity-safety-factor", "1.5"},
+		{"--allow-concurrent"},
+		{"--verbose"},
+	}
+	for _, extra := range tests {
+		t.Run(strings.Join(extra, "_"), func(t *testing.T) {
+			root := cli.NewRoot()
+			var out, errb bytes.Buffer
+			root.SetOut(&out)
+			root.SetErr(&errb)
+			args := []string{"backup", "db1", "--control-plane", "http://does-not-matter:8443", "-o", "json"}
+			root.SetArgs(append(args, extra...))
+			exit := cli.Run(root)
+			if exit != int(output.ExitMisuse) {
+				t.Fatalf("exit=%d, want %d; stderr=%s", exit, output.ExitMisuse, errb.String())
+			}
+			if !strings.Contains(errb.String(), "usage.unsupported_flag") {
+				t.Fatalf("missing unsupported-flag error: %s", errb.String())
+			}
+		})
+	}
+}

@@ -126,6 +126,9 @@ func runInsiderScan(cmd *cobra.Command, f insiderScanFlags) error {
 		return err
 	}
 	defer sp.Close()
+	if err := assertRepoWritable(cmd.Context(), sp, "insider scan"); err != nil {
+		return err
+	}
 	auditStore := audit.NewStoreWithRetention(sp, repoMeta.WORM)
 	det := insider.NewDetector(auditStore)
 	scan, err := det.Run(cmd.Context(), insider.Options{

@@ -13,6 +13,20 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **CLI hardening merged from the July quality pass.** `restore` now
+  validates `--verify` / `--verify-restore` before any dispatch and the
+  agent's restore executor validates and honours a `verify_restore` job
+  arg; capacity preflight, `rotate` (negative GFS counts), `repair scrub`
+  (negative `--limit`), `threshold` and several rare numeric flags are
+  range-checked up front; `integrity run --skip-sign` is genuinely
+  read-only (no read-only-repo bypass, no audit append);
+  `ManifestStore.UndeleteForce` validates its deployment/backup-id
+  reference like every other entry point. The July pass's repository-wide
+  mutation lock, its single-record encryption domain, its plaintext-writer
+  refusal and its control-plane flag filter (HEAD's per-verb refusal list is richer) were
+  NOT adopted: the gc commit fence, per-KEK shared-DEK slots and
+  read-side posture mitigation already cover those hazards without making
+  every backup and WAL commit fail while a gc runs.
 - **Memory on the 100 TB paths is bounded by spill budgets, not database
   size.** A pass over every command that held a per-chunk, per-file or
   per-segment list in memory (backup, restore, PITR, retention, verify,
