@@ -11,6 +11,8 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ## [Unreleased]
 
+## [1.6.0] — 2026-10-27
+
 ### Fixed
 
 - **CLI hardening merged from the July quality pass.** `restore` now
