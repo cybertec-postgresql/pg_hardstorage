@@ -272,6 +272,7 @@ jobs:
         id: wait
         env:
           WANT: ${{ steps.v.outputs.version }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           url="https://raw.githubusercontent.com/cybertec-postgresql/homebrew-tap/main/Casks/pg_hardstorage.rb"
           for i in $(seq 1 20); do
@@ -283,7 +284,10 @@ jobs:
           # The cask reaches the tap's main through a reviewed PR (see
           # homebrew_casks in .goreleaser.yaml), so an unmerged PR is the
           # expected state here, not a failure: say so, and how to finish.
-          prs=$(curl -fsSL "https://api.github.com/repos/cybertec-postgresql/homebrew-tap/pulls?state=open&head=cybertec-postgresql:pg_hardstorage-$WANT" || echo '[]')
+          # Authenticated: an anonymous call from a shared runner IP is
+          # rate-limited (403), which `|| echo '[]'` turned into "no PR
+          # found" and failed the v1.6.0 release job over an expected state.
+          prs=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/cybertec-postgresql/homebrew-tap/pulls?state=open&head=cybertec-postgresql:pg_hardstorage-$WANT" || echo '[]')
           pr=$(printf '%s' "$prs" | python3 -c 'import json,sys; p=json.load(sys.stdin); print(p[0]["html_url"] if p else "")')
           if [ -n "$pr" ]; then
             echo "pending=true" >> "$GITHUB_OUTPUT"
