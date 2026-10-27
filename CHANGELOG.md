@@ -36,7 +36,7 @@ keeps reading that version for at least 24 months after a successor lands.
   `repo check`, `integrity`, `wal prune`, `partial`) replaced the lists
   with streams, 1-bit-per-segment bitmaps, counters with bounded samples,
   or disk-spilling sets (see [Very large
-  databases](docs/how-to/operating/very-large-databases.md)). Commands
+  databases](how-to/operating/very-large-databases.md)). Commands
   that only need a manifest's header (`list`, `status`, `capacity`,
   `cost`, `forecast`, `slo`, `doctor`, `fleet search`, `recovery`
   windows, `timetravel`, `restore --to`, retention, ...) no longer parse
