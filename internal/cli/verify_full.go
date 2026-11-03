@@ -122,8 +122,11 @@ func runVerifyFull(cmd *cobra.Command, deployment, backupID, repoURL, pgMajorOve
 		Deployment: deployment,
 		BackupID:   backupID,
 		TargetDir:  tmp,
-		Verifier:   verifier,
-		KEKForRef:  kekResolver,
+		// tmp is removed once pg_verifybackup has run: no per-file
+		// fsync (issue #90).
+		ScratchTarget: true,
+		Verifier:      verifier,
+		KEKForRef:     kekResolver,
 		UnwrapDEK: func(ctx context.Context, kekRef string, wrapped []byte) ([]byte, error) {
 			return keystore.UnwrapDEK(ctx, kekRef, wrapped, keystore.UnwrapOpts{
 				KeyringDir:     p.Keyring.Value,

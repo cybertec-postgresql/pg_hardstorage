@@ -61,7 +61,7 @@ func TestMaterializeFile_MultiChunkRoundTrip(t *testing.T) {
 		Chunks: []backup.ChunkRef{chunkOf(t, cas, 0, a), chunkOf(t, cas, 5, b), chunkOf(t, cas, 12, c)},
 	}
 	dest := t.TempDir()
-	n, _, err := materializeFile(context.Background(), cas, dest, f)
+	n, _, err := materializeFile(context.Background(), cas, dest, f, true)
 	if err != nil {
 		t.Fatalf("materializeFile: %v", err)
 	}
@@ -97,7 +97,7 @@ func TestMaterializeFile_ReorderedChunksDetected(t *testing.T) {
 		},
 	}
 	dest := t.TempDir()
-	_, _, err := materializeFile(context.Background(), cas, dest, f)
+	_, _, err := materializeFile(context.Background(), cas, dest, f, true)
 	if err == nil {
 		got, _ := os.ReadFile(filepath.Join(dest, f.Path))
 		t.Fatalf("materializeFile accepted a reordered chunk list and wrote %q — a "+
@@ -128,7 +128,7 @@ func TestMaterializeManifestInto_DirsAndFiles(t *testing.T) {
 		},
 	}
 	dir := t.TempDir()
-	bytes, chunks, err := materializeManifestInto(context.Background(), cas, m, dir)
+	bytes, chunks, err := materializeManifestInto(context.Background(), cas, m, dir, true)
 	if err != nil {
 		t.Fatalf("materializeManifestInto: %v", err)
 	}
