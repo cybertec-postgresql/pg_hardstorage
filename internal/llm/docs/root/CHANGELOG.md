@@ -11,6 +11,35 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Backup and `wal stream` throughput was capped near 20 GB/h on
+  CPU-limited hosts (#90).** Upload concurrency was `min(GOMAXPROCS, 8)`,
+  and since Go 1.25 GOMAXPROCS follows the cgroup CPU limit, so a pod
+  limited to 500m–1 core kept two chunk uploads in flight while the CPU
+  sat idle: roughly 100 chunks/s against a remote object store. A chunk
+  write waits on the storage round trip, not on CPU, so both writers now
+  default to 16 uploads in flight regardless of core count. The new
+  `--upload-concurrency` flag on `backup` and `wal stream` (1..64) tunes
+  it.
+- **Backups uploaded small files one at a time (#90).** Each file
+  waited for its last chunk before the next tar entry was read, so the
+  thousands of one-chunk files in a typical PGDATA (small relations,
+  FSM/VM forks) cost one full storage round trip each. The upload pool
+  now spans file boundaries within a tablespace; manifest entries are
+  still emitted in tar order. A backup that fails or is cancelled during
+  the data transfer now waits for its in-flight uploads before closing
+  the repository. Before, an upload that landed late could panic the
+  process.
+- **The primary terminated `wal stream`'s walsender under load (#90).**
+  Status updates went out every 10 s, which is longer than CloudNativePG's
+  default `wal_sender_timeout` of 5 s. PostgreSQL's own reply-requested
+  keepalives sit behind unread WAL while the streamer is busy, so they
+  did not help. The walsender was killed every few minutes, the stream
+  fell behind, and `max_slot_wal_keep_size` could invalidate the slot.
+  `wal stream` now reads `wal_sender_timeout` from the walsender and caps
+  the status interval at a third of it (at least 100 ms).
+
 ## [1.6.0] — 2026-10-27
 
 ### Fixed

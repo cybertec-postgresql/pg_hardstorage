@@ -66,6 +66,37 @@ func (r CASRetention) retainUntil() time.Time {
 	return r.RetainUntil
 }
 
+// DefaultUploadConcurrency is how many PutChunk calls the bulk writers
+// (backup's tarsink, the WAL streamer) keep in flight by default, and
+// MaxUploadConcurrency the most an operator may ask for.
+//
+// It is deliberately NOT derived from GOMAXPROCS. A chunk write is
+// dominated by the storage round trip (one PUT, plus a HEAD and a
+// retention call when it dedups), not by the compress/encrypt CPU. Since
+// Go 1.25 GOMAXPROCS follows the cgroup CPU limit, so a pod limited to
+// 500m–1 core ran two uploads at a time: ~100 chunks/s against a remote
+// object store at 20 ms per request, ~20 GB/h for both backup and
+// `wal stream`, while the CPU sat idle (issue #90). Goroutines parked on
+// the network cost no CPU; the scheduler still bounds the CPU work to
+// GOMAXPROCS. Memory stays O(concurrency × max chunk size).
+const (
+	DefaultUploadConcurrency = 16
+	MaxUploadConcurrency     = 64
+)
+
+// ClampUploadConcurrency resolves a requested upload concurrency: 0 (or
+// negative) → DefaultUploadConcurrency, otherwise n capped at
+// MaxUploadConcurrency. 1 is the serial path.
+func ClampUploadConcurrency(n int) int {
+	if n <= 0 {
+		return DefaultUploadConcurrency
+	}
+	if n > MaxUploadConcurrency {
+		return MaxUploadConcurrency
+	}
+	return n
+}
+
 // CAS is a content-addressed object store layered on top of a StoragePlugin.
 //
 // The contract is simple: every chunk lives at a key derived from its

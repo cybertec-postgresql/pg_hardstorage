@@ -182,6 +182,11 @@ type TakeOptions struct {
 	// pick one value per deployment and keep it.
 	ChunkAvgSize int
 
+	// UploadConcurrency bounds how many chunks are written to the
+	// repository at once (0 = repo.DefaultUploadConcurrency; at most
+	// repo.MaxUploadConcurrency). See repo.DefaultUploadConcurrency.
+	UploadConcurrency int
+
 	// SpoolDir is where the backup's file-entry spool and canonical
 	// manifest are written while it runs (empty = os.TempDir()). The
 	// manifest of a very large database is hundreds of GB; it is spooled
@@ -729,7 +734,13 @@ func take(ctx context.Context, opts TakeOptions, abortCtx *context.Context) (*Re
 			return chunker.NewWithParams(avg/16, avg, avg*4)
 		}))
 	}
+	if opts.UploadConcurrency > 0 {
+		sinkOpts = append(sinkOpts, tarsink.WithChunkConcurrency(opts.UploadConcurrency))
+	}
 	sink := tarsink.New(ctx, cas, sinkOpts...)
+	// Before the CAS teardown deferred above: a failed BASE_BACKUP can
+	// leave the parser and its chunk uploads running (see tarsink.Close).
+	defer func() { _ = sink.Close() }()
 	backupTypeLabel = string(backupType)
 	started = true
 	metrics.BackupStarted(opts.Deployment, backupTypeLabel)
@@ -1116,6 +1127,10 @@ func validateOptions(o *TakeOptions) error {
 	if o.ChunkAvgSize != 0 && (o.ChunkAvgSize < 16<<10 || o.ChunkAvgSize > 16<<20) {
 		return output.NewError("usage.invalid_chunk_size",
 			fmt.Sprintf("backup: ChunkAvgSize %d is outside 16 KiB..16 MiB", o.ChunkAvgSize)).Wrap(output.ErrUsage)
+	}
+	if o.UploadConcurrency < 0 || o.UploadConcurrency > repo.MaxUploadConcurrency {
+		return output.NewError("usage.invalid_upload_concurrency",
+			fmt.Sprintf("backup: UploadConcurrency %d is outside 1..%d", o.UploadConcurrency, repo.MaxUploadConcurrency)).Wrap(output.ErrUsage)
 	}
 	// The deployment is interpolated into storage keys
 	// (manifests/<dep>/backups/..., wal/<dep>/...) and the backup ID.

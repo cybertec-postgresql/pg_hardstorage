@@ -196,7 +196,7 @@ func TestTarsink_MultipleFiles(t *testing.T) {
 
 // newSinkAndCASWithObserver mirrors newSinkAndCAS but registers a
 // FileObserver so the test can assert on per-file callbacks.
-func newSinkAndCASWithObserver(t *testing.T, obs tarsink.FileObserver) (*tarsink.Sink, *repo.CAS) {
+func newSinkAndCASWithObserver(t *testing.T, obs tarsink.FileObserver, opts ...tarsink.Option) (*tarsink.Sink, *repo.CAS) {
 	t.Helper()
 	root := t.TempDir()
 	sp := &fs.Plugin{}
@@ -205,7 +205,7 @@ func newSinkAndCASWithObserver(t *testing.T, obs tarsink.FileObserver) (*tarsink
 	}
 	t.Cleanup(func() { _ = sp.Close() })
 	cas := repo.NewCAS(sp)
-	return tarsink.New(context.Background(), cas, tarsink.WithFileObserver(obs)), cas
+	return tarsink.New(context.Background(), cas, append([]tarsink.Option{tarsink.WithFileObserver(obs)}, opts...)...), cas
 }
 
 // TestTarsink_FileObserver_FiresPerFile is the issue #9 happy path:
@@ -255,26 +255,37 @@ func TestTarsink_FileObserver_FiresPerFile(t *testing.T) {
 
 // TestTarsink_FileObserver_TracksDedup verifies the dedup counters
 // the verbose renderer leans on.  Two identical files should
-// chunk-equal — the second's stats report DedupedChunks == ChunkCount
-// and UniqueBytes == 0.
+// chunk-equal — run serially, the second's stats report
+// DedupedChunks == ChunkCount and UniqueBytes == 0.
+//
+// With concurrent uploads the two files' chunks are in flight together
+// (the pool spans files, issue #90), so which file's PutChunk lands
+// first — and is counted unique — is a race. Per-file attribution is
+// only deterministic serially; at any concurrency the totals must match.
 func TestTarsink_FileObserver_TracksDedup(t *testing.T) {
-	var stats []tarsink.FileStats
-	sink, _ := newSinkAndCASWithObserver(t, func(s tarsink.FileStats) {
-		stats = append(stats, s)
-	})
 	body := bytes.Repeat([]byte("dedup-me"), 16*1024) // 128 KiB, deterministic content
 	tarBytes := buildTar(t, []fileSpec{
 		{name: "twin/a", body: body},
 		{name: "twin/b", body: body}, // identical content
 	})
-	if err := drive(t, sink, 0, basebackup.TablespaceInfo{OID: 1663}, tarBytes, 0); err != nil {
-		t.Fatalf("drive: %v", err)
+	run := func(opts ...tarsink.Option) []tarsink.FileStats {
+		t.Helper()
+		var stats []tarsink.FileStats
+		sink, _ := newSinkAndCASWithObserver(t, func(s tarsink.FileStats) {
+			stats = append(stats, s)
+		}, opts...)
+		if err := drive(t, sink, 0, basebackup.TablespaceInfo{OID: 1663}, tarBytes, 0); err != nil {
+			t.Fatalf("drive: %v", err)
+		}
+		if len(stats) != 2 {
+			t.Fatalf("observer fired %d times; want 2", len(stats))
+		}
+		return stats
 	}
-	if len(stats) != 2 {
-		t.Fatalf("observer fired %d times; want 2", len(stats))
-	}
-	first := stats[0]
-	second := stats[1]
+
+	serial := run(tarsink.WithChunkConcurrency(1))
+	first := serial[0]
+	second := serial[1]
 	if first.DedupedChunks != 0 {
 		t.Errorf("first file reported %d deduped chunks; want 0 (nothing in CAS yet)",
 			first.DedupedChunks)
@@ -291,6 +302,14 @@ func TestTarsink_FileObserver_TracksDedup(t *testing.T) {
 	}
 	if second.UniqueBytes != 0 {
 		t.Errorf("second file UniqueBytes=%d; want 0 (full dedup)", second.UniqueBytes)
+	}
+
+	conc := run()
+	gotDeduped := conc[0].DedupedChunks + conc[1].DedupedChunks
+	gotUnique := conc[0].UniqueBytes + conc[1].UniqueBytes
+	if gotDeduped != second.ChunkCount || gotUnique != first.UniqueBytes {
+		t.Errorf("concurrent totals: deduped=%d unique=%d; want deduped=%d unique=%d (as serial)",
+			gotDeduped, gotUnique, second.ChunkCount, first.UniqueBytes)
 	}
 }
 

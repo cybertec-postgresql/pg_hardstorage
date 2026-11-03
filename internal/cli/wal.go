@@ -1332,6 +1332,8 @@ Resume LSN is determined automatically:
 		"exit on stream connection break instead of reconnecting; default behaviour reconnects with exponential backoff (1s → 30s) using EnsureSlot resume — survives Patroni failovers and PG bounces transparently")
 	DurationDaysVar(c.Flags(), &opts.maxReconnectBackoff, "max-reconnect-backoff", 30*time.Second,
 		"upper bound on the auto-reconnect backoff (initial 1s, doubles on each failure)")
+	c.Flags().IntVar(&opts.uploadConcurrency, "upload-concurrency", 0,
+		"chunk uploads kept in flight (1..64; default 16). Uploads wait on storage round trips, not CPU, so a high-latency object store benefits from more; 1 is serial")
 	c.Flags().StringVar(&opts.durability, "durability", "per-segment",
 		"WAL durability: per-segment (one syncfs per 16 MiB segment, the fast default) "+
 			"| per-chunk (fsync every chunk — slower, the 'fsync every object' opt-in)")
@@ -1385,6 +1387,7 @@ type walStreamOptions struct {
 	maxReconnectBackoff time.Duration
 	noInactivityTimeout bool
 	durability          string
+	uploadConcurrency   int // --upload-concurrency (0 = default)
 	// kekRef + kmsConfig select WAL encryption under a cloud KMS (issue
 	// #108). Empty kekRef keeps the automatic local-KEK posture (a keyring
 	// kek.bin encrypts WAL transparently). A cloud kekRef MUST match the
@@ -1668,6 +1671,11 @@ func runWalStream(cmd *cobra.Command, opts walStreamOptions) error {
 
 	if _, err := resolveDurability(opts.durability); err != nil {
 		return output.NewError("usage.bad_flag", err.Error()).Wrap(output.ErrUsage)
+	}
+	if opts.uploadConcurrency < 0 || opts.uploadConcurrency > repo.MaxUploadConcurrency {
+		return output.NewError("usage.bad_flag",
+			fmt.Sprintf("--upload-concurrency %d: want 1..%d (0 = default %d)",
+				opts.uploadConcurrency, repo.MaxUploadConcurrency, repo.DefaultUploadConcurrency)).Wrap(output.ErrUsage)
 	}
 	if opts.slotName == "" {
 		// PG replication slot names are [a-z0-9_]+ — hyphens
@@ -2254,6 +2262,7 @@ func streamAttempt(
 		// looks contiguous forever after.
 		ExpectedFirstLSN: startLSN,
 		Durability:       durabilityMode,
+		ChunkConcurrency: opts.uploadConcurrency,
 		// WORM thread: the streaming CAS already locks chunks
 		// (casdefault.NewWithRetention above), but the segment MANIFEST
 		// must be locked too — otherwise it can be deleted/overwritten

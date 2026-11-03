@@ -82,7 +82,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -392,7 +391,7 @@ type Options struct {
 
 	// ChunkConcurrency bounds how many of a segment's chunks are
 	// compressed/encrypted/written in parallel by the processor.
-	// 0 → min(GOMAXPROCS, 8); 1 → the legacy serial path.
+	// 0 → repo.DefaultUploadConcurrency; 1 → the serial path.
 	ChunkConcurrency int
 
 	// FaultHook, when non-nil, fires at named checkpoints in the
@@ -475,25 +474,17 @@ func New(cas *repo.CAS, sp storage.StoragePlugin, opts Options) (*Sink, error) {
 	return s, nil
 }
 
-// resolveChunkConcurrency mirrors tarsink: 0 → min(GOMAXPROCS, 8),
-// negative/1 → serial, capped at 8 (diminishing returns past that for
-// the compress+encrypt+Put mix, and a streamer should not monopolise a
-// many-core host).
+// resolveChunkConcurrency mirrors tarsink: 0 → repo.DefaultUploadConcurrency,
+// negative/1 → serial, capped at repo.MaxUploadConcurrency. Not derived
+// from GOMAXPROCS: a chunk write waits on the storage round trip, and a
+// CPU-limited pod (GOMAXPROCS 2) kept two uploads in flight — ~22 GB/h
+// against a WAL rate of 30-40 GB/h, so the stream fell ever further
+// behind (issue #90).
 func resolveChunkConcurrency(n int) int {
-	if n > 0 {
-		if n > 8 {
-			return 8
-		}
-		return n
+	if n < 0 {
+		return 1
 	}
-	g := runtime.GOMAXPROCS(0)
-	if g > 8 {
-		g = 8
-	}
-	if g < 1 {
-		g = 1
-	}
-	return g
+	return repo.ClampUploadConcurrency(n)
 }
 
 // OnRecord implements replication.WALSink. It buffers WAL bytes into
