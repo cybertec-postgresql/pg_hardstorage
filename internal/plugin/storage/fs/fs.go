@@ -371,7 +371,18 @@ func (p *Plugin) Put(ctx context.Context, key string, r io.Reader, opts storage.
 	if err != nil {
 		return storage.PutResult{}, err
 	}
-	if err := mkdirAllRetry(filepath.Dir(full)); err != nil {
+	mkdir := mkdirAllRetry
+	if opts.IfNotExists && opts.Durability == storage.DurabilityDeferred && barrierPersistsNewDirs {
+		// A deferred create always stages a file, so the Barrier that
+		// publishes it runs; where that Barrier is syncfs it persists
+		// this directory's entry too, and fsyncing each new directory
+		// here is pure cost. A first backup into a fresh repository
+		// creates up to 65,536 chunks/sha256/aa/bb buckets, and those
+		// fsyncs — serialised through the filesystem journal — were
+		// ~40% of its wall time (issue #90).
+		mkdir = mkdirAllNoSyncRetry
+	}
+	if err := mkdir(filepath.Dir(full)); err != nil {
 		return storage.PutResult{}, fmt.Errorf("fs: mkdir parent of %q: %w", key, err)
 	}
 
@@ -879,10 +890,18 @@ const pruneRaceRetries = 100
 
 // mkdirAllRetry is mkdirAllDurable, retried when it loses a race with
 // PruneEmptyDirs (the directory it just saw, or created, vanished again).
-func mkdirAllRetry(dir string) error {
+func mkdirAllRetry(dir string) error { return retryPruneRace(dir, mkdirAllDurable) }
+
+// mkdirAllNoSyncRetry is mkdirAllRetry without the directory fsyncs, for
+// callers whose Barrier makes new directory entries durable (see Put).
+func mkdirAllNoSyncRetry(dir string) error {
+	return retryPruneRace(dir, func(d string) error { return os.MkdirAll(d, repoDirMode) })
+}
+
+func retryPruneRace(dir string, mkdir func(string) error) error {
 	var err error
 	for i := 0; i < pruneRaceRetries; i++ {
-		if err = mkdirAllDurable(dir); err == nil ||
+		if err = mkdir(dir); err == nil ||
 			!(errors.Is(err, stdfs.ErrExist) || errors.Is(err, stdfs.ErrNotExist)) {
 			return err
 		}

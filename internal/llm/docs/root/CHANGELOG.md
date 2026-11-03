@@ -39,6 +39,16 @@ keeps reading that version for at least 24 months after a successor lands.
   fell behind, and `max_slot_wal_keep_size` could invalidate the slot.
   `wal stream` now reads `wal_sender_timeout` from the walsender and caps
   the status interval at a third of it (at least 100 ms).
+- **The first backup into a fresh `file://` repository spent most of
+  its time on directory fsyncs.** Every new chunk directory
+  (`chunks/sha256/aa/bb`, up to 65,536 of them) was fsynced along with
+  its parent as it was created. On ext4 those fsyncs serialise on the
+  journal: a 47 GB backup ran at 66 MB/s, against 115 MB/s with the
+  directories already in place. On
+  Linux the end-of-backup barrier already calls `syncfs`, which persists
+  new directory entries too, so deferred chunk writes now create their
+  directories without a per-directory fsync. Other platforms keep the
+  per-directory fsync.
 
 ## [1.6.0] — 2026-10-27
 
