@@ -49,6 +49,19 @@ keeps reading that version for at least 24 months after a successor lands.
   new directory entries too, so deferred chunk writes now create their
   directories without a per-directory fsync. Other platforms keep the
   per-directory fsync.
+- **`verify --full` took minutes on many-file backups (#90).** It restores
+  into a throwaway directory before running `pg_verifybackup`, and that
+  restore wrote one file at a time and fsynced each one. On a 68k-file
+  backup it took 1,212 s; it now takes about 55 s. The scratch restore no
+  longer fsyncs, since nobody starts a cluster from it. The agent's
+  scheduled verify gets the same change.
+- **Restores write files in parallel (#90).** `restore` used to write one
+  file at a time, verifying and decompressing each file's chunks on a
+  single core and paying one fsync latency per file. Files are now
+  written on a pool of 16. Every file is still fsynced, and the resume
+  checkpoint records a file only after it is on disk. A 68k-file restore
+  went from 22 s to 10 s with fsync costs excluded; with fsync the
+  overlap matters far more.
 
 ## [1.6.0] — 2026-10-27
 
