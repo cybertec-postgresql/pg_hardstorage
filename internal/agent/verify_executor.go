@@ -187,9 +187,12 @@ func (e *VerifyExecutor) Execute(ctx context.Context, job *ControlPlaneJob, prog
 		Deployment: job.Deployment,
 		BackupID:   backupID,
 		TargetDir:  tmp,
-		Verifier:   e.verifier,
-		KEKForRef:  kekFor,
-		UnwrapDEK:  e.unwrapDEK,
+		// tmp is removed after the sandbox check: no per-file fsync
+		// (issue #90).
+		ScratchTarget: true,
+		Verifier:      e.verifier,
+		KEKForRef:     kekFor,
+		UnwrapDEK:     e.unwrapDEK,
 		// Audit-chain Actor for the inner restore: tags the
 		// restore.complete event with "verify:job:<id>" so a forensic
 		// walk distinguishes verify-driven sandbox restores from
