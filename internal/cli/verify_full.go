@@ -117,11 +117,14 @@ func runVerifyFull(cmd *cobra.Command, deployment, backupID, repoURL, pgMajorOve
 	kmsCfg, _ := cmd.Flags().GetStringToString("kms-config")
 	kmsProviderFor := deploymentKMSResolver(kmsCfg)
 
+	// Tablespaces go under tmp too, never to their recorded paths.
+	dataDir, tsRemap, tsDirs := restore.ScratchLayout(m, tmp)
 	if _, err := restore.Restore(cmd.Context(), restore.Options{
-		RepoURL:    repoURL,
-		Deployment: deployment,
-		BackupID:   backupID,
-		TargetDir:  tmp,
+		RepoURL:         repoURL,
+		Deployment:      deployment,
+		BackupID:        backupID,
+		TargetDir:       dataDir,
+		TablespaceRemap: tsRemap,
 		// tmp is removed once pg_verifybackup has run: no per-file
 		// fsync (issue #90).
 		ScratchTarget: true,
@@ -157,8 +160,9 @@ func runVerifyFull(cmd *cobra.Command, deployment, backupID, repoURL, pgMajorOve
 
 	// 2. Sandbox verify.
 	res, err := sandbox.Verify(cmd.Context(), sandbox.Options{
-		DataDir: tmp,
-		PGMajor: major,
+		DataDir:    dataDir,
+		ExtraBinds: tsDirs,
+		PGMajor:    major,
 		// The restore above writes backup_manifest whenever the
 		// manifest carries it — so a "could not open backup_manifest"
 		// from pg_verifybackup is an environment fault, not a skip.

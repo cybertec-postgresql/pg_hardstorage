@@ -182,11 +182,14 @@ func (e *VerifyExecutor) Execute(ctx context.Context, job *ControlPlaneJob, prog
 		kekFor = keystore.KEKResolver(e.keyringDir)
 	}
 
+	// Tablespaces go under tmp too, never to their recorded paths.
+	dataDir, tsRemap, tsDirs := restore.ScratchLayout(m, tmp)
 	if _, err := restore.Restore(ctx, restore.Options{
-		RepoURL:    repoURL,
-		Deployment: job.Deployment,
-		BackupID:   backupID,
-		TargetDir:  tmp,
+		RepoURL:         repoURL,
+		Deployment:      job.Deployment,
+		BackupID:        backupID,
+		TargetDir:       dataDir,
+		TablespaceRemap: tsRemap,
 		// tmp is removed after the sandbox check: no per-file fsync
 		// (issue #90).
 		ScratchTarget: true,
@@ -210,8 +213,9 @@ func (e *VerifyExecutor) Execute(ctx context.Context, job *ControlPlaneJob, prog
 	})
 
 	res, err := sandbox.Verify(ctx, sandbox.Options{
-		DataDir: tmp,
-		PGMajor: major,
+		DataDir:    dataDir,
+		ExtraBinds: tsDirs,
+		PGMajor:    major,
 		// The restore above writes backup_manifest whenever the
 		// manifest carries it — so a "could not open backup_manifest"
 		// from pg_verifybackup is an environment fault, not a skip.

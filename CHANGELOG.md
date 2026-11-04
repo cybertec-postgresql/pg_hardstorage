@@ -13,6 +13,14 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **`verify --full` failed on any backup with a non-default tablespace
+  when run on the database host.** Its scratch restore put tablespaces
+  at their recorded paths, so the restore refused with
+  `preflight.tablespace_not_empty`; on another host it wrote them there
+  and never removed them. The scratch restore, in the CLI and in agent
+  verify jobs, now keeps PGDATA and every tablespace under its temp
+  directory and mounts the tablespace directories into the sandbox.
+
 - **Backup and `wal stream` throughput was capped near 20 GB/h on
   CPU-limited hosts (#90).** Upload concurrency was `min(GOMAXPROCS, 8)`,
   and since Go 1.25 GOMAXPROCS follows the cgroup CPU limit, so a pod
