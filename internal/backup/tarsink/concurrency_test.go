@@ -233,18 +233,13 @@ func TestConcurrency_SmallFilesOverlapAcrossFiles(t *testing.T) {
 		tarsink.WithEntryStream(rec),
 		tarsink.WithFileObserver(func(fs tarsink.FileStats) { observed = append(observed, fs.Path) }))
 
-	start := time.Now()
 	if err := drive(t, sink, 0, basebackup.TablespaceInfo{OID: 1663}, tarBytes, 64*1024); err != nil {
 		t.Fatalf("drive: %v", err)
 	}
-	elapsed := time.Since(start)
-
+	// Peak concurrency, not wall time: a timing bound fails on a loaded
+	// host even when files overlap.
 	if p := sp.peak.Load(); p < conc/2 {
 		t.Fatalf("peak concurrent Puts = %d, want >= %d: small files are not overlapping", p, conc/2)
-	}
-	// Serial would be ~nFiles × delay (~0.8 s); overlapped is a fraction.
-	if serial := time.Duration(nFiles) * sp.delay; elapsed > serial/2 {
-		t.Errorf("backup of %d one-chunk files took %v; serial would be %v", nFiles, elapsed, serial)
 	}
 
 	var want []string

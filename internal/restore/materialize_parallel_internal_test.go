@@ -76,7 +76,6 @@ func TestMaterializeAll_OverlapsFilesAndReportsEachOnce(t *testing.T) {
 	dest := t.TempDir()
 	var mu sync.Mutex
 	seen := map[string]int{}
-	start := time.Now()
 	err := materializeAll(context.Background(), cas, m, false,
 		func(f *backup.FileEntry) (string, bool, error) { return dest, false, nil },
 		func(f *backup.FileEntry, bw int64, ck int) error {
@@ -92,7 +91,6 @@ func TestMaterializeAll_OverlapsFilesAndReportsEachOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	elapsed := time.Since(start)
 	if len(seen) != n {
 		t.Fatalf("done reported %d files, want %d", len(seen), n)
 	}
@@ -101,11 +99,10 @@ func TestMaterializeAll_OverlapsFilesAndReportsEachOnce(t *testing.T) {
 			t.Fatalf("%s reported done %d times", p, c)
 		}
 	}
+	// Peak concurrency, not wall time: a timing bound fails on a loaded
+	// host even when files overlap.
 	if p := sp.peak.Load(); p < materializeConcurrency/2 {
 		t.Fatalf("peak concurrent chunk fetches = %d; files are not overlapping", p)
-	}
-	if serial := time.Duration(n) * sp.delay; elapsed > serial/3 {
-		t.Errorf("%d files took %v; serial would be %v", n, elapsed, serial)
 	}
 }
 
