@@ -11,6 +11,20 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A base backup no longer aborts on a chunk that is already locked
+  longer than it needs.** Adopting a deduplicated chunk extends its WORM
+  lock to the backup's deadline; S3 Object Lock refuses that request when
+  the existing lock runs later, which `wal stream` causes routinely (it
+  locks shared chunks under its moving deadline plus headroom while a
+  long base backup holds a fixed one). The refusal failed the whole
+  backup, after hours. The CAS now reads the lock back
+  (`storage.RetentionAware`, S3 `GetObjectRetention`) and adopts the
+  chunk when the existing lock covers the deadline in an equal or
+  stronger mode; otherwise it fails as before. The writer additionally
+  needs `s3:GetObjectRetention`.
+
 ## [1.6.0] — 2026-10-27
 
 ### Fixed

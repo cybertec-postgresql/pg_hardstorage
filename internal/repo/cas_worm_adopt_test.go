@@ -2,6 +2,7 @@ package repo_test
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -134,5 +135,116 @@ func TestCAS_MovingDeadlineReExtendsOnSeenHit(t *testing.T) {
 	}
 	if got := rec.calls(repo.ChunkKey(ci.Hash)); len(got) != 1 {
 		t.Errorf("re-extended inside the headroom: %v", got)
+	}
+}
+
+type objectLock struct {
+	until time.Time
+	mode  storage.WORMMode
+}
+
+// objectLockStore mimics S3 Object Lock on top of a plain backend: it
+// refuses to shorten a lock or weaken its mode, and reads locks back.
+type objectLockStore struct {
+	storage.StoragePlugin
+	mu    sync.Mutex
+	locks map[string]objectLock
+	calls int
+}
+
+var errShortens = errors.New("AccessDenied: proposed retain-until date shortens an existing retention period")
+
+func (s *objectLockStore) Capabilities() storage.Capabilities {
+	c := s.StoragePlugin.Capabilities()
+	c.WORM = true
+	return c
+}
+
+func (s *objectLockStore) SetRetention(_ context.Context, key string, until time.Time, mode storage.WORMMode) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.calls++
+	if cur, ok := s.locks[key]; ok && (until.Before(cur.until) || !mode.Covers(cur.mode)) {
+		return errShortens
+	}
+	s.locks[key] = objectLock{until: until, mode: mode}
+	return nil
+}
+
+func (s *objectLockStore) Retention(_ context.Context, key string) (time.Time, storage.WORMMode, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	l := s.locks[key]
+	return l.until, l.mode, nil
+}
+
+// noReadBack hides RetentionAware: a backend that cannot report locks.
+type noReadBack struct{ storage.StoragePlugin }
+
+// A base backup runs for hours with a fixed deadline taken at its start,
+// while `wal stream` keeps locking shared chunks under its moving
+// deadline plus headroom. The backup then meets a chunk locked LATER
+// than it asks for; S3 refuses the shortening, and that refusal used to
+// abort the whole backup although the chunk is protected long enough.
+func TestCAS_AdoptionAcceptsLongerExistingLock(t *testing.T) {
+	need := time.Date(2026, 11, 9, 2, 0, 0, 0, time.UTC)
+	cases := []struct {
+		name     string
+		existing objectLock
+		want     storage.WORMMode
+		readBack bool
+		ok       bool
+	}{
+		{"longer lock, same mode", objectLock{need.Add(6 * time.Hour), storage.WORMGovernance}, storage.WORMGovernance, true, true},
+		{"longer by milliseconds", objectLock{need.Add(52 * time.Millisecond), storage.WORMGovernance}, storage.WORMGovernance, true, true},
+		{"longer compliance covers governance", objectLock{need.Add(time.Hour), storage.WORMCompliance}, storage.WORMGovernance, true, true},
+		{"longer governance does not cover compliance", objectLock{need.Add(time.Hour), storage.WORMGovernance}, storage.WORMCompliance, true, false},
+		{"backend cannot read the lock back", objectLock{need.Add(time.Hour), storage.WORMGovernance}, storage.WORMGovernance, false, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			sp, _ := newGCRepo(t)
+			body := []byte("chunk shared with wal stream")
+			first, err := repo.NewCAS(sp).PutChunk(ctx, body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			store := &objectLockStore{StoragePlugin: sp, locks: map[string]objectLock{
+				repo.ChunkKey(first.Hash): tc.existing,
+			}}
+			var backend storage.StoragePlugin = store
+			if !tc.readBack {
+				backend = noReadBack{store}
+			}
+
+			c := repo.NewCAS(backend, repo.WithRetention(repo.CASRetention{RetainUntil: need, Mode: tc.want}))
+			ci, err := c.PutChunk(ctx, body)
+			if !tc.ok {
+				if err == nil {
+					t.Fatal("adopted a chunk whose lock does not cover the manifest's promise")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("adoption failed although the existing lock covers %v: %v", need, err)
+			}
+			if !ci.Deduped {
+				t.Fatal("expected a dedup hit")
+			}
+			if got := store.locks[repo.ChunkKey(first.Hash)]; got != tc.existing {
+				t.Errorf("lock changed to %v, want %v untouched", got, tc.existing)
+			}
+
+			// The read-back lock is remembered: a repeat hit in the same
+			// backup asks the backend nothing.
+			calls := store.calls
+			if _, err := c.PutChunk(ctx, body); err != nil {
+				t.Fatal(err)
+			}
+			if store.calls != calls {
+				t.Errorf("repeat hit called SetRetention again (%d -> %d)", calls, store.calls)
+			}
+		})
 	}
 }
