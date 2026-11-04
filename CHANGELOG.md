@@ -13,6 +13,14 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **Backups failed with "inactivity timeout" when the server's start
+  checkpoint took longer than 90 s.** PostgreSQL sends nothing on the
+  BASE_BACKUP connection until the checkpoint finishes, so many dirty
+  buffers on a busy disk (seen: 103 s for an incremental backup) hit
+  the 90 s stream watchdog. The wait for the start LSN now has its own
+  30-minute window, and a timeout there names the start checkpoint;
+  once data flows the 90 s window applies again.
+
 - **`verify --full` failed on any backup with a non-default tablespace
   when run on the database host.** Its scratch restore put tablespaces
   at their recorded paths, so the restore refused with
