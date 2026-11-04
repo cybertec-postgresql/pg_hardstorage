@@ -363,6 +363,13 @@ func (t *Throttle) ReapStaging(ctx context.Context, olderThan time.Duration) (st
 	return storage.ReapStats{Unsupported: true}, nil
 }
 
+// Retention delegates via storage.RetentionOf so the CAS can read an
+// adopted chunk's lock through the wrapper. Metadata-only, not
+// throttled.
+func (t *Throttle) Retention(ctx context.Context, key string) (time.Time, storage.WORMMode, error) {
+	return storage.RetentionOf(ctx, t.inner, key)
+}
+
 // Compile-time assertions that we satisfy StoragePlugin and forward
 // every optional capability interface. A middleware that drops one
 // turns a backend that HAS the capability into one that reports it
@@ -373,4 +380,5 @@ var (
 	_ storage.RegionAware      = (*Throttle)(nil)
 	_ storage.FreeSpaceAware   = (*Throttle)(nil)
 	_ storage.StagingReapAware = (*Throttle)(nil)
+	_ storage.RetentionAware   = (*Throttle)(nil)
 )
