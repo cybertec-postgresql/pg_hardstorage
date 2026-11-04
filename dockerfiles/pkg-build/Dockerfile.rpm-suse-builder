@@ -28,7 +28,7 @@ RUN zypper -n install --no-recommends \
 # wasn't available (older Leap, custom repo set).  Pull
 # upstream Go tarball as a fallback so the spec's BuildRequires
 # is satisfied either way.
-ARG GO_VERSION=1.26.0
+ARG GO_VERSION=1.26.10
 RUN if ! command -v go >/dev/null 2>&1; then \
         arch="$(uname -m)"; \
         case "$arch" in \

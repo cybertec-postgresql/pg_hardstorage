@@ -11,6 +11,17 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ## [Unreleased]
 
+### Security
+
+- **Built with Go 1.26.10 and `golang.org/x/net` v0.62.0.** The previous
+  toolchain (1.26.6) left 12 standard-library vulnerabilities reachable
+  from our code: `net/http` and http2 (also in `x/net`), `crypto/tls`,
+  `crypto/x509` (GO-2026-6809), `html/template`, `mime/multipart`. The
+  release workflows were on Go 1.26.5, and the `.deb`/`.rpm` builder
+  images installed Go 1.26.0 with `GOTOOLCHAIN=local`, so packages did
+  not get the toolchain `go.mod` asked for; every pin is now 1.26.10.
+  `golang.org/x/crypto` moves to v0.58.0.
+
 ### Fixed
 
 - **Backups failed with "inactivity timeout" when the server's start

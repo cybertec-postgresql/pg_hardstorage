@@ -33,7 +33,7 @@ RUN apt-get update \
 # which is < 1.26 the package requires.  Pull the latest stable
 # tarball from go.dev/dl and put `go` on PATH.  Same approach
 # the project's CI uses; keeps the build env reproducible.
-ARG GO_VERSION=1.26.0
+ARG GO_VERSION=1.26.10
 RUN arch="$(dpkg --print-architecture)" \
  && case "$arch" in \
         amd64)   gotar="go${GO_VERSION}.linux-amd64.tar.gz"  ;; \
