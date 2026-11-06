@@ -282,6 +282,14 @@ millions of chunks) prefer `sftp://`.  For repos with
 fewer larger objects (snapshot-style backup, small WAL
 volume), the difference is negligible.
 
+The backend keeps at most 8 sessions open on its connection, whatever
+`--upload-concurrency` and `--fetch-concurrency` say, because sshd
+refuses a channel beyond `MaxSessions` (default 10) per connection.
+Further operations wait for a free session. If the server sets
+`MaxSessions` below 8, the surplus opens are refused and retried for a
+few seconds, which is slow; raise `MaxSessions` or lower the two
+concurrency flags to match.
+
 ## Next steps
 
 - [Add a deployment](deployment.md) wired to this repo

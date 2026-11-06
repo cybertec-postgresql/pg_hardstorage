@@ -221,6 +221,16 @@ keeps reading that version for at least 24 months after a successor lands.
   signing input is still held in RAM. `audit verify-bundle` still reads
   a bundle into memory and refuses an `events.ndjson` over 1 GiB.
 
+- **`scp://` repositories failed under the new upload and read
+  concurrency.** Every remote command is an SSH session, and a stock
+  sshd allows 10 per connection (`MaxSessions`). With 16 chunk uploads
+  or reads in flight the server refused channels (`ssh: rejected:
+  connect failed ("open failed")`), and a refusal that outlasted the
+  0.3 s retry failed the backup or restore. The backend now keeps at
+  most 8 sessions open and queues the rest, and retries a refused open
+  for about four seconds. Found by the release validation
+  (`TestFaultSoak/scp`); `sftp://` is not affected, it uses one channel.
+
 ### Changed
 
 - **S3 multipart uploads send up to 4 parts in parallel** instead of one

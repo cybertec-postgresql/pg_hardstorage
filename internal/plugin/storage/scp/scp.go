@@ -124,6 +124,11 @@ type Plugin struct {
 	dead       bool   // set when the transport is found dead; cleared by redial
 	lastRedial time.Time
 	closed     bool
+
+	// slots bounds the sessions open at once (see maxOpenSessions).
+	// Created on first use so a Plugin built without Open works too.
+	slotsOnce sync.Once
+	slots     chan struct{}
 }
 
 // Name implements storage.StoragePlugin.
@@ -648,34 +653,102 @@ func (p *Plugin) SetRetention(ctx context.Context, key string, until time.Time, 
 // Keep the command line as the sole argument; never interpolate
 // user-controlled keys without `shellQuote()`.
 
-// newSession opens an SSH session with a small bounded retry on
-// channel-open rejection. sshd's default MaxSessions is 10; a burst of
-// concurrent Puts (each using short-lived sessions for upload + commit
-// + cleanup) can transiently exceed it, and the server answers
-// "rejected: connect failed (open failed)". That is backpressure, not
-// failure — retrying after a short jittered pause keeps the plugin
-// correct against DEFAULT sshd configs (the contract suite's
+// maxOpenSessions is how many SSH sessions the plugin keeps open on its
+// connection at once. Every remote command is a session, and sshd
+// refuses a channel beyond MaxSessions (default 10) per connection.
+// Backup keeps 16 chunk uploads in flight and restore 16 reads (issues
+// #90, #97), so without a bound of its own the plugin ran into that
+// refusal as a matter of course, and a refusal that outlasted the retry
+// below failed the Put or Get — and the backup or restore with it.
+// Eight leaves room for sessions the server has not finished closing.
+const maxOpenSessions = 8
+
+// sessionSlotWait is how long newSession waits for one of its own
+// slots before opening a session anyway. The bound is there to stay
+// under the server's limit, not to serialise callers: a caller that
+// holds a session while it opens another (a listing whose consumer
+// reads each object) must not be able to wait on itself forever.
+var sessionSlotWait = 5 * time.Second
+
+// session is an ssh.Session that gives its slot back when closed.
+type session struct {
+	*ssh.Session
+	release func()
+}
+
+// Close closes the session and frees its slot. Safe to call twice.
+func (s *session) Close() error {
+	err := s.Session.Close()
+	s.release()
+	return err
+}
+
+// acquireSlot takes a session slot and returns the function that frees
+// it (idempotent). After sessionSlotWait it gives up waiting and returns
+// a no-op: see sessionSlotWait.
+func (p *Plugin) acquireSlot(ctx context.Context) (func(), error) {
+	p.slotsOnce.Do(func() { p.slots = make(chan struct{}, maxOpenSessions) })
+	t := time.NewTimer(sessionSlotWait)
+	defer t.Stop()
+	select {
+	case p.slots <- struct{}{}:
+		var once sync.Once
+		return func() { once.Do(func() { <-p.slots }) }, nil
+	case <-t.C:
+		return func() {}, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// sessionOpenAttempts and sessionOpenBackoff bound the retry of a
+// refused channel open: 20 ms doubling to half a second, about four
+// seconds in all.
+const sessionOpenAttempts = 12
+
+func sessionOpenBackoff(attempt int) time.Duration {
+	d := 20 * time.Millisecond << attempt
+	if d > 500*time.Millisecond {
+		d = 500 * time.Millisecond
+	}
+	return d
+}
+
+// newSession opens an SSH session, holding one of the plugin's session
+// slots until the session is closed, with a bounded retry on
+// channel-open rejection. The slots keep the plugin under sshd's
+// MaxSessions; the server can still answer "rejected: connect failed
+// (open failed)" for a moment, because it counts a session until it has
+// finished closing it, and after the slot wait ran out. That is
+// backpressure, not failure — retrying after a short pause keeps the
+// plugin correct against DEFAULT sshd configs (the contract suite's
 // ParallelPuts runs against one).
 //
 // A session that cannot be opened because the TRANSPORT is gone
 // (keepalive teardown, peer restart, reset) marks the connection dead
 // and is retried once over a fresh dial — see keepalive.go.
-func (p *Plugin) newSession() (*ssh.Session, uint64, error) {
+func (p *Plugin) newSession(ctx context.Context) (*session, uint64, error) {
+	release, err := p.acquireSlot(ctx)
+	if err != nil {
+		return nil, 0, err
+	}
 	var lastErr error
 	redialed := false
-	for attempt := 0; attempt < 5; attempt++ {
+	for attempt := 0; attempt < sessionOpenAttempts; attempt++ {
 		cli, gen, cerr := p.conn()
 		if cerr != nil {
+			release()
 			return nil, 0, cerr
 		}
 		sess, err := cli.NewSession()
 		if err == nil {
-			return sess, gen, nil
+			return &session{Session: sess, release: release}, gen, nil
 		}
 		lastErr = err
 		if isTransportGone(err) {
 			p.markDead(gen)
 			if redialed {
+				release()
 				return nil, 0, err
 			}
 			redialed = true
@@ -683,15 +756,22 @@ func (p *Plugin) newSession() (*ssh.Session, uint64, error) {
 		}
 		msg := err.Error()
 		if !strings.Contains(msg, "rejected") && !strings.Contains(msg, "open failed") {
+			release()
 			return nil, 0, err
 		}
-		time.Sleep(time.Duration(20*(attempt+1)) * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			release()
+			return nil, 0, ctx.Err()
+		case <-time.After(sessionOpenBackoff(attempt)):
+		}
 	}
+	release()
 	return nil, 0, lastErr
 }
 
 func (p *Plugin) runShell(ctx context.Context, command string) (string, error) {
-	sess, _, err := p.newSession()
+	sess, _, err := p.newSession(ctx)
 	if err != nil {
 		return "", fmt.Errorf("scp: new session: %w", err)
 	}
@@ -731,7 +811,7 @@ func (e *remoteCmdError) Unwrap() error { return e.err }
 // if any, is runShell's: the command's failure with its stderr, or the
 // context's error.
 func (p *Plugin) runShellLines(ctx context.Context, command string, fn func(line string) bool) error {
-	sess, gen, err := p.newSession()
+	sess, gen, err := p.newSession(ctx)
 	if err != nil {
 		return fmt.Errorf("scp: new session: %w", err)
 	}
@@ -799,7 +879,7 @@ func (c *cappedBuffer) String() string { return c.buf.String() }
 // uploadVia opens a session for command (typically `cat > path`)
 // and streams r to its stdin.  Returns the byte count.
 func (p *Plugin) uploadVia(ctx context.Context, command string, r io.Reader) (int64, error) {
-	sess, _, err := p.newSession()
+	sess, _, err := p.newSession(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("scp: new session: %w", err)
 	}
@@ -852,7 +932,7 @@ func (p *Plugin) uploadVia(ctx context.Context, command string, r io.Reader) (in
 // and returns a ReadCloser that drains stdout.  Closing the
 // reader closes the session.
 func (p *Plugin) streamRead(ctx context.Context, command string, classify func(error) error) (io.ReadCloser, error) {
-	sess, gen, err := p.newSession()
+	sess, gen, err := p.newSession(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("scp: new session: %w", err)
 	}
@@ -879,7 +959,7 @@ func (p *Plugin) streamRead(ctx context.Context, command string, classify func(e
 // sessionReader pairs an ssh.Session with its stdout pipe so
 // closing the reader tears down the session.
 type sessionReader struct {
-	sess   *ssh.Session
+	sess   *session
 	stdout io.Reader
 	ctx    context.Context
 
