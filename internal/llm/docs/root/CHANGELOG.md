@@ -217,6 +217,10 @@ keeps reading that version for at least 24 months after a successor lands.
   `go test -race ./internal/audit/` no longer runs into its deadline.
 - Removed unused code found by `staticcheck` / `unused` (about 40
   functions, fields and dead assignments).
+- **The Homebrew cask no longer uses the deprecated `postflight`
+  block (#91).** The quarantine-attribute removal on macOS is declared
+  through goreleaser's `install_steps` (2.19 or later) and lands in the
+  cask as `postflight_steps`.
 
 ## [1.6.0] — 2026-10-27
 
