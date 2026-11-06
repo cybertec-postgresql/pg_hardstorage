@@ -172,6 +172,17 @@ On OpenSSH servers the commit uses the protocol extensions:
   published. SFTP cannot fsync the directory entry, so the
   backend does not claim inline durability.
 
+## Empty directories after `repo gc`
+
+`repo gc --apply` removes the directories its deletes left empty
+(`chunks/sha256/xx/yy`, the directory of a reaped manifest temp),
+the way the filesystem backend does. They go by SFTP `rmdir`,
+which the server refuses for a directory that is not empty, so a
+backup running beside gc cannot lose an object; a writer whose
+directory was pruned a moment before its write re-creates it and
+carries on. The repository root and the top-level directories that
+still hold objects stay.
+
 ## Troubleshooting
 
 **`extras.known_hosts is required`** — the plugin refuses to

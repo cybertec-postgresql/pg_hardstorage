@@ -737,8 +737,9 @@ func Sweep(ctx context.Context, sp storage.StoragePlugin, opts SweepOptions) (*S
 		res.StaleTempDeleted++
 	}
 
-	// Empty directories the deletes left behind (fs: chunks/sha256/xx/yy
-	// shells, the id directory of a reaped manifest temp). Best-effort.
+	// Empty directories the deletes left behind (fs, sftp, scp:
+	// chunks/sha256/xx/yy shells, the id directory of a reaped manifest
+	// temp). Best-effort.
 	// Always, not only after deleting: a run that crashed or hit faults after
 	// its deletes must still be cleaned up by the next one.
 	for _, prefix := range []string{"chunks", "manifests", "wal", "logical"} {

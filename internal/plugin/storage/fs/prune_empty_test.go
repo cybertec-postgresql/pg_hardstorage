@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage/contract"
 )
 
 func openPruneFS(t *testing.T) (*Plugin, string) {
@@ -42,6 +43,18 @@ func TestPruneEmptyDirs_Basic(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(root, "chunks")); err != nil {
 		t.Fatal("prefix itself must stay")
 	}
+}
+
+// The shared EmptyDirPruner clauses, run against the reference
+// implementation: sftp and scp are held to the same contract, so it has
+// to describe what fs actually does.
+func TestPruneEmptyDirs_Contract(t *testing.T) {
+	p, root := openPruneFS(t)
+	contract.PruneEmptyDirs(t, p)
+	if _, err := os.Stat(root); err != nil {
+		t.Fatalf("store root after pruning it: %v", err)
+	}
+	contract.PruneRacesWriters(t, p, 4, 200)
 }
 
 // Puts racing the prune must never fail because their directory vanished.

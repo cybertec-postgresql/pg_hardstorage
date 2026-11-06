@@ -33,8 +33,8 @@
 // permit ssh-exec; some embedded / appliance SSH servers don't
 // implement SFTP at all.  The scp:// backend talks to those
 // servers using the same set of remote-shell primitives `scp`
-// itself uses — `cat`, `stat`, `find`, `mv`, `rm`, `mkdir`.  No
-// SFTP subsystem required.
+// itself uses — `cat`, `stat`, `find`, `mv`, `ln`, `rm`, `mkdir`,
+// `rmdir`.  No SFTP subsystem required.
 //
 // # What this backend is NOT
 //
@@ -304,15 +304,12 @@ func (p *Plugin) Put(ctx context.Context, key string, r io.Reader, opts storage.
 		}
 	}
 
-	if err := p.mkdirAll(ctx, path.Dir(full)); err != nil {
-		return storage.PutResult{}, err
-	}
-
 	tmp := full + ".hstmp-" + randomSuffix()
-	// Flush the staged bytes before anything publishes them: a link or
-	// rename of an un-synced file can survive a crash as a truncated
-	// object at the real key.
-	written, err := p.uploadVia(ctx, "cat > "+shellQuote(tmp)+" && "+syncCommand(tmp), r)
+	// stageCommand creates the parent directory as well, and flushes the
+	// staged bytes before anything publishes them: a link or rename of
+	// an un-synced file can survive a crash as a truncated object at the
+	// real key.
+	written, err := p.uploadVia(ctx, stageCommand(tmp), r)
 	if err != nil {
 		_, _ = p.runShell(ctx, "rm -f "+shellQuote(tmp))
 		return storage.PutResult{}, fmt.Errorf("scp: write tmp %s: %w", tmp, err)
@@ -544,18 +541,14 @@ func (p *Plugin) RenameIfNotExists(ctx context.Context, src, dst string) error {
 	} else if exists {
 		return storage.ErrAlreadyExists
 	}
-	// Create the destination's parent, matching the fs reference
-	// implementation (fs.RenameIfNotExists does os.MkdirAll). Today's
-	// callers rename within one directory — a manifest's staging file
-	// sits beside its final key — so the parent always happened to
+	// linkCommand creates the destination's parent too, matching the fs
+	// reference implementation (fs.RenameIfNotExists does os.MkdirAll).
+	// Today's callers rename within one directory — a manifest's staging
+	// file sits beside its final key — so the parent always happened to
 	// exist and the gap was invisible. A cross-prefix rename failed
 	// with a bare "No such file or directory" on scp/sftp while
 	// succeeding on fs:// and s3://.
-	if err := p.mkdirAll(ctx, path.Dir(dstFull)); err != nil {
-		return err
-	}
-	if _, lerr := p.runShell(ctx, "ln -T "+shellQuote(srcFull)+" "+shellQuote(dstFull)+
-		" && "+syncCommand(path.Dir(dstFull))); lerr != nil {
+	if _, lerr := p.runShell(ctx, linkCommand(srcFull, dstFull)); lerr != nil {
 		if strings.Contains(lerr.Error(), "File exists") {
 			return storage.ErrAlreadyExists
 		}
@@ -590,6 +583,42 @@ func (p *Plugin) ReapStaging(ctx context.Context, olderThan time.Duration) (stor
 		return st, fmt.Errorf("scp: reap staging: %w", err)
 	}
 	return st, nil
+}
+
+// PruneEmptyDirs (storage.EmptyDirPruner) removes directories under dir
+// that hold nothing, deepest first, and dir itself when includeSelf is
+// set. The repo root is never removed. It returns how many directories
+// were removed.
+//
+// One remote find does the whole walk — a round trip per directory
+// would be tens of thousands of SSH sessions for a chunk tree. See
+// pruneEmptyDirsCommand for why this cannot remove a writer's file; a
+// writer racing the removal of its directory re-creates it
+// (retryVanishedDir). A directory that vanished or was filled
+// concurrently is not an error.
+//
+// Nothing is synced afterwards: a crash that resurrects an empty
+// directory is harmless, the next gc prunes it again.
+func (p *Plugin) PruneEmptyDirs(ctx context.Context, dir string, includeSelf bool) (int, error) {
+	if err := p.assertOpen(); err != nil {
+		return 0, err
+	}
+	full, err := p.resolvePrefix(strings.Trim(dir, "/"))
+	if err != nil {
+		return 0, err
+	}
+	if full == p.root {
+		includeSelf = false
+	}
+	// runShell, not runShellLines: the walk prints only on a removal, so
+	// on a large healthy tree it is silent for longer than the
+	// no-progress guard on a streamed read allows.
+	out, err := p.runShell(ctx, pruneEmptyDirsCommand(full, includeSelf))
+	n := strings.Count(out, pruneMark+"\n")
+	if err != nil && !isPruneRace(err) {
+		return n, fmt.Errorf("scp: prune empty directories under %s: %w", full, err)
+	}
+	return n, nil
 }
 
 // reapStagingCommand prints the size of, then deletes, every staging
@@ -675,8 +704,7 @@ func (p *Plugin) runShell(ctx context.Context, command string) (string, error) {
 	select {
 	case err := <-done:
 		if err != nil {
-			return out.String(), fmt.Errorf("%w (stderr: %s)", err,
-				strings.TrimSpace(errBuf.String()))
+			return out.String(), &remoteCmdError{err: err, stderr: strings.TrimSpace(errBuf.String())}
 		}
 		return out.String(), nil
 	case <-ctx.Done():
@@ -684,6 +712,18 @@ func (p *Plugin) runShell(ctx context.Context, command string) (string, error) {
 		return "", ctx.Err()
 	}
 }
+
+// remoteCmdError is a failed remote command together with what it wrote
+// to stderr. The two are kept apart so a caller can tell failures apart
+// by the command's own words (PruneEmptyDirs: a lost race against a
+// real error) instead of picking a formatted message to pieces.
+type remoteCmdError struct {
+	err    error
+	stderr string
+}
+
+func (e *remoteCmdError) Error() string { return fmt.Sprintf("%v (stderr: %s)", e.err, e.stderr) }
+func (e *remoteCmdError) Unwrap() error { return e.err }
 
 // runShellLines runs command and calls fn with each line of its stdout as it
 // arrives, in constant memory (runShell buffers the whole output). fn
@@ -1016,18 +1056,6 @@ func (p *Plugin) exists(ctx context.Context, fullPath string) (bool, error) {
 	return false, fmt.Errorf("scp: exists check %s: unexpected output %q", fullPath, out)
 }
 
-// mkdirAll creates dir + every parent.  Pure shell `mkdir -p`
-// is atomic against concurrent creators on POSIX.
-func (p *Plugin) mkdirAll(ctx context.Context, dir string) error {
-	if dir == "" || dir == "/" {
-		return nil
-	}
-	if _, err := p.runShell(ctx, "mkdir -p "+shellQuote(dir)); err != nil {
-		return fmt.Errorf("scp: mkdir -p %s: %w", dir, err)
-	}
-	return nil
-}
-
 func (p *Plugin) assertOpen() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -1060,6 +1088,111 @@ func shellQuote(s string) string {
 // falls back to a global flush rather than to no flush at all.
 func syncCommand(p string) string {
 	return "{ sync -- " + shellQuote(p) + " 2>/dev/null || sync; }"
+}
+
+// pruneRaceRetries bounds how often a remote command re-creates a
+// directory that a concurrent PruneEmptyDirs removed under it. The
+// retries run inside ONE remote command, so each costs a `mkdir -p`,
+// not a round trip.
+const pruneRaceRetries = 100
+
+// retryVanishedDir builds a remote loop that runs attempt — a command
+// starting with the `mkdir -p` of the directory it writes into — until
+// it succeeds. PruneEmptyDirs (run by `repo gc`) removes directories
+// that are empty at that instant, so the directory can vanish between
+// the mkdir and the write; that is a lost race, not a failure, and the
+// attempt is simply repeated.
+//
+// The loop cannot ask WHY an attempt failed without parsing shell- and
+// locale-specific messages, so it repeats on any failure, up to
+// pruneRaceRetries times or until giveUp (a shell test, may be empty)
+// says the failure is a different one. It then reports the last
+// attempt's own error text and exits non-zero.
+func retryVanishedDir(attempt, giveUp string) string {
+	if giveUp != "" {
+		giveUp += " || "
+	}
+	return "i=0; until e=$({ " + attempt + "; } 2>&1); do i=$((i+1)); " +
+		"if " + giveUp + "[ $i -ge " + strconv.Itoa(pruneRaceRetries) + " ]; then " +
+		`printf '%s\n' "$e" >&2; exit 1; fi; done`
+}
+
+// stageCommand builds the remote command for Put's upload: create tmp's
+// directory and tmp itself, stream stdin into tmp, flush it.
+//
+// The create is a step of its own, ahead of the `cat`, because it is
+// the only point where a pruned directory can still fail the write:
+// once tmp exists its directory is not empty, rmdir refuses it, and
+// both the `cat` and the later commit (ln/mv inside that directory)
+// find it in place. `true >` rather than the customary `: >` — a failed
+// redirection on a special builtin makes a POSIX shell (dash, BusyBox
+// ash) exit on the spot instead of reaching the retry.
+func stageCommand(tmp string) string {
+	q := shellQuote(tmp)
+	return retryVanishedDir("mkdir -p "+shellQuote(path.Dir(tmp))+" && true > "+q, "") +
+		"; cat > " + q + " && " + syncCommand(tmp)
+}
+
+// linkCommand builds the remote command for RenameIfNotExists' commit:
+// create dst's directory, hard-link src to dst (`ln -T` fails with
+// EEXIST when dst is present — the atomic single-winner gate), flush
+// the directory. Until the link exists dst's directory may be empty, so
+// the mkdir+ln pair is retried against a concurrent prune; a present
+// dst or an absent src is a real answer and ends the loop at once.
+func linkCommand(src, dst string) string {
+	s, d := shellQuote(src), shellQuote(dst)
+	return retryVanishedDir("mkdir -p "+shellQuote(path.Dir(dst))+" && ln -T "+s+" "+d,
+		"[ -e "+d+" ] || [ ! -e "+s+" ]") +
+		"; " + syncCommand(path.Dir(dst))
+}
+
+// pruneMark is what pruneEmptyDirsCommand prints per removed directory.
+// A fixed token, never the name: directory names are caller data and
+// may contain anything, including newlines.
+const pruneMark = "d"
+
+// pruneEmptyDirsCommand builds the remote command for PruneEmptyDirs.
+//
+// find walks depth-first (-depth), so a directory is tested after its
+// children are gone and a whole empty subtree goes in one pass. Each
+// candidate is removed by rmdir(1), handed the path as an argument
+// (never through a shell): rmdir refuses anything that is not an empty
+// directory, so a writer that got in after find's -empty test loses
+// nothing, and a refused rmdir only skips the -printf. -H follows a
+// symlinked start point the way the fs backend does; symlinks below it
+// are never followed. LC_ALL=C pins the wording of find's complaints
+// for isPruneRace.
+func pruneEmptyDirsCommand(fullPath string, includeSelf bool) string {
+	q := shellQuote(fullPath)
+	minDepth := " -mindepth 1"
+	if includeSelf {
+		minDepth = ""
+	}
+	return "if [ ! -d " + q + " ]; then exit 0; fi; " +
+		"LC_ALL=C find -H " + q + minDepth + " -depth -type d -empty" +
+		` -exec rmdir -- {} \; -printf '` + pruneMark + `\n'`
+}
+
+// isPruneRace reports whether a failed pruneEmptyDirsCommand lost a race
+// rather than hit a real error: every complaint is about a directory
+// that vanished mid-walk (another prune, a repo wipe) or that a writer
+// filled before the rmdir.
+func isPruneRace(err error) bool {
+	var re *remoteCmdError
+	var exit *ssh.ExitError
+	if !errors.As(err, &re) || !errors.As(re.err, &exit) || re.stderr == "" {
+		return false
+	}
+	for _, line := range strings.Split(re.stderr, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" ||
+			strings.HasSuffix(line, ": No such file or directory") ||
+			strings.HasSuffix(line, ": Directory not empty") {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 // statNotFoundMarker is printed by statCommand when the path is

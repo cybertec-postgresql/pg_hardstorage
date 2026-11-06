@@ -196,6 +196,19 @@ keeps reading that version for at least 24 months after a successor lands.
   give up only after five attempts in a row without progress. A chunk
   whose body breaks off mid-read is fetched again, twice.
 
+- **sftp and scp repositories kept empty directories after `repo gc`
+  (#89).** Only the fs backend pruned the chunk and manifest directories
+  a sweep had emptied; on sftp and scp a writer failed when its
+  directory vanished between its `mkdir` and its write, so pruning was
+  left out. Both writers now re-create a directory that a concurrent
+  prune removed (sftp retries the walk, the staging-file create and the
+  rename; scp runs `mkdir` and the write as one remote command in a
+  bounded loop, which also saves one SSH session per object), and both
+  backends prune like fs: empty directories only, deepest first, never
+  the repository root. The first `repo gc --apply` after upgrading
+  removes what earlier sweeps left. scp additionally needs `rmdir` on
+  the remote host.
+
 ### Changed
 
 - **S3 multipart uploads send up to 4 parts in parallel** instead of one
