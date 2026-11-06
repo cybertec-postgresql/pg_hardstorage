@@ -503,6 +503,35 @@ func (p *Plugin) SetRetention(ctx context.Context, key string, until time.Time, 
 	return nil
 }
 
+// Retention implements storage.RetentionAware from the object's
+// attributes. An object without Object Retention reports a zero
+// deadline.
+func (p *Plugin) Retention(ctx context.Context, key string) (time.Time, storage.WORMMode, error) {
+	if err := p.assertOpen(); err != nil {
+		return time.Time{}, storage.WORMNone, err
+	}
+	attrs, err := p.client.Bucket(p.bucket).Object(p.fullKey(key)).Attrs(ctx)
+	if err != nil {
+		if errors.Is(err, gcs.ErrObjectNotExist) {
+			return time.Time{}, storage.WORMNone, storage.ErrNotFound
+		}
+		return time.Time{}, storage.WORMNone, fmt.Errorf("gcs: get retention %s: %w", key, err)
+	}
+	if attrs.Retention == nil || attrs.Retention.RetainUntil.IsZero() {
+		return time.Time{}, storage.WORMNone, nil
+	}
+	var mode storage.WORMMode
+	switch attrs.Retention.Mode {
+	case "Locked":
+		mode = storage.WORMCompliance
+	case "Unlocked":
+		mode = storage.WORMGovernance
+	default:
+		return time.Time{}, storage.WORMNone, fmt.Errorf("gcs: get retention %s: unknown retention mode %q", key, attrs.Retention.Mode)
+	}
+	return attrs.Retention.RetainUntil.UTC(), mode, nil
+}
+
 // retentionModeFor maps our WORMMode onto GCS's mode
 // vocabulary.
 func retentionModeFor(m storage.WORMMode) string {

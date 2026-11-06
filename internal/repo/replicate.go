@@ -897,7 +897,8 @@ func copyChunk(ctx context.Context, src, dst storage.StoragePlugin, h Hash, opts
 // would reference a chunk that becomes deletable first (the same gap
 // CAS.ensureRetention closes on the backup path). A refusal withholds
 // the manifest: better a reported failure than a replica whose
-// retention promise is false. ErrUnsupported only reaches here when the
+// retention promise is false — unless the chunk turns out to be held at
+// least that long already. ErrUnsupported only reaches here when the
 // operator accepted an unenforced WORM destination; there is no lock.
 func extendDstRetention(ctx context.Context, dst storage.StoragePlugin, key string, opts ReplicateOptions, res *ReplicateResult) bool {
 	if opts.DryRun || opts.DstWORM.IsZero() {
@@ -905,6 +906,14 @@ func extendDstRetention(ctx context.Context, dst storage.StoragePlugin, key stri
 	}
 	until, mode := opts.retentionPut()
 	if err := dst.SetRetention(ctx, key, until, mode); err != nil && !errors.Is(err, storage.ErrUnsupported) {
+		// Object Lock refuses to shorten a lock, so a replica chunk that
+		// is already held longer than this run asks for (an earlier run
+		// with a longer policy, or a backup writing to the same bucket)
+		// is refused here although the promise holds. Same check as
+		// CAS.ensureRetention.
+		if _, ok, _ := storage.LockCovers(ctx, dst, key, until, mode); ok {
+			return true
+		}
 		recordReplicateFailure(res, key, fmt.Errorf("extend retention of existing replica chunk to %s: %w", until.UTC().Format(time.RFC3339), err))
 		res.ChunksFailed++
 		return false

@@ -39,8 +39,9 @@ Query parameters:
   env vars (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`),
   IRSA, IMDSv2, AWS SSO, or `~/.aws/credentials`.
 - `s3:GetObject`, `s3:PutObject`, `s3:DeleteObject`, `s3:ListBucket`
-  on the bucket. Add `s3:PutObjectRetention` /
-  `s3:PutObjectLegalHold` if you also want WORM (Object Lock).
+  on the bucket. Add `s3:PutObjectRetention`,
+  `s3:GetObjectRetention` and `s3:PutObjectLegalHold` if you also
+  want WORM (Object Lock).
 
 ## Steps
 
@@ -187,9 +188,16 @@ includes one):
 }
 ```
 
-Add `s3:PutObjectRetention` and `s3:PutObjectLegalHold` if you
-use WORM; add `s3:BypassGovernanceRetention` only on the
-break-glass principal.
+Add `s3:PutObjectRetention`, `s3:GetObjectRetention` and
+`s3:PutObjectLegalHold` if you use WORM; add
+`s3:BypassGovernanceRetention` only on the break-glass principal.
+
+`s3:GetObjectRetention` is what lets a backup reuse a chunk that
+another writer (typically `wal stream`) already holds under a longer
+lock: Object Lock refuses to shorten a lock, and pg_hardstorage reads
+the existing one to see that it is long enough. Without the
+permission such a backup fails with `could not be extended ...
+reading the existing lock back failed as well`.
 
 ## Troubleshooting
 

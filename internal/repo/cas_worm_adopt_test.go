@@ -3,6 +3,7 @@ package repo_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -246,5 +247,39 @@ func TestCAS_AdoptionAcceptsLongerExistingLock(t *testing.T) {
 				t.Errorf("repeat hit called SetRetention again (%d -> %d)", calls, store.calls)
 			}
 		})
+	}
+}
+
+// lockReadDenied refuses every shortening and cannot read the lock back
+// for a reason the operator can fix (a missing permission).
+type lockReadDenied struct{ *objectLockStore }
+
+func (lockReadDenied) Retention(context.Context, string) (time.Time, storage.WORMMode, error) {
+	return time.Time{}, storage.WORMNone, errors.New("AccessDenied: s3:GetObjectRetention")
+}
+
+// Review of PR #96: when the read-back fails, the error has to say so.
+// With only the refusal in it, a writer that lacks s3:GetObjectRetention
+// looks exactly like the original bug.
+func TestCAS_AdoptionReportsFailedLockReadBack(t *testing.T) {
+	ctx := context.Background()
+	need := time.Date(2026, 11, 9, 2, 0, 0, 0, time.UTC)
+	sp, _ := newGCRepo(t)
+	body := []byte("chunk shared with wal stream")
+	first, err := repo.NewCAS(sp).PutChunk(ctx, body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &objectLockStore{StoragePlugin: sp, locks: map[string]objectLock{
+		repo.ChunkKey(first.Hash): {need.Add(time.Hour), storage.WORMGovernance}}}
+	c := repo.NewCAS(lockReadDenied{store}, repo.WithRetention(repo.CASRetention{RetainUntil: need, Mode: storage.WORMGovernance}))
+	_, err = c.PutChunk(ctx, body)
+	if err == nil {
+		t.Fatal("adopted a chunk whose lock could not be read")
+	}
+	for _, want := range []string{"shortens an existing retention period", "s3:GetObjectRetention", "reading the existing lock back failed"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error does not mention %q:\n%v", want, err)
+		}
 	}
 }

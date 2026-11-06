@@ -277,7 +277,7 @@ func (p *Plugin) Put(ctx context.Context, key string, r io.Reader, opts storage.
 		if mode == "" {
 			mode = storage.WORMCompliance // regulatory-grade default, matching s3
 		}
-		if rerr := p.SetRetention(ctx, key, opts.RetainUntil, mode); rerr != nil {
+		if rerr := p.applyRetention(ctx, key, opts.RetainUntil, mode); rerr != nil {
 			// Uploaded but not locked. Delete it so a retry re-uploads and
 			// re-locks rather than leaving an UNLOCKED blob a dedup hit
 			// (IfNotExists) would treat as a committed, protected object.
@@ -527,6 +527,14 @@ func (p *Plugin) awaitCopyComplete(ctx context.Context, dstBlob *blob.Client, fi
 // SetRetention implements storage.StoragePlugin via Azure
 // Blob immutability policies.  Compliance → Locked,
 // Governance → Unlocked.  WORMNone short-circuits.
+//
+// It never shortens a lock. Azure refuses that for a Locked policy, but
+// an Unlocked one is simply replaced, so the same call that extends a
+// lock can cut it: a base backup re-locking a chunk that `wal stream`
+// already holds longer would move the chunk's deadline EARLIER than the
+// WAL segment that needs it (on S3 the same request is refused, see
+// storage.LockCovers). For an Unlocked request the existing policy is
+// therefore read first and left alone when it already covers until.
 func (p *Plugin) SetRetention(ctx context.Context, key string, until time.Time, mode storage.WORMMode) error {
 	if err := p.assertOpen(); err != nil {
 		return err
@@ -534,6 +542,20 @@ func (p *Plugin) SetRetention(ctx context.Context, key string, until time.Time, 
 	if mode == storage.WORMNone {
 		return nil
 	}
+	if mode == storage.WORMGovernance {
+		// A failed read is not a reason to skip the lock: fall through
+		// and let the set call report what is wrong.
+		if _, ok, err := storage.LockCovers(ctx, p, key, until, mode); err == nil && ok {
+			return nil
+		}
+	}
+	return p.applyRetention(ctx, key, until, mode)
+}
+
+// applyRetention sets the immutability policy unconditionally. Put uses
+// it directly: a blob it just wrote has no policy to preserve, so the
+// read in SetRetention would be a wasted round trip per chunk.
+func (p *Plugin) applyRetention(ctx context.Context, key string, until time.Time, mode storage.WORMMode) error {
 	bClient := p.client.ServiceClient().
 		NewContainerClient(p.container).
 		NewBlobClient(p.fullKey(key))
@@ -545,6 +567,39 @@ func (p *Plugin) SetRetention(ctx context.Context, key string, until time.Time, 
 		return fmt.Errorf("azblob: set retention %s: %w", key, err)
 	}
 	return nil
+}
+
+// Retention implements storage.RetentionAware from the blob's
+// properties. A blob without a policy reports a zero deadline.
+func (p *Plugin) Retention(ctx context.Context, key string) (time.Time, storage.WORMMode, error) {
+	if err := p.assertOpen(); err != nil {
+		return time.Time{}, storage.WORMNone, err
+	}
+	bClient := p.client.ServiceClient().NewContainerClient(p.container).NewBlobClient(p.fullKey(key))
+	resp, err := bClient.GetProperties(ctx, nil)
+	if err != nil {
+		if isNotFound(err) {
+			return time.Time{}, storage.WORMNone, storage.ErrNotFound
+		}
+		return time.Time{}, storage.WORMNone, fmt.Errorf("azblob: get retention %s: %w", key, err)
+	}
+	if resp.ImmutabilityPolicyExpiresOn == nil || resp.ImmutabilityPolicyMode == nil {
+		return time.Time{}, storage.WORMNone, nil
+	}
+	// Compared without regard to case: the SDK hands the header value
+	// through as it arrived, and the service answers "locked" /
+	// "unlocked" where the SDK's own constants are capitalised.
+	var mode storage.WORMMode
+	switch got := string(*resp.ImmutabilityPolicyMode); {
+	case strings.EqualFold(got, string(blob.ImmutabilityPolicyModeLocked)):
+		mode = storage.WORMCompliance
+	case strings.EqualFold(got, string(blob.ImmutabilityPolicyModeUnlocked)):
+		mode = storage.WORMGovernance
+	default:
+		// "Mutable": no policy in force.
+		return time.Time{}, storage.WORMNone, nil
+	}
+	return resp.ImmutabilityPolicyExpiresOn.UTC(), mode, nil
 }
 
 func retentionModeFor(m storage.WORMMode) blob.ImmutabilityPolicySetting {

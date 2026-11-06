@@ -50,7 +50,19 @@ keeps reading that version for at least 24 months after a successor lands.
   (`storage.RetentionAware`, S3 `GetObjectRetention`) and adopts the
   chunk when the existing lock covers the deadline in an equal or
   stronger mode; otherwise it fails as before. The writer additionally
-  needs `s3:GetObjectRetention`.
+  needs `s3:GetObjectRetention`; when that read is denied the error now
+  says so (#95, #96). The same refusal withheld manifests in `repo
+  replicate` when a chunk at the destination was already held longer;
+  it is accepted there too. Azure and GCS report existing locks as well
+  (`Locked` policies and GCS retention are refused like S3's).
+
+- **On Azure, re-locking a chunk in governance mode could shorten its
+  lock.** Azure replaces an `Unlocked` immutability policy with whatever
+  the next request asks for, earlier dates included, where S3 refuses.
+  A base backup that reused a chunk `wal stream` held longer moved the
+  chunk's deadline back to its own, before the WAL segment's. The
+  existing policy is now read first and left alone when it already
+  covers the requested deadline.
 
 - **An explicit `keep_daily: 0` (or `keep_weekly`, `keep_monthly`,
   `keep_yearly`, `keep_fulls`) in a deployment's `retention` block was

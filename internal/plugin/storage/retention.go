@@ -29,6 +29,23 @@ func RetentionOf(ctx context.Context, sp StoragePlugin, key string) (time.Time, 
 	return time.Time{}, WORMNone, ErrUnsupported
 }
 
+// LockCovers reports whether the lock already on key holds it until
+// need in a mode at least as strong as mode, and returns that lock's
+// deadline. It is the question to ask after a SetRetention was refused:
+// "refused because the object is held longer than I asked" needs no
+// action, every other refusal is a failure.
+//
+// ok is false with a nil error when the lock was read and is too short
+// or too weak; err reports that it could not be read (ErrUnsupported on
+// a backend that cannot report locks).
+func LockCovers(ctx context.Context, sp StoragePlugin, key string, need time.Time, mode WORMMode) (until time.Time, ok bool, err error) {
+	cur, curMode, err := RetentionOf(ctx, sp, key)
+	if err != nil {
+		return time.Time{}, false, err
+	}
+	return cur, !cur.IsZero() && !cur.Before(need) && curMode.Covers(mode), nil
+}
+
 // Covers reports whether a lock in mode m holds an object at least as
 // firmly as want: compliance covers both modes, governance only
 // governance (a governance lock can be lifted by a privileged

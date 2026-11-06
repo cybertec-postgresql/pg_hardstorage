@@ -1144,15 +1144,25 @@ func (c *CAS) ensureRetention(ctx context.Context, hash Hash, have time.Time) (t
 		if errors.Is(err, storage.ErrUnsupported) {
 			return have, nil
 		}
-		if cur, mode, rerr := storage.RetentionOf(ctx, c.sp, ChunkKey(hash)); rerr == nil &&
-			!cur.Before(need) && mode.Covers(c.retention.Mode) {
+		// Checked against need, not until: the headroom is a saving, not
+		// part of the promise.
+		cur, ok, rerr := storage.LockCovers(ctx, c.sp, ChunkKey(hash), need, c.retention.Mode)
+		if ok {
 			return cur, nil
 		}
+		// A read-back that itself failed (a writer without
+		// s3:GetObjectRetention) must be visible: otherwise the operator
+		// sees only the refusal and cannot tell why a lock that is long
+		// enough was not accepted.
+		readBack := ""
+		if rerr != nil && !errors.Is(rerr, storage.ErrUnsupported) {
+			readBack = fmt.Sprintf("; reading the existing lock back failed as well: %v", rerr)
+		}
 		return time.Time{}, fmt.Errorf("cas: chunk %s is already in the repository but its WORM retention "+
-			"could not be extended to %s (%w); deduplicating against it would reference a chunk whose lock "+
+			"could not be extended to %s (%w)%s; deduplicating against it would reference a chunk whose lock "+
 			"may expire before this manifest's. Check the credentials allow setting object retention "+
 			"(s3:PutObjectRetention) and reading it back (s3:GetObjectRetention)",
-			hash, until.UTC().Format(time.RFC3339), err)
+			hash, until.UTC().Format(time.RFC3339), err, readBack)
 	}
 	return until, nil
 }
