@@ -851,6 +851,10 @@ func trimAuditMatches(out []*Event, limit int, reverse bool) []*Event {
 // Limit interaction with Reverse: Limit caps AFTER ordering, so
 // Reverse=true + Limit=10 returns the 10 most-recent events
 // matching filters — the natural "what happened recently?" query.
+//
+// Every match is held in the returned slice. A caller that walks a
+// whole window should use SearchEach, which yields the same sequence
+// without it.
 func (s *Store) Search(ctx context.Context, f ListFilters) ([]*Event, error) {
 	// Collect matches across every shard, then order globally. Per-shard
 	// Sequence isn't comparable across shards, so the global order is by

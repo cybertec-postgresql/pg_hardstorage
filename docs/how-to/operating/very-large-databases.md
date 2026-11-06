@@ -27,6 +27,7 @@ memory. The on-disk format is unchanged.
 | Sets of chunk hashes (GC marks, integrity, verify, dedup counts, adoption) | exact, disk-spilling sets (`internal/spill`) with a Bloom filter per on-disk run; the heap budget is `spill.DefaultMemEntries` (4 M hashes) per set |
 | Dedup hints | a Bloom filter (~1.25 bytes per chunk); a false positive costs one `Stat` |
 | S3 manifest upload | multipart, so the 5 GiB single-PUT limit does not apply |
+| Audit evidence bundle being exported (`audit export-bundle`) | the window's events are ordered by a disk-spilling sorter and written straight into the canonical signing input, a temp file that is memory-mapped for the Ed25519 signature and then streamed into the archive |
 
 ## Disk you need
 
@@ -41,6 +42,11 @@ memory. The on-disk format is unchanged.
   "not enough free space ... set TMPDIR" error instead of hitting ENOSPC
   mid-run. A warning is printed once when the directory is on tmpfs/ramfs,
   because spilled hashes would then live in RAM.
+- **Evidence bundles**: `audit export-bundle` needs about twice the
+  uncompressed size of the exported events in `$TMPDIR` while it runs (the
+  sorted events, then the canonical copy that is signed). The files are
+  removed when the command finishes, fails or is interrupted. See
+  [Audit evidence bundles](../../compliance/audit-evidence-bundles.md#large-windows).
 
 ## Memory sizing
 

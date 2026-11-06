@@ -82,6 +82,11 @@ Other:
 Output:
   --out PATH                   destination .tar.gz file (required)
 
+Memory does not grow with the window: the events are sorted and the
+signing input is assembled in temporary files under $TMPDIR (about
+twice the size of the exported events; removed on exit) rather than
+in RAM.
+
 Read-only against the source repo.  Safe at any cadence.`,
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {

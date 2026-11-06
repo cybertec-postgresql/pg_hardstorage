@@ -209,6 +209,18 @@ keeps reading that version for at least 24 months after a successor lands.
   removes what earlier sweeps left. scp additionally needs `rmdir` on
   the remote host.
 
+- **`audit export-bundle` held its whole window in memory (#87):** the
+  events, their NDJSON form and the canonical signing input, about twice
+  the window's size on the heap. Events now go through an external
+  sorter into one temp file that is memory-mapped for the Ed25519
+  signature and then streamed into the archive; heap use no longer grows
+  with the window (30,000 events: 36 MiB before, 2 MiB now). The bundle
+  format is unchanged, byte for byte: 1.6.0 verifies bundles written by
+  this release and the other way round. The export needs temp space of
+  about twice the uncompressed events under `$TMPDIR`; on Windows the
+  signing input is still held in RAM. `audit verify-bundle` still reads
+  a bundle into memory and refuses an `events.ndjson` over 1 GiB.
+
 ### Changed
 
 - **S3 multipart uploads send up to 4 parts in parallel** instead of one
