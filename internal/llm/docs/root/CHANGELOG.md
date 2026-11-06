@@ -231,6 +231,17 @@ keeps reading that version for at least 24 months after a successor lands.
   for about four seconds. Found by the release validation
   (`TestFaultSoak/scp`); `sftp://` is not affected, it uses one channel.
 
+- **A `file://` writer could fail with "no such file or directory" while
+  `repo gc` pruned empty directories on a busy disk.** A writer whose
+  directory was pruned re-created it durably (an fsync per new
+  component) before creating its file. While those fsyncs ran the
+  directory was still empty, and a prune still walking the tree could
+  remove it again, a hundred times in a row. The directory is now
+  re-created without syncing, the file or link is created at once, which
+  pins the directory, and the new directory entries are synced after
+  that. Found by the release validation at IO pressure above 50%; the
+  window existed since 1.6.0.
+
 ### Changed
 
 - **S3 multipart uploads send up to 4 parts in parallel** instead of one
