@@ -378,6 +378,12 @@ func (m *Middleware) ReapStaging(ctx context.Context, olderThan time.Duration) (
 	return storage.ReapStats{Unsupported: true}, nil
 }
 
+// Retention delegates via storage.RetentionOf so the CAS can read an
+// adopted chunk's lock through the wrapper.
+func (m *Middleware) Retention(ctx context.Context, key string) (time.Time, storage.WORMMode, error) {
+	return storage.RetentionOf(ctx, m.inner, key)
+}
+
 // Compile-time assertions that we satisfy StoragePlugin and forward
 // every optional capability interface.
 var (
@@ -385,6 +391,7 @@ var (
 	_ storage.RegionAware      = (*Middleware)(nil)
 	_ storage.FreeSpaceAware   = (*Middleware)(nil)
 	_ storage.StagingReapAware = (*Middleware)(nil)
+	_ storage.RetentionAware   = (*Middleware)(nil)
 )
 
 // ErrInjected is the canonical sentinel an operator can use as a

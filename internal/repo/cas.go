@@ -1118,9 +1118,16 @@ const retentionExtendHeadroom = time.Hour
 // without WORM that the operator explicitly accepted via
 // WithRetentionAllowUnenforced) is not an error: there is no lock to
 // extend. Any other failure fails the PutChunk — dedup must not adopt a
-// chunk into a retention promise it could not make. Note that S3 refuses
-// to SHORTEN a lock, so an object already locked beyond our deadline
-// surfaces here as a refusal too; the error says so.
+// chunk into a retention promise it could not make.
+//
+// S3 refuses to SHORTEN a lock, so a chunk already locked beyond our
+// deadline surfaces as a refusal too. That happens in normal operation:
+// `wal stream` locks shared chunks under its moving deadline plus
+// headroom, so a base backup running for hours (fixed deadline from its
+// start) meets chunks locked later than it asks for, and aborted on the
+// first one. A refusal is therefore checked against the lock read back
+// from the backend: if it already covers need in an equal or stronger
+// mode, the promise holds and the chunk is adopted.
 func (c *CAS) ensureRetention(ctx context.Context, hash Hash, have time.Time) (time.Time, error) {
 	if c.retention.IsZero() {
 		return time.Time{}, nil
@@ -1137,10 +1144,14 @@ func (c *CAS) ensureRetention(ctx context.Context, hash Hash, have time.Time) (t
 		if errors.Is(err, storage.ErrUnsupported) {
 			return have, nil
 		}
+		if cur, mode, rerr := storage.RetentionOf(ctx, c.sp, ChunkKey(hash)); rerr == nil &&
+			!cur.Before(need) && mode.Covers(c.retention.Mode) {
+			return cur, nil
+		}
 		return time.Time{}, fmt.Errorf("cas: chunk %s is already in the repository but its WORM retention "+
 			"could not be extended to %s (%w); deduplicating against it would reference a chunk whose lock "+
 			"may expire before this manifest's. Check the credentials allow setting object retention "+
-			"(s3:PutObjectRetention); a lock already longer than the new deadline is also refused by S3",
+			"(s3:PutObjectRetention) and reading it back (s3:GetObjectRetention)",
 			hash, until.UTC().Format(time.RFC3339), err)
 	}
 	return until, nil

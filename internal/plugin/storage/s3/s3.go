@@ -694,6 +694,30 @@ func (p *Plugin) SetRetention(ctx context.Context, key string, until time.Time, 
 	return nil
 }
 
+// Retention implements storage.RetentionAware via GetObjectRetention.
+func (p *Plugin) Retention(ctx context.Context, key string) (time.Time, storage.WORMMode, error) {
+	out, err := p.client.GetObjectRetention(ctx, &s3.GetObjectRetentionInput{
+		Bucket: aws.String(p.bucket),
+		Key:    aws.String(p.fullKey(key)),
+	})
+	if err != nil {
+		return time.Time{}, storage.WORMNone, fmt.Errorf("s3: get retention %q: %w", key, err)
+	}
+	if out.Retention == nil || out.Retention.RetainUntilDate == nil {
+		return time.Time{}, storage.WORMNone, nil
+	}
+	var mode storage.WORMMode
+	switch out.Retention.Mode {
+	case s3types.ObjectLockRetentionModeGovernance:
+		mode = storage.WORMGovernance
+	case s3types.ObjectLockRetentionModeCompliance:
+		mode = storage.WORMCompliance
+	default:
+		return time.Time{}, storage.WORMNone, fmt.Errorf("s3: get retention %q: unknown lock mode %q", key, out.Retention.Mode)
+	}
+	return out.Retention.RetainUntilDate.UTC(), mode, nil
+}
+
 // objectInfoFrom builds a storage.ObjectInfo from a HeadObject result.
 func objectInfoFrom(key string, out *s3.HeadObjectOutput) storage.ObjectInfo {
 	info := storage.ObjectInfo{Key: key}
