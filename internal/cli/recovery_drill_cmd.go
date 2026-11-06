@@ -79,9 +79,13 @@ Verify control:
                         the sandbox.  Returns Partial verdict with
                         the restore-only result.
 
-Output formats:
-  --format json     (default) — JSON body, the v1 contract.
-  --format markdown — forensics-grade GFM rendering.
+Output:
+  The global -o/--output picks the encoding, as on every command: text
+  on a terminal, JSON (the v1 contract) off one or with -o json.
+  --format only picks the layout of the text report:
+    --format json     (default) — compact summary.
+    --format markdown — forensics-grade GFM rendering; use it with
+                        -o text (e.g. --format markdown -o text > drill.md).
 
 The drill requires Docker on the operator host (for the sandbox).
 For Docker-free runs, pass --skip-verify; the report's RTO actual
@@ -135,7 +139,8 @@ For Docker-free runs, pass --skip-verify; the report's RTO actual
 	c.Flags().Int64Var(&rtoSeconds, "rto-seconds", 0,
 		"RTO target in seconds for actual-vs-target comparison")
 	c.Flags().StringVar(&format, "format", "json",
-		"output format: json | markdown")
+		"layout of the report when the output is text: json (compact summary) | markdown (full GFM report). "+
+			"It does not select JSON: -o/--output does, and -o json always emits the v1 JSON body")
 	c.Flags().BoolVar(&skipEncryption, "no-encryption", false,
 		"don't wire the local-keystore KEK resolver (drill an unencrypted backup or one whose KEK lives elsewhere)")
 	c.Flags().BoolVar(&skipHistory, "no-history", false,
@@ -281,8 +286,8 @@ func (b drillReportBody) WriteText(w io.Writer) error {
 	return writeDrillSummary(w, b.DrillReport)
 }
 
-// writeDrillSummary renders the compact human-readable view for
-// `--format json -o text`.
+// writeDrillSummary renders the compact human-readable view: what a
+// terminal gets by default (`-o text` with the default `--format json`).
 func writeDrillSummary(w io.Writer, r *recovery.DrillReport) error {
 	bw := &strings.Builder{}
 	icon := "✓"

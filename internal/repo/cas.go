@@ -606,7 +606,7 @@ func WithRegistry(r *compression.CodecRegistry) CASOption {
 //
 // Passing the same Encryptor for both write and read is the v0.1
 // default; per-tenant key rotation (multiple Encryptors registered
-// for read, one for write) is a+ shape.
+// for read, one for write) is a later shape.
 func WithEncryptor(e encryption.Encryptor) CASOption {
 	return func(cas *CAS) {
 		cas.encWriter = e
@@ -1054,13 +1054,16 @@ func (c *CAS) GetChunkBytes(ctx context.Context, hash Hash) ([]byte, error) {
 	}
 	algo, encFields, payload, err := compression.ReadEnvelope(envelope)
 	if err != nil {
-		return nil, fmt.Errorf("cas: decode envelope for chunk %s: %w", hash, err)
+		return nil, fmt.Errorf("cas: decode envelope for chunk %s: %w (%w)", hash, err, ErrChunkCorrupt)
 	}
 	if encFields.IsEncrypted() {
 		decryptor, lookupErr := c.encRegistry.Lookup(encryption.AlgorithmID(encFields.EncryptionAlgo))
 		if lookupErr != nil {
 			return nil, fmt.Errorf("cas: chunk %s: %w", hash, lookupErr)
 		}
+		// Not ErrChunkCorrupt: an authentication failure is what a
+		// wrong key looks like too, and that is not repaired by healing
+		// the chunk.
 		pt, decErr := decryptor.Decrypt(payload, encFields.Nonce)
 		if decErr != nil {
 			return nil, fmt.Errorf("cas: decrypt chunk %s: %w", hash, decErr)
@@ -1073,12 +1076,12 @@ func (c *CAS) GetChunkBytes(ctx context.Context, hash Hash) ([]byte, error) {
 	}
 	body, err := codec.Decompress(payload)
 	if err != nil {
-		return nil, fmt.Errorf("cas: decompress chunk %s (algo=%s): %w", hash, algo, err)
+		return nil, fmt.Errorf("cas: decompress chunk %s (algo=%s): %w (%w)", hash, algo, err, ErrChunkCorrupt)
 	}
 	got := Hash(sha256.Sum256(body))
 	if got != hash {
-		return nil, fmt.Errorf("cas: chunk %s: %w (stored bytes hash to %s)",
-			hash, storage.ErrChecksumMismatch, got)
+		return nil, fmt.Errorf("cas: chunk %s: %w (stored bytes hash to %s; %w)",
+			hash, storage.ErrChecksumMismatch, got, ErrChunkCorrupt)
 	}
 	// Through markSeen, never a bare Store: a restore reads every chunk
 	// of a backup through one CAS, and an uncounted Store grew the cache
@@ -1339,6 +1342,14 @@ func ParseChunkKey(key string) (Hash, error) {
 
 // ErrNotAChunkKey indicates a key that doesn't match the chunk-key format.
 var ErrNotAChunkKey = errors.New("repo: not a chunk key")
+
+// ErrChunkCorrupt is in the chain of every GetChunkBytes error that means
+// "the chunk object is there and its bytes are wrong": an undecodable
+// envelope, a payload that does not decompress, or plaintext that does
+// not hash to the chunk's address. It lets a caller tell damage (heal
+// from a replica) from absence (storage.ErrNotFound: re-push, or find
+// what deleted it) and from a failed read (retry).
+var ErrChunkCorrupt = errors.New("repo: chunk is corrupt")
 
 // ErrRetentionUnenforceable is returned by PutChunk when the CAS was
 // configured with WithRetention but the underlying storage backend

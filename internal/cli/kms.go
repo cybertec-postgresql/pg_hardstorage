@@ -21,7 +21,7 @@ import (
 // surface of the keyring. Ships only the read-only `inspect`
 // verb; the mutating verbs (rotate, shred, hsm-status) require
 // substantial new infrastructure (rewrap walker; PKCS#11 binding)
-// and remain stubs in the SPEC's+ tree.
+// and remain stubs in the SPEC's tree.
 //
 // `inspect` answers the operator's "what's in my keyring?" question
 // without ever READING the key bytes — it reports presence, file

@@ -717,19 +717,6 @@ const MaxEntryBytes = 256 << 20
 
 // --- internal helpers --------------------------------------------------
 
-// writeManifestEntry serialises m through the package's canonical
-// JSON form (omitting attestation; the source repo's
-// attestation.intoto.jsonl is bundled separately under the same
-// directory).  Using the in-memory struct keeps bundle bytes
-// reproducible regardless of source-repo metadata noise.
-func writeManifestEntry(tw *tar.Writer, name string, m *backup.Manifest) error {
-	body, err := json.MarshalIndent(m, "", "  ")
-	if err != nil {
-		return fmt.Errorf("bundle: marshal manifest: %w", err)
-	}
-	return writeTarEntry(tw, name, body)
-}
-
 func writeTarEntry(tw *tar.Writer, name string, body []byte) error {
 	hdr := &tar.Header{
 		Name:    name,

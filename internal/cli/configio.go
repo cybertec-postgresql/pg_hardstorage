@@ -101,9 +101,20 @@ func configEditError(err error) error {
 	return output.NewError("config.marshal_failed", err.Error()).Wrap(err)
 }
 
-// writeConfigFile serialises cfg to path atomically.
+// writeConfigFile serialises cfg to path atomically. A file that
+// already exists is updated in place: its comments, key order and
+// permission bits are kept (config.MarshalPreserving). A new file is
+// created 0600, since a config routinely carries DSNs.
 func writeConfigFile(path string, cfg *config.Config) error {
-	body, err := config.Marshal(cfg)
+	mode := os.FileMode(0o600)
+	var existing []byte
+	if st, err := os.Stat(path); err == nil && st.Mode().IsRegular() {
+		mode = st.Mode().Perm()
+		// An unreadable existing file just means nothing to preserve;
+		// the write below reports the real problem if there is one.
+		existing, _ = os.ReadFile(path)
+	}
+	body, err := config.MarshalPreserving(cfg, existing)
 	if err != nil {
 		return output.NewError("config.marshal_failed", err.Error()).Wrap(err)
 	}
@@ -114,9 +125,13 @@ func writeConfigFile(path string, cfg *config.Config) error {
 	// fsutil.WriteFileAtomic: another process (or a parallel
 	// `pg_hardstorage` invocation) could be reading the config
 	// concurrently — atomic rewrite avoids tearing the YAML.
-	if err := fsutil.WriteFileAtomic(path, body, 0o600); err != nil {
+	if err := fsutil.WriteFileAtomic(path, body, mode); err != nil {
 		return output.NewError("config.write_failed",
 			fmt.Sprintf("config: write %s: %v", path, err)).Wrap(err)
+	}
+	if mode != 0o600 {
+		// The create is subject to umask; restore the bits the file had.
+		_ = os.Chmod(path, mode)
 	}
 	return nil
 }

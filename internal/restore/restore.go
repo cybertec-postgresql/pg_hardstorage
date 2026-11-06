@@ -167,7 +167,7 @@ type Options struct {
 	// flags.
 	//
 	// Empty / nil = no remap; the manifest's recorded paths are
-	// used verbatim (the previous+ behaviour).
+	// used verbatim (the previous behaviour).
 	TablespaceRemap TablespaceRemap
 
 	// TablespaceMapAll, when non-empty, redirects every non-default
@@ -2555,7 +2555,7 @@ func materializeManifestInto(ctx context.Context, cas *repo.CAS, m *backup.Manif
 	}
 	// pg_combinebackup hard-requires backup_manifest (PG's own JSON
 	// shape) in every input dir — both for the full anchor and for
-	// every incremental link. Manifests committed before+ do
+	// every incremental link. Manifests committed before that do
 	// not carry PGBackupManifest; the runner refuses to take a child
 	// incremental without it, so by the time we're walking a chain
 	// here we expect every link to carry one.
@@ -2563,7 +2563,7 @@ func materializeManifestInto(ctx context.Context, cas *repo.CAS, m *backup.Manif
 		return totalBytes, totalChunks, output.NewError("chain.missing_pg_manifest",
 			fmt.Sprintf("restore chain: link %q has no pg_backup_manifest field; pg_combinebackup will refuse it", m.BackupID)).
 			WithSuggestion(&output.Suggestion{
-				Human: "this backup pre-dates the+ PGBackupManifest field. Restoring it as a standalone backup still works; it cannot anchor or appear in an incremental chain. Take a fresh full backup to enable incrementals from this point forward.",
+				Human: "this backup pre-dates the PGBackupManifest field. Restoring it as a standalone backup still works; it cannot anchor or appear in an incremental chain. Take a fresh full backup to enable incrementals from this point forward.",
 			})
 	}
 	if err := writeSpecial(dir, "backup_manifest", m.PGBackupManifest); err != nil {

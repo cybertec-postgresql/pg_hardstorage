@@ -151,7 +151,9 @@ func (s *HashSet) Add(k Key) bool {
 	if _, ok := s.mem[k]; ok {
 		return false
 	}
-	if s.hot != nil && s.hot[hotSlot(k)] == k {
+	// The zero key is never cached: an empty hot slot equals it, so the
+	// cache cannot tell "seen" from "never written". Same guard as Has.
+	if s.hot != nil && k != (Key{}) && s.hot[hotSlot(k)] == k {
 		return false
 	}
 	if found, clean := s.lookupRunsLocked(k); found {

@@ -226,10 +226,9 @@ func (h *runHeap) Pop() any          { o := *h; n := len(o); x := o[n-1]; *h = o
 
 // recMerge merges a set of runs.
 type recMerge struct {
-	all  []*runReader
-	h    runHeap
-	cur  *runReader // reader whose record was last returned; advanced lazily
-	init bool
+	all []*runReader
+	h   runHeap
+	cur *runReader // reader whose record was last returned; advanced lazily
 }
 
 func newRecMerge(paths []string) (*recMerge, error) {

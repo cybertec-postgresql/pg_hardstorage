@@ -32,7 +32,7 @@ func flagDefaults() rotateOpts {
 
 func TestRotatePolicy_ReportersConfigIsHonoured(t *testing.T) {
 	deps := map[string]config.DeploymentConfig{
-		"local": {Retention: config.RetentionConfig{Policy: "count", KeepFulls: 2}},
+		"local": {Retention: config.RetentionConfig{Policy: "count", KeepFulls: config.Keep(2)}},
 	}
 	p, src, err := resolveRotatePolicy("local", false, flagDefaults(), deps)
 	if err != nil {
@@ -50,7 +50,7 @@ func TestRotatePolicy_ReportersConfigIsHonoured(t *testing.T) {
 
 func TestRotatePolicy_ExplicitFlagsWin(t *testing.T) {
 	deps := map[string]config.DeploymentConfig{
-		"local": {Retention: config.RetentionConfig{Policy: "count", KeepFulls: 2}},
+		"local": {Retention: config.RetentionConfig{Policy: "count", KeepFulls: config.Keep(2)}},
 	}
 	o := flagDefaults()
 	o.policy, o.keepFor = "simple", 48*time.Hour
@@ -100,11 +100,11 @@ func TestRotatePolicy_InvalidConfigRefuses(t *testing.T) {
 // agent's scheduled task must now arrive at the same policy.
 func TestRotatePolicy_ManualMatchesScheduled(t *testing.T) {
 	for _, r := range []config.RetentionConfig{
-		{Policy: "count", KeepFulls: 2},
+		{Policy: "count", KeepFulls: config.Keep(2)},
 		{Policy: "count"},
 		{Policy: "simple", KeepFor: "7d"},
-		{Policy: "gfs", KeepDaily: 3, KeepMonthly: 1},
-		{KeepDaily: 10}, // policy omitted → gfs, with the override
+		{Policy: "gfs", KeepDaily: config.Keep(3), KeepMonthly: config.Keep(1)},
+		{KeepDaily: config.Keep(10)}, // policy omitted → gfs, with the override
 	} {
 		deps := map[string]config.DeploymentConfig{"d": {Retention: r}}
 		manual, _, err := resolveRotatePolicy("d", false, flagDefaults(), deps)

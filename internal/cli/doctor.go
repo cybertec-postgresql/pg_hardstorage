@@ -991,7 +991,7 @@ type airgapSinkReport struct {
 
 // pgVersionReport summarises the PG major version observed for
 // each deployment with backups in the repo. Surfaces:
-//   - the manifest-derived major (so a+ "you upgraded the
+//   - the manifest-derived major (so a later "you upgraded the
 //     server but didn't take a fresh backup" check can land)
 //   - whether the major is in pg.SupportedMajors() — operators
 //     running PG < MinSupportedMajor or > MaxSupportedMajor see

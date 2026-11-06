@@ -2,10 +2,13 @@ package cli
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/pg/walsink"
 )
 
 // docs/reference/error-codes.md tells automation to route on
@@ -58,13 +61,43 @@ func TestWalPushSplitBrainCarriesItsDocumentedCode(t *testing.T) {
 // streamer stopped with wal.stream_permanent instead.
 func TestWalStreamSplitBrainStopsWithItsDocumentedCode(t *testing.T) {
 	for _, leaf := range []string{"content_mismatch", "system_identifier_mismatch", "read_failed"} {
-		err := errors.New("sink: splitbrain." + leaf + ": segment already archived by another cluster")
-		code, _, stop := decideStreamStop(err, 0)
+		// As the streamer sees it: the sink's refusal, wrapped by the
+		// replication loop.
+		err := fmt.Errorf("replication: sink.OnRecord: %w", &walsink.SplitBrainError{
+			Code: "splitbrain." + leaf,
+			Err:  errors.New("segment already archived by another cluster"),
+		})
+		code, msg, stop := decideStreamStop(err, 0)
 		if !stop {
 			t.Errorf("%s: a split-brain must stop the streamer", leaf)
 		}
 		if code != "splitbrain."+leaf {
 			t.Errorf("%s: stop code = %q, want splitbrain.%s", leaf, code, leaf)
 		}
+		if !strings.Contains(msg, "splitbrain."+leaf+": segment already archived") {
+			t.Errorf("%s: message lost the refusal text: %q", leaf, msg)
+		}
+	}
+}
+
+// The code comes from the typed error, never from prose. It used to be
+// scraped out of the message with a regular expression, so any error
+// whose text merely contained "splitbrain.<word>" — a path, a quoted
+// log line, a reworded message — produced a split-brain code, and a
+// reworded real refusal lost it.
+func TestSplitBrainCodeIsNotScrapedFromProse(t *testing.T) {
+	for _, err := range []error{
+		errors.New("open /var/lib/splitbrain.content_mismatch/segment: permission denied"),
+		errors.New("see runbook R7 for splitbrain.read_failed handling"),
+	} {
+		if code := splitBrainCode(err); code != "" {
+			t.Errorf("splitBrainCode(%q) = %q, want none: the text is not a refusal", err, code)
+		}
+		if isPermanentStreamError(err) {
+			t.Errorf("%q stopped the streamer as a split-brain", err)
+		}
+	}
+	if splitBrainCode(nil) != "" {
+		t.Error("nil error has a split-brain code")
 	}
 }

@@ -101,7 +101,6 @@ type DockerCellRuntime struct {
 	sustainedStartedAt time.Time
 	sustainedCancel    context.CancelFunc
 	sustainedDone      chan struct{}
-	walPreCount        int64 // pg_stat_wal.wal_bytes at writer start; 0 = not sampled
 	walPreLSN          string
 	sustainedPGBin     string
 	sustainedMu        sync.Mutex
@@ -1292,22 +1291,6 @@ func (d *DockerCellRuntime) StopWALStream(ctx context.Context) (*report.LoadStat
 	return stats, nil
 }
 
-// samplePGStatWAL returns pg_stat_wal.wal_bytes for the cell
-// or 0 if the view is unavailable (PG ≤ 13) or the query
-// fails.  Used by Start/Stop SustainedLoad to compute "WAL
-// bytes written during the writer's lifetime".
-func (d *DockerCellRuntime) samplePGStatWAL(ctx context.Context) int64 {
-	if d.conn == nil {
-		return 0
-	}
-	var n int64
-	row := d.conn.QueryRow(ctx, "select coalesce(wal_bytes, 0)::bigint from pg_stat_wal")
-	if err := row.Scan(&n); err != nil {
-		return 0
-	}
-	return n
-}
-
 // computeWALStreamLag returns the byte distance between the
 // primary's current WAL position and the worst-lagging
 // active streamer's flush_lsn.  -1 on any error reaching the
@@ -1422,41 +1405,6 @@ func parseLSN(s string) (uint64, bool) {
 		return 0, false
 	}
 	return (hi << 32) | lo, true
-}
-
-// parsePgbenchSummary extracts (TPS, p95 latency in ms) from
-// pgbench's final report block.  pgbench prints lines like:
-//
-//	tps = 1234.567 (without initial connection time)
-//	latency stddev = 4.521 ms
-//	latency average = 12.345 ms
-//
-// We pick the "tps =" line and convert latency_average as a
-// stand-in for p95 (pgbench prints percentiles only with
-// --latency-detail; we keep the report self-contained for
-// now).  Future: switch to --latency-detail and parse the
-// percentiles block when available.
-func parsePgbenchSummary(s string) (tps, latencyMs float64) {
-	for _, line := range strings.Split(s, "\n") {
-		line = strings.TrimSpace(line)
-		switch {
-		case strings.HasPrefix(line, "tps = ") || strings.HasPrefix(line, "tps: "):
-			parts := strings.Fields(strings.TrimPrefix(strings.TrimPrefix(line, "tps = "), "tps: "))
-			if len(parts) > 0 {
-				if v, err := strconv.ParseFloat(parts[0], 64); err == nil {
-					tps = v
-				}
-			}
-		case strings.HasPrefix(line, "latency average = "):
-			parts := strings.Fields(strings.TrimPrefix(line, "latency average = "))
-			if len(parts) > 0 {
-				if v, err := strconv.ParseFloat(parts[0], 64); err == nil {
-					latencyMs = v
-				}
-			}
-		}
-	}
-	return tps, latencyMs
 }
 
 // --- helpers ----------------------------------------------------------

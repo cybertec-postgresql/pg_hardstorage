@@ -6,7 +6,6 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
-	"io"
 )
 
 // DeriveDEK returns a deterministic 32-byte data-encryption
@@ -87,14 +86,3 @@ func hkdfExpand(prk, info, out []byte) (int, error) {
 	}
 	return written, nil
 }
-
-// readKEKFromKeyring is a small helper the CLI uses when
-// constructing the history.Store.  Returns the 32-byte KEK
-// when present at <keyringDir>/kek.bin, or (nil, false)
-// when absent — letting the CLI degrade to a
-// history-disabled session rather than failing.
-//
-// Kept here (not in keystore) to avoid an import cycle:
-// keystore knows nothing about LLM history; history knows
-// the file layout but not the keystore's API surface.
-func readKEKFromKeyring(_ io.Reader) ([]byte, bool) { return nil, false }

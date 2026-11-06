@@ -182,7 +182,9 @@ deployments:
 	if !strings.Contains(got, "tenant: legacy") {
 		t.Errorf("tenant should be preserved (not passed):\n%s", got)
 	}
-	if !strings.Contains(got, "every: 6h") {
+	// Preserved as the operator wrote it — flow style and quoting
+	// included — not re-rendered in the encoder's canonical layout.
+	if !strings.Contains(got, `backup: {every: "6h"}`) {
 		t.Errorf("schedule should be preserved (not passed):\n%s", got)
 	}
 }
@@ -336,7 +338,7 @@ deployments:
 		"interval: 5s",
 		// Everything else preserved.
 		"pg_connection: postgres://x@h/db",
-		"every: 6h",
+		`every: "6h"`, // as written in the file, quotes and all
 		"daily_at: \"04:00\"",
 	} {
 		if !strings.Contains(got, want) {

@@ -161,7 +161,7 @@ var ErrEmptyTables = errors.New("partial: Tables is empty")
 //     the SQL layer (pg_dump invocation, DDL emission) belongs in
 //     a follow-up that owns a sandbox PG runtime.
 //
-// The split lets+ ship the half that absolutely needs the
+// The split lets us ship the half that absolutely needs the
 // repo + manifest + chunk store (file selection + materialisation)
 // without waiting for the testcontainers + pg_dump plumbing.
 func Restore(ctx context.Context, opts RestoreOptions) (*RestoreResult, error) {

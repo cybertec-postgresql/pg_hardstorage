@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sync"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -27,6 +28,25 @@ const (
 	maxParts     int64 = 9000 // S3 allows 10,000; leave headroom
 	maxObjectLen int64 = 5 << 40
 )
+
+// Parts upload in parallel: a serial loop is bound by parts × round trip,
+// which on a multi-hundred-GB manifest is thousands of sequential
+// requests. Every in-flight part holds its own buffer, so the fan-out is
+// bounded twice — by maxPartConcurrency and by partBufferBudget of
+// memory. At the default 64 MiB part that is 4 parts (256 MiB); once the
+// part size has to grow to stay under maxParts, concurrency drops until
+// a single part is in flight.
+var (
+	maxPartConcurrency       = 4
+	partBufferBudget   int64 = 256 << 20
+)
+
+// partConcurrencyFor is the number of parts uploaded at once.
+func partConcurrencyFor(partSize int64, nParts int) int {
+	c := int(partBufferBudget / partSize)
+	c = min(c, maxPartConcurrency, nParts)
+	return max(c, 1)
+}
 
 // partSizeFor picks a part size that keeps size within maxParts parts.
 func partSizeFor(size int64) int64 {
@@ -67,33 +87,83 @@ func (p *Plugin) putMultipart(ctx context.Context, key string, r io.Reader, size
 	}
 
 	partSize := partSizeFor(size)
-	buf := make([]byte, partSize)
-	var parts []s3types.CompletedPart
+	nParts := int((size + partSize - 1) / partSize)
+	conc := partConcurrencyFor(partSize, nParts)
+	// The body is a stream, so it is read here, in order, one part at a
+	// time; only the uploads overlap. free holds one token per upload
+	// slot — a buffer once that slot has been used — so a part is read
+	// only when there is a slot to send it from.
+	free := make(chan []byte, conc)
+	for i := 0; i < conc; i++ {
+		free <- nil
+	}
+	uctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var (
+		wg      sync.WaitGroup
+		failed  sync.Once
+		partErr error
+	)
+	parts := make([]s3types.CompletedPart, nParts)
+	var readErr error
 	var sent int64
+read:
 	for n := int32(1); sent < size; n++ {
-		want := partSize
-		if size-sent < want {
-			want = size - sent
+		var buf []byte
+		select {
+		case buf = <-free:
+		case <-uctx.Done():
+			break read
+		}
+		want := min(partSize, size-sent)
+		if buf == nil {
+			buf = make([]byte, partSize)
 		}
 		if _, err := io.ReadFull(r, buf[:want]); err != nil {
-			abort()
 			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-				return storage.PutResult{}, fmt.Errorf("s3: put %q: body ended after %d of %d bytes", key, sent, size)
+				readErr = fmt.Errorf("s3: put %q: body ended after %d of %d bytes", key, sent, size)
+			} else {
+				readErr = fmt.Errorf("s3: put %q: read part %d: %w", key, n, err)
 			}
-			return storage.PutResult{}, fmt.Errorf("s3: put %q: read part %d: %w", key, n, err)
+			cancel()
+			break
 		}
-		up, err := p.client.UploadPart(ctx, &s3.UploadPartInput{
-			Bucket: in.Bucket, Key: in.Key, UploadId: uploadID,
-			PartNumber:    aws.Int32(n),
-			Body:          bytes.NewReader(buf[:want]),
-			ContentLength: aws.Int64(want),
-		})
-		if err != nil {
-			abort()
-			return storage.PutResult{}, fmt.Errorf("s3: put %q: upload part %d: %w", key, n, err)
-		}
-		parts = append(parts, s3types.CompletedPart{ETag: up.ETag, PartNumber: aws.Int32(n)})
+		wg.Add(1)
+		go func(n int32, buf []byte, want int64) {
+			defer wg.Done()
+			defer func() { free <- buf }()
+			up, err := p.client.UploadPart(uctx, &s3.UploadPartInput{
+				Bucket: in.Bucket, Key: in.Key, UploadId: uploadID,
+				PartNumber:    aws.Int32(n),
+				Body:          bytes.NewReader(buf[:want]),
+				ContentLength: aws.Int64(want),
+			})
+			if err != nil {
+				// The first failure is the one reported; it cancels
+				// the siblings, whose "context canceled" is noise.
+				failed.Do(func() {
+					partErr = fmt.Errorf("s3: put %q: upload part %d: %w", key, n, err)
+					cancel()
+				})
+				return
+			}
+			parts[n-1] = s3types.CompletedPart{ETag: up.ETag, PartNumber: aws.Int32(n)}
+		}(n, buf, want)
 		sent += want
+	}
+	// Abort only once nothing is in flight: a part landing after the
+	// abort would be an orphan nobody cleans up.
+	wg.Wait()
+	switch {
+	case readErr != nil:
+		abort()
+		return storage.PutResult{}, readErr
+	case partErr != nil:
+		abort()
+		return storage.PutResult{}, partErr
+	case sent < size:
+		abort()
+		return storage.PutResult{}, fmt.Errorf("s3: put %q: %w", key, context.Cause(ctx))
 	}
 
 	done := &s3.CompleteMultipartUploadInput{

@@ -38,7 +38,6 @@ package dsa
 import (
 	"context"
 	"crypto/ed25519"
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
@@ -720,12 +719,6 @@ func (s *ReportStore) List(ctx context.Context, f ListFilter) ([]*Report, error)
 }
 
 // ----- helpers -----
-
-func randHex(n int) string {
-	b := make([]byte, n)
-	_, _ = rand.Read(b)
-	return hex.EncodeToString(b)
-}
 
 // HashSubjectIDForFilter is exposed so the CLI can compute a hash
 // for the --subject-id-hash list filter without re-importing

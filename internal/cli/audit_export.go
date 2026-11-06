@@ -150,17 +150,17 @@ func runAuditExportBundle(cmd *cobra.Command, f auditExportBundleFlags) error {
 			fmt.Sprintf("audit export-bundle: --until: %v", err)).Wrap(output.ErrUsage)
 	}
 
-	// A freshly minted key would sign a bundle no verifier trusts.
-	bsigner, _, err := loadExistingKeypair("audit export-bundle")
-	if err != nil {
-		return err
-	}
-
 	_, sp, err := openRepo(cmd.Context(), f.repoURL)
 	if err != nil {
 		return err
 	}
 	defer sp.Close()
+
+	// A freshly minted key would sign a bundle no verifier trusts.
+	bsigner, _, err := loadExistingKeypair("audit export-bundle")
+	if err != nil {
+		return err
+	}
 
 	// Open the destination file with O_EXCL so we never silently
 	// overwrite a previous evidence bundle (operators frequently

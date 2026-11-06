@@ -41,7 +41,7 @@ import (
 //   - The temp dir holds a full restore of the backup; large backups
 //     need correspondingly large free space. The executor refuses to
 //     start when the configured tempdir is on a tmpfs smaller than
-//     the manifest's logical size + 10% headroom — a+
+//     the manifest's logical size + 10% headroom — a later
 //     enhancement; lets the OS surface ENOSPC and the manifest
 //     stays uncorrupted because we never write to the source repo.
 type VerifyExecutor struct {

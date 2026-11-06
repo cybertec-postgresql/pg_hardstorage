@@ -32,31 +32,6 @@ var errNotBuilt = errors.New(
 // errors.Is detection.
 func ErrNotBuilt() error { return errNotBuilt }
 
-// stubClient implements Client and refuses every call with
-// errNotBuilt.
-type stubClient struct{}
-
-// Encrypt implements Client; the stub build always returns errNotBuilt.
-func (stubClient) Encrypt(context.Context, Mechanism, string, []byte, []byte) ([]byte, error) {
-	return nil, errNotBuilt
-}
-
-// Decrypt implements Client; the stub build always returns errNotBuilt.
-func (stubClient) Decrypt(context.Context, Mechanism, string, []byte, []byte) ([]byte, error) {
-	return nil, errNotBuilt
-}
-
-// DestroyKey implements Client; the stub build always returns errNotBuilt.
-func (stubClient) DestroyKey(context.Context, string) error { return errNotBuilt }
-
-// DescribeKey implements Client; the stub build always returns errNotBuilt.
-func (stubClient) DescribeKey(context.Context, string) (map[string]any, error) {
-	return nil, errNotBuilt
-}
-
-// Close implements Client. There is nothing to release in the stub build.
-func (stubClient) Close() error { return nil }
-
 // newRealClient is the stub-build entry point — refuses to
 // open at all so misconfigured deployments fail at startup
 // with a clear remediation, not deep inside a wrap call.

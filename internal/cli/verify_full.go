@@ -58,15 +58,15 @@ func runVerifyFull(cmd *cobra.Command, deployment, backupID, repoURL, pgMajorOve
 		return missingFlagErr(cmd, "--repo")
 	}
 
-	verifier, err := loadVerifier()
-	if err != nil {
-		return err
-	}
 	repoMeta, sp, err := openRepo(cmd.Context(), repoURL)
 	if err != nil {
 		return err
 	}
 	defer sp.Close()
+	verifier, err := loadVerifier()
+	if err != nil {
+		return err
+	}
 
 	store := backup.NewManifestStore(sp)
 	if backupID == "latest" {

@@ -7,6 +7,5 @@ import (
 )
 
 func TestGCS_RepoGC(t *testing.T) {
-	requireDocker(t)
 	gccontract.Run(t, openGCSOnFreshFake(t))
 }

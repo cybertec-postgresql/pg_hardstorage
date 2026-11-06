@@ -172,7 +172,7 @@ type restoreOpts struct {
 	// every tablespace not named by --tablespace-mapping is moved under.
 	tablespaceMapAll string
 
-	// skipGapCheck bypasses the+ WAL-gap pre-flight when
+	// skipGapCheck bypasses the WAL-gap pre-flight when
 	// the operator has validated restore safety some other way
 	// (recovery drill, manual WAL splice). The override is
 	// audit-logged via the wal_gap_check_skipped event so
@@ -559,7 +559,7 @@ func runRestore(cmd *cobra.Command, opts restoreOpts) error {
 	// Surface tablespace remap in the result body for
 	// forensics. Only populated when the operator passed
 	// --tablespace-mapping; omitempty preserves the default
-	// body shape for the+ JSON-compat regression.
+	// body shape for the JSON-compat regression.
 	if !tsRemap.Empty() {
 		rows := make([]tablespaceRemapRow, 0, len(tsRemap))
 		for _, e := range tsRemap {
@@ -846,7 +846,7 @@ func validateExplicitBackupForTime(ctx context.Context, repoURL, deployment, bac
 // honoured --to (most-recent backup with stop_time ≤ target)
 // and "latest" when it just picked the most-recent backup.
 // Both fields are omitempty; default body for an explicit
-// backup-id stays byte-identical to+.
+// backup-id stays byte-identical to earlier releases.
 type restoreResultBody struct {
 	BackupID          string                `json:"backup_id"`
 	Deployment        string                `json:"deployment"`
@@ -869,7 +869,7 @@ type restoreResultBody struct {
 	// TablespaceRemap surfaces the operator-supplied path
 	// redirects when --tablespace-mapping was used. Empty /
 	// nil = no remap requested; the field is omitempty so the
-	// default body shape stays byte-identical to+
+	// default body shape stays byte-identical to earlier releases
 	// (24-month JSON-compat).
 	TablespaceRemap []tablespaceRemapRow `json:"tablespace_remap,omitempty"`
 	// TablespaceMapAll echoes --tablespace-mapping-all: every tablespace

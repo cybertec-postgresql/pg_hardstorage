@@ -52,8 +52,8 @@ func fullDeployment(useSlots bool) config.DeploymentConfig {
 			AuditAnchor: config.ScheduleSpec{Every: "30m"},
 		},
 		Retention: config.RetentionConfig{
-			Policy: "gfs", KeepDaily: 9, KeepWeekly: 8,
-			KeepMonthly: 60, KeepYearly: 20, KeepFor: "720h", KeepFulls: 7,
+			Policy: "gfs", KeepDaily: config.Keep(9), KeepWeekly: config.Keep(8),
+			KeepMonthly: config.Keep(60), KeepYearly: config.Keep(20), KeepFor: "720h", KeepFulls: config.Keep(7),
 		},
 		SLO: config.SLOConfig{RPOSeconds: 3600, RTOSeconds: 7200},
 		TDE: config.TDEConfig{Enabled: true, Engine: "pg_tde", KeyRef: "ref-1"},

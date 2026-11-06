@@ -592,6 +592,23 @@ const (
 	MaxBundleBytes      int64 = 4 << 30 // 4 GiB decompressed, whole bundle
 )
 
+// bundleLimits carries the three bounds through the verifier. Production
+// always passes defaultBundleLimits; the tests pass small ones, so the
+// refusals can be exercised with a few megabytes instead of by building
+// a 4 GiB archive (which took the whole package past its deadline under
+// the race detector).
+type bundleLimits struct {
+	entries    int
+	entryBytes int64
+	totalBytes int64
+}
+
+var defaultBundleLimits = bundleLimits{
+	entries:    MaxBundleEntries,
+	entryBytes: MaxBundleEntryBytes,
+	totalBytes: MaxBundleBytes,
+}
+
 // VerifyBundle reads + verifies a bundle.  Auditors run this to
 // reproduce the bundle's claims independently.
 //
@@ -660,6 +677,10 @@ func (o VerifyBundleOptions) trusts(pub ed25519.PublicKey) bool {
 // trust set (when one is given), else the manifest is returned with a
 // wrapped ErrBundleSignerUntrusted.
 func VerifyBundleWithOptions(r io.Reader, opts VerifyBundleOptions) (*BundleManifest, error) {
+	return verifyBundle(r, opts, defaultBundleLimits)
+}
+
+func verifyBundle(r io.Reader, opts VerifyBundleOptions, lim bundleLimits) (*BundleManifest, error) {
 	gz, err := gzip.NewReader(r)
 	if err != nil {
 		return nil, fmt.Errorf("audit: open gzip: %w", err)
@@ -677,7 +698,7 @@ func VerifyBundleWithOptions(r io.Reader, opts VerifyBundleOptions) (*BundleMani
 	// truncation would be worse than a refusal here, since a short read
 	// changes the canonical signing input and would surface as a
 	// signature failure, pointing an operator at the wrong problem.
-	limited := io.LimitReader(gz, MaxBundleBytes+1)
+	limited := io.LimitReader(gz, lim.totalBytes+1)
 	tr := tar.NewReader(limited)
 
 	files := map[string][]byte{}
@@ -697,23 +718,23 @@ func VerifyBundleWithOptions(r io.Reader, opts VerifyBundleOptions) (*BundleMani
 			return nil, fmt.Errorf("audit: bundle contains suspicious path %q", hdr.Name)
 		}
 		entries++
-		if entries > MaxBundleEntries {
+		if entries > lim.entries {
 			return nil, fmt.Errorf("audit: bundle has more than %d entries; refusing to "+
 				"verify a bundle that could exhaust memory (a real audit bundle has a "+
-				"handful of files)", MaxBundleEntries)
+				"handful of files)", lim.entries)
 		}
-		body, err := io.ReadAll(io.LimitReader(tr, MaxBundleEntryBytes+1))
+		body, err := io.ReadAll(io.LimitReader(tr, lim.entryBytes+1))
 		if err != nil {
 			return nil, fmt.Errorf("audit: tar read body %q: %w", hdr.Name, err)
 		}
-		if int64(len(body)) > MaxBundleEntryBytes {
+		if int64(len(body)) > lim.entryBytes {
 			return nil, fmt.Errorf("audit: bundle entry %q exceeds the %d-byte limit",
-				hdr.Name, MaxBundleEntryBytes)
+				hdr.Name, lim.entryBytes)
 		}
 		total += int64(len(body))
-		if total > MaxBundleBytes {
+		if total > lim.totalBytes {
 			return nil, fmt.Errorf("audit: bundle decompresses to more than %d bytes; "+
-				"refusing (decompression bomb or corrupt archive)", MaxBundleBytes)
+				"refusing (decompression bomb or corrupt archive)", lim.totalBytes)
 		}
 		files[hdr.Name] = body
 	}

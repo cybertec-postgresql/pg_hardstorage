@@ -60,12 +60,15 @@ func TestRepoBundle_ExportNoBackupsErrors(t *testing.T) {
 	}
 }
 
-// TestRepoBundle_ImportRequiresFlags: --to and --in are both
-// required.
+// TestRepoBundle_ImportRequiresFlags: the destination (--repo, or its
+// older spelling --to) and --in are both required.
 func TestRepoBundle_ImportRequiresFlags(t *testing.T) {
 	cases := [][]string{
 		{"repo", "bundle", "import"},
 		{"repo", "bundle", "import", "--to", "file:///tmp/x"},
+		{"repo", "bundle", "import", "--repo", "file:///tmp/x"},
+		{"repo", "bundle", "import", "--in", "/tmp/nope.tar"},
+		{"repo", "bundle", "import", "--in", "/tmp/nope.tar", "--repo", "file:///tmp/x", "--to", "file:///tmp/y"},
 	}
 	for _, args := range cases {
 		_, stderr, exit := runCLI(t, append(args, "-o", "json")...)
@@ -103,6 +106,34 @@ func TestRepoBundle_ImportFromEmptyTarFails(t *testing.T) {
 	}
 	if !strings.Contains(stderr, "repo.bundle_import_failed") {
 		t.Errorf("expected repo.bundle_import_failed; stderr=%s", stderr)
+	}
+}
+
+// TestRepoBundle_ImportDestinationSpellings: import names its
+// destination --repo, as export names its source; --to still works, and
+// naming the same repository both ways is not a conflict.
+func TestRepoBundle_ImportDestinationSpellings(t *testing.T) {
+	tmp := t.TempDir()
+	dstURL := "file://" + filepath.Join(tmp, "dst")
+	if _, _, exit := runCLI(t, "repo", "init", dstURL); exit != int(output.ExitOK) {
+		t.Fatalf("repo init exit=%d", exit)
+	}
+	garbage := filepath.Join(tmp, "garbage.tar")
+	if err := os.WriteFile(garbage, []byte("not a tar at all"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Each spelling must get past flag handling and reach the importer,
+	// which then rejects the garbage tar.
+	for _, dest := range [][]string{
+		{"--repo", dstURL},
+		{"--to", dstURL},
+		{"--repo", dstURL, "--to", dstURL},
+	} {
+		args := append([]string{"repo", "bundle", "import", "--in", garbage, "-o", "json"}, dest...)
+		_, stderr, _ := runCLI(t, args...)
+		if !strings.Contains(stderr, "repo.bundle_import_failed") {
+			t.Errorf("%v: flags not accepted; stderr=%s", dest, stderr)
+		}
 	}
 }
 

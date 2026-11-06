@@ -78,15 +78,15 @@ func runRepoCheck(cmd *cobra.Command, repoURL string) error {
 	if repoURL == "" {
 		return missingFlagErr(cmd, "--repo (or the first positional <url>)")
 	}
-	verifier, err := loadVerifier()
-	if err != nil {
-		return err
-	}
 	meta, sp, err := openRepo(cmd.Context(), repoURL)
 	if err != nil {
 		return err
 	}
 	defer sp.Close()
+	verifier, err := loadVerifier()
+	if err != nil {
+		return err
+	}
 
 	commitMode := "stage_and_rename"
 	if sp.Capabilities().ConditionalPut {
@@ -101,6 +101,26 @@ func runRepoCheck(cmd *cobra.Command, repoURL string) error {
 		return output.NewError("repo.check.deployments_failed",
 			fmt.Sprintf("repo check: enumerate deployments: %v", err)).Wrap(err)
 	}
+	// A deployment that only archives or streams WAL has no manifest,
+	// so it is absent from the list above; without this pass a
+	// repository holding nothing but WAL reported "deployments: []".
+	walSegments, err := backup.WALSegmentCounts(cmd.Context(), sp)
+	if err != nil {
+		return output.NewError("repo.check.wal_walk_failed",
+			fmt.Sprintf("repo check: enumerate WAL deployments: %v", err)).Wrap(err)
+	}
+	totalWALSegments := 0
+	withBackups := make(map[string]bool, len(deployments))
+	for _, dep := range deployments {
+		withBackups[dep] = true
+	}
+	for dep, n := range walSegments {
+		totalWALSegments += n
+		if !withBackups[dep] {
+			deployments = append(deployments, dep)
+		}
+	}
+	sort.Strings(deployments)
 	depReports := make([]repoCheckDeployment, 0, len(deployments))
 	totalSigFailed := 0
 	var sigFailedKeys []string
@@ -108,7 +128,7 @@ func runRepoCheck(cmd *cobra.Command, repoURL string) error {
 	totalUnreadable := 0
 	walkErrSample := ""
 	for _, dep := range deployments {
-		dr := repoCheckDeployment{Name: dep}
+		dr := repoCheckDeployment{Name: dep, WALSegments: walSegments[dep]}
 		walk, werr := checkDeploymentManifests(cmd.Context(), sp, dep, verifier)
 		if werr != nil {
 			return output.NewError("repo.check.manifest_walk_failed",
@@ -177,6 +197,7 @@ func runRepoCheck(cmd *cobra.Command, repoURL string) error {
 		Schema:                   meta.Schema,
 		Deployments:              depReports,
 		LiveManifests:            totalManifests,
+		WALSegments:              totalWALSegments,
 		SignatureFailures:        totalSigFailed,
 		SignatureFailedManifests: capList(sigFailedKeys, maxListedSignatureFailures),
 		UnreadableManifests:      totalUnreadable,
@@ -415,16 +436,23 @@ type repoCheckDeployment struct {
 	// about bytes that were read. See checkDeploymentManifests.
 	UnreadableManifests int `json:"unreadable_manifests,omitempty"`
 	Tombstones          int `json:"tombstones"`
+	// WALSegments is the number of archived WAL segment manifests. A
+	// deployment with WAL and no backup is listed with LiveManifests 0.
+	WALSegments int `json:"wal_segments,omitempty"`
 }
 
 // repoCheckBody is the v1-stable result body.
 type repoCheckBody struct {
-	URL               string                `json:"url"`
-	RepoID            string                `json:"repo_id"`
-	Schema            string                `json:"schema"`
-	Deployments       []repoCheckDeployment `json:"deployments"`
-	LiveManifests     int                   `json:"live_manifests"`
-	SignatureFailures int                   `json:"signature_failures"`
+	URL    string `json:"url"`
+	RepoID string `json:"repo_id"`
+	Schema string `json:"schema"`
+	// Deployments lists every deployment with a backup OR archived WAL.
+	Deployments   []repoCheckDeployment `json:"deployments"`
+	LiveManifests int                   `json:"live_manifests"`
+	// WALSegments is the repository-wide count of archived WAL segment
+	// manifests.
+	WALSegments       int `json:"wal_segments"`
+	SignatureFailures int `json:"signature_failures"`
 	// SignatureFailedManifests lists the manifests that failed to parse
 	// or verify (capped; SignatureFailures has the full count).
 	SignatureFailedManifests []string `json:"signature_failed_manifests,omitempty"`
@@ -467,6 +495,7 @@ func (b repoCheckBody) WriteText(w io.Writer) error {
 	fmt.Fprintf(bw, "  Schema:          %s\n", b.Schema)
 	fmt.Fprintf(bw, "  Deployments:     %d\n", len(b.Deployments))
 	fmt.Fprintf(bw, "  Live manifests:  %d\n", b.LiveManifests)
+	fmt.Fprintf(bw, "  WAL segments:    %d\n", b.WALSegments)
 	if b.SignatureFailures > 0 {
 		fmt.Fprintf(bw, "  ✗ Signature failures: %d (skipped during walk; investigate with `repair manifest`)\n",
 			b.SignatureFailures)
@@ -515,6 +544,9 @@ func (b repoCheckBody) WriteText(w io.Writer) error {
 		sort.Slice(sorted, func(i, j int) bool { return sorted[i].Name < sorted[j].Name })
 		for _, dr := range sorted {
 			fmt.Fprintf(bw, "    %s — live=%d, tombstoned=%d", dr.Name, dr.LiveManifests, dr.Tombstones)
+			if dr.WALSegments > 0 {
+				fmt.Fprintf(bw, ", wal-segments=%d", dr.WALSegments)
+			}
 			if dr.SignatureFailures > 0 {
 				fmt.Fprintf(bw, ", sig-failed=%d", dr.SignatureFailures)
 			}

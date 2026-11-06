@@ -734,10 +734,6 @@ type backupFileEventBody struct {
 // padded — file path lengths vary wildly across PGDATA and any
 // padding we picked would look broken on the next backup.
 func (b backupFileEventBody) WriteText(w io.Writer) error {
-	saved := b.Size - b.UniqueBytes
-	if saved < 0 {
-		saved = 0
-	}
 	_, err := fmt.Fprintf(w,
 		"%s  size=%s  chunks=%d  deduped=%d  stored=%s",
 		b.Path,

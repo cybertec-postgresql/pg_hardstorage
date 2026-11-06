@@ -98,7 +98,7 @@ type Recovery struct {
 	// has no stop point.
 	StandbyMode bool
 
-	// SkipGapCheck disables the+ WAL-gap pre-flight that
+	// SkipGapCheck disables the WAL-gap pre-flight that
 	// would otherwise refuse a TargetLSN restore landing in a
 	// known-failover gap (or warn for time/name targets). Off
 	// by default — set explicitly when the operator has

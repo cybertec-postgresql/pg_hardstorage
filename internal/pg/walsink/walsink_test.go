@@ -787,3 +787,51 @@ func TestPublicSurface_Smoke(t *testing.T) {
 		t.Errorf("smoke marshal: %v", err)
 	}
 }
+
+// A split-brain refusal raised inside the streaming sink's asynchronous
+// pipeline must still carry its code as a typed error when it comes out
+// of Close: the CLI stops the streamer and reports splitbrain.* from
+// SplitBrainCode, not from the message text.
+func TestSink_SplitBrainRefusalIsTypedThroughThePipeline(t *testing.T) {
+	root := t.TempDir()
+	sp := &fs.Plugin{}
+	if err := sp.Open(context.Background(), storage.StorageConfig{URL: &url.URL{Scheme: "file", Path: root}}); err != nil {
+		t.Fatal(err)
+	}
+	defer sp.Close()
+	cas := repo.NewCAS(sp)
+	commit := func(sysID string, fill byte) error {
+		s, err := walsink.New(cas, sp, walsink.Options{Deployment: "db1", Timeline: 1, SystemIdentifier: sysID})
+		if err != nil {
+			t.Fatal(err)
+		}
+		rec := replication.XLogRecord{WALStart: 0, Data: fillBytes(fill, walsink.SegmentSize)}
+		if err := s.OnRecord(context.Background(), rec); err != nil {
+			_ = s.Close(context.Background())
+			return err
+		}
+		return s.Close(context.Background())
+	}
+	if err := commit("7388123456789", 0x11); err != nil {
+		t.Fatalf("first commit: %v", err)
+	}
+	for _, c := range []struct {
+		name, sysID string
+		fill        byte
+		want        string
+	}{
+		{"same cluster, different bytes", "7388123456789", 0x22, walsink.SplitBrainContentMismatch},
+		{"another cluster, same segment", "9999999999999", 0x11, walsink.SplitBrainSystemIdentifierMismatch},
+	} {
+		err := commit(c.sysID, c.fill)
+		if err == nil {
+			t.Fatalf("%s: committed over an existing segment", c.name)
+		}
+		if got := walsink.SplitBrainCode(err); got != c.want {
+			t.Errorf("%s: SplitBrainCode = %q, want %q (err: %v)", c.name, got, c.want, err)
+		}
+		if !strings.Contains(err.Error(), c.want+": ") {
+			t.Errorf("%s: message lost its code prefix: %v", c.name, err)
+		}
+	}
+}

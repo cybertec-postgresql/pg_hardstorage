@@ -141,15 +141,15 @@ func runVerify(cmd *cobra.Command, deployment, backupID, repoURL string, sample 
 			"verify: --sample must be ≥ 0").Wrap(output.ErrUsage)
 	}
 
-	verifier, err := loadVerifier()
-	if err != nil {
-		return err
-	}
 	repoMeta, sp, err := openRepo(cmd.Context(), repoURL)
 	if err != nil {
 		return err
 	}
 	defer sp.Close()
+	verifier, err := loadVerifier()
+	if err != nil {
+		return err
+	}
 
 	store := backup.NewManifestStore(sp)
 
@@ -587,7 +587,7 @@ func verifyChunkExistence(ctx context.Context, sp storage.StoragePlugin, m *back
 
 // verifyBody is the v1-stable result body. Field names match the
 // SPEC's "fast verify" vocabulary. ExistenceOnly is omitempty so the
-// default (full) verify body shape stays byte-identical to+ —
+// default (full) verify body shape stays byte-identical to earlier releases —
 // schema-additive only.
 type verifyBody struct {
 	Deployment        string   `json:"deployment"`

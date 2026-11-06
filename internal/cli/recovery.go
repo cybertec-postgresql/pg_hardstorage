@@ -163,15 +163,15 @@ func runRecoveryReadiness(cmd *cobra.Command, deployment string, f recoveryReadi
 			"recovery readiness: --rpo-seconds / --rto-seconds must be >= 0").Wrap(output.ErrUsage)
 	}
 
-	verifier, err := loadVerifier()
-	if err != nil {
-		return err
-	}
 	_, sp, err := openRepo(cmd.Context(), f.repoURL)
 	if err != nil {
 		return err
 	}
 	defer sp.Close()
+	verifier, err := loadVerifier()
+	if err != nil {
+		return err
+	}
 
 	p, err := paths.Resolve(paths.DefaultOptions())
 	if err != nil {

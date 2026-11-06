@@ -22,7 +22,70 @@ keeps reading that version for at least 24 months after a successor lands.
   not get the toolchain `go.mod` asked for; every pin is now 1.26.10.
   `golang.org/x/crypto` moves to v0.58.0.
 
+- **`wal` commands accepted a deployment name that escaped the `wal/`
+  prefix.** The name was interpolated into storage keys unchecked, so
+  `wal push ../audit <segment>` wrote a segment manifest into the audit
+  tree (after which `audit verify-chain` reported the chain broken),
+  `../chunks` wrote into the chunk store, and `../x` and `a/../../x`
+  were two names for one namespace. Writes stayed inside the repository
+  root. Every `wal` subcommand, the WAL sinks and the logical sink now
+  refuse a name with a path separator or control character, or equal to
+  `.` / `..`, with `usage.bad_deployment` (exit 2) before anything
+  reaches storage — the rule `backup` and the HTTP API already applied.
+  Names that are a single key component are unaffected.
+- **Redacting a malformed connection string could panic.** `Redact`
+  located the secret keyword in a lower-cased copy and cut the original
+  at that offset; bytes that are not valid UTF-8 change length when
+  lower-cased, so the offset could lie past the end.
+
 ### Fixed
+
+- **An explicit `keep_daily: 0` (or `keep_weekly`, `keep_monthly`,
+  `keep_yearly`, `keep_fulls`) in a deployment's `retention` block was
+  replaced by the default.** The scheduled rotate then kept 7 dailies
+  (4 weeklies, 12 monthlies, 5 yearlies, 14 fulls) the config had
+  switched off, while `rotate --keep-daily 0` did what it said. A count
+  that is written is now used as written, 0 included, and a conf.d
+  overlay can set one to 0; a count that is absent still takes the
+  default or inherits the base value. **If a config carries a literal
+  `0` only as a placeholder, remove the key before upgrading** — it now
+  means "keep none in this bucket". Negative counts are refused.
+- **Config-editing commands destroyed the comments in
+  `pg_hardstorage.yaml`** (`deployment add`, sink / notify / schedule
+  edits, `init` on an existing file) while the file's own header said
+  hand edits were preserved. Edits are now merged into the existing
+  document: comments, key order, quoting and indentation of everything
+  the edit did not touch are kept, and the file keeps its permission
+  bits instead of being reset to 0600.
+- **`anomaly check -o json` shipped `"schema": ""`**; it now carries
+  `pg_hardstorage.anomaly.v1`.
+- **A damaged `HSREPO` was reported as an internal error** with a raw
+  JSON parse message. It is now `verify.repo_marker_corrupt` (exit 9)
+  on every command, with the repair in the suggestion.
+- **Read commands on a host with an empty keyring always answered
+  `notfound.signing_key`**, whatever was wrong with the repository.
+  The repository is now opened first, so a wrong URL is
+  `notfound.repo` and a damaged marker is `verify.repo_marker_corrupt`.
+- **`repo check` and `repo audit` reported a repository holding only
+  archived WAL as having no deployments.** Both now list every
+  deployment with a backup or archived WAL, with a `wal_segments`
+  count per deployment (and repository-wide in `repo check`).
+- **`wal fetch` reported a corrupt chunk as `wal.fetch.chunk_missing`.**
+  A chunk that is present but damaged is now `verify.checksum_mismatch`
+  (exit 9) and one that cannot be read or decrypted is
+  `wal.fetch.chunk_unreadable`; `chunk_missing` means the object is
+  absent.
+- **`splitbrain.*` codes were recovered from the error message with a
+  regular expression**, so rewording the message would have silently
+  turned them into `wal.push_failed`. The code is now a field of a
+  typed error.
+- **Operator-facing messages contained a stray `+`** ("carries the+
+  WAL-gap metadata", "pre-dates the+ PGBackupManifest field", …).
+- `spill.HashSet.Add` reported the all-zero key as already present once
+  the set had spilled to disk.
+- `TestSweep_CheckpointWindowCappedByFenceMaxWait` failed on fast hosts:
+  it expected a time cap to force one checkpoint per delete slice
+  without spending the time. The sweep was correct; the test now is.
 
 - **Backups failed with "inactivity timeout" when the server's start
   checkpoint took longer than 90 s.** PostgreSQL sends nothing on the
@@ -89,6 +152,28 @@ keeps reading that version for at least 24 months after a successor lands.
   checkpoint records a file only after it is on disk. A 68k-file restore
   went from 22 s to 10 s with fsync costs excluded; with fsync the
   overlap matters far more.
+
+### Changed
+
+- **S3 multipart uploads send up to 4 parts in parallel** instead of one
+  at a time, bounded by 256 MiB of part buffers (previously one 64 MiB
+  buffer). Objects over 64 MiB — the manifests of very large clusters —
+  were bound by parts × round trip.
+- `repo bundle import` takes its destination as `--repo`, mirroring
+  `repo bundle export --repo … --out …`. `--to` is still accepted.
+- `recovery drill --help` now says what `--format` does: it selects the
+  layout of the text report, never JSON (`-o json` does).
+- The CLI reference states the `--apply` / `--dry-run` rule, and a test
+  enforces that no command carries both.
+- The storage contract suites (S3, GCS, Azure, SFTP) are skipped under
+  `go test -short`, bound every emulator start to 3 minutes, and stop
+  waiting once a sink has failed to start twice in a row.
+  `PG_HARDSTORAGE_DEMAND_DOCKER=1` still forces them.
+- The audit-bundle size-limit tests run against scaled-down limits
+  instead of building a 4 GiB archive: 21 s became milliseconds, and
+  `go test -race ./internal/audit/` no longer runs into its deadline.
+- Removed unused code found by `staticcheck` / `unused` (about 40
+  functions, fields and dead assignments).
 
 ## [1.6.0] — 2026-10-27
 

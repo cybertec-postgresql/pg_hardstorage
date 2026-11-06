@@ -193,6 +193,11 @@ func mapRepoSetModeError(url string, err error) error {
 				Command: "pg_hardstorage repo init " + url,
 			}).Wrap(err)
 	}
+	// An error the repo layer already classified (a damaged HSREPO)
+	// keeps its code.
+	if oe, ok := output.AsOutputError(err); ok {
+		return oe
+	}
 	return output.NewError("repo.set_mode_failed",
 		fmt.Sprintf("repo set-mode: %v", err)).Wrap(err)
 }

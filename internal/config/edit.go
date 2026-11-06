@@ -194,7 +194,9 @@ func (v *EditView) Apply(updated *Config) (*Config, error) {
 }
 
 // clone deep-copies a Config through its YAML form — the same form it is
-// read from and written to, so nothing the file can carry is lost.
+// read from and written to, so no value the file can carry is lost.
+// Comments are not values and do not survive this; MarshalPreserving
+// puts them back from the file at write time.
 func clone(c Config) (Config, error) {
 	b, err := yaml.Marshal(&c)
 	if err != nil {

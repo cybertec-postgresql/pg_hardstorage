@@ -874,7 +874,7 @@ func take(ctx context.Context, opts TakeOptions, abortCtx *context.Context) (*Re
 			WithSubject(output.Subject{Deployment: opts.Deployment, BackupID: backupID}).
 			WithBody(map[string]any{
 				"gap_count": len(gaps),
-				"hint":      "this backup carries the+ WAL-gap metadata; restore will refuse PITR within these ranges",
+				"hint":      "this backup carries WAL-gap metadata; restore will refuse PITR within these ranges",
 			}))
 	}
 

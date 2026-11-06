@@ -11,7 +11,7 @@
 // deprovisions them.  No manual operator management; no stale
 // accounts after team changes.
 //
-// Scope at+: domain primitive — User, Group, Store, Filter
+// Scope: domain primitive — User, Group, Store, Filter
 // parser, and a small subset of the SCIM PATCH operation set.
 // HTTP handler wiring into the existing server lands in a
 // follow-on commit; the primitive is what the integration needs

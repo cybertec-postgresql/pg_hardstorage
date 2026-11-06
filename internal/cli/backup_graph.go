@@ -109,15 +109,15 @@ func runBackupGraph(cmd *cobra.Command, deployment string, f backupGraphFlags) e
 			Wrap(output.ErrUsage)
 	}
 
-	verifier, err := loadVerifier()
-	if err != nil {
-		return err
-	}
 	_, sp, err := openRepo(cmd.Context(), f.repoURL)
 	if err != nil {
 		return err
 	}
 	defer sp.Close()
+	verifier, err := loadVerifier()
+	if err != nil {
+		return err
+	}
 
 	g, err := chain.BuildGraph(cmd.Context(), sp, deployment, chain.Options{
 		Verifier:          verifier,

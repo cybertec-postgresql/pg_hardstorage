@@ -438,7 +438,7 @@ func (b partialInspectBody) WriteText(w io.Writer) error {
 	return err
 }
 
-// newPartialRestoreCmd is the+ selective-extraction path.
+// newPartialRestoreCmd is the selective-extraction path.
 //
 // What it does today: extract ONLY the heap files (and TOAST + _vm
 // + _fsm + segment siblings) for the named tables from the backup

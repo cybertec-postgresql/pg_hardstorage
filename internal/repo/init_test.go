@@ -2,12 +2,17 @@ package repo_test
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	stdio "io"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/output"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo"
 )
 
@@ -112,5 +117,44 @@ func TestInit_UnknownScheme(t *testing.T) {
 	_, err := repo.Init(context.Background(), repo.InitOptions{URL: "weirdo://nope"})
 	if err == nil {
 		t.Fatal("unknown scheme should fail")
+	}
+}
+
+// A damaged HSREPO is the repository telling us it is broken, not a bug
+// in this tool: Open must say so with a structured verify.* error (exit
+// 9) that survives the %w wrapping its many callers apply, instead of a
+// bare JSON parse error that the CLI files under "internal".
+func TestOpen_DamagedMarkerIsStructured(t *testing.T) {
+	ctx := context.Background()
+	for name, body := range map[string]string{
+		"not json":       "not json",
+		"truncated":      `{"schema":"pg_hardstorage.repo.v1","id":"ab`,
+		"empty":          "",
+		"json, no shape": `{}`,
+	} {
+		url := tempFileURL(t)
+		path := filepath.Join(strings.TrimPrefix(url, "file://"), repo.HSREPOFilename)
+		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		_, sp, err := repo.Open(ctx, url)
+		if err == nil {
+			_ = sp.Close()
+			t.Errorf("%s: Open accepted a damaged marker", name)
+			continue
+		}
+		if !errors.Is(err, repo.ErrCorruptMarker) {
+			t.Errorf("%s: err = %v, want ErrCorruptMarker in the chain", name, err)
+		}
+		oe, ok := output.AsOutputError(fmt.Errorf("open repo: %w", err))
+		if !ok || oe.Code != "verify.repo_marker_corrupt" {
+			t.Errorf("%s: code = %v (structured=%v), want verify.repo_marker_corrupt", name, oe, ok)
+		}
+		if ok && oe.Suggestion == nil {
+			t.Errorf("%s: no suggestion on the most actionable repository failure there is", name)
+		}
+		if errors.Is(err, repo.ErrNotARepo) {
+			t.Errorf("%s: a damaged marker must not read as \"no repository here\"", name)
+		}
 	}
 }

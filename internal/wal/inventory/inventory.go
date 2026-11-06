@@ -8,7 +8,7 @@
 // repository-usage callers will need.
 //
 // We expose it as a public package (rather than keeping a
-// private helper in cli/wal.go) because the+ leader-follow
+// private helper in cli/wal.go) because the leader-follow
 // coordinator (internal/wal/follower) needs to query it from
 // outside the cli package.
 package inventory

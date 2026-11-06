@@ -438,8 +438,8 @@ func New(cas *repo.CAS, sp storage.StoragePlugin, opts Options) (*Sink, error) {
 	if sp == nil {
 		return nil, errors.New("walsink: nil StoragePlugin")
 	}
-	if opts.Deployment == "" {
-		return nil, errors.New("walsink: empty deployment")
+	if err := ValidateDeployment(opts.Deployment); err != nil {
+		return nil, err
 	}
 	if opts.SystemIdentifier == "" {
 		return nil, errors.New("walsink: empty SystemIdentifier")

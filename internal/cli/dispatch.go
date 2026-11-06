@@ -64,7 +64,7 @@ func (c *DispatchClient) EnqueueRestore(ctx context.Context, deployment string, 
 }
 
 // EnqueueBackup POSTs to /v1/deployments/<deployment>/backups.
-// Symmetric to EnqueueRestore; the+ backup --control-plane mode
+// Symmetric to EnqueueRestore; the backup --control-plane mode
 // rides this path.
 func (c *DispatchClient) EnqueueBackup(ctx context.Context, deployment string, body map[string]any) (string, error) {
 	return c.enqueue(ctx, fmt.Sprintf("/v1/deployments/%s/backups", deployment), body)

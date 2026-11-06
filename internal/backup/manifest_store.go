@@ -2068,7 +2068,7 @@ func (ms *ManifestStore) removeTombstone(ctx context.Context, deployment, backup
 //
 // Scan-and-walk implementation: we read every visible manifest in
 // the deployment once (O(N) reads) and build a parent-id index,
-// then BFS forward from backupID. For the+ fleet sizes (hundreds
+// then BFS forward from backupID. For current fleet sizes (hundreds
 // of backups per deployment) this is fine. A future indexed lookup
 // can drop in if profiling shows it matters.
 //

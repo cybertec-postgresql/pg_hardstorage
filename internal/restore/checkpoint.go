@@ -107,7 +107,6 @@ type CheckpointWriter struct {
 	logw     *bufio.Writer
 	logBytes int64
 	resume   bool // log is extended (truncated to CompletedLogBytes), not restarted
-	legacy   bool // state on disk still carries the inline list; migrate it first
 }
 
 // NewCheckpointWriter constructs a writer rooted at targetDir. cp is

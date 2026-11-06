@@ -612,20 +612,6 @@ func parseAzblobURL(u *url.URL) (serviceURL, containerName, prefix string, err e
 	return serviceURL, containerName, prefix, nil
 }
 
-// accountNameFromURL extracts the storage account name from
-// a service URL.  Used by the SharedKeyCredential builder.
-func accountNameFromURL(serviceURL string) string {
-	u, err := url.Parse(serviceURL)
-	if err != nil {
-		return ""
-	}
-	host := u.Host
-	if i := strings.IndexByte(host, '.'); i > 0 {
-		return host[:i]
-	}
-	return host
-}
-
 // isNotFound checks the wrapped Azure error code for the
 // blob-not-found shape.
 func isNotFound(err error) bool {

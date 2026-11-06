@@ -34,7 +34,7 @@
 // dedicated entry point.  Catalog files spell out both forms
 // for every plural key.
 //
-// Scope at+: ship the framework + a small representative
+// Scope: ship the framework + a small representative
 // catalog (~30 keys) covering doctor / restore / status / common
 // errors in EN/DE/FR/JA.  Future commits expand the catalog as
 // new commands surface translatable strings.
@@ -308,7 +308,7 @@ func mergeData(seed map[string]any, data ...any) map[string]any {
 			// Anything non-map is dropped — the catalog uses named
 			// fields exclusively.  A future template that wants to
 			// pass a struct can do so by registering its fields via
-			// reflection, out of+ scope.
+			// reflection, out of scope.
 		}
 	}
 	return out
