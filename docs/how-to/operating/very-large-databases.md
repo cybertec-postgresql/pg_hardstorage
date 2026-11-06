@@ -119,6 +119,25 @@ to re-run with. A chain (incremental) restore keeps its link staging under
 `--chain-staging-root` and preserves it across retries; `--reset-chain-staging`
 discards it.
 
+## Restore and verify throughput
+
+`restore` and `verify` read chunks from the repository several at a
+time: 16 by default, across all the files being written, set with
+`--fetch-concurrency` (1 to 64). A chunk read waits on a storage round
+trip, not on CPU, so against an object store the rate is roughly
+`fetch concurrency / round-trip time`: at 30 ms per request, 16 reads in
+flight give about 500 chunks/s, which is 500 MiB/s at 1 MiB chunks and
+about 30 MiB/s at the default 64 KiB. Raise the value when the host's
+CPU, disks and network are idle during a restore; lower it if the
+storage service throttles. Memory grows with it (one chunk per read in
+flight).
+
+A chunk read that breaks off mid-body is repeated twice before the
+restore fails. The manifest, which a restore streams for as long as it
+runs, is re-opened at the byte it had reached when its connection drops;
+it gives up after five attempts in a row that deliver nothing. Both are
+on top of the request retries of the storage SDKs.
+
 ## Fewer, larger chunks
 
 `pg_hardstorage backup --chunk-size 1MiB` makes the average chunk 1 MiB

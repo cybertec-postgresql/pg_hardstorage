@@ -290,6 +290,12 @@ func (t *Throttle) Get(ctx context.Context, key string) (io.ReadCloser, error) {
 	return t.inner.Get(ctx, key)
 }
 
+// GetFrom delegates via storage.GetFrom, so a resumed read keeps the
+// backend's ranged request when it has one.
+func (t *Throttle) GetFrom(ctx context.Context, key string, offset int64) (io.ReadCloser, error) {
+	return storage.GetFrom(ctx, t.inner, key, offset)
+}
+
 // Stat delegates.
 func (t *Throttle) Stat(ctx context.Context, key string) (storage.ObjectInfo, error) {
 	return t.inner.Stat(ctx, key)
@@ -381,4 +387,5 @@ var (
 	_ storage.FreeSpaceAware   = (*Throttle)(nil)
 	_ storage.StagingReapAware = (*Throttle)(nil)
 	_ storage.RetentionAware   = (*Throttle)(nil)
+	_ storage.OffsetReadAware  = (*Throttle)(nil)
 )

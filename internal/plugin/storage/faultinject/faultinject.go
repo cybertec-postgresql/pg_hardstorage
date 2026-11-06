@@ -291,6 +291,15 @@ func (m *Middleware) Get(ctx context.Context, key string) (io.ReadCloser, error)
 	return m.inner.Get(ctx, key)
 }
 
+// GetFrom is a Get for the rule list: a resumed read is the same
+// operation on the same key and must hit the same rules.
+func (m *Middleware) GetFrom(ctx context.Context, key string, offset int64) (io.ReadCloser, error) {
+	if err := m.matchAndRecord(OpGet, key); err != nil {
+		return nil, err
+	}
+	return storage.GetFrom(ctx, m.inner, key, offset)
+}
+
 // Stat consults the rule list.
 func (m *Middleware) Stat(ctx context.Context, key string) (storage.ObjectInfo, error) {
 	if err := m.matchAndRecord(OpStat, key); err != nil {
@@ -392,6 +401,7 @@ var (
 	_ storage.FreeSpaceAware   = (*Middleware)(nil)
 	_ storage.StagingReapAware = (*Middleware)(nil)
 	_ storage.RetentionAware   = (*Middleware)(nil)
+	_ storage.OffsetReadAware  = (*Middleware)(nil)
 )
 
 // ErrInjected is the canonical sentinel an operator can use as a

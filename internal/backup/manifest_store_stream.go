@@ -92,7 +92,7 @@ func (ms *ManifestStore) streamFilesT(ctx context.Context, deployment, backupID 
 // streamOne reads one object: verify pass (when gate), then deliver pass.
 func (ms *ManifestStore) streamOne(ctx context.Context, key, deployment, backupID string, opts StreamOptions, gate bool, fn func(*FileEntry) error) (*StreamInfo, string, error) {
 	get := func(o StreamOptions, cb func(*FileEntry) error) (*StreamInfo, error) {
-		rc, err := ms.sp.Get(ctx, key)
+		rc, err := storage.GetResuming(ctx, ms.sp, key)
 		if err != nil {
 			return nil, err
 		}

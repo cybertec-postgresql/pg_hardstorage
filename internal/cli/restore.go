@@ -117,6 +117,7 @@ targets never combine with the requested one.`,
 		"target timeline: 'latest' or an explicit TLI number")
 	c.Flags().BoolVar(&opts.toExclusive, "to-exclusive", false,
 		"stop recovery just BEFORE the target (default: just after)")
+	registerFetchConcurrencyFlag(c)
 	c.Flags().BoolVar(&opts.skipGapCheck, "skip-gap-check", false,
 		"bypass the WAL pre-flights: known WAL gaps, missing timeline history, and a backup whose WAL exists nowhere (operator override; "+
 			"the override is audit-logged)")
@@ -226,6 +227,10 @@ func runRestore(cmd *cobra.Command, opts restoreOpts) error {
 	// accepted and printed by --preview, then failed only when PG
 	// started recovery on the remote agent).
 	if err := validateRestoreTargets(&opts); err != nil {
+		return err
+	}
+	fetchConcurrency, err := fetchConcurrencyFlag(cmd)
+	if err != nil {
 		return err
 	}
 	verifyMode, err := restore.ParseVerifyMode(opts.verifyMode)
@@ -453,6 +458,7 @@ func runRestore(cmd *cobra.Command, opts restoreOpts) error {
 		Deployment:          opts.deployment,
 		BackupID:            backupID,
 		TargetDir:           opts.targetDir,
+		FetchConcurrency:    fetchConcurrency,
 		Verifier:            verifier,
 		AllowOverwrite:      opts.force,
 		AllowForeignCluster: opts.forceForeign,

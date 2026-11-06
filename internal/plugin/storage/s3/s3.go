@@ -500,6 +500,25 @@ func (p *Plugin) Get(ctx context.Context, key string) (io.ReadCloser, error) {
 	return out.Body, nil
 }
 
+// GetFrom implements storage.OffsetReadAware with a Range request.
+func (p *Plugin) GetFrom(ctx context.Context, key string, offset int64) (io.ReadCloser, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	out, err := p.client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(p.bucket),
+		Key:    aws.String(p.fullKey(key)),
+		Range:  aws.String(fmt.Sprintf("bytes=%d-", offset)),
+	})
+	if err != nil {
+		if isNotFound(err) {
+			return nil, fmt.Errorf("%w: %s", storage.ErrNotFound, key)
+		}
+		return nil, fmt.Errorf("s3: get %q from byte %d: %w", key, offset, err)
+	}
+	return out.Body, nil
+}
+
 // Stat implements storage.StoragePlugin.
 func (p *Plugin) Stat(ctx context.Context, key string) (storage.ObjectInfo, error) {
 	if err := ctx.Err(); err != nil {

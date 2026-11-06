@@ -119,6 +119,7 @@ Backup ID:
 		"verify only the first N chunks in hash-sorted order (0 = every referenced chunk)")
 	c.Flags().BoolVar(&existenceOnly, "existence-only", false,
 		"only check that each chunk EXISTS (Stat) — skip fetch+decrypt+SHA verification (much faster; useful pre-flight before `backup undelete`)")
+	registerFetchConcurrencyFlag(c)
 	c.Flags().Bool("full", false,
 		"perform a full restore into a Docker sandbox and run pg_verifybackup against it")
 	c.Flags().String("pg-major", "",
@@ -131,6 +132,10 @@ Backup ID:
 
 func runVerify(cmd *cobra.Command, deployment, backupID, repoURL string, sample int, existenceOnly bool) error {
 	d := DispatcherFrom(cmd)
+	fetchConcurrency, err := fetchConcurrencyFlag(cmd)
+	if err != nil {
+		return err
+	}
 	// Resolve --repo from the named deployment in config when omitted (#12).
 	_, repoURL = deploymentDefaults(deployment, "", repoURL)
 	if repoURL == "" {
@@ -202,8 +207,9 @@ func runVerify(cmd *cobra.Command, deployment, backupID, repoURL string, sample 
 	started := time.Now()
 	var stats verifyStats
 	if existenceOnly {
-		stats, err = verifyChunkExistence(cmd.Context(), sp, m, sample)
+		stats, err = verifyChunkExistence(cmd.Context(), sp, m, sample, fetchConcurrency)
 	} else {
+		cas.SetFetchConcurrency(fetchConcurrency)
 		stats, err = verifyChunks(cmd.Context(), cas, m, sample)
 	}
 	stats.DurationMS = time.Since(started).Milliseconds()
@@ -476,19 +482,21 @@ func verifyChunks(ctx context.Context, cas *repo.CAS, m *backup.Manifest, sample
 	}
 	stats.ChunksSampled = hashes.n
 
-	for h := range hashes.each() {
-		// Cooperative cancellation point. We check BEFORE each
-		// GetChunkBytes — checking after would still let one
-		// ctx-cancelled call leak into stats.Mismatches.
-		if err := ctx.Err(); err != nil {
-			return stats, err
+	// Chunks are read ahead (issue #97: one at a time, `verify` of a
+	// backup in an object store ran at ~24 chunks/s) and judged in
+	// ascending hash order, so the counts and the capped mismatch list
+	// are what a serial walk produced.
+	err = cas.FetchOrdered(ctx, hashes.each(), func(h repo.Hash, body []byte, err error) error {
+		// Cooperative cancellation point: a chunk whose read ended
+		// because the walk was cancelled is not a verification finding.
+		// Without this, a Ctrl-C mid-walk would count every remaining
+		// chunk as a mismatch.
+		if cerr := ctx.Err(); cerr != nil {
+			return cerr
 		}
-		body, err := cas.GetChunkBytes(ctx, h)
 		if err != nil {
-			// Distinguish ctx errors from real fetch failures: a
-			// cancelled fetch is not a verification finding.
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-				return stats, err
+				return err
 			}
 			// GetChunkBytes content-address-verifies every chunk it
 			// returns — decrypt, decompress, then SHA-256 the plaintext
@@ -497,7 +505,7 @@ func verifyChunks(ctx context.Context, cas *repo.CAS, m *backup.Manifest, sample
 			// non-ctx error here IS the corruption / missing-chunk
 			// finding; record it.
 			stats.noteMismatch(h)
-			continue
+			return nil
 		}
 		// No second SHA pass. A body returned WITHOUT error already
 		// hashed to h inside GetChunkBytes, so re-hashing it here was an
@@ -506,6 +514,10 @@ func verifyChunks(ctx context.Context, cas *repo.CAS, m *backup.Manifest, sample
 		// a corrupt chunk surfaces as the GetChunkBytes error above.
 		stats.ChunksVerified++
 		stats.BytesVerified += int64(len(body))
+		return nil
+	})
+	if err != nil {
+		return stats, err
 	}
 	return stats, nil
 }
@@ -550,7 +562,7 @@ func summarizeHashes(h []repo.Hash, max int) string {
 // Same context-cancellation discipline as verifyChunks: a
 // Ctrl-C mid-walk surfaces context.Canceled rather than
 // inflating Mismatches.
-func verifyChunkExistence(ctx context.Context, sp storage.StoragePlugin, m *backup.Manifest, sample int) (verifyStats, error) {
+func verifyChunkExistence(ctx context.Context, sp storage.StoragePlugin, m *backup.Manifest, sample, concurrency int) (verifyStats, error) {
 	stats := verifyStats{}
 	unique, referenced, err := uniqueChunkSet(ctx, m)
 	if err != nil {
@@ -565,22 +577,30 @@ func verifyChunkExistence(ctx context.Context, sp storage.StoragePlugin, m *back
 	}
 	stats.ChunksSampled = hashes.n
 
-	for h := range hashes.each() {
-		if err := ctx.Err(); err != nil {
-			return stats, err
-		}
+	stat := func(ctx context.Context, h repo.Hash) (struct{}, error) {
 		_, err := sp.Stat(ctx, repo.ChunkKey(h))
-		if err != nil {
-			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-				return stats, err
+		return struct{}{}, err
+	}
+	err = repo.EachOrdered(ctx, repo.NewFetchBudget(concurrency), hashes.each(), stat,
+		func(h repo.Hash, _ struct{}, err error) error {
+			if cerr := ctx.Err(); cerr != nil {
+				return cerr
 			}
-			// Treat ErrNotFound (the common case — chunk-GC
-			// reclaimed the body) the same as any other
-			// fetch failure: it's a "missing" finding.
-			stats.noteMismatch(h)
-			continue
-		}
-		stats.ChunksVerified++
+			if err != nil {
+				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+					return err
+				}
+				// Treat ErrNotFound (the common case — chunk-GC
+				// reclaimed the body) the same as any other
+				// fetch failure: it's a "missing" finding.
+				stats.noteMismatch(h)
+				return nil
+			}
+			stats.ChunksVerified++
+			return nil
+		})
+	if err != nil {
+		return stats, err
 	}
 	return stats, nil
 }

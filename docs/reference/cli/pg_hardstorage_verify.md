@@ -54,6 +54,7 @@ pg_hardstorage verify <deployment> [latest|<backup-id>] [flags]
       --control-plane-poll-secs int        poll cadence (seconds) for /v1/jobs/<id> (default 1)
       --control-plane-token-file string    file containing the bearer token for the control plane
       --existence-only backup undelete     only check that each chunk EXISTS (Stat) — skip fetch+decrypt+SHA verification (much faster; useful pre-flight before backup undelete)
+      --fetch-concurrency int              chunk reads kept in flight (1..64; default 16). Reads wait on storage round trips, not CPU, so a high-latency object store benefits from more; 1 is serial
       --full                               perform a full restore into a Docker sandbox and run pg_verifybackup against it
   -h, --help                               help for verify
       --kms-config stringToString          cloud KMS provider config for verifying a cloud-KMS-encrypted backup (e.g. region=eu-central-1,endpoint=...); empty uses ambient credentials (default [])

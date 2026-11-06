@@ -177,6 +177,25 @@ keeps reading that version for at least 24 months after a successor lands.
   went from 22 s to 10 s with fsync costs excluded; with fsync the
   overlap matters far more.
 
+- **`restore` and `verify` read chunks one at a time (#97).** Against an
+  object store that is one round trip per chunk: 25-36 chunks/s on
+  azblob, 19-24 hours for a 2.5 TiB restore on a host whose CPU, disks
+  and network were idle, and the same rate for `verify --sample`. Both
+  now keep 16 chunk reads in flight (also within one file, so a restore
+  does not slow down once fewer than 16 files remain), delivered in
+  order; `partial restore` and `verify --existence-only` likewise. A new
+  `--fetch-concurrency` flag (1..64) on `restore` and `verify` tunes it.
+  The budget covers all files being written, and memory is one chunk
+  per read in flight.
+
+- **One dropped connection ended a restore (#97).** A restore streams the
+  manifest for as long as it runs, and a reset on that connection
+  (`manifest: parse: read tcp ...: connection reset by peer`, 69 minutes
+  in) failed the run. Streamed manifest reads now re-open the object at
+  the byte they had reached (a ranged request on S3, Azure and GCS) and
+  give up only after five attempts in a row without progress. A chunk
+  whose body breaks off mid-read is fetched again, twice.
+
 ### Changed
 
 - **S3 multipart uploads send up to 4 parts in parallel** instead of one

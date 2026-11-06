@@ -52,6 +52,10 @@ import (
 //     differ from the source PG.
 func runVerifyFull(cmd *cobra.Command, deployment, backupID, repoURL, pgMajorOverride string) error {
 	d := DispatcherFrom(cmd)
+	fetchConcurrency, err := fetchConcurrencyFlag(cmd)
+	if err != nil {
+		return err
+	}
 	// Resolve --repo from the named deployment in config when omitted (#12).
 	_, repoURL = deploymentDefaults(deployment, "", repoURL)
 	if repoURL == "" {
@@ -127,9 +131,10 @@ func runVerifyFull(cmd *cobra.Command, deployment, backupID, repoURL, pgMajorOve
 		TablespaceRemap: tsRemap,
 		// tmp is removed once pg_verifybackup has run: no per-file
 		// fsync (issue #90).
-		ScratchTarget: true,
-		Verifier:      verifier,
-		KEKForRef:     kekResolver,
+		ScratchTarget:    true,
+		FetchConcurrency: fetchConcurrency,
+		Verifier:         verifier,
+		KEKForRef:        kekResolver,
 		UnwrapDEK: func(ctx context.Context, kekRef string, wrapped []byte) ([]byte, error) {
 			return keystore.UnwrapDEK(ctx, kekRef, wrapped, keystore.UnwrapOpts{
 				KeyringDir:     p.Keyring.Value,

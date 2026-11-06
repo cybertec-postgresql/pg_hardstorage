@@ -247,7 +247,8 @@ Validates the manifest's Ed25519 signature, then for each referenced
 chunk: read from CAS, decrypt with the resolved KEK, verify the
 plaintext SHA-256 against the manifest entry. `--sample N` caps the
 chunk count for spot-checks. No PG, no restore, no WAL replay. Exit 9
-on mismatch.
+on mismatch. Chunks are read 16 at a time; `--fetch-concurrency` (1 to
+64) changes that, on `verify` and on `restore` alike.
 
 ### Full verify (sandbox restore + pg_verifybackup)
 

@@ -129,6 +129,10 @@ type CAS struct {
 	encWriter   encryption.Encryptor
 	encRegistry *encryption.CodecRegistry
 
+	// fetchTokens bounds the chunk reads FetchOrdered keeps in flight,
+	// across all of its concurrent callers. See fetch.go.
+	fetchTokens chan struct{}
+
 	// Optional retention propagation (WORM). When non-zero, every
 	// PutChunk includes RetainUntil + RetentionMode in PutOptions.
 	retention CASRetention
@@ -757,7 +761,8 @@ func NewCAS(sp storage.StoragePlugin, opts ...CASOption) *CAS {
 	if sp == nil {
 		panic("repo: NewCAS requires a non-nil StoragePlugin")
 	}
-	c := &CAS{sp: sp, registry: defaultRegistry(), seenCap: defaultSeenCacheLimit}
+	c := &CAS{sp: sp, registry: defaultRegistry(), seenCap: defaultSeenCacheLimit,
+		fetchTokens: make(chan struct{}, DefaultFetchConcurrency)}
 	for _, opt := range opts {
 		opt(c)
 	}
@@ -1031,7 +1036,7 @@ func readEnvelopeLimited(rc io.Reader, max int64) ([]byte, error) {
 		return nil, err
 	}
 	if int64(len(body)) > max {
-		return nil, fmt.Errorf("cas: chunk envelope exceeds the %d-byte limit (refusing an oversized or malformed chunk)", max)
+		return nil, fmt.Errorf("cas: %w, the %d-byte limit (refusing an oversized or malformed chunk)", errEnvelopeTooLarge, max)
 	}
 	return body, nil
 }
@@ -1043,14 +1048,9 @@ func readEnvelopeLimited(rc io.Reader, max int64) ([]byte, error) {
 // Use this anywhere correctness matters — restoration, scrub,
 // manifest verification.
 func (c *CAS) GetChunkBytes(ctx context.Context, hash Hash) ([]byte, error) {
-	rc, err := c.GetChunk(ctx, hash)
+	envelope, err := c.readChunkEnvelope(ctx, hash)
 	if err != nil {
 		return nil, err
-	}
-	defer rc.Close()
-	envelope, err := readEnvelopeLimited(rc, MaxChunkEnvelopeBytes)
-	if err != nil {
-		return nil, fmt.Errorf("cas: read chunk %s: %w", hash, err)
 	}
 	algo, encFields, payload, err := compression.ReadEnvelope(envelope)
 	if err != nil {

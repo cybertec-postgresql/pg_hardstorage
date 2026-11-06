@@ -209,6 +209,12 @@ type Options struct {
 	// ~300 s for 40k files (issue #90). Never set it for a restore an
 	// operator will use.
 	ScratchTarget bool
+
+	// FetchConcurrency bounds how many chunks are read from the
+	// repository at once, across all files being written (0 =
+	// repo.DefaultFetchConcurrency; at most repo.MaxFetchConcurrency).
+	// See repo.CAS.FetchOrdered.
+	FetchConcurrency int
 }
 
 // chainLinkCompleteFilename is the marker file written into a
@@ -421,6 +427,7 @@ func Restore(ctx context.Context, opts Options) (res *Result, err error) {
 		}
 		cas = dec
 	}
+	cas.SetFetchConcurrency(opts.FetchConcurrency)
 	emit(output.NewEvent(output.SeverityInfo, "restore", "manifest_loaded").
 		WithSubject(output.Subject{
 			Deployment: opts.Deployment,
@@ -989,6 +996,10 @@ func Restore(ctx context.Context, opts Options) (res *Result, err error) {
 // validateOptions enforces required fields and surfaces structured
 // usage errors.
 func validateOptions(o *Options) error {
+	if o.FetchConcurrency < 0 || o.FetchConcurrency > repo.MaxFetchConcurrency {
+		return output.NewError("usage.bad_flag",
+			fmt.Sprintf("restore: FetchConcurrency %d is outside 1..%d", o.FetchConcurrency, repo.MaxFetchConcurrency)).Wrap(output.ErrUsage)
+	}
 	if o.RepoURL == "" {
 		return output.NewError("usage.missing_repo_url",
 			"restore: RepoURL is required").Wrap(output.ErrUsage)
@@ -1404,19 +1415,31 @@ func materializeFile(ctx context.Context, cas *repo.CAS, destRoot string, f *bac
 		}
 	}()
 
-	// bytesWritten is the named return; the loop accumulates into it
+	// bytesWritten is the named return; the walk accumulates into it
 	// directly so the deferred Close-error capture doesn't observe a
 	// stale value through a shadowed local.
-	for i, ref := range f.Chunks {
-		if err := ctx.Err(); err != nil {
-			return bytesWritten, i, err
+	//
+	// Chunks are read ahead of the write position (issue #97: one read
+	// at a time left a restore from an object store at 25-36 chunks/s)
+	// and handed over in list order, so the file is still written front
+	// to back.
+	hashes := func(yield func(repo.Hash) bool) {
+		for i := range f.Chunks {
+			if !yield(f.Chunks[i].Hash) {
+				return
+			}
 		}
-		body, err := cas.GetChunkBytes(ctx, ref.Hash)
-		if err != nil {
-			return bytesWritten, i, fmt.Errorf("fetch chunk %s: %w", ref.Hash, err)
+	}
+	err = cas.FetchOrdered(ctx, hashes, func(_ repo.Hash, body []byte, ferr error) error {
+		ref := f.Chunks[chunksFetched]
+		if ferr != nil {
+			if cerr := ctx.Err(); cerr != nil {
+				return cerr
+			}
+			return fmt.Errorf("fetch chunk %s: %w", ref.Hash, ferr)
 		}
 		if int64(len(body)) != ref.Len {
-			return bytesWritten, i, fmt.Errorf("chunk %s len mismatch: got %d, manifest says %d",
+			return fmt.Errorf("chunk %s len mismatch: got %d, manifest says %d",
 				ref.Hash, len(body), ref.Len)
 		}
 		// Defense in depth on the most catastrophic failure surface:
@@ -1431,14 +1454,19 @@ func materializeFile(ctx context.Context, cas *repo.CAS, destRoot string, f *bac
 		// check) — but the byte-order of restored data is not
 		// something to leave resting on a single upstream guard.
 		if !chunkOffsetContiguous(ref.Offset, bytesWritten) {
-			return bytesWritten, i, fmt.Errorf("chunk %s offset=%d but the running write "+
+			return fmt.Errorf("chunk %s offset=%d but the running write "+
 				"position is %d — the chunk list is not contiguous in offset order; refusing "+
 				"to write a byte-scrambled file", ref.Hash, ref.Offset, bytesWritten)
 		}
 		if _, err := dst.Write(body); err != nil {
-			return bytesWritten, i, fmt.Errorf("write chunk %s: %w", ref.Hash, err)
+			return fmt.Errorf("write chunk %s: %w", ref.Hash, err)
 		}
 		bytesWritten += int64(len(body))
+		chunksFetched++
+		return nil
+	})
+	if err != nil {
+		return bytesWritten, chunksFetched, err
 	}
 
 	// Concatenated chunks must equal the declared file size. A
@@ -2104,6 +2132,7 @@ func restoreIncrementalChain(ctx context.Context, opts Options, sp storage.Stora
 			}
 			linkCAS = dec
 		}
+		linkCAS.SetFetchConcurrency(opts.FetchConcurrency)
 
 		bw, ck, merr := materializeManifestInto(chainCtx, linkCAS, m, linkDir, !opts.ScratchTarget)
 		if merr != nil {

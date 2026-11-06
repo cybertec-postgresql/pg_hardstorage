@@ -313,6 +313,21 @@ func (p *Plugin) Get(ctx context.Context, key string) (io.ReadCloser, error) {
 	return notFoundOnRead{r}, nil
 }
 
+// GetFrom implements storage.OffsetReadAware with a range reader.
+func (p *Plugin) GetFrom(ctx context.Context, key string, offset int64) (io.ReadCloser, error) {
+	if err := p.assertOpen(); err != nil {
+		return nil, err
+	}
+	r, err := p.client.Bucket(p.bucket).Object(p.fullKey(key)).NewRangeReader(ctx, offset, -1)
+	if err != nil {
+		if errors.Is(err, gcs.ErrObjectNotExist) {
+			return nil, storage.ErrNotFound
+		}
+		return nil, fmt.Errorf("gcs: get %s from byte %d: %w", key, offset, err)
+	}
+	return notFoundOnRead{r}, nil
+}
+
 // notFoundOnRead maps a mid-stream ErrObjectNotExist onto
 // storage.ErrNotFound.
 //

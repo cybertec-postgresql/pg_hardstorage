@@ -314,6 +314,23 @@ func (p *Plugin) Get(ctx context.Context, key string) (io.ReadCloser, error) {
 	return resp.Body, nil
 }
 
+// GetFrom implements storage.OffsetReadAware with a ranged download.
+func (p *Plugin) GetFrom(ctx context.Context, key string, offset int64) (io.ReadCloser, error) {
+	if err := p.assertOpen(); err != nil {
+		return nil, err
+	}
+	resp, err := p.client.DownloadStream(ctx, p.container, p.fullKey(key), &az.DownloadStreamOptions{
+		Range: az.HTTPRange{Offset: offset},
+	})
+	if err != nil {
+		if isNotFound(err) {
+			return nil, storage.ErrNotFound
+		}
+		return nil, fmt.Errorf("azblob: download %s from byte %d: %w", key, offset, err)
+	}
+	return resp.Body, nil
+}
+
 // Stat implements storage.StoragePlugin.  Azure exposes
 // blob properties via the per-blob client, which we reach
 // through the service client.

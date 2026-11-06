@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
 	"iter"
 	"sort"
 	"strings"
@@ -74,7 +75,7 @@ func (m *Manifest) CanonicalSHA256(ctx context.Context) ([32]byte, error) {
 		return sha256.Sum256(b), nil
 	}
 	fs := m.stream
-	rc, err := fs.ms.sp.Get(ctx, fs.key)
+	rc, err := storage.GetResuming(ctx, fs.ms.sp, fs.key)
 	if err != nil {
 		return [32]byte{}, err
 	}
@@ -108,7 +109,7 @@ func (m *Manifest) EachFile(ctx context.Context, fn func(*FileEntry) error) erro
 		return nil
 	}
 	fs := m.stream
-	rc, err := fs.ms.sp.Get(ctx, fs.key)
+	rc, err := storage.GetResuming(ctx, fs.ms.sp, fs.key)
 	if err != nil {
 		return err
 	}
@@ -154,7 +155,7 @@ func (ms *ManifestStore) ReadStreaming(ctx context.Context, deployment, backupID
 // validate runs the full streaming Validate over the stored object and
 // confirms it is still the object ReadStreaming verified.
 func (fs *fileStream) validate() error {
-	rc, err := fs.ms.sp.Get(context.Background(), fs.key)
+	rc, err := storage.GetResuming(context.Background(), fs.ms.sp, fs.key)
 	if err != nil {
 		return err
 	}
@@ -235,7 +236,7 @@ func (ms *ManifestStore) listStreamingEntries(ctx context.Context, deployment st
 
 // streamHeader reads one object into a streamed Manifest.
 func (ms *ManifestStore) streamHeader(ctx context.Context, key string, opts StreamOptions) (*Manifest, error) {
-	rc, err := ms.sp.Get(ctx, key)
+	rc, err := storage.GetResuming(ctx, ms.sp, key)
 	if err != nil {
 		return nil, err
 	}
