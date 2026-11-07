@@ -82,6 +82,10 @@ targets never combine with the requested one.
 	file containing the bearer token for the control plane
 
 .PP
+\fB--fetch-concurrency\fP=0
+	chunk reads kept in flight (1..64; default 16). Reads wait on storage round trips, not CPU, so a high-latency object store benefits from more; 1 is serial
+
+.PP
 \fB--force\fP[=false]
 	allow overwriting a non-empty target directory
 

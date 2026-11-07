@@ -85,15 +85,15 @@ func runRecoveryWindows(cmd *cobra.Command, deployment string, f recoveryWindows
 			fmt.Sprintf("recovery windows: --include-older-than: %v", err)).Wrap(output.ErrUsage)
 	}
 
-	verifier, err := loadVerifier()
-	if err != nil {
-		return err
-	}
 	_, sp, err := openRepo(cmd.Context(), f.repoURL)
 	if err != nil {
 		return err
 	}
 	defer sp.Close()
+	verifier, err := loadVerifier()
+	if err != nil {
+		return err
+	}
 
 	r, err := recovery.Windows(cmd.Context(), sp, deployment, recovery.WindowsOptions{
 		Verifier:         verifier,

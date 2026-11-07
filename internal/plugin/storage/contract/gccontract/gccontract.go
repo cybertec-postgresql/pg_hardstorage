@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path"
 	"testing"
 	"time"
 
@@ -106,6 +107,30 @@ func Run(t *testing.T, sp storage.StoragePlugin) {
 	}
 	if !exists(t, sp, "chunks/sha256/zz/notachunk") || !exists(t, sp, "manifests/db1/backups/b1/manifest.json") {
 		t.Fatal("gc touched a non-orphan object")
+	}
+	// A hierarchical backend is left without the shells of what gc
+	// deleted: the bucket directory of an orphan (unless a live chunk
+	// shares it) and the directory that held only the stale temp. Stat
+	// answers for a directory on these backends.
+	if _, ok := sp.(storage.EmptyDirPruner); ok {
+		liveDirs := map[string]bool{}
+		for _, h := range live {
+			liveDirs[path.Dir(repo.ChunkKey(h))] = true
+		}
+		gone := []string{"manifests/db1/backups/b2"}
+		for _, h := range dead {
+			if dir := path.Dir(repo.ChunkKey(h)); !liveDirs[dir] {
+				gone = append(gone, dir)
+			}
+		}
+		for _, dir := range gone {
+			if exists(t, sp, dir) {
+				t.Fatalf("gc left the empty directory %s behind", dir)
+			}
+		}
+		if !exists(t, sp, "chunks") || !exists(t, sp, "manifests") {
+			t.Fatal("gc pruned a top-level directory that still holds objects")
+		}
 	}
 	again, err := repo.Sweep(ctx, sp, opts)
 	if err != nil {

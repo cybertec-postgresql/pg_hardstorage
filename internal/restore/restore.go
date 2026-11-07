@@ -32,12 +32,14 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/audit"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup"
@@ -165,7 +167,7 @@ type Options struct {
 	// flags.
 	//
 	// Empty / nil = no remap; the manifest's recorded paths are
-	// used verbatim (the previous+ behaviour).
+	// used verbatim (the previous behaviour).
 	TablespaceRemap TablespaceRemap
 
 	// TablespaceMapAll, when non-empty, redirects every non-default
@@ -197,6 +199,22 @@ type Options struct {
 	// left staging in an unknown state, or when the operator
 	// wants to start over from scratch. .
 	ResetChainStaging bool
+
+	// ScratchTarget marks TargetDir as disposable: the caller deletes
+	// it once it has looked at it (verify --full, the agent's verify
+	// executor). Restore then skips the per-file fsync. Crash
+	// durability buys nothing for a directory nobody will start a
+	// cluster from, and that fsync was most of the wall time of
+	// verify --full on many-file backups — one serial flush per file,
+	// ~300 s for 40k files (issue #90). Never set it for a restore an
+	// operator will use.
+	ScratchTarget bool
+
+	// FetchConcurrency bounds how many chunks are read from the
+	// repository at once, across all files being written (0 =
+	// repo.DefaultFetchConcurrency; at most repo.MaxFetchConcurrency).
+	// See repo.CAS.FetchOrdered.
+	FetchConcurrency int
 }
 
 // chainLinkCompleteFilename is the marker file written into a
@@ -409,6 +427,7 @@ func Restore(ctx context.Context, opts Options) (res *Result, err error) {
 		}
 		cas = dec
 	}
+	cas.SetFetchConcurrency(opts.FetchConcurrency)
 	emit(output.NewEvent(output.SeverityInfo, "restore", "manifest_loaded").
 		WithSubject(output.Subject{
 			Deployment: opts.Deployment,
@@ -559,57 +578,62 @@ func Restore(ctx context.Context, opts Options) (res *Result, err error) {
 	// tablespace files land at their real location (consistent with the
 	// tablespace_map we write below), not flattened under PGDATA root.
 	tsDests := tablespaceDestRoots(m, opts.TablespaceRemap)
-	walkErr := m.EachFile(matCtx, func(f *backup.FileEntry) error {
-		// Checkpoint identity is (tablespace, path): two tablespaces
-		// can carry the same relative path, so keying resume on the
-		// bare path would wrongly skip a not-yet-written file.
-		fkey := checkpointKey(f)
-		destRoot, err := fileDestRoot(opts.TargetDir, tsDests, f.TablespaceOID)
-		if err != nil {
-			return err
-		}
-		if done.Has(fkey) {
-			if err := done.Err(); err != nil {
-				return fmt.Errorf("restore: resume set: %w", err)
+	walkErr := materializeAll(matCtx, cas, m, !opts.ScratchTarget,
+		func(f *backup.FileEntry) (string, bool, error) {
+			// Checkpoint identity is (tablespace, path): two tablespaces
+			// can carry the same relative path, so keying resume on the
+			// bare path would wrongly skip a not-yet-written file.
+			fkey := checkpointKey(f)
+			destRoot, err := fileDestRoot(opts.TargetDir, tsDests, f.TablespaceOID)
+			if err != nil {
+				return "", false, err
 			}
-			// Cheap on-disk revalidation before trusting the
-			// checkpoint. After an OS crash / power loss the journal
-			// can persist the checkpoint's rename while dropping the
-			// dentries of files fsynced into OTHER directories (their
-			// parents were never dir-fsynced) — the checkpoint then
-			// claims files the filesystem lost. Blindly skipping them
-			// yielded a datadir with missing relation files: silently
-			// corrupt for TDE / pre-manifest sources (their verify leg
-			// is skipped), and a wedged retry loop otherwise (the L2
-			// verify failed but the "completed" file was never
-			// re-materialised). A stat + size compare is O(#files)
-			// and negligible next to chunk fetches.
-			if st, serr := os.Stat(filepath.Join(destRoot, filepath.FromSlash(f.Path))); serr == nil && st.Size() == f.Size {
-				return nil
+			if done.Has(fkey) {
+				if err := done.Err(); err != nil {
+					return "", false, fmt.Errorf("resume set: %w", err)
+				}
+				// Cheap on-disk revalidation before trusting the
+				// checkpoint. After an OS crash / power loss the journal
+				// can persist the checkpoint's rename while dropping the
+				// dentries of files fsynced into OTHER directories (their
+				// parents were never dir-fsynced) — the checkpoint then
+				// claims files the filesystem lost. Blindly skipping them
+				// yielded a datadir with missing relation files: silently
+				// corrupt for TDE / pre-manifest sources (their verify leg
+				// is skipped), and a wedged retry loop otherwise (the L2
+				// verify failed but the "completed" file was never
+				// re-materialised). A stat + size compare is O(#files)
+				// and negligible next to chunk fetches.
+				if st, serr := os.Stat(filepath.Join(destRoot, filepath.FromSlash(f.Path))); serr == nil && st.Size() == f.Size {
+					return "", true, nil
+				}
+				// Missing or wrong size: re-materialise (each file is visited
+				// once, so the stale claim needs no removal from the set).
 			}
-			// Missing or wrong size: re-materialise (each file is visited
-			// once, so the stale claim needs no removal from the set).
+			return destRoot, false, nil
+		},
+		func(f *backup.FileEntry, n int64, k int) error {
+			bytesWritten += n
+			chunksFetched += k
+			if err := cw.MarkFileDone(checkpointKey(f), n, k); err != nil {
+				return output.NewError("restore.checkpoint_write_failed",
+					fmt.Sprintf("restore: write checkpoint: %v", err)).Wrap(err)
+			}
+			return nil
+		})
+	if walkErr == nil {
+		walkErr = ctx.Err()
+	}
+	if walkErr != nil {
+		// Best-effort flush of what we did manage so the next resume
+		// picks up here. A flush failure is non-fatal — the original
+		// error is what the caller needs to see.
+		_ = cw.Flush()
+		var oe *output.Error
+		if !errors.As(walkErr, &oe) && !errors.Is(walkErr, context.Canceled) && !errors.Is(walkErr, context.DeadlineExceeded) {
+			walkErr = fmt.Errorf("restore: %w", walkErr)
 		}
-		n, k, err := materializeFile(matCtx, cas, destRoot, f)
-		if err != nil {
-			// Best-effort flush of what we did manage so the next
-			// resume picks up here. A flush failure is non-fatal —
-			// the original error is what the caller needs to see.
-			_ = cw.Flush()
-			return fmt.Errorf("restore: file %s: %w", f.Path, err)
-		}
-		bytesWritten += n
-		chunksFetched += k
-		if err := cw.MarkFileDone(fkey, n, k); err != nil {
-			return output.NewError("restore.checkpoint_write_failed",
-				fmt.Sprintf("restore: write checkpoint: %v", err)).Wrap(err)
-		}
-		if err := ctx.Err(); err != nil {
-			_ = cw.Flush()
-			return err
-		}
-		return nil
-	})
+	}
 	_ = done.Close() // release the resume set's heap and spill files
 	if walkErr != nil {
 		matSpan.SetStatus(codes.Error, walkErr.Error())
@@ -972,6 +996,10 @@ func Restore(ctx context.Context, opts Options) (res *Result, err error) {
 // validateOptions enforces required fields and surfaces structured
 // usage errors.
 func validateOptions(o *Options) error {
+	if o.FetchConcurrency < 0 || o.FetchConcurrency > repo.MaxFetchConcurrency {
+		return output.NewError("usage.bad_flag",
+			fmt.Sprintf("restore: FetchConcurrency %d is outside 1..%d", o.FetchConcurrency, repo.MaxFetchConcurrency)).Wrap(output.ErrUsage)
+	}
 	if o.RepoURL == "" {
 		return output.NewError("usage.missing_repo_url",
 			"restore: RepoURL is required").Wrap(output.ErrUsage)
@@ -1358,7 +1386,7 @@ func targetIsResumeEligible(target string, entries []os.DirEntry) (bool, error) 
 // Returns (bytesWritten, chunksFetched, error). Named returns are
 // load-bearing — the deferred Close-error capture writes back into
 // `err` when Close itself fails.
-func materializeFile(ctx context.Context, cas *repo.CAS, destRoot string, f *backup.FileEntry) (bytesWritten int64, chunksFetched int, err error) {
+func materializeFile(ctx context.Context, cas *repo.CAS, destRoot string, f *backup.FileEntry, durable bool) (bytesWritten int64, chunksFetched int, err error) {
 	full, err := safeJoinTarget(destRoot, f.Path)
 	if err != nil {
 		return 0, 0, err
@@ -1387,19 +1415,31 @@ func materializeFile(ctx context.Context, cas *repo.CAS, destRoot string, f *bac
 		}
 	}()
 
-	// bytesWritten is the named return; the loop accumulates into it
+	// bytesWritten is the named return; the walk accumulates into it
 	// directly so the deferred Close-error capture doesn't observe a
 	// stale value through a shadowed local.
-	for i, ref := range f.Chunks {
-		if err := ctx.Err(); err != nil {
-			return bytesWritten, i, err
+	//
+	// Chunks are read ahead of the write position (issue #97: one read
+	// at a time left a restore from an object store at 25-36 chunks/s)
+	// and handed over in list order, so the file is still written front
+	// to back.
+	hashes := func(yield func(repo.Hash) bool) {
+		for i := range f.Chunks {
+			if !yield(f.Chunks[i].Hash) {
+				return
+			}
 		}
-		body, err := cas.GetChunkBytes(ctx, ref.Hash)
-		if err != nil {
-			return bytesWritten, i, fmt.Errorf("fetch chunk %s: %w", ref.Hash, err)
+	}
+	err = cas.FetchOrdered(ctx, hashes, func(_ repo.Hash, body []byte, ferr error) error {
+		ref := f.Chunks[chunksFetched]
+		if ferr != nil {
+			if cerr := ctx.Err(); cerr != nil {
+				return cerr
+			}
+			return fmt.Errorf("fetch chunk %s: %w", ref.Hash, ferr)
 		}
 		if int64(len(body)) != ref.Len {
-			return bytesWritten, i, fmt.Errorf("chunk %s len mismatch: got %d, manifest says %d",
+			return fmt.Errorf("chunk %s len mismatch: got %d, manifest says %d",
 				ref.Hash, len(body), ref.Len)
 		}
 		// Defense in depth on the most catastrophic failure surface:
@@ -1414,14 +1454,19 @@ func materializeFile(ctx context.Context, cas *repo.CAS, destRoot string, f *bac
 		// check) — but the byte-order of restored data is not
 		// something to leave resting on a single upstream guard.
 		if !chunkOffsetContiguous(ref.Offset, bytesWritten) {
-			return bytesWritten, i, fmt.Errorf("chunk %s offset=%d but the running write "+
+			return fmt.Errorf("chunk %s offset=%d but the running write "+
 				"position is %d — the chunk list is not contiguous in offset order; refusing "+
 				"to write a byte-scrambled file", ref.Hash, ref.Offset, bytesWritten)
 		}
 		if _, err := dst.Write(body); err != nil {
-			return bytesWritten, i, fmt.Errorf("write chunk %s: %w", ref.Hash, err)
+			return fmt.Errorf("write chunk %s: %w", ref.Hash, err)
 		}
 		bytesWritten += int64(len(body))
+		chunksFetched++
+		return nil
+	})
+	if err != nil {
+		return bytesWritten, chunksFetched, err
 	}
 
 	// Concatenated chunks must equal the declared file size. A
@@ -1432,10 +1477,85 @@ func materializeFile(ctx context.Context, cas *repo.CAS, destRoot string, f *bac
 			fmt.Errorf("size mismatch: chunks total %d, manifest says %d", bytesWritten, f.Size)
 	}
 
-	if err := dst.Sync(); err != nil {
-		return bytesWritten, len(f.Chunks), fmt.Errorf("fsync: %w", err)
+	if durable {
+		if err := dst.Sync(); err != nil {
+			return bytesWritten, len(f.Chunks), fmt.Errorf("fsync: %w", err)
+		}
 	}
 	return bytesWritten, len(f.Chunks), nil
+}
+
+// materializeConcurrency is how many files materializeAll writes at
+// once. Not derived from GOMAXPROCS: a file's cost is chunk fetches
+// (storage round trips) and its fsync as much as SHA-256 and
+// decompression, and those overlap across files whatever the core
+// count.
+const materializeConcurrency = 16
+
+// materializeAll writes every file m lists, materializeConcurrency at
+// a time (issue #90). Restore used to write one file at a time — fetch
+// its chunks, verify, write, fsync, next — so a restore of a many-file
+// PGDATA ran at one core and one fsync latency per file.
+//
+// The manifest walk stays on the calling goroutine. For each entry,
+// plan returns the destination root, or skip for a file that needs no
+// work (already restored, per the checkpoint). The entry is deep-copied
+// before it crosses into a worker: a streamed manifest's entries are
+// only valid during the EachFile callback.
+//
+// done runs once per written file, after the write (and, when durable,
+// the fsync) has finished, serialised under a mutex — so a caller's
+// counters and checkpoint marks need no locking of their own, and a
+// file is never marked done before it is on disk. Files complete out
+// of manifest order; the checkpoint records an exact set of completed
+// files, so order does not matter to resume. Files still in flight
+// when another fails are not marked and are rewritten on resume.
+//
+// The first error (plan, a write, done, or the walk itself) stops the
+// walk, cancels the in-flight writes and is returned.
+func materializeAll(ctx context.Context, cas *repo.CAS, m *backup.Manifest, durable bool,
+	plan func(f *backup.FileEntry) (destRoot string, skip bool, err error),
+	done func(f *backup.FileEntry, bytesWritten int64, chunksFetched int) error,
+) error {
+	wctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	g, gctx := errgroup.WithContext(wctx)
+	g.SetLimit(materializeConcurrency)
+	var mu sync.Mutex
+	walkErr := m.EachFile(gctx, func(f *backup.FileEntry) error {
+		destRoot, skip, err := plan(f)
+		if err != nil || skip {
+			return err
+		}
+		fc := *f
+		fc.Chunks = append([]backup.ChunkRef(nil), f.Chunks...)
+		g.Go(func() error {
+			n, k, err := materializeFile(gctx, cas, destRoot, &fc, durable)
+			if err != nil {
+				return fmt.Errorf("file %s: %w", fc.Path, err)
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			return done(&fc, n, k)
+		})
+		return nil
+	})
+	if walkErr != nil {
+		cancel()
+	}
+	werr := g.Wait()
+	switch {
+	case werr == nil:
+		return walkErr
+	case walkErr != nil && ctx.Err() == nil && errors.Is(werr, context.Canceled):
+		// The walk failed first (plan, done's checkpoint write, the
+		// manifest pass) and the workers only saw the cancel above.
+		return walkErr
+	default:
+		// A worker failed first; the walk's error is then just the
+		// cancellation that failure triggered.
+		return werr
+	}
 }
 
 // tablespaceDestRoots maps each non-default tablespace OID to the
@@ -2012,8 +2132,9 @@ func restoreIncrementalChain(ctx context.Context, opts Options, sp storage.Stora
 			}
 			linkCAS = dec
 		}
+		linkCAS.SetFetchConcurrency(opts.FetchConcurrency)
 
-		bw, ck, merr := materializeManifestInto(chainCtx, linkCAS, m, linkDir)
+		bw, ck, merr := materializeManifestInto(chainCtx, linkCAS, m, linkDir, !opts.ScratchTarget)
 		if merr != nil {
 			return nil, fmt.Errorf("restore chain: materialize %s: %w", m.BackupID, merr)
 		}
@@ -2375,7 +2496,7 @@ func restoreIncrementalChain(ctx context.Context, opts Options, sp storage.Stora
 // Returns (bytesWritten, chunksFetched, error). Used only by the
 // chain-restore path; the regular full-restore loop materialises
 // inline because it interleaves checkpointing.
-func materializeManifestInto(ctx context.Context, cas *repo.CAS, m *backup.Manifest, dir string) (int64, int, error) {
+func materializeManifestInto(ctx context.Context, cas *repo.CAS, m *backup.Manifest, dir string, durable bool) (int64, int, error) {
 	var totalBytes int64
 	var totalChunks int
 
@@ -2431,19 +2552,16 @@ func materializeManifestInto(ctx context.Context, cas *repo.CAS, m *backup.Manif
 	// data and let same-named files of different tablespaces
 	// overwrite each other, while pg_combinebackup never saw the
 	// tablespace at all.
-	if err := m.EachFile(ctx, func(f *backup.FileEntry) error {
-		root, err := fileDestRoot(dir, tsRoots, f.TablespaceOID)
-		if err != nil {
-			return err
-		}
-		bw, ck, err := materializeFile(ctx, cas, root, f)
-		if err != nil {
-			return err
-		}
-		totalBytes += bw
-		totalChunks += ck
-		return nil
-	}); err != nil {
+	if err := materializeAll(ctx, cas, m, durable,
+		func(f *backup.FileEntry) (string, bool, error) {
+			root, err := fileDestRoot(dir, tsRoots, f.TablespaceOID)
+			return root, false, err
+		},
+		func(_ *backup.FileEntry, bw int64, ck int) error {
+			totalBytes += bw
+			totalChunks += ck
+			return nil
+		}); err != nil {
 		return totalBytes, totalChunks, err
 	}
 	if err := writeTablespaceSymlinks(dir, tsRoots); err != nil {
@@ -2466,7 +2584,7 @@ func materializeManifestInto(ctx context.Context, cas *repo.CAS, m *backup.Manif
 	}
 	// pg_combinebackup hard-requires backup_manifest (PG's own JSON
 	// shape) in every input dir — both for the full anchor and for
-	// every incremental link. Manifests committed before+ do
+	// every incremental link. Manifests committed before that do
 	// not carry PGBackupManifest; the runner refuses to take a child
 	// incremental without it, so by the time we're walking a chain
 	// here we expect every link to carry one.
@@ -2474,7 +2592,7 @@ func materializeManifestInto(ctx context.Context, cas *repo.CAS, m *backup.Manif
 		return totalBytes, totalChunks, output.NewError("chain.missing_pg_manifest",
 			fmt.Sprintf("restore chain: link %q has no pg_backup_manifest field; pg_combinebackup will refuse it", m.BackupID)).
 			WithSuggestion(&output.Suggestion{
-				Human: "this backup pre-dates the+ PGBackupManifest field. Restoring it as a standalone backup still works; it cannot anchor or appear in an incremental chain. Take a fresh full backup to enable incrementals from this point forward.",
+				Human: "this backup pre-dates the PGBackupManifest field. Restoring it as a standalone backup still works; it cannot anchor or appear in an incremental chain. Take a fresh full backup to enable incrementals from this point forward.",
 			})
 	}
 	if err := writeSpecial(dir, "backup_manifest", m.PGBackupManifest); err != nil {

@@ -222,7 +222,8 @@ Some hardened SSH deployments disable the SFTP subsystem
 permit ssh-exec; some embedded / appliance SSH servers don't
 implement SFTP at all.  The `scp://` backend talks to those
 servers using the same set of remote-shell primitives `scp`
-itself uses — `cat`, `stat`, `find`, `mv`, `rm`, `mkdir`.
+itself uses — `cat`, `stat`, `find`, `mv`, `ln`, `rm`, `mkdir`,
+`rmdir`.
 No SFTP subsystem required.
 
 ### What this is NOT

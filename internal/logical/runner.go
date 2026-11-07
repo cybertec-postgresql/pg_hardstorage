@@ -404,7 +404,7 @@ func (r *Runner) runStreamOnce(ctx context.Context, s *Stream, conn string) erro
 	}
 
 	// pgoutput proto_version=2 + named publication. Operators on
-	// older PG can override via the+ stream config; for
+	// older PG can override via the stream config; for
 	// we use the default that works on PG 14+.
 	args := []string{
 		"proto_version '2'",

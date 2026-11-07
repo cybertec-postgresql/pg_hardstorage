@@ -143,6 +143,8 @@ func writeCLIIndex(root *cobra.Command, dir string) error {
 	b.WriteString("One page per `pg_hardstorage` subcommand.  Pages are\n")
 	b.WriteString("generated from the Cobra command tree on every\n")
 	b.WriteString("`make docs-regen`; CI fails on drift.\n\n")
+	b.WriteString(cliConventions(cmds))
+	b.WriteString("## Commands\n\n")
 	b.WriteString("| Command | Synopsis |\n")
 	b.WriteString("| --- | --- |\n")
 	for _, c := range cmds {
@@ -156,6 +158,61 @@ func writeCLIIndex(root *cobra.Command, dir string) error {
 	}
 	out := filepath.Join(dir, "index.md")
 	return os.WriteFile(out, []byte(b.String()), 0o644)
+}
+
+// cliConventions describes how the command tree gates mutation and
+// selects output. The command lists are computed from the tree, so the
+// page cannot name a command that does not carry the flag; the two
+// invariants it states are enforced by
+// TestMutatingCommandsFollowOneConfirmationRule in internal/cli.
+func cliConventions(cmds []*cobra.Command) string {
+	var apply, confirm, dryOnly, layout []string
+	for _, c := range cmds {
+		if c.Hidden {
+			continue
+		}
+		f := c.LocalFlags()
+		name := "`" + strings.TrimPrefix(c.CommandPath(), "pg_hardstorage ") + "`"
+		hasApply, hasDry, hasYes := f.Lookup("apply") != nil, f.Lookup("dry-run") != nil, f.Lookup("yes") != nil
+		switch {
+		case hasApply:
+			apply = append(apply, name)
+		case hasDry && hasYes:
+			confirm = append(confirm, name)
+		case hasDry:
+			dryOnly = append(dryOnly, name)
+		}
+		if ff := f.Lookup("format"); ff != nil && strings.Contains(ff.Usage, "markdown") {
+			layout = append(layout, name)
+		}
+	}
+	list := func(names []string) string {
+		if len(names) == 0 {
+			return "(none)"
+		}
+		return strings.Join(names, ", ")
+	}
+	var b strings.Builder
+	b.WriteString("## Conventions\n\n")
+	b.WriteString("### Previewing and confirming a change\n\n")
+	b.WriteString("Commands that change or delete data come in three styles. Which one a\n")
+	b.WriteString("command uses is fixed by its flags, and no command carries both\n")
+	b.WriteString("`--apply` and `--dry-run`:\n\n")
+	b.WriteString("| Flags | Bare invocation | To act | Commands |\n")
+	b.WriteString("| --- | --- | --- | --- |\n")
+	fmt.Fprintf(&b, "| `--apply` | dry run: reports what it would do and changes nothing | `--apply` | %s |\n", list(apply))
+	fmt.Fprintf(&b, "| `--dry-run` and `--yes` | see the command's page: a bulk removal refuses until confirmed | `--yes`; `--dry-run` previews without confirmation | %s |\n", list(confirm))
+	fmt.Fprintf(&b, "| `--dry-run` | acts | `--dry-run` previews | %s |\n", list(dryOnly))
+	b.WriteString("\nSo `--apply` always means \"the default was a dry run\", and\n")
+	b.WriteString("`--dry-run` always means \"the default acts, or asks first\".\n\n")
+	b.WriteString("### Output\n\n")
+	b.WriteString("`-o/--output` selects the encoding on every command: text on a\n")
+	b.WriteString("terminal, JSON off one. On the report commands below, `--format`\n")
+	b.WriteString("selects only the layout of the text report (`json` = compact\n")
+	b.WriteString("summary, `markdown` = full report); `-o json` emits the JSON body\n")
+	b.WriteString("whatever `--format` says.\n\n")
+	fmt.Fprintf(&b, "%s\n\n", list(layout))
+	return b.String()
 }
 
 // collect walks the Cobra tree DF, accumulating commands.

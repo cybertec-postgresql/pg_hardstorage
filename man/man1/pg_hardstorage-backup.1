@@ -137,6 +137,10 @@ The repository must already exist — create it with \fBpg_hardstorage repo init
 	tenant scope for the backup
 
 .PP
+\fB--upload-concurrency\fP=0
+	chunk uploads kept in flight (1..64; default 16). Uploads wait on storage round trips, not CPU, so a high-latency object store benefits from more; 1 is serial
+
+.PP
 \fB-v\fP, \fB--verbose\fP[=false]
 	emit one line per regular file as it commits to the CAS — file path, logical size, chunk count, deduped chunks, and bytes the CAS actually had to store after dedup.  Useful for live progress on large backups; suppressed under --output json (JSON consumers see file events as backup.file_archived structured events instead).
 

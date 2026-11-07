@@ -44,6 +44,17 @@ type execServer struct {
 	// client disconnects. wedgeSuffix + wedgeChunk are guarded by mu.
 	wedgeSuffix string
 	wedgeChunk  int
+
+	// maxSessions, when > 0, makes the server refuse a session channel
+	// while that many are open on the connection, the way sshd's
+	// MaxSessions (default 10) does. sessionHold delays every command by
+	// that long, so sessions overlap the way they do against a real disk.
+	// peakSessions is the most sessions ever open at once.
+	maxSessions  atomic.Int32
+	sessionHold  atomic.Int64 // a time.Duration
+	openSessions atomic.Int32
+	peakSessions atomic.Int32
+	rejected     atomic.Int32
 }
 
 // wedge returns the current wedge suffix + chunk (mu-guarded).
@@ -116,11 +127,29 @@ func startExecServer(t *testing.T) *execServer {
 						_ = newCh.Reject(ssh.UnknownChannelType, "only session")
 						continue
 					}
-					ch, chReqs, cerr := newCh.Accept()
-					if cerr != nil {
+					n := s.openSessions.Add(1)
+					if lim := s.maxSessions.Load(); lim > 0 && n > lim {
+						s.openSessions.Add(-1)
+						s.rejected.Add(1)
+						// What sshd answers past MaxSessions.
+						_ = newCh.Reject(ssh.ConnectionFailed, "open failed")
 						continue
 					}
-					go s.serveSession(ch, chReqs)
+					for {
+						p := s.peakSessions.Load()
+						if n <= p || s.peakSessions.CompareAndSwap(p, n) {
+							break
+						}
+					}
+					ch, chReqs, cerr := newCh.Accept()
+					if cerr != nil {
+						s.openSessions.Add(-1)
+						continue
+					}
+					go func() {
+						defer s.openSessions.Add(-1)
+						s.serveSession(ch, chReqs)
+					}()
 				}
 				_ = sconn.Wait()
 			}(raw)
@@ -147,6 +176,9 @@ func (s *execServer) serveSession(ch ssh.Channel, reqs <-chan *ssh.Request) {
 			_ = req.Reply(true, nil)
 			if s.wedgeCat(ch, reqs, command) {
 				return
+			}
+			if d := time.Duration(s.sessionHold.Load()); d > 0 {
+				time.Sleep(d)
 			}
 			cmd = exec.Command("/bin/sh", "-c", command)
 			cmd.Stdin = ch

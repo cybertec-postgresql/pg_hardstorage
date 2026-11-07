@@ -226,6 +226,61 @@ func TestReplicate_ExtendsRetentionOfExistingDstChunk(t *testing.T) {
 	}
 }
 
+// Review of PR #96: the replica side had the same refusal. A chunk
+// already at the destination under a LONGER lock (an earlier run with a
+// longer policy) made Object Lock refuse this run's shorter deadline,
+// and the manifest was withheld although the chunk outlives it.
+func TestReplicate_AcceptsLongerLockOnExistingDstChunk(t *testing.T) {
+	now := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
+	policy := &repo.WORMPolicy{Mode: "governance", RetentionSeconds: 86400 * 30}
+	need := policy.RetainUntil(now)
+	cases := []struct {
+		name     string
+		existing objectLock
+		ok       bool
+	}{
+		{"longer lock", objectLock{need.Add(48 * time.Hour), storage.WORMGovernance}, true},
+		{"longer compliance lock", objectLock{need.Add(time.Hour), storage.WORMCompliance}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			src, dst := twoRepos(t)
+			c := putChunk(t, src, []byte("shared"))
+			putRaw(t, dst, repo.ChunkKey(c), []byte("shared"))
+			putManifest(t, src, "db1", "b1", []repo.Hash{c})
+			store := &objectLockStore{StoragePlugin: dst, locks: map[string]objectLock{repo.ChunkKey(c): tc.existing}}
+
+			res, err := repo.Replicate(ctx, src, store, repo.ReplicateOptions{DstWORM: policy, Now: now})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if res.ChunksFailed != 0 || res.ManifestsCopied != 1 {
+				t.Fatalf("chunks_failed=%d manifests_copied=%d failures=%v; the chunk is held past %v and must be accepted",
+					res.ChunksFailed, res.ManifestsCopied, res.Failures, need)
+			}
+			if got := store.locks[repo.ChunkKey(c)]; got != tc.existing {
+				t.Errorf("lock changed to %v, want %v untouched", got, tc.existing)
+			}
+		})
+	}
+
+	// A destination that cannot report the lock keeps failing closed.
+	t.Run("lock cannot be read back", func(t *testing.T) {
+		ctx := context.Background()
+		src, dst := twoRepos(t)
+		c := putChunk(t, src, []byte("shared"))
+		putRaw(t, dst, repo.ChunkKey(c), []byte("shared"))
+		putManifest(t, src, "db1", "b1", []repo.Hash{c})
+		store := &objectLockStore{StoragePlugin: dst, locks: map[string]objectLock{
+			repo.ChunkKey(c): {need.Add(time.Hour), storage.WORMGovernance}}}
+		res, err := repo.Replicate(ctx, src, noReadBack{store}, repo.ReplicateOptions{DstWORM: policy, Now: now})
+		if err == nil && res.ChunksFailed == 0 {
+			t.Fatal("a refused extension was accepted without knowing the existing lock")
+		}
+	})
+}
+
 func readBodyBytes(t *testing.T, sp storage.StoragePlugin, key string) []byte {
 	t.Helper()
 	rc, err := sp.Get(context.Background(), key)

@@ -48,7 +48,7 @@ func (v Version) AtLeast(major, minor int) bool {
 // PG 15 is the floor because the SPEC explicitly targets PG 15+
 // (non-exclusive `pg_backup_start/stop`, `archive_library`).
 // PG 18 is the ceiling because that's the current upstream
-// stable release as of+; bumping the ceiling is one
+// stable release as of this writing; bumping the ceiling is one
 // constant edit + a matrix-row add.
 const (
 	MinSupportedMajor     = 15

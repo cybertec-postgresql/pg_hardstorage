@@ -33,8 +33,8 @@
 // permit ssh-exec; some embedded / appliance SSH servers don't
 // implement SFTP at all.  The scp:// backend talks to those
 // servers using the same set of remote-shell primitives `scp`
-// itself uses — `cat`, `stat`, `find`, `mv`, `rm`, `mkdir`.  No
-// SFTP subsystem required.
+// itself uses — `cat`, `stat`, `find`, `mv`, `ln`, `rm`, `mkdir`,
+// `rmdir`.  No SFTP subsystem required.
 //
 // # What this backend is NOT
 //
@@ -124,6 +124,11 @@ type Plugin struct {
 	dead       bool   // set when the transport is found dead; cleared by redial
 	lastRedial time.Time
 	closed     bool
+
+	// slots bounds the sessions open at once (see maxOpenSessions).
+	// Created on first use so a Plugin built without Open works too.
+	slotsOnce sync.Once
+	slots     chan struct{}
 }
 
 // Name implements storage.StoragePlugin.
@@ -304,15 +309,12 @@ func (p *Plugin) Put(ctx context.Context, key string, r io.Reader, opts storage.
 		}
 	}
 
-	if err := p.mkdirAll(ctx, path.Dir(full)); err != nil {
-		return storage.PutResult{}, err
-	}
-
 	tmp := full + ".hstmp-" + randomSuffix()
-	// Flush the staged bytes before anything publishes them: a link or
-	// rename of an un-synced file can survive a crash as a truncated
-	// object at the real key.
-	written, err := p.uploadVia(ctx, "cat > "+shellQuote(tmp)+" && "+syncCommand(tmp), r)
+	// stageCommand creates the parent directory as well, and flushes the
+	// staged bytes before anything publishes them: a link or rename of
+	// an un-synced file can survive a crash as a truncated object at the
+	// real key.
+	written, err := p.uploadVia(ctx, stageCommand(tmp), r)
 	if err != nil {
 		_, _ = p.runShell(ctx, "rm -f "+shellQuote(tmp))
 		return storage.PutResult{}, fmt.Errorf("scp: write tmp %s: %w", tmp, err)
@@ -544,18 +546,14 @@ func (p *Plugin) RenameIfNotExists(ctx context.Context, src, dst string) error {
 	} else if exists {
 		return storage.ErrAlreadyExists
 	}
-	// Create the destination's parent, matching the fs reference
-	// implementation (fs.RenameIfNotExists does os.MkdirAll). Today's
-	// callers rename within one directory — a manifest's staging file
-	// sits beside its final key — so the parent always happened to
+	// linkCommand creates the destination's parent too, matching the fs
+	// reference implementation (fs.RenameIfNotExists does os.MkdirAll).
+	// Today's callers rename within one directory — a manifest's staging
+	// file sits beside its final key — so the parent always happened to
 	// exist and the gap was invisible. A cross-prefix rename failed
 	// with a bare "No such file or directory" on scp/sftp while
 	// succeeding on fs:// and s3://.
-	if err := p.mkdirAll(ctx, path.Dir(dstFull)); err != nil {
-		return err
-	}
-	if _, lerr := p.runShell(ctx, "ln -T "+shellQuote(srcFull)+" "+shellQuote(dstFull)+
-		" && "+syncCommand(path.Dir(dstFull))); lerr != nil {
+	if _, lerr := p.runShell(ctx, linkCommand(srcFull, dstFull)); lerr != nil {
 		if strings.Contains(lerr.Error(), "File exists") {
 			return storage.ErrAlreadyExists
 		}
@@ -592,6 +590,42 @@ func (p *Plugin) ReapStaging(ctx context.Context, olderThan time.Duration) (stor
 	return st, nil
 }
 
+// PruneEmptyDirs (storage.EmptyDirPruner) removes directories under dir
+// that hold nothing, deepest first, and dir itself when includeSelf is
+// set. The repo root is never removed. It returns how many directories
+// were removed.
+//
+// One remote find does the whole walk — a round trip per directory
+// would be tens of thousands of SSH sessions for a chunk tree. See
+// pruneEmptyDirsCommand for why this cannot remove a writer's file; a
+// writer racing the removal of its directory re-creates it
+// (retryVanishedDir). A directory that vanished or was filled
+// concurrently is not an error.
+//
+// Nothing is synced afterwards: a crash that resurrects an empty
+// directory is harmless, the next gc prunes it again.
+func (p *Plugin) PruneEmptyDirs(ctx context.Context, dir string, includeSelf bool) (int, error) {
+	if err := p.assertOpen(); err != nil {
+		return 0, err
+	}
+	full, err := p.resolvePrefix(strings.Trim(dir, "/"))
+	if err != nil {
+		return 0, err
+	}
+	if full == p.root {
+		includeSelf = false
+	}
+	// runShell, not runShellLines: the walk prints only on a removal, so
+	// on a large healthy tree it is silent for longer than the
+	// no-progress guard on a streamed read allows.
+	out, err := p.runShell(ctx, pruneEmptyDirsCommand(full, includeSelf))
+	n := strings.Count(out, pruneMark+"\n")
+	if err != nil && !isPruneRace(err) {
+		return n, fmt.Errorf("scp: prune empty directories under %s: %w", full, err)
+	}
+	return n, nil
+}
+
 // reapStagingCommand prints the size of, then deletes, every staging
 // temp under root older than olderThan (rounded up to whole minutes:
 // -mmin +N is "more than N minutes").
@@ -619,34 +653,102 @@ func (p *Plugin) SetRetention(ctx context.Context, key string, until time.Time, 
 // Keep the command line as the sole argument; never interpolate
 // user-controlled keys without `shellQuote()`.
 
-// newSession opens an SSH session with a small bounded retry on
-// channel-open rejection. sshd's default MaxSessions is 10; a burst of
-// concurrent Puts (each using short-lived sessions for upload + commit
-// + cleanup) can transiently exceed it, and the server answers
-// "rejected: connect failed (open failed)". That is backpressure, not
-// failure — retrying after a short jittered pause keeps the plugin
-// correct against DEFAULT sshd configs (the contract suite's
+// maxOpenSessions is how many SSH sessions the plugin keeps open on its
+// connection at once. Every remote command is a session, and sshd
+// refuses a channel beyond MaxSessions (default 10) per connection.
+// Backup keeps 16 chunk uploads in flight and restore 16 reads (issues
+// #90, #97), so without a bound of its own the plugin ran into that
+// refusal as a matter of course, and a refusal that outlasted the retry
+// below failed the Put or Get — and the backup or restore with it.
+// Eight leaves room for sessions the server has not finished closing.
+const maxOpenSessions = 8
+
+// sessionSlotWait is how long newSession waits for one of its own
+// slots before opening a session anyway. The bound is there to stay
+// under the server's limit, not to serialise callers: a caller that
+// holds a session while it opens another (a listing whose consumer
+// reads each object) must not be able to wait on itself forever.
+var sessionSlotWait = 5 * time.Second
+
+// session is an ssh.Session that gives its slot back when closed.
+type session struct {
+	*ssh.Session
+	release func()
+}
+
+// Close closes the session and frees its slot. Safe to call twice.
+func (s *session) Close() error {
+	err := s.Session.Close()
+	s.release()
+	return err
+}
+
+// acquireSlot takes a session slot and returns the function that frees
+// it (idempotent). After sessionSlotWait it gives up waiting and returns
+// a no-op: see sessionSlotWait.
+func (p *Plugin) acquireSlot(ctx context.Context) (func(), error) {
+	p.slotsOnce.Do(func() { p.slots = make(chan struct{}, maxOpenSessions) })
+	t := time.NewTimer(sessionSlotWait)
+	defer t.Stop()
+	select {
+	case p.slots <- struct{}{}:
+		var once sync.Once
+		return func() { once.Do(func() { <-p.slots }) }, nil
+	case <-t.C:
+		return func() {}, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// sessionOpenAttempts and sessionOpenBackoff bound the retry of a
+// refused channel open: 20 ms doubling to half a second, about four
+// seconds in all.
+const sessionOpenAttempts = 12
+
+func sessionOpenBackoff(attempt int) time.Duration {
+	d := 20 * time.Millisecond << attempt
+	if d > 500*time.Millisecond {
+		d = 500 * time.Millisecond
+	}
+	return d
+}
+
+// newSession opens an SSH session, holding one of the plugin's session
+// slots until the session is closed, with a bounded retry on
+// channel-open rejection. The slots keep the plugin under sshd's
+// MaxSessions; the server can still answer "rejected: connect failed
+// (open failed)" for a moment, because it counts a session until it has
+// finished closing it, and after the slot wait ran out. That is
+// backpressure, not failure — retrying after a short pause keeps the
+// plugin correct against DEFAULT sshd configs (the contract suite's
 // ParallelPuts runs against one).
 //
 // A session that cannot be opened because the TRANSPORT is gone
 // (keepalive teardown, peer restart, reset) marks the connection dead
 // and is retried once over a fresh dial — see keepalive.go.
-func (p *Plugin) newSession() (*ssh.Session, uint64, error) {
+func (p *Plugin) newSession(ctx context.Context) (*session, uint64, error) {
+	release, err := p.acquireSlot(ctx)
+	if err != nil {
+		return nil, 0, err
+	}
 	var lastErr error
 	redialed := false
-	for attempt := 0; attempt < 5; attempt++ {
+	for attempt := 0; attempt < sessionOpenAttempts; attempt++ {
 		cli, gen, cerr := p.conn()
 		if cerr != nil {
+			release()
 			return nil, 0, cerr
 		}
 		sess, err := cli.NewSession()
 		if err == nil {
-			return sess, gen, nil
+			return &session{Session: sess, release: release}, gen, nil
 		}
 		lastErr = err
 		if isTransportGone(err) {
 			p.markDead(gen)
 			if redialed {
+				release()
 				return nil, 0, err
 			}
 			redialed = true
@@ -654,15 +756,22 @@ func (p *Plugin) newSession() (*ssh.Session, uint64, error) {
 		}
 		msg := err.Error()
 		if !strings.Contains(msg, "rejected") && !strings.Contains(msg, "open failed") {
+			release()
 			return nil, 0, err
 		}
-		time.Sleep(time.Duration(20*(attempt+1)) * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			release()
+			return nil, 0, ctx.Err()
+		case <-time.After(sessionOpenBackoff(attempt)):
+		}
 	}
+	release()
 	return nil, 0, lastErr
 }
 
 func (p *Plugin) runShell(ctx context.Context, command string) (string, error) {
-	sess, _, err := p.newSession()
+	sess, _, err := p.newSession(ctx)
 	if err != nil {
 		return "", fmt.Errorf("scp: new session: %w", err)
 	}
@@ -675,8 +784,7 @@ func (p *Plugin) runShell(ctx context.Context, command string) (string, error) {
 	select {
 	case err := <-done:
 		if err != nil {
-			return out.String(), fmt.Errorf("%w (stderr: %s)", err,
-				strings.TrimSpace(errBuf.String()))
+			return out.String(), &remoteCmdError{err: err, stderr: strings.TrimSpace(errBuf.String())}
 		}
 		return out.String(), nil
 	case <-ctx.Done():
@@ -685,13 +793,25 @@ func (p *Plugin) runShell(ctx context.Context, command string) (string, error) {
 	}
 }
 
+// remoteCmdError is a failed remote command together with what it wrote
+// to stderr. The two are kept apart so a caller can tell failures apart
+// by the command's own words (PruneEmptyDirs: a lost race against a
+// real error) instead of picking a formatted message to pieces.
+type remoteCmdError struct {
+	err    error
+	stderr string
+}
+
+func (e *remoteCmdError) Error() string { return fmt.Sprintf("%v (stderr: %s)", e.err, e.stderr) }
+func (e *remoteCmdError) Unwrap() error { return e.err }
+
 // runShellLines runs command and calls fn with each line of its stdout as it
 // arrives, in constant memory (runShell buffers the whole output). fn
 // returning false stops the command early and is not an error. The error,
 // if any, is runShell's: the command's failure with its stderr, or the
 // context's error.
 func (p *Plugin) runShellLines(ctx context.Context, command string, fn func(line string) bool) error {
-	sess, gen, err := p.newSession()
+	sess, gen, err := p.newSession(ctx)
 	if err != nil {
 		return fmt.Errorf("scp: new session: %w", err)
 	}
@@ -759,7 +879,7 @@ func (c *cappedBuffer) String() string { return c.buf.String() }
 // uploadVia opens a session for command (typically `cat > path`)
 // and streams r to its stdin.  Returns the byte count.
 func (p *Plugin) uploadVia(ctx context.Context, command string, r io.Reader) (int64, error) {
-	sess, _, err := p.newSession()
+	sess, _, err := p.newSession(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("scp: new session: %w", err)
 	}
@@ -812,7 +932,7 @@ func (p *Plugin) uploadVia(ctx context.Context, command string, r io.Reader) (in
 // and returns a ReadCloser that drains stdout.  Closing the
 // reader closes the session.
 func (p *Plugin) streamRead(ctx context.Context, command string, classify func(error) error) (io.ReadCloser, error) {
-	sess, gen, err := p.newSession()
+	sess, gen, err := p.newSession(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("scp: new session: %w", err)
 	}
@@ -839,7 +959,7 @@ func (p *Plugin) streamRead(ctx context.Context, command string, classify func(e
 // sessionReader pairs an ssh.Session with its stdout pipe so
 // closing the reader tears down the session.
 type sessionReader struct {
-	sess   *ssh.Session
+	sess   *session
 	stdout io.Reader
 	ctx    context.Context
 
@@ -1016,18 +1136,6 @@ func (p *Plugin) exists(ctx context.Context, fullPath string) (bool, error) {
 	return false, fmt.Errorf("scp: exists check %s: unexpected output %q", fullPath, out)
 }
 
-// mkdirAll creates dir + every parent.  Pure shell `mkdir -p`
-// is atomic against concurrent creators on POSIX.
-func (p *Plugin) mkdirAll(ctx context.Context, dir string) error {
-	if dir == "" || dir == "/" {
-		return nil
-	}
-	if _, err := p.runShell(ctx, "mkdir -p "+shellQuote(dir)); err != nil {
-		return fmt.Errorf("scp: mkdir -p %s: %w", dir, err)
-	}
-	return nil
-}
-
 func (p *Plugin) assertOpen() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -1060,6 +1168,111 @@ func shellQuote(s string) string {
 // falls back to a global flush rather than to no flush at all.
 func syncCommand(p string) string {
 	return "{ sync -- " + shellQuote(p) + " 2>/dev/null || sync; }"
+}
+
+// pruneRaceRetries bounds how often a remote command re-creates a
+// directory that a concurrent PruneEmptyDirs removed under it. The
+// retries run inside ONE remote command, so each costs a `mkdir -p`,
+// not a round trip.
+const pruneRaceRetries = 100
+
+// retryVanishedDir builds a remote loop that runs attempt — a command
+// starting with the `mkdir -p` of the directory it writes into — until
+// it succeeds. PruneEmptyDirs (run by `repo gc`) removes directories
+// that are empty at that instant, so the directory can vanish between
+// the mkdir and the write; that is a lost race, not a failure, and the
+// attempt is simply repeated.
+//
+// The loop cannot ask WHY an attempt failed without parsing shell- and
+// locale-specific messages, so it repeats on any failure, up to
+// pruneRaceRetries times or until giveUp (a shell test, may be empty)
+// says the failure is a different one. It then reports the last
+// attempt's own error text and exits non-zero.
+func retryVanishedDir(attempt, giveUp string) string {
+	if giveUp != "" {
+		giveUp += " || "
+	}
+	return "i=0; until e=$({ " + attempt + "; } 2>&1); do i=$((i+1)); " +
+		"if " + giveUp + "[ $i -ge " + strconv.Itoa(pruneRaceRetries) + " ]; then " +
+		`printf '%s\n' "$e" >&2; exit 1; fi; done`
+}
+
+// stageCommand builds the remote command for Put's upload: create tmp's
+// directory and tmp itself, stream stdin into tmp, flush it.
+//
+// The create is a step of its own, ahead of the `cat`, because it is
+// the only point where a pruned directory can still fail the write:
+// once tmp exists its directory is not empty, rmdir refuses it, and
+// both the `cat` and the later commit (ln/mv inside that directory)
+// find it in place. `true >` rather than the customary `: >` — a failed
+// redirection on a special builtin makes a POSIX shell (dash, BusyBox
+// ash) exit on the spot instead of reaching the retry.
+func stageCommand(tmp string) string {
+	q := shellQuote(tmp)
+	return retryVanishedDir("mkdir -p "+shellQuote(path.Dir(tmp))+" && true > "+q, "") +
+		"; cat > " + q + " && " + syncCommand(tmp)
+}
+
+// linkCommand builds the remote command for RenameIfNotExists' commit:
+// create dst's directory, hard-link src to dst (`ln -T` fails with
+// EEXIST when dst is present — the atomic single-winner gate), flush
+// the directory. Until the link exists dst's directory may be empty, so
+// the mkdir+ln pair is retried against a concurrent prune; a present
+// dst or an absent src is a real answer and ends the loop at once.
+func linkCommand(src, dst string) string {
+	s, d := shellQuote(src), shellQuote(dst)
+	return retryVanishedDir("mkdir -p "+shellQuote(path.Dir(dst))+" && ln -T "+s+" "+d,
+		"[ -e "+d+" ] || [ ! -e "+s+" ]") +
+		"; " + syncCommand(path.Dir(dst))
+}
+
+// pruneMark is what pruneEmptyDirsCommand prints per removed directory.
+// A fixed token, never the name: directory names are caller data and
+// may contain anything, including newlines.
+const pruneMark = "d"
+
+// pruneEmptyDirsCommand builds the remote command for PruneEmptyDirs.
+//
+// find walks depth-first (-depth), so a directory is tested after its
+// children are gone and a whole empty subtree goes in one pass. Each
+// candidate is removed by rmdir(1), handed the path as an argument
+// (never through a shell): rmdir refuses anything that is not an empty
+// directory, so a writer that got in after find's -empty test loses
+// nothing, and a refused rmdir only skips the -printf. -H follows a
+// symlinked start point the way the fs backend does; symlinks below it
+// are never followed. LC_ALL=C pins the wording of find's complaints
+// for isPruneRace.
+func pruneEmptyDirsCommand(fullPath string, includeSelf bool) string {
+	q := shellQuote(fullPath)
+	minDepth := " -mindepth 1"
+	if includeSelf {
+		minDepth = ""
+	}
+	return "if [ ! -d " + q + " ]; then exit 0; fi; " +
+		"LC_ALL=C find -H " + q + minDepth + " -depth -type d -empty" +
+		` -exec rmdir -- {} \; -printf '` + pruneMark + `\n'`
+}
+
+// isPruneRace reports whether a failed pruneEmptyDirsCommand lost a race
+// rather than hit a real error: every complaint is about a directory
+// that vanished mid-walk (another prune, a repo wipe) or that a writer
+// filled before the rmdir.
+func isPruneRace(err error) bool {
+	var re *remoteCmdError
+	var exit *ssh.ExitError
+	if !errors.As(err, &re) || !errors.As(re.err, &exit) || re.stderr == "" {
+		return false
+	}
+	for _, line := range strings.Split(re.stderr, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" ||
+			strings.HasSuffix(line, ": No such file or directory") ||
+			strings.HasSuffix(line, ": Directory not empty") {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 // statNotFoundMarker is printed by statCommand when the path is

@@ -26,8 +26,6 @@ package timeline
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"strconv"
@@ -36,22 +34,6 @@ import (
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo"
 )
-
-// tmpSuffix returns a random hex suffix so concurrent writers stage
-// their tmp at DISTINCT keys. A shared (fixed) tmp path would let one
-// agent's truncate-then-write leave the file partial at the instant
-// another agent renames it — installing a truncated .history. Mirrors
-// the randomized-tmp convention every other commit path uses (backup,
-// walsink, repair).
-func tmpSuffix() string {
-	var b [8]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		// crypto/rand failure is pathological; fall back to a
-		// nanosecond stamp so the tmp key is still unlikely to collide.
-		return strconv.FormatInt(time.Now().UnixNano(), 16)
-	}
-	return hex.EncodeToString(b[:])
-}
 
 // Path returns the canonical repo key for a deployment's TLI
 // history file. Exposed so callers in the doctor / repair surface

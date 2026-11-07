@@ -52,21 +52,25 @@ import (
 //     differ from the source PG.
 func runVerifyFull(cmd *cobra.Command, deployment, backupID, repoURL, pgMajorOverride string) error {
 	d := DispatcherFrom(cmd)
+	fetchConcurrency, err := fetchConcurrencyFlag(cmd)
+	if err != nil {
+		return err
+	}
 	// Resolve --repo from the named deployment in config when omitted (#12).
 	_, repoURL = deploymentDefaults(deployment, "", repoURL)
 	if repoURL == "" {
 		return missingFlagErr(cmd, "--repo")
 	}
 
-	verifier, err := loadVerifier()
-	if err != nil {
-		return err
-	}
 	repoMeta, sp, err := openRepo(cmd.Context(), repoURL)
 	if err != nil {
 		return err
 	}
 	defer sp.Close()
+	verifier, err := loadVerifier()
+	if err != nil {
+		return err
+	}
 
 	store := backup.NewManifestStore(sp)
 	if backupID == "latest" {
@@ -117,13 +121,20 @@ func runVerifyFull(cmd *cobra.Command, deployment, backupID, repoURL, pgMajorOve
 	kmsCfg, _ := cmd.Flags().GetStringToString("kms-config")
 	kmsProviderFor := deploymentKMSResolver(kmsCfg)
 
+	// Tablespaces go under tmp too, never to their recorded paths.
+	dataDir, tsRemap, tsDirs := restore.ScratchLayout(m, tmp)
 	if _, err := restore.Restore(cmd.Context(), restore.Options{
-		RepoURL:    repoURL,
-		Deployment: deployment,
-		BackupID:   backupID,
-		TargetDir:  tmp,
-		Verifier:   verifier,
-		KEKForRef:  kekResolver,
+		RepoURL:         repoURL,
+		Deployment:      deployment,
+		BackupID:        backupID,
+		TargetDir:       dataDir,
+		TablespaceRemap: tsRemap,
+		// tmp is removed once pg_verifybackup has run: no per-file
+		// fsync (issue #90).
+		ScratchTarget:    true,
+		FetchConcurrency: fetchConcurrency,
+		Verifier:         verifier,
+		KEKForRef:        kekResolver,
 		UnwrapDEK: func(ctx context.Context, kekRef string, wrapped []byte) ([]byte, error) {
 			return keystore.UnwrapDEK(ctx, kekRef, wrapped, keystore.UnwrapOpts{
 				KeyringDir:     p.Keyring.Value,
@@ -154,8 +165,9 @@ func runVerifyFull(cmd *cobra.Command, deployment, backupID, repoURL, pgMajorOve
 
 	// 2. Sandbox verify.
 	res, err := sandbox.Verify(cmd.Context(), sandbox.Options{
-		DataDir: tmp,
-		PGMajor: major,
+		DataDir:    dataDir,
+		ExtraBinds: tsDirs,
+		PGMajor:    major,
 		// The restore above writes backup_manifest whenever the
 		// manifest carries it — so a "could not open backup_manifest"
 		// from pg_verifybackup is an environment fault, not a skip.

@@ -7,9 +7,12 @@ import (
 	"fmt"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup/chunker"
+	"io"
 	"math/rand"
 	"net/url"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup/tarsink"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/pg/basebackup"
@@ -169,5 +172,152 @@ func TestEntryStream_InOrderAndEquivalent(t *testing.T) {
 		if off != int64(len(body)) {
 			t.Fatalf("conc=%d total %d", conc, off)
 		}
+	}
+}
+
+// slowPutSP delays every Put and records how many run at once — a
+// stand-in for a remote object store, where a chunk write is a network
+// round trip rather than CPU.
+type slowPutSP struct {
+	*fs.Plugin
+	delay        time.Duration
+	active, peak atomic.Int32
+}
+
+func (s *slowPutSP) Put(ctx context.Context, key string, r io.Reader, o storage.PutOptions) (storage.PutResult, error) {
+	n := s.active.Add(1)
+	defer s.active.Add(-1)
+	for {
+		p := s.peak.Load()
+		if n <= p || s.peak.CompareAndSwap(p, n) {
+			break
+		}
+	}
+	time.Sleep(s.delay)
+	return s.Plugin.Put(ctx, key, r, o)
+}
+
+// Issue #90: one-chunk files (most of PGDATA) used to upload one at a
+// time, because each file waited for its last chunk before the next tar
+// entry was read. The pool now spans files: many small files must have
+// their uploads in flight together, and the per-file emission — stream
+// events, chunk refs and observer callbacks — must stay in tar order.
+func TestConcurrency_SmallFilesOverlapAcrossFiles(t *testing.T) {
+	const (
+		nFiles = 48
+		conc   = 8
+	)
+	rng := rand.New(rand.NewSource(0x90))
+	var specs []fileSpec
+	for i := 0; i < nFiles; i++ {
+		body := make([]byte, 2048)
+		rng.Read(body)
+		if i%7 == 3 {
+			body = nil // empty files interleaved: end markers with no chunks
+		}
+		specs = append(specs, fileSpec{name: fmt.Sprintf("base/1/%d", 10000+i), body: body})
+	}
+	tarBytes := buildTar(t, specs)
+
+	fsp := &fs.Plugin{}
+	if err := fsp.Open(context.Background(), storage.StorageConfig{URL: &url.URL{Scheme: "file", Path: t.TempDir()}}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = fsp.Close() })
+	sp := &slowPutSP{Plugin: fsp, delay: 20 * time.Millisecond}
+	cas := repo.NewCAS(sp)
+	rec := &streamRec{}
+	var observed []string
+	sink := tarsink.New(context.Background(), cas,
+		tarsink.WithChunkConcurrency(conc),
+		tarsink.WithEntryStream(rec),
+		tarsink.WithFileObserver(func(fs tarsink.FileStats) { observed = append(observed, fs.Path) }))
+
+	if err := drive(t, sink, 0, basebackup.TablespaceInfo{OID: 1663}, tarBytes, 64*1024); err != nil {
+		t.Fatalf("drive: %v", err)
+	}
+	// Peak concurrency, not wall time: a timing bound fails on a loaded
+	// host even when files overlap.
+	if p := sp.peak.Load(); p < conc/2 {
+		t.Fatalf("peak concurrent Puts = %d, want >= %d: small files are not overlapping", p, conc/2)
+	}
+
+	var want []string
+	for _, f := range specs {
+		want = append(want, "begin:"+f.name, "end")
+	}
+	if fmt.Sprint(rec.events) != fmt.Sprint(want) {
+		t.Fatalf("stream events out of tar order:\n got %v\nwant %v", rec.events, want)
+	}
+	for i, f := range specs {
+		if observed[i] != f.name {
+			t.Fatalf("observer #%d = %s, want %s", i, observed[i], f.name)
+		}
+	}
+	// Each non-empty file is one chunk, emitted in tar order.
+	ci := 0
+	for _, f := range specs {
+		if len(f.body) == 0 {
+			continue
+		}
+		bs, err := cas.GetChunkBytes(context.Background(), rec.chunks[ci].Hash)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(bs, f.body) {
+			t.Fatalf("chunk %d does not belong to %s", ci, f.name)
+		}
+		ci++
+	}
+	if ci != len(rec.chunks) {
+		t.Fatalf("%d chunks emitted, want %d", len(rec.chunks), ci)
+	}
+}
+
+// A BASE_BACKUP that fails mid-stream never reaches OnTablespaceEnd, so
+// the parser and its uploads outlive the basebackup call. Close must
+// not return while any PutChunk is still running: the runner tears the
+// CAS down right after, and a late adoption into its closed set
+// panicked a cancelled backup.
+func TestClose_WaitsForInFlightUploads(t *testing.T) {
+	rng := rand.New(rand.NewSource(0xC105E))
+	var specs []fileSpec
+	for i := 0; i < 64; i++ {
+		body := make([]byte, 4096)
+		rng.Read(body)
+		specs = append(specs, fileSpec{name: fmt.Sprintf("base/1/%d", 20000+i), body: body})
+	}
+	tarBytes := buildTar(t, specs)
+
+	fsp := &fs.Plugin{}
+	if err := fsp.Open(context.Background(), storage.StorageConfig{URL: &url.URL{Scheme: "file", Path: t.TempDir()}}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = fsp.Close() })
+	sp := &slowPutSP{Plugin: fsp, delay: 30 * time.Millisecond}
+	sink := tarsink.New(context.Background(), repo.NewCAS(sp), tarsink.WithChunkConcurrency(8))
+
+	if err := sink.OnTablespaceStart(0, basebackup.TablespaceInfo{OID: 1663}); err != nil {
+		t.Fatal(err)
+	}
+	// Half the stream, then abandon it — no OnTablespaceEnd.
+	if err := sink.OnTablespaceData(0, tarBytes[:len(tarBytes)/2]); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for sp.active.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if sp.active.Load() == 0 {
+		t.Fatal("no upload in flight to exercise Close against")
+	}
+	if err := sink.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if n := sp.active.Load(); n != 0 {
+		t.Fatalf("Close returned with %d PutChunk calls still running", n)
+	}
+	if err := sink.Close(); err != nil { // idempotent
+		t.Fatal(err)
 	}
 }

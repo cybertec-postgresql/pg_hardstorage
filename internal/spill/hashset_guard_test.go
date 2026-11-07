@@ -95,3 +95,33 @@ func TestHashSet_WarnsOnceWhenSpillDirIsTmpfs(t *testing.T) {
 		t.Fatalf("warnings = %q, want exactly one tmpfs warning", got)
 	}
 }
+
+// The zero key shares its value with an empty hot-cache slot. Add must
+// not mistake that for "already present" once the cache exists: it would
+// report a first insert as a duplicate and never store the key.
+func TestHashSet_ZeroKeyIsNotAnsweredByAnEmptyHotSlot(t *testing.T) {
+	s := NewHashSet(Options{MemEntries: 8, Dir: t.TempDir()})
+	defer s.Close()
+	for i := 0; i < 40; i++ {
+		s.Add(key(i))
+	}
+	if s.Spilled() == 0 || s.hot == nil {
+		t.Fatal("expected a spill with the hot cache allocated")
+	}
+	var zero Key
+	if s.Has(zero) {
+		t.Fatal("zero key present before it was added")
+	}
+	if !s.Add(zero) {
+		t.Fatal("first Add of the zero key reported it as already present")
+	}
+	if !s.Has(zero) {
+		t.Fatal("zero key missing after Add")
+	}
+	if s.Add(zero) {
+		t.Fatal("second Add of the zero key reported it as absent")
+	}
+	if err := s.Err(); err != nil {
+		t.Fatal(err)
+	}
+}

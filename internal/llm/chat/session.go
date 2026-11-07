@@ -104,7 +104,7 @@ type Session struct {
 	// tool result, response, error).  The chat orchestrator
 	// emits the events; the caller decides whether they go to
 	// the hash-chained audit log, an in-memory log, or
-	// /dev/null.  Audit+ #4 — accountability layer.
+	// /dev/null.  Audit #4 — accountability layer.
 	AuditEmitter AuditEmitter
 
 	// SessionID is the stable identifier the AuditEmitter

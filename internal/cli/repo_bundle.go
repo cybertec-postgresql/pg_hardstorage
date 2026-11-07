@@ -147,14 +147,31 @@ func newRepoBundleExportCmd() *cobra.Command {
 func newRepoBundleImportCmd() *cobra.Command {
 	var (
 		repoURL string
+		toURL   string
 		inPath  string
 	)
 	c := &cobra.Command{
-		Use:          "import",
-		Short:        "Import a previously-exported bundle into a destination repo (idempotent)",
+		Use:   "import",
+		Short: "Import a previously-exported bundle into a destination repo (idempotent)",
+		Long: `Import a bundle written by 'repo bundle export' into a repository.
+
+The flags mirror export's: export reads --repo and writes --out, import
+reads --in and writes --repo. --to is the older name for the
+destination and is still accepted.`,
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			d := DispatcherFrom(cmd)
+			switch {
+			case repoURL == "" && toURL == "":
+				return output.NewError("usage.missing_flag",
+					"repo bundle import: --repo is required (the destination repository)").Wrap(output.ErrUsage)
+			case repoURL == "":
+				repoURL = toURL
+			case toURL != "" && toURL != repoURL:
+				return output.NewError("usage.bad_flag",
+					fmt.Sprintf("repo bundle import: --repo %q and --to %q name different destinations; pass one", repoURL, toURL)).
+					Wrap(output.ErrUsage)
+			}
 			f, err := os.Open(inPath)
 			if err != nil {
 				return output.NewError("repo.bundle_import_failed",
@@ -195,8 +212,8 @@ func newRepoBundleImportCmd() *cobra.Command {
 			return d.Result(output.NewResult(cmd.CommandPath()).WithBody(body))
 		},
 	}
-	c.Flags().StringVar(&repoURL, "to", "", "destination repository URL (required)")
-	_ = c.MarkFlagRequired("to")
+	c.Flags().StringVar(&repoURL, "repo", "", "destination repository URL (required)")
+	c.Flags().StringVar(&toURL, "to", "", "alias of --repo, kept for compatibility")
 	c.Flags().StringVar(&inPath, "in", "", "input path to a .tar bundle (required)")
 	_ = c.MarkFlagRequired("in")
 	return c

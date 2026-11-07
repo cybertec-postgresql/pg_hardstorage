@@ -806,24 +806,6 @@ done
 	return NoRecovery, nil
 }
 
-// randIntn returns a cryptographically-random int in [0, n).
-// Mirrors flipRandomByteFault's offset selection — read 8
-// crypto-rand bytes, build uint64, mod n.  Modding in unsigned
-// space and converting after preserves the [0, n) invariant
-// even on a 32-bit int target.
-func randIntn(n int) int {
-	if n <= 0 {
-		return 0
-	}
-	buf := make([]byte, 8)
-	_, _ = rand.Read(buf)
-	v := uint64(buf[0])<<56 | uint64(buf[1])<<48 |
-		uint64(buf[2])<<40 | uint64(buf[3])<<32 |
-		uint64(buf[4])<<24 | uint64(buf[5])<<16 |
-		uint64(buf[6])<<8 | uint64(buf[7])
-	return int(v % uint64(n))
-}
-
 // --- concurrent_repo_writer ------------------------------------------
 
 // concurrentRepoWriterFault launches a SECOND `pg_hardstorage

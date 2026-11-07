@@ -13,7 +13,7 @@ tags:
 
 > The `scp://` scheme stores chunks on a remote Unix host
 > over plain SSH command-exec — `cat`, `stat`, `find`, `mv`,
-> `rm`, `mkdir`.  Useful when corporate policy disables the
+> `ln`, `rm`, `mkdir`, `rmdir`.  Useful when corporate policy disables the
 > SFTP subsystem (`Subsystem sftp` commented out in
 > sshd_config) but allows ssh-exec, or against embedded /
 > appliance SSH servers that don't implement SFTP at all.
@@ -71,8 +71,8 @@ process listings and shell history.
   `known_hosts` file.
 - A directory that the backup user owns and can write to.
 - The remote shell environment must have `cat`, `stat`,
-  `find`, `mv`, `rm`, `mkdir` on PATH.  Every standard Unix
-  shell + busybox satisfies this.
+  `find`, `mv`, `ln`, `rm`, `mkdir`, `rmdir` on PATH.  Every
+  standard Unix shell + busybox satisfies this.
 
 ## Steps
 
@@ -208,6 +208,18 @@ arguments falls back to a global `sync`). Directories created by
 `mkdir -p` are not synced in their parents, so the backend does
 not claim inline durability.
 
+## Empty directories after `repo gc`
+
+`repo gc --apply` removes the directories its deletes left empty
+(`chunks/sha256/xx/yy`, the directory of a reaped manifest temp),
+the way the filesystem backend does. One remote `find` walks the
+tree and hands each empty directory to `rmdir` — never `rm -r` —
+which refuses a directory that is not empty, so a backup running
+beside gc cannot lose an object; a writer whose directory was
+pruned a moment before its write re-creates it and carries on.
+The repository root and the top-level directories that still hold
+objects stay.
+
 ## Dead connections
 
 The plugin sends an SSH keepalive every 30 s and tears the
@@ -249,8 +261,8 @@ Confirm out-of-band, then update `known_hosts` deliberately.
 
 **`stat: command not found`** or similar — extremely rare,
 but minimal embedded SSH servers may ship without coreutils.
-The plugin needs `cat`, `stat`, `find`, `mv`, `rm`,
-`mkdir`.  If those aren't available, you're on a setup the
+The plugin needs `cat`, `stat`, `find`, `mv`, `ln`, `rm`,
+`mkdir`, `rmdir`.  If those aren't available, you're on a setup the
 backup tool can't drive over plain SSH; switch to
 [`sftp://`](repository-sftp.md) or pull the data through a
 sidecar that does have a normal toolchain.
@@ -269,6 +281,14 @@ LAN).  For repos with many small files (heavy CAS-dedup,
 millions of chunks) prefer `sftp://`.  For repos with
 fewer larger objects (snapshot-style backup, small WAL
 volume), the difference is negligible.
+
+The backend keeps at most 8 sessions open on its connection, whatever
+`--upload-concurrency` and `--fetch-concurrency` say, because sshd
+refuses a channel beyond `MaxSessions` (default 10) per connection.
+Further operations wait for a free session. If the server sets
+`MaxSessions` below 8, the surplus opens are refused and retried for a
+few seconds, which is slow; raise `MaxSessions` or lower the two
+concurrency flags to match.
 
 ## Next steps
 

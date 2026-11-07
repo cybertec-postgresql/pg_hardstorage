@@ -164,6 +164,33 @@ func SegmentFileName(timeline uint32, segNum uint64, segmentSize int64) string {
 	return fmt.Sprintf("%08X%08X%08X", timeline, logID, segLo)
 }
 
+// ValidateDeployment rejects a deployment name that cannot be a single
+// storage-key component. Every WAL key is built by interpolating the
+// name (wal/<deployment>/<timeline>/<segment>.json and its siblings), so
+// a name carrying a path separator or equal to "." / ".." does not
+// address a deployment at all: "../audit" resolves to the repository's
+// audit/ tree, and "a/../../x" and "../x" land on the same keys.
+//
+// It is the rule the backup path applies (backup.ValidateDeployment) —
+// path separators, control characters and the reserved components, and
+// nothing else, so no name that archives correctly today is refused.
+// Kept here rather than imported because backup imports this package;
+// TestWALDeploymentRuleMatchesBackupRule holds the two together.
+func ValidateDeployment(deployment string) error {
+	if deployment == "" {
+		return errors.New("walsink: empty deployment")
+	}
+	if deployment == "." || deployment == ".." {
+		return fmt.Errorf("walsink: deployment %q is a reserved path component", deployment)
+	}
+	if strings.IndexFunc(deployment, func(r rune) bool {
+		return r == '/' || r == '\\' || r < 0x20 || r == 0x7f
+	}) >= 0 {
+		return fmt.Errorf("walsink: deployment %q contains an illegal character (path separators and control characters are not allowed)", deployment)
+	}
+	return nil
+}
+
 // SegmentPath returns the repo key for a WAL segment manifest. Layout
 // matches the SPEC's `wal/<deployment>/<timeline>/<segment>.json`.
 // Caller passes the bare 24-char segment name; we add the suffix.

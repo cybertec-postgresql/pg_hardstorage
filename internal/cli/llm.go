@@ -297,8 +297,7 @@ func runLlmDoctor(cmd *cobra.Command) error {
 
 	// Check 5: round-trip a known-good probe.  Kept tiny to bound
 	// cost / latency.  We ask the model to echo a literal token
-	// and check the response contains it.
-	checkStart = time.Now()
+	// and check the response contains it.  The probe times itself.
 	body.Checks = append(body.Checks, roundTripProbe(cmd, flagProvider, flagEndpoint, flagModel))
 
 	// Aggregate.
@@ -557,7 +556,7 @@ func runLlmAsk(cmd *cobra.Command, opts llmAskOptions) error {
 	skill, err := set.Get(opts.skill)
 	if err != nil {
 		return output.NewError("notfound.skill",
-			fmt.Sprintf("llm: skill %q not loaded — drop a YAML at /etc/pg_hardstorage/skills/ or upgrade the binary (the four builtins ask/explain/restore/incident ship with+)", opts.skill)).Wrap(err)
+			fmt.Sprintf("llm: skill %q not loaded — drop a YAML at /etc/pg_hardstorage/skills/ or upgrade the binary (the four builtins ask/explain/restore/incident ship with it)", opts.skill)).Wrap(err)
 	}
 
 	// 2. Resolve provider.  Use the -Full variant so we get the
@@ -645,7 +644,7 @@ func runLlmAsk(cmd *cobra.Command, opts llmAskOptions) error {
 	return d.Result(output.NewResult(cmd.CommandPath()).WithBody(body))
 }
 
-// resolveLlmProvider picks + opens the LLM provider.
+// LLM provider resolution, implemented by resolveLlmProviderFull below.
 //
 // Resolution chain (later wins for each field):
 //
@@ -829,11 +828,9 @@ func renderHotCommandHelp(tree *cmdtree.Node) string {
 	return b.String()
 }
 
-// resolveLlmProviderFull is the four-return-value variant
-// of resolveLlmProvider: same behaviour, but also returns
-// the resolved endpoint + model so the chat banner can
-// show them.  Existing callers stay on the three-value
-// shim below.
+// resolveLlmProviderFull picks + opens the LLM provider (see the
+// resolution chain above) and also returns the resolved endpoint +
+// model so the chat banner can show them.
 func resolveLlmProviderFull(ctx context.Context, flagProvider, flagEndpoint, flagModel string) (llmprovider.Provider, string, string, string, error) {
 	llmCfg := loadLLMConfigFromFile()
 
@@ -929,14 +926,6 @@ func resolveLlmProviderFull(ctx context.Context, flagProvider, flagEndpoint, fla
 			fmt.Sprintf("llm: open %s: %v", provName, err)).Wrap(err)
 	}
 	return prov, provName, cfg.Endpoint, cfg.Model, nil
-}
-
-// resolveLlmProvider is the back-compat shim for callers
-// that don't need the resolved endpoint + model — drops the
-// last two return values from resolveLlmProviderFull.
-func resolveLlmProvider(ctx context.Context, flagProvider, flagEndpoint, flagModel string) (llmprovider.Provider, string, error) {
-	prov, name, _, _, err := resolveLlmProviderFull(ctx, flagProvider, flagEndpoint, flagModel)
-	return prov, name, err
 }
 
 // loadLLMConfigFromFile reads pg_hardstorage.yaml + drop-ins and

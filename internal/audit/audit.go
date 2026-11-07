@@ -719,46 +719,9 @@ func (s *Store) head(ctx context.Context, shard string) (*Event, error) {
 // caller already drops non-.json files; _head.json IS a .json file,
 // so we filter explicitly here.
 
-// listAllKeysSorted lists every audit/*.json key in lex order, EXCEPT
-// non-event sidecar files that live alongside the chain in the same
-// prefix:
-//
-//   - audit/_head.json: the chain-tail pointer.
-//   - audit/anchors/<log-id>.json: transparency-log anchor records
-//     (own schema `pg_hardstorage.audit.anchor.v1`).  Without this
-//     filter, anchors get picked up by Search and VerifyChain, then
-//     unmarshal into zero-valued Event structs — which inflates the
-//     Search count by 1 per anchor and breaks VerifyChain's hash
-//     integrity (the zero event's empty prev_hash won't match the
-//     prior event's hash).  Surfaced by L8_audit_anchor_round_trip
-//     after the first `audit anchor` write made `audit verify-chain`
-//     report `verify.audit_chain_broken: 1 hash mismatch(es), 1
-//     chain break(s)` on a chain that was green moments earlier.
-//
-// Per-day directory layout means the natural prefix walk is
-// sequence-sorted.
-//
-// listShardEventKeys lists one shard's event keys in lex (= commit)
-// order. The global chain ("") shares the audit/ root with the sharded
-// sub-tree, the head pointer, and the anchor sidecars, so it excludes
-// all of them; a named shard's directory contains only its own events
-// plus its _head.json.
-func (s *Store) listShardEventKeys(ctx context.Context, shard string) ([]string, error) {
-	var out []string
-	if err := s.eachShardEventKey(ctx, shard, func(k string) error {
-		out = append(out, k)
-		return nil
-	}); err != nil {
-		return nil, err
-	}
-	sort.Strings(out)
-	return out, nil
-}
-
 // eachShardEventKey streams one shard's event keys (in the backend's list
 // order) without collecting them: a chain of millions of events must not
-// cost a heap slice of every key. Use listShardEventKeys only where a
-// sorted slice is genuinely required (tests).
+// cost a heap slice of every key.
 func (s *Store) eachShardEventKey(ctx context.Context, shard string, fn func(key string) error) error {
 	dir := shardEventDir(shard)
 	headKey := headKeyForShard(shard)
@@ -888,6 +851,10 @@ func trimAuditMatches(out []*Event, limit int, reverse bool) []*Event {
 // Limit interaction with Reverse: Limit caps AFTER ordering, so
 // Reverse=true + Limit=10 returns the 10 most-recent events
 // matching filters — the natural "what happened recently?" query.
+//
+// Every match is held in the returned slice. A caller that walks a
+// whole window should use SearchEach, which yields the same sequence
+// without it.
 func (s *Store) Search(ctx context.Context, f ListFilters) ([]*Event, error) {
 	// Collect matches across every shard, then order globally. Per-shard
 	// Sequence isn't comparable across shards, so the global order is by

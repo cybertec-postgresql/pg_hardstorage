@@ -149,6 +149,16 @@ func New(cas *repo.CAS, sp storage.StoragePlugin, opts Options) (*Sink, error) {
 	if opts.StreamName == "" {
 		return nil, errors.New("chunked: empty stream name")
 	}
+	// Both are interpolated into storage keys (SegmentPath:
+	// logical/<deployment>/<stream>/...). A path separator or a "."/".."
+	// component would write outside that prefix — the same hole the WAL
+	// path had (walsink.ValidateDeployment).
+	if err := validKeyComponent("deployment", opts.Deployment); err != nil {
+		return nil, err
+	}
+	if err := validKeyComponent("stream name", opts.StreamName); err != nil {
+		return nil, err
+	}
 	if opts.Slot == "" {
 		return nil, errors.New("chunked: empty slot")
 	}
@@ -446,6 +456,20 @@ func (s *Sink) readSegmentManifest(ctx context.Context, key string) (*SegmentMan
 func SegmentPath(deployment, streamName string, startLSN pglogrepl.LSN) string {
 	return fmt.Sprintf("logical/%s/%s/%s.json",
 		deployment, streamName, replaceSlash(startLSN.String()))
+}
+
+// validKeyComponent rejects a name that cannot be one component of a
+// storage key: "." / "..", path separators and control characters.
+func validKeyComponent(kind, s string) error {
+	if s == "." || s == ".." {
+		return fmt.Errorf("chunked: %s %q is a reserved path component", kind, s)
+	}
+	if strings.IndexFunc(s, func(r rune) bool {
+		return r == '/' || r == '\\' || r < 0x20 || r == 0x7f
+	}) >= 0 {
+		return fmt.Errorf("chunked: %s %q contains an illegal character (path separators and control characters are not allowed)", kind, s)
+	}
+	return nil
 }
 
 // replaceSlash converts "0/3F5A1B40" to "0_3F5A1B40" for filesystem

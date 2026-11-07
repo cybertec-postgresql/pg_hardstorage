@@ -75,6 +75,9 @@ type walPreflightOptions struct {
 
 func runWalPreflight(cmd *cobra.Command, opts walPreflightOptions) error {
 	d := DispatcherFrom(cmd)
+	if err := validateWALDeployment("wal preflight", opts.deployment); err != nil {
+		return err
+	}
 
 	role := opts.role
 	if role == "" {

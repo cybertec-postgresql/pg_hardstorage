@@ -224,6 +224,39 @@ the filter recording makes that explicit.
 
 ---
 
+## Large windows
+
+`audit export-bundle` does not hold the window in memory. The
+matching events are ordered by a disk-spilling sorter and
+written straight into the canonical signing input, a temp
+file; Ed25519 needs the whole message as one buffer, so that
+file is memory-mapped for the signature and then streamed
+into the archive. Heap use is a fixed few tens of MiB however
+many events the window holds. The bundle format is unchanged.
+
+What a large export needs instead:
+
+- **Temp space**: about twice the uncompressed size of the
+  exported events, in `$TMPDIR`. Point `TMPDIR` at a
+  disk-backed volume; on tmpfs the "disk" is RAM. The files
+  are removed when the command finishes, fails or is
+  interrupted.
+- **A platform with `mmap`** for very large windows. Where
+  it is missing (Windows) the signing input is held in RAM
+  for the signature, and an export whose signing input
+  exceeds 4 GiB is refused.
+
+`audit verify-bundle` is a different matter: it reads the
+whole bundle into memory, and as a guard against
+decompression bombs it refuses a bundle with a file over
+1 GiB or more than 4 GiB in total once decompressed. An
+export can therefore be larger than this verifier accepts.
+Keep `events.ndjson` under 1 GiB (split the period with
+`--since` / `--until`, or filter) when the bundle will be
+checked with `verify-bundle`.
+
+---
+
 ## When to export
 
 | Trigger | Recommended cadence |

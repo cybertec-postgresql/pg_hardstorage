@@ -11,6 +11,11 @@ import (
 	"path/filepath"
 )
 
+// barrierPersistsNewDirs: this Barrier fsyncs only each published
+// chunk's own directory, not the parent entry of a directory Put just
+// created, so Put must keep creating directories durably.
+const barrierPersistsNewDirs = false
+
 // Barrier is the portable (non-Linux) form of the deferred-chunk
 // commit. Same three-step sequence as the Linux build — staging
 // content durable, then publish to final keys, then directory

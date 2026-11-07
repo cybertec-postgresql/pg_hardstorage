@@ -463,15 +463,15 @@ it describes can no longer be restored.`,
 
 func runRepairManifest(cmd *cobra.Command, deployment, backupID, repoURL string, force bool) error {
 	d := DispatcherFrom(cmd)
-	verifier, err := loadVerifier()
-	if err != nil {
-		return err
-	}
 	repoMeta, sp, err := openRepo(cmd.Context(), repoURL)
 	if err != nil {
 		return err
 	}
 	defer sp.Close()
+	verifier, err := loadVerifier()
+	if err != nil {
+		return err
+	}
 	// Every branch below may write (rebuild the replica or overwrite the
 	// primary), so refuse up front on a read-only repository.
 	if err := assertRepoWritable(cmd.Context(), sp, "repair manifest"); err != nil {
@@ -589,20 +589,6 @@ func runRepairManifest(cmd *cobra.Command, deployment, backupID, repoURL string,
 		PrimaryWasValid: primaryValid,
 		Forced:          force,
 	}))
-}
-
-// randHex8 returns 8 random hex chars for tmp-file disambiguation.
-// Same shape backup.randSuffix uses; duplicated here to keep cli's
-// dep on backup limited to the public surface.
-func randHex8() string {
-	const hex = "0123456789abcdef"
-	out := make([]byte, 8)
-	now := time.Now().UnixNano()
-	for i := 7; i >= 0; i-- {
-		out[i] = hex[now&0xF]
-		now >>= 4
-	}
-	return string(out)
 }
 
 type repairManifestBody struct {

@@ -89,3 +89,19 @@ func TestSCP_Contract_Container(t *testing.T) {
 	_, open := startSCPContainer(t)
 	contract.Run(t, func(t *testing.T) storage.StoragePlugin { return open(t) })
 }
+
+// TestSCP_PruneEmptyDirs_Container runs the EmptyDirPruner clauses and
+// the writers-against-pruners race where the remote commands meet a
+// different shell and userland than the in-process tests' /bin/sh:
+// BusyBox ash as the login shell, GNU find and coreutils, and sshd's
+// default MaxSessions.
+func TestSCP_PruneEmptyDirs_Container(t *testing.T) {
+	_, open := startSCPContainer(t)
+	p := open(t)
+	contract.PruneEmptyDirs(t, p)
+	iters := 60
+	if testing.Short() {
+		iters = 15
+	}
+	contract.PruneRacesWriters(t, p, 4, iters)
+}

@@ -180,6 +180,11 @@ func mapRepoInitError(url string, err error) error {
 				Human: fmt.Sprintf("registered schemes: %v", storage.Schemes()),
 			}).Wrap(output.ErrUsage)
 	}
+	// An error the repo layer already classified (a damaged HSREPO)
+	// keeps its code.
+	if oe, ok := output.AsOutputError(err); ok {
+		return oe
+	}
 	return output.NewError("internal", err.Error()).Wrap(err)
 }
 

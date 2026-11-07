@@ -21,18 +21,7 @@ import (
 // metadata but doesn't enforce deletion, so we verify by reading it back
 // through a direct SDK client rather than a delete attempt.
 func TestGCS_PutAppliesObjectRetention(t *testing.T) {
-	requireDocker(t)
-	s, err := sink.New("gcs-fake")
-	if err != nil {
-		t.Fatalf("sink.New(gcs-fake): %v", err)
-	}
-	if err := s.Up(context.Background()); err != nil {
-		t.Fatalf("sink.Up: %v", err)
-	}
-	t.Cleanup(func() { _ = s.Down(context.Background()) })
-	for k, v := range s.EnvForAgent() {
-		t.Setenv(k, v)
-	}
+	s := sink.UpForTest(t, "gcs-fake")
 	u, err := url.Parse(s.URL())
 	if err != nil {
 		t.Fatalf("parse sink URL %s: %v", s.URL(), err)

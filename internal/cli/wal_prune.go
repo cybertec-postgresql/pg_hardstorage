@@ -86,6 +86,9 @@ treated as segments.`,
 
 func runWalPrune(cmd *cobra.Command, deployment, repoURL string, apply bool, keepSince, tombstoneGrace time.Duration) error {
 	d := DispatcherFrom(cmd)
+	if err := validateWALDeployment("wal prune", deployment); err != nil {
+		return err
+	}
 	if keepSince < 0 {
 		return output.NewError("usage.bad_flag",
 			fmt.Sprintf("wal prune: --keep-since must be >= 0; got %v", keepSince)).Wrap(output.ErrUsage)

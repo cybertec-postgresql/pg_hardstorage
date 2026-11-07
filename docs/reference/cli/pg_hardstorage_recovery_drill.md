@@ -39,9 +39,13 @@ Verify control:
                         the sandbox.  Returns Partial verdict with
                         the restore-only result.
 
-Output formats:
-  --format json     (default) — JSON body, the v1 contract.
-  --format markdown — forensics-grade GFM rendering.
+Output:
+  The global -o/--output picks the encoding, as on every command: text
+  on a terminal, JSON (the v1 contract) off one or with -o json.
+  --format only picks the layout of the text report:
+    --format json     (default) — compact summary.
+    --format markdown — forensics-grade GFM rendering; use it with
+                        -o text (e.g. --format markdown -o text > drill.md).
 
 The drill requires Docker on the operator host (for the sandbox).
 For Docker-free runs, pass --skip-verify; the report's RTO actual
@@ -56,7 +60,7 @@ pg_hardstorage recovery drill <deployment> [flags]
 ```
       --allow-skip-verify                accept a Partial verdict when pg_verifybackup skips
       --backup-id string                 explicit backup ID to drill against (default: latest)
-      --format string                    output format: json | markdown (default "json")
+      --format string                    layout of the report when the output is text: json (compact summary) | markdown (full GFM report). It does not select JSON: -o/--output does, and -o json always emits the v1 JSON body (default "json")
   -h, --help                             help for drill
       --image string                     override 'postgres:<major>' sandbox image (air-gapped)
       --keep                             keep the temporary target dir after the drill (for inspection)

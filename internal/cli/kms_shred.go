@@ -41,7 +41,7 @@ const KMSShredOp = approval.Op("kms.shred")
 // without an approved n-of-m request whose Op is `kms.shred` and
 // whose Target is the canonical keyring-directory path.
 //
-// Future+: KMS-provider plugins (AWS KMS, GCP KMS, Vault Transit)
+// Future: KMS-provider plugins (AWS KMS, GCP KMS, Vault Transit)
 // have their own shred semantics — they typically schedule
 // destruction with a cooldown window. The plugin abstraction will
 // route `kms shred --provider aws-kms ...` to the right backend;

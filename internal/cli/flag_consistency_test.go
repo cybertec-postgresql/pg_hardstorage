@@ -142,3 +142,51 @@ func TestPointInTimeSinceFlagsShareTheGrammar(t *testing.T) {
 	}
 	walkCommands(root, visit, "")
 }
+
+// TestMutatingCommandsFollowOneConfirmationRule pins the two invariants
+// stated at the top of docs/reference/cli/index.md (cmd/docsgen,
+// cliConventions), which lists the commands in each style from the tree:
+//
+//   - --apply means the bare command is a dry run, so a command with
+//     --apply never also has --dry-run, and its help says it performs
+//     the change.
+//   - --dry-run means the bare command acts (or asks for --yes).
+//
+// The tree has both styles and that is not unified here — renaming the
+// flags would break every script that uses them. What is ruled out is a
+// command carrying both: two spellings of "preview" with opposite
+// defaults.
+func TestMutatingCommandsFollowOneConfirmationRule(t *testing.T) {
+	root := cli.NewRoot()
+	applies, dryRuns := 0, 0
+	visit := func(c *cobra.Command, _ string) {
+		apply, dry := c.LocalFlags().Lookup("apply"), c.LocalFlags().Lookup("dry-run")
+		if apply != nil && dry != nil {
+			t.Errorf("%s carries both --apply and --dry-run; pick one: --apply for a sweep that "+
+				"previews by default, --dry-run for a command that acts by default", c.CommandPath())
+		}
+		for _, f := range []*pflag.Flag{apply, dry} {
+			if f == nil {
+				continue
+			}
+			if f.Value.Type() != "bool" || f.DefValue != "false" {
+				t.Errorf("%s --%s must be a bool defaulting to false (got %s, default %q)",
+					c.CommandPath(), f.Name, f.Value.Type(), f.DefValue)
+			}
+		}
+		if apply != nil {
+			applies++
+			if !strings.Contains(apply.Usage, "actually") {
+				t.Errorf("%s --apply help must say it performs the change (\"actually ...\"), "+
+					"since the bare command only previews: %q", c.CommandPath(), apply.Usage)
+			}
+		}
+		if dry != nil {
+			dryRuns++
+		}
+	}
+	walkCommands(root, visit, "")
+	if applies < 5 || dryRuns < 5 {
+		t.Fatalf("found %d --apply and %d --dry-run flags — the tree walk is broken, not the flags", applies, dryRuns)
+	}
+}

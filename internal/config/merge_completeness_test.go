@@ -41,7 +41,7 @@ func TestMergeDeployment_CarriesEveryField(t *testing.T) {
 			SkipVerify:           true,
 			TempBase:             "/var/tmp/over",
 		},
-		Retention:      RetentionConfig{Policy: "gfs", KeepDaily: 9, KeepWeekly: 8, KeepMonthly: 60, KeepYearly: 20, KeepFor: "720h", KeepFulls: 7},
+		Retention:      RetentionConfig{Policy: "gfs", KeepDaily: Keep(9), KeepWeekly: Keep(8), KeepMonthly: Keep(60), KeepYearly: Keep(20), KeepFor: "720h", KeepFulls: Keep(7)},
 		Classification: "restricted",
 		Residency:      []string{"eu"},
 		SLO:            SLOConfig{RPOSeconds: 3600, RTOSeconds: 7200},
@@ -83,28 +83,37 @@ func TestMergeDeployment_CarriesEveryField(t *testing.T) {
 // TestMergeDeployment_PartialRetentionPreservesBaseDimensions: a
 // conf.d drop-in that overrides ONE retention dimension must keep the
 // base's other dimensions. Under the old wholesale replace they were
-// zeroed, and the agent's defaultIfZero then silently reverted them to
+// zeroed, and the agent then silently reverted them to
 // hardcoded defaults — a base keep_daily:30 became 7, pruning dailies
 // 8-30 early. Field-by-field merge (matching the Drill block) fixes it.
 func TestMergeDeployment_PartialRetentionPreservesBaseDimensions(t *testing.T) {
 	base := DeploymentConfig{
 		Retention: RetentionConfig{
-			Policy: "gfs", KeepDaily: 30, KeepWeekly: 8, KeepMonthly: 12, KeepYearly: 5,
+			Policy: "gfs", KeepDaily: Keep(30), KeepWeekly: Keep(8), KeepMonthly: Keep(12), KeepYearly: Keep(5),
 		},
 		TDE: TDEConfig{Enabled: true, Engine: "pg_tde", KeyRef: "k1"},
 		SLO: SLOConfig{RPOSeconds: 300, RTOSeconds: 3600},
 	}
 	// Drop-in overrides ONLY keep_monthly, TDE KeyRef, and RPO.
 	overlay := DeploymentConfig{
-		Retention: RetentionConfig{KeepMonthly: 60},
+		Retention: RetentionConfig{KeepMonthly: Keep(60)},
 		TDE:       TDEConfig{KeyRef: "k2"},
 		SLO:       SLOConfig{RPOSeconds: 120},
 	}
 	got := mergeDeployment(base, overlay)
 
-	want := RetentionConfig{Policy: "gfs", KeepDaily: 30, KeepWeekly: 8, KeepMonthly: 60, KeepYearly: 5}
-	if got.Retention != want {
+	want := RetentionConfig{Policy: "gfs", KeepDaily: Keep(30), KeepWeekly: Keep(8), KeepMonthly: Keep(60), KeepYearly: Keep(5)}
+	if !got.Retention.Equal(want) {
 		t.Errorf("retention: partial override lost base dimensions\n got: %+v\nwant: %+v", got.Retention, want)
+	}
+	// An overlay's explicit 0 is an override, not "inherit": it switches
+	// the bucket off, and the base value must not shine through.
+	zero := mergeDeployment(base, DeploymentConfig{Retention: RetentionConfig{KeepWeekly: Keep(0)}})
+	if w := zero.Retention.KeepWeekly; w == nil || *w != 0 {
+		t.Errorf("retention: overlay keep_weekly: 0 did not override the base 8: %v", w)
+	}
+	if base.Retention.KeepWeekly == nil || *base.Retention.KeepWeekly != 8 {
+		t.Errorf("retention: merge wrote through to the base config")
 	}
 	if got.TDE != (TDEConfig{Enabled: true, Engine: "pg_tde", KeyRef: "k2"}) {
 		t.Errorf("TDE: partial override lost base fields: %+v", got.TDE)

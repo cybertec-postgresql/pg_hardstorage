@@ -106,9 +106,29 @@ type Options struct {
 	// InactivityTimeout overrides streaming.Reader's default. Zero
 	// uses the package default (90 s).
 	InactivityTimeout time.Duration
+
+	// StartTimeout bounds the silence before the start LSN arrives.
+	// PG sends nothing while it runs the start checkpoint (and, for an
+	// incremental backup, while it waits for the WAL summarizer); with
+	// many dirty buffers on a busy disk that takes minutes, far past
+	// InactivityTimeout. Zero uses the package default (30 min); it is
+	// never shorter than InactivityTimeout.
+	StartTimeout time.Duration
 }
 
-const defaultInactivityTimeout = 90 * time.Second
+const (
+	defaultInactivityTimeout = 90 * time.Second
+	defaultStartTimeout      = 30 * time.Minute
+)
+
+// startWindow is the inactivity window until the start LSN arrives.
+func startWindow(opts Options) time.Duration {
+	w := opts.StartTimeout
+	if w == 0 {
+		w = defaultStartTimeout
+	}
+	return max(w, opts.InactivityTimeout)
+}
 
 // Sink receives the streaming output of a BASE_BACKUP run.
 //
@@ -241,6 +261,7 @@ func run(ctx context.Context, c *pg.Conn, opts Options, sink Sink, aw *archiveWa
 	if timeout == 0 {
 		timeout = defaultInactivityTimeout
 	}
+	opts.InactivityTimeout = timeout // drive switches between this and startWindow
 	var reader *streaming.Reader
 	reader, err := streaming.New(ctx, c.PgConn(), streaming.Options{
 		InactivityTimeout: timeout,
@@ -302,10 +323,23 @@ func run(ctx context.Context, c *pg.Conn, opts Options, sink Sink, aw *archiveWa
 // drive runs the BASE_BACKUP protocol state machine over reader.
 // Documented states map directly to the wire-format phases above.
 func drive(ctx context.Context, reader *streaming.Reader, opts Options, sink Sink, res *Result) error {
-	// Phase 1: start LSN result set.
+	// Phase 1: start LSN result set. Silent until PG's start checkpoint
+	// is done, so it gets its own, longer window. A disabled (negative)
+	// or unset window is left alone.
+	base := opts.InactivityTimeout
+	if base > 0 {
+		reader.SetInactivityTimeout(startWindow(opts))
+	}
 	startLSN, startTLI, err := readLSNResult(ctx, reader, "start LSN")
 	if err != nil {
+		if base > 0 && errors.Is(err, streaming.ErrInactivityTimeout) {
+			return fmt.Errorf("basebackup: PostgreSQL did not finish the start checkpoint within %s; "+
+				"check the server log and disk I/O: %w", startWindow(opts), err)
+		}
 		return err
+	}
+	if base > 0 {
+		reader.SetInactivityTimeout(base)
 	}
 	res.StartLSN = startLSN
 	res.StartTimeline = startTLI

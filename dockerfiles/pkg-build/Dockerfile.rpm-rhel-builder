@@ -25,7 +25,7 @@ RUN dnf -y install --allowerasing \
         which procps-ng \
  && dnf clean all
 
-ARG GO_VERSION=1.26.0
+ARG GO_VERSION=1.26.10
 RUN arch="$(uname -m)" \
  && case "$arch" in \
         x86_64)  gotar="go${GO_VERSION}.linux-amd64.tar.gz"  ;; \

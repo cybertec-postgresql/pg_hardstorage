@@ -132,8 +132,8 @@ func TestPgbackrestTranslateOutputLoads(t *testing.T) {
 
 	// retention-full=4 must arrive as keep_fulls, not be silently
 	// dropped into the loader's default of 14.
-	if got := loaded.Config.Deployments["db1"].Retention.KeepFulls; got != 4 {
-		t.Errorf("retention-full=4 → keep_fulls: got %d, want 4", got)
+	if got := loaded.Config.Deployments["db1"].Retention.KeepFulls; got == nil || *got != 4 {
+		t.Errorf("retention-full=4 → keep_fulls: got %v, want 4", got)
 	}
 	if got := loaded.Config.Deployments["db1"].Retention.Policy; got != "count" {
 		t.Errorf("retention policy: got %q, want %q", got, "count")

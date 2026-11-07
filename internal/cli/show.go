@@ -87,15 +87,15 @@ when triaging undelete candidates discovered via
 func runShow(cmd *cobra.Command, deployment, backupID, repoURL string, includeDeleted bool) error {
 	d := DispatcherFrom(cmd)
 
-	verifier, err := loadVerifier()
-	if err != nil {
-		return err
-	}
 	_, sp, err := openRepo(cmd.Context(), repoURL)
 	if err != nil {
 		return err
 	}
 	defer sp.Close()
+	verifier, err := loadVerifier()
+	if err != nil {
+		return err
+	}
 
 	// `latest` resolves to the newest live backup, as restore and verify
 	// do — the tutorials (and this command's own usage error) promised it,
@@ -181,7 +181,7 @@ func runShow(cmd *cobra.Command, deployment, backupID, repoURL string, includeDe
 // showBody embeds the full Manifest plus computed aggregates the
 // caller is likely to want at a glance. Tombstoned + DeletedAt +
 // DeleteReason + DeletePolicy are all omitempty so the default
-// `show` body shape stays byte-identical to+; only
+// `show` body shape stays byte-identical to earlier releases; only
 // `--include-deleted` populates them. Schema-additive — 24-month
 // JSON-compat commitment holds.
 type showBody struct {

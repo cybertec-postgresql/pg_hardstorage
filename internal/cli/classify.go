@@ -69,7 +69,7 @@ func validClassification(level string) bool {
 // What's deliberately NOT here for v0.1's pull-forward:
 //
 //   - Enforcement (per-class retention floor, allowed-region check,
-//     required-encryption gate) — the SPEC's+ work; today's
+//     required-encryption gate) — the SPEC's later work; today's
 //     classify is a tag the operator + future enforcement read.
 //   - Per-tenant default (a `tenant: prod, default-class: confidential`
 //     config block); add when a multi-tenant SaaS user shows up.

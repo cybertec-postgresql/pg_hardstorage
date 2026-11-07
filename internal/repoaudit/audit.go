@@ -135,6 +135,11 @@ type DeploymentAudit struct {
 	// holding chunk references (waiting for `repo gc` to reap).
 	Tombstoned int `json:"tombstoned"`
 
+	// WALSegments is the count of archived WAL segment manifests. A
+	// deployment that has WAL but no backup yet is listed with
+	// Active == 0.
+	WALSegments int `json:"wal_segments,omitempty"`
+
 	// Held is the count of currently-active hold markers
 	// (indefinite or with future ExpiresAt). Expired holds aren't
 	// counted — they're protecting nothing.
@@ -329,6 +334,23 @@ func Audit(ctx context.Context, sp storage.StoragePlugin, meta *repo.Metadata, r
 		finish()
 		return rep, fmt.Errorf("repoaudit: enumerate deployments: %w", err)
 	}
+	// A deployment that only archives or streams WAL has no manifest and
+	// is absent from store.Deployments; it is still a deployment this
+	// repository holds data for, and the audit must say so.
+	walSegments, err := backup.WALSegmentCounts(ctx, sp)
+	if err != nil {
+		finish()
+		return rep, fmt.Errorf("repoaudit: enumerate WAL deployments: %w", err)
+	}
+	withBackups := make(map[string]bool, len(allDeployments))
+	for _, d := range allDeployments {
+		withBackups[d] = true
+	}
+	for d := range walSegments {
+		if !withBackups[d] {
+			allDeployments = append(allDeployments, d)
+		}
+	}
 	sort.Strings(allDeployments)
 
 	// Pre-load fleet-wide hold + replica-key indexes once so we don't
@@ -360,7 +382,7 @@ func Audit(ctx context.Context, sp storage.StoragePlugin, meta *repo.Metadata, r
 			finish()
 			return rep, err
 		}
-		da := DeploymentAudit{Name: deployment}
+		da := DeploymentAudit{Name: deployment, WALSegments: walSegments[deployment]}
 		latest := newLatestTracker()
 		// Track sets per-deployment; the nilable entry types let us
 		// skip an empty set gracefully in the JSON output (omitempty).

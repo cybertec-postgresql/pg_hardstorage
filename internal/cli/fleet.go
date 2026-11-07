@@ -106,6 +106,12 @@ func runFleetSearch(cmd *cobra.Command, opts fleetSearchOptions) error {
 			fmt.Sprintf("fleet search: %v", err)).Wrap(output.ErrUsage)
 	}
 
+	_, sp, err := openRepo(cmd.Context(), opts.repoURL)
+	if err != nil {
+		return err
+	}
+	defer sp.Close()
+
 	// Every committed manifest is signed; without the operator's
 	// verifier each one fails verification and the search answers
 	// "0 hits" on a populated repository. Same keyring `list` uses.
@@ -113,12 +119,6 @@ func runFleetSearch(cmd *cobra.Command, opts fleetSearchOptions) error {
 	if err != nil {
 		return err
 	}
-
-	_, sp, err := openRepo(cmd.Context(), opts.repoURL)
-	if err != nil {
-		return err
-	}
-	defer sp.Close()
 
 	res, err := search.Search(cmd.Context(), sp, q, search.SearchOptions{
 		Limit:    opts.limit,

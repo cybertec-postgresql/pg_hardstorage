@@ -90,8 +90,8 @@ func PushSegmentFile(ctx context.Context, cas *repo.CAS, sp storage.StoragePlugi
 	if sp == nil {
 		return nil, errors.New("walsink: nil StoragePlugin")
 	}
-	if opts.Deployment == "" {
-		return nil, errors.New("walsink: empty deployment")
+	if err := ValidateDeployment(opts.Deployment); err != nil {
+		return nil, err
 	}
 	if opts.SystemIdentifier == "" {
 		return nil, errors.New("walsink: empty SystemIdentifier")
@@ -414,8 +414,8 @@ func PushAuxiliaryFile(ctx context.Context, sp storage.StoragePlugin, path strin
 	if sp == nil {
 		return "", AuxiliaryNone, errors.New("walsink: nil StoragePlugin")
 	}
-	if opts.Deployment == "" {
-		return "", AuxiliaryNone, errors.New("walsink: empty deployment")
+	if err := ValidateDeployment(opts.Deployment); err != nil {
+		return "", AuxiliaryNone, err
 	}
 	base := filepath.Base(path)
 	kind := ClassifyArchiveInput(base)
@@ -456,6 +456,60 @@ func PushAuxiliaryFile(ctx context.Context, sp storage.StoragePlugin, path strin
 	return key, kind, nil
 }
 
+// The split-brain refusal codes. They are a documented contract
+// (docs/reference/error-codes.md, `splitbrain.*`): automation routes on
+// them, and runbook R7 is keyed to them.
+const (
+	// SplitBrainSystemIdentifierMismatch: another cluster already
+	// archived this segment number (a cloned datadir).
+	SplitBrainSystemIdentifierMismatch = "splitbrain.system_identifier_mismatch"
+	// SplitBrainContentMismatch: the same cluster, different bytes.
+	SplitBrainContentMismatch = "splitbrain.content_mismatch"
+	// SplitBrainReadFailed: something is already archived under the name
+	// and could not be read to compare; refused on doubt.
+	SplitBrainReadFailed = "splitbrain.read_failed"
+)
+
+// SplitBrainError is the refusal to archive WAL over an existing,
+// different (or unverifiable) object of the same name.
+//
+// Code is the structured error code. It is a field, found with
+// errors.As, because it used to exist only as the message's prefix: the
+// CLI recovered it by running a regular expression over err.Error(), so
+// rewording the message — or wrapping it in something that happened to
+// contain "splitbrain." — changed or invented the code automation sees.
+type SplitBrainError struct {
+	Code string
+	// Err is the detail, and wraps the cause when there is one (a
+	// storage error, for read_failed).
+	Err error
+}
+
+// Error keeps the "<code>: <detail>" text the refusal has always had.
+func (e *SplitBrainError) Error() string {
+	if e.Err == nil {
+		return e.Code
+	}
+	return e.Code + ": " + e.Err.Error()
+}
+
+// Unwrap exposes the detail and, through it, the underlying cause.
+func (e *SplitBrainError) Unwrap() error { return e.Err }
+
+// SplitBrainCode returns the splitbrain.* code of the refusal in err's
+// chain, or "" when err is not one.
+func SplitBrainCode(err error) string {
+	var sb *SplitBrainError
+	if errors.As(err, &sb) {
+		return sb.Code
+	}
+	return ""
+}
+
+func splitBrain(code, format string, args ...any) error {
+	return &SplitBrainError{Code: code, Err: fmt.Errorf(format, args...)}
+}
+
 // verifyExistingAuxiliaryFile reads the object already at key and
 // compares it byte-for-byte against body.  Returns nil iff they match
 // (true idempotent re-push); otherwise a structured error using the
@@ -465,17 +519,17 @@ func PushAuxiliaryFile(ctx context.Context, sp storage.StoragePlugin, path strin
 func verifyExistingAuxiliaryFile(ctx context.Context, sp storage.StoragePlugin, key string, body []byte) error {
 	rc, err := sp.Get(ctx, key)
 	if err != nil {
-		return fmt.Errorf("splitbrain.read_failed: existing auxiliary file %q present but unreadable: %w", key, err)
+		return splitBrain(SplitBrainReadFailed, "existing auxiliary file %q present but unreadable: %w", key, err)
 	}
 	defer rc.Close()
 	// An auxiliary file has its own documented ceiling; use it rather
 	// than the generic metadata cap.
 	existing, err := storage.ReadAllLimited(rc, MaxAuxiliaryFileSize)
 	if err != nil {
-		return fmt.Errorf("splitbrain.read_failed: read existing auxiliary file %q: %w", key, err)
+		return splitBrain(SplitBrainReadFailed, "read existing auxiliary file %q: %w", key, err)
 	}
 	if !bytes.Equal(existing, body) {
-		return fmt.Errorf("splitbrain.content_mismatch: auxiliary file %q already archived with different content (%d bytes on repo, %d bytes pushed); split-brain or external corruption",
+		return splitBrain(SplitBrainContentMismatch, "auxiliary file %q already archived with different content (%d bytes on repo, %d bytes pushed); split-brain or external corruption",
 			key, len(existing), len(body))
 	}
 	return nil
@@ -600,23 +654,23 @@ func commitManifestStandalone(ctx context.Context, sp storage.StoragePlugin, m *
 func verifyExistingManifest(ctx context.Context, sp storage.StoragePlugin, key string, m *SegmentManifest) error {
 	rc, err := sp.Get(ctx, key)
 	if err != nil {
-		return fmt.Errorf("splitbrain.read_failed: existing manifest %q present but unreadable: %w", key, err)
+		return splitBrain(SplitBrainReadFailed, "existing manifest %q present but unreadable: %w", key, err)
 	}
 	defer rc.Close()
 	body, err := storage.ReadAllLimited(rc, storage.MaxMetadataBytes)
 	if err != nil {
-		return fmt.Errorf("splitbrain.read_failed: read existing manifest %q: %w", key, err)
+		return splitBrain(SplitBrainReadFailed, "read existing manifest %q: %w", key, err)
 	}
 	existing, err := ParseSegmentManifest(body)
 	if err != nil {
-		return fmt.Errorf("splitbrain.read_failed: parse existing manifest %q: %w", key, err)
+		return splitBrain(SplitBrainReadFailed, "parse existing manifest %q: %w", key, err)
 	}
 	if existing.SystemIdentifier != m.SystemIdentifier {
-		return fmt.Errorf("splitbrain.system_identifier_mismatch: segment %s already archived by cluster %s; refusing to archive from cluster %s (cloned datadir without pg_resetwal?)",
+		return splitBrain(SplitBrainSystemIdentifierMismatch, "segment %s already archived by cluster %s; refusing to archive from cluster %s (cloned datadir without pg_resetwal?)",
 			m.SegmentName, existing.SystemIdentifier, m.SystemIdentifier)
 	}
 	if !ChunkRefsEqual(existing.Chunks, m.Chunks) {
-		return fmt.Errorf("splitbrain.content_mismatch: segment %s already archived with different content (existing manifest has %d chunks, this push has %d); split-brain or external corruption",
+		return splitBrain(SplitBrainContentMismatch, "segment %s already archived with different content (existing manifest has %d chunks, this push has %d); split-brain or external corruption",
 			m.SegmentName, len(existing.Chunks), len(m.Chunks))
 	}
 	// True idempotent re-push: every identifying field

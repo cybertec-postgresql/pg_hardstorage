@@ -64,6 +64,7 @@ pg_hardstorage wal stream <deployment> [flags]
       --slot string                      replication slot name (default: pg_hardstorage_<deployment>)
       --start-lsn string                 explicit start LSN (e.g. 0/3000000); overrides resume-from-repo logic
       --status-interval duration         how often to send Standby Status Updates to PostgreSQL (default 10s)
+      --upload-concurrency int           chunk uploads kept in flight (1..64; default 16). Uploads wait on storage round trips, not CPU, so a high-latency object store benefits from more; 1 is serial
   -v, --verbose                          emit one wal.stream.progress event per --status-interval covering the segment just committed, the partial PG is currently writing, and the interval throughput.  Off by default (the streamer's existing output is a single starting event + the eventual stopped event); set this for an interactive view of a long-running stream.  Suppressed under --output json — JSON consumers should read the structured stream's other events instead.
 ```
 

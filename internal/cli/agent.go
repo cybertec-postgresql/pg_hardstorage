@@ -811,15 +811,32 @@ func buildRotateTask(name string, dep config.DeploymentConfig, verifier *backup.
 // buildRetentionPolicy translates the YAML retention block to a
 // concrete retention.Policy. Defaults to GFS with the spec's standard
 // numbers (7/4/12/5) when the operator doesn't set anything.
+//
+// A count the operator did not write takes its default; one they wrote
+// is used as written, including 0 (keep nothing in that bucket), which
+// is what `rotate --keep-daily 0` means on the flag path. A negative
+// count is refused, as buildPolicy refuses it for flags.
 func buildRetentionPolicy(c config.RetentionConfig) (retention.Policy, error) {
+	for _, k := range []struct {
+		name string
+		v    *int
+	}{
+		{"keep_daily", c.KeepDaily}, {"keep_weekly", c.KeepWeekly},
+		{"keep_monthly", c.KeepMonthly}, {"keep_yearly", c.KeepYearly},
+		{"keep_fulls", c.KeepFulls},
+	} {
+		if k.v != nil && *k.v < 0 {
+			return nil, fmt.Errorf("retention.%s %d: must be >= 0", k.name, *k.v)
+		}
+	}
 	policy := strings.ToLower(c.Policy)
 	switch policy {
 	case "", "gfs":
 		return retention.GFSPolicy{
-			KeepDaily:   defaultIfZero(c.KeepDaily, 7),
-			KeepWeekly:  defaultIfZero(c.KeepWeekly, 4),
-			KeepMonthly: defaultIfZero(c.KeepMonthly, 12),
-			KeepYearly:  defaultIfZero(c.KeepYearly, 5),
+			KeepDaily:   keepOrDefault(c.KeepDaily, 7),
+			KeepWeekly:  keepOrDefault(c.KeepWeekly, 4),
+			KeepMonthly: keepOrDefault(c.KeepMonthly, 12),
+			KeepYearly:  keepOrDefault(c.KeepYearly, 5),
 		}, nil
 	case "simple":
 		dur := 30 * 24 * time.Hour
@@ -835,16 +852,18 @@ func buildRetentionPolicy(c config.RetentionConfig) (retention.Policy, error) {
 		}
 		return retention.SimplePolicy{KeepFor: dur}, nil
 	case "count":
-		return retention.CountPolicy{KeepFulls: defaultIfZero(c.KeepFulls, 14)}, nil
+		return retention.CountPolicy{KeepFulls: keepOrDefault(c.KeepFulls, 14)}, nil
 	}
 	return nil, fmt.Errorf("retention.policy %q (allowed: gfs, simple, count)", policy)
 }
 
-func defaultIfZero(v, def int) int {
-	if v == 0 {
+// keepOrDefault returns the configured count, or def when the operator
+// left it unset. An explicit 0 is a value, not "unset".
+func keepOrDefault(v *int, def int) int {
+	if v == nil {
 		return def
 	}
-	return v
+	return *v
 }
 
 // buildDryRunBody renders the engine's task list for the --dry-run path.
@@ -858,7 +877,7 @@ type dryRunBody struct {
 // configuration for the --dry-run report. Operators verifying
 // their config see exactly what will get spawned at start.
 //
-// Slot mode reflects the+ Mechanism 2/3 split:
+// Slot mode reflects the Mechanism 2/3 split:
 //   - Slots is set with a single entry → single-slot Mechanism 2
 //   - Slots has 2+ entries → multi-slot Mechanism 3 (dual-slot
 //     etc.) with each role visible

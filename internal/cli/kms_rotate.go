@@ -19,7 +19,7 @@ import (
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo"
 )
 
-// newKMSRotateCmd implements `pg_hardstorage kms rotate` (the+
+// newKMSRotateCmd implements `pg_hardstorage kms rotate` (the
 // real implementation, replacing the v0.1.1 deferred stub).
 //
 // The plan calls this out: "KEK rotation. `pg_hardstorage kms
@@ -162,6 +162,12 @@ func runKMSRotate(cmd *cobra.Command, f kmsRotateFlags) error {
 			fmt.Sprintf("kms rotate: --new-kek-file: %v", err)).Wrap(output.ErrUsage)
 	}
 
+	repoMeta, sp, err := openRepo(cmd.Context(), f.repoURL)
+	if err != nil {
+		return err
+	}
+	defer sp.Close()
+
 	// Load the operator's signing keypair from the canonical
 	// keyring so we can re-sign rotated manifests. The signing key
 	// is unchanged across KEK rotation — only the encryption layer
@@ -172,12 +178,6 @@ func runKMSRotate(cmd *cobra.Command, f kmsRotateFlags) error {
 	if err != nil {
 		return err
 	}
-
-	repoMeta, sp, err := openRepo(cmd.Context(), f.repoURL)
-	if err != nil {
-		return err
-	}
-	defer sp.Close()
 
 	if f.apply {
 		if err := assertRepoWritable(cmd.Context(), sp, "kms rotate --apply"); err != nil {

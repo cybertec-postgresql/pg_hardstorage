@@ -17,18 +17,18 @@
 //
 // Skip behaviour
 // --------------
-// When Docker isn't available (no daemon, no `docker` on
-// PATH) the test SKIPS rather than fails — the contract is
-// still defined, just not exercised in this environment.
-// CI that requires the gate sets `PG_HARDSTORAGE_DEMAND_DOCKER=1`
-// to flip the skip into a fatal.
+// sink.UpForTest decides: the suite SKIPS under `go test -short` and
+// when Docker isn't available (no daemon, no `docker` on PATH) — the
+// contract is still defined, just not exercised in this environment.
+// CI that requires the gate sets `PG_HARDSTORAGE_DEMAND_DOCKER=1`,
+// which runs it under -short too and turns a missing daemon into a
+// failure. Container start is bounded, and a sink that keeps failing
+// to start fails the remaining sub-cases at once.
 package s3_test
 
 import (
 	"context"
 	"net/url"
-	"os"
-	"os/exec"
 	"testing"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
@@ -36,31 +36,6 @@ import (
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage/s3"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/testkit/sink"
 )
-
-// requireDocker skips the calling test when Docker isn't
-// reachable.  Honours PG_HARDSTORAGE_DEMAND_DOCKER=1 to
-// flip the skip into a fatal — CI environments that
-// promise Docker availability set the env var so an
-// unexpectedly-skipped suite fails the build.
-func requireDocker(t *testing.T) {
-	t.Helper()
-	if _, err := exec.LookPath("docker"); err != nil {
-		if os.Getenv("PG_HARDSTORAGE_DEMAND_DOCKER") == "1" {
-			t.Fatalf("docker not on PATH but PG_HARDSTORAGE_DEMAND_DOCKER=1: %v", err)
-		}
-		t.Skip("docker not on PATH; skipping S3-via-MinIO contract suite")
-	}
-	// `docker info` is the canonical reachability probe;
-	// passing means the daemon answered, failing means
-	// either the daemon is down or the user lacks the
-	// docker socket permission.
-	if err := exec.Command("docker", "info").Run(); err != nil {
-		if os.Getenv("PG_HARDSTORAGE_DEMAND_DOCKER") == "1" {
-			t.Fatalf("docker daemon not reachable but PG_HARDSTORAGE_DEMAND_DOCKER=1: %v", err)
-		}
-		t.Skip("docker daemon not reachable; skipping")
-	}
-}
 
 // openS3OnFreshMinIO is the PluginOpener the contract
 // harness consumes.  Each call brings up a fresh MinIO
@@ -71,25 +46,7 @@ func requireDocker(t *testing.T) {
 // scoped to this sub-test and reverts automatically.
 func openS3OnFreshMinIO(t *testing.T) storage.StoragePlugin {
 	t.Helper()
-	requireDocker(t)
-
-	s, err := sink.New("s3-minio")
-	if err != nil {
-		t.Fatalf("sink.New(s3-minio): %v", err)
-	}
-	if err := s.Up(context.Background()); err != nil {
-		t.Fatalf("sink.Up: %v", err)
-	}
-	t.Cleanup(func() {
-		_ = s.Down(context.Background())
-	})
-
-	// AWS SDK's default credential chain reads these env
-	// vars first; t.Setenv scopes them to this sub-test
-	// and Go reverts automatically at sub-test exit.
-	for k, v := range s.EnvForAgent() {
-		t.Setenv(k, v)
-	}
+	s := sink.UpForTest(t, "s3-minio")
 
 	u, err := url.Parse(s.URL())
 	if err != nil {

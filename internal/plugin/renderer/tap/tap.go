@@ -350,7 +350,6 @@ func writeYAMLField(w io.Writer, indent, key string, v any) {
 					prefix := indent + "  "
 					if first {
 						fmt.Fprintf(w, "%s- ", indent)
-						prefix = indent + "  "
 						writeYAMLFieldSameLine(w, prefix, k, sub[k])
 						first = false
 					} else {
@@ -460,8 +459,6 @@ func boolField(m map[string]any, key string) *bool {
 	}
 	return &b
 }
-
-func truePtr(b bool) *bool { return &b }
 
 func strField(m map[string]any, key string) string {
 	v, ok := m[key]

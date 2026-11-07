@@ -229,13 +229,13 @@ func pushProbe(ctx context.Context, cas *repo.CAS, sp storage.StoragePlugin, pat
 }
 
 // isSplitBrainRefusal reports whether err is the expected refusal.
-// Matching on the code prefix rather than the whole message keeps the
+// Matching on the structured code rather than the message keeps the
 // drill from breaking when the wording changes, while still failing if
 // the CLASS of refusal changes — a content mismatch reported as a
 // system-identifier mismatch would send the operator hunting a cloned
 // datadir that does not exist.
 func isSplitBrainRefusal(err error, leaf string) bool {
-	return err != nil && strings.Contains(err.Error(), "splitbrain."+leaf)
+	return walsink.SplitBrainCode(err) == "splitbrain."+leaf
 }
 
 // cleanUpSplitBrainProbe removes every OBJECT the drill wrote.

@@ -34,6 +34,7 @@ import (
 	"testing"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/output"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/pg/walsink"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
 )
 
@@ -57,8 +58,12 @@ func TestIsPermanentStreamError_StopsOnUnfixableFailures(t *testing.T) {
 			// Two clusters archiving into one lineage. Retrying cannot
 			// resolve it, and each attempt risks interleaving more
 			// foreign WAL.
-			err: fmt.Errorf("splitbrain.system_identifier_mismatch: segment X already " +
-				"archived by cluster 123"),
+			// As it reaches the streamer: the sink's typed refusal,
+			// wrapped by the replication loop.
+			err: fmt.Errorf("replication: sink.OnRecord: %w", &walsink.SplitBrainError{
+				Code: walsink.SplitBrainSystemIdentifierMismatch,
+				Err:  errors.New("segment X already archived by cluster 123"),
+			}),
 			want: true,
 		},
 		{

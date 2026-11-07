@@ -25,7 +25,7 @@ permissions:
   contents: read
 
 env:
-  GO_VERSION: "1.26.5"
+  GO_VERSION: "1.26.10"
 
 jobs:
   vet:
@@ -649,7 +649,7 @@ jobs:
           #   the targeted Go version (1.26)
           #
           # install-mode: goinstall rebuilds golangci-lint from
-          # source using the actions/setup-go Go (1.26.3 above), so
+          # source using the actions/setup-go Go (GO_VERSION), so
           # the binary the runner uses tracks our toolchain
           # automatically.  Picks up future Go bumps for free.
           install-mode: goinstall

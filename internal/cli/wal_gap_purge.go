@@ -99,6 +99,9 @@ events.
 
 func runWalGapPurge(cmd *cobra.Command, deployment, repoURL string, orphans, all, dryRun, yes bool) error {
 	d := DispatcherFrom(cmd)
+	if err := validateWALDeployment("wal gap-purge", deployment); err != nil {
+		return err
+	}
 	if orphans == all {
 		return output.NewError("usage.bad_flag",
 			"wal gap-purge: exactly one of --orphans / --all must be set").

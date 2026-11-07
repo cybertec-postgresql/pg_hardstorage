@@ -11,6 +11,291 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ## [Unreleased]
 
+### Security
+
+- **Built with Go 1.26.10 and `golang.org/x/net` v0.62.0.** The previous
+  toolchain (1.26.6) left 12 standard-library vulnerabilities reachable
+  from our code: `net/http` and http2 (also in `x/net`), `crypto/tls`,
+  `crypto/x509` (GO-2026-6809), `html/template`, `mime/multipart`. The
+  release workflows were on Go 1.26.5, and the `.deb`/`.rpm` builder
+  images installed Go 1.26.0 with `GOTOOLCHAIN=local`, so packages did
+  not get the toolchain `go.mod` asked for; every pin is now 1.26.10.
+  `golang.org/x/crypto` moves to v0.58.0.
+
+- **`wal` commands accepted a deployment name that escaped the `wal/`
+  prefix.** The name was interpolated into storage keys unchecked, so
+  `wal push ../audit <segment>` wrote a segment manifest into the audit
+  tree (after which `audit verify-chain` reported the chain broken),
+  `../chunks` wrote into the chunk store, and `../x` and `a/../../x`
+  were two names for one namespace. Writes stayed inside the repository
+  root. Every `wal` subcommand, the WAL sinks and the logical sink now
+  refuse a name with a path separator or control character, or equal to
+  `.` / `..`, with `usage.bad_deployment` (exit 2) before anything
+  reaches storage — the rule `backup` and the HTTP API already applied.
+  Names that are a single key component are unaffected.
+- **Redacting a malformed connection string could panic.** `Redact`
+  located the secret keyword in a lower-cased copy and cut the original
+  at that offset; bytes that are not valid UTF-8 change length when
+  lower-cased, so the offset could lie past the end.
+
+### Fixed
+
+- **A restore survives a lossier link, and says so when it does not.**
+  A chunk body that breaks off mid-read is now fetched up to four more
+  times (five attempts, as a streamed manifest already had) instead of
+  two more. Judged per restore rather than per chunk, three attempts
+  were thin: at one broken body in a hundred a chunk still failed once
+  in a million reads, which a restore of a million chunks met more often
+  than not; validation against a proxy cutting 5 % of chunk bodies
+  failed 2 of 6 restores with three attempts and 0 of 6 with five. A
+  restore that fails in materialisation is reported as `restore.failed`
+  (the code the control-plane path already used) instead of `internal`.
+
+- **`repo init` and every later write work on an S3-compatible store that
+  rejects `If-None-Match: *`** (#98). Alibaba Cloud OSS answers a
+  conditional `PutObject` with `400 NotImplemented` instead of honouring
+  or ignoring the header, so nothing could be written. For an endpoint
+  that is not vouched for with `?conditional_put=native` the plugin now
+  takes that answer as the store's capability statement: it emulates
+  `IfNotExists` with a read before the write (`HeadObject`, then an
+  unconditional `PutObject` / `CompleteMultipartUpload` / `CopyObject`)
+  and sends the header to that endpoint no more. The capability was
+  already reported as `ConditionalPut=false` there, so the callers that
+  need a single winner were on their read-back paths all along; the
+  backup lease still has to be waived explicitly (`--allow-concurrent`
+  or `allow_unenforceable_lease`), and its refusal now names those
+  knobs instead of an internal field. A vouched endpoint that answers
+  `NotImplemented` fails with a message naming the parameter to drop
+  rather than being downgraded silently.
+
+- **A base backup no longer aborts on a chunk that is already locked
+  longer than it needs.** Adopting a deduplicated chunk extends its WORM
+  lock to the backup's deadline; S3 Object Lock refuses that request when
+  the existing lock runs later, which `wal stream` causes routinely (it
+  locks shared chunks under its moving deadline plus headroom while a
+  long base backup holds a fixed one). The refusal failed the whole
+  backup, after hours. The CAS now reads the lock back
+  (`storage.RetentionAware`, S3 `GetObjectRetention`) and adopts the
+  chunk when the existing lock covers the deadline in an equal or
+  stronger mode; otherwise it fails as before. The writer additionally
+  needs `s3:GetObjectRetention`; when that read is denied the error now
+  says so (#95, #96). The same refusal withheld manifests in `repo
+  replicate` when a chunk at the destination was already held longer;
+  it is accepted there too. Azure and GCS report existing locks as well
+  (`Locked` policies and GCS retention are refused like S3's).
+
+- **On Azure, re-locking a chunk in governance mode could shorten its
+  lock.** Azure replaces an `Unlocked` immutability policy with whatever
+  the next request asks for, earlier dates included, where S3 refuses.
+  A base backup that reused a chunk `wal stream` held longer moved the
+  chunk's deadline back to its own, before the WAL segment's. The
+  existing policy is now read first and left alone when it already
+  covers the requested deadline.
+
+- **An explicit `keep_daily: 0` (or `keep_weekly`, `keep_monthly`,
+  `keep_yearly`, `keep_fulls`) in a deployment's `retention` block was
+  replaced by the default.** The scheduled rotate then kept 7 dailies
+  (4 weeklies, 12 monthlies, 5 yearlies, 14 fulls) the config had
+  switched off, while `rotate --keep-daily 0` did what it said. A count
+  that is written is now used as written, 0 included, and a conf.d
+  overlay can set one to 0; a count that is absent still takes the
+  default or inherits the base value. **If a config carries a literal
+  `0` only as a placeholder, remove the key before upgrading** — it now
+  means "keep none in this bucket". Negative counts are refused.
+- **Config-editing commands destroyed the comments in
+  `pg_hardstorage.yaml`** (`deployment add`, sink / notify / schedule
+  edits, `init` on an existing file) while the file's own header said
+  hand edits were preserved. Edits are now merged into the existing
+  document: comments, key order, quoting and indentation of everything
+  the edit did not touch are kept, and the file keeps its permission
+  bits instead of being reset to 0600.
+- **`anomaly check -o json` shipped `"schema": ""`**; it now carries
+  `pg_hardstorage.anomaly.v1`.
+- **A damaged `HSREPO` was reported as an internal error** with a raw
+  JSON parse message. It is now `verify.repo_marker_corrupt` (exit 9)
+  on every command, with the repair in the suggestion.
+- **Read commands on a host with an empty keyring always answered
+  `notfound.signing_key`**, whatever was wrong with the repository.
+  The repository is now opened first, so a wrong URL is
+  `notfound.repo` and a damaged marker is `verify.repo_marker_corrupt`.
+- **`repo check` and `repo audit` reported a repository holding only
+  archived WAL as having no deployments.** Both now list every
+  deployment with a backup or archived WAL, with a `wal_segments`
+  count per deployment (and repository-wide in `repo check`).
+- **`wal fetch` reported a corrupt chunk as `wal.fetch.chunk_missing`.**
+  A chunk that is present but damaged is now `verify.checksum_mismatch`
+  (exit 9) and one that cannot be read or decrypted is
+  `wal.fetch.chunk_unreadable`; `chunk_missing` means the object is
+  absent.
+- **`splitbrain.*` codes were recovered from the error message with a
+  regular expression**, so rewording the message would have silently
+  turned them into `wal.push_failed`. The code is now a field of a
+  typed error.
+- **Operator-facing messages contained a stray `+`** ("carries the+
+  WAL-gap metadata", "pre-dates the+ PGBackupManifest field", …).
+- `spill.HashSet.Add` reported the all-zero key as already present once
+  the set had spilled to disk.
+- `TestSweep_CheckpointWindowCappedByFenceMaxWait` failed on fast hosts:
+  it expected a time cap to force one checkpoint per delete slice
+  without spending the time. The sweep was correct; the test now is.
+
+- **Backups failed with "inactivity timeout" when the server's start
+  checkpoint took longer than 90 s.** PostgreSQL sends nothing on the
+  BASE_BACKUP connection until the checkpoint finishes, so many dirty
+  buffers on a busy disk (seen: 103 s for an incremental backup) hit
+  the 90 s stream watchdog. The wait for the start LSN now has its own
+  30-minute window, and a timeout there names the start checkpoint;
+  once data flows the 90 s window applies again.
+
+- **`verify --full` failed on any backup with a non-default tablespace
+  when run on the database host.** Its scratch restore put tablespaces
+  at their recorded paths, so the restore refused with
+  `preflight.tablespace_not_empty`; on another host it wrote them there
+  and never removed them. The scratch restore, in the CLI and in agent
+  verify jobs, now keeps PGDATA and every tablespace under its temp
+  directory and mounts the tablespace directories into the sandbox.
+
+- **Backup and `wal stream` throughput was capped near 20 GB/h on
+  CPU-limited hosts (#90).** Upload concurrency was `min(GOMAXPROCS, 8)`,
+  and since Go 1.25 GOMAXPROCS follows the cgroup CPU limit, so a pod
+  limited to 500m–1 core kept two chunk uploads in flight while the CPU
+  sat idle: roughly 100 chunks/s against a remote object store. A chunk
+  write waits on the storage round trip, not on CPU, so both writers now
+  default to 16 uploads in flight regardless of core count. The new
+  `--upload-concurrency` flag on `backup` and `wal stream` (1..64) tunes
+  it.
+- **Backups uploaded small files one at a time (#90).** Each file
+  waited for its last chunk before the next tar entry was read, so the
+  thousands of one-chunk files in a typical PGDATA (small relations,
+  FSM/VM forks) cost one full storage round trip each. The upload pool
+  now spans file boundaries within a tablespace; manifest entries are
+  still emitted in tar order. A backup that fails or is cancelled during
+  the data transfer now waits for its in-flight uploads before closing
+  the repository. Before, an upload that landed late could panic the
+  process.
+- **The primary terminated `wal stream`'s walsender under load (#90).**
+  Status updates went out every 10 s, which is longer than CloudNativePG's
+  default `wal_sender_timeout` of 5 s. PostgreSQL's own reply-requested
+  keepalives sit behind unread WAL while the streamer is busy, so they
+  did not help. The walsender was killed every few minutes, the stream
+  fell behind, and `max_slot_wal_keep_size` could invalidate the slot.
+  `wal stream` now reads `wal_sender_timeout` from the walsender and caps
+  the status interval at a third of it (at least 100 ms).
+- **The first backup into a fresh `file://` repository spent most of
+  its time on directory fsyncs.** Every new chunk directory
+  (`chunks/sha256/aa/bb`, up to 65,536 of them) was fsynced along with
+  its parent as it was created. On ext4 those fsyncs serialise on the
+  journal: a 47 GB backup ran at 66 MB/s, against 115 MB/s with the
+  directories already in place. On
+  Linux the end-of-backup barrier already calls `syncfs`, which persists
+  new directory entries too, so deferred chunk writes now create their
+  directories without a per-directory fsync. Other platforms keep the
+  per-directory fsync.
+- **`verify --full` took minutes on many-file backups (#90).** It restores
+  into a throwaway directory before running `pg_verifybackup`, and that
+  restore wrote one file at a time and fsynced each one. On a 68k-file
+  backup it took 1,212 s; it now takes about 55 s. The scratch restore no
+  longer fsyncs, since nobody starts a cluster from it. The agent's
+  scheduled verify gets the same change.
+- **Restores write files in parallel (#90).** `restore` used to write one
+  file at a time, verifying and decompressing each file's chunks on a
+  single core and paying one fsync latency per file. Files are now
+  written on a pool of 16. Every file is still fsynced, and the resume
+  checkpoint records a file only after it is on disk. A 68k-file restore
+  went from 22 s to 10 s with fsync costs excluded; with fsync the
+  overlap matters far more.
+
+- **`restore` and `verify` read chunks one at a time (#97).** Against an
+  object store that is one round trip per chunk: 25-36 chunks/s on
+  azblob, 19-24 hours for a 2.5 TiB restore on a host whose CPU, disks
+  and network were idle, and the same rate for `verify --sample`. Both
+  now keep 16 chunk reads in flight (also within one file, so a restore
+  does not slow down once fewer than 16 files remain), delivered in
+  order; `partial restore` and `verify --existence-only` likewise. A new
+  `--fetch-concurrency` flag (1..64) on `restore` and `verify` tunes it.
+  The budget covers all files being written, and memory is one chunk
+  per read in flight.
+
+- **One dropped connection ended a restore (#97).** A restore streams the
+  manifest for as long as it runs, and a reset on that connection
+  (`manifest: parse: read tcp ...: connection reset by peer`, 69 minutes
+  in) failed the run. Streamed manifest reads now re-open the object at
+  the byte they had reached (a ranged request on S3, Azure and GCS) and
+  give up only after five attempts in a row without progress. A chunk
+  whose body breaks off mid-read is fetched again, up to four times.
+
+- **sftp and scp repositories kept empty directories after `repo gc`
+  (#89).** Only the fs backend pruned the chunk and manifest directories
+  a sweep had emptied; on sftp and scp a writer failed when its
+  directory vanished between its `mkdir` and its write, so pruning was
+  left out. Both writers now re-create a directory that a concurrent
+  prune removed (sftp retries the walk, the staging-file create and the
+  rename; scp runs `mkdir` and the write as one remote command in a
+  bounded loop, which also saves one SSH session per object), and both
+  backends prune like fs: empty directories only, deepest first, never
+  the repository root. The first `repo gc --apply` after upgrading
+  removes what earlier sweeps left. scp additionally needs `rmdir` on
+  the remote host.
+
+- **`audit export-bundle` held its whole window in memory (#87):** the
+  events, their NDJSON form and the canonical signing input, about twice
+  the window's size on the heap. Events now go through an external
+  sorter into one temp file that is memory-mapped for the Ed25519
+  signature and then streamed into the archive; heap use no longer grows
+  with the window (30,000 events: 36 MiB before, 2 MiB now). The bundle
+  format is unchanged, byte for byte: 1.6.0 verifies bundles written by
+  this release and the other way round. The export needs temp space of
+  about twice the uncompressed events under `$TMPDIR`; on Windows the
+  signing input is still held in RAM. `audit verify-bundle` still reads
+  a bundle into memory and refuses an `events.ndjson` over 1 GiB.
+
+- **`scp://` repositories failed under the new upload and read
+  concurrency.** Every remote command is an SSH session, and a stock
+  sshd allows 10 per connection (`MaxSessions`). With 16 chunk uploads
+  or reads in flight the server refused channels (`ssh: rejected:
+  connect failed ("open failed")`), and a refusal that outlasted the
+  0.3 s retry failed the backup or restore. The backend now keeps at
+  most 8 sessions open and queues the rest, and retries a refused open
+  for about four seconds. Found by the release validation
+  (`TestFaultSoak/scp`); `sftp://` is not affected, it uses one channel.
+
+- **A `file://` writer could fail with "no such file or directory" while
+  `repo gc` pruned empty directories on a busy disk.** A writer whose
+  directory was pruned re-created it durably (an fsync per new
+  component) before creating its file. While those fsyncs ran the
+  directory was still empty, and a prune still walking the tree could
+  remove it again, a hundred times in a row. The directory is now
+  re-created without syncing, the file or link is created at once, which
+  pins the directory, and the new directory entries are synced after
+  that. Found by the release validation at IO pressure above 50%; the
+  window existed since 1.6.0.
+
+### Changed
+
+- **S3 multipart uploads send up to 4 parts in parallel** instead of one
+  at a time, bounded by 256 MiB of part buffers (previously one 64 MiB
+  buffer). Objects over 64 MiB — the manifests of very large clusters —
+  were bound by parts × round trip.
+- `repo bundle import` takes its destination as `--repo`, mirroring
+  `repo bundle export --repo … --out …`. `--to` is still accepted.
+- `recovery drill --help` now says what `--format` does: it selects the
+  layout of the text report, never JSON (`-o json` does).
+- The CLI reference states the `--apply` / `--dry-run` rule, and a test
+  enforces that no command carries both.
+- The storage contract suites (S3, GCS, Azure, SFTP) are skipped under
+  `go test -short`, bound every emulator start to 3 minutes, and stop
+  waiting once a sink has failed to start twice in a row.
+  `PG_HARDSTORAGE_DEMAND_DOCKER=1` still forces them.
+- The audit-bundle size-limit tests run against scaled-down limits
+  instead of building a 4 GiB archive: 21 s became milliseconds, and
+  `go test -race ./internal/audit/` no longer runs into its deadline.
+- Removed unused code found by `staticcheck` / `unused` (about 40
+  functions, fields and dead assignments).
+- **The Homebrew cask no longer uses the deprecated `postflight`
+  block (#91).** The quarantine-attribute removal on macOS is declared
+  through goreleaser's `install_steps` (2.19 or later) and lands in the
+  cask as `postflight_steps`.
+
 ## [1.6.0] — 2026-10-27
 
 ### Fixed

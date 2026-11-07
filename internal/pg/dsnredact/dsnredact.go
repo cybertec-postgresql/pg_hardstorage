@@ -57,15 +57,41 @@ func Redact(dsn string) string {
 	b.WriteString(dsn[last:rest])
 	// Anything the tokenizer could not parse is redacted from the first
 	// secret keyword onward: a malformed string must not leak through.
+	// Every secret keyword contains "password", so its first occurrence
+	// is the earliest any of them can start.
 	tail := dsn[rest:]
-	low := strings.ToLower(tail)
-	for k := range secretDSNKeys {
-		if idx := strings.Index(low, k); idx >= 0 {
-			tail = tail[:idx] + redactedValue
-			break
-		}
+	if idx := indexFoldASCII(tail, "password"); idx >= 0 {
+		tail = tail[:idx] + redactedValue
 	}
 	return b.String() + tail
+}
+
+// indexFoldASCII returns the byte offset of the first ASCII
+// case-insensitive occurrence of sub (lower-case ASCII) in s, or -1.
+//
+// It compares bytes, so the offset is valid in s whatever else s holds.
+// strings.ToLower is not: it re-encodes invalid UTF-8 as U+FFFD and
+// changes the length of some runes, so an index into its result points
+// somewhere else in the original — past the end, for a malformed DSN,
+// which is exactly the input this path exists for.
+func indexFoldASCII(s, sub string) int {
+	for i := 0; i+len(sub) <= len(s); i++ {
+		j := 0
+		for j < len(sub) {
+			c := s[i+j]
+			if c >= 'A' && c <= 'Z' {
+				c += 'a' - 'A'
+			}
+			if c != sub[j] {
+				break
+			}
+			j++
+		}
+		if j == len(sub) {
+			return i
+		}
+	}
+	return -1
 }
 
 // SplitPassword removes the password from dsn and returns it

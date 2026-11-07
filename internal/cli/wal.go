@@ -10,7 +10,6 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -195,6 +194,9 @@ type walPushOptions struct {
 
 func runWalPush(cmd *cobra.Command, opts walPushOptions) error {
 	d := DispatcherFrom(cmd)
+	if err := validateWALDeployment("wal push", opts.deployment); err != nil {
+		return err
+	}
 	// Validate an explicit --system-identifier up front (before the
 	// repo round-trip): it is stamped verbatim onto the segment
 	// manifest and compared for equality against header-derived pushes
@@ -541,6 +543,9 @@ type walFetchOptions struct {
 // information.
 func runWalFetch(cmd *cobra.Command, opts walFetchOptions) error {
 	d := DispatcherFrom(cmd)
+	if err := validateWALDeployment("wal fetch", opts.deployment); err != nil {
+		return err
+	}
 
 	// Open repo. The same error mapping as `wal stream`.
 	_, sp, err := repo.Open(cmd.Context(), opts.repoURL)
@@ -1195,8 +1200,7 @@ func writeSegmentAtomically(ctx context.Context, cas *repo.CAS, m *walsink.Segme
 		if err != nil {
 			_ = f.Close()
 			cleanup()
-			return output.NewError("wal.fetch.chunk_missing",
-				fmt.Sprintf("wal fetch: get chunk %s: %v", c.Hash, err)).Wrap(err)
+			return walFetchChunkError(c.Hash.String(), err)
 		}
 		if int64(len(bs)) != c.Len {
 			_ = f.Close()
@@ -1332,6 +1336,8 @@ Resume LSN is determined automatically:
 		"exit on stream connection break instead of reconnecting; default behaviour reconnects with exponential backoff (1s → 30s) using EnsureSlot resume — survives Patroni failovers and PG bounces transparently")
 	DurationDaysVar(c.Flags(), &opts.maxReconnectBackoff, "max-reconnect-backoff", 30*time.Second,
 		"upper bound on the auto-reconnect backoff (initial 1s, doubles on each failure)")
+	c.Flags().IntVar(&opts.uploadConcurrency, "upload-concurrency", 0,
+		"chunk uploads kept in flight (1..64; default 16). Uploads wait on storage round trips, not CPU, so a high-latency object store benefits from more; 1 is serial")
 	c.Flags().StringVar(&opts.durability, "durability", "per-segment",
 		"WAL durability: per-segment (one syncfs per 16 MiB segment, the fast default) "+
 			"| per-chunk (fsync every chunk — slower, the 'fsync every object' opt-in)")
@@ -1385,6 +1391,7 @@ type walStreamOptions struct {
 	maxReconnectBackoff time.Duration
 	noInactivityTimeout bool
 	durability          string
+	uploadConcurrency   int // --upload-concurrency (0 = default)
 	// kekRef + kmsConfig select WAL encryption under a cloud KMS (issue
 	// #108). Empty kekRef keeps the automatic local-KEK posture (a keyring
 	// kek.bin encrypts WAL transparently). A cloud kekRef MUST match the
@@ -1665,9 +1672,17 @@ func walSegSizeHuman(b int64) string {
 
 func runWalStream(cmd *cobra.Command, opts walStreamOptions) error {
 	d := DispatcherFrom(cmd)
+	if err := validateWALDeployment("wal stream", opts.deployment); err != nil {
+		return err
+	}
 
 	if _, err := resolveDurability(opts.durability); err != nil {
 		return output.NewError("usage.bad_flag", err.Error()).Wrap(output.ErrUsage)
+	}
+	if opts.uploadConcurrency < 0 || opts.uploadConcurrency > repo.MaxUploadConcurrency {
+		return output.NewError("usage.bad_flag",
+			fmt.Sprintf("--upload-concurrency %d: want 1..%d (0 = default %d)",
+				opts.uploadConcurrency, repo.MaxUploadConcurrency, repo.DefaultUploadConcurrency)).Wrap(output.ErrUsage)
 	}
 	if opts.slotName == "" {
 		// PG replication slot names are [a-z0-9_]+ — hyphens
@@ -2254,6 +2269,7 @@ func streamAttempt(
 		// looks contiguous forever after.
 		ExpectedFirstLSN: startLSN,
 		Durability:       durabilityMode,
+		ChunkConcurrency: opts.uploadConcurrency,
 		// WORM thread: the streaming CAS already locks chunks
 		// (casdefault.NewWithRetention above), but the segment MANIFEST
 		// must be locked too — otherwise it can be deleted/overwritten
@@ -2577,7 +2593,7 @@ func isPermanentStreamError(err error) bool {
 	// Split-brain: two clusters archiving into one lineage. Retrying
 	// does not resolve it and every attempt risks interleaving more
 	// foreign WAL, so stopping is the safe direction.
-	if strings.Contains(err.Error(), "splitbrain.") {
+	if splitBrainCode(err) != "" {
 		return true
 	}
 	oe, ok := output.AsOutputError(err)
@@ -3202,6 +3218,48 @@ func watchOnceCancel(ctx context.Context, cancel context.CancelFunc, sink *walsi
 	}
 }
 
+// walFetchChunkError classifies a failed chunk read for `wal fetch`.
+// All three used to be wal.fetch.chunk_missing, so a chunk that was
+// present but damaged was reported to automation as absent — and the
+// runbook for "missing" (push the segment again) cannot repair damage:
+// the push deduplicates against the very chunk that is corrupt.
+func walFetchChunkError(hash string, err error) error {
+	switch {
+	case errors.Is(err, storage.ErrNotFound):
+		return output.NewError("wal.fetch.chunk_missing",
+			fmt.Sprintf("wal fetch: chunk %s is not in the repository: %v", hash, err)).Wrap(err)
+	case errors.Is(err, repo.ErrChunkCorrupt):
+		return output.NewError("verify.checksum_mismatch",
+			fmt.Sprintf("wal fetch: chunk %s is present but corrupt: %v", hash, err)).
+			WithSuggestion(&output.Suggestion{
+				Human: "archiving the segment again will not help (it deduplicates against the damaged chunk). " +
+					"Find every damaged chunk with `pg_hardstorage repo scrub --full`, then heal them from a replica: " +
+					"`pg_hardstorage repair scrub --heal --replica <url>`",
+			}).Wrap(err)
+	default:
+		return output.NewError("wal.fetch.chunk_unreadable",
+			fmt.Sprintf("wal fetch: read chunk %s: %v", hash, err)).Wrap(err)
+	}
+}
+
+// validateWALDeployment is the first thing every `wal` subcommand does
+// with its <deployment> argument. The name becomes a component of every
+// key under wal/, and it used to be interpolated unchecked: `wal push
+// ../audit` wrote segment manifests into the audit tree (breaking
+// verify-chain), `../chunks` into the chunk store, and two spellings
+// such as `../x` and `a/../../x` shared one namespace. The backup path
+// and the HTTP API already refused these with the same code.
+func validateWALDeployment(op, deployment string) error {
+	if err := walsink.ValidateDeployment(deployment); err != nil {
+		return output.NewError("usage.bad_deployment",
+			fmt.Sprintf("%s: deployment %q is not a valid name: path separators, control characters and the components \".\" / \"..\" are not allowed", op, deployment)).
+			WithSuggestion(&output.Suggestion{
+				Human: "pass the deployment name exactly as it appears in pg_hardstorage.yaml or `pg_hardstorage list`",
+			}).Wrap(output.ErrUsage)
+	}
+	return nil
+}
+
 // mapRepoOpenErr translates repo.Open failures into the structured
 // errors the CLI contract uses; mirrors the runner's mapRepoErr.
 func mapRepoOpenErr(repoURL string, err error) error {
@@ -3215,6 +3273,11 @@ func mapRepoOpenErr(repoURL string, err error) error {
 	}
 	if errors.Is(err, storage.ErrUnknownScheme) {
 		return output.NewError("usage.unknown_scheme", err.Error()).Wrap(output.ErrUsage)
+	}
+	// An error the repo layer already classified (a damaged HSREPO)
+	// keeps its code.
+	if oe, ok := output.AsOutputError(err); ok {
+		return oe
 	}
 	return output.NewError("repo.open_failed",
 		fmt.Sprintf("wal stream: open repo %s: %v", repoURL, err)).Wrap(err)
@@ -3380,17 +3443,12 @@ func captureStreamTimelineHistory(ctx context.Context, d *output.Dispatcher, sp 
 	}
 }
 
-// splitBrainRe extracts a `splitbrain.<leaf>` code from an error chain's
-// text, where walsink records it.
-var splitBrainRe = regexp.MustCompile(`splitbrain\.[a-z_]+`)
-
 // splitBrainCode returns the documented splitbrain.* code carried by err,
-// or "" when err is not a split-brain refusal.
+// or "" when err is not a split-brain refusal. The code is a field of
+// walsink.SplitBrainError, read with errors.As — not text scraped from
+// the message, which silently changed the code whenever the wording did.
 func splitBrainCode(err error) string {
-	if err == nil {
-		return ""
-	}
-	return splitBrainRe.FindString(err.Error())
+	return walsink.SplitBrainCode(err)
 }
 
 // stampDeployment sets the event's deployment when the emitter left it

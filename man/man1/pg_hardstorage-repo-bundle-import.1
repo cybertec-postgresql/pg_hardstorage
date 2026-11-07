@@ -13,7 +13,12 @@ pg_hardstorage-repo-bundle-import - Import a previously-exported bundle into a d
 
 .SH DESCRIPTION
 .PP
-Import a previously-exported bundle into a destination repo (idempotent)
+Import a bundle written by 'repo bundle export' into a repository.
+
+.PP
+The flags mirror export's: export reads --repo and writes --out, import
+reads --in and writes --repo. --to is the older name for the
+destination and is still accepted.
 
 
 .SH OPTIONS
@@ -26,8 +31,12 @@ Import a previously-exported bundle into a destination repo (idempotent)
 	input path to a .tar bundle (required)
 
 .PP
-\fB--to\fP=""
+\fB--repo\fP=""
 	destination repository URL (required)
+
+.PP
+\fB--to\fP=""
+	alias of --repo, kept for compatibility
 
 
 .SH OPTIONS INHERITED FROM PARENT COMMANDS

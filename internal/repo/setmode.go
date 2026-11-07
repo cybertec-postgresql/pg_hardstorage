@@ -153,7 +153,7 @@ func AssertWritable(ctx context.Context, sp storage.StoragePlugin) error {
 	}
 	var meta Metadata
 	if err := json.Unmarshal(body, &meta); err != nil {
-		return fmt.Errorf("repo: parse HSREPO for mode check: %w", err)
+		return corruptMarker("", fmt.Sprintf("it is not valid JSON (%v)", err))
 	}
 	if meta.Mode.Effective() == ModeReadOnly {
 		return ErrReadOnly

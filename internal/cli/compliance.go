@@ -191,15 +191,15 @@ func runComplianceReport(cmd *cobra.Command, f complianceReportFlags) error {
 			Wrap(output.ErrUsage)
 	}
 
-	verifier, err := loadVerifier()
-	if err != nil {
-		return err
-	}
 	meta, sp, err := openRepo(cmd.Context(), f.repoURL)
 	if err != nil {
 		return err
 	}
 	defer sp.Close()
+	verifier, err := loadVerifier()
+	if err != nil {
+		return err
+	}
 
 	rep, err := compliance.Generate(cmd.Context(), sp, meta, f.repoURL, compliance.Options{
 		Verifier:         verifier,

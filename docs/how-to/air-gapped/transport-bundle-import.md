@@ -32,7 +32,7 @@ tags:
 
 ```bash
 pg_hardstorage repo bundle import \
-    --to s3://airgap-mirror/pg-backups \
+    --repo s3://airgap-mirror/pg-backups \
     --in /mnt/incoming/db1-bundle.tar
 ```
 

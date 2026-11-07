@@ -371,7 +371,7 @@ func (p *Plugin) Put(ctx context.Context, key string, r io.Reader, opts storage.
 	}
 
 	tmp := full + ".hstmp-" + randomSuffix()
-	f, err := cli.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC)
+	f, err := p.createStaging(cli, tmp)
 	if err != nil {
 		return storage.PutResult{}, fmt.Errorf("sftp: create tmp %s: %w", tmp, err)
 	}
@@ -672,10 +672,30 @@ func (p *Plugin) RenameIfNotExists(ctx context.Context, src, dst string) error {
 	if err := p.mkdirAll(cli, path.Dir(dstFull)); err != nil {
 		return err
 	}
-	if err := p.atomicRename(cli, srcFull, dstFull); err != nil {
+	if err := p.renameIntoDir(cli, srcFull, dstFull); err != nil {
 		return fmt.Errorf("sftp: rename %s -> %s: %w", srcFull, dstFull, err)
 	}
 	return nil
+}
+
+// renameIntoDir is atomicRename for a dst whose directory may be empty
+// until the rename lands — and may therefore be pruned (PruneEmptyDirs)
+// between the caller's mkdirAll and the rename. The server then answers
+// "no such file", which names either that directory or src; only the
+// first is worth another attempt, so src is checked before the directory
+// is re-created and the rename retried.
+func (p *Plugin) renameIntoDir(cli *sftp.Client, src, dst string) error {
+	err := p.atomicRename(cli, src, dst)
+	for i := 0; i < pruneRaceRetries && isNotExist(err); i++ {
+		if _, serr := cli.Stat(src); serr != nil {
+			break
+		}
+		if merr := p.mkdirAll(cli, path.Dir(dst)); merr != nil {
+			break
+		}
+		err = p.atomicRename(cli, src, dst)
+	}
+	return err
 }
 
 // SetRetention implements storage.StoragePlugin.  SFTP has no
@@ -684,11 +704,40 @@ func (p *Plugin) SetRetention(ctx context.Context, key string, until time.Time, 
 	return storage.ErrUnsupported
 }
 
-// mkdirAll creates all parents of dir.  SFTP doesn't have
+// pruneRaceRetries bounds how often a writer re-creates a directory that a
+// concurrent PruneEmptyDirs removed under it. A prune removes a given
+// directory at most once per pass, so a writer that loses this often is
+// not racing a prune and gets the underlying error.
+const pruneRaceRetries = 100
+
+// mkdirExistsRetries bounds the retries of one Mkdir that the server
+// refused although the directory is absent (see mkdirAllOnce).
+const mkdirExistsRetries = 3
+
+// mkdirAll creates dir and all its parents.  SFTP doesn't have
 // MkdirAll natively in older servers; we walk the path.
+//
+// The walk is not atomic: a component it has just seen or created can
+// be removed again by PruneEmptyDirs (run by `repo gc`) while it is
+// still empty, and the Mkdir of the next component then fails with "no
+// such file". That is a lost race, not a failure, so the walk starts
+// over.
 func (p *Plugin) mkdirAll(cli *sftp.Client, dir string) error {
+	var err error
+	for i := 0; i < pruneRaceRetries; i++ {
+		var vanished bool
+		if vanished, err = p.mkdirAllOnce(cli, dir); !vanished {
+			return err
+		}
+	}
+	return err
+}
+
+// mkdirAllOnce is one walk of mkdirAll. vanished reports that the walk
+// failed only because a component it relied on disappeared under it.
+func (p *Plugin) mkdirAllOnce(cli *sftp.Client, dir string) (vanished bool, err error) {
 	if dir == "" || dir == "/" {
-		return nil
+		return false, nil
 	}
 	parts := strings.Split(dir, "/")
 	cur := ""
@@ -700,17 +749,153 @@ func (p *Plugin) mkdirAll(cli *sftp.Client, dir string) error {
 		if _, err := cli.Stat(cur); err == nil {
 			continue
 		}
-		if err := cli.Mkdir(cur); err != nil {
+		for attempt := 0; ; attempt++ {
+			mkErr := cli.Mkdir(cur)
+			if mkErr == nil {
+				break
+			}
 			// Tolerate races: if another process created the
 			// directory between our Stat and Mkdir, the second
 			// Stat will return success.
 			if _, statErr := cli.Stat(cur); statErr == nil {
-				continue
+				break
 			}
-			return fmt.Errorf("sftp: mkdir %s: %w", cur, err)
+			if isNotExist(mkErr) {
+				// cur's parent — seen or created a moment ago — is gone:
+				// a lost race. Unless the parent is there and is not a
+				// directory, which OpenSSH also reports as "no such
+				// file" (ENOTDIR) and no retry will change.
+				parent := path.Dir(cur)
+				if fi, perr := cli.Stat(parent); perr == nil && !fi.IsDir() {
+					return false, fmt.Errorf("sftp: mkdir %s: %s is not a directory", cur, parent)
+				}
+				return true, fmt.Errorf("sftp: mkdir %s: %w", cur, mkErr)
+			}
+			// Refused, yet cur does not exist. Servers report "already
+			// exists" as a bare SSH_FX_FAILURE, so this can be a
+			// concurrent creator's directory that a prune removed again
+			// before our Stat; a second Mkdir settles it. Anything that
+			// keeps failing (quota, read-only filesystem) is real.
+			if errors.Is(mkErr, os.ErrPermission) || attempt+1 >= mkdirExistsRetries {
+				return false, fmt.Errorf("sftp: mkdir %s: %w", cur, mkErr)
+			}
 		}
 	}
-	return nil
+	return false, nil
+}
+
+// createStaging creates a staging file. If its directory vanished after
+// Put's mkdirAll — PruneEmptyDirs removes directories that were empty at
+// that instant — it re-creates the directory and retries, a bounded
+// number of times since a prune can win the race again.
+//
+// Only the create needs this: once the staging file exists its directory
+// is not empty, the server's rmdir refuses it, and the commit (a link or
+// rename inside that directory) finds it in place.
+func (p *Plugin) createStaging(cli *sftp.Client, tmp string) (*sftp.File, error) {
+	for attempt := 0; ; attempt++ {
+		f, err := cli.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC)
+		if err == nil || !isNotExist(err) || attempt >= pruneRaceRetries {
+			return f, err
+		}
+		if merr := p.mkdirAll(cli, path.Dir(tmp)); merr != nil {
+			return nil, merr
+		}
+	}
+}
+
+// PruneEmptyDirs (storage.EmptyDirPruner) removes directories under dir
+// that hold nothing, deepest first, and dir itself when includeSelf is
+// set. The repo root is never removed. It returns how many directories
+// were removed.
+//
+// SSH_FXP_RMDIR refuses a non-empty directory, so a concurrent writer's
+// file is never lost; a writer racing the removal of its directory
+// re-creates it (mkdirAll, createStaging, renameIntoDir). A directory
+// that another prune removed first, or that a writer filled before the
+// rmdir, is not an error.
+//
+// Unlike the fs backend nothing is fsynced afterwards: SFTP cannot fsync
+// a directory, and a crash that resurrects an empty directory is
+// harmless — the next gc prunes it again.
+func (p *Plugin) PruneEmptyDirs(ctx context.Context, dir string, includeSelf bool) (int, error) {
+	cli, gen, _, cerr := p.connGen()
+	if cerr != nil {
+		return 0, cerr
+	}
+	full := p.root
+	if d := strings.Trim(dir, "/"); d != "" {
+		var err error
+		if full, err = p.resolve(d); err != nil {
+			return 0, err
+		}
+	}
+	n := 0
+	var rec func(cur string, self bool) (bool, error)
+	rec = func(cur string, self bool) (bool, error) {
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
+		var ents []os.FileInfo
+		// Bounded like a List step: a wedged directory listing must
+		// become an error, not hang gc.
+		if err := p.idleRoundTrip(gen, func() error {
+			var rerr error
+			ents, rerr = cli.ReadDir(cur)
+			return rerr
+		}); err != nil {
+			if isNotExist(err) {
+				return true, nil
+			}
+			return false, fmt.Errorf("sftp: read dir %s: %w", cur, err)
+		}
+		empty := true
+		for _, e := range ents {
+			// Anything that is not a plain child directory pins cur:
+			// objects, staging temps, symlinks (never followed — the
+			// target may lie outside the repo), and a name no honest
+			// server returns, which must not steer the walk elsewhere.
+			name := e.Name()
+			if !e.IsDir() || name == "." || name == ".." || strings.Contains(name, "/") {
+				empty = false
+				continue
+			}
+			gone, err := rec(path.Join(cur, name), true)
+			if err != nil {
+				return false, err
+			}
+			if !gone {
+				empty = false
+			}
+		}
+		if !empty || !self || cur == p.root {
+			return false, nil
+		}
+		if err := cli.RemoveDirectory(cur); err != nil {
+			if isNotExist(err) {
+				return true, nil
+			}
+			if isServerRefusal(err) {
+				return false, nil // not empty any more (a writer got there first)
+			}
+			return false, fmt.Errorf("sftp: rmdir %s: %w", cur, err)
+		}
+		n++
+		return true, nil
+	}
+	if _, err := rec(full, includeSelf); err != nil {
+		return n, err
+	}
+	return n, nil
+}
+
+// isServerRefusal reports whether err is the server's answer to a request
+// (an SFTP status) rather than a failure to reach the server. OpenSSH
+// reports "directory not empty" as a bare SSH_FX_FAILURE, so the refusal
+// of an rmdir cannot be told apart more precisely than this.
+func isServerRefusal(err error) bool {
+	var se *sftp.StatusError
+	return errors.As(err, &se) || errors.Is(err, os.ErrPermission)
 }
 
 var errClosed = errors.New("sftp: plugin not open")

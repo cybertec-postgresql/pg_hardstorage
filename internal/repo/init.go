@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/output"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/version"
 
@@ -167,7 +168,11 @@ func Open(ctx context.Context, url string) (*Metadata, storage.StoragePlugin, er
 	var meta Metadata
 	if err := json.Unmarshal(body, &meta); err != nil {
 		_ = sp.Close()
-		return nil, nil, fmt.Errorf("repo: parse HSREPO: %w", err)
+		return nil, nil, corruptMarker(url, fmt.Sprintf("it is not valid JSON (%v)", err))
+	}
+	if meta.Schema == "" {
+		_ = sp.Close()
+		return nil, nil, corruptMarker(url, "it carries no schema tag")
 	}
 	if meta.Schema != SchemaRepo {
 		_ = sp.Close()
@@ -243,6 +248,32 @@ func (e *ErrRepoFormatUnsupported) Error() string {
 
 // ErrNotARepo is returned by Open when the URL has no HSREPO.
 var ErrNotARepo = errors.New("repo: no HSREPO at this URL")
+
+// ErrCorruptMarker is in the chain of the error Open returns when
+// HSREPO exists but cannot be a repository marker: unparseable, or JSON
+// without a schema tag.
+var ErrCorruptMarker = errors.New("repo: HSREPO is damaged")
+
+// corruptMarker is the error for a damaged HSREPO. It is structured
+// here, not at the call sites, because Open has some forty callers and
+// most pass its error up unclassified — which made the most actionable
+// repository failure there is surface as code "internal", the bucket
+// for bugs in this tool. A structured error survives their %w wrapping.
+// It sits in verify.* (exit 9) beside the other "the bytes were read
+// and are wrong" conditions: retrying cannot help.
+func corruptMarker(url, detail string) error {
+	where := "of this repository"
+	if url != "" {
+		where = "at " + url
+	}
+	return output.NewError("verify.repo_marker_corrupt",
+		fmt.Sprintf("repository marker %s %s is damaged: %s", HSREPOFilename, where, detail)).
+		WithSuggestion(&output.Suggestion{
+			Human: "restore " + HSREPOFilename + " from a replica of this repository or from a storage-level copy or object version; " +
+				"it records the repository id and its WORM, compression and mode settings, so do not recreate it by hand without them. " +
+				"The backups and WAL stored in the repository are not affected by this error",
+		}).Wrap(ErrCorruptMarker)
+}
 
 // generateID returns a 32-character hex string from 16 random bytes.
 func generateID() (string, error) {

@@ -71,6 +71,9 @@ Filters:
 
 func runWalGaps(cmd *cobra.Command, deployment, repoURL string, timeline uint32, limit int) error {
 	d := DispatcherFrom(cmd)
+	if err := validateWALDeployment("wal gaps", deployment); err != nil {
+		return err
+	}
 
 	_, sp, err := openRepo(cmd.Context(), repoURL)
 	if err != nil {

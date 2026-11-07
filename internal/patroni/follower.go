@@ -74,7 +74,7 @@ type FollowerOptions struct {
 	// streaming WAL from a different cluster's primary.
 	//
 	// When empty (the default), system-identifier verification is
-	// skipped — appropriate for the+ scope where we don't yet
+	// skipped — appropriate for the current scope where we don't yet
 	// require Patroni to surface the field. The follower still
 	// works; the cluster-mismatch defence is just absent and
 	// logged as a Notice.

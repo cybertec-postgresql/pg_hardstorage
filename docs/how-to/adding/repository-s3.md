@@ -39,8 +39,9 @@ Query parameters:
   env vars (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`),
   IRSA, IMDSv2, AWS SSO, or `~/.aws/credentials`.
 - `s3:GetObject`, `s3:PutObject`, `s3:DeleteObject`, `s3:ListBucket`
-  on the bucket. Add `s3:PutObjectRetention` /
-  `s3:PutObjectLegalHold` if you also want WORM (Object Lock).
+  on the bucket. Add `s3:PutObjectRetention`,
+  `s3:GetObjectRetention` and `s3:PutObjectLegalHold` if you also
+  want WORM (Object Lock).
 
 ## Steps
 
@@ -145,6 +146,45 @@ Two reasons this matters beyond speed:
     honestly-unsupported backends are disabled by the claim. When
     unsure, leave it unset and accept the staging path.
 
+#### Stores that reject `If-None-Match` outright
+
+A few S3-compatible services do not ignore the precondition but
+refuse the request — Alibaba Cloud OSS answers
+
+```text
+400 NotImplemented: A header you provided implies functionality
+that is not implemented.
+```
+
+The plugin treats that answer as the store's capability statement:
+from the first refusal on it emulates `IfNotExists` with a read
+before each write (`HeadObject`, then an unconditional `PUT` or
+`COPY`) and never sends the header to that endpoint again. One
+refused request per process is the whole cost. Do **not** set
+`conditional_put=native` on such a store; with the vouch the plugin
+refuses to downgrade and the write fails with a message naming the
+parameter.
+
+The emulation is not atomic, and the plugin says so by reporting
+`ConditionalPut=false` — the same posture as an SFTP server without
+`hardlink@openssh.com`. Consequences you will meet:
+
+- `backup` refuses the per-deployment lease
+  (`backup.lease_failed`) because it cannot exclude a second runner.
+  Where exactly one runner exists, pass `--allow-concurrent` to a
+  one-off backup, or set `allow_unenforceable_lease: true` on the
+  deployment for the agent.
+- Manifests commit through the staging path (`<key>.tmp.<rand>`,
+  `COPY`, `DELETE`), so the bucket is not append-only.
+- The audit chain reads every slot back after writing it.
+
+OSS also needs `path_style=false` (virtual-hosted addressing):
+
+```bash
+pg_hardstorage repo init \
+    's3://BUCKET/pg-hardstorage?endpoint=https://oss-cn-hongkong.aliyuncs.com&path_style=false&profile=aliyun'
+```
+
 ### 6. Verify writability
 
 ```bash
@@ -187,9 +227,16 @@ includes one):
 }
 ```
 
-Add `s3:PutObjectRetention` and `s3:PutObjectLegalHold` if you
-use WORM; add `s3:BypassGovernanceRetention` only on the
-break-glass principal.
+Add `s3:PutObjectRetention`, `s3:GetObjectRetention` and
+`s3:PutObjectLegalHold` if you use WORM; add
+`s3:BypassGovernanceRetention` only on the break-glass principal.
+
+`s3:GetObjectRetention` is what lets a backup reuse a chunk that
+another writer (typically `wal stream`) already holds under a longer
+lock: Object Lock refuses to shorten a lock, and pg_hardstorage reads
+the existing one to see that it is long enough. Without the
+permission such a backup fails with `could not be extended ...
+reading the existing lock back failed as well`.
 
 ## Troubleshooting
 
