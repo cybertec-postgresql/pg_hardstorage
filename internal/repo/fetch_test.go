@@ -248,21 +248,21 @@ func TestGetChunkBytes_RetriesABrokenBody(t *testing.T) {
 	}
 	key := repo.ChunkKey(ci.Hash)
 
-	flaky := &breakingBody{StoragePlugin: sp, breaks: 2, opens: map[string]int{}}
+	flaky := &breakingBody{StoragePlugin: sp, breaks: 4, opens: map[string]int{}}
 	body, err := repo.NewCAS(flaky).GetChunkBytes(ctx, ci.Hash)
 	if err != nil || string(body) != "a chunk worth reading twice" {
-		t.Fatalf("body=%q err=%v; two broken reads must be retried", body, err)
+		t.Fatalf("body=%q err=%v; four broken reads must be retried", body, err)
 	}
-	if flaky.opens[key] != 3 {
-		t.Errorf("%d opens, want 3", flaky.opens[key])
+	if flaky.opens[key] != 5 {
+		t.Errorf("%d opens, want 5", flaky.opens[key])
 	}
 
 	dead := &breakingBody{StoragePlugin: sp, breaks: 99, opens: map[string]int{}}
 	if _, err := repo.NewCAS(dead).GetChunkBytes(ctx, ci.Hash); err == nil {
 		t.Fatal("a body that never completes was reported as read")
 	}
-	if dead.opens[key] != 3 {
-		t.Errorf("%d opens of a persistently broken body, want 3 (one read, two retries)", dead.opens[key])
+	if dead.opens[key] != 5 {
+		t.Errorf("%d opens of a persistently broken body, want 5 (one read, four retries)", dead.opens[key])
 	}
 
 	counting := &slowGets{StoragePlugin: sp}

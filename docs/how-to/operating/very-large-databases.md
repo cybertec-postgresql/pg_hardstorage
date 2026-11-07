@@ -138,8 +138,8 @@ CPU, disks and network are idle during a restore; lower it if the
 storage service throttles. Memory grows with it (one chunk per read in
 flight).
 
-A chunk read that breaks off mid-body is repeated twice before the
-restore fails. The manifest, which a restore streams for as long as it
+A chunk read that breaks off mid-body is repeated up to four times
+(five attempts in all) before the restore fails. The manifest, which a restore streams for as long as it
 runs, is re-opened at the byte it had reached when its connection drops;
 it gives up after five attempts in a row that deliver nothing. Both are
 on top of the request retries of the storage SDKs.

@@ -40,6 +40,17 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **A restore survives a lossier link, and says so when it does not.**
+  A chunk body that breaks off mid-read is now fetched up to four more
+  times (five attempts, as a streamed manifest already had) instead of
+  two more. Judged per restore rather than per chunk, three attempts
+  were thin: at one broken body in a hundred a chunk still failed once
+  in a million reads, which a restore of a million chunks met more often
+  than not; validation against a proxy cutting 5 % of chunk bodies
+  failed 2 of 6 restores with three attempts and 0 of 6 with five. A
+  restore that fails in materialisation is reported as `restore.failed`
+  (the code the control-plane path already used) instead of `internal`.
+
 - **`repo init` and every later write work on an S3-compatible store that
   rejects `If-None-Match: *`** (#98). Alibaba Cloud OSS answers a
   conditional `PutObject` with `400 NotImplemented` instead of honouring
@@ -211,7 +222,7 @@ keeps reading that version for at least 24 months after a successor lands.
   in) failed the run. Streamed manifest reads now re-open the object at
   the byte they had reached (a ranged request on S3, Azure and GCS) and
   give up only after five attempts in a row without progress. A chunk
-  whose body breaks off mid-read is fetched again, twice.
+  whose body breaks off mid-read is fetched again, up to four times.
 
 - **sftp and scp repositories kept empty directories after `repo gc`
   (#89).** Only the fs backend pruned the chunk and manifest directories

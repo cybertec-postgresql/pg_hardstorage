@@ -508,6 +508,15 @@ func runRestore(cmd *cobra.Command, opts restoreOpts) error {
 	var verifyErr error
 	if err != nil {
 		if res == nil || res.Verify == nil {
+			// A failure inside the restore (a chunk that could not be
+			// read, a file that could not be written) is restore.failed,
+			// the code the control-plane path already uses, so an
+			// operator's automation can tell it from a bug in this
+			// binary; the structured errors the restore package raises
+			// itself (restore.target_*, manifest.*) pass through.
+			if _, structured := output.AsOutputError(err); !structured && !errors.Is(err, context.Canceled) {
+				return output.NewError("restore.failed", "restore: "+err.Error()).Wrap(err)
+			}
 			return err
 		}
 		verifyErr = err

@@ -160,17 +160,29 @@ func EachOrdered[T any](ctx context.Context, tokens chan struct{}, hashes iter.S
 }
 
 // chunkReadBackoff is the pause before the nth retry (n from 1) of a
-// chunk whose body broke off mid-read. A var so tests do not sleep.
+// chunk whose body broke off mid-read: 200 ms, then 1 s, 2 s, 2 s. A
+// var so tests do not sleep.
 var chunkReadBackoff = func(n int) time.Duration {
-	if n == 1 {
+	switch n {
+	case 1:
 		return 200 * time.Millisecond
+	case 2:
+		return time.Second
+	default:
+		return 2 * time.Second
 	}
-	return time.Second
 }
 
 // chunkReadRetries is how often a chunk read that failed MID-BODY is
-// repeated.
-const chunkReadRetries = 2
+// repeated: five attempts in all, as storage.ResumeAttempts gives a
+// manifest. The budget has to be judged per restore, not per chunk: a
+// link that breaks one body in a hundred fails a given chunk three
+// times in a row once in a million reads, which a restore of a million
+// chunks (a quarter terabyte) would hit more often than not. Five
+// attempts put that at one in ten thousand restores. Only a body that
+// keeps breaking pays for the extra attempts; an open that fails is
+// still not retried here.
+const chunkReadRetries = 4
 
 // errEnvelopeTooLarge marks a chunk object larger than any chunk can
 // be: reading it again will not make it smaller.
