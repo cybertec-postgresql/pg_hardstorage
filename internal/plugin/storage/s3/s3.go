@@ -31,6 +31,9 @@
 //	              Cloudflare R2). Without the vouch, custom endpoints
 //	              report ConditionalPut=false so single-winner callers
 //	              degrade loudly instead of trusting an unverified claim.
+//	              An unvouched endpoint that REJECTS the header
+//	              (NotImplemented; Alibaba Cloud OSS) is served with a
+//	              read-before-write emulation instead.
 //
 // Authentication is delegated to the AWS SDK v2 default credential
 // chain (env vars, IRSA, IAM role, profile, SSO). Inline credentials in
@@ -57,6 +60,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -106,6 +110,23 @@ type Plugin struct {
 	// false for ?endpoint= overrides unless the operator passes
 	// ?conditional_put=native. See Capabilities.
 	conditionalPut bool
+	// vouched is true when the operator passed ?conditional_put=native.
+	// Only used to word the error when the endpoint then proves it does
+	// not implement the header.
+	vouched bool
+
+	// noCondPut and noCondCopy are set once the endpoint has answered a
+	// conditional PutObject / CompleteMultipartUpload, respectively a
+	// conditional CopyObject, with NotImplemented. Some S3-compatible
+	// stores (Alibaba Cloud OSS, issue #98) refuse `If-None-Match: *`
+	// outright instead of ignoring it. From then on IfNotExists is
+	// emulated with HeadObject + unconditional write, the posture of
+	// an sftp server without hardlink@openssh.com: ConditionalPut is
+	// already reported false for such an endpoint, so the callers that
+	// need a single winner are already on their read-back paths. A
+	// vouched endpoint gets an error instead; see Put.
+	noCondPut  atomic.Bool
+	noCondCopy atomic.Bool
 }
 
 // Name implements storage.StoragePlugin.
@@ -320,6 +341,7 @@ func (p *Plugin) Open(ctx context.Context, cfg storage.StorageConfig) error {
 	p.storageClass = storageClass
 	p.region = awsCfg.Region
 	p.conditionalPut = conditionalPut
+	p.vouched = q.Get("conditional_put") == "native"
 	return nil
 }
 
@@ -460,6 +482,16 @@ func (p *Plugin) Put(ctx context.Context, key string, r io.Reader, opts storage.
 			bodySize = int64(len(buf))
 		}
 	}
+	if opts.IfNotExists && p.noCondPut.Load() {
+		return p.putEmulated(ctx, key, in, bodySize)
+	}
+	// Where the body starts, so the emulated retry below can rewind
+	// to the same place the SDK did. in.Body is seekable on this path:
+	// either the caller's reader was, or it was buffered above.
+	var bodyStart int64
+	if sk, ok := in.Body.(io.Seeker); ok {
+		bodyStart, _ = sk.Seek(0, io.SeekCurrent)
+	}
 	var callOpts []func(*s3.Options)
 	if opts.IfNotExists {
 		callOpts = append(callOpts, retryConditionalConflict)
@@ -469,17 +501,85 @@ func (p *Plugin) Put(ctx context.Context, key string, r io.Reader, opts storage.
 		if isPreconditionFailed(err) {
 			return storage.PutResult{}, fmt.Errorf("%w: %s", storage.ErrAlreadyExists, key)
 		}
+		if opts.IfNotExists && isNotImplemented(err) {
+			if cerr := p.conditionalPutRefused(key, err); cerr != nil {
+				return storage.PutResult{}, cerr
+			}
+			if sk, ok := in.Body.(io.Seeker); ok {
+				if _, serr := sk.Seek(bodyStart, io.SeekStart); serr != nil {
+					return storage.PutResult{}, fmt.Errorf("s3: put %q: rewind body for unconditional write: %w", key, serr)
+				}
+			}
+			return p.putEmulated(ctx, key, in, bodySize)
+		}
 		return storage.PutResult{}, fmt.Errorf("s3: put %q: %w", key, err)
 	}
+	return putResult(key, bodySize, out.ETag, out.VersionId), nil
+}
 
-	res := storage.PutResult{Key: key, Size: bodySize}
-	if out.ETag != nil {
-		res.ETag = *out.ETag
+// conditionalPutRefused decides what a NotImplemented answer to a
+// conditional write means for this endpoint. On an unvouched custom
+// endpoint it switches the plugin to the emulated path and returns
+// nil; ConditionalPut was already reported false, so no caller loses
+// a guarantee it was promised. On AWS proper, or when the operator
+// vouched with ?conditional_put=native, it returns an error: a silent
+// downgrade there would make the capability claim a lie.
+func (p *Plugin) conditionalPutRefused(key string, err error) error {
+	if !p.conditionalPut {
+		p.noCondPut.Store(true)
+		return nil
 	}
-	if out.VersionId != nil {
-		res.VersionID = *out.VersionId
+	if p.vouched {
+		return fmt.Errorf("s3: put %q: the endpoint does not implement conditional writes (If-None-Match: *) "+
+			"although ?conditional_put=native vouches that it does; drop the parameter so IfNotExists is "+
+			"emulated with a read before each write: %w", key, err)
 	}
-	return res, nil
+	return fmt.Errorf("s3: put %q: %w", key, err)
+}
+
+// putEmulated is Put for an endpoint that rejects `If-None-Match: *`:
+// HeadObject, then an unconditional PutObject. Not atomic; two writers
+// in the window both succeed and the later one wins, which is why the
+// plugin reports ConditionalPut=false for the endpoint and never takes
+// this path on a vouched one.
+func (p *Plugin) putEmulated(ctx context.Context, key string, in *s3.PutObjectInput, bodySize int64) (storage.PutResult, error) {
+	if err := p.refuseIfPresent(ctx, key); err != nil {
+		return storage.PutResult{}, err
+	}
+	in.IfNoneMatch = nil
+	out, err := p.client.PutObject(ctx, in)
+	if err != nil {
+		return storage.PutResult{}, fmt.Errorf("s3: put %q: %w", key, err)
+	}
+	return putResult(key, bodySize, out.ETag, out.VersionId), nil
+}
+
+// refuseIfPresent is the read half of the emulated IfNotExists:
+// ErrAlreadyExists when key is present, nil when it is absent.
+func (p *Plugin) refuseIfPresent(ctx context.Context, key string) error {
+	_, err := p.client.HeadObject(ctx, &s3.HeadObjectInput{
+		Bucket: aws.String(p.bucket),
+		Key:    aws.String(p.fullKey(key)),
+	})
+	switch {
+	case err == nil:
+		return fmt.Errorf("%w: %s", storage.ErrAlreadyExists, key)
+	case isNotFound(err):
+		return nil
+	default:
+		return fmt.Errorf("s3: put %q: precheck head: %w", key, err)
+	}
+}
+
+func putResult(key string, size int64, etag, versionID *string) storage.PutResult {
+	res := storage.PutResult{Key: key, Size: size}
+	if etag != nil {
+		res.ETag = *etag
+	}
+	if versionID != nil {
+		res.VersionID = *versionID
+	}
+	return res
 }
 
 // Get implements storage.StoragePlugin.
@@ -657,12 +757,27 @@ func (p *Plugin) RenameIfNotExists(ctx context.Context, src, dst string) error {
 		return fmt.Errorf("s3: rename precheck head %q: %w", dst, err)
 	}
 
-	_, err := p.client.CopyObject(ctx, &s3.CopyObjectInput{
-		Bucket:      aws.String(p.bucket),
-		Key:         aws.String(p.fullKey(dst)),
-		CopySource:  aws.String(url.PathEscape(p.bucket + "/" + p.fullKey(src))),
-		IfNoneMatch: aws.String("*"),
-	}, retryConditionalConflict)
+	copyIn := &s3.CopyObjectInput{
+		Bucket:     aws.String(p.bucket),
+		Key:        aws.String(p.fullKey(dst)),
+		CopySource: aws.String(url.PathEscape(p.bucket + "/" + p.fullKey(src))),
+	}
+	var err error
+	if p.noCondCopy.Load() {
+		_, err = p.client.CopyObject(ctx, copyIn)
+	} else {
+		copyIn.IfNoneMatch = aws.String("*")
+		_, err = p.client.CopyObject(ctx, copyIn, retryConditionalConflict)
+		if err != nil && isNotImplemented(err) {
+			// The store refuses the directive rather than ignoring it
+			// (OSS, #98). Either way the HEAD above is the guard that
+			// holds on every store; the copy itself carries no
+			// exclusion from here on, exactly as on MinIO.
+			p.noCondCopy.Store(true)
+			copyIn.IfNoneMatch = nil
+			_, err = p.client.CopyObject(ctx, copyIn)
+		}
+	}
 	if err != nil {
 		if isPreconditionFailed(err) {
 			return fmt.Errorf("%w: %s", storage.ErrAlreadyExists, dst)
@@ -789,6 +904,18 @@ func isPreconditionFailed(err error) bool {
 	}
 	var re *awshttp.ResponseError
 	return errors.As(err, &re) && re.HTTPStatusCode() == http.StatusPreconditionFailed
+}
+
+// isNotImplemented reports whether err is the store saying it does
+// not implement something the request asked for: S3 code
+// NotImplemented (OSS sends it with HTTP 400) or HTTP 501.
+func isNotImplemented(err error) bool {
+	var ae smithy.APIError
+	if errors.As(err, &ae) && ae.ErrorCode() == "NotImplemented" {
+		return true
+	}
+	var re *awshttp.ResponseError
+	return errors.As(err, &re) && re.HTTPStatusCode() == http.StatusNotImplemented
 }
 
 // conditionalConflictAttempts bounds the retries of a conditional

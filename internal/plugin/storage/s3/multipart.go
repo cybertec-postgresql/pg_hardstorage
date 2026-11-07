@@ -66,6 +66,14 @@ func (p *Plugin) putMultipart(ctx context.Context, key string, r io.Reader, size
 	if size > maxObjectLen {
 		return storage.PutResult{}, fmt.Errorf("s3: put %q: %d bytes exceeds the 5 TiB S3 object limit", key, size)
 	}
+	// An endpoint known to reject If-None-Match gets the read first,
+	// not after every part has gone up; the completion reads again
+	// for the window in between.
+	if opts.IfNotExists && p.noCondPut.Load() {
+		if err := p.refuseIfPresent(ctx, key); err != nil {
+			return storage.PutResult{}, err
+		}
+	}
 	create, err := p.client.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
 		Bucket:                    in.Bucket,
 		Key:                       in.Key,
@@ -171,13 +179,36 @@ read:
 		MultipartUpload: &s3types.CompletedMultipartUpload{Parts: parts},
 	}
 	var callOpts []func(*s3.Options)
-	if opts.IfNotExists {
+	emulate := opts.IfNotExists && p.noCondPut.Load()
+	if opts.IfNotExists && !emulate {
 		done.IfNoneMatch = aws.String("*")
 		callOpts = append(callOpts, retryConditionalConflict)
 	}
-	out, err := p.client.CompleteMultipartUpload(ctx, done, callOpts...)
+	complete := func() (*s3.CompleteMultipartUploadOutput, error) {
+		if emulate {
+			// The endpoint rejects If-None-Match (see Put): the read
+			// before the write is the only exclusion there is.
+			if err := p.refuseIfPresent(ctx, key); err != nil {
+				return nil, err
+			}
+		}
+		return p.client.CompleteMultipartUpload(ctx, done, callOpts...)
+	}
+	out, err := complete()
+	if err != nil && opts.IfNotExists && !emulate && isNotImplemented(err) {
+		if cerr := p.conditionalPutRefused(key, err); cerr != nil {
+			abort()
+			return storage.PutResult{}, cerr
+		}
+		// The parts are still there; only the completion was refused.
+		emulate, done.IfNoneMatch, callOpts = true, nil, nil
+		out, err = complete()
+	}
 	if err != nil {
 		abort()
+		if errors.Is(err, storage.ErrAlreadyExists) {
+			return storage.PutResult{}, err
+		}
 		if isPreconditionFailed(err) {
 			return storage.PutResult{}, fmt.Errorf("%w: %s", storage.ErrAlreadyExists, key)
 		}

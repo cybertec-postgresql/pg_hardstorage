@@ -40,6 +40,23 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Fixed
 
+- **`repo init` and every later write work on an S3-compatible store that
+  rejects `If-None-Match: *`** (#98). Alibaba Cloud OSS answers a
+  conditional `PutObject` with `400 NotImplemented` instead of honouring
+  or ignoring the header, so nothing could be written. For an endpoint
+  that is not vouched for with `?conditional_put=native` the plugin now
+  takes that answer as the store's capability statement: it emulates
+  `IfNotExists` with a read before the write (`HeadObject`, then an
+  unconditional `PutObject` / `CompleteMultipartUpload` / `CopyObject`)
+  and sends the header to that endpoint no more. The capability was
+  already reported as `ConditionalPut=false` there, so the callers that
+  need a single winner were on their read-back paths all along; the
+  backup lease still has to be waived explicitly (`--allow-concurrent`
+  or `allow_unenforceable_lease`), and its refusal now names those
+  knobs instead of an internal field. A vouched endpoint that answers
+  `NotImplemented` fails with a message naming the parameter to drop
+  rather than being downgraded silently.
+
 - **A base backup no longer aborts on a chunk that is already locked
   longer than it needs.** Adopting a deduplicated chunk extends its WORM
   lock to the backup's deadline; S3 Object Lock refuses that request when
