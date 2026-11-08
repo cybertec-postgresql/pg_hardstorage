@@ -74,11 +74,22 @@ $(info pg_hardstorage: TMPDIR=$(TMPDIR) (override: HS_TMPDIR=<path> make ...))
 #
 # A vet that exits non-zero for reasons no one can act on is a vet
 # people learn to ignore. GOTMPDIR is specifically where the go command
-# puts those trees, so pointing it at a dot-prefixed sibling fixes it at
-# the source: the go tool ignores directories beginning with "." or "_"
-# when expanding ./..., while TMPDIR stays exactly where it is
+# puts those trees, so pointing it at a dot-prefixed directory fixes it
+# at the source: the go tool ignores directories beginning with "." or
+# "_" when expanding ./..., while TMPDIR stays exactly where it is
 # documented to be for testcontainers and minio bind mounts.
-HS_GOTMPDIR ?= $(CURDIR)/test-runs/.gotmp
+#
+# It lives UNDER HS_TMPDIR, not beside it. GOTMPDIR is documented as the
+# "temporary directory used by the go command and testing package": the
+# testing package puts every t.TempDir() there too, so it holds the test
+# fixtures (CAS trees, spools, cluster data directories), not just build
+# scratch. With a fixed sibling, HS_TMPDIR=/dev/shm/x moved nothing that
+# matters: the fixtures kept fsyncing on the repo's disk and the stress
+# lane hit its deadline there (audit at -count=10: over 60 min on a
+# stalling disk, 52 s on tmpfs). Deriving it from HS_TMPDIR keeps one
+# override moving everything, and the default is still gitignored and
+# dot-prefixed.
+HS_GOTMPDIR ?= $(HS_TMPDIR)/.gotmp
 export GOTMPDIR := $(HS_GOTMPDIR)
 # Created at parse time rather than as an order-only prerequisite: the
 # go tool errors when GOTMPDIR names a directory that does not exist,
