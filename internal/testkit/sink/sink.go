@@ -125,8 +125,18 @@ type Runtime interface {
 // map.  Air-gap mode treats this as the universe of allowed
 // images — anything missing locally fails pre-flight.
 var SinkImages = map[string]string{
-	"s3-minio":  "minio/minio:RELEASE.2025-01-20T14-49-07Z",
-	"tls-minio": "minio/minio:RELEASE.2025-01-20T14-49-07Z", // same image; TLS toggled by mounting certs
+	// MinIO, Inc. archived the upstream project and withdrew the
+	// minio/minio and minio/mc images from Docker Hub and quay.io
+	// (every tag answers 401 since autumn 2026). Silo is Pigsty's
+	// maintained fork of the same server: S3 API, MINIO_* variables,
+	// /minio/* routes, `server /data`, --certs-dir and the on-disk
+	// format are unchanged; only the binary (/usr/bin/silo) and the
+	// image are renamed. It also bundles `mc` (/usr/bin/mc → mcli),
+	// so docker-compose.yml's bucket bootstrap uses the same image.
+	// The sink names stay "s3-minio"/"tls-minio": they are the names
+	// scenario files and the air-gap allow-list refer to.
+	"s3-minio":  "pgsty/silo:RELEASE.2026-10-26T00-00-00Z",
+	"tls-minio": "pgsty/silo:RELEASE.2026-10-26T00-00-00Z", // same image; TLS toggled by mounting certs
 	"azurite":   "mcr.microsoft.com/azure-storage/azurite:3.33.0",
 	"gcs-fake":  "fsouza/fake-gcs-server:1.52.2",
 	// sftp is the SFTP fixture. Like ssh-exec the value is the BASE

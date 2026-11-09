@@ -77,8 +77,8 @@ spec:
     spec:
       containers:
         - name: minio
-          image: minio/minio:RELEASE.2024-12-18T13-15-44Z
-          args: ["server", "/data", "--console-address", ":9001"]
+          image: pgsty/silo:RELEASE.2026-10-26T00-00-00Z
+          args: ["server", "/data"]
           env:
             - { name: MINIO_ROOT_USER, valueFrom: { secretKeyRef: { name: minio-creds, key: AWS_ACCESS_KEY_ID } } }
             - { name: MINIO_ROOT_PASSWORD, valueFrom: { secretKeyRef: { name: minio-creds, key: AWS_SECRET_ACCESS_KEY } } }
@@ -102,7 +102,7 @@ spec:
       restartPolicy: OnFailure
       containers:
         - name: mc
-          image: minio/mc:RELEASE.2024-11-21T17-21-54Z
+          image: pgsty/silo:RELEASE.2026-10-26T00-00-00Z
           envFrom: [{ secretRef: { name: minio-creds } }]
           command:
             - sh

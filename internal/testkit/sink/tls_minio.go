@@ -23,7 +23,7 @@
 //     longer windows would be wasted.
 //   - Persisted to a per-instance host tempdir as
 //     `<dir>/public.crt` + `<dir>/private.key`, then bind-
-//     mounted into MinIO at /root/.minio/certs.
+//     mounted into the server at /certs (--certs-dir).
 //
 // Trust is plumbed via AWS_CA_BUNDLE in EnvForAgent and via
 // the Extras map (key "ca_bundle"), so the testkit's compat
@@ -79,7 +79,7 @@ func (m *tlsMinioRuntime) Name() string { return "tls-minio" }
 
 // Up generates a fresh 24-hour ED25519 self-signed cert under
 // a per-instance tempdir, runs MinIO with TLS enabled
-// (bind-mounting the cert at /root/.minio/certs), waits until
+// (bind-mounting the cert at /certs, --certs-dir), waits until
 // the HTTPS port returns a valid TLS handshake, and remembers
 // the CA bundle path for AWS_CA_BUNDLE plumbing.
 func (m *tlsMinioRuntime) Up(ctx context.Context) error {
@@ -109,7 +109,7 @@ func (m *tlsMinioRuntime) Up(ctx context.Context) error {
 	}
 
 	// Generate a self-signed cert + key for 127.0.0.1 / localhost.
-	// MinIO reads /root/.minio/certs/public.crt + private.key —
+	// The server reads <certs-dir>/public.crt + private.key —
 	// other paths are ignored, so the filenames are fixed.
 	if err := writeSelfSignedCert(m.certDir); err != nil {
 		_ = os.RemoveAll(dir)
@@ -126,7 +126,7 @@ func (m *tlsMinioRuntime) Up(ctx context.Context) error {
 
 	// `:z` on data + cert bind-mounts: SELinux-enforcing hosts
 	// (Fedora, RHEL, Alma, Rocky) deny the MinIO container's
-	// writes to /data and reads of /root/.minio/certs when the
+	// writes to /data and reads of /certs when the
 	// host directories carry a non-container SELinux label.
 	// Without this, the container starts but TLS handshake
 	// fails (cert not readable inside) and writes silently
@@ -146,11 +146,15 @@ func (m *tlsMinioRuntime) Up(ctx context.Context) error {
 		"--ulimit", "nofile=65536:65536",
 		"-p", fmt.Sprintf("127.0.0.1:%d:9000", m.port),
 		"-v", fmt.Sprintf("%s:/data:z", m.dataDir),
-		"-v", fmt.Sprintf("%s:/root/.minio/certs:ro,z", m.certDir),
+		// An explicit --certs-dir rather than the default
+		// $HOME/.minio/certs: the Silo image sets HOME=/tmp and
+		// resolves its default to ~/.silo, so a mount at
+		// /root/.minio/certs would never be looked at.
+		"-v", fmt.Sprintf("%s:/certs:ro,z", m.certDir),
 		"-e", "MINIO_ROOT_USER=" + m.accessKey,
 		"-e", "MINIO_ROOT_PASSWORD=" + m.secretKey,
-		SinkImages["s3-minio"], // same MinIO image; TLS triggers on cert presence
-		"server", "/data",
+		SinkImages["s3-minio"], // same server image; TLS triggers on cert presence
+		"server", "/data", "--certs-dir", "/certs",
 	}
 	cmd := execCommand(ctx, "docker", args...)
 	out, err := cmd.CombinedOutput()
@@ -363,7 +367,7 @@ func (m *tlsMinioRuntime) Extras() map[string]string {
 // self-signed X.509 cert valid for 24 h with SANs covering
 // 127.0.0.1 / localhost / ::1, and writes them to
 // <dir>/public.crt + <dir>/private.key in PEM form (the
-// shapes MinIO expects under /root/.minio/certs).
+// shapes the server expects under its --certs-dir).
 //
 // ED25519 chosen over RSA: smaller (32-byte key), faster to
 // generate, and the SDK + Go stdlib both accept it.  No

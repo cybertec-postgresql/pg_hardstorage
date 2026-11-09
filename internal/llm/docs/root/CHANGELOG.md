@@ -275,6 +275,15 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Changed
 
+- **The evaluation stack and the test fixtures run their S3 endpoint on
+  `pgsty/silo`**, Pigsty's maintained fork of the MinIO server. MinIO,
+  Inc. archived the upstream project and withdrew the `minio/minio` and
+  `minio/mc` images from Docker Hub and quay.io, so a fresh
+  `docker compose up` failed at the image pull. The S3 API, the
+  `MINIO_*` variables, the `/minio/health/*` routes and the `/data`
+  layout are unchanged; the bucket bootstrap uses the `mc` the Silo
+  image bundles. The eval stack no longer publishes a web console on
+  port 9001 (the fork, like late MinIO, ships none).
 - **S3 multipart uploads send up to 4 parts in parallel** instead of one
   at a time, bounded by 256 MiB of part buffers (previously one 64 MiB
   buffer). Objects over 64 MiB — the manifests of very large clusters —

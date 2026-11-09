@@ -114,7 +114,7 @@ The agent is started with `--metrics-listen 0.0.0.0:9187`, so the
 | Agent `/metrics` | <http://localhost:9187/metrics> | Prometheus text exposition |
 | Prometheus | <http://localhost:9090> | scrapes the agent every 15s |
 | Grafana | <http://localhost:3000> | `admin`/`admin`; Prometheus datasource + a *pg_hardstorage overview* dashboard are provisioned at boot |
-| MinIO console | <http://localhost:9001> | `minioadmin`/`minioadmin` |
+| S3 (Silo, a MinIO fork) | <http://localhost:9000> | `minioadmin`/`minioadmin`; S3 API only, no web console |
 
 No PostgreSQL handy? Bring up a throwaway PG + agent + repo entirely
 on your local Docker daemon:
