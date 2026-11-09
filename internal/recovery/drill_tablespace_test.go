@@ -1,3 +1,8 @@
+// These tests reason about Linux tablespace locations (/srv/live/…) as a
+// source host records them; on Windows filepath.IsAbs rejects such a path
+// before the drill logic under test is reached.
+//go:build !windows
+
 package recovery_test
 
 // drill_tablespace_test.go — a drill must not write outside the temp

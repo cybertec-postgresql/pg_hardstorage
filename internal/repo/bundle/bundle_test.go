@@ -42,10 +42,8 @@ type tar_Header = tar.Header
 func newRepo(t *testing.T) storage.StoragePlugin {
 	t.Helper()
 	dir := t.TempDir()
-	u, err := url.Parse("file://" + dir)
-	if err != nil {
-		t.Fatal(err)
-	}
+	// Built, not parsed: url.Parse reads a Windows drive letter as a host.
+	u := &url.URL{Scheme: "file", Path: dir}
 	sp := &fs.Plugin{}
 	if err := sp.Open(context.Background(), storage.StorageConfig{URL: u}); err != nil {
 		t.Fatalf("sp.Open: %v", err)

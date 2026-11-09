@@ -34,10 +34,7 @@ import (
 func adoptTestStore(t *testing.T) storage.StoragePlugin {
 	t.Helper()
 	p := &fs.Plugin{}
-	u, err := url.Parse("file://" + t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
+	u := &url.URL{Scheme: "file", Path: t.TempDir()} // built, not parsed: Windows drive letters
 	if err := p.Open(context.Background(), storage.StorageConfig{URL: u}); err != nil {
 		t.Fatalf("open fs store: %v", err)
 	}
