@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/url"
 	"sort"
+	"strings"
 	"sync"
 )
 
@@ -79,6 +80,18 @@ func parseStorageURL(raw string) (*url.URL, error) {
 		// Bare absolute path -> file://<path>.
 		return &url.URL{Scheme: "file", Path: raw}, nil
 	}
+	// Windows drive paths, bare (C:\repo) or behind file:// without the
+	// third slash (file://C:\repo, file://C:/repo). url.Parse reads the
+	// drive letter as a host and the colon as a port and rejects them;
+	// a drive path is as unambiguous as a leading slash, so it is a file
+	// URL. file:///C:/repo parses on its own (the fs plugin drops the
+	// leading slash of a "/C:/..." path on Windows).
+	if hasWindowsDrive(raw) {
+		return &url.URL{Scheme: "file", Path: raw}, nil
+	}
+	if rest, ok := strings.CutPrefix(raw, "file://"); ok && hasWindowsDrive(rest) {
+		return &url.URL{Scheme: "file", Path: rest}, nil
+	}
 	u, err := url.Parse(raw)
 	if err != nil {
 		return nil, fmt.Errorf("storage: parse %q: %w", raw, err)
@@ -87,4 +100,14 @@ func parseStorageURL(raw string) (*url.URL, error) {
 		return nil, fmt.Errorf("storage: URL %q has no scheme; use file://, s3://, ...", raw)
 	}
 	return u, nil
+}
+
+// hasWindowsDrive reports whether s starts with a drive letter, a colon
+// and a path separator (C:\ or C:/).
+func hasWindowsDrive(s string) bool {
+	if len(s) < 3 || s[1] != ':' || (s[2] != '\\' && s[2] != '/') {
+		return false
+	}
+	c := s[0]
+	return ('A' <= c && c <= 'Z') || ('a' <= c && c <= 'z')
 }

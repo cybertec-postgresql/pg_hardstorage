@@ -43,6 +43,11 @@ The host must be empty (or `localhost`).  The path is the
 absolute repository root; relative paths are rejected
 rather than silently rebased.
 
+On Windows a drive path is accepted in any of its spellings —
+`C:\backups\repo`, `file://C:\backups\repo`, `file:///C:/backups/repo`
+— and directory fsync is a no-op there (NTFS journals directory
+metadata; files are still fsynced).
+
 | Field | Value |
 | --- | --- |
 | **Parsed by** | [`internal/plugin/storage/fs/fs.go`](https://github.com/cybertec-postgresql/pg_hardstorage/blob/main/internal/plugin/storage/fs/fs.go) |

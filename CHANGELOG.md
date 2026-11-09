@@ -281,6 +281,10 @@ keeps reading that version for at least 24 months after a successor lands.
   (`FlushFileBuffers` refuses a read-only directory handle), which made
   every repository write on Windows fail. NTFS journals directory
   metadata itself; the file-level fsync is unchanged.
+- **Windows: `file://` repositories accept drive paths** — `C:\repo`,
+  `file://C:\repo` and `file:///C:/repo` all open the same root. The URL
+  parser used to read the drive letter as a host and the colon as a port
+  and reject the path.
 - **The evaluation stack and the test fixtures run their S3 endpoint on
   `pgsty/silo`**, Pigsty's maintained fork of the MinIO server. MinIO,
   Inc. archived the upstream project and withdrew the `minio/minio` and

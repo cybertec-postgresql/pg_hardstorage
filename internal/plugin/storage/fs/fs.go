@@ -35,6 +35,7 @@ import (
 	"iter"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -291,6 +292,11 @@ func (p *Plugin) Open(_ context.Context, cfg storage.StorageConfig) error {
 	root := cfg.URL.Path
 	if root == "" {
 		return errors.New("fs: empty URL path")
+	}
+	// file:///C:/repo parses to the path "/C:/repo"; on Windows the
+	// leading slash is URL syntax, not part of the path.
+	if runtime.GOOS == "windows" && len(root) >= 3 && root[0] == '/' && root[2] == ':' {
+		root = root[1:]
 	}
 	abs, err := filepath.Abs(root)
 	if err != nil {
