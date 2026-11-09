@@ -143,7 +143,7 @@ services:
     command:
       - "repo"
       - "init"
-      - "s3://pg-hardstorage-demo/?endpoint=http://minio:9000&region=us-east-1&path_style=true"
+      - "s3://pg-hardstorage-demo/?endpoint=http://minio:9000&region=us-east-1&path_style=true&conditional_put=native"
     restart: "no"
 
   # keyring-init prepares the persistent keyring volume so the agent's
@@ -203,7 +203,11 @@ services:
         deployments:
           demo:
             pg_connection: "postgres://postgres:demo@pg:5432/demo?sslmode=disable"
-            repo: "s3://pg-hardstorage-demo/?endpoint=http://minio:9000&region=us-east-1&path_style=true"
+            # conditional_put=native: with an ?endpoint= override the S3
+            # plugin assumes the store does NOT enforce If-None-Match and the
+            # backup lease refuses to run (backup.lease_failed). Silo/MinIO
+            # do enforce it, so the eval stack vouches for its own endpoint.
+            repo: "s3://pg-hardstorage-demo/?endpoint=http://minio:9000&region=us-east-1&path_style=true&conditional_put=native"
             schedule:
               backup:
                 every: "6h"

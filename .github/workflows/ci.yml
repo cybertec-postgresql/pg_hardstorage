@@ -137,7 +137,7 @@ jobs:
           # than checking once, or a slow runner races the first log
           # flush and the one-shot grep spuriously fails.
           deadline=$((SECONDS + 60))
-          until docker compose logs pg_hardstorage 2>&1 | grep -q '"op": "starting"'; do
+          until docker compose logs pg_hardstorage 2>&1 | grep -qE '"op": ?"starting"'; do
             if [ "$SECONDS" -ge "$deadline" ]; then
               echo "::error::agent never emitted its startup event within 60s — config may not have loaded"; dump; exit 1
             fi
