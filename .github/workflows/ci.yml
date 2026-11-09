@@ -539,7 +539,10 @@ jobs:
     name: test (integration, PG ${{ matrix.pg }})
     runs-on: ubuntu-24.04
     needs: [vet]
-    timeout-minutes: 25
+    # 35, not 25: with the S3 fixtures running again (pgsty/silo) the
+    # suite takes 19-22 min on a hosted runner and a slow one took 25:10
+    # on 2026-11-09 — every package green, job cancelled by the budget.
+    timeout-minutes: 35
     strategy:
       fail-fast: false
       matrix:
@@ -972,41 +975,3 @@ jobs:
             echo "=== rpmlint $rpm ==="
             rpmlint -i "$rpm"
           done
-
-  # TEMPORARY (2026-11-09): which fixture leaves anonymous volumes behind
-  # on a hosted runner. The integration lane's leak gate found 10 after the
-  # S3 fixtures first ran on pgsty/silo. Removed with the commit that
-  # records the answer.
-  diag-volumes:
-    name: diag — dangling volumes per fixture
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    steps:
-      - name: silo like the sink (bind /data, rm -fv)
-        run: |
-          set -u
-          echo "baseline: $(docker volume ls -qf dangling=true | wc -l)"
-          d=$(mktemp -d); mkdir -p "$d/bkt"
-          docker run -d --name silo1 -p 127.0.0.1:19000:9000 -v "$d:/data:z" -e MINIO_ROOT_USER=a -e MINIO_ROOT_PASSWORD=bbbbbbbb pgsty/silo:RELEASE.2026-10-26T00-00-00Z server /data
-          sleep 8
-          echo "mounts: $(docker inspect silo1 --format '{{json .Mounts}}')"
-          docker exec silo1 sh -c 'rm -rf /data/* /data/.[!.]* 2>/dev/null' || true
-          docker rm -fv silo1
-          echo "dangling after silo rm -fv: $(docker volume ls -qf dangling=true | wc -l)"
-      - name: postgres like the boot matrix (image VOLUME, rm -f vs rm -fv)
-        run: |
-          set -u
-          docker run -d --name pgm1 -e POSTGRES_PASSWORD=x postgres:17 -c listen_addresses=
-          sleep 5
-          echo "mounts: $(docker inspect pgm1 --format '{{json .Mounts}}')"
-          docker rm -f pgm1
-          echo "dangling after postgres rm -f: $(docker volume ls -qf dangling=true | wc -l)"
-          docker volume prune -f >/dev/null
-          docker run -d --name pgm2 -e POSTGRES_PASSWORD=x postgres:17 -c listen_addresses=
-          sleep 5
-          docker rm -fv pgm2
-          echo "dangling after postgres rm -fv: $(docker volume ls -qf dangling=true | wc -l)"
-      - name: alpine probe
-        run: |
-          docker run --rm alpine:3.20 true
-          echo "dangling after alpine --rm: $(docker volume ls -qf dangling=true | wc -l)"
