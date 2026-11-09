@@ -23,7 +23,7 @@ require (
 	github.com/hashicorp/vault/api v1.23.0
 	github.com/jackc/pglogrepl v0.0.0-20260401131349-e37c41485510
 	github.com/jackc/pgx/v5 v5.9.2
-	github.com/klauspost/compress v1.18.7
+	github.com/klauspost/compress v1.20.2
 	github.com/miekg/pkcs11 v1.1.2
 	github.com/moby/moby/api v1.54.1
 	github.com/pkg/sftp v1.13.10

@@ -21,6 +21,9 @@ keeps reading that version for at least 24 months after a successor lands.
   images installed Go 1.26.0 with `GOTOOLCHAIN=local`, so packages did
   not get the toolchain `go.mod` asked for; every pin is now 1.26.10.
   `golang.org/x/crypto` moves to v0.58.0.
+- **`github.com/klauspost/compress` 1.20.2** (from 1.18.7): GO-2026-6865,
+  a panic on two-block frames in the zstd/fse/huff0 path, was reachable
+  from the zstd compression plugin. Found by the govulncheck gate on CI.
 
 - **`wal` commands accepted a deployment name that escaped the `wal/`
   prefix.** The name was interpolated into storage keys unchecked, so

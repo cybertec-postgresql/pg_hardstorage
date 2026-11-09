@@ -423,7 +423,7 @@ jobs:
     name: storage contract (every backend, skips forbidden)
     runs-on: ubuntu-24.04
     needs: [vet]
-    # Six backends with real fixtures (Azurite, fake-gcs-server, MinIO,
+    # Six backends with real fixtures (Azurite, fake-gcs-server, Silo (S3),
     # atmoz/sftp, host sshd). Measured ~7.5 min for the three cloud
     # emulators alone, so 15 was too tight once they joined.
     timeout-minutes: 30
@@ -457,7 +457,7 @@ jobs:
     # cluster-start smoke) + L7 (assert_restored_match strict).
     #
     # Matrix over every supported sink: file:// (no emulator),
-    # MinIO (S3), Azurite (Azure), atmoz/sftp (SFTP),
+    # Silo/MinIO (S3), Azurite (Azure), atmoz/sftp (SFTP),
     # fake-gcs-server (GCS).  A regression in any storage
     # plugin's backup/restore round-trip fails the matching
     # cell before merge.
@@ -614,7 +614,7 @@ jobs:
     name: test (patroni failover)
     runs-on: ubuntu-24.04
     needs: [vet]
-    timeout-minutes: 45
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -623,8 +623,17 @@ jobs:
           cache: true
       # Docker is preinstalled on ubuntu-24.04 runners; the topology brings
       # up etcd + 3 Spilo nodes via `docker compose`.
+      #
+      # The lane also sweeps in the integration-tagged tests of the topology
+      # package (restore boot matrix across five PG majors, retention boot),
+      # which on a hosted runner took the whole 30 m default by themselves.
+      # The seed of TestBackup_InterruptedByAFailover_FailsHonestly is sized
+      # for a fast developer box (6M rows, ~3 GB); the 7 GB runner killed it,
+      # so it gets the test's own knob.
       - name: patroni failover suite
-        run: make test-patroni
+        env:
+          PGHS_FAILOVER_SEED_ROWS: "2000000"
+        run: make test-patroni PATRONI_TIMEOUT=60m
 
   lint:
     name: golangci-lint
