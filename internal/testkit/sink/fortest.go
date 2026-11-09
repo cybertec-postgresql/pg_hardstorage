@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -17,7 +18,12 @@ import (
 // run into the package timeout instead of failing.
 const (
 	dockerProbeBudget = 20 * time.Second
-	testSinkUpBudget  = 3 * time.Minute
+	// A container start, not just an API answer: a daemon whose
+	// storage has stalled still answers `docker info` while every
+	// `docker run` hangs. Alpine is ~3 MB, so a first-time pull fits.
+	dockerRunProbeBudget = 60 * time.Second
+	dockerRunProbeImage  = "alpine:3.20"
+	testSinkUpBudget     = 3 * time.Minute
 	// After this many consecutive failed starts of one kind, later
 	// tests in the process fail at once instead of waiting again. Two,
 	// not one: a single slow start on a loaded host is routine.
@@ -27,6 +33,9 @@ const (
 var (
 	dockerProbeOnce sync.Once
 	dockerProbeErr  error
+
+	dockerRunProbeOnce sync.Once
+	dockerRunProbeErr  error
 
 	testSinkMu       sync.Mutex
 	testSinkFailures = map[string]int{}
@@ -53,13 +62,54 @@ func dockerAvailable() error {
 	return dockerProbeErr
 }
 
+// dockerRuns reports, once per process, whether the daemon can start
+// and finish a container within dockerRunProbeBudget. Only meaningful
+// after dockerAvailable succeeded.
+func dockerRuns() error {
+	dockerRunProbeOnce.Do(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), dockerRunProbeBudget)
+		defer cancel()
+		out, err := execCommand(ctx, "docker", "run", "--rm", dockerRunProbeImage, "true").CombinedOutput()
+		if err != nil {
+			if ctx.Err() != nil {
+				err = fmt.Errorf("no container finished within %s", dockerRunProbeBudget)
+			}
+			dockerRunProbeErr = fmt.Errorf("docker answers but cannot run a container: %w (output: %s)", err, strings.TrimSpace(string(out)))
+		}
+	})
+	return dockerRunProbeErr
+}
+
+// SkipUnlessContainersRun skips t when no Docker daemon is reachable or
+// the reachable one cannot start a container (storage stalled, cgroup
+// trouble, …). PG_HARDSTORAGE_DEMAND_DOCKER=1 turns either skip into a
+// failure, for CI that promises Docker and must not lose a suite
+// silently. For tests that start containers through the product itself
+// (the verify --full sandbox) rather than through a sink.
+func SkipUnlessContainersRun(t testing.TB) {
+	t.Helper()
+	demand := os.Getenv("PG_HARDSTORAGE_DEMAND_DOCKER") == "1"
+	if err := dockerAvailable(); err != nil {
+		if demand {
+			t.Fatalf("PG_HARDSTORAGE_DEMAND_DOCKER=1 but %v", err)
+		}
+		t.Skipf("%v; skipping", err)
+	}
+	if err := dockerRuns(); err != nil {
+		if demand {
+			t.Fatalf("PG_HARDSTORAGE_DEMAND_DOCKER=1 but %v", err)
+		}
+		t.Skipf("%v; skipping", err)
+	}
+}
+
 // UpForTest starts a fresh sink of the given kind for t, exports its
 // credentials into t's environment and tears it down when t ends.
 //
 // It skips t when the suite cannot or should not run here: under
 // `go test -short` (an emulator container per sub-case is not a short
-// test), without a reachable Docker daemon, or when the fixture image
-// cannot execute on this platform. PG_HARDSTORAGE_DEMAND_DOCKER=1 turns
+// test), without a Docker daemon that can start a container, or when
+// the fixture image cannot execute on this platform. PG_HARDSTORAGE_DEMAND_DOCKER=1 turns
 // the first two skips into a run / a failure, for CI that promises
 // Docker and must not lose the suite silently.
 //
@@ -72,12 +122,7 @@ func UpForTest(t testing.TB, kind string) Runtime {
 	if testing.Short() && !demand {
 		t.Skipf("%s sink needs a Docker container; skipped under -short (PG_HARDSTORAGE_DEMAND_DOCKER=1 to run)", kind)
 	}
-	if err := dockerAvailable(); err != nil {
-		if demand {
-			t.Fatalf("PG_HARDSTORAGE_DEMAND_DOCKER=1 but %v", err)
-		}
-		t.Skipf("%v; skipping the %s suite", err, kind)
-	}
+	SkipUnlessContainersRun(t)
 
 	testSinkMu.Lock()
 	failures, last := testSinkFailures[kind], testSinkLastErr[kind]
