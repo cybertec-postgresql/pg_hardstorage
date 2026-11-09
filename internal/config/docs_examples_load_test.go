@@ -47,7 +47,9 @@ func TestDocumentedConfigExamplesLoad(t *testing.T) {
 		if rerr != nil {
 			return rerr
 		}
-		src := string(raw)
+		// A Windows checkout with core.autocrlf has CRLF line ends;
+		// the fence and key patterns are written for LF.
+		src := strings.ReplaceAll(string(raw), "\r\n", "\n")
 		for _, m := range fence.FindAllStringSubmatchIndex(src, -1) {
 			body := src[m[2]:m[3]]
 			tops := top.FindAllStringSubmatch(body, -1)
@@ -132,7 +134,9 @@ func TestDocumentedConfigClaimsAreReal(t *testing.T) {
 		if rerr != nil {
 			return rerr
 		}
-		src := string(raw)
+		// A Windows checkout with core.autocrlf has CRLF line ends;
+		// the fence and key patterns are written for LF.
+		src := strings.ReplaceAll(string(raw), "\r\n", "\n")
 		for _, m := range fence.FindAllStringSubmatchIndex(src, -1) {
 			body := src[m[2]:m[3]]
 			pre := src[max(0, m[0]-400):m[0]]

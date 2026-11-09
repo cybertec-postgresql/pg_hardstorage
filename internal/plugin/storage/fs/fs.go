@@ -39,6 +39,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/fsutil"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
 )
 
@@ -907,10 +908,10 @@ var dirSyncHook func(dir string)
 // change on a power loss before the parent dentry is flushed.
 //
 // On Linux + macOS this is a real fsync syscall against the
-// directory fd.  On Windows, fsync on a directory is a no-op
-// at the syscall layer and Go's *os.File.Sync returns nil; the
-// helper still works (just doesn't do anything) so the caller
-// path is portable.
+// directory fd.  On Windows it is a no-op (fsutil.SyncDirHandle:
+// FlushFileBuffers refuses a read-only directory handle, and
+// NTFS journals directory metadata itself) so the caller path
+// is portable.
 //
 // Best-effort failure path: a failure to fsync the directory
 // is reported back to the caller but doesn't undo the
@@ -932,7 +933,7 @@ func syncDir(dir string) error {
 		return fmt.Errorf("open dir for fsync: %w", err)
 	}
 	defer d.Close()
-	if err := d.Sync(); err != nil {
+	if err := fsutil.SyncDirHandle(d); err != nil {
 		return fmt.Errorf("fsync dir: %w", err)
 	}
 	return nil

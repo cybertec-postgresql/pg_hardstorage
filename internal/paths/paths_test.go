@@ -1,3 +1,8 @@
+// FHS / XDG resolution is the Unix contract; the Windows contract
+// (ProgramData / AppData) is asserted in winresolution_test.go on
+// every platform through withForcedWindows.
+//go:build !windows
+
 package paths_test
 
 import (

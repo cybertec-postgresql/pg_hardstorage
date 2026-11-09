@@ -39,6 +39,12 @@ func setupPrecedenceWorld(t *testing.T) *paths.Paths {
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
 	t.Setenv("XDG_DATA_HOME", filepath.Join(home, ".local", "share"))
 	t.Setenv("XDG_STATE_HOME", filepath.Join(home, ".local", "state"))
+	// Windows resolves through these instead of XDG; without them the
+	// tests would all write into the runner's real %LOCALAPPDATA% and
+	// read each other's drop-ins.
+	t.Setenv("APPDATA", filepath.Join(home, "AppData", "Roaming"))
+	t.Setenv("LOCALAPPDATA", filepath.Join(home, "AppData", "Local"))
+	t.Setenv("PROGRAMDATA", filepath.Join(home, "ProgramData"))
 
 	// Make sure no env-var config leaks from the test runner.
 	t.Setenv("PG_HARDSTORAGE_CONFIG", "")

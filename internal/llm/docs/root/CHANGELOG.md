@@ -275,6 +275,12 @@ keeps reading that version for at least 24 months after a successor lands.
 
 ### Changed
 
+- **Windows: directory fsync is a no-op.** Every durable write in the
+  file-system plugin and in `fsutil` fsyncs the file, then its parent
+  directory. On Windows the directory step failed with "Access is denied"
+  (`FlushFileBuffers` refuses a read-only directory handle), which made
+  every repository write on Windows fail. NTFS journals directory
+  metadata itself; the file-level fsync is unchanged.
 - **The evaluation stack and the test fixtures run their S3 endpoint on
   `pgsty/silo`**, Pigsty's maintained fork of the MinIO server. MinIO,
   Inc. archived the upstream project and withdrew the `minio/minio` and
