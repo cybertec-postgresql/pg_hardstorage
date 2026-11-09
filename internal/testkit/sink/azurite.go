@@ -187,7 +187,7 @@ func (a *azuriteRuntime) createContainer(ctx context.Context) error {
 // port.  Idempotent.
 func (a *azuriteRuntime) Down(ctx context.Context) error {
 	if a.container != "" {
-		_ = exec.CommandContext(ctx, "docker", "rm", "-fv", a.container).Run()
+		removeContainer(ctx, a.container)
 		a.container = ""
 	}
 	a.port = 0

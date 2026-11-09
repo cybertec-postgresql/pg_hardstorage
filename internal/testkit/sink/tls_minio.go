@@ -309,7 +309,7 @@ func (m *tlsMinioRuntime) Down(ctx context.Context) error {
 			_ = execCommand(ctx, "docker", "exec", m.container,
 				"sh", "-c", "rm -rf /data/* /data/.[!.]* 2>/dev/null").Run()
 		}
-		_ = execCommand(ctx, "docker", "rm", "-fv", m.container).Run()
+		removeContainer(ctx, m.container)
 		m.container = ""
 	}
 	var residue error

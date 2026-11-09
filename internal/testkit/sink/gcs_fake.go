@@ -192,7 +192,7 @@ func (g *gcsFakeRuntime) Down(ctx context.Context) error {
 			_ = exec.CommandContext(ctx, "docker", "exec", g.container,
 				"sh", "-c", "rm -rf /data/* /data/.[!.]* 2>/dev/null").Run()
 		}
-		_ = exec.CommandContext(ctx, "docker", "rm", "-fv", g.container).Run()
+		removeContainer(ctx, g.container)
 		g.container = ""
 	}
 	var residue error

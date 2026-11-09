@@ -350,3 +350,19 @@ func PreflightAirgap(ctx context.Context, kind string) error {
 	}
 	return nil
 }
+
+// removeContainer removes a sink's container together with every volume
+// mounted into it. `docker rm -fv` drops the anonymous volumes Docker
+// created for the image's VOLUME declarations; the explicit pass covers
+// whatever that leaves (a volume Docker did not consider "anonymous to
+// this container"), because the CI integration lane fails on a single
+// dangling volume. Errors are ignored: Down is best-effort and the
+// container may already be gone.
+func removeContainer(ctx context.Context, container string) {
+	out, _ := execCommand(ctx, "docker", "inspect", "-f",
+		`{{range .Mounts}}{{if eq .Type "volume"}}{{.Name}}{{"\n"}}{{end}}{{end}}`, container).Output()
+	_ = execCommand(ctx, "docker", "rm", "-fv", container).Run()
+	for _, v := range strings.Fields(string(out)) {
+		_ = execCommand(ctx, "docker", "volume", "rm", "-f", v).Run()
+	}
+}

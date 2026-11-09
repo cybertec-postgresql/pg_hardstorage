@@ -264,7 +264,7 @@ func (m *minioRuntime) Down(ctx context.Context) error {
 			_ = exec.CommandContext(ctx, "docker", "exec", m.container,
 				"sh", "-c", "rm -rf /data/* /data/.[!.]* 2>/dev/null").Run()
 		}
-		_ = exec.CommandContext(ctx, "docker", "rm", "-fv", m.container).Run()
+		removeContainer(ctx, m.container)
 		m.container = ""
 	}
 	var residue error

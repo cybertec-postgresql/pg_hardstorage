@@ -158,7 +158,7 @@ func runBootMatrixFor(t *testing.T, ctx context.Context, major, image string) {
 	t.Cleanup(func() {
 		cctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer cancel()
-		_, _ = dockerOut(cctx, "rm", "-f", src)
+		_, _ = dockerOut(cctx, "rm", "-fv", src) // -v: the image declares a VOLUME for PGDATA
 	})
 
 	psqlSrc := func(sql string) string {

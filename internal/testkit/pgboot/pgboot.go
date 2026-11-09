@@ -129,7 +129,7 @@ func Boot(tb testing.TB, ctx context.Context, image, dataDir string, mounts, env
 	tb.Cleanup(func() {
 		cctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer cancel()
-		_, _ = Docker(cctx, "rm", "-f", name)
+		_, _ = Docker(cctx, "rm", "-fv", name) // -v: the image declares a VOLUME for its default PGDATA
 		me := fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid())
 		ChownAll(tb, cctx, dataDir, me)
 	})

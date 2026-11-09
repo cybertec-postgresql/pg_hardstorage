@@ -85,7 +85,7 @@ func TestRetentionThenRecovery_PrunedArchiveStillBoots(t *testing.T) {
 	t.Cleanup(func() {
 		cctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer cancel()
-		_, _ = dockerOut(cctx, "rm", "-f", src)
+		_, _ = dockerOut(cctx, "rm", "-fv", src) // -v: the image declares a VOLUME for PGDATA
 	})
 	psqlSrc := func(sql string) string {
 		out, err := dockerOut(ctx, "exec", src, "psql", "-U", "postgres", "-tAc", sql)

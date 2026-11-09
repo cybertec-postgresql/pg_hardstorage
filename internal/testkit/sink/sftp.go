@@ -295,7 +295,7 @@ func (s *sftpRuntime) Down(ctx context.Context) error {
 			_ = exec.CommandContext(ctx, "docker", "exec", s.container,
 				"sh", "-c", "rm -rf /home/"+sftpUser+"/"+sftpDir+"/* /home/"+sftpUser+"/"+sftpDir+"/.[!.]*").Run()
 		}
-		_ = exec.CommandContext(ctx, "docker", "rm", "-fv", s.container).Run()
+		removeContainer(ctx, s.container)
 		s.container = ""
 	}
 	if s.scratchDir != "" {
