@@ -14,6 +14,35 @@ One page per `pg_hardstorage` subcommand.  Pages are
 generated from the Cobra command tree on every
 `make docs-regen`; CI fails on drift.
 
+## Conventions
+
+### Previewing and confirming a change
+
+Commands that change or delete data come in three styles. Which one a
+command uses is fixed by its flags, and no command carries both
+`--apply` and `--dry-run`:
+
+| Flags | Bare invocation | To act | Commands |
+| --- | --- | --- | --- |
+| `--apply` | dry run: reports what it would do and changes nothing | `--apply` | `kms rotate`, `repair chunks`, `repo compact`, `repo gc`, `rotate`, `timetable emit`, `wal prune` |
+| `--dry-run` and `--yes` | see the command's page: a bulk removal refuses until confirmed | `--yes`; `--dry-run` previews without confirmation | `approval purge-expired`, `hold purge-expired`, `kms shred`, `wal gap-purge` |
+| `--dry-run` | acts | `--dry-run` previews | `agent`, `db install-extension`, `gameday run`, `redact apply`, `repo replicate` |
+
+So `--apply` always means "the default was a dry run", and
+`--dry-run` always means "the default acts, or asks first".
+
+### Output
+
+`-o/--output` selects the encoding on every command: text on a
+terminal, JSON off one. On the report commands below, `--format`
+selects only the layout of the text report (`json` = compact
+summary, `markdown` = full report); `-o json` emits the JSON body
+whatever `--format` says.
+
+`backup graph`, `compliance report`, `forecast`, `recovery drill`, `recovery drill history`, `recovery readiness`, `recovery windows`, `repo replicate verify`
+
+## Commands
+
 | Command | Synopsis |
 | --- | --- |
 | [`pg_hardstorage`](pg_hardstorage.md) | PostgreSQL backup, done right. |

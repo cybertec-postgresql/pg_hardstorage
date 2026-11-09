@@ -244,8 +244,9 @@ type DeploymentConfig struct {
 	// terminal when the scheduler fires (issue #53).
 	Drill DrillConfig `yaml:"drill,omitempty"`
 
-	// Retention overrides the default retention policy. v0.1 ships
-	// with a hard-coded GFS default; this is forward-compat scaffolding.
+	// Retention overrides the default retention policy (GFS 7/4/12/5)
+	// for the scheduled rotate task and for a manual `rotate` without
+	// policy flags.
 	Retention RetentionConfig `yaml:"retention,omitempty"`
 
 	// Classification is the data sensitivity tag for this deployment.
@@ -278,11 +279,11 @@ type DeploymentConfig struct {
 
 	// SLO declares per-deployment RPO/RTO targets. Empty fields
 	// mean "no target declared"; `slo report` compares actual
-	// last-backup-age against RPO and (when+ wires it)
+	// last-backup-age against RPO and (when a later release wires it)
 	// observed restore times against RTO.
 	SLO SLOConfig `yaml:"slo,omitempty" json:"slo,omitempty"`
 
-	// Patroni opts the deployment into the+ leader-follow
+	// Patroni opts the deployment into the leader-follow
 	// coordinator (internal/wal/follower). When URL is set, the
 	// agent runs a dedicated goroutine per deployment that polls
 	// Patroni REST, reconciles the replication slot on leader
@@ -542,16 +543,41 @@ func (s ScheduleSpec) IsZero() bool {
 	return s.Every == "" && s.DailyAt == "" && s.At == ""
 }
 
-// RetentionConfig is the operator-controlled retention policy.
-// Forward-compat shape; v0.1 ignores all fields and uses hard defaults.
+// RetentionConfig is the operator-controlled retention policy, consumed
+// by the scheduled rotate task and by a manual `rotate` that passes no
+// policy flags (cli.buildRetentionPolicy).
+//
+// The keep_* counts are pointers because unset and zero mean different
+// things: an unset count takes the built-in default (GFS 7/4/12/5,
+// count 14) or, in a conf.d overlay, inherits the base value; an
+// explicit 0 keeps nothing in that bucket — the same meaning
+// `rotate --keep-daily 0` has. The newest backup is kept regardless.
 type RetentionConfig struct {
 	Policy      string `yaml:"policy,omitempty"` // "gfs", "simple", "count"
-	KeepDaily   int    `yaml:"keep_daily,omitempty"`
-	KeepWeekly  int    `yaml:"keep_weekly,omitempty"`
-	KeepMonthly int    `yaml:"keep_monthly,omitempty"`
-	KeepYearly  int    `yaml:"keep_yearly,omitempty"`
+	KeepDaily   *int   `yaml:"keep_daily,omitempty"`
+	KeepWeekly  *int   `yaml:"keep_weekly,omitempty"`
+	KeepMonthly *int   `yaml:"keep_monthly,omitempty"`
+	KeepYearly  *int   `yaml:"keep_yearly,omitempty"`
 	KeepFor     string `yaml:"keep_for,omitempty"` // duration string
-	KeepFulls   int    `yaml:"keep_fulls,omitempty"`
+	KeepFulls   *int   `yaml:"keep_fulls,omitempty"`
+}
+
+// Keep returns a retention count for a RetentionConfig literal.
+func Keep(n int) *int { return &n }
+
+// Equal reports whether two retention blocks declare the same policy.
+// RetentionConfig holds pointers, so == would compare addresses.
+func (r RetentionConfig) Equal(o RetentionConfig) bool {
+	eq := func(a, b *int) bool {
+		if a == nil || b == nil {
+			return a == b
+		}
+		return *a == *b
+	}
+	return r.Policy == o.Policy && r.KeepFor == o.KeepFor &&
+		eq(r.KeepDaily, o.KeepDaily) && eq(r.KeepWeekly, o.KeepWeekly) &&
+		eq(r.KeepMonthly, o.KeepMonthly) && eq(r.KeepYearly, o.KeepYearly) &&
+		eq(r.KeepFulls, o.KeepFulls)
 }
 
 // PathsConfig mirrors the paths-package overrides we accept from YAML.
@@ -1018,8 +1044,10 @@ func validateDeployment(name string, dep DeploymentConfig) error {
 	return nil
 }
 
-// Marshal returns the YAML serialisation of cfg. Used by `init`
-// to write the merged config back out as a canonical pg_hardstorage.yaml.
+// Marshal returns the YAML serialisation of cfg as a NEW file: the
+// canonical layout under a header comment. Writing over an existing
+// file goes through MarshalPreserving, which keeps the operator's
+// comments; Marshal alone would replace the file wholesale.
 //
 // The output preserves field order from the struct definition (yaml.v3
 // emits in declaration order). Empty / zero-value fields with the
@@ -1035,7 +1063,9 @@ func Marshal(cfg *Config) ([]byte, error) {
 	}
 	// Add a small header comment so anyone opening the file knows
 	// what it is and which schema version it targets.
-	header := "# pg_hardstorage configuration\n# Schema: " + Schema + "\n# This file is managed by `pg_hardstorage init`. Hand edits are preserved.\n\n"
+	header := "# pg_hardstorage configuration\n# Schema: " + Schema + "\n" +
+		"# Written by `pg_hardstorage init`; the config-editing commands update it in\n" +
+		"# place and keep your comments and key order.\n\n"
 	return append([]byte(header), body...), nil
 }
 
@@ -1160,29 +1190,31 @@ func mergeDeployment(existing, overlay DeploymentConfig) DeploymentConfig {
 	// became 7 and dailies 8-30 pruned early. (This is the exact
 	// partial-override case the block's own history cites; wholesale
 	// replace fixed "dropped entirely" but not "partial loses base".)
-	// Zero means "inherit" throughout this system — the config layer
-	// treats 0 as "use default", so no field can legitimately mean
-	// "keep zero", making override-if-nonzero correct.
+	// Unset means "inherit": the keep_* counts are pointers, so an
+	// overlay that does not mention a count leaves the base value alone
+	// while an explicit `keep_weekly: 0` overrides it (and disables that
+	// bucket). Copy the value, not the pointer, so base and overlay never
+	// alias.
 	if overlay.Retention.Policy != "" {
 		existing.Retention.Policy = overlay.Retention.Policy
 	}
-	if overlay.Retention.KeepDaily != 0 {
-		existing.Retention.KeepDaily = overlay.Retention.KeepDaily
+	if v := overlay.Retention.KeepDaily; v != nil {
+		existing.Retention.KeepDaily = Keep(*v)
 	}
-	if overlay.Retention.KeepWeekly != 0 {
-		existing.Retention.KeepWeekly = overlay.Retention.KeepWeekly
+	if v := overlay.Retention.KeepWeekly; v != nil {
+		existing.Retention.KeepWeekly = Keep(*v)
 	}
-	if overlay.Retention.KeepMonthly != 0 {
-		existing.Retention.KeepMonthly = overlay.Retention.KeepMonthly
+	if v := overlay.Retention.KeepMonthly; v != nil {
+		existing.Retention.KeepMonthly = Keep(*v)
 	}
-	if overlay.Retention.KeepYearly != 0 {
-		existing.Retention.KeepYearly = overlay.Retention.KeepYearly
+	if v := overlay.Retention.KeepYearly; v != nil {
+		existing.Retention.KeepYearly = Keep(*v)
 	}
 	if overlay.Retention.KeepFor != "" {
 		existing.Retention.KeepFor = overlay.Retention.KeepFor
 	}
-	if overlay.Retention.KeepFulls != 0 {
-		existing.Retention.KeepFulls = overlay.Retention.KeepFulls
+	if v := overlay.Retention.KeepFulls; v != nil {
+		existing.Retention.KeepFulls = Keep(*v)
 	}
 	if overlay.TDE.Enabled {
 		existing.TDE.Enabled = true

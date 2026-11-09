@@ -290,6 +290,12 @@ func (t *Throttle) Get(ctx context.Context, key string) (io.ReadCloser, error) {
 	return t.inner.Get(ctx, key)
 }
 
+// GetFrom delegates via storage.GetFrom, so a resumed read keeps the
+// backend's ranged request when it has one.
+func (t *Throttle) GetFrom(ctx context.Context, key string, offset int64) (io.ReadCloser, error) {
+	return storage.GetFrom(ctx, t.inner, key, offset)
+}
+
 // Stat delegates.
 func (t *Throttle) Stat(ctx context.Context, key string) (storage.ObjectInfo, error) {
 	return t.inner.Stat(ctx, key)
@@ -363,6 +369,13 @@ func (t *Throttle) ReapStaging(ctx context.Context, olderThan time.Duration) (st
 	return storage.ReapStats{Unsupported: true}, nil
 }
 
+// Retention delegates via storage.RetentionOf so the CAS can read an
+// adopted chunk's lock through the wrapper. Metadata-only, not
+// throttled.
+func (t *Throttle) Retention(ctx context.Context, key string) (time.Time, storage.WORMMode, error) {
+	return storage.RetentionOf(ctx, t.inner, key)
+}
+
 // Compile-time assertions that we satisfy StoragePlugin and forward
 // every optional capability interface. A middleware that drops one
 // turns a backend that HAS the capability into one that reports it
@@ -373,4 +386,6 @@ var (
 	_ storage.RegionAware      = (*Throttle)(nil)
 	_ storage.FreeSpaceAware   = (*Throttle)(nil)
 	_ storage.StagingReapAware = (*Throttle)(nil)
+	_ storage.RetentionAware   = (*Throttle)(nil)
+	_ storage.OffsetReadAware  = (*Throttle)(nil)
 )

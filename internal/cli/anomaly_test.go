@@ -167,6 +167,9 @@ func TestAnomaly_StableBaselineNoFlag(t *testing.T) {
 	if body.FlaggedCount != 0 {
 		t.Errorf("stable baseline should not flag; got %d", body.FlaggedCount)
 	}
+	if got := anomalyBodySchema(t, stdout); got != anomaly.Schema {
+		t.Errorf("scored body schema = %q, want %q", got, anomaly.Schema)
+	}
 }
 
 // TestAnomaly_OutlierFlagsAndExitsVerifyFailed: 5 identical-sized
@@ -287,4 +290,23 @@ func TestAnomaly_SchemaStable(t *testing.T) {
 	if err := stdjson.Unmarshal([]byte(stdout), &res); err != nil {
 		t.Fatalf("decode envelope: %v\n%s", err, stdout)
 	}
+	// The body itself must carry the tag. It used to be assigned inside
+	// WriteText — a value receiver that never runs for JSON — so every
+	// JSON body shipped "schema": "".
+	if got := anomalyBodySchema(t, stdout); got != anomaly.Schema {
+		t.Errorf("empty-deployment body schema = %q, want %q\n%s", got, anomaly.Schema, stdout)
+	}
+}
+
+func anomalyBodySchema(t *testing.T, stdout string) string {
+	t.Helper()
+	var env struct {
+		Result struct {
+			Schema string `json:"schema"`
+		} `json:"result"`
+	}
+	if err := stdjson.Unmarshal([]byte(stdout), &env); err != nil {
+		t.Fatalf("decode body: %v\n%s", err, stdout)
+	}
+	return env.Result.Schema
 }

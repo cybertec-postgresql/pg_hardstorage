@@ -82,6 +82,9 @@ primitive, no exit-code flip, no audit emission.`,
 
 func runWalAudit(cmd *cobra.Command, deployment, repoURL string, tliFilter uint32) error {
 	d := DispatcherFrom(cmd)
+	if err := validateWALDeployment("wal audit", deployment); err != nil {
+		return err
+	}
 	repoMeta, sp, err := openRepo(cmd.Context(), repoURL)
 	if err != nil {
 		return err

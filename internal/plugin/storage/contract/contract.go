@@ -107,6 +107,7 @@ func Run(t *testing.T, open PluginOpener) {
 		{"StorageClass_ToleratedWhenUnsupported", caseStorageClassTolerated},
 		{"DurabilityBarrier_MatchesAdvertisedCapability", caseDurabilityBarrierHonesty},
 		{"Multipart_HandlesLargeObject", caseMultipartLargeObject},
+		{"GetFrom_ReturnsTheTail", caseGetFrom},
 	}
 	for _, c := range cases {
 		c := c
@@ -171,6 +172,29 @@ func caseRoundTrip(t *testing.T, p storage.StoragePlugin) {
 	putString(t, p, "rt/file", body)
 	if got := getString(t, p, "rt/file"); got != body {
 		t.Errorf("round-trip body mismatch: got %q, want %q", got, body)
+	}
+}
+
+// caseGetFrom: storage.GetFrom returns exactly the bytes from offset on,
+// through the backend's ranged read where it has one (OffsetReadAware)
+// and by skipping the prefix where it has not. A resumed manifest read
+// depends on the two agreeing byte for byte (issue #97).
+func caseGetFrom(t *testing.T, p storage.StoragePlugin) {
+	const body = "0123456789abcdefghijklmnopqrstuvwxyz"
+	putString(t, p, "range/k", body)
+	for _, off := range []int64{0, 1, 10, int64(len(body)) - 1} {
+		rc, err := storage.GetFrom(context.Background(), p, "range/k", off)
+		if err != nil {
+			t.Fatalf("GetFrom(%d): %v", off, err)
+		}
+		got, rerr := io.ReadAll(rc)
+		_ = rc.Close()
+		if rerr != nil || string(got) != body[off:] {
+			t.Errorf("GetFrom(%d) = %q (%v), want %q", off, got, rerr, body[off:])
+		}
+	}
+	if _, err := storage.GetFrom(context.Background(), p, "range/missing", 5); !errors.Is(err, storage.ErrNotFound) {
+		t.Errorf("GetFrom on a missing key: err = %v, want ErrNotFound", err)
 	}
 }
 

@@ -1,3 +1,5 @@
+//go:build !windows
+
 package backup_test
 
 import (

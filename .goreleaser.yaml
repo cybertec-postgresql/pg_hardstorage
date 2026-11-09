@@ -167,12 +167,21 @@ homebrew_casks:
         # The release binaries are cosign-signed but NOT Apple-notarised,
         # so on macOS Gatekeeper would quarantine the binary and refuse to
         # run it ("pg_hardstorage is damaged and cannot be opened").  Strip
-        # the quarantine xattr on install.  Guarded by OS.mac? so the Linux
-        # cask path is unaffected.
-        install: |
-          if OS.mac?
-            system_command "/usr/bin/xattr",
-                           args: ["-dr", "com.apple.quarantine", "#{staged_path}/pg_hardstorage"]
+        # the quarantine xattr on install.  Guarded by on_macos so the
+        # Linux cask path is unaffected.
+        #
+        # install_steps (goreleaser >= 2.19) is written to the cask as a
+        # `postflight_steps` block: Homebrew's declarative steps, which
+        # replace the Ruby `postflight` block that `install:` produced
+        # and that Homebrew now warns about (issue #91). A steps block
+        # takes literal arguments only, so the path is the install-time
+        # token {{staged_path}} rather than Ruby's #{staged_path}; it is
+        # wrapped in a Go-template string because goreleaser templates
+        # this field first and would otherwise try to evaluate it.
+        install_steps: |
+          on_macos do
+            run "/usr/bin/xattr",
+                args: ["-dr", "com.apple.quarantine", "{{ "{{staged_path}}" }}/pg_hardstorage"]
           end
 
 checksum:

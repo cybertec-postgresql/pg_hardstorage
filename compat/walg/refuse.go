@@ -25,14 +25,6 @@ func refuseUnimplemented(w io.Writer, command, suggestion string) error {
 	return &shimError{exitCode: notImplementedExitCode, message: msg}
 }
 
-// warnDroppedFlag prints a non-fatal warning when a WAL-G env var has
-// no native equivalent because the underlying behaviour differs.
-// The shim still proceeds; the operator's existing scripts keep
-// working with the new (better) default.
-func warnDroppedFlag(w io.Writer, name, rationale string) {
-	fmt.Fprintf(w, "pg-hardstorage-walg: warning: %s ignored — %s\n", name, rationale)
-}
-
 // shimError carries an exit code so cmd/pg-hardstorage-walg's main
 // can return the right process status.  Mirrors compat/barman and
 // compat/pgbackrest.

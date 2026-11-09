@@ -150,10 +150,10 @@ func WriteFileAtomic(path string, data []byte, mode os.FileMode) error {
 // change on a power loss before the parent dentry is flushed.
 //
 // On Linux + macOS this is a real fsync syscall against the
-// directory fd.  On Windows, fsync on a directory is a no-op
-// at the syscall layer and Go's *os.File.Sync returns nil; the
-// helper still works (just doesn't do anything) so callers
-// remain portable.
+// directory fd.  On Windows it is a no-op (see SyncDirHandle:
+// FlushFileBuffers refuses a read-only directory handle, and
+// NTFS journals directory metadata itself) so callers remain
+// portable.
 //
 // A non-existent dir returns nil — typical for the first write
 // into a fresh prefix where MkdirAll just happened and we're
@@ -167,7 +167,7 @@ func SyncDir(dir string) error {
 		return fmt.Errorf("fsutil: open dir %q for fsync: %w", dir, err)
 	}
 	defer d.Close()
-	if err := d.Sync(); err != nil {
+	if err := SyncDirHandle(d); err != nil {
 		return fmt.Errorf("fsutil: fsync dir %q: %w", dir, err)
 	}
 	return nil

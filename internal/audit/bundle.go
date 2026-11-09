@@ -17,7 +17,6 @@ import (
 	"fmt"
 	"io"
 	"path/filepath"
-	"sort"
 	"strings"
 	"time"
 
@@ -137,6 +136,12 @@ type ExportOptions struct {
 
 	// Now overrides time.Now() for deterministic test output.
 	Now time.Time
+
+	// SpoolDir is where the export keeps its temp files: the sorted
+	// events and the canonical signing input, together about twice the
+	// size of events.ndjson. Empty = os.TempDir(). ExportBundle removes
+	// what it created there before it returns.
+	SpoolDir string
 }
 
 // ExportBundle writes a signed evidence bundle to w.  Returns
@@ -167,6 +172,13 @@ type ExportOptions struct {
 // bytes — not the tar bytes — so bundle re-archiving (different
 // tar tools, different timestamps) doesn't invalidate the
 // signature.
+//
+// Memory does not grow with the window: the events and the signing
+// input live in temp files under opts.SpoolDir (see ExportOptions),
+// which are removed before ExportBundle returns, whether it succeeds,
+// fails or ctx is cancelled. Nothing is written to w until the bundle
+// has been signed; on an error after that point w holds a truncated
+// archive the caller must discard.
 func ExportBundle(ctx context.Context, sp storage.StoragePlugin, w io.Writer, signer EventSigner, opts ExportOptions) (*BundleResult, error) {
 	if sp == nil {
 		return nil, errors.New("audit: ExportBundle: nil StoragePlugin")
@@ -192,47 +204,84 @@ func ExportBundle(ctx context.Context, sp storage.StoragePlugin, w io.Writer, si
 		res.DurationMS = res.StoppedAt.Sub(started).Milliseconds()
 	}
 
-	store := NewStore(sp)
-	events, err := store.Search(ctx, opts.Filters)
-	if err != nil {
+	fail := func(err error) (*BundleResult, error) {
 		finish()
-		return res, fmt.Errorf("audit: ExportBundle: search events: %w", err)
+		return res, err
 	}
 
-	var anchors []*Anchor
+	// Nothing below holds the window in memory. The matching events go
+	// through an external sorter (their order is global, across shards,
+	// so it only exists once every shard has been read) straight into the
+	// canonical signing input on disk; that file is memory-mapped for the
+	// signature and then streamed into the archive. The temp files are
+	// gone on every return path.
+	store := NewStore(sp)
+	matches, err := store.sortMatches(ctx, opts.Filters, opts.SpoolDir)
+	if err != nil {
+		return fail(fmt.Errorf("audit: ExportBundle: search events: %w", err))
+	}
+	defer matches.Close()
+
+	// The signed files, in the order they appear in the tar.
+	// signed_files ORDER MATTERS — the auditor reproduces the
+	// signature by concatenating in this exact order. bundle.json is
+	// always signed AND last in the order so the verifier knows which
+	// other files were included.
+	signedFiles := []string{"events.ndjson"}
 	if opts.IncludeAnchors {
-		anchors, err = collectAnchors(ctx, sp, opts.Filters)
+		signedFiles = append(signedFiles, "anchors.ndjson")
+	}
+	signedFiles = append(signedFiles, "chain_proof.json", "public_key.pem", "README.md", "bundle.json")
+
+	spool, err := newBundleSpool(opts.SpoolDir, len(signedFiles))
+	if err != nil {
+		return fail(fmt.Errorf("audit: ExportBundle: create spool: %w", err))
+	}
+	defer spool.Close()
+
+	// events.ndjson: one event per line, in commit order.
+	spool.begin("events.ndjson")
+	eventCount, first, last, err := writeEventsNDJSON(ctx, matches, spool)
+	if err != nil {
+		return fail(fmt.Errorf("audit: ExportBundle: spool events: %w", err))
+	}
+	// The sorted copy has been consumed; drop it now rather than at
+	// return so the export's peak disk use is not three copies of the
+	// events (sorter runs, canonical form, archive).
+	_ = matches.Close()
+
+	// anchors.ndjson: one anchor per line.  Skipped when
+	// IncludeAnchors=false.
+	anchorCount := 0
+	if opts.IncludeAnchors {
+		spool.begin("anchors.ndjson")
+		anchorCount, err = writeAnchorsNDJSON(ctx, sp, opts.Filters, opts.SpoolDir, spool)
 		if err != nil {
-			finish()
-			return res, fmt.Errorf("audit: ExportBundle: collect anchors: %w", err)
+			return fail(fmt.Errorf("audit: ExportBundle: collect anchors: %w", err))
 		}
 	}
 
 	// Head-pointer metadata for the chain proof. With a sharded chain
 	// there is no single repo-wide head, so the bundle describes its OWN
-	// tip: the newest event it contains (Search returns them in
+	// tip: the newest event it contains (the events are streamed in
 	// timestamp order). This is self-consistent regardless of which
 	// shards the filtered events came from, and matches the LastEvent
 	// edge recorded in the chain proof. An empty bundle falls back to
 	// the global chain head. The bundle's integrity is the ed25519
 	// signature over its files, not a head recomputation.
 	var headPtr *HeadPointer
-	if len(events) > 0 {
-		tip := events[len(events)-1]
+	if last != nil {
 		headPtr = &HeadPointer{
 			Schema:   HeadPointerSchema,
-			Sequence: tip.Sequence,
-			Hash:     tip.Hash,
-			EventID:  tip.ID,
-			Key:      keyFor(tip),
+			Sequence: last.Sequence,
+			Hash:     last.Hash,
+			EventID:  last.ID,
+			Key:      keyFor(last),
 		}
 	} else {
 		headPtr, _ = store.readHeadPointer(ctx, "")
 	}
 
-	// Build each file's bytes in the order they appear in the
-	// tar.  signed_files ORDER MATTERS — the auditor reproduces
-	// the signature by concatenating in this exact order.
 	manifest := &BundleManifest{
 		Schema:               BundleSchema,
 		GeneratedAt:          now,
@@ -241,9 +290,10 @@ func ExportBundle(ctx context.Context, sp storage.StoragePlugin, w io.Writer, si
 		Since:                opts.Filters.Since,
 		Until:                opts.Filters.Until,
 		Filters:              filtersToBundleFilters(opts.Filters),
-		EventCount:           len(events),
-		AnchorCount:          len(anchors),
+		EventCount:           eventCount,
+		AnchorCount:          anchorCount,
 		PublicKeyFingerprint: publicKeyFingerprint(signer.PublicKey()),
+		SignedFiles:          signedFiles,
 		SignatureAlgorithm:   "ed25519",
 	}
 	if headPtr != nil {
@@ -253,79 +303,60 @@ func ExportBundle(ctx context.Context, sp storage.StoragePlugin, w io.Writer, si
 		res.HeadSequence = headPtr.Sequence
 	}
 
-	files := []bundleFile{}
-
-	// events.ndjson: one event per line, in commit order.
-	eventsBody := encodeEventsNDJSON(events)
-	files = append(files, bundleFile{Name: "events.ndjson", Body: eventsBody})
-
-	// anchors.ndjson: one anchor per line.  Skipped when
-	// IncludeAnchors=false.
-	if opts.IncludeAnchors {
-		anchorsBody := encodeAnchorsNDJSON(anchors)
-		files = append(files, bundleFile{Name: "anchors.ndjson", Body: anchorsBody})
-	}
-
 	// chain_proof.json: head pointer + window edge events with
 	// their hashes so an auditor can re-derive the chain edge
 	// without fetching the rest of the repo.
-	chainProof := buildChainProof(events, headPtr)
+	chainProof := buildChainProof(first, last, headPtr)
 	chainProofBody, err := json.MarshalIndent(chainProof, "", "  ")
 	if err != nil {
-		finish()
-		return res, fmt.Errorf("audit: marshal chain proof: %w", err)
+		return fail(fmt.Errorf("audit: marshal chain proof: %w", err))
 	}
-	files = append(files, bundleFile{Name: "chain_proof.json", Body: chainProofBody})
+	spool.add("chain_proof.json", chainProofBody)
 
 	// public_key.pem: operator's signing public key.
 	pubPEM, err := signer.PublicKeyPEM()
 	if err != nil {
-		finish()
-		return res, fmt.Errorf("audit: marshal public key: %w", err)
+		return fail(fmt.Errorf("audit: marshal public key: %w", err))
 	}
-	files = append(files, bundleFile{Name: "public_key.pem", Body: pubPEM})
+	spool.add("public_key.pem", pubPEM)
 
 	// README.md: verifier instructions.  Always-present so an
 	// auditor opening the tarball without the project's docs can
 	// still verify.
-	files = append(files, bundleFile{Name: "README.md", Body: bundleReadme()})
+	spool.add("README.md", bundleReadme())
 
-	// Record the file order in the manifest BEFORE building
-	// bundle.json (which is itself one of the signed files).
-	manifest.SignedFiles = make([]string, 0, len(files)+1)
-	for _, f := range files {
-		manifest.SignedFiles = append(manifest.SignedFiles, f.Name)
-	}
-	// bundle.json is always signed AND last in the order so the
-	// verifier knows which other files were included.
-	manifest.SignedFiles = append(manifest.SignedFiles, "bundle.json")
-
+	// bundle.json is itself one of the signed files; it could only be
+	// built now that the counts and the head are known.
 	manifestBody, err := json.MarshalIndent(manifest, "", "  ")
 	if err != nil {
-		finish()
-		return res, fmt.Errorf("audit: marshal bundle manifest: %w", err)
+		return fail(fmt.Errorf("audit: marshal bundle manifest: %w", err))
 	}
-	files = append(files, bundleFile{Name: "bundle.json", Body: manifestBody})
+	spool.add("bundle.json", manifestBody)
 
 	// Sign the canonical concatenation of file bytes.
-	sigInput := canonicalBundleBytes(files)
-	signature := signer.Sign(sigInput)
-
-	files = append(files, bundleFile{Name: "signature.sig", Body: signature})
+	if err := spool.seal(); err != nil {
+		return fail(fmt.Errorf("audit: ExportBundle: write spool: %w", err))
+	}
+	if err := ctx.Err(); err != nil {
+		return fail(fmt.Errorf("audit: ExportBundle: %w", err))
+	}
+	signature, err := spool.sign(signer)
+	if err != nil {
+		return fail(fmt.Errorf("audit: ExportBundle: sign: %w", err))
+	}
 
 	// Build the gzipped tar archive.  We compute the SHA-256
 	// of the tar.gz bytes as a separate digest the operator
 	// records out-of-band.
-	hashed, archiveBytes, err := buildTarGz(w, files, now)
+	hashed, archiveBytes, err := writeBundleArchive(ctx, w, spool, signature, now)
 	if err != nil {
-		finish()
-		return res, fmt.Errorf("audit: build tar: %w", err)
+		return fail(fmt.Errorf("audit: build tar: %w", err))
 	}
 
 	res.SHA256 = hashed
 	res.BundleBytes = archiveBytes
-	res.EventCount = len(events)
-	res.AnchorCount = len(anchors)
+	res.EventCount = eventCount
+	res.AnchorCount = anchorCount
 	res.Manifest = manifest
 
 	finish()
@@ -337,6 +368,10 @@ func ExportBundle(ctx context.Context, sp storage.StoragePlugin, w io.Writer, si
 // on the backup package (avoiding an import cycle: backup
 // imports audit via the audit chain in the manifest commit
 // path; if audit imported backup we'd cycle).
+//
+// Sign must not keep payload after it returns: ExportBundle hands it
+// a memory-mapped view of the spooled signing input and unmaps it as
+// soon as the signature is back.
 type EventSigner interface {
 	Sign(payload []byte) []byte
 	PublicKey() ed25519.PublicKey
@@ -365,6 +400,10 @@ type bundleFile struct {
 //
 // signature.sig itself is excluded — it can't sign itself.
 //
+// The exporter does not call this: it writes the same bytes to disk
+// (bundleSpool) so a large window is never held in memory. The two must
+// stay byte-for-byte equivalent; bundle_stream_internal_test.go checks it.
+//
 // The auditor reproduces this exactly: extract the tarball,
 // read manifest.signed_files in order, concatenate per-file
 // bytes per the format above, SHA-256, verify against
@@ -391,43 +430,6 @@ func appendU64BE(b []byte, v uint64) []byte {
 		byte(v>>24), byte(v>>16), byte(v>>8), byte(v))
 }
 
-// buildTarGz writes the gzipped tar archive to w + computes a
-// SHA-256 over the gzipped bytes for the operator's record.
-//
-// The tar's mtime fields are set to `now` (single value across
-// every file) so a re-build of the same input yields the same
-// bytes — useful for reproducible bundles.
-func buildTarGz(w io.Writer, files []bundleFile, now time.Time) (string, int64, error) {
-	hasher := sha256.New()
-	mw := io.MultiWriter(w, hasher)
-	counter := &writeCounter{w: mw}
-	gw := gzip.NewWriter(counter)
-	tw := tar.NewWriter(gw)
-
-	for _, f := range files {
-		hdr := &tar.Header{
-			Name:    f.Name,
-			Mode:    0o644,
-			Size:    int64(len(f.Body)),
-			ModTime: now,
-			Format:  tar.FormatPAX,
-		}
-		if err := tw.WriteHeader(hdr); err != nil {
-			return "", 0, err
-		}
-		if _, err := tw.Write(f.Body); err != nil {
-			return "", 0, err
-		}
-	}
-	if err := tw.Close(); err != nil {
-		return "", 0, err
-	}
-	if err := gw.Close(); err != nil {
-		return "", 0, err
-	}
-	return hex.EncodeToString(hasher.Sum(nil)), counter.n, nil
-}
-
 // writeCounter wraps an io.Writer + counts bytes written.
 type writeCounter struct {
 	w io.Writer
@@ -440,68 +442,6 @@ func (c *writeCounter) Write(p []byte) (int, error) {
 	n, err := c.w.Write(p)
 	c.n += int64(n)
 	return n, err
-}
-
-// encodeEventsNDJSON encodes a slice of events one-per-line.
-func encodeEventsNDJSON(items []*Event) []byte {
-	var out []byte
-	for _, item := range items {
-		body, _ := json.Marshal(item)
-		out = append(out, body...)
-		out = append(out, '\n')
-	}
-	return out
-}
-
-// encodeAnchorsNDJSON encodes an anchor slice one-per-line.
-func encodeAnchorsNDJSON(anchors []*Anchor) []byte {
-	var out []byte
-	for _, a := range anchors {
-		body, _ := json.Marshal(a)
-		out = append(out, body...)
-		out = append(out, '\n')
-	}
-	return out
-}
-
-// collectAnchors walks the audit/anchors/ prefix and returns
-// every anchor whose AnchoredAt falls within the filter window.
-func collectAnchors(ctx context.Context, sp storage.StoragePlugin, f ListFilters) ([]*Anchor, error) {
-	var keys []string
-	for info, err := range sp.List(ctx, AnchorPrefix) {
-		if err != nil {
-			return nil, err
-		}
-		if !strings.HasSuffix(info.Key, ".json") {
-			continue
-		}
-		keys = append(keys, info.Key)
-	}
-	sort.Strings(keys)
-	var out []*Anchor
-	for _, key := range keys {
-		rc, err := sp.Get(ctx, key)
-		if err != nil {
-			continue
-		}
-		body, err := storage.ReadAllLimited(rc, storage.MaxMetadataBytes)
-		_ = rc.Close()
-		if err != nil {
-			continue
-		}
-		var a Anchor
-		if err := json.Unmarshal(body, &a); err != nil {
-			continue
-		}
-		if !f.Since.IsZero() && a.AnchoredAt.Before(f.Since) {
-			continue
-		}
-		if !f.Until.IsZero() && !a.AnchoredAt.Before(f.Until) {
-			continue
-		}
-		out = append(out, &a)
-	}
-	return out, nil
 }
 
 // buildChainProof captures the edge of the chain seen at bundle
@@ -531,19 +471,19 @@ type EventEdge struct {
 	PrevHash string `json:"prev_hash,omitempty"`
 }
 
-func buildChainProof(events []*Event, head *HeadPointer) ChainProof {
+// buildChainProof records the bundled segment's first and last events
+// (both nil for an empty bundle; the same event for a bundle of one).
+func buildChainProof(first, last *Event, head *HeadPointer) ChainProof {
 	out := ChainProof{Schema: "pg_hardstorage.audit.chain_proof.v1"}
 	if head != nil {
 		out.HeadHash = head.Hash
 		out.HeadSequence = head.Sequence
 	}
-	if len(events) > 0 {
-		first := events[0]
+	if first != nil && last != nil {
 		out.FirstEvent = &EventEdge{
 			ID: first.ID, Sequence: first.Sequence,
 			Hash: first.Hash, PrevHash: first.PrevHash,
 		}
-		last := events[len(events)-1]
 		out.LastEvent = &EventEdge{
 			ID: last.ID, Sequence: last.Sequence,
 			Hash: last.Hash, PrevHash: last.PrevHash,
@@ -591,6 +531,23 @@ const (
 	MaxBundleEntryBytes int64 = 1 << 30 // 1 GiB
 	MaxBundleBytes      int64 = 4 << 30 // 4 GiB decompressed, whole bundle
 )
+
+// bundleLimits carries the three bounds through the verifier. Production
+// always passes defaultBundleLimits; the tests pass small ones, so the
+// refusals can be exercised with a few megabytes instead of by building
+// a 4 GiB archive (which took the whole package past its deadline under
+// the race detector).
+type bundleLimits struct {
+	entries    int
+	entryBytes int64
+	totalBytes int64
+}
+
+var defaultBundleLimits = bundleLimits{
+	entries:    MaxBundleEntries,
+	entryBytes: MaxBundleEntryBytes,
+	totalBytes: MaxBundleBytes,
+}
 
 // VerifyBundle reads + verifies a bundle.  Auditors run this to
 // reproduce the bundle's claims independently.
@@ -660,6 +617,10 @@ func (o VerifyBundleOptions) trusts(pub ed25519.PublicKey) bool {
 // trust set (when one is given), else the manifest is returned with a
 // wrapped ErrBundleSignerUntrusted.
 func VerifyBundleWithOptions(r io.Reader, opts VerifyBundleOptions) (*BundleManifest, error) {
+	return verifyBundle(r, opts, defaultBundleLimits)
+}
+
+func verifyBundle(r io.Reader, opts VerifyBundleOptions, lim bundleLimits) (*BundleManifest, error) {
 	gz, err := gzip.NewReader(r)
 	if err != nil {
 		return nil, fmt.Errorf("audit: open gzip: %w", err)
@@ -677,7 +638,7 @@ func VerifyBundleWithOptions(r io.Reader, opts VerifyBundleOptions) (*BundleMani
 	// truncation would be worse than a refusal here, since a short read
 	// changes the canonical signing input and would surface as a
 	// signature failure, pointing an operator at the wrong problem.
-	limited := io.LimitReader(gz, MaxBundleBytes+1)
+	limited := io.LimitReader(gz, lim.totalBytes+1)
 	tr := tar.NewReader(limited)
 
 	files := map[string][]byte{}
@@ -697,23 +658,23 @@ func VerifyBundleWithOptions(r io.Reader, opts VerifyBundleOptions) (*BundleMani
 			return nil, fmt.Errorf("audit: bundle contains suspicious path %q", hdr.Name)
 		}
 		entries++
-		if entries > MaxBundleEntries {
+		if entries > lim.entries {
 			return nil, fmt.Errorf("audit: bundle has more than %d entries; refusing to "+
 				"verify a bundle that could exhaust memory (a real audit bundle has a "+
-				"handful of files)", MaxBundleEntries)
+				"handful of files)", lim.entries)
 		}
-		body, err := io.ReadAll(io.LimitReader(tr, MaxBundleEntryBytes+1))
+		body, err := io.ReadAll(io.LimitReader(tr, lim.entryBytes+1))
 		if err != nil {
 			return nil, fmt.Errorf("audit: tar read body %q: %w", hdr.Name, err)
 		}
-		if int64(len(body)) > MaxBundleEntryBytes {
+		if int64(len(body)) > lim.entryBytes {
 			return nil, fmt.Errorf("audit: bundle entry %q exceeds the %d-byte limit",
-				hdr.Name, MaxBundleEntryBytes)
+				hdr.Name, lim.entryBytes)
 		}
 		total += int64(len(body))
-		if total > MaxBundleBytes {
+		if total > lim.totalBytes {
 			return nil, fmt.Errorf("audit: bundle decompresses to more than %d bytes; "+
-				"refusing (decompression bomb or corrupt archive)", MaxBundleBytes)
+				"refusing (decompression bomb or corrupt archive)", lim.totalBytes)
 		}
 		files[hdr.Name] = body
 	}

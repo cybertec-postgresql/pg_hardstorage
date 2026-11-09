@@ -157,10 +157,6 @@ type leaf struct {
 	Family string
 }
 
-func expandLeaves(c *catalog.Catalog) []*leaf {
-	return expandLeavesFiltered(c, nil)
-}
-
 // expandLeavesFiltered is expandLeaves but filtered by the
 // supplied arch allow-list.  Empty allow-list = all arches.
 func expandLeavesFiltered(c *catalog.Catalog, archPool []string) []*leaf {
@@ -279,15 +275,6 @@ func sanitizeName(s string) string {
 	out = strings.ReplaceAll(out, ":", "-")
 	out = strings.ReplaceAll(out, ".", "")
 	return out
-}
-
-func hasPatroni(f *config.Fleet) bool {
-	for _, e := range f.Entries {
-		if e.Role == "patroni-cluster" {
-			return true
-		}
-	}
-	return false
 }
 
 func hasArm64(f *config.Fleet) bool {

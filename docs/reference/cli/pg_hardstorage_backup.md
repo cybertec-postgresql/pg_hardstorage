@@ -63,6 +63,7 @@ pg_hardstorage backup <deployment> [flags]
       --tde-engine string                  free-form TDE engine label stamped on the manifest (e.g. cybertec_enterprise, pg_tde, edb_tde); implies --tde
       --tde-key-ref string                 opaque operator key-set reference stamped on the manifest for forensic/migration purposes; implies --tde
       --tenant string                      tenant scope for the backup (default "default")
+      --upload-concurrency int             chunk uploads kept in flight (1..64; default 16). Uploads wait on storage round trips, not CPU, so a high-latency object store benefits from more; 1 is serial
   -v, --verbose                            emit one line per regular file as it commits to the CAS — file path, logical size, chunk count, deduped chunks, and bytes the CAS actually had to store after dedup.  Useful for live progress on large backups; suppressed under --output json (JSON consumers see file events as backup.file_archived structured events instead).
 ```
 

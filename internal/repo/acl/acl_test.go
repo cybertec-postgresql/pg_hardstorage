@@ -56,7 +56,7 @@ func freshStorage(t *testing.T) storage.StoragePlugin {
 	if _, err := repo.Init(context.Background(), repo.InitOptions{URL: "file://" + root}); err != nil {
 		t.Fatal(err)
 	}
-	u, _ := url.Parse("file://" + root)
+	u := &url.URL{Scheme: "file", Path: root} // built, not parsed: Windows drive letters
 	sp := &fs.Plugin{}
 	if err := sp.Open(context.Background(), storage.StorageConfig{URL: u}); err != nil {
 		t.Fatal(err)

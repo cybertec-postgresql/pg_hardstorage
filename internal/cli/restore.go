@@ -117,6 +117,7 @@ targets never combine with the requested one.`,
 		"target timeline: 'latest' or an explicit TLI number")
 	c.Flags().BoolVar(&opts.toExclusive, "to-exclusive", false,
 		"stop recovery just BEFORE the target (default: just after)")
+	registerFetchConcurrencyFlag(c)
 	c.Flags().BoolVar(&opts.skipGapCheck, "skip-gap-check", false,
 		"bypass the WAL pre-flights: known WAL gaps, missing timeline history, and a backup whose WAL exists nowhere (operator override; "+
 			"the override is audit-logged)")
@@ -172,7 +173,7 @@ type restoreOpts struct {
 	// every tablespace not named by --tablespace-mapping is moved under.
 	tablespaceMapAll string
 
-	// skipGapCheck bypasses the+ WAL-gap pre-flight when
+	// skipGapCheck bypasses the WAL-gap pre-flight when
 	// the operator has validated restore safety some other way
 	// (recovery drill, manual WAL splice). The override is
 	// audit-logged via the wal_gap_check_skipped event so
@@ -226,6 +227,10 @@ func runRestore(cmd *cobra.Command, opts restoreOpts) error {
 	// accepted and printed by --preview, then failed only when PG
 	// started recovery on the remote agent).
 	if err := validateRestoreTargets(&opts); err != nil {
+		return err
+	}
+	fetchConcurrency, err := fetchConcurrencyFlag(cmd)
+	if err != nil {
 		return err
 	}
 	verifyMode, err := restore.ParseVerifyMode(opts.verifyMode)
@@ -453,6 +458,7 @@ func runRestore(cmd *cobra.Command, opts restoreOpts) error {
 		Deployment:          opts.deployment,
 		BackupID:            backupID,
 		TargetDir:           opts.targetDir,
+		FetchConcurrency:    fetchConcurrency,
 		Verifier:            verifier,
 		AllowOverwrite:      opts.force,
 		AllowForeignCluster: opts.forceForeign,
@@ -502,6 +508,15 @@ func runRestore(cmd *cobra.Command, opts restoreOpts) error {
 	var verifyErr error
 	if err != nil {
 		if res == nil || res.Verify == nil {
+			// A failure inside the restore (a chunk that could not be
+			// read, a file that could not be written) is restore.failed,
+			// the code the control-plane path already uses, so an
+			// operator's automation can tell it from a bug in this
+			// binary; the structured errors the restore package raises
+			// itself (restore.target_*, manifest.*) pass through.
+			if _, structured := output.AsOutputError(err); !structured && !errors.Is(err, context.Canceled) {
+				return output.NewError("restore.failed", "restore: "+err.Error()).Wrap(err)
+			}
 			return err
 		}
 		verifyErr = err
@@ -559,7 +574,7 @@ func runRestore(cmd *cobra.Command, opts restoreOpts) error {
 	// Surface tablespace remap in the result body for
 	// forensics. Only populated when the operator passed
 	// --tablespace-mapping; omitempty preserves the default
-	// body shape for the+ JSON-compat regression.
+	// body shape for the JSON-compat regression.
 	if !tsRemap.Empty() {
 		rows := make([]tablespaceRemapRow, 0, len(tsRemap))
 		for _, e := range tsRemap {
@@ -846,7 +861,7 @@ func validateExplicitBackupForTime(ctx context.Context, repoURL, deployment, bac
 // honoured --to (most-recent backup with stop_time ≤ target)
 // and "latest" when it just picked the most-recent backup.
 // Both fields are omitempty; default body for an explicit
-// backup-id stays byte-identical to+.
+// backup-id stays byte-identical to earlier releases.
 type restoreResultBody struct {
 	BackupID          string                `json:"backup_id"`
 	Deployment        string                `json:"deployment"`
@@ -869,7 +884,7 @@ type restoreResultBody struct {
 	// TablespaceRemap surfaces the operator-supplied path
 	// redirects when --tablespace-mapping was used. Empty /
 	// nil = no remap requested; the field is omitempty so the
-	// default body shape stays byte-identical to+
+	// default body shape stays byte-identical to earlier releases
 	// (24-month JSON-compat).
 	TablespaceRemap []tablespaceRemapRow `json:"tablespace_remap,omitempty"`
 	// TablespaceMapAll echoes --tablespace-mapping-all: every tablespace

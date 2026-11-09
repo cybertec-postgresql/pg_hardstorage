@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strconv"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -35,6 +37,8 @@ type StreamOptions struct {
 	// StatusUpdateInterval is how often we send a Standby Status
 	// Update. Zero defaults to 10 s — short enough for PG to advance
 	// confirmed_flush_lsn promptly, long enough to keep traffic low.
+	// Stream lowers it to a third of the server's wal_sender_timeout
+	// when that is shorter; see statusIntervalFor.
 	StatusUpdateInterval time.Duration
 
 	// InactivityTimeout overrides the streaming.Reader default for
@@ -174,13 +178,20 @@ func Stream(ctx context.Context, c *pg.Conn, opts StreamOptions, sink WALSink) e
 		Timeline: int32(opts.Timeline),
 		Mode:     pglogrepl.PhysicalReplication,
 	}
-	if err := pglogrepl.StartReplication(ctx, c.PgConn(), opts.Slot, opts.StartLSN, startOpts); err != nil {
-		return fmt.Errorf("replication: START_REPLICATION slot %q: %w", opts.Slot, err)
-	}
 
 	statusInterval := opts.StatusUpdateInterval
 	if statusInterval == 0 {
 		statusInterval = defaultStatusInterval
+	}
+	// Probe before START_REPLICATION: once the connection is in
+	// CopyBoth it can no longer run commands. A failed probe is not
+	// fatal — the configured interval still applies.
+	if senderTimeout, err := showWalSenderTimeout(ctx, c); err == nil {
+		statusInterval = statusIntervalFor(statusInterval, senderTimeout)
+	}
+
+	if err := pglogrepl.StartReplication(ctx, c.PgConn(), opts.Slot, opts.StartLSN, startOpts); err != nil {
+		return fmt.Errorf("replication: START_REPLICATION slot %q: %w", opts.Slot, err)
 	}
 
 	// Hijack into our resilient reader. From this point onward the
@@ -195,6 +206,86 @@ func Stream(ctx context.Context, c *pg.Conn, opts StreamOptions, sink WALSink) e
 	defer reader.Close()
 
 	return runReceiveLoop(ctx, reader, sink, statusInterval)
+}
+
+// minStatusInterval floors the status interval derived from a tiny
+// wal_sender_timeout, so a misconfigured server cannot make us flood it.
+const minStatusInterval = 100 * time.Millisecond
+
+// statusIntervalFor caps the status-update interval at a third of the
+// server's wal_sender_timeout (0 = timeout disabled, keep configured).
+//
+// The walsender kills a standby that has sent nothing for
+// wal_sender_timeout. Its own remedy — a reply-requested keepalive at
+// half the timeout — only works if we READ it promptly, and a busy
+// stream reads it late: the keepalive is queued behind every byte of
+// WAL already in the socket buffers, and while the sink applies
+// backpressure we read nothing at all. So the periodic ticker, which
+// runs on its own goroutine and does not depend on the receive side,
+// must on its own fire well inside the timeout. At 10 s against
+// CloudNativePG's default wal_sender_timeout of 5 s it never did: under
+// load the primary terminated the walsender every 1-3 minutes, the
+// stream fell behind, and max_slot_wal_keep_size eventually invalidated
+// the slot (issue #90). A third leaves two missed ticks of headroom.
+func statusIntervalFor(configured, senderTimeout time.Duration) time.Duration {
+	if senderTimeout <= 0 {
+		return configured
+	}
+	limit := senderTimeout / 3
+	if limit < minStatusInterval {
+		limit = minStatusInterval
+	}
+	if configured > limit {
+		return limit
+	}
+	return configured
+}
+
+// showWalSenderTimeout reads wal_sender_timeout over the replication
+// connection itself (SHOW is a replication-protocol command since
+// PG 10), so it is the value of the walsender that will serve us.
+func showWalSenderTimeout(ctx context.Context, c *pg.Conn) (time.Duration, error) {
+	results, err := c.PgConn().Exec(ctx, "SHOW wal_sender_timeout").ReadAll()
+	if err != nil {
+		return 0, fmt.Errorf("replication: SHOW wal_sender_timeout: %w", err)
+	}
+	if len(results) == 0 || len(results[0].Rows) == 0 || len(results[0].Rows[0]) == 0 {
+		return 0, errors.New("replication: SHOW wal_sender_timeout returned no rows")
+	}
+	return parseGUCDuration(string(results[0].Rows[0][0]))
+}
+
+// parseGUCDuration parses a time GUC as SHOW prints it: an integer
+// with an optional unit (us, ms, s, min, h, d); a bare number is
+// milliseconds, wal_sender_timeout's base unit.
+func parseGUCDuration(v string) (time.Duration, error) {
+	v = strings.TrimSpace(v)
+	i := 0
+	for i < len(v) && v[i] >= '0' && v[i] <= '9' {
+		i++
+	}
+	n, err := strconv.ParseInt(v[:i], 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("replication: parse duration %q: %w", v, err)
+	}
+	var unit time.Duration
+	switch strings.TrimSpace(v[i:]) {
+	case "", "ms":
+		unit = time.Millisecond
+	case "us":
+		unit = time.Microsecond
+	case "s":
+		unit = time.Second
+	case "min":
+		unit = time.Minute
+	case "h":
+		unit = time.Hour
+	case "d":
+		unit = 24 * time.Hour
+	default:
+		return 0, fmt.Errorf("replication: parse duration %q: unknown unit", v)
+	}
+	return time.Duration(n) * unit, nil
 }
 
 // runReceiveLoop is the inner receive loop, factored out so unit tests

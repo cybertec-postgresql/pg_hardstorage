@@ -5,6 +5,8 @@ import (
 	"testing"
 	"time"
 
+	"gopkg.in/yaml.v3"
+
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup/retention"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/config"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/schedule"
@@ -47,7 +49,7 @@ func TestBuildRetentionPolicy_SimpleDefaultIs30d(t *testing.T) {
 }
 
 func TestBuildRetentionPolicy_CountHonoursKeepFulls(t *testing.T) {
-	p, err := buildRetentionPolicy(config.RetentionConfig{Policy: "count", KeepFulls: 21})
+	p, err := buildRetentionPolicy(config.RetentionConfig{Policy: "count", KeepFulls: config.Keep(21)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -107,12 +109,63 @@ func TestBuildBackupTask_RejectsBadSchedule(t *testing.T) {
 	}
 }
 
-func TestDefaultIfZero(t *testing.T) {
-	if defaultIfZero(0, 5) != 5 {
-		t.Error("zero should fall to default")
+func TestKeepOrDefault(t *testing.T) {
+	if keepOrDefault(nil, 5) != 5 {
+		t.Error("unset should fall to default")
 	}
-	if defaultIfZero(7, 5) != 7 {
-		t.Error("non-zero should win")
+	if keepOrDefault(config.Keep(7), 5) != 7 {
+		t.Error("a set count should win")
+	}
+	if keepOrDefault(config.Keep(0), 5) != 0 {
+		t.Error("an explicit 0 is a value, not unset")
+	}
+}
+
+// An explicit zero in the config disables that bucket, exactly as
+// `rotate --keep-daily 0` does; it used to be replaced by the default,
+// so the scheduled rotate kept 7 dailies the operator had switched off.
+func TestBuildRetentionPolicy_ExplicitZeroIsHonoured(t *testing.T) {
+	p, err := buildRetentionPolicy(config.RetentionConfig{
+		KeepDaily: config.Keep(0), KeepWeekly: config.Keep(0), KeepMonthly: config.Keep(6),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := retention.GFSPolicy{KeepDaily: 0, KeepWeekly: 0, KeepMonthly: 6, KeepYearly: 5}
+	if p != retention.Policy(want) {
+		t.Errorf("gfs = %+v, want %+v", p, want)
+	}
+	p, err = buildRetentionPolicy(config.RetentionConfig{Policy: "count", KeepFulls: config.Keep(0)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p != retention.Policy(retention.CountPolicy{KeepFulls: 0}) {
+		t.Errorf("count = %+v, want KeepFulls 0", p)
+	}
+}
+
+// The flag path refuses a negative count; so does the config path.
+func TestBuildRetentionPolicy_RejectsNegative(t *testing.T) {
+	if _, err := buildRetentionPolicy(config.RetentionConfig{KeepWeekly: config.Keep(-1)}); err == nil {
+		t.Fatal("keep_weekly: -1 accepted")
+	}
+}
+
+// The YAML a config file carries: an absent key stays unset, `0` is 0.
+func TestRetentionConfig_YAMLDistinguishesUnsetFromZero(t *testing.T) {
+	var r config.RetentionConfig
+	if err := yaml.Unmarshal([]byte("keep_daily: 0\nkeep_monthly: 3\n"), &r); err != nil {
+		t.Fatal(err)
+	}
+	if r.KeepDaily == nil || *r.KeepDaily != 0 || r.KeepWeekly != nil || r.KeepMonthly == nil || *r.KeepMonthly != 3 {
+		t.Fatalf("decoded %+v", r)
+	}
+	out, err := yaml.Marshal(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(out) != "keep_daily: 0\nkeep_monthly: 3\n" {
+		t.Fatalf("re-encoded as %q: an explicit 0 must survive a config edit", out)
 	}
 }
 

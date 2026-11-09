@@ -5,6 +5,7 @@ package backup
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -19,8 +20,8 @@ func TestMapReadOnly_NonUnixRefusesOverCap(t *testing.T) {
 	}
 	f, _ := os.Open(p)
 	defer f.Close()
-	if _, _, err := mapReadOnly(f, 8); err == nil {
-		t.Fatal("want error over the cap")
+	if _, _, err := mapReadOnly(f, 8); err == nil || !strings.Contains(err.Error(), "mmap") {
+		t.Fatalf("over the cap: want a clear mmap error, got %v", err)
 	}
 	if b, _, err := mapReadOnly(f, 4); err != nil || string(b) != "abcd" {
 		t.Fatalf("under cap: %q %v", b, err)

@@ -329,7 +329,7 @@ func (s *sshExecRuntime) writeKnownHosts(ctx context.Context, total time.Duratio
 // Down implements Runtime. Idempotent.
 func (s *sshExecRuntime) Down(ctx context.Context) error {
 	if s.container != "" {
-		_ = exec.CommandContext(ctx, "docker", "rm", "-fv", s.container).Run()
+		removeContainer(ctx, s.container)
 		s.container = ""
 	}
 	s.cleanupDir()

@@ -60,10 +60,6 @@ func AllocatePorts(fleet *config.Fleet, base int) PortMap {
 // it in PrefixedContainerName when you need the global Docker
 // container_name for `docker exec` / `docker kill`.
 func FirstContainer(e config.FleetEntry) string {
-	units := e.Count
-	if units < 1 {
-		units = 1
-	}
 	nodesPerUnit := 1
 	if e.EffectiveRole() == "patroni-cluster" {
 		nodesPerUnit = e.Nodes

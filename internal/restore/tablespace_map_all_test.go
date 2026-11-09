@@ -168,3 +168,26 @@ func TestRestore_TablespaceMapAll_RedirectsEveryTablespace(t *testing.T) {
 		t.Errorf("relative parent: err = %v", err)
 	}
 }
+
+// verify --full's scratch restore must keep every tablespace under its
+// own root: the recorded locations are live on the source host.
+func TestScratchLayout_KeepsTablespacesUnderRoot(t *testing.T) {
+	m := &backup.Manifest{Tablespaces: []backup.Tablespace{
+		{OID: 0, Location: ""},
+		{OID: 1663, Location: "pg_default"},
+		{OID: 16400, Location: "/srv/pg/ts1"},
+	}}
+	data, remap, dirs := restore.ScratchLayout(m, "/tmp/v")
+	if data != "/tmp/v/data" {
+		t.Errorf("data dir = %s, want /tmp/v/data", data)
+	}
+	if len(remap) != 1 || remap[0].Old != "/srv/pg/ts1" || remap[0].New != "/tmp/v/tablespaces/16400" {
+		t.Errorf("remap = %+v, want /srv/pg/ts1 -> /tmp/v/tablespaces/16400", remap)
+	}
+	if len(dirs) != 1 || dirs[0] != "/tmp/v/tablespaces/16400" {
+		t.Errorf("sandbox binds = %v, want [/tmp/v/tablespaces/16400]", dirs)
+	}
+	if _, remap, dirs := restore.ScratchLayout(&backup.Manifest{Tablespaces: m.Tablespaces[:2]}, "/tmp/v"); len(remap) != 0 || len(dirs) != 0 {
+		t.Errorf("no external tablespaces: remap=%+v binds=%v, want none", remap, dirs)
+	}
+}

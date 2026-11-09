@@ -67,6 +67,11 @@ func (p *Plugin) Barrier(ctx context.Context) error {
 	return nil
 }
 
+// barrierPersistsNewDirs: Barrier is syncfs, which flushes every
+// metadata change on the filesystem — including the entries of
+// directories Put created without fsyncing them.
+const barrierPersistsNewDirs = true
+
 // syncfsFn performs the syncfs(2) syscall against fd. It is a package
 // var (not a direct call) purely so tests can inject a failure at a
 // chosen call — the syncfs syscall itself cannot be made to fail

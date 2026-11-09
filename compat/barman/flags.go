@@ -28,10 +28,6 @@ type recoverArgs struct {
 	getWAL   *bool
 	retryN   string
 	retrySlp string
-	repoURL  string
-	pgConn   string
-	// Anything we did not recognise.
-	unknown []string
 }
 
 // flagMap is the most-cited Barman -> native translation table.

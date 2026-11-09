@@ -4,7 +4,6 @@ package chain
 import (
 	"fmt"
 	"io"
-	"sort"
 	"strings"
 	"time"
 )
@@ -141,14 +140,4 @@ func escapeDOTString(s string) string {
 		"\n", `\n`,
 	)
 	return r.Replace(s)
-}
-
-// sortedRootsByID returns the graph's roots in stable BackupID
-// order. Helper for renderers that want lex-sorted output.
-func sortedRootsByID(g *Graph) []*Node {
-	out := append([]*Node(nil), g.Roots...)
-	sort.Slice(out, func(i, j int) bool {
-		return out[i].BackupID < out[j].BackupID
-	})
-	return out
 }

@@ -1,11 +1,12 @@
 # pg_hardstorage evaluation stack.
 #
-# Stands up PostgreSQL + MinIO + pg_hardstorage in a single compose
+# Stands up PostgreSQL + Silo (S3, a maintained MinIO fork) +
+# pg_hardstorage in a single compose
 # project for local evaluation.  Boot-up runs three one-shots
 # before the agent so the operator gets a working repo on first
 # `docker compose up`:
 #
-#   1. `minio-init` creates the demo bucket (minio/mc image).
+#   1. `minio-init` creates the demo bucket (`mc` from the Silo image).
 #   2. `repo-init` runs `pg_hardstorage repo init` against the
 #      bucket (pg_hardstorage image, distroless — no shell).
 #   3. `pg_hardstorage` runs the agent against PG_HARDSTORAGE_CONFIG.
@@ -81,15 +82,19 @@ services:
       timeout: 3s
       retries: 10
 
+  # pgsty/silo is Pigsty's maintained fork of the MinIO server; the
+  # upstream minio/minio and minio/mc images were withdrawn from
+  # Docker Hub and quay.io when MinIO, Inc. archived the project.
+  # S3 API, MINIO_* variables, /minio/* health routes and the /data
+  # layout are unchanged. Same pin as internal/testkit/sink/sink.go.
   minio:
-    image: minio/minio:latest
-    command: server /data --console-address ":9001"
+    image: pgsty/silo:RELEASE.2026-10-26T00-00-00Z
+    command: server /data
     environment:
       MINIO_ROOT_USER: minioadmin
       MINIO_ROOT_PASSWORD: minioadmin
     ports:
       - "9000:9000"
-      - "9001:9001"
     volumes:
       - miniodata:/data
     healthcheck:
@@ -102,10 +107,11 @@ services:
   # the agent has somewhere to write.  Runs once and exits 0.
   # minio-init creates the demo bucket.  The pg_hardstorage image
   # is distroless (no `sh`, no `mc`), so bucket creation cannot
-  # happen in-process there — issue #89.  We use minio/mc for the
-  # bucket-mb step; the next service handles repo init.
+  # happen in-process there — issue #89.  The Silo image bundles
+  # `mc` (and a shell), so it does the bucket-mb step; the next
+  # service handles repo init.
   minio-init:
-    image: minio/mc:latest
+    image: pgsty/silo:RELEASE.2026-10-26T00-00-00Z
     depends_on:
       minio:
         condition: service_healthy
@@ -137,7 +143,7 @@ services:
     command:
       - "repo"
       - "init"
-      - "s3://pg-hardstorage-demo/?endpoint=http://minio:9000&region=us-east-1&path_style=true"
+      - "s3://pg-hardstorage-demo/?endpoint=http://minio:9000&region=us-east-1&path_style=true&conditional_put=native"
     restart: "no"
 
   # keyring-init prepares the persistent keyring volume so the agent's
@@ -197,7 +203,11 @@ services:
         deployments:
           demo:
             pg_connection: "postgres://postgres:demo@pg:5432/demo?sslmode=disable"
-            repo: "s3://pg-hardstorage-demo/?endpoint=http://minio:9000&region=us-east-1&path_style=true"
+            # conditional_put=native: with an ?endpoint= override the S3
+            # plugin assumes the store does NOT enforce If-None-Match and the
+            # backup lease refuses to run (backup.lease_failed). Silo/MinIO
+            # do enforce it, so the eval stack vouches for its own endpoint.
+            repo: "s3://pg-hardstorage-demo/?endpoint=http://minio:9000&region=us-east-1&path_style=true&conditional_put=native"
             schedule:
               backup:
                 every: "6h"

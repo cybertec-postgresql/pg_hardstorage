@@ -1,3 +1,8 @@
+// Linux tablespace locations (/srv/live/…) as the source host records
+// them; on Windows filepath.IsAbs rejects them before the logic under
+// test. See drill_tablespace_test.go.
+//go:build !windows
+
 package recovery_test
 
 import (

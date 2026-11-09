@@ -114,15 +114,15 @@ func runAnomalyCheck(cmd *cobra.Command, deployment, repoURL string, threshold f
 			fmt.Sprintf("anomaly check: --min-samples must be >= 2; got %d", minSamples)).Wrap(output.ErrUsage)
 	}
 
-	verifier, err := loadVerifier()
-	if err != nil {
-		return err
-	}
 	repoMeta, sp, err := openRepo(cmd.Context(), repoURL)
 	if err != nil {
 		return err
 	}
 	defer sp.Close()
+	verifier, err := loadVerifier()
+	if err != nil {
+		return err
+	}
 
 	// Collect all same-deployment manifests as Samples in chronological
 	// order. The detector handles type-filtering, window trimming, and
@@ -147,6 +147,7 @@ func runAnomalyCheck(cmd *cobra.Command, deployment, repoURL string, threshold f
 		// the cold-start case. Surface a structured empty result so
 		// scripts can act on it.
 		body := anomalyCheckBody{
+			Schema:           anomaly.Schema,
 			Deployment:       deployment,
 			Repo:             repoURL,
 			Threshold:        threshold,
@@ -196,6 +197,7 @@ func runAnomalyCheck(cmd *cobra.Command, deployment, repoURL string, threshold f
 
 	// Build the response body + count flags.
 	body := anomalyCheckBody{
+		Schema:           anomaly.Schema,
 		Deployment:       deployment,
 		Repo:             repoURL,
 		Threshold:        threshold,
@@ -318,14 +320,11 @@ type anomalyCheckBody struct {
 	GeneratedAt      time.Time         `json:"generated_at"`
 }
 
-// initSchema is what callers see in the body — set in WriteText
-// indirectly (we set it before marshalling by carrying the constant
-// in the JSON tag default).
+// WriteText renders the run-level summary. The schema tag is set where
+// the body is built: WriteText has a value receiver and only runs for
+// text output, so it cannot be what stamps the JSON body.
 func (b anomalyCheckBody) WriteText(w io.Writer) error {
 	bw := &strings.Builder{}
-	if b.Schema == "" {
-		b.Schema = anomaly.Schema
-	}
 	fmt.Fprintf(bw, "anomaly check — deployment %s\n", b.Deployment)
 	fmt.Fprintf(bw, "  Total backups:   %d\n", b.TotalBackups)
 	fmt.Fprintf(bw, "  Threshold:       ±%g (z-score)\n", b.Threshold)

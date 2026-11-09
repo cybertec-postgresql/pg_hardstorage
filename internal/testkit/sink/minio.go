@@ -26,7 +26,7 @@ import (
 //     - reserves a free localhost port (kernel-assigned)
 //     - creates a host temp dir + a `<bucket>/` subdir
 //     (this IS the pre-created bucket; no init step)
-//     - docker run -d minio/minio server /data
+//     - docker run -d <SinkImages["s3-minio"]> server /data
 //     - polls /minio/health/ready until 200 or timeout
 //
 //  2. URL() returns:
@@ -264,7 +264,7 @@ func (m *minioRuntime) Down(ctx context.Context) error {
 			_ = exec.CommandContext(ctx, "docker", "exec", m.container,
 				"sh", "-c", "rm -rf /data/* /data/.[!.]* 2>/dev/null").Run()
 		}
-		_ = exec.CommandContext(ctx, "docker", "rm", "-fv", m.container).Run()
+		removeContainer(ctx, m.container)
 		m.container = ""
 	}
 	var residue error

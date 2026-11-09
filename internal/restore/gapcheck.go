@@ -191,7 +191,7 @@ func preflightWALGap(ctx context.Context, sp storage.StoragePlugin, deployment, 
 			emit(output.NewEvent(output.SeverityNotice, "restore", "wal_gap_check_skipped").
 				WithSubject(output.Subject{Deployment: deployment}).
 				WithBody(map[string]any{
-					"hint": "the+ WAL-gap pre-flight was bypassed via --skip-gap-check; the operator accepted the risk that the PITR target may land in a known gap",
+					"hint": "the WAL-gap pre-flight was bypassed via --skip-gap-check; the operator accepted the risk that the PITR target may land in a known gap",
 				}))
 		}
 		return nil

@@ -41,7 +41,6 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/durationx"
@@ -247,9 +246,7 @@ func (d DailyAt) locName() string {
 // Once triggers a single time at a specific instant. After it fires,
 // Next returns the zero Time, signalling "no further firings."
 type Once struct {
-	When  time.Time
-	fired sync.Once
-	doneC chan struct{}
+	When time.Time
 }
 
 // Next implements Schedule. Returns zero once the firing window has

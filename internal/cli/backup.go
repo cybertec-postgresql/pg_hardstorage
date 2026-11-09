@@ -96,6 +96,8 @@ The repository must already exist — create it with ` + "`" + `pg_hardstorage r
 			"requires summarize_wal=on on the source DB")
 	c.Flags().StringVar(&opts.chunkSize, "chunk-size", "",
 		"average chunk size (e.g. 256KiB, 1MiB; 16KiB..16MiB, default 64KiB). Larger chunks mean far fewer chunk objects and manifest entries for very large databases, at the cost of coarser dedup; boundaries differ per size, so keep one value per deployment")
+	c.Flags().IntVar(&opts.uploadConcurrency, "upload-concurrency", 0,
+		"chunk uploads kept in flight (1..64; default 16). Uploads wait on storage round trips, not CPU, so a high-latency object store benefits from more; 1 is serial")
 	c.Flags().BoolVar(&opts.ignoreCapacity, "ignore-capacity", false,
 		"skip the capacity pre-flight (refuse-on-low-free-space gate); use only when the projection is misleading")
 	c.Flags().Float64Var(&opts.capacitySafetyFactor, "capacity-safety-factor", capacity.DefaultSafetyFactor,
@@ -174,6 +176,9 @@ type runOptions struct {
 
 	// chunkSize is --chunk-size, a human byte size ("1MiB").
 	chunkSize string
+
+	// uploadConcurrency is --upload-concurrency (0 = default).
+	uploadConcurrency int
 
 	// allowConcurrent disables the per-deployment backup lease, so a
 	// second backup of the same deployment can run alongside one
@@ -327,21 +332,22 @@ func runBackup(cmd *cobra.Command, opts runOptions) error {
 		chunkAvg = int(n)
 	}
 	res, err := runner.Take(cmd.Context(), runner.TakeOptions{
-		PGConnString: opts.pgConn,
-		RepoURL:      opts.repoURL,
-		Deployment:   opts.deployment,
-		Tenant:       opts.tenant,
-		Signer:       signer,
-		Verifier:     verifier,
-		Label:        opts.label,
-		Fast:         opts.fast,
-		IncludeWAL:   opts.includeWAL,
-		Encryption:   encConfig,
-		SourceTDE:    sourceTDE,
-		Incremental:  incrConfig,
-		StallTimeout: opts.stallTimeout,
-		ChunkAvgSize: chunkAvg,
-		SkipLease:    opts.allowConcurrent,
+		PGConnString:      opts.pgConn,
+		RepoURL:           opts.repoURL,
+		Deployment:        opts.deployment,
+		Tenant:            opts.tenant,
+		Signer:            signer,
+		Verifier:          verifier,
+		Label:             opts.label,
+		Fast:              opts.fast,
+		IncludeWAL:        opts.includeWAL,
+		Encryption:        encConfig,
+		SourceTDE:         sourceTDE,
+		Incremental:       incrConfig,
+		StallTimeout:      opts.stallTimeout,
+		ChunkAvgSize:      chunkAvg,
+		UploadConcurrency: opts.uploadConcurrency,
+		SkipLease:         opts.allowConcurrent,
 		OnEvent: func(e *output.Event) {
 			if suppressEvents {
 				return
@@ -728,10 +734,6 @@ type backupFileEventBody struct {
 // padded — file path lengths vary wildly across PGDATA and any
 // padding we picked would look broken on the next backup.
 func (b backupFileEventBody) WriteText(w io.Writer) error {
-	saved := b.Size - b.UniqueBytes
-	if saved < 0 {
-		saved = 0
-	}
 	_, err := fmt.Fprintf(w,
 		"%s  size=%s  chunks=%d  deduped=%d  stored=%s",
 		b.Path,

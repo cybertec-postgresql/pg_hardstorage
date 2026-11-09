@@ -8,10 +8,7 @@ package sftp_test
 
 import (
 	"context"
-	"errors"
 	"net/url"
-	"os"
-	"os/exec"
 	"testing"
 
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
@@ -20,43 +17,9 @@ import (
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/testkit/sink"
 )
 
-func requireDocker(t *testing.T) {
-	t.Helper()
-	if _, err := exec.LookPath("docker"); err != nil {
-		if os.Getenv("PG_HARDSTORAGE_DEMAND_DOCKER") == "1" {
-			t.Fatalf("docker not on PATH but PG_HARDSTORAGE_DEMAND_DOCKER=1: %v", err)
-		}
-		t.Skip("docker not on PATH; skipping SFTP-via-atmoz/sftp contract suite")
-	}
-	if err := exec.Command("docker", "info").Run(); err != nil {
-		if os.Getenv("PG_HARDSTORAGE_DEMAND_DOCKER") == "1" {
-			t.Fatalf("docker daemon not reachable but PG_HARDSTORAGE_DEMAND_DOCKER=1: %v", err)
-		}
-		t.Skip("docker daemon not reachable; skipping")
-	}
-}
-
 func openSFTPOnFresh(t *testing.T) storage.StoragePlugin {
 	t.Helper()
-	requireDocker(t)
-	s, err := sink.New("sftp")
-	if err != nil {
-		t.Fatalf("sink.New(sftp): %v", err)
-	}
-	if err := s.Up(context.Background()); err != nil {
-		// The atmoz/sftp fixture image is amd64-only. On a host that
-		// cannot execute it (arm64 without binfmt/qemu) the container
-		// exits milliseconds after start with "exec format error" —
-		// an environment limitation, not a plugin regression. Skip,
-		// the way requireDocker skips an unreachable daemon; any other
-		// container death is still a hard failure.
-		var ce *sink.ContainerExitError
-		if errors.As(err, &ce) && ce.IsPlatformMismatch() {
-			t.Skipf("SFTP fixture image cannot execute on this platform: %v", err)
-		}
-		t.Fatalf("sink.Up: %v", err)
-	}
-	t.Cleanup(func() { _ = s.Down(context.Background()) })
+	s := sink.UpForTest(t, "sftp")
 	u, err := url.Parse(s.URL())
 	if err != nil {
 		t.Fatalf("parse sink URL %s: %v", s.URL(), err)

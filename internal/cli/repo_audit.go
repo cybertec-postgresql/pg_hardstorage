@@ -111,15 +111,15 @@ func runRepoAudit(cmd *cobra.Command, repoURL, deployment string, skipStor, skip
 	if repoURL == "" {
 		return missingFlagErr(cmd, "--repo (or the first positional <url>)")
 	}
-	verifier, err := loadVerifier()
-	if err != nil {
-		return err
-	}
 	meta, sp, err := openRepo(cmd.Context(), repoURL)
 	if err != nil {
 		return err
 	}
 	defer sp.Close()
+	verifier, err := loadVerifier()
+	if err != nil {
+		return err
+	}
 
 	rep, err := repoaudit.Audit(cmd.Context(), sp, meta, repoURL, repoaudit.Options{
 		Verifier:         verifier,
@@ -185,14 +185,14 @@ func (b repoAuditBody) WriteText(w io.Writer) error {
 	} else {
 		fmt.Fprintln(bw, "Deployments:")
 		tw := tabwriter.NewWriter(bw, 0, 4, 2, ' ', 0)
-		fmt.Fprintln(tw, "  NAME\tACTIVE\tTOMB\tHELD\tEXP-HELD\tSIG-FAIL\tPOSTURE\tLATEST")
+		fmt.Fprintln(tw, "  NAME\tACTIVE\tTOMB\tWAL-SEG\tHELD\tEXP-HELD\tSIG-FAIL\tPOSTURE\tLATEST")
 		for _, d := range r.Deployments {
 			latest := "(none)"
 			if d.Latest != nil {
 				latest = d.Latest.BackupID
 			}
-			fmt.Fprintf(tw, "  %s\t%d\t%d\t%d\t%d\t%d\t%s\t%s\n",
-				d.Name, d.Active, d.Tombstoned, d.Held, d.HeldExpired,
+			fmt.Fprintf(tw, "  %s\t%d\t%d\t%d\t%d\t%d\t%d\t%s\t%s\n",
+				d.Name, d.Active, d.Tombstoned, d.WALSegments, d.Held, d.HeldExpired,
 				d.SignatureFailed, d.EncryptionPosture, latest)
 		}
 		_ = tw.Flush()

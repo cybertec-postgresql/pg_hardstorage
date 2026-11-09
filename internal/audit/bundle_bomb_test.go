@@ -55,42 +55,84 @@ func gzipTar(t *testing.T, entries []struct {
 	return buf.Bytes()
 }
 
-// A highly compressible payload past the whole-bundle ceiling: the
-// classic bomb shape, tiny on disk and enormous decompressed.
-func TestVerifyBundle_RefusesADecompressionBomb(t *testing.T) {
-	const oversize = audit.MaxBundleBytes + (1 << 20)
-	zeros := make([]byte, 1<<20)
+// The refusals are exercised against scaled-down limits (see
+// audit.VerifyBundleWithLimits): the code path is the one production
+// runs, the arithmetic is the same, and the archives are megabytes.
+// Building a real 4 GiB bomb cost 21 s per run and more than the
+// package's whole deadline under -race.
+const (
+	testEntryLimit = 1 << 20 // 1 MiB per entry
+	testTotalLimit = 4 << 20 // 4 MiB per bundle
+)
 
-	var buf bytes.Buffer
-	zw := gzip.NewWriter(&buf)
-	tw := tar.NewWriter(zw)
-	if err := tw.WriteHeader(&tar.Header{
-		Name: "events.ndjson", Mode: 0o600, Size: oversize,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	for written := int64(0); written < oversize; written += int64(len(zeros)) {
-		n := int64(len(zeros))
-		if oversize-written < n {
-			n = oversize - written
-		}
-		if _, err := tw.Write(zeros[:n]); err != nil {
-			t.Fatal(err)
-		}
-	}
-	_ = tw.Close()
-	_ = zw.Close()
+// zeroEntry is a maximally compressible entry of n bytes.
+func zeroEntry(name string, n int) struct {
+	name string
+	body []byte
+} {
+	return struct {
+		name string
+		body []byte
+	}{name: name, body: make([]byte, n)}
+}
 
-	t.Logf("bomb is %d bytes on disk, %d decompressed (%.0fx)",
-		buf.Len(), oversize, float64(oversize)/float64(buf.Len()))
+// One highly compressible entry past the per-entry ceiling: the classic
+// bomb shape, tiny on disk and enormous decompressed.
+func TestVerifyBundle_RefusesAnOversizedEntry(t *testing.T) {
+	bomb := gzipTar(t, []struct {
+		name string
+		body []byte
+	}{zeroEntry("events.ndjson", testEntryLimit+1)})
+	t.Logf("bomb is %d bytes on disk, %d decompressed", len(bomb), testEntryLimit+1)
 
-	_, err := audit.VerifyBundle(bytes.NewReader(buf.Bytes()))
+	_, err := audit.VerifyBundleWithLimits(bytes.NewReader(bomb), 16, testEntryLimit, testTotalLimit)
 	if err == nil {
-		t.Fatal("VerifyBundle accepted a bundle decompressing past its ceiling — a few-MB " +
+		t.Fatal("VerifyBundle accepted an entry larger than the per-entry ceiling — a few-MB " +
 			"file the operator received can exhaust the machine running the verification")
 	}
-	if !strings.Contains(err.Error(), "limit") && !strings.Contains(err.Error(), "decompresses to more") {
+	if !strings.Contains(err.Error(), "limit") {
 		t.Errorf("refused, but not for the size: %v", err)
+	}
+	// An entry exactly at the ceiling is not over it.
+	atLimit := gzipTar(t, []struct {
+		name string
+		body []byte
+	}{zeroEntry("events.ndjson", testEntryLimit)})
+	if _, err := audit.VerifyBundleWithLimits(bytes.NewReader(atLimit), 16, testEntryLimit, testTotalLimit); err == nil ||
+		!strings.Contains(err.Error(), "bundle.json") {
+		t.Errorf("an entry exactly at the limit must pass the size guard and fail on bundle.json: %v", err)
+	}
+}
+
+// Every entry under the per-entry ceiling, the bundle as a whole over
+// its own: the decompressed total is bounded too.
+func TestVerifyBundle_RefusesADecompressionBomb(t *testing.T) {
+	var entries []struct {
+		name string
+		body []byte
+	}
+	for i := 0; i < 5; i++ { // 5 MiB in 1 MiB entries, total limit 4 MiB
+		entries = append(entries, zeroEntry("f"+itoa(i), testEntryLimit))
+	}
+	_, err := audit.VerifyBundleWithLimits(bytes.NewReader(gzipTar(t, entries)), 16, testEntryLimit, testTotalLimit)
+	if err == nil {
+		t.Fatal("VerifyBundle accepted a bundle decompressing past its ceiling")
+	}
+	if !strings.Contains(err.Error(), "decompresses to more") && !strings.Contains(err.Error(), "tar read") {
+		t.Errorf("refused, but not for the size: %v", err)
+	}
+}
+
+// The scaled-down tests only mean something if production runs with the
+// documented ceilings.
+func TestVerifyBundle_ProductionLimitsAreTheDocumentedOnes(t *testing.T) {
+	entries, entryBytes, totalBytes := audit.DefaultBundleLimits()
+	if entries != audit.MaxBundleEntries || entryBytes != audit.MaxBundleEntryBytes || totalBytes != audit.MaxBundleBytes {
+		t.Fatalf("VerifyBundle runs with %d entries / %d per entry / %d total, want the Max* constants",
+			entries, entryBytes, totalBytes)
+	}
+	if audit.MaxBundleEntryBytes != 1<<30 || audit.MaxBundleBytes != 4<<30 || audit.MaxBundleEntries != 1024 {
+		t.Fatal("the documented ceilings changed; update the docs and this test together")
 	}
 }
 

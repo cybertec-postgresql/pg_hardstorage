@@ -14,6 +14,7 @@ import (
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/backup/keystore"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/repo/casdefault"
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/testkit/sink"
 )
 
 // TestHugeManifest_AllCommandsStream is the end-to-end proof for issue #81
@@ -85,6 +86,13 @@ func TestHugeManifest_AllCommandsStream(t *testing.T) {
 		t.Helper()
 		var out string
 		t.Run(name, func(t *testing.T) {
+			if name == "verify-full" {
+				// --full restores into a sandbox container
+				// (internal/verify/sandbox, testcontainers); every other
+				// step here is in-process. Without a usable Docker this
+				// step skips instead of waiting out the package timeout.
+				sink.SkipUnlessContainersRun(t)
+			}
 			stdout, stderr, exit := runCLI(t, args...)
 			out = stdout
 			all := stdout + stderr

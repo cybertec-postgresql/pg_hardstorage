@@ -148,6 +148,12 @@ func runRotate(cmd *cobra.Command, opts rotateOpts) error {
 		}
 	}
 
+	repoMeta, sp, err := repo.Open(cmd.Context(), opts.repoURL)
+	if err != nil {
+		return mapRepoOpenErr(opts.repoURL, err)
+	}
+	defer sp.Close()
+
 	// Resolve verifier the same way restore does — every manifest we
 	// touch must have a valid signature, otherwise the safety story
 	// (the signed-manifest commitment) is broken.
@@ -157,12 +163,6 @@ func runRotate(cmd *cobra.Command, opts rotateOpts) error {
 	if err != nil {
 		return err
 	}
-
-	repoMeta, sp, err := repo.Open(cmd.Context(), opts.repoURL)
-	if err != nil {
-		return mapRepoOpenErr(opts.repoURL, err)
-	}
-	defer sp.Close()
 	// --apply tombstones backups; a read-only repo refuses that like
 	// every other mutating verb. The dry-run plan stays available.
 	if opts.apply {

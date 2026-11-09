@@ -71,6 +71,10 @@ Backup ID:
 	only check that each chunk EXISTS (Stat) — skip fetch+decrypt+SHA verification (much faster; useful pre-flight before \fBbackup undelete\fR)
 
 .PP
+\fB--fetch-concurrency\fP=0
+	chunk reads kept in flight (1..64; default 16). Reads wait on storage round trips, not CPU, so a high-latency object store benefits from more; 1 is serial
+
+.PP
 \fB--full\fP[=false]
 	perform a full restore into a Docker sandbox and run pg_verifybackup against it
 

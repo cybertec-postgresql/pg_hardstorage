@@ -7,6 +7,5 @@ import (
 )
 
 func TestSFTP_RepoGC(t *testing.T) {
-	requireDocker(t)
 	gccontract.Run(t, openSFTPOnFresh(t))
 }

@@ -48,3 +48,9 @@ plugin list
 # L1_misc_smoke; this sibling under `approval` performs the live sweep
 # with no additional data path to assert.
 approval purge-expired
+# Copies keyring files into place with owner-only modes for the
+# Kubernetes install initContainer (#46). A file-copy helper with no
+# backup/restore data path; its mode and symlink handling is covered
+# by unit tests (internal/cli/keyring_install_test.go) and the Helm
+# chart tests that render the initContainer.
+keyring install

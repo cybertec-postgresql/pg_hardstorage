@@ -65,6 +65,9 @@ const defaultWalListLimit = 100000
 
 func runWalList(cmd *cobra.Command, deployment, repoURL string, tliFilter uint32, gapsOnly bool, limit int) error {
 	d := DispatcherFrom(cmd)
+	if err := validateWALDeployment("wal list", deployment); err != nil {
+		return err
+	}
 	_, sp, err := repo.Open(cmd.Context(), repoURL)
 	if err != nil {
 		return mapRepoOpenErr(repoURL, err)
@@ -450,6 +453,9 @@ func newWalRepairCmd() *cobra.Command {
 
 func runWalRepair(cmd *cobra.Command, deployment, pgConn, repoURL, slotName string) error {
 	d := DispatcherFrom(cmd)
+	if err := validateWALDeployment("wal repair", deployment); err != nil {
+		return err
+	}
 	if slotName == "" {
 		slotName = walStreamAppName(deployment)
 	}
@@ -497,7 +503,7 @@ func runWalRepair(cmd *cobra.Command, deployment, pgConn, repoURL, slotName stri
 			fmt.Sprintf("wal repair: list segments: %v", listErr)).Wrap(listErr)
 	}
 
-	// EnsureSlot is the+ Mechanism 2 primitive: probes the
+	// EnsureSlot is the Mechanism 2 primitive: probes the
 	// slot, recreates with RESERVE_WAL if missing, returns the gap
 	// analysis. We open the two connections it needs (regular for
 	// pg_replication_slots, replication for CREATE_REPLICATION_SLOT)
@@ -567,7 +573,7 @@ type walRepairBody struct {
 	Timeline        uint32 `json:"timeline"`
 	HighestArchived string `json:"highest_archived_lsn"`
 
-	// Outcome is the+ Mechanism 2 strategy outcome:
+	// Outcome is the Mechanism 2 strategy outcome:
 	//   "found"     — slot existed (Strategy A/B), no recreation
 	//   "recreated" — slot was missing, recreated with RESERVE_WAL
 	// The string value is part of the v1 contract; renaming it
@@ -583,7 +589,7 @@ type walRepairBody struct {
 	SlotMinusArchivedBytes int64  `json:"slot_minus_archived_bytes"`
 	GapDetected            bool   `json:"gap_detected"`
 
-	// New+ fields giving the gap structurally. GapBytes is
+	// Newer fields giving the gap structurally. GapBytes is
 	// unsigned (a real gap is always non-negative — it's the slot
 	// AHEAD of the archive). GapStartLSN / GapEndLSN are the
 	// archive's last-known and the slot's current restart_lsn

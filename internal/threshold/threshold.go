@@ -45,7 +45,7 @@
 //     + timestamp, so partial tampering is detected.)
 //  4. Counts distinct valid roster members; compares to roster.Threshold.
 //
-// Scope at+: primitive + CLI.  Integration into the backup-commit
+// Scope: primitive + CLI.  Integration into the backup-commit
 // path so manifests can require k-of-n attestation comes in a follow-on
 // commit.
 package threshold
@@ -900,20 +900,6 @@ func commitIfBytesMatch(
 		return err
 	}
 	return nil
-}
-
-// randHex returns 2*n hex characters from crypto/rand.  Used for
-// tmp-file disambiguation under concurrent first-writers.
-func randHex(n int) string {
-	b := make([]byte, n)
-	_, _ = rand.Read(b)
-	const hex = "0123456789abcdef"
-	out := make([]byte, len(b)*2)
-	for i, c := range b {
-		out[i*2] = hex[c>>4]
-		out[i*2+1] = hex[c&0xf]
-	}
-	return string(out)
 }
 
 // ListSignatures returns every signature for the given attestation.

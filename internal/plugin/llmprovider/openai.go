@@ -55,7 +55,7 @@ const DefaultOpenAIMaxTokens = 4096
 
 // OpenAIProvider talks to any OpenAI-compatible Chat Completions
 // endpoint with full streaming + tool-use support.  This is the
-// production provider for+; the previous Anthropic-native
+// production provider; the previous Anthropic-native
 // and Ollama-native providers were removed in favour of routing
 // every backend through this one shape.
 //

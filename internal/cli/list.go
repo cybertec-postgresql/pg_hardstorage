@@ -65,16 +65,16 @@ func runList(cmd *cobra.Command, deployment, repoURL string, includeDeleted, onl
 	// --repo required-ness is declared via MarkFlagRequired; cobra
 	// enforces it before RunE (translated to usage.missing_flag in Run).
 
-	verifier, err := loadVerifier()
-	if err != nil {
-		return err
-	}
-
 	_, sp, err := openRepo(cmd.Context(), repoURL)
 	if err != nil {
 		return err
 	}
 	defer sp.Close()
+
+	verifier, err := loadVerifier()
+	if err != nil {
+		return err
+	}
 
 	store := backup.NewManifestStore(sp)
 	var summaries []backupSummary
@@ -366,6 +366,11 @@ func loadExistingKeypair(op string) (*backup.Signer, *backup.Verifier, error) {
 // openRepo opens a repository at url, returning its parsed metadata
 // and the StoragePlugin. Caller must Close the StoragePlugin.
 //
+// Commands that also need the keyring call openRepo FIRST: a wrong URL
+// or a damaged repository is then reported as such (notfound.repo,
+// verify.repo_marker_corrupt) even on a host with an empty keyring,
+// instead of every failure collapsing into notfound.signing_key.
+//
 // Errors are mapped to the same structured codes other commands use:
 // notfound.repo, usage.unknown_scheme, etc.
 func openRepo(ctx context.Context, url string) (*repo.Metadata, storage.StoragePlugin, error) {
@@ -401,6 +406,9 @@ func assertRepoWritable(ctx context.Context, sp storage.StoragePlugin, op string
 					Human:   "flip the repository back to read-write if you really want this operation",
 					Command: "pg_hardstorage repo set-mode <url> read-write",
 				}).Wrap(err)
+		}
+		if oe, ok := output.AsOutputError(err); ok {
+			return oe // already classified: a damaged HSREPO
 		}
 		return output.NewError("repo.mode_check_failed",
 			fmt.Sprintf("%s: read repo mode: %v", op, err)).Wrap(err)

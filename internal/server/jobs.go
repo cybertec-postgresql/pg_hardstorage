@@ -38,7 +38,7 @@ const (
 
 // JobKind enumerates the dispatchable operations. v0.4 ships
 // `backup` end-to-end; `restore` and `verify` are accepted by the
-// dispatcher but the agent-side runner integration is+.
+// dispatcher but the agent-side runner integration is still to come.
 type JobKind string
 
 const (

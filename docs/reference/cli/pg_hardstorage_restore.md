@@ -64,6 +64,7 @@ pg_hardstorage restore <deployment> <backup-id|latest> [flags]
       --control-plane-client-key string                                                                  client key for mTLS to the control plane
       --control-plane-poll-secs int                                                                      poll cadence (seconds) for /v1/jobs/<id> (default 1)
       --control-plane-token-file string                                                                  file containing the bearer token for the control plane
+      --fetch-concurrency int                                                                            chunk reads kept in flight (1..64; default 16). Reads wait on storage round trips, not CPU, so a high-latency object store benefits from more; 1 is serial
       --force                                                                                            allow overwriting a non-empty target directory
       --force-foreign                                                                                    with --force, also overwrite a target that is a DIFFERENT cluster (pg_control system identifier mismatch); the default refuses, to guard against a wrong --target path
   -h, --help                                                                                             help for restore

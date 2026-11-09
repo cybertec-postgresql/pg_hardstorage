@@ -14,6 +14,14 @@ tags:
 
 Import a previously-exported bundle into a destination repo (idempotent)
 
+### Synopsis
+
+Import a bundle written by 'repo bundle export' into a repository.
+
+The flags mirror export's: export reads --repo and writes --out, import
+reads --in and writes --repo. --to is the older name for the
+destination and is still accepted.
+
 ```
 pg_hardstorage repo bundle import [flags]
 ```
@@ -21,9 +29,10 @@ pg_hardstorage repo bundle import [flags]
 ### Options
 
 ```
-  -h, --help        help for import
-      --in string   input path to a .tar bundle (required)
-      --to string   destination repository URL (required)
+  -h, --help          help for import
+      --in string     input path to a .tar bundle (required)
+      --repo string   destination repository URL (required)
+      --to string     alias of --repo, kept for compatibility
 ```
 
 ### Options inherited from parent commands

@@ -683,7 +683,7 @@ func buildKEKLifecycleSection(ctx context.Context, store *audit.Store, opts Opti
 			// "attempted but failed" case is recorded but counted
 			// here as success-by-default. Future: a kms.rotate.failed
 			// event for the failed-rotation forensics — when it
-			// lands, this section gets a separate counter. For+
+			// lands, this section gets a separate counter. For now
 			// every kms.rotate audit event is a successful rotate.
 			out.RotationsSucceeded++
 		case "kms.shred":

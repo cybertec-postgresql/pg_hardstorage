@@ -13,6 +13,12 @@ operator deciding whether to upgrade.
 
 ## Releases
 
+- **[v1.7](v1.7.md)** — backup, restore and verify throughput follows the
+  storage instead of the core count (`--upload-concurrency`,
+  `--fetch-concurrency`); S3-compatible stores that reject `If-None-Match`
+  and WORM buckets shared with `wal stream` work; a lossy link no longer
+  ends a restore; `audit export-bundle` is bounded; sftp/scp prune after
+  gc; Go 1.26.10. Every issue reported against 1.6.0 is fixed.
 - **[v1.6](v1.6.md)** — a 100 TB database no longer exhausts memory in
   backup, restore or `repo gc`; `repo gc` leaves a clean repository;
   manifest replay, credential leaks and the restore boot test's

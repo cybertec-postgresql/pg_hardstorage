@@ -43,6 +43,11 @@ The host must be empty (or `localhost`).  The path is the
 absolute repository root; relative paths are rejected
 rather than silently rebased.
 
+On Windows a drive path is accepted in any of its spellings —
+`C:\backups\repo`, `file://C:\backups\repo`, `file:///C:/backups/repo`
+— and directory fsync is a no-op there (NTFS journals directory
+metadata; files are still fsynced).
+
 | Field | Value |
 | --- | --- |
 | **Parsed by** | [`internal/plugin/storage/fs/fs.go`](https://github.com/cybertec-postgresql/pg_hardstorage/blob/main/internal/plugin/storage/fs/fs.go) |
@@ -222,7 +227,8 @@ Some hardened SSH deployments disable the SFTP subsystem
 permit ssh-exec; some embedded / appliance SSH servers don't
 implement SFTP at all.  The `scp://` backend talks to those
 servers using the same set of remote-shell primitives `scp`
-itself uses — `cat`, `stat`, `find`, `mv`, `rm`, `mkdir`.
+itself uses — `cat`, `stat`, `find`, `mv`, `ln`, `rm`, `mkdir`,
+`rmdir`.
 No SFTP subsystem required.
 
 ### What this is NOT

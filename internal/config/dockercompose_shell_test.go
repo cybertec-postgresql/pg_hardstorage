@@ -10,8 +10,8 @@
 //   exec "sh": executable file not found in $PATH
 //
 // The fix in docker-compose.yml splits shell-required work into
-// a separate `minio-init` service that runs on minio/mc (which
-// has a shell) and keeps the pg_hardstorage container as a
+// a separate `minio-init` service that runs on the S3 server image (which
+// bundles `mc` and a shell) and keeps the pg_hardstorage container as a
 // pure-Go entrypoint.  This test asserts that split holds: any
 // future commit that re-introduces `entrypoint: [sh|bash|...]`
 // against the distroless image fails here at PR time, not at

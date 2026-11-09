@@ -425,8 +425,6 @@ func boolField(m map[string]any, key string) *bool {
 	return &b
 }
 
-func truePtr(b bool) *bool { return &b }
-
 func strField(m map[string]any, key string) string {
 	v, ok := m[key]
 	if !ok {

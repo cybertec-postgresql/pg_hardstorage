@@ -9,7 +9,13 @@ import (
 	stdfs "io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 )
+
+// barrierPersistsNewDirs: this Barrier fsyncs only each published
+// chunk's own directory, not the parent entry of a directory Put just
+// created, so Put must keep creating directories durably.
+const barrierPersistsNewDirs = false
 
 // Barrier is the portable (non-Linux) form of the deferred-chunk
 // commit. Same three-step sequence as the Linux build — staging
@@ -67,10 +73,18 @@ func (p *Plugin) Barrier(ctx context.Context) error {
 	return nil
 }
 
-// fsyncFile reopens path read-only and fsyncs its contents. A file
-// deleted before the Barrier is a no-op success.
+// fsyncFile reopens path and fsyncs its contents. A file deleted
+// before the Barrier is a no-op success.
+//
+// Read-only on Unix. On Windows FlushFileBuffers needs a handle with
+// write access (a read-only one fails with ERROR_ACCESS_DENIED), so
+// the file is reopened read-write there; nothing is written.
 func fsyncFile(path string) error {
-	f, err := os.Open(path)
+	flag := os.O_RDONLY
+	if runtime.GOOS == "windows" {
+		flag = os.O_RDWR
+	}
+	f, err := os.OpenFile(path, flag, 0)
 	if err != nil {
 		if errors.Is(err, stdfs.ErrNotExist) {
 			return nil

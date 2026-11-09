@@ -188,6 +188,7 @@ func snapTree(t testing.TB, root string) (files []string, emptyDirs []string) {
 			return nil
 		}
 		rel, _ := filepath.Rel(root, p)
+		rel = filepath.ToSlash(rel) // compared against "gc/runs/" below
 		if d.IsDir() {
 			ents, _ := os.ReadDir(p)
 			if len(ents) == 0 && rel != "." {

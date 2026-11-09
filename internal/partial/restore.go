@@ -161,7 +161,7 @@ var ErrEmptyTables = errors.New("partial: Tables is empty")
 //     the SQL layer (pg_dump invocation, DDL emission) belongs in
 //     a follow-up that owns a sandbox PG runtime.
 //
-// The split lets+ ship the half that absolutely needs the
+// The split lets us ship the half that absolutely needs the
 // repo + manifest + chunk store (file selection + materialisation)
 // without waiting for the testcontainers + pg_dump plumbing.
 func Restore(ctx context.Context, opts RestoreOptions) (*RestoreResult, error) {
@@ -537,16 +537,27 @@ func materialiseOneFile(ctx context.Context, cas *repo.CAS, target, relPath stri
 			err = fmt.Errorf("close destination: %w", cerr)
 		}
 	}()
-	for _, ref := range f.Chunks {
-		if err := ctx.Err(); err != nil {
-			return bytesWritten, err
+	// Chunks are read ahead and delivered in list order, as in the full
+	// restore path (issue #97).
+	hashes := func(yield func(repo.Hash) bool) {
+		for i := range f.Chunks {
+			if !yield(f.Chunks[i].Hash) {
+				return
+			}
 		}
-		body, gerr := cas.GetChunkBytes(ctx, ref.Hash)
+	}
+	next := 0
+	err = cas.FetchOrdered(ctx, hashes, func(_ repo.Hash, body []byte, gerr error) error {
+		ref := f.Chunks[next]
+		next++
 		if gerr != nil {
-			return bytesWritten, fmt.Errorf("fetch chunk %s: %w", ref.Hash, gerr)
+			if cerr := ctx.Err(); cerr != nil {
+				return cerr
+			}
+			return fmt.Errorf("fetch chunk %s: %w", ref.Hash, gerr)
 		}
 		if int64(len(body)) != ref.Len {
-			return bytesWritten, fmt.Errorf("chunk %s len mismatch: got %d, want %d",
+			return fmt.Errorf("chunk %s len mismatch: got %d, want %d",
 				ref.Hash, len(body), ref.Len)
 		}
 		// Offset contiguity: chunks are written in slice order, so a
@@ -557,14 +568,18 @@ func materialiseOneFile(ctx context.Context, cas *repo.CAS, target, relPath stri
 		// #32); this mirror must too, or `partial dump`/`partial restore`
 		// hands back corrupt table data that looks correct.
 		if !chunkOffsetContiguous(ref.Offset, bytesWritten) {
-			return bytesWritten, fmt.Errorf("chunk %s offset=%d but running write position is %d: "+
+			return fmt.Errorf("chunk %s offset=%d but running write position is %d: "+
 				"the manifest's chunks are out of order; refusing to write a byte-scrambled file",
 				ref.Hash, ref.Offset, bytesWritten)
 		}
 		if _, werr := dst.Write(body); werr != nil {
-			return bytesWritten, fmt.Errorf("write chunk %s: %w", ref.Hash, werr)
+			return fmt.Errorf("write chunk %s: %w", ref.Hash, werr)
 		}
 		bytesWritten += int64(len(body))
+		return nil
+	})
+	if err != nil {
+		return bytesWritten, err
 	}
 	if bytesWritten != f.Size {
 		return bytesWritten, fmt.Errorf("size mismatch: chunks total %d, manifest says %d",

@@ -90,7 +90,7 @@ func runBackupControlPlane(cmd *cobra.Command, opts runOptions) error {
 	// tenant + encrypt/no-encrypt are deployment-config concerns on
 	// the agent side (the agent's local config picks the tenant; the
 	// keyring picks the encryption posture). Passing them through the
-	// API is a+ enhancement once we extend EnqueueOptions; for
+	// API is a later enhancement once we extend EnqueueOptions; for
 	// now we surface a clear refusal so the operator isn't surprised
 	// when their flag is silently ignored.
 	if opts.tenant != "" && opts.tenant != "default" {

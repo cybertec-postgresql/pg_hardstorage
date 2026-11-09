@@ -53,7 +53,6 @@ type commonFlags struct {
 	gzip          bool   // --gzip
 	user          string // --user (barman-cloud-backup only — PG role)
 	name          string // --name  (barman-cloud-backup only — backup label)
-	hostStanza    string // legacy --host-stanza (rarely used)
 }
 
 func attachCommonFlags(c *cobra.Command, f *commonFlags, withUserName bool) {
@@ -213,15 +212,4 @@ func buildRepoURL(positional string, f commonFlags, e bcEnv) (string, error) {
 		out += separator + strings.Join(params, "&")
 	}
 	return out, nil
-}
-
-// emitWarn prints a one-line shim warning to stderr.  Used
-// when soft-honoured flags or env vars don't translate
-// cleanly.  The operator sees this in the operator's pod log
-// (CNPG forwards barman-cloud-* stderr to the controller's
-// structured log).
-func emitWarn(stderr *cobra.Command, format string, args ...any) {
-	if stderr != nil {
-		fmt.Fprintf(stderr.ErrOrStderr(), "pg-hardstorage-barmancloud: warn: "+format+"\n", args...)
-	}
 }

@@ -637,21 +637,6 @@ func tailString(s string, n int) string {
 	return "...<truncated>...\n" + s[len(s)-n:]
 }
 
-// currentUser returns $USER or "postgres" as a fallback. PG
-// peer-auth checks the connecting OS user against the requested
-// PG role. We pass --username explicitly so pg_dump doesn't
-// reflect a stale one from libpq env vars the operator might
-// have set.
-func currentUser() string {
-	if u := os.Getenv("USER"); u != "" {
-		return u
-	}
-	if u := os.Getenv("LOGNAME"); u != "" {
-		return u
-	}
-	return "postgres"
-}
-
 // DiscoverPGTools probes PATH for pg_ctl + pg_dump and returns
 // the resolved paths. Useful in CLI pre-flight checks before the
 // operator commits to a long restore.

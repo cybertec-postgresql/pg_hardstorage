@@ -37,8 +37,8 @@ func TestBarmanRetentionTranslatesWithPolicy(t *testing.T) {
 		if tc.policy == "simple" && r.KeepFor != tc.field {
 			t.Errorf("%s: keep_for = %q, want %q", tc.in, r.KeepFor, tc.field)
 		}
-		if tc.policy == "count" && r.KeepFulls != 4 {
-			t.Errorf("%s: keep_fulls = %d, want 4", tc.in, r.KeepFulls)
+		if tc.policy == "count" && (r.KeepFulls == nil || *r.KeepFulls != 4) {
+			t.Errorf("%s: keep_fulls = %v, want 4", tc.in, r.KeepFulls)
 		}
 	}
 }

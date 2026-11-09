@@ -123,7 +123,7 @@ func Run(root *cobra.Command) int {
 	// names an UNKNOWN deployment is really a typo'd deployment name —
 	// say so instead of demanding flags the operator never uses.
 	err = enrichUnknownDeploymentError(cmd, err)
-	// Audit+ #3 — `--on-error-llm` auto-launch.  If the
+	// Audit #3 — `--on-error-llm` auto-launch.  If the
 	// global flag (or env var) is set AND the failure carries a
 	// structured error code AND a loaded skill declares
 	// `auto_on_error: [<code>]`, drop into the matching skill

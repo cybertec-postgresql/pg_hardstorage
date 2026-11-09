@@ -540,7 +540,7 @@ func Drill(ctx context.Context, repoURL string, deployment string, opts DrillOpt
 				Severity:   SeverityWarning,
 				Code:       "recovery.drill_verify_skipped",
 				Message:    "pg_verifybackup skipped: " + verifyRes.SkipReason,
-				Suggestion: "the source manifest may pre-date the+ backup_manifest field; take a fresh backup to anchor a clean drill window",
+				Suggestion: "the source manifest may pre-date the backup_manifest field; take a fresh backup to anchor a clean drill window",
 			})
 		} else {
 			report.Verdict = DrillVerdictFail

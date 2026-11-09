@@ -1125,3 +1125,56 @@ func TestDrive_NetworkErrorMidArchiveTearsDownSink(t *testing.T) {
 		t.Errorf("OnTablespaceEnd called %d times, want 1 (the deferred teardown)", sink.ends)
 	}
 }
+
+// PG sends nothing until its start checkpoint finishes, which on a busy
+// disk outlasts the 90 s window (seen: 103 s). That silence gets
+// StartTimeout; after the start LSN the normal window applies again.
+func TestDrive_StartCheckpointGetsItsOwnWindow(t *testing.T) {
+	const base = 150 * time.Millisecond
+	r, be, ctx, cancel := pipeDrive(t)
+	defer cancel()
+	r.SetInactivityTimeout(base) // as run creates it
+	go func() {
+		time.Sleep(4 * base) // the checkpoint
+		emit(t, be, lsnResult("0/2000028", "1")...)
+		emit(t, be, tablespaceListSchema(), &pgproto3.CommandComplete{CommandTag: []byte("SELECT")})
+		// then a real stall
+	}()
+	res := &Result{}
+	err := drive(ctx, r, Options{InactivityTimeout: base, StartTimeout: 20 * base}, &recordingSink{}, res)
+	if res.StartLSN == "" {
+		t.Fatalf("start-checkpoint silence killed the backup: %v", err)
+	}
+	if !errors.Is(err, streaming.ErrInactivityTimeout) {
+		t.Fatalf("stall after the start LSN: want inactivity timeout, got %v", err)
+	}
+	if strings.Contains(err.Error(), "start checkpoint") {
+		t.Fatalf("stall after the start LSN blamed on the checkpoint: %v", err)
+	}
+}
+
+func TestDrive_StartCheckpointTimeoutIsExplained(t *testing.T) {
+	const base = 50 * time.Millisecond
+	r, _, ctx, cancel := pipeDrive(t)
+	defer cancel()
+	r.SetInactivityTimeout(base) // as run creates it
+	err := drive(ctx, r, Options{InactivityTimeout: base, StartTimeout: 3 * base}, &recordingSink{}, &Result{})
+	if !errors.Is(err, streaming.ErrInactivityTimeout) || !strings.Contains(err.Error(), "start checkpoint") {
+		t.Fatalf("want an inactivity timeout naming the start checkpoint, got %v", err)
+	}
+}
+
+func TestStartWindow(t *testing.T) {
+	for _, c := range []struct {
+		opts Options
+		want time.Duration
+	}{
+		{Options{InactivityTimeout: 90 * time.Second}, 30 * time.Minute},
+		{Options{InactivityTimeout: 90 * time.Second, StartTimeout: 5 * time.Minute}, 5 * time.Minute},
+		{Options{InactivityTimeout: time.Hour, StartTimeout: 5 * time.Minute}, time.Hour},
+	} {
+		if got := startWindow(c.opts); got != c.want {
+			t.Errorf("startWindow(%+v) = %s, want %s", c.opts, got, c.want)
+		}
+	}
+}

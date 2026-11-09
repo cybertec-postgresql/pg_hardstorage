@@ -368,20 +368,6 @@ func matchesHistoryFilter(e *DrillHistoryEntry, f HistoryFilter) bool {
 	return true
 }
 
-func (s *HistoryStore) allKeys(ctx context.Context) ([]string, error) {
-	var keys []string
-	for info, err := range s.sp.List(ctx, HistoryPrefix) {
-		if err != nil {
-			return nil, fmt.Errorf("recovery: list history: %w", err)
-		}
-		if !strings.HasSuffix(info.Key, ".json") {
-			continue
-		}
-		keys = append(keys, info.Key)
-	}
-	return keys, nil
-}
-
 func (s *HistoryStore) get(ctx context.Context, key string) (*DrillHistoryEntry, error) {
 	rc, err := s.sp.Get(ctx, key)
 	if err != nil {

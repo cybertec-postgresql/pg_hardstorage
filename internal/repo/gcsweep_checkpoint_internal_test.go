@@ -71,24 +71,55 @@ func TestSweep_ManifestBetweenCheckpointsProtectsLaterSlice(t *testing.T) {
 	}
 }
 
-// The checkpoint window is capped by the writer fence wait: with a tiny
-// GCFenceMaxWait every slice gets its own checkpoint despite BatchDuration.
+// The checkpoint window is capped by the writer fence wait: once a
+// checkpoint's own work (pin read, lease check, rescan) has used up 3/5 of
+// GCFenceMaxWait, no delete window is left and every slice gets its own
+// checkpoint despite BatchDuration.
+//
+// The cap is a time bound, so the test has to spend the time: the hook
+// stands in for a slow rescan. Without it the three slices finish inside
+// the window on a fast host and legitimately share one checkpoint.
 func TestSweep_CheckpointWindowCappedByFenceMaxWait(t *testing.T) {
-	sp, root := fenceWorld(t)
+	sp, root := fenceWorld(t) // restores GCFenceMaxWait on cleanup
 	for i := 0; i < 9; i++ {
 		oldOrphan(t, sp, root, fmt.Sprintf("o%d", i))
 	}
-	GCFenceMaxWait = time.Millisecond
+	GCFenceMaxWait = 5 * time.Millisecond
 	checkpoints := 0
 	res, err := Sweep(context.Background(), sp, SweepOptions{
 		Apply: true, BatchSize: 3, BatchDuration: time.Hour,
-		beforeBatch: func(int) { checkpoints++ },
+		beforeBatch: func(int) {
+			checkpoints++
+			time.Sleep(GCFenceMaxWait) // > the 3/5 cap: the window is spent
+		},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if checkpoints != 3 || res.Deleted != 9 {
 		t.Errorf("checkpoints=%d deleted=%d, want 3/9", checkpoints, res.Deleted)
+	}
+}
+
+// The other side of the cap: a checkpoint that leaves delete time inside
+// 3/5 of GCFenceMaxWait keeps covering slices, so the cap alone never
+// forces a rescan per slice.
+func TestSweep_CheckpointWindowNotSpentIsShared(t *testing.T) {
+	sp, root := fenceWorld(t)
+	for i := 0; i < 9; i++ {
+		oldOrphan(t, sp, root, fmt.Sprintf("o%d", i))
+	}
+	GCFenceMaxWait = time.Hour
+	checkpoints := 0
+	res, err := Sweep(context.Background(), sp, SweepOptions{
+		Apply: true, BatchSize: 3, BatchDuration: 24 * time.Hour,
+		beforeBatch: func(int) { checkpoints++ },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if checkpoints != 1 || res.Deleted != 9 {
+		t.Errorf("checkpoints=%d deleted=%d, want 1/9", checkpoints, res.Deleted)
 	}
 }
 

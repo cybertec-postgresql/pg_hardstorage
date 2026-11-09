@@ -83,15 +83,15 @@ func runBackupCompare(cmd *cobra.Command, deployment, idA, idB, repoURL string, 
 			"backup compare: --top-n must be ≥ 0").Wrap(output.ErrUsage)
 	}
 
-	verifier, err := loadVerifier()
-	if err != nil {
-		return err
-	}
 	_, sp, err := openRepo(cmd.Context(), repoURL)
 	if err != nil {
 		return err
 	}
 	defer sp.Close()
+	verifier, err := loadVerifier()
+	if err != nil {
+		return err
+	}
 
 	store := backup.NewManifestStore(sp)
 	manifestA, err := store.ReadAuto(cmd.Context(), deployment, idA, verifier)

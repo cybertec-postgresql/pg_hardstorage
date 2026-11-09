@@ -242,8 +242,10 @@ func AcquireBackupLease(ctx context.Context, sp storage.StoragePlugin, deploymen
 		return nil, fmt.Errorf("%w: backend %q emulates IfNotExists with stat-then-write, "+
 			"so two runners can hold this lease at once and back up %q concurrently. "+
 			"For SFTP this means the server does not advertise hardlink@openssh.com; "+
-			"use a server that does, or a different repository backend. Set "+
-			"LeaseOptions.AllowUnenforceable only where exactly one runner can exist",
+			"for S3 that the endpoint does not enforce If-None-Match (or is not vouched for "+
+			"with ?conditional_put=native). Use a backend that does, or, where exactly one "+
+			"runner can exist, pass --allow-concurrent to backup or set "+
+			"allow_unenforceable_lease: true on the deployment",
 			ErrLeaseNotEnforceable, sp.Name(), deployment)
 	}
 

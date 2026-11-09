@@ -477,7 +477,7 @@ func checkEncryptionHealth(ctx context.Context, latest *backup.Manifest, opts Op
 	out.KEKReachable = true
 	// We don't unwrap here (Unwrap requires the wrapped_dek bytes
 	// + the actual DEK to be cryptographically tied). The
-	// reachability check + the+ kms verify command together
+	// reachability check + the kms verify command together
 	// give the operator a complete encryption-health story.
 	out.UnwrapOK = true
 	return out

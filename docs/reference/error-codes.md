@@ -19,10 +19,10 @@ domain.
 
 This page lists the namespaces shipped today, their stable
 properties, and the typical recovery path.  Individual
-leaf codes are not exhaustively listed — the surface is
-~270 codes — but every leaf belongs to one of the
-namespaces below, and every namespace honours the
-properties documented here.
+leaf codes are not exhaustively listed — the binary
+constructs more than 500 distinct codes — but every leaf
+belongs to one of the namespaces below, and every namespace
+honours the properties documented here.
 
 ## Quick map: namespace → exit code → recovery
 
@@ -60,6 +60,7 @@ Common leaf shapes:
 | `usage.bad_flag`, `usage.bad_flags` | Flag value parse failed |
 | `usage.flag` | Unknown flag (`unknown flag: --x`) — the commonest usage error |
 | `usage.bad_args`, `usage.bad_arg`, `usage.bad_set` | Wrong number or shape of positional arguments |
+| `usage.bad_deployment` | The deployment name cannot be a single storage-key component: it contains a path separator or a control character, or is `.` / `..`. Raised by `backup`, the HTTP API and every `wal` subcommand before anything reaches storage — a name such as `../audit` would otherwise address another part of the repository. |
 | `usage.missing_*` | Required input absent (`missing_repo_url`, `missing_deployment`, `missing_signer`, `missing_target_dir`, `missing_trusted_key`, …) |
 | `usage.bad_lsn`, `usage.bad_target_lsn`, `usage.unaligned_lsn` | LSN parse / alignment refused |
 | `usage.bad_time`, `usage.bad_until`, `usage.bad_schedule` | Time / cron parse refused |
@@ -177,7 +178,8 @@ treat any `verify.*` exit as an alert.
 
 | Leaf | Meaning |
 | --- | --- |
-| `verify.checksum_mismatch`, `verify.chunk_size_mismatch`, `verify.short_assembly`, `verify.scrub_mismatch` | CAS chunk corruption |
+| `verify.checksum_mismatch`, `verify.chunk_size_mismatch`, `verify.short_assembly`, `verify.scrub_mismatch` | CAS chunk corruption. `wal fetch` raises `verify.checksum_mismatch` for a chunk that is **present but damaged** (envelope, decompression or content hash fails); archiving the segment again does not repair it — scrub, then `repair scrub --heal --replica <url>`. A chunk that is absent is `wal.fetch.chunk_missing`. |
+| `verify.repo_marker_corrupt` | The repository marker `HSREPO` exists but is not a valid marker (unparseable, or no schema tag). Raised by every command that opens the repository; restore the file from a replica or a storage-level copy. Exit 9. The backups and WAL in the repository are not affected. |
 | `verify.missing_chunks` | Manifest references a chunk not present in the repo |
 | `verify.scrub_unverifiable_manifests` | `repo scrub` / `repair scrub`: manifests that would not verify or parse were skipped, so their chunks are unscrubbed (possible tampering, not bit rot). Both commands exit 9 on it, `--heal` included. |
 | `verify.scrub_key_unavailable` | `repo scrub` / `repair scrub`: encrypted manifests (backup or WAL segment) whose DEK this host cannot resolve (keyring/KEK/KMS access) were skipped. A key-access gap, never reported as a mismatch or healed; exit 9. |
@@ -237,6 +239,7 @@ field is where the recovery hint lives.
 | `keyring.*` | Keyring utilities (`keyring.install_failed`, `keyring.install_empty_source` — the initContainer copy refusing an empty or unreadable Secret mount) |
 | `restore.*` | Restore pipeline (`restore.failed`, `restore.kek_mismatch`, `restore.kek_resolve_failed`, `restore.target_in_wal_gap`, `restore.timeline_history_unreachable`, `restore.unknown_scheme`) |
 | `wal.*` | WAL streaming / fetch (`wal.slot_missing`, `wal.slot_ensure_failed`, `wal.slot_repair_failed`, `wal.fetch.*`, `wal.gap_purge_failed`, `wal.push_failed`, `wal.stream_error`, `wal.system_identifier_changed` — the DSN reached a different cluster than this `wal stream` process started on (permanent), `wal.segment_size_probe_failed` — `wal_segment_size` could not be read on a connected cluster; retried, never assumed) |
+| `wal.fetch.chunk_missing`, `wal.fetch.chunk_unreadable` | `wal fetch` could not obtain a chunk the segment manifest references: `chunk_missing` — the chunk object is not in the repository; `chunk_unreadable` — it could not be read or decrypted (storage error, wrong or unavailable key, unknown codec). A chunk that was read and is damaged is `verify.checksum_mismatch` (exit 9) instead. |
 | `repo.*` | Repo lifecycle, GC, scrub, replicate (`repo.open_failed`, `repo.gc.*`, `repo.scrub.*`, `repo.check.*`, `repo.replicate.*`, `repo.wal_prune.failed`, `repo.wal_prune.incomplete` — `wal prune` finished but `segments_failed > 0`; the result body lists each failure, re-run once fixed, `repo.wipe.partial`) |
 | `repo.check.manifests_unreadable` | `repo check` could not READ some manifests (storage errors such as an S3 500): the check is incomplete (exit 1, body still emitted, `healthy: false`). Distinct from `verify.signature_failures` (exit 9), which is reserved for manifest bytes that were read and failed Ed25519 verification or parsing. |
 | `repo.replicate.incomplete` | `repo replicate` finished but the destination is NOT a complete replica (some manifests/chunks failed or are missing). Non-zero exit so `replicate && rm source` can't trust a partial DR copy — re-run until it exits 0, then `repo replicate verify`. |
@@ -248,7 +251,7 @@ field is where the recovery hint lives.
 | `kms.rotate_incomplete` | `kms rotate --apply` finished but some manifest, replica copy or WAL segment manifest still holds the old KEK (`failed`, `replica_failures` or `wal_failed` > 0). Exit 1. Do NOT retire the old KEK; re-run until it exits 0. |
 | `kms.rotate_plan_failed` | `kms rotate` dry-run whose plan already contains failures (`failed` or `wal_failed` > 0) — `--apply` could not complete. Exit 1. |
 | `chain.*` | Backup-chain integrity (`chain.cycle`, `chain.too_deep`, `chain.no_full_anchor`, `chain.broken_tombstoned`, `chain.degenerate`, `chain.missing_pg_manifest`) |
-| `splitbrain.*` | WAL archive collision: another writer already archived this segment (`splitbrain.content_mismatch` — same cluster, different bytes; `splitbrain.system_identifier_mismatch` — a different cluster, typically a cloned datadir without `pg_resetwal`; `splitbrain.read_failed` — the existing manifest is present but unreadable, refused on doubt). Exit 1. Raised by `wal push` and the streaming sink; see [R7](runbooks/R7-patroni-split-brain.md). |
+| `splitbrain.*` | WAL archive collision: another writer already archived this segment (`splitbrain.content_mismatch` — same cluster, different bytes; `splitbrain.system_identifier_mismatch` — a different cluster, typically a cloned datadir without `pg_resetwal`; `splitbrain.read_failed` — the existing manifest is present but unreadable, refused on doubt). Exit 1. The code is carried by the error itself (`walsink.SplitBrainError`), not derived from the message text. Raised by `wal push` and the streaming sink; see [R7](runbooks/R7-patroni-split-brain.md). |
 | `audit.*` | Audit log (`audit.append_failed`, `audit.anchor_failed`, `audit.verify_failed`, `audit.search_failed`, `audit.export_bundle_failed`, `audit.summary_failed`) |
 | `approval.*` | n-of-m approval flow (`approval.gate_failed` — the gate refused for a reason other than pending/expired/revoked/op-or-target mismatch: votes not from the trusted roster or below the configured minimum, no roster configured, or the approval was already redeemed — approvals are single-use) |
 | `threshold.*` | Threshold-signing (FROST) ceremony |

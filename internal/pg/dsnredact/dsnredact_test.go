@@ -37,3 +37,27 @@ func FuzzRedact(f *testing.F) {
 		_ = out
 	})
 }
+
+// A DSN the tokenizer cannot parse is redacted from the first secret
+// keyword onward. Bytes that are not valid UTF-8, or runes whose lower
+// case has a different length, must neither crash that search (it used
+// to slice the original at an offset into its lower-cased copy) nor
+// shift the cut so the secret survives.
+func TestRedactMalformedNonASCIITail(t *testing.T) {
+	const pw = "s3cr3t!pw"
+	for _, c := range []struct{ dsn, want string }{
+		{"\xd3\xe8\xc30\x9c\x9dpAssword", "\xd3\xe8\xc30\x9c\x9d" + redactedValue},
+		{"\xff\xfe\xfd PASSWORD " + pw, "\xff\xfe\xfd " + redactedValue},
+		{"İİİİ sslPassword " + pw, "İİİİ ssl" + redactedValue}, // U+0130 lower-cases to 3 bytes
+		{"KKKK Password " + pw, "KKKK " + redactedValue},       // Kelvin sign lower-cases to 1 byte
+		{"host=h \xc3 nonsense", "host=h \xc3 nonsense"},       // no keyword: untouched
+	} {
+		got := Redact(c.dsn)
+		if got != c.want {
+			t.Errorf("Redact(%q) = %q, want %q", c.dsn, got, c.want)
+		}
+		if strings.Contains(got, pw) {
+			t.Errorf("Redact(%q) = %q leaks the password", c.dsn, got)
+		}
+	}
+}

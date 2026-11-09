@@ -35,10 +35,12 @@ import (
 	"iter"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/cybertec-postgresql/pg_hardstorage/internal/fsutil"
 	"github.com/cybertec-postgresql/pg_hardstorage/internal/plugin/storage"
 )
 
@@ -291,6 +293,11 @@ func (p *Plugin) Open(_ context.Context, cfg storage.StorageConfig) error {
 	if root == "" {
 		return errors.New("fs: empty URL path")
 	}
+	// file:///C:/repo parses to the path "/C:/repo"; on Windows the
+	// leading slash is URL syntax, not part of the path.
+	if runtime.GOOS == "windows" && len(root) >= 3 && root[0] == '/' && root[2] == ':' {
+		root = root[1:]
+	}
 	abs, err := filepath.Abs(root)
 	if err != nil {
 		return fmt.Errorf("fs: resolve %q: %w", root, err)
@@ -371,7 +378,18 @@ func (p *Plugin) Put(ctx context.Context, key string, r io.Reader, opts storage.
 	if err != nil {
 		return storage.PutResult{}, err
 	}
-	if err := mkdirAllRetry(filepath.Dir(full)); err != nil {
+	mkdir := mkdirAllRetry
+	if opts.IfNotExists && opts.Durability == storage.DurabilityDeferred && barrierPersistsNewDirs {
+		// A deferred create always stages a file, so the Barrier that
+		// publishes it runs; where that Barrier is syncfs it persists
+		// this directory's entry too, and fsyncing each new directory
+		// here is pure cost. A first backup into a fresh repository
+		// creates up to 65,536 chunks/sha256/aa/bb buckets, and those
+		// fsyncs — serialised through the filesystem journal — were
+		// ~40% of its wall time (issue #90).
+		mkdir = mkdirAllNoSyncRetry
+	}
+	if err := mkdir(filepath.Dir(full)); err != nil {
 		return storage.PutResult{}, fmt.Errorf("fs: mkdir parent of %q: %w", key, err)
 	}
 
@@ -732,13 +750,15 @@ func (p *Plugin) RenameIfNotExists(ctx context.Context, src, dst string) error {
 	}
 	err = os.Link(srcFull, dstFull)
 	if errors.Is(err, stdfs.ErrNotExist) {
-		// dst's directory was pruned (PruneEmptyDirs) between the mkdir
-		// and the link; src exists, so the missing piece is the directory.
-		for i := 0; i < pruneRaceRetries && errors.Is(err, stdfs.ErrNotExist); i++ {
-			if merr := mkdirAllRetry(filepath.Dir(dstFull)); merr != nil {
-				break
-			}
-			err = os.Link(srcFull, dstFull)
+		// Either src is missing, or dst's directory was pruned
+		// (PruneEmptyDirs) between the mkdir and the link. Only the
+		// second is worth another attempt, so src is checked first; the
+		// link then goes in before the re-created directory is synced
+		// (inRecreatedDir).
+		if _, serr := os.Lstat(srcFull); serr == nil {
+			err = inRecreatedDir(filepath.Dir(dstFull), func() error {
+				return os.Link(srcFull, dstFull)
+			})
 		}
 	}
 	if err != nil {
@@ -798,14 +818,25 @@ func mkdirAllDurable(dir string) error {
 	if fi, err := os.Stat(dir); err == nil && fi.IsDir() {
 		return nil
 	}
-	// Collect the missing components, deepest first, up to the first
-	// existing ancestor.
+	missing, err := missingDirs(dir)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(dir, repoDirMode); err != nil {
+		return err
+	}
+	return syncNewDirs(missing)
+}
+
+// missingDirs lists the components of dir that do not exist, deepest
+// first, up to the first existing ancestor.
+func missingDirs(dir string) ([]string, error) {
 	var missing []string
 	for d := dir; ; {
 		if _, err := os.Stat(d); err == nil {
 			break
 		} else if !errors.Is(err, stdfs.ErrNotExist) {
-			return err
+			return nil, err
 		}
 		missing = append(missing, d)
 		parent := filepath.Dir(d)
@@ -814,18 +845,59 @@ func mkdirAllDurable(dir string) error {
 		}
 		d = parent
 	}
-	if err := os.MkdirAll(dir, repoDirMode); err != nil {
-		return err
-	}
-	// Shallowest first, so each parent's entry is on disk before its
-	// child's. A concurrent creator of the same component is fine: the
-	// entry exists either way, and syncing it twice is harmless.
+	return missing, nil
+}
+
+// syncNewDirs makes the entries of freshly created directories durable:
+// it fsyncs the parent of each directory in missing (as missingDirs
+// returned it), shallowest first, so each parent's entry is on disk
+// before its child's. A concurrent creator of the same component is
+// fine: the entry exists either way, and syncing it twice is harmless.
+func syncNewDirs(missing []string) error {
 	for i := len(missing) - 1; i >= 0; i-- {
 		if err := syncDir(filepath.Dir(missing[i])); err != nil {
 			return fmt.Errorf("fsync parent of new directory %q: %w", missing[i], err)
 		}
 	}
 	return nil
+}
+
+// inRecreatedDir runs op — the create or link of an entry in dir — after
+// re-creating dir, for a caller that just found dir gone (removed by
+// PruneEmptyDirs, which `repo gc` runs, while it was empty).
+//
+// The order matters. The directory is created WITHOUT syncing and op
+// runs at once; only when op has put an entry into the directory are
+// the new directory entries made durable. Syncing first, as
+// mkdirAllDurable does, leaves the directory empty for the length of an
+// fsync per new component, and on a busy disk that is long enough for a
+// prune still walking the tree to remove it again every single time:
+// the writer lost a hundred rounds in a row and failed with ENOENT. An
+// entry pins the directory — rmdir refuses it — so after op nothing can
+// be lost to the prune, and the syncs can take as long as they take.
+func inRecreatedDir(dir string, op func() error) error {
+	var err error
+	for i := 0; i < pruneRaceRetries; i++ {
+		missing, merr := missingDirs(dir)
+		if merr != nil {
+			return merr
+		}
+		if merr := os.MkdirAll(dir, repoDirMode); merr != nil {
+			if errors.Is(merr, stdfs.ErrExist) || errors.Is(merr, stdfs.ErrNotExist) {
+				err = merr // lost a race inside MkdirAll itself; go again
+				continue
+			}
+			return merr
+		}
+		if err = op(); errors.Is(err, stdfs.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		return syncNewDirs(missing)
+	}
+	return err
 }
 
 // dirSyncHook, when set (tests only), observes every syncDir call —
@@ -842,10 +914,10 @@ var dirSyncHook func(dir string)
 // change on a power loss before the parent dentry is flushed.
 //
 // On Linux + macOS this is a real fsync syscall against the
-// directory fd.  On Windows, fsync on a directory is a no-op
-// at the syscall layer and Go's *os.File.Sync returns nil; the
-// helper still works (just doesn't do anything) so the caller
-// path is portable.
+// directory fd.  On Windows it is a no-op (fsutil.SyncDirHandle:
+// FlushFileBuffers refuses a read-only directory handle, and
+// NTFS journals directory metadata itself) so the caller path
+// is portable.
 //
 // Best-effort failure path: a failure to fsync the directory
 // is reported back to the caller but doesn't undo the
@@ -867,7 +939,7 @@ func syncDir(dir string) error {
 		return fmt.Errorf("open dir for fsync: %w", err)
 	}
 	defer d.Close()
-	if err := d.Sync(); err != nil {
+	if err := fsutil.SyncDirHandle(d); err != nil {
 		return fmt.Errorf("fsync dir: %w", err)
 	}
 	return nil
@@ -879,10 +951,18 @@ const pruneRaceRetries = 100
 
 // mkdirAllRetry is mkdirAllDurable, retried when it loses a race with
 // PruneEmptyDirs (the directory it just saw, or created, vanished again).
-func mkdirAllRetry(dir string) error {
+func mkdirAllRetry(dir string) error { return retryPruneRace(dir, mkdirAllDurable) }
+
+// mkdirAllNoSyncRetry is mkdirAllRetry without the directory fsyncs, for
+// callers whose Barrier makes new directory entries durable (see Put).
+func mkdirAllNoSyncRetry(dir string) error {
+	return retryPruneRace(dir, func(d string) error { return os.MkdirAll(d, repoDirMode) })
+}
+
+func retryPruneRace(dir string, mkdir func(string) error) error {
 	var err error
 	for i := 0; i < pruneRaceRetries; i++ {
-		if err = mkdirAllDurable(dir); err == nil ||
+		if err = mkdir(dir); err == nil ||
 			!(errors.Is(err, stdfs.ErrExist) || errors.Is(err, stdfs.ErrNotExist)) {
 			return err
 		}
@@ -893,17 +973,30 @@ func mkdirAllRetry(dir string) error {
 // createStaging creates a staging file exclusively. If the parent directory
 // vanished after Put's mkdir (PruneEmptyDirs, run by `repo gc`, removes
 // directories that were empty at that instant), it re-creates it and retries
-// — a few times, since a prune can win the race again.
+// — a bounded number of times, since a prune can win the race again; see
+// inRecreatedDir for why the directory is not synced before the retry.
 func createStaging(path string) (*os.File, error) {
-	for attempt := 0; ; attempt++ {
-		f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, repoFileMode)
-		if err == nil || !errors.Is(err, stdfs.ErrNotExist) || attempt >= pruneRaceRetries {
-			return f, err
-		}
-		if merr := mkdirAllRetry(filepath.Dir(path)); merr != nil {
-			return nil, merr
-		}
+	open := func() (*os.File, error) {
+		return os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, repoFileMode)
 	}
+	f, err := open()
+	if err == nil || !errors.Is(err, stdfs.ErrNotExist) {
+		return f, err
+	}
+	err = inRecreatedDir(filepath.Dir(path), func() error {
+		var oerr error
+		f, oerr = open()
+		return oerr
+	})
+	if err != nil {
+		if f != nil {
+			// Created, but its new directory could not be made durable.
+			_ = f.Close()
+			_ = os.Remove(path)
+		}
+		return nil, err
+	}
+	return f, nil
 }
 
 // PruneEmptyDirs (storage.EmptyDirPruner) removes directories under dir that

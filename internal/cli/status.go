@@ -48,15 +48,15 @@ func newRealStatusCmd() *cobra.Command {
 func runStatus(cmd *cobra.Command, deployment, repoURL string) error {
 	d := DispatcherFrom(cmd)
 
-	verifier, err := loadVerifier()
-	if err != nil {
-		return err
-	}
 	repoMeta, sp, err := openRepo(cmd.Context(), repoURL)
 	if err != nil {
 		return err
 	}
 	defer sp.Close()
+	verifier, err := loadVerifier()
+	if err != nil {
+		return err
+	}
 
 	store := backup.NewManifestStore(sp)
 

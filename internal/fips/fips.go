@@ -14,7 +14,7 @@
 //
 //   - `pg_hardstorage doctor` can print "FIPS: yes/no" and
 //     warn if the configured KMS provider isn't FIPS-validated.
-//   - `--fips-strict` mode (in+) can refuse to start
+//   - `--fips-strict` mode (in a later release) can refuse to start
 //     when Enabled() returns false.
 //   - The audit log can stamp every backup with a `fips:true`
 //     attribute that compliance auditors rely on.

@@ -156,6 +156,14 @@ deployments:
       keep_yearly: 5
 ```
 
+A count you leave out takes the default shown above (`keep_fulls: 14`
+for the `count` policy), or — in a `conf.d` drop-in — inherits the
+value from the base file. A count you write is used as written,
+including `0`, which keeps nothing in that bucket: `keep_weekly: 0`
+with `keep_daily: 30` is "dailies only". It is the same meaning
+`rotate --keep-weekly 0` has. The newest backup is always kept,
+whatever the counts say.
+
 `rotate` is a job in its own right: the agent runs it on the schedule
 the deployment declares, and nothing else triggers it. In particular
 **`backup` does not run it** — a deployment that schedules `backup` but
@@ -239,7 +247,8 @@ Validates the manifest's Ed25519 signature, then for each referenced
 chunk: read from CAS, decrypt with the resolved KEK, verify the
 plaintext SHA-256 against the manifest entry. `--sample N` caps the
 chunk count for spot-checks. No PG, no restore, no WAL replay. Exit 9
-on mismatch.
+on mismatch. Chunks are read 16 at a time; `--fetch-concurrency` (1 to
+64) changes that, on `verify` and on `restore` alike.
 
 ### Full verify (sandbox restore + pg_verifybackup)
 

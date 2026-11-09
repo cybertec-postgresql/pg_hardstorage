@@ -276,3 +276,15 @@ func (r TablespaceRemap) AppliedPaths() []string {
 // operator passes an empty entry. Tests + the CLI gate on
 // it via errors.Is.
 var ErrEmptyTablespaceRemap = errors.New("restore: empty tablespace remap entry")
+
+// ScratchLayout places a throwaway restore (verify --full) entirely
+// under root: PGDATA at root/data, every non-default tablespace at
+// root/tablespaces/<oid>. Nothing lands at the locations the backup
+// recorded, which on the source host are live and non-empty, and
+// elsewhere would be left behind. It returns the data dir, the remap
+// to restore with, and the tablespace dirs a sandbox must bind at
+// their own paths (the restored pg_tblspc symlinks are absolute).
+func ScratchLayout(m *backup.Manifest, root string) (dataDir string, remap TablespaceRemap, tsDirs []string) {
+	remap = TablespaceRemap(nil).WithMapAll(filepath.Join(root, "tablespaces"), m.Tablespaces)
+	return filepath.Join(root, "data"), remap, remap.AppliedPaths()
+}
