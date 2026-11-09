@@ -1,0 +1,36 @@
+# Temporary diagnostic: which fixture leaves anonymous volumes behind on
+# a hosted runner. Removed once the answer is in the commit that fixes it.
+name: diag-volumes
+on:
+  workflow_dispatch:
+jobs:
+  diag:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: baseline
+        run: |
+          docker volume ls -qf dangling=true | wc -l
+      - name: silo like the sink (bind /data, rm -fv)
+        run: |
+          d=$(mktemp -d); mkdir -p "$d/bkt"
+          docker run -d --name silo1 -p 127.0.0.1:19000:9000 -v "$d:/data:z" -e MINIO_ROOT_USER=a -e MINIO_ROOT_PASSWORD=bbbbbbbb pgsty/silo:RELEASE.2026-10-26T00-00-00Z server /data
+          sleep 8
+          docker inspect silo1 --format '{{json .Mounts}}'
+          docker exec silo1 sh -c 'rm -rf /data/* /data/.[!.]* 2>/dev/null' || true
+          docker rm -fv silo1
+          echo "dangling after silo: $(docker volume ls -qf dangling=true | wc -l)"
+          docker volume ls -f dangling=true --format '{{.Name}} {{.Labels}}'
+      - name: postgres like pgboot (bind /pgdata, image VOLUME, rm -f)
+        run: |
+          d=$(mktemp -d); chmod 777 "$d"
+          docker run -d --name pgb1 --user 999:999 -e PGDATA=/pgdata -e POSTGRES_PASSWORD=x -v "$d:/pgdata" postgres:16 postgres -D /pgdata -c listen_addresses= || true
+          sleep 5
+          docker inspect pgb1 --format '{{json .Mounts}}' || true
+          docker rm -f pgb1 || true
+          echo "dangling after pgboot-style: $(docker volume ls -qf dangling=true | wc -l)"
+          docker volume ls -f dangling=true --format '{{.Name}} {{.Labels}}'
+      - name: alpine probe
+        run: |
+          docker run --rm alpine:3.20 true
+          echo "dangling after alpine: $(docker volume ls -qf dangling=true | wc -l)"
