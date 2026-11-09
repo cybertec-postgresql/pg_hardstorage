@@ -50,7 +50,16 @@ func TestRetentionThenRecovery_PrunedArchiveStillBoots(t *testing.T) {
 	targetRoot := mkSharedDir(t, "pghs-retboot-target-", 0o755)
 	repoURL := "file://" + repoDir
 	home := t.TempDir()
-	env := append(os.Environ(), "HOME="+home)
+	// HOME alone is not enough: paths.Resolve prefers the XDG variables
+	// when set, and GitHub's runners set them globally. With them left in
+	// place every product call here shared the runner's real keyring, and
+	// once an earlier test in the same process had minted a kek.bin there
+	// the archived WAL came out encrypted — which the booted container,
+	// holding no key, could not replay. Same scrub as the chaos soak.
+	env := append(os.Environ(), "HOME="+home,
+		"XDG_CONFIG_HOME=", "XDG_DATA_HOME=", "XDG_CACHE_HOME=",
+		"XDG_STATE_HOME=", "XDG_RUNTIME_DIR=",
+		"PG_HARDSTORAGE_ROOT=", "PG_HARDSTORAGE_CONFIG_DIR=", "PG_HARDSTORAGE_KEYRING_DIR=")
 
 	runBin := func(timeout time.Duration, args ...string) (string, int) {
 		cctx, c := context.WithTimeout(ctx, timeout)
