@@ -166,7 +166,7 @@ jobs:
 
           # 1. The agent must announce its metrics bind in its event
           #    stream (the listener logs a notice with the address).
-          if ! docker compose logs pg_hardstorage 2>&1 | grep -q '"op": "listening"'; then
+          if ! docker compose logs pg_hardstorage 2>&1 | grep -qE '"op": ?"listening"'; then
             echo "::error::agent never logged the metrics listener 'listening' event — --metrics-listen not wired (issue #98)"; dump; exit 1
           fi
 
