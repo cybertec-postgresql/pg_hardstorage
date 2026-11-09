@@ -40,10 +40,8 @@ func newRepoWithURL(t *testing.T) (storage.StoragePlugin, string) {
 	if _, err := repo.Init(context.Background(), repo.InitOptions{URL: repoURL}); err != nil {
 		t.Fatalf("repo.Init: %v", err)
 	}
-	u, err := url.Parse(repoURL)
-	if err != nil {
-		t.Fatal(err)
-	}
+	// Built, not parsed: url.Parse reads a Windows drive letter as a host.
+	u := &url.URL{Scheme: "file", Path: dir}
 	sp := &fs.Plugin{}
 	if err := sp.Open(context.Background(), storage.StorageConfig{URL: u}); err != nil {
 		t.Fatalf("sp.Open: %v", err)
