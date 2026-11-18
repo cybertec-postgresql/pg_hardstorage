@@ -38,7 +38,7 @@ report.
 | 3.6.1.3 | Key rotation | KEK rotation walks all manifests and rewraps DEKs | `pg_hardstorage kms rotate` | `kms.rotate` |
 | 3.6.1.4 | Retired keys retained for retention period | Old KEKs preserved in keyring after rotation; `kms shred` is the explicit destruction path | `pg_hardstorage kms shred ...` | `kms.shred` |
 | 3.7.1 | Cryptographic key management documented | Three-layer envelope documented in [GDPR Art. 17 — crypto-shred](gdpr-art-17-crypto-shred.md) | (docs) | — |
-| 3.7.6 | Cryptographic keys cannot be substituted | Manifest signature binds DEK envelope to manifest; tampering surfaces as `verify.manifest_signature` | `pg_hardstorage verify ...` | `verify.manifest_signature` (on fail) |
+| 3.7.6 | Cryptographic keys cannot be substituted | Manifest signature binds DEK envelope to manifest; tampering surfaces as `verify.manifest_signature` | `pg_hardstorage verify <deployment> latest` | `verify.manifest_signature` (on fail) |
 | 3.7.7 | Split knowledge / dual control | n-of-m approval for `kms.shred` and other destructive ops | `pg_hardstorage approval request ...` | `approval.request`, `approval.approve` |
 
 ---

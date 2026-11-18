@@ -49,7 +49,7 @@ tags:
 | `info`                   | `pg_hardstorage list` + `show`      |
 | `expire`                 | `pg_hardstorage rotate`             |
 | Cipher (`repo1-cipher-pass`) | KMS envelope: set `kek_ref:` on the deployment (recorded per manifest as `encryption.kek_ref`) |
-| Repo verify (`pgbackrest verify`) | `pg_hardstorage verify` (fast or `--full`) |
+| Repo verify (`pgbackrest verify`) | `pg_hardstorage verify <deployment> latest` (fast: signature + every chunk re-hashed; add `--full` for a sandbox restore + `pg_verifybackup`) |
 
 !!! warning "Incrementals need PostgreSQL 17+"
 

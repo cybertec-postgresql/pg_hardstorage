@@ -144,9 +144,11 @@ Build a block image first:
 mkfs.ext4 -d <pgdata-dir> pgdata.img <size>
 ```
 
-Auto-image-creation is a v1.5 polish item. For v1.0 the
-agent (or a `pg_hardstorage verify prepare-image` helper) is
-expected to produce the image before calling Verify.
+The backend does not build the image itself, and there is no
+`pg_hardstorage` subcommand that does: whoever hands the
+restored PGDATA to the Firecracker backend — the agent, or
+your wrapper around it — produces the image first, exactly as
+in [step 2](#2-build-the-pgdata-block-image).
 
 ### `rootfs did not emit __PG_HARDSTORAGE_VERIFY__ line`
 
