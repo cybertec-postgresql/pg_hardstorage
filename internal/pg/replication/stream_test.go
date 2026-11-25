@@ -311,7 +311,7 @@ func TestBuildStatusUpdate_Shape(t *testing.T) {
 	// at the durable point.
 	const write = pglogrepl.LSN(0x12345678)
 	const flush = pglogrepl.LSN(0x12340000)
-	body, err := buildStatusUpdate(write, flush)
+	body, err := buildStatusUpdate(write, flush, false)
 	if err != nil {
 		t.Fatal(err)
 	}

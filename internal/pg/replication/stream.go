@@ -42,9 +42,9 @@ type StreamOptions struct {
 	StatusUpdateInterval time.Duration
 
 	// InactivityTimeout overrides the streaming.Reader default for
-	// the receive watchdog. Zero uses the streaming default (60 s),
-	// which is appropriate for replication: PG sends a primary-
-	// keepalive at least every 30 s, so a 60 s gap is suspicious.
+	// the receive watchdog. Zero uses streaming.DefaultInactivityTimeout.
+	// A healthy idle server still answers within it: runReceiveLoop asks
+	// for a reply whenever a status interval passes in silence.
 	InactivityTimeout time.Duration
 
 	// OnNotice forwards backend NoticeResponse messages to the
@@ -301,10 +301,21 @@ func runReceiveLoop(ctx context.Context, reader *streaming.Reader, sink WALSink,
 	// it's atomic. See sendStatusUpdate / issue #101.
 	var written atomic.Uint64
 
+	// heard is set on every server message and cleared by each tick. An
+	// idle primary sends nothing on its own: its walsender pings only
+	// after wal_sender_timeout/2 without a reply, and our ticks are what
+	// keep that from happening. A tick that heard nothing since the
+	// previous one therefore asks for a reply, as walreceiver does after
+	// wal_receiver_timeout/2, and the answer re-arms the reader's
+	// inactivity watchdog. Without it an idle database tripped the
+	// watchdog every DefaultInactivityTimeout, and five attempts without
+	// progress stopped the streamer with wal.stream_no_progress.
+	var heard atomic.Bool
+
 	// Initial status update: PG learns our position immediately after
 	// START_REPLICATION. SyncedLSN of 0 is fine — it means "no
 	// durability claimed yet" and doesn't advance the slot.
-	if err := sendStatusUpdate(reader, sink, &written); err != nil {
+	if err := sendStatusUpdate(reader, sink, &written, false); err != nil {
 		return err
 	}
 
@@ -331,7 +342,7 @@ func runReceiveLoop(ctx context.Context, reader *streaming.Reader, sink WALSink,
 			case <-recvCtx.Done():
 				return
 			case <-tick.C:
-				if err := sendStatusUpdate(reader, sink, &written); err != nil {
+				if err := sendStatusUpdate(reader, sink, &written, !heard.Swap(false)); err != nil {
 					tickErr.Store(&err)
 					cancelRecv() // unblock the receive loop promptly
 					return
@@ -354,6 +365,7 @@ func runReceiveLoop(ctx context.Context, reader *streaming.Reader, sink WALSink,
 			}
 			return err
 		}
+		heard.Store(true)
 		// Server-initiated end of COPY. PG sends CopyDone when the
 		// walsender finishes — notably during a fast/smart shutdown,
 		// once our reported write position has caught up (issue #101).
@@ -426,7 +438,7 @@ func runReceiveLoop(ctx context.Context, reader *streaming.Reader, sink WALSink,
 			// If PG asks for a reply, send one right away so it
 			// doesn't time us out.
 			if pk.ReplyRequested {
-				if err := sendStatusUpdate(reader, sink, &written); err != nil {
+				if err := sendStatusUpdate(reader, sink, &written, false); err != nil {
 					return err
 				}
 			}
@@ -442,7 +454,7 @@ func runReceiveLoop(ctx context.Context, reader *streaming.Reader, sink WALSink,
 // buildStatusUpdate for why the distinction matters (issue #101). The
 // physical slot's restart_lsn follows the flush position, so reporting
 // a write position ahead of it is safe and never opens a gap.
-func sendStatusUpdate(reader *streaming.Reader, sink WALSink, written *atomic.Uint64) error {
+func sendStatusUpdate(reader *streaming.Reader, sink WALSink, written *atomic.Uint64, replyRequested bool) error {
 	flush := sink.SyncedLSN()
 	write := pglogrepl.LSN(written.Load())
 	// The write (received) position can never sensibly be behind the
@@ -451,7 +463,7 @@ func sendStatusUpdate(reader *streaming.Reader, sink WALSink, written *atomic.Ui
 	if write < flush {
 		write = flush
 	}
-	body, err := buildStatusUpdate(write, flush)
+	body, err := buildStatusUpdate(write, flush, replyRequested)
 	if err != nil {
 		return err
 	}
@@ -463,7 +475,7 @@ func sendStatusUpdate(reader *streaming.Reader, sink WALSink, written *atomic.Ui
 
 // buildStatusUpdate encodes a Standby Status Update via pglogrepl's
 // helper. Encapsulated so the unit tests can compare bytes deterministically.
-func buildStatusUpdate(write, flush pglogrepl.LSN) ([]byte, error) {
+func buildStatusUpdate(write, flush pglogrepl.LSN, replyRequested bool) ([]byte, error) {
 	// pglogrepl's SendStandbyStatusUpdate takes a pgconn directly;
 	// we want to send via streaming.Reader instead, so we construct
 	// the body bytes the same way pglogrepl does and ship through Send.
@@ -500,7 +512,11 @@ func buildStatusUpdate(write, flush pglogrepl.LSN) ([]byte, error) {
 	pgEpoch := time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
 	micros := uint64(now.Sub(pgEpoch).Microseconds())
 	out = appendUint64BE(out, micros)
-	out = append(out, 0) // 0 = no immediate reply requested
+	if replyRequested {
+		out = append(out, 1)
+	} else {
+		out = append(out, 0)
+	}
 	return out, nil
 }
 
