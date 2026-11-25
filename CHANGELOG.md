@@ -9,6 +9,19 @@ on-disk and on-the-wire schema (backup manifests, configuration, output JSON,
 and the on-disk chunk envelope): an agent built against a given schema version
 keeps reading that version for at least 24 months after a successor lands.
 
+## [Unreleased]
+
+### Fixed
+
+- **`wal stream` stays connected to an idle database** (#105). The
+  walsender sends nothing while standby status updates keep arriving,
+  and ours never asked for a reply, so on a database without writes the
+  5 min inactivity watchdog fired and five attempts without progress
+  stopped the streamer with `wal.stream_no_progress`: a restart about
+  every 25 minutes under a supervisor. A status update that follows an
+  interval without any server message now requests a reply, as
+  walreceiver does, which PG answers whatever `wal_sender_timeout` is.
+
 ## [1.7.0] — 2026-11-09
 
 ### Security

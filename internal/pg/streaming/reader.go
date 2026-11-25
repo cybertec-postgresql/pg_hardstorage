@@ -163,13 +163,12 @@ type Options struct {
 }
 
 // DefaultInactivityTimeout is the timeout applied when
-// Options.InactivityTimeout is zero.  Sized for steady-state
-// replication where PG's wal_sender_timeout (default 60s) makes it
-// emit keepalives every ~30s: 5 minutes gives a 10× margin on
-// keepalive cadence so a single missed keepalive doesn't trip the
-// watchdog.  An idle database with the default
-// wal_sender_timeout still keeps the stream alive indefinitely
-// because PG's keepalives arrive well within this window.
+// Options.InactivityTimeout is zero.  An idle replication stream
+// carries no traffic from PG unless asked: the walsender pings only
+// after wal_sender_timeout/2 without a standby reply, which the
+// periodic status updates prevent.  replication.Stream therefore
+// requests a reply whenever a status interval passes in silence;
+// 5 minutes leaves a wide margin over that cadence.
 //
 // Operators with non-default `wal_sender_timeout = 0` (PG never
 // sends keepalives) MUST disable the watchdog explicitly via the

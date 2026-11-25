@@ -210,6 +210,47 @@ func TestIntegration_StreamReceivesXLogData(t *testing.T) {
 	t.Logf("streamed %d records; slot.restart_lsn = %s", sink.count.Load(), info.RestartLSN)
 }
 
+// An idle primary sends nothing on its own while our status updates
+// keep arriving: the walsender only pings after wal_sender_timeout/2
+// without a reply. The stream must still outlive the inactivity
+// watchdog.
+func TestIntegration_Stream_IdleDatabaseOutlivesInactivityTimeout(t *testing.T) {
+	srv := testkit.StartPostgres(t)
+
+	repl := connectReplication(t, srv.DSN)
+	const slot = "hsctl_idle_test"
+	if err := replication.CreatePhysicalSlotReserveWAL(context.Background(), repl, slot); err != nil {
+		t.Fatalf("create slot: %v", err)
+	}
+	t.Cleanup(func() {
+		repl2 := connectReplication(t, srv.DSN)
+		defer repl2.Close(context.Background())
+		_ = replication.DropSlot(context.Background(), repl2, slot)
+	})
+
+	reg := connectRegular(t, srv.DSN)
+	slotInfo, err := replication.GetSlot(context.Background(), reg, slot)
+	if err != nil {
+		t.Fatalf("GetSlot: %v", err)
+	}
+	startLSN, err := pglogrepl.ParseLSN(slotInfo.RestartLSN)
+	if err != nil {
+		t.Fatalf("parse slot RestartLSN %q: %v", slotInfo.RestartLSN, err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	err = replication.Stream(ctx, connectReplication(t, srv.DSN), replication.StreamOptions{
+		Slot:                 slot,
+		StartLSN:             startLSN,
+		StatusUpdateInterval: 500 * time.Millisecond,
+		InactivityTimeout:    3 * time.Second,
+	}, &recordingSink{})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected the stream to run until ctx deadline; got %v", err)
+	}
+}
+
 func TestIntegration_Stream_RejectsRegularConn(t *testing.T) {
 	srv := testkit.StartPostgres(t)
 	reg := connectRegular(t, srv.DSN)
